@@ -11,6 +11,10 @@ pub struct Chat {
     pub peer_fingerprint: Option<String>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
+    #[serde(skip)]
+    pub peer_typing: bool,
+    #[serde(skip)]
+    pub typing_since: Option<std::time::Instant>,
 }
 
 /// A single message in a chat
@@ -113,6 +117,8 @@ pub struct Config {
     pub temp_dir: PathBuf,
     pub auto_accept_files: bool,
     pub max_file_size: u64,
+    pub enable_notifications: bool,
+    pub enable_typing_indicators: bool,
 }
 
 impl Default for Config {
@@ -122,6 +128,8 @@ impl Default for Config {
             temp_dir: PathBuf::from("temp"),
             auto_accept_files: false,
             max_file_size: 1024 * 1024 * 1024, // 1 GB
+            enable_notifications: true,
+            enable_typing_indicators: true,
         }
     }
 }

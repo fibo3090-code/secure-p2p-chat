@@ -26,6 +26,12 @@ pub enum ProtocolMessage {
 
     /// Keep-alive ping
     Ping,
+
+    /// Typing indicator - user started typing
+    TypingStart,
+
+    /// Typing indicator - user stopped typing
+    TypingStop,
 }
 
 impl ProtocolMessage {
@@ -55,6 +61,10 @@ impl ProtocolMessage {
             Self::FileEnd => b"FILE_END:".to_vec(),
 
             Self::Ping => b"PING".to_vec(),
+
+            Self::TypingStart => b"TYPING_START".to_vec(),
+
+            Self::TypingStop => b"TYPING_STOP".to_vec(),
         }
     }
 
@@ -92,6 +102,10 @@ impl ProtocolMessage {
             Some(Self::FileEnd)
         } else if b == b"PING" {
             Some(Self::Ping)
+        } else if b == b"TYPING_START" {
+            Some(Self::TypingStart)
+        } else if b == b"TYPING_STOP" {
+            Some(Self::TypingStop)
         } else {
             None
         }

@@ -107,6 +107,9 @@ mod gui {
         show_about: bool,
         chat_to_delete: Option<Uuid>,
         history_path: PathBuf,
+        show_emoji_picker: bool,
+        last_typing_time: Option<std::time::Instant>,
+        typing_stopped: bool,
     }
 
     impl App {
@@ -116,6 +119,8 @@ mod gui {
                 temp_dir: PathBuf::from("temp"),
                 auto_accept_files: false,
                 max_file_size: 1024 * 1024 * 1024,
+                enable_notifications: true,
+                enable_typing_indicators: true,
             };
 
             let mut chat_manager = ChatManager::new(config);
@@ -145,6 +150,9 @@ mod gui {
                 show_about: false,
                 chat_to_delete: None,
                 history_path,
+                show_emoji_picker: false,
+                last_typing_time: None,
+                typing_stopped: false,
             }
         }
 
@@ -346,6 +354,16 @@ mod gui {
         }
 
         fn render_chat(&mut self, ui: &mut egui::Ui, chat_id: Uuid) {
+            // Handle dropped files
+            let dropped_files = ui.input(|i| i.raw.dropped_files.clone());
+            if !dropped_files.is_empty() {
+                if let Some(file) = dropped_files.first() {
+                    if let Some(path) = &file.path {
+                        self.file_to_send = Some(path.clone());
+                    }
+                }
+            }
+
             // Header with connection status
             egui::TopBottomPanel::top("chat_header")
                 .exact_height(60.0)
@@ -381,11 +399,20 @@ mod gui {
                                 // Title and status
                                 ui.vertical(|ui| {
                                     ui.heading(&chat.title);
-                                    ui.label(
-                                        egui::RichText::new("🟢 Connected")
-                                            .size(12.0)
-                                            .color(egui::Color32::from_rgb(0, 200, 0)),
-                                    );
+                                    // Show typing indicator or connection status
+                                    if chat.peer_typing {
+                                        ui.label(
+                                            egui::RichText::new("✍️ typing...")
+                                                .size(12.0)
+                                                .color(egui::Color32::LIGHT_BLUE),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("🟢 Connected")
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgb(0, 200, 0)),
+                                        );
+                                    }
                                 });
 
                                 // Fingerprint on right
@@ -448,12 +475,21 @@ mod gui {
                         // File attach button
                         if ui
                             .button(egui::RichText::new("📎").size(20.0))
-                            .on_hover_text("Attach file")
+                            .on_hover_text("Attach file (or drag & drop)")
                             .clicked()
                         {
                             if let Some(path) = rfd::FileDialog::new().pick_file() {
                                 self.file_to_send = Some(path);
                             }
+                        }
+
+                        // Emoji picker button
+                        if ui
+                            .button(egui::RichText::new("😊").size(20.0))
+                            .on_hover_text("Emoji picker")
+                            .clicked()
+                        {
+                            self.show_emoji_picker = !self.show_emoji_picker;
                         }
 
                         // Multiline text input
@@ -466,11 +502,45 @@ mod gui {
                                 .lock_focus(false),
                         );
 
+                        // Handle typing indicators
+                        if response.changed() && !self.input_text.is_empty() {
+                            let now = std::time::Instant::now();
+                            let should_send_typing = self.last_typing_time
+                                .map_or(true, |last| now.duration_since(last).as_secs() >= 2);
+                            
+                            if should_send_typing {
+                                let manager = self.chat_manager.clone();
+                                tokio::spawn(async move {
+                                    let mgr = manager.lock().await;
+                                    let _ = mgr.send_typing_start(chat_id);
+                                });
+                                self.last_typing_time = Some(now);
+                                self.typing_stopped = false;
+                            }
+                        }
+
+                        // Stop typing when text is cleared or after timeout
+                        if self.input_text.is_empty() && !self.typing_stopped {
+                            let manager = self.chat_manager.clone();
+                            tokio::spawn(async move {
+                                let mgr = manager.lock().await;
+                                let _ = mgr.send_typing_stop(chat_id);
+                            });
+                            self.typing_stopped = true;
+                        }
+
                         // Handle keyboard shortcuts
                         if response.has_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl)
                         {
                             self.send_message_clicked(chat_id);
+                            // Stop typing on send
+                            let manager = self.chat_manager.clone();
+                            tokio::spawn(async move {
+                                let mgr = manager.lock().await;
+                                let _ = mgr.send_typing_stop(chat_id);
+                            });
+                            self.typing_stopped = true;
                         }
 
                         // Send button
@@ -490,37 +560,62 @@ mod gui {
                     });
                 });
 
-            // Messages area - fills remaining space
-            egui::CentralPanel::default().show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        if let Ok(manager) = self.chat_manager.try_lock() {
-                            if let Some(chat) = manager.get_chat(chat_id) {
-                                if chat.messages.is_empty() {
-                                    ui.vertical_centered(|ui| {
-                                        ui.add_space(100.0);
-                                        ui.label(
-                                            egui::RichText::new("🔒 End-to-end encrypted conversation")
-                                                .size(16.0)
-                                                .color(egui::Color32::GRAY),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new("Send your first message below!")
-                                                .size(14.0)
-                                                .color(egui::Color32::DARK_GRAY),
-                                        );
-                                    });
-                                } else {
-                                    for message in &chat.messages {
-                                        self.render_message(ui, message);
-                                        ui.add_space(4.0);
-                                    }
+            // Emoji picker overlay
+            if self.show_emoji_picker {
+                egui::Window::new("😊 Emoji Picker")
+                    .resizable(false)
+                    .collapsible(false)
+                    .default_width(300.0)
+                    .show(ui.ctx(), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let common_emojis = [
+                                "😊", "😂", "❤️", "👍", "👎", "🎉", "🔥", "💯",
+                                "😍", "😎", "😢", "😭", "😡", "🤔", "👋", "🙏",
+                                "✨", "⭐", "💪", "👏", "🎊", "🎈", "🚀", "💡",
+                                "📱", "💻", "📷", "🎵", "🎮", "⚽", "🍕", "🍰",
+                            ];
+                            
+                            for emoji in &common_emojis {
+                                if ui.button(egui::RichText::new(*emoji).size(24.0)).clicked() {
+                                    self.input_text.push_str(emoji);
+                                    self.show_emoji_picker = false;
                                 }
                             }
+                        });
+                        
+                        ui.separator();
+                        if ui.button("Close").clicked() {
+                            self.show_emoji_picker = false;
                         }
                     });
+            }
+
+            // Messages area - fills remaining space
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                if let Ok(manager) = self.chat_manager.try_lock() {
+                    if let Some(chat) = manager.get_chat(chat_id) {
+                        if chat.messages.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(100.0);
+                                ui.label(
+                                    egui::RichText::new("🔒 End-to-end encrypted conversation")
+                                        .size(16.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Send your first message below!")
+                                        .size(14.0)
+                                        .color(egui::Color32::DARK_GRAY),
+                                );
+                            });
+                        } else {
+                            for message in &chat.messages {
+                                self.render_message(ui, message);
+                                ui.add_space(4.0);
+                            }
+                        }
+                    }
+                }
             });
         }
 
@@ -900,6 +995,20 @@ mod gui {
                                 (manager.config.max_file_size / (1024 * 1024)) as u32;
                             ui.add(egui::Slider::new(&mut max_size_mb, 1..=10240).suffix(" MB"));
                             manager.config.max_file_size = (max_size_mb as u64) * 1024 * 1024;
+
+                            ui.add_space(10.0);
+
+                            ui.checkbox(
+                                &mut manager.config.enable_notifications,
+                                "Enable desktop notifications",
+                            );
+
+                            ui.add_space(10.0);
+
+                            ui.checkbox(
+                                &mut manager.config.enable_typing_indicators,
+                                "Enable typing indicators",
+                            );
                         }
 
                         ui.add_space(10.0);

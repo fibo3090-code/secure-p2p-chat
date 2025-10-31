@@ -2,7 +2,7 @@
 
 A modern, secure peer-to-peer encrypted messaging application with **forward secrecy**, built in Rust with end-to-end encryption.
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
 ![Security](https://img.shields.io/badge/security-forward_secrecy-brightgreen)
@@ -23,6 +23,10 @@ A modern, secure peer-to-peer encrypted messaging application with **forward sec
 - 📎 **File Transfer**: Send files of any size with progress tracking
 - 💾 **Message History**: Automatic persistence in JSON format
 - ⏰ **Smart Timestamps**: Relative time display (Today, Yesterday, etc.)
+- 😊 **Emoji Picker**: Quick access to common emojis
+- 📁 **Drag & Drop**: Simply drag files to send them
+- ✍️ **Typing Indicators**: See when your peer is typing
+- 🔔 **Desktop Notifications**: Get notified of new messages
 
 ### User Experience
 - 👋 **Welcome Screen**: Guided onboarding for new users

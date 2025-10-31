@@ -62,6 +62,8 @@ impl ChatManager {
             peer_fingerprint: None,
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
         };
 
         self.chats.insert(chat_id, chat);
@@ -99,6 +101,8 @@ impl ChatManager {
             peer_fingerprint: None,
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
         };
 
         self.chats.insert(chat_id, chat);
@@ -206,6 +210,65 @@ impl ChatManager {
         self.toasts.retain(|toast| {
             now.duration_since(toast.created_at) < toast.duration
         });
+    }
+
+    /// Send typing start indicator
+    pub fn send_typing_start(&self, chat_id: Uuid) -> Result<()> {
+        if !self.config.enable_typing_indicators {
+            return Ok(());
+        }
+
+        let session = self
+            .sessions
+            .get(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+
+        session.from_app_tx.send(ProtocolMessage::TypingStart)?;
+        Ok(())
+    }
+
+    /// Send typing stop indicator
+    pub fn send_typing_stop(&self, chat_id: Uuid) -> Result<()> {
+        if !self.config.enable_typing_indicators {
+            return Ok(());
+        }
+
+        let session = self
+            .sessions
+            .get(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+
+        session.from_app_tx.send(ProtocolMessage::TypingStop)?;
+        Ok(())
+    }
+
+    /// Show desktop notification
+    pub fn show_notification(&self, title: &str, body: &str) {
+        if !self.config.enable_notifications {
+            return;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            use notify_rust::Notification;
+            let _ = Notification::new()
+                .summary(title)
+                .body(body)
+                .icon("mail-message-new")
+                .timeout(5000)
+                .show();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use notify_rust::{Notification, Timeout};
+            let _ = Notification::new()
+                .summary(title)
+                .body(body)
+                .icon("mail-message-new")
+                .timeout(Timeout::Milliseconds(5000))
+                .show();
+        }
     }
 
     /// Get a chat by ID
@@ -370,6 +433,18 @@ impl ChatManager {
                                 timestamp: chrono::Utc::now(),
                             });
 
+                            // Clear typing indicator
+                            chat.peer_typing = false;
+                            chat.typing_since = None;
+
+                            // Show desktop notification
+                            let preview = if text.len() > 50 {
+                                format!("{}...", &text[..50])
+                            } else {
+                                text.clone()
+                            };
+                            self.show_notification("New message", &preview);
+
                             tracing::info!("Added received message to chat {}", chat_id);
                         } else {
                             tracing::error!("Chat {} not found for received message", chat_id);
@@ -421,7 +496,8 @@ impl ChatManager {
                                         format!("File transfer error: {}", e)
                                     );
                                 } else {
-                                    self.update_transfer_progress(transfer_id, incoming.bytes_received());
+                                    let bytes_received = incoming.bytes_received();
+                                    self.update_transfer_progress(transfer_id, bytes_received);
                                 }
                                 break;
                             }
@@ -434,7 +510,8 @@ impl ChatManager {
                         // Finalize all active transfers
                         let transfer_ids: Vec<Uuid> = self.incoming_files.keys().copied().collect();
                         for transfer_id in transfer_ids {
-                            if let Some(mut incoming) = self.incoming_files.remove(&transfer_id) {
+                            if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+                                let bytes_received = incoming.bytes_received();
                                 match incoming.finalize() {
                                     Ok(final_path) => {
                                         if let Some(transfer) = self.active_transfers.get(&transfer_id) {
@@ -452,7 +529,7 @@ impl ChatManager {
                                                 });
                                             }
                                         }
-                                        self.update_transfer_progress(transfer_id, incoming.bytes_received());
+                                        self.update_transfer_progress(transfer_id, bytes_received);
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to finalize file: {}", e);
@@ -468,6 +545,20 @@ impl ChatManager {
 
                     ProtocolMessage::Ping => {
                         tracing::trace!("Received ping");
+                    }
+
+                    ProtocolMessage::TypingStart => {
+                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                            chat.peer_typing = true;
+                            chat.typing_since = Some(std::time::Instant::now());
+                        }
+                    }
+
+                    ProtocolMessage::TypingStop => {
+                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                            chat.peer_typing = false;
+                            chat.typing_since = None;
+                        }
                     }
 
                     ProtocolMessage::Version { .. } | ProtocolMessage::EphemeralKey { .. } => {

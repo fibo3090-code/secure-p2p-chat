@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - Enhanced UX Release - 2025-10-31
+
+### ✨ New Features
+- **🎨 Emoji Picker**: Quick access to common emojis with a dedicated picker button
+- **📁 Drag & Drop**: Simply drag files into the chat window to send them
+- **🔔 Desktop Notifications**: Get notified when new messages arrive (configurable)
+- **✍️ Typing Indicators**: See when your peer is typing in real-time
+- **⚙️ Enhanced Settings**: New toggles for notifications and typing indicators
+
+### 🎨 UI Improvements
+- Improved chat header with dynamic status display
+- Better visual feedback for typing state
+- Emoji picker with 32 common emojis
+- Drag-and-drop visual hints
+
+### 🔧 Technical Changes
+- Added `notify-rust` for cross-platform desktop notifications
+- Added `emojis` crate for emoji support
+- Extended protocol with `TypingStart` and `TypingStop` messages
+- Updated Config with notification and typing indicator settings
+
+### 📚 Documentation
+- Updated README with new features
+- Added feature descriptions to DEVELOPMENT_PLAN
+
 ## [1.1.0] - 2025-10-31
 
 ### 🔐 Major Security Enhancement: Forward Secrecy

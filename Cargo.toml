@@ -50,6 +50,12 @@ rfd = "0.14"
 # Open files
 open = "5"
 
+# Desktop notifications
+notify-rust = "4"
+
+# Emoji support
+emojis = "0.6"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
