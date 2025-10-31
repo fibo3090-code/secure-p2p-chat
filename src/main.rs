@@ -105,6 +105,8 @@ mod gui {
         show_welcome: bool,
         file_to_send: Option<PathBuf>,
         show_about: bool,
+        chat_to_delete: Option<Uuid>,
+        history_path: PathBuf,
     }
 
     impl App {
@@ -116,8 +118,20 @@ mod gui {
                 max_file_size: 1024 * 1024 * 1024,
             };
 
+            let mut chat_manager = ChatManager::new(config);
+            
+            // Auto-restore conversation history
+            let history_path = PathBuf::from("Downloads").join("history.json");
+            if history_path.exists() {
+                if let Err(e) = chat_manager.load_history(&history_path) {
+                    tracing::warn!("Failed to load history: {}", e);
+                } else {
+                    tracing::info!("Successfully loaded conversation history");
+                }
+            }
+
             Self {
-                chat_manager: Arc::new(Mutex::new(ChatManager::new(config))),
+                chat_manager: Arc::new(Mutex::new(chat_manager)),
                 selected_chat: None,
                 input_text: String::new(),
                 show_connect_dialog: false,
@@ -129,6 +143,8 @@ mod gui {
                 show_welcome: true, // Show welcome screen on first launch
                 file_to_send: None,
                 show_about: false,
+                chat_to_delete: None,
+                history_path,
             }
         }
 
@@ -176,10 +192,30 @@ mod gui {
 
                     for chat in chats {
                         let is_selected = self.selected_chat == Some(chat.id);
+                        let chat_id = chat.id;
 
-                        let response = ui.horizontal(|ui| {
+                        ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 12.0;
 
+                            // Make the entire row clickable
+                            let response = ui.add(
+                                egui::Button::new("")
+                                    .fill(if is_selected {
+                                        egui::Color32::from_rgb(40, 40, 50)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .min_size(egui::vec2(180.0, 50.0))
+                                    .frame(false)
+                            );
+
+                            if response.clicked() {
+                                self.selected_chat = Some(chat_id);
+                            }
+
+                            // Position elements absolutely over the button
+                            let rect = response.rect;
+                            
                             // Avatar with color based on fingerprint
                             let color = if let Some(fp) = &chat.peer_fingerprint {
                                 fingerprint_to_color(fp)
@@ -187,16 +223,12 @@ mod gui {
                                 egui::Color32::GRAY
                             };
 
-                            let (rect, _resp) = ui.allocate_exact_size(
-                                egui::vec2(40.0, 40.0),
-                                egui::Sense::hover(),
-                            );
-
-                            ui.painter().circle_filled(rect.center(), 20.0, color);
+                            let avatar_center = rect.left_center() + egui::vec2(30.0, 0.0);
+                            ui.painter().circle_filled(avatar_center, 20.0, color);
 
                             let initials = get_initials(&chat.title);
                             ui.painter().text(
-                                rect.center(),
+                                avatar_center,
                                 egui::Align2::CENTER_CENTER,
                                 initials,
                                 egui::FontId::proportional(16.0),
@@ -204,37 +236,35 @@ mod gui {
                             );
 
                             // Chat info
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&chat.title)
-                                        .strong()
-                                        .size(15.0),
-                                );
-                                let last_msg_time = chat
-                                    .messages
-                                    .last()
-                                    .map(|m| format_timestamp_relative(&m.timestamp))
-                                    .unwrap_or_else(|| "No messages".to_string());
-                                ui.label(
-                                    egui::RichText::new(last_msg_time)
-                                        .size(12.0)
-                                        .color(egui::Color32::GRAY),
-                                );
+                            let text_start = rect.left_top() + egui::vec2(65.0, 8.0);
+                            ui.painter().text(
+                                text_start,
+                                egui::Align2::LEFT_TOP,
+                                &chat.title,
+                                egui::FontId::proportional(15.0),
+                                egui::Color32::WHITE,
+                            );
+                            
+                            let last_msg_time = chat
+                                .messages
+                                .last()
+                                .map(|m| format_timestamp_relative(&m.timestamp))
+                                .unwrap_or_else(|| "No messages".to_string());
+                            ui.painter().text(
+                                text_start + egui::vec2(0.0, 20.0),
+                                egui::Align2::LEFT_TOP,
+                                last_msg_time,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::GRAY,
+                            );
+
+                            // Delete button
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("🗑").on_hover_text("Delete chat").clicked() {
+                                    self.chat_to_delete = Some(chat_id);
+                                }
                             });
                         });
-
-                        if response.response.interact(egui::Sense::click()).clicked() {
-                            self.selected_chat = Some(chat.id);
-                        }
-
-                        if is_selected {
-                            let rect = response.response.rect;
-                            ui.painter().rect_stroke(
-                                rect,
-                                4.0,
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
-                            );
-                        }
 
                         ui.add_space(4.0);
                         ui.separator();
@@ -398,8 +428,16 @@ mod gui {
                                 self.file_to_send = None;
                             }
                             if ui.button("✅ Send File").clicked() {
-                                // TODO: Implement file sending
-                                self.file_to_send = None;
+                                // Implement file sending
+                                if let Some(path) = self.file_to_send.take() {
+                                    let manager = self.chat_manager.clone();
+                                    tokio::spawn(async move {
+                                        let mut mgr = manager.lock().await;
+                                        if let Err(e) = mgr.send_file(chat_id, path).await {
+                                            mgr.add_toast(ToastLevel::Error, format!("Failed to send file: {}", e));
+                                        }
+                                    });
+                                }
                             }
                         });
                         ui.separator();
@@ -674,6 +712,22 @@ mod gui {
             if let Ok(mut manager) = self.chat_manager.try_lock() {
                 manager.poll_session_events();
                 manager.cleanup_expired_toasts();
+                
+                // Auto-save history periodically
+                static mut LAST_SAVE: Option<std::time::Instant> = None;
+                unsafe {
+                    let now = std::time::Instant::now();
+                    let should_save = LAST_SAVE.map_or(true, |last| {
+                        now.duration_since(last).as_secs() > 30
+                    });
+                    
+                    if should_save && !manager.chats.is_empty() {
+                        if let Err(e) = manager.save_history(&self.history_path) {
+                            tracing::warn!("Failed to auto-save history: {}", e);
+                        }
+                        LAST_SAVE = Some(now);
+                    }
+                }
             }
 
             // Top panel - Menu bar
@@ -730,6 +784,36 @@ mod gui {
 
             // Toasts overlay
             self.render_toasts(ctx);
+
+            // Delete confirmation dialog
+            if let Some(chat_id) = self.chat_to_delete {
+                egui::Window::new("⚠️ Delete Chat")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label("Are you sure you want to delete this chat?");
+                        ui.label("This action cannot be undone.");
+                        ui.add_space(10.0);
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("❌ Delete").clicked() {
+                                if let Ok(mut manager) = self.chat_manager.try_lock() {
+                                    manager.delete_chat(chat_id);
+                                    if self.selected_chat == Some(chat_id) {
+                                        self.selected_chat = None;
+                                    }
+                                    // Auto-save after deletion
+                                    let _ = manager.save_history(&self.history_path);
+                                }
+                                self.chat_to_delete = None;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.chat_to_delete = None;
+                            }
+                        });
+                    });
+            }
 
             // Dialogs
             if self.show_host_dialog {

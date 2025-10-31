@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::core::{generate_rsa_keypair_async, ProtocolMessage};
 use crate::network::{run_client_session, run_host_session};
-use crate::transfer::IncomingFile;
+use crate::transfer::IncomingFileSync;
 use crate::types::*;
 
 /// Session handle for communication with network task
@@ -21,7 +21,7 @@ pub struct ChatManager {
     session_events: HashMap<Uuid, mpsc::UnboundedReceiver<SessionEvent>>,
     active_transfers: HashMap<Uuid, FileTransferState>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
-    incoming_files: HashMap<Uuid, IncomingFile>,
+    incoming_files: HashMap<Uuid, IncomingFileSync>,
     pub toasts: Vec<Toast>,
     pub config: Config,
 }
@@ -223,6 +223,83 @@ impl ChatManager {
         self.chats.keys().copied().collect()
     }
 
+    /// Delete a chat and its associated session
+    pub fn delete_chat(&mut self, chat_id: Uuid) {
+        self.chats.remove(&chat_id);
+        self.sessions.remove(&chat_id);
+        self.session_events.remove(&chat_id);
+        self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
+    }
+
+    /// Send a file to a chat
+    pub async fn send_file(&mut self, chat_id: Uuid, path: std::path::PathBuf) -> Result<()> {
+        use tokio::fs::File;
+        use tokio::io::AsyncReadExt;
+
+        let session = self
+            .sessions
+            .get(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?
+            .to_string();
+        
+        let file_size = tokio::fs::metadata(&path).await?.len();
+
+        // Send file metadata
+        let meta_msg = ProtocolMessage::FileMeta {
+            filename: filename.clone(),
+            size: file_size,
+        };
+        session.from_app_tx.send(meta_msg)?;
+
+        // Send file chunks
+        let mut file = File::open(&path).await?;
+        let mut buffer = vec![0u8; crate::FILE_CHUNK_SIZE];
+        let mut seq = 0u64;
+
+        loop {
+            let n = file.read(&mut buffer).await?;
+            if n == 0 {
+                break; // EOF
+            }
+
+            let chunk_msg = ProtocolMessage::FileChunk {
+                chunk: buffer[..n].to_vec(),
+                seq,
+            };
+            session.from_app_tx.send(chunk_msg)?;
+            seq += 1;
+        }
+
+        // Send end marker
+        session.from_app_tx.send(ProtocolMessage::FileEnd)?;
+
+        // Add to local history
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.messages.push(Message {
+                id: Uuid::new_v4(),
+                from_me: true,
+                content: MessageContent::File {
+                    filename: filename.clone(),
+                    size: file_size,
+                    path: Some(path),
+                },
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        self.add_toast(
+            ToastLevel::Success,
+            format!("File sent: {}", filename),
+        );
+
+        Ok(())
+    }
+
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
         let chat_ids: Vec<Uuid> = self.session_events.keys().copied().collect();
@@ -302,23 +379,91 @@ impl ChatManager {
                     ProtocolMessage::FileMeta { filename, size } => {
                         tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
 
-                        if let Err(e) = self.start_receiving_file(chat_id, &filename, size) {
-                            tracing::error!("Failed to start receiving file: {}", e);
-                            self.add_toast(
-                                ToastLevel::Error,
-                                format!("Failed to receive file: {}", e)
-                            );
+                        match self.start_receiving_file(chat_id, &filename, size) {
+                            Ok(transfer_id) => {
+                                // Create new IncomingFileSync for this transfer
+                                let file_path = self.config.download_dir.join(&filename);
+                                
+                                match IncomingFileSync::new(&file_path, size) {
+                                    Ok(incoming) => {
+                                        self.incoming_files.insert(transfer_id, incoming);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to create incoming file: {}", e);
+                                        self.add_toast(
+                                            ToastLevel::Error,
+                                            format!("Failed to receive file: {}", e)
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to start receiving file: {}", e);
+                                self.add_toast(
+                                    ToastLevel::Error,
+                                    format!("Failed to receive file: {}", e)
+                                );
+                            }
                         }
                     }
 
-                    ProtocolMessage::FileChunk { .. } => {
-                        // TODO: Handle file chunks
-                        tracing::debug!("Received file chunk");
+                    ProtocolMessage::FileChunk { chunk, seq } => {
+                        tracing::debug!("Received file chunk {} ({} bytes)", seq, chunk.len());
+                        
+                        // Find the active transfer for this chat
+                        let transfer_ids: Vec<Uuid> = self.active_transfers.keys().copied().collect();
+                        for transfer_id in transfer_ids {
+                            if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
+                                if let Err(e) = incoming.write_chunk(&chunk) {
+                                    tracing::error!("Failed to write chunk: {}", e);
+                                    self.add_toast(
+                                        ToastLevel::Error,
+                                        format!("File transfer error: {}", e)
+                                    );
+                                } else {
+                                    self.update_transfer_progress(transfer_id, incoming.bytes_received());
+                                }
+                                break;
+                            }
+                        }
                     }
 
                     ProtocolMessage::FileEnd => {
-                        // TODO: Finalize file transfer
                         tracing::info!("File transfer completed");
+                        
+                        // Finalize all active transfers
+                        let transfer_ids: Vec<Uuid> = self.incoming_files.keys().copied().collect();
+                        for transfer_id in transfer_ids {
+                            if let Some(mut incoming) = self.incoming_files.remove(&transfer_id) {
+                                match incoming.finalize() {
+                                    Ok(final_path) => {
+                                        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+                                            // Add to chat history
+                                            if let Some(chat) = self.chats.get_mut(&chat_id) {
+                                                chat.messages.push(Message {
+                                                    id: Uuid::new_v4(),
+                                                    from_me: false,
+                                                    content: MessageContent::File {
+                                                        filename: transfer.filename.clone(),
+                                                        size: transfer.size,
+                                                        path: Some(final_path),
+                                                    },
+                                                    timestamp: chrono::Utc::now(),
+                                                });
+                                            }
+                                        }
+                                        self.update_transfer_progress(transfer_id, incoming.bytes_received());
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to finalize file: {}", e);
+                                        self.add_toast(
+                                            ToastLevel::Error,
+                                            format!("File transfer error: {}", e)
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     ProtocolMessage::Ping => {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+use std::io::Write;
 
 use crate::util::sanitize_filename;
 
@@ -139,6 +140,87 @@ impl IncomingFile {
         self.expected
     }
 }
+
+/// Synchronous incoming file for use in non-async contexts
+pub struct IncomingFileSync {
+    tmp_path: PathBuf,
+    file: std::fs::File,
+    received: u64,
+    expected: u64,
+    filename: String,
+}
+
+impl IncomingFileSync {
+    /// Create a new incoming file
+    pub fn new(dest_path: &Path, expected_size: u64) -> Result<Self> {
+        let filename = dest_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?
+            .to_string();
+        
+        let safe_filename = sanitize_filename(&filename);
+        
+        // Create temp directory if needed
+        let tmp_dir = dest_path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(tmp_dir)?;
+        
+        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), safe_filename);
+        let tmp_path = tmp_dir.join(tmp_name);
+        
+        let file = std::fs::File::create(&tmp_path)?;
+        
+        Ok(Self {
+            tmp_path,
+            file,
+            received: 0,
+            expected: expected_size,
+            filename: safe_filename,
+        })
+    }
+    
+    /// Write a chunk to the file
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        self.file.write_all(chunk)?;
+        self.received += chunk.len() as u64;
+        
+        if self.received > self.expected {
+            anyhow::bail!(
+                "Received more data than expected: {} > {}",
+                self.received,
+                self.expected
+            );
+        }
+        
+        Ok(())
+    }
+    
+    /// Get bytes received so far
+    pub fn bytes_received(&self) -> u64 {
+        self.received
+    }
+    
+    /// Finalize the file transfer
+    pub fn finalize(mut self) -> Result<PathBuf> {
+        // Flush and sync
+        self.file.flush()?;
+        self.file.sync_all()?;
+        drop(self.file);
+        
+        // Verify size
+        if self.received != self.expected {
+            anyhow::bail!(
+                "Size mismatch: expected {}, got {}",
+                self.expected,
+                self.received
+            );
+        }
+        
+        // The temp path is the final location
+        Ok(self.tmp_path)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
