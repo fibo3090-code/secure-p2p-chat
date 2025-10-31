@@ -71,7 +71,37 @@ out/
 *.secret
 *.key
 *.pem
+*.pfx
+*.p12
+*.cert
+*.crt
+*.der
 !**/test*.pem
+!.github/**/*.pem
+
+# Application data files that might contain sensitive information
+history.json
+*.history
+config.json
+secrets.json
+identity.json
+keystore.json
+*.db
+*.sqlite
+
+# Private keys and certificates (CRITICAL - never commit these!)
+private_key.pem
+id_rsa
+id_rsa.pub
+*.priv
+*.private
+
+# Build artifacts that might contain embedded secrets
+*.exe
+!target/release/*.exe
+*.dll
+*.so
+*.dylib
 
 # Dependency directories (non-Rust)
 node_modules/

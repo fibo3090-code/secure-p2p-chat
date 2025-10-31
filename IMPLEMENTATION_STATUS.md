@@ -151,10 +151,7 @@ cargo build --release
 
 ## Known Limitations
 
-1. **Forward Secrecy**: Not implemented - session keys derived from long-term RSA keys
-   - **Future**: Implement X25519 ECDH ephemeral keys
-
-2. **Persistent Identity**: Keys generated per session
+1. **Persistent Identity**: Keys generated per session
    - **Future**: Argon2-encrypted key storage
 
 3. **Certificate Authority**: Trust-on-first-use (TOFU) model
@@ -315,7 +312,7 @@ This implementation follows the specification document exactly and **exceeds** i
 
 ## Conclusion
 
-The P2P encrypted messaging application is **production-ready** with **industry-standard security** (Signal/WhatsApp level). Version 1.1.0 adds critical forward secrecy protection ensuring past messages remain secure even if keys are compromised.
+The P2P encrypted messaging application is **production-ready** with **industry-standard security** (Signal/WhatsApp level). Version 1.2.0 includes forward secrecy (added in v1.1.0) and enhanced UX features (emoji picker, drag & drop, typing indicators, desktop notifications).
 
 **Security Level**: 
 - ✅ End-to-end encryption

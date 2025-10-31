@@ -252,9 +252,17 @@ cargo clippy
 2. Update Rust: `rustup update`
 3. Clean and rebuild: `cargo clean && cargo build --release`
 
-## 🎨 What's New in v1.1.0
+## 🎨 What's New
 
-### 🔒 Major Security Enhancement: Forward Secrecy
+### 🎉 v1.2.0 - Enhanced UX Release
+
+**New Features**:
+- 😊 **Emoji Picker**: Quick access to common emojis
+- 📁 **Drag & Drop**: Simply drag files into the chat window
+- ✍️ **Typing Indicators**: See when your peer is typing in real-time
+- 🔔 **Desktop Notifications**: Get notified of new messages
+
+### 🔒 v1.1.0 - Major Security Enhancement: Forward Secrecy
 
 **Critical Improvement**: Past messages now secure even if encryption keys are compromised!
 
@@ -283,7 +291,7 @@ cargo clippy
 
 ### Essential Reading
 - **README.md** (this file) - User guide and quick start
-- **FORWARD_SECRECY.md** - v1.1.0 technical details and security analysis
+- **FORWARD_SECRECY.md** - v1.1.0 forward secrecy technical details and security analysis
 - **CHANGELOG.md** - Version history and release notes
 - **DEVELOPMENT_PLAN.md** - Roadmap for future features
 
@@ -326,14 +334,11 @@ cargo run --release -- --connect 192.168.1.10:12345
 ## 🔮 Planned Features
 
 Future enhancements:
-- Drag & drop file support
-- Emoji picker
-- Message search
-- Typing indicators
-- Desktop notifications
+- Message search functionality
 - Group chats (requires protocol update)
-- Forward secrecy (X25519 ECDH)
-- Persistent identities
+- Persistent identities with encrypted key storage
+- NAT traversal for WAN connectivity
+- Mobile apps (Android/iOS)
 
 ## 📜 License
 

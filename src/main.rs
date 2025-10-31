@@ -306,10 +306,12 @@ mod gui {
                     ui.add_space(5.0);
 
                     ui.label("🔒 End-to-end encryption with RSA-2048 & AES-256-GCM");
+                    ui.label("🔐 Forward secrecy with X25519 ECDH (protects past messages)");
                     ui.label("📁 Secure file transfer with progress tracking");
                     ui.label("👥 Direct peer-to-peer connections (no server!)");
-                    ui.label("🔐 Fingerprint verification for security");
+                    ui.label("🛡️ Fingerprint verification for security");
                     ui.label("💾 Message history persistence");
+                    ui.label("😊 Emoji picker, typing indicators, desktop notifications");
 
                     ui.add_space(15.0);
                     ui.separator();
@@ -1029,7 +1031,7 @@ mod gui {
                     .show(ctx, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.heading("Encrypted P2P Messenger");
-                            ui.label("Version 1.0.0");
+                            ui.label("Version 1.2.0");
                             ui.add_space(10.0);
                         });
 
@@ -1037,12 +1039,13 @@ mod gui {
                         ui.add_space(10.0);
 
                         ui.label("A secure, peer-to-peer messaging application");
-                        ui.label("with end-to-end encryption.");
+                        ui.label("with end-to-end encryption and forward secrecy.");
                         ui.add_space(10.0);
 
                         ui.label("🔒 Encryption: RSA-2048-OAEP + AES-256-GCM");
-                        ui.label("🔐 Security: Fingerprint verification");
-                        ui.label("📁 Features: File transfer, message history");
+                        ui.label("🔐 Forward Secrecy: X25519 ECDH + HKDF-SHA256");
+                        ui.label("🛡️ Security: Fingerprint verification");
+                        ui.label("📁 Features: File transfer, message history, typing indicators");
                         ui.add_space(10.0);
 
                         ui.separator();
