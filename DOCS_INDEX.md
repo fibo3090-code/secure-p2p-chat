@@ -1,7 +1,7 @@
 # 📚 Documentation Index
 
 **Project**: Encrypted P2P Messenger  
-**Version**: 1.1.0  
+**Version**: 1.2.0  
 **Last Updated**: 2025-10-31
 
 ---
@@ -32,7 +32,7 @@
 | **[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)** | Component status | Checking what's implemented |
 | **[FORWARD_SECRECY.md](FORWARD_SECRECY.md)** | v1.1.0 security details | Understanding crypto |
 | **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)** | Roadmap & future plans | Contributing features |
-| **[project overvieuw.md](project%20overvieuw.md)** | Protocol specification (FR) | Protocol implementation |
+| **[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md)** | Protocol specification (FR) | Protocol implementation |
 
 ### For Contributors
 
@@ -142,7 +142,7 @@
 
 **Updated for v1.1.0** with forward secrecy
 
-### project overvieuw.md
+### PROTOCOL_SPEC.md
 **Protocol Specification (French)**
 - Complete protocol specification
 - Wire format details
@@ -182,7 +182,7 @@ Project Root/
 │   ├── FORWARD_SECRECY.md ........ v1.1.0 Security Details
 │   ├── CLAUDE.md ................. Architecture Deep-Dive
 │   ├── IMPLEMENTATION_STATUS.md .. Component Status
-│   └── project overvieuw.md ...... Protocol Spec (FR)
+│   └── PROTOCOL_SPEC.md ...... Protocol Spec (FR)
 │
 ├── Planning/
 │   ├── DEVELOPMENT_PLAN.md ....... Roadmap
@@ -219,7 +219,7 @@ Project Root/
 → **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)** - Roadmap
 
 ### "I want to implement the protocol"
-→ **[project overvieuw.md](project%20overvieuw.md)** - Protocol spec
+→ **[PROTOCOL_SPEC.md](PROTOCOL_SPEC.md)** - Protocol spec
 
 ---
 
@@ -252,7 +252,7 @@ Project Root/
 | CLAUDE.md | As needed | Architecture changes |
 | CONTRIBUTING.md | Rare | Process changes |
 | CODE_OF_CONDUCT.md | Rare | Policy updates |
-| project overvieuw.md | Stable | Protocol changes only |
+| PROTOCOL_SPEC.md | Stable | Protocol changes only |
 
 ---
 
@@ -287,21 +287,35 @@ Project Root/
 
 ## 📝 Notes
 
-### Recent Changes (v1.1.0)
+### Recent Changes
+**v1.2.0** (2025-10-31):
+- ✅ Updated CHANGELOG.md with comprehensive v1.2.0 release notes
+- ✅ Enhanced HISTORY.md with v1.1.0 cleanup details
+- ✅ Renamed `project overvieuw.md` → `PROTOCOL_SPEC.md` (fixed typo)
+- ✅ Updated all documentation references
+
+**v1.1.0** (2025-10-31):
 - ✅ Created HISTORY.md (consolidates old bug fixes)
 - ✅ Created FORWARD_SECRECY.md (v1.1.0 technical)
+- ✅ Created DOCS_INDEX.md (navigation guide)
 - ✅ Updated README.md (v1.1.0 features)
 - ✅ Updated CHANGELOG.md (v1.1.0 entry)
 - ✅ Updated IMPLEMENTATION_STATUS.md (v1.1.0 status)
-- ❌ Deleted BUGFIX_MESSAGES.md (→ HISTORY.md)
-- ❌ Deleted FIX_SUMMARY.md (→ HISTORY.md)
-- ❌ Deleted NEW_FEATURES.md (→ HISTORY.md)
-- ❌ Deleted TEST_MESSAGING.md (→ HISTORY.md)
-- ❌ Deleted IMPLEMENTATION_SUMMARY.md (→ FORWARD_SECRECY.md)
 
-### File Consolidation
-**5 redundant files merged** into 2 comprehensive documents (HISTORY.md + FORWARD_SECRECY.md)  
-**Zero data loss** - all information preserved
+### File Consolidation History
+**v1.1.0 Cleanup**: 5 redundant files merged into HISTORY.md and FORWARD_SECRECY.md
+- BUGFIX_MESSAGES.md → HISTORY.md
+- FIX_SUMMARY.md → HISTORY.md
+- NEW_FEATURES.md → HISTORY.md
+- TEST_MESSAGING.md → HISTORY.md
+- IMPLEMENTATION_SUMMARY.md → FORWARD_SECRECY.md
+
+**v1.2.0 Cleanup**: 3 redundant files merged into CHANGELOG.md and HISTORY.md
+- CLEANUP_SUMMARY.md → HISTORY.md (v1.1.0 cleanup section)
+- COMPLETION_SUMMARY.md → CHANGELOG.md (v1.2.0 detailed stats)
+- RELEASE_NOTES_v1.2.0.md → CHANGELOG.md (v1.2.0 release notes)
+
+**Total**: 8 redundant files consolidated with **zero data loss** - all information preserved
 
 ---
 
@@ -323,4 +337,4 @@ Project Root/
 
 **Last Updated**: 2025-10-31  
 **Maintained By**: Project Team  
-**Status**: ✅ Up to date with v1.1.0
+**Status**: ✅ Up to date with v1.2.0

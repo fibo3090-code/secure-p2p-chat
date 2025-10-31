@@ -1,9 +1,9 @@
 [package]
 name = "encodeur_rsa_rust"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
-description = "P2P encrypted messaging application with file transfer"
+description = "Encrypted P2P Messenger - A secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
 
 [dependencies]
 # Runtime async

@@ -126,7 +126,7 @@ encodeur_rsa_rust/
 │  ├─ network/             # Logique réseau
 │  │  ├─ mod.rs
 │  │  ├─ session.rs        # SessionState, run_host/client_session
-│  │  ├─ server.rs         # Host accept loop
+│  │  ├─ server.rs      # Host accept loop
 │  │  └─ client.rs         # Client connect flow
 │  │
 │  ├─ transfer/            # Transfert de fichiers
@@ -1199,7 +1199,6 @@ pub struct HistoryFile {
 }
 
 impl ChatManager {
-    pub fnRéessayerClaude n'a pas encore la capacité d'exécuter le code qu'il génère.AContinuerPlotted documentation continuation from section 10.2 onward.L'utilisateur me demande de continuer la documentation. Je dois reprendre là où je me suis arrêté, c'est-à-dire à la section 10.2 sur la sérialisation/désérialisation de l'historique. Je vais continuer avec les méthodes de persistence, puis compléter toutes les sections restantes du document fusionné.rustimpl ChatManager {
     pub fn load_history(&mut self, path: &Path) -> anyhow::Result<()> {
         let content = std::fs::read_to_string(path)?;
         let history: HistoryFile = serde_json::from_str(&content)?;

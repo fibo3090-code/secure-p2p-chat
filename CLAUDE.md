@@ -315,7 +315,7 @@ When modifying crypto/network code:
 
 ## Useful References
 
-- **Specification**: See `project overvieuw.md` (French) for complete protocol details
+- **Specification**: See `PROTOCOL_SPEC.md` (French) for complete protocol details
 - **Implementation Status**: See `IMPLEMENTATION_STATUS.md` for current progress
 - **README**: User-facing documentation for installation and usage
 - **RustCrypto**: https://github.com/RustCrypto - Cryptography primitives used

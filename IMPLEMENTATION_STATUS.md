@@ -1,6 +1,6 @@
 # Implementation Status
 
-**Version**: 1.1.0  
+**Version**: 1.2.0  
 **Protocol**: v2  
 **Last Updated**: 2025-10-31
 

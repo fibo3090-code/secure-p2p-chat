@@ -444,6 +444,42 @@ src/
 
 ---
 
+## Version 1.1.0 (2025-10-31) - Documentation Cleanup & Code Quality
+
+### 📚 Documentation Consolidation
+
+As part of the v1.1.0 release, a comprehensive cleanup was performed to organize documentation and improve maintainability:
+
+**Files Consolidated**:
+- 5 redundant documentation files merged into comprehensive documents
+- 1,073 lines consolidated into 2 new comprehensive docs (HISTORY.md and DOCS_INDEX.md)
+- Zero data loss - all information preserved
+
+**New Documentation Created**:
+- **HISTORY.md**: Consolidates v0.9.0 → v1.0.2 history (bug fixes, features, testing guides)
+- **DOCS_INDEX.md**: Complete documentation navigation and quick reference
+
+**Documentation Structure Organized**:
+- Essential docs: README.md, CHANGELOG.md, DOCS_INDEX.md
+- Technical docs: FORWARD_SECRECY.md, CLAUDE.md, IMPLEMENTATION_STATUS.md, PROTOCOL_SPEC.md
+- Planning docs: DEVELOPMENT_PLAN.md, HISTORY.md
+- Community docs: CONTRIBUTING.md, CODE_OF_CONDUCT.md
+
+### 🐛 Code Quality Improvements (v1.1.0)
+
+**Clippy Fixes**:
+1. **Redundant Import** (`src/main.rs`): Removed single component path import `use tracing_subscriber;`
+2. **Collapsible If** (`src/main.rs`): Collapsed nested if statements for better readability
+3. **Dead Code Warning** (`src/app/chat_manager.rs`): Added `#[allow(dead_code)]` with documentation for `incoming_files` field
+
+**Result**: Zero clippy warnings (except deprecated API from dependencies)
+
+### 📊 Statistics
+- **Files Modified**: 3 (code quality fixes)
+- **Documentation Files**: Reduced from 14 to 11 (removed 5 redundant, added 2 comprehensive)
+- **Build Status**: ✅ Success
+- **Data Loss**: Zero ✅
+
 ## Migration Notes
 
 ### From v1.0.2 to v1.1.0
@@ -477,6 +513,7 @@ src/
 - FIX_SUMMARY.md
 - NEW_FEATURES.md (French)
 - TEST_MESSAGING.md
+- CLEANUP_SUMMARY.md (v1.1.0 documentation cleanup details)
 - Historical CHANGELOG entries
 
 **For current information, see**:
