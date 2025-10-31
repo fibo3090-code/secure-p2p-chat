@@ -66,3 +66,6 @@ node_modules/
 *.msi
 *.rpm
 *.tar.gz
+
+# claude code assistant files
+.claude
