@@ -65,6 +65,7 @@
 
 ### CHANGELOG.md
 **Version History**
+- v1.2.0 (2025-10-31) - Enhanced UX Release (emoji, drag-drop, typing, notifications)
 - v1.1.0 (2025-10-31) - Forward secrecy implementation
 - v1.0.2 (2025-10-23) - Message receiving bug fix
 - v1.0.0 (2025-10-23) - Major UI/UX overhaul
@@ -92,10 +93,11 @@
 
 ### DEVELOPMENT_PLAN.md
 **Roadmap for Future Features**
-- Phase 1: Security enhancements
-- Phase 2: Connection reliability
-- Phase 3: User experience
-- Phase 4: Enhanced features
+- ✅ Phase 1: Security enhancements (v1.1.0 - Forward Secrecy DONE)
+- Phase 2: Connection reliability (heartbeat, acknowledgments)
+- ✅ Phase 3: User experience (v1.2.0 - ALL DONE)
+- ✅ Phase 4.1: Emoji picker (v1.2.0 - DONE)
+- Phase 4.2+: Message search, image previews
 - Phase 5: Testing & quality
 - Phase 6: Advanced features
 
@@ -104,6 +106,7 @@
 - Estimated timelines
 - Priority matrix
 - Success metrics
+- v1.2.0 achievement summary
 
 ### HISTORY.md
 **Past Development History (v0.9 - v1.0.2)**
@@ -140,7 +143,9 @@
 - Dependencies
 - Known limitations
 
-**Updated for v1.1.0** with forward secrecy
+**Updated for v1.2.0** with:
+- Forward secrecy (v1.1.0)
+- Emoji picker, drag-drop, typing indicators, notifications (v1.2.0)
 
 ### PROTOCOL_SPEC.md
 **Protocol Specification (French)**
