@@ -147,25 +147,26 @@ pub struct IncomingFileSync {
     file: std::fs::File,
     received: u64,
     expected: u64,
-    filename: String,
+    // filename removed: not used by sync helper (kept in transfer state instead)
 }
 
 impl IncomingFileSync {
     /// Create a new incoming file
     pub fn new(dest_path: &Path, expected_size: u64) -> Result<Self> {
-        let filename = dest_path
+        let _ = dest_path
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?
-            .to_string();
-        
-        let safe_filename = sanitize_filename(&filename);
-        
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+
         // Create temp directory if needed
         let tmp_dir = dest_path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(tmp_dir)?;
         
-        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), safe_filename);
+        let safe_filename = dest_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), sanitize_filename(safe_filename));
         let tmp_path = tmp_dir.join(tmp_name);
         
         let file = std::fs::File::create(&tmp_path)?;
@@ -175,7 +176,6 @@ impl IncomingFileSync {
             file,
             received: 0,
             expected: expected_size,
-            filename: safe_filename,
         })
     }
     

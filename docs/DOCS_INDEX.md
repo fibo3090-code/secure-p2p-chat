@@ -14,6 +14,18 @@
 
 ---
 
+---
+
+## ✨ New Features (v1.2.1)
+
+- Contacts: Manage known peers with display names and fingerprints. Contacts are persisted in history files and can be added/removed from the UI.
+- Group chats: Create group conversations by selecting multiple contacts. Group chats maintain a participants list and a group title.
+- Rename conversations: Rename any chat or group to a friendly title; the name is saved in chat history and persisted across runs.
+
+These features improve usability for multi-peer scenarios and make organizing conversations easier.
+
+---
+
 ## 📖 Documentation Structure
 
 ### For Users

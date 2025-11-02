@@ -2,19 +2,20 @@ use anyhow::Result;
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::AsyncWrite;
 
 use crate::core::{send_packet, AesCipher, ProtocolMessage};
 use crate::FILE_CHUNK_SIZE;
 
 /// Send a file over the network in chunks
-pub async fn send_file<F>(
+pub async fn send_file<S, F>(
     path: &Path,
-    stream: &mut TcpStream,
+    stream: &mut S,
     cipher: &AesCipher,
     mut progress_callback: F,
 ) -> Result<()>
 where
+    S: AsyncWrite + Unpin,
     F: FnMut(u64, u64),
 {
     // 1. Get file metadata
@@ -76,11 +77,14 @@ where
 }
 
 /// Helper to send encrypted protocol message
-async fn send_message(
-    stream: &mut TcpStream,
+async fn send_message<S>(
+    stream: &mut S,
     cipher: &AesCipher,
     msg: &ProtocolMessage,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let plaintext = msg.to_plain_bytes();
     let encrypted = cipher.encrypt(&plaintext);
     send_packet(stream, &encrypted).await?;
@@ -107,8 +111,9 @@ mod tests {
 
         // Send file
         let path = temp_file.path().to_path_buf();
+        let send_cipher = cipher.clone();
         tokio::spawn(async move {
-            send_file(&path, &mut client, &cipher, |_, _| {})
+            send_file(&path, &mut client, &send_cipher, |_, _| {})
                 .await
                 .unwrap();
         });

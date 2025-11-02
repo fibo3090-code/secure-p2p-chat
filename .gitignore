@@ -128,3 +128,8 @@ __pycache__/
 # Debug symbols (optional - uncomment if you want to ignore)
 # *.dSYM/
 # *.pdb
+
+# Documentation organization: keep archived originals tracked by git
+!docs/
+!docs/archived/
+!docs/archived/*.md.orig

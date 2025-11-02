@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Result};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::core::{
     derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, parse_x25519_public,
     pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher, ProtocolMessage,
     PROTOCOL_VERSION,
+    
 };
 use crate::types::SessionEvent;
 
@@ -222,12 +224,15 @@ pub async fn run_client_session(
 }
 
 /// Main message loop: send and receive encrypted messages
-async fn run_message_loop(
-    mut stream: TcpStream,
+async fn run_message_loop<S>(
+    mut stream: S,
     cipher: AesCipher,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     mut from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     loop {
         tokio::select! {
             // Receive from network
@@ -291,8 +296,9 @@ async fn run_message_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::generate_rsa_keypair;
+    use crate::core::{generate_rsa_keypair, rsa_encrypt_oaep, rsa_decrypt_oaep};
     use crate::RSA_KEY_BITS;
+    use rand::RngCore;
 
     #[tokio::test]
     async fn test_full_handshake() {

@@ -1,12 +1,14 @@
 use std::io::{Error, ErrorKind, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::MAX_PACKET_SIZE;
 
 /// Send a length-prefixed packet over TCP
 /// Format: 4 bytes big-endian length || payload
-pub async fn send_packet(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
+pub async fn send_packet<S>(stream: &mut S, payload: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let len = payload.len();
     if len > MAX_PACKET_SIZE {
         return Err(Error::new(
@@ -29,7 +31,10 @@ pub async fn send_packet(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
 
 /// Receive a length-prefixed packet from TCP
 /// Format: 4 bytes big-endian length || payload
-pub async fn recv_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
+pub async fn recv_packet<S>(stream: &mut S) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     // Read length header
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
@@ -77,10 +82,10 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(10 * 1024 * 1024);
 
         let payload = vec![42u8; 1024 * 1024]; // 1 MB
-
-        tokio::spawn(async move {
-            send_packet(&mut client, &payload).await.unwrap();
-        });
+            let payload_clone = payload.clone();
+            tokio::spawn(async move {
+                send_packet(&mut client, &payload_clone).await.unwrap();
+            });
 
         let received = recv_packet(&mut server).await.unwrap();
 

@@ -9,6 +9,8 @@ pub struct Chat {
     pub id: Uuid,
     pub title: String,
     pub peer_fingerprint: Option<String>,
+    /// Participants (references to Contact IDs). Empty for one-to-one until contact added.
+    pub participants: Vec<Uuid>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     #[serde(skip)]
@@ -24,6 +26,16 @@ pub struct Message {
     pub from_me: bool,
     pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
+}
+
+/// A contact (a known peer)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Contact {
+    pub id: Uuid,
+    pub name: String,
+    pub fingerprint: Option<String>,
+    pub public_key: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Message content types

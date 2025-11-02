@@ -9,6 +9,7 @@ use crate::types::Chat;
 pub struct HistoryFile {
     pub version: String,
     pub chats: Vec<Chat>,
+    pub contacts: Vec<crate::types::Contact>,
 }
 
 impl HistoryFile {
@@ -16,6 +17,7 @@ impl HistoryFile {
         Self {
             version: "1.0".to_string(),
             chats,
+            contacts: Vec::new(),
         }
     }
 
@@ -58,12 +60,17 @@ impl ChatManager {
             self.chats.insert(chat.id, chat);
         }
 
+        for contact in history.contacts {
+            self.contacts.insert(contact.id, contact);
+        }
+
         Ok(())
     }
 
     /// Save chat history to file
     pub fn save_history(&self, path: &Path) -> Result<()> {
-        let history = HistoryFile::new(self.chats.values().cloned().collect());
+        let mut history = HistoryFile::new(self.chats.values().cloned().collect());
+        history.contacts = self.contacts.values().cloned().collect();
         history.save(path)
     }
 
@@ -88,8 +95,11 @@ mod tests {
             id: Uuid::new_v4(),
             title: "Test Chat".to_string(),
             peer_fingerprint: Some("abc123".to_string()),
+            participants: Vec::new(),
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
         };
 
         let history = HistoryFile::new(vec![chat.clone()]);

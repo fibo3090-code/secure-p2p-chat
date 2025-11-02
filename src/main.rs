@@ -96,6 +96,19 @@ mod gui {
         chat_manager: Arc<Mutex<ChatManager>>,
         selected_chat: Option<Uuid>,
         input_text: String,
+        // Contacts / groups UI state
+        show_contacts: bool,
+        show_add_contact: bool,
+        new_contact_name: String,
+        new_contact_fingerprint: String,
+        new_contact_pubkey: String,
+        show_create_group: bool,
+        group_selected: Vec<Uuid>,
+        group_title: String,
+        // Rename conversation dialog
+        show_rename_dialog: bool,
+        rename_chat_id: Option<Uuid>,
+        rename_input: String,
         show_connect_dialog: bool,
         connect_host: String,
         connect_port: String,
@@ -149,6 +162,17 @@ mod gui {
                 file_to_send: None,
                 show_about: false,
                 chat_to_delete: None,
+                show_contacts: false,
+                show_add_contact: false,
+                new_contact_name: String::new(),
+                new_contact_fingerprint: String::new(),
+                new_contact_pubkey: String::new(),
+                show_create_group: false,
+                group_selected: Vec::new(),
+                group_title: String::new(),
+                show_rename_dialog: false,
+                rename_chat_id: None,
+                rename_input: String::new(),
                 history_path,
                 show_emoji_picker: false,
                 last_typing_time: None,
@@ -426,6 +450,13 @@ mod gui {
                                         ui.monospace(format_fingerprint_short(fp));
                                     }
                                 });
+
+                                // Rename conversation button
+                                if ui.button("✏️ Rename").on_hover_text("Rename conversation").clicked() {
+                                    self.show_rename_dialog = true;
+                                    self.rename_chat_id = Some(chat_id);
+                                    self.rename_input = chat.title.clone();
+                                }
                             });
                         }
                     }
@@ -841,6 +872,10 @@ mod gui {
                         }
                     });
 
+                    if ui.button("👥 Contacts").clicked() {
+                        self.show_contacts = true;
+                    }
+
                     ui.menu_button("⚙️ Settings", |ui| {
                         if ui.button("⚙️ Preferences").clicked() {
                             self.show_settings = true;
@@ -953,6 +988,232 @@ mod gui {
 
                             if ui.button("Cancel").clicked() {
                                 self.show_connect_dialog = false;
+                            }
+                        });
+                    });
+            }
+
+            // Contacts window
+            if self.show_contacts {
+                egui::Window::new("👥 Contacts")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(400.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("➕ Add Contact").clicked() {
+                                self.show_add_contact = true;
+                            }
+
+                            if ui.button("🧩 Create Group").clicked() {
+                                self.show_create_group = true;
+                                self.group_selected.clear();
+                            }
+                        });
+
+                        ui.separator();
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if let Ok(manager) = self.chat_manager.try_lock() {
+                                for contact in manager.contacts.values() {
+                                    ui.horizontal(|ui| {
+                                        let mut checked = self.group_selected.contains(&contact.id);
+                                        if ui.checkbox(&mut checked, "").changed() {
+                                            if checked {
+                                                if !self.group_selected.contains(&contact.id) {
+                                                    self.group_selected.push(contact.id);
+                                                }
+                                            } else {
+                                                self.group_selected.retain(|id| id != &contact.id);
+                                            }
+                                        }
+
+                                        ui.label(&contact.name);
+                                        if let Some(fp) = &contact.fingerprint {
+                                            ui.monospace(format_fingerprint_short(fp));
+                                        }
+
+                                        if ui.small_button("🔗").on_hover_text("Open chat").clicked() {
+                                            // If there's a mapped chat, select it; otherwise create a new chat entry.
+                                            if let Some(chat_id) = manager.contact_to_chat.get(&contact.id) {
+                                                self.selected_chat = Some(*chat_id);
+                                            } else {
+                                                // Generate chat id locally so UI can select it immediately
+                                                let chat_id = Uuid::new_v4();
+                                                self.selected_chat = Some(chat_id);
+
+                                                // Try to create chat synchronously if mutex is available to avoid races
+                                                let history_path = self.history_path.clone();
+                                                if let Ok(mut mgr) = self.chat_manager.try_lock() {
+                                                    let chat = Chat {
+                                                        id: chat_id,
+                                                        title: contact.name.clone(),
+                                                        peer_fingerprint: contact.fingerprint.clone(),
+                                                        participants: vec![contact.id],
+                                                        messages: Vec::new(),
+                                                        created_at: chrono::Utc::now(),
+                                                        peer_typing: false,
+                                                        typing_since: None,
+                                                    };
+                                                    mgr.chats.insert(chat_id, chat);
+                                                    mgr.contact_to_chat.insert(contact.id, chat_id);
+                                                    let _ = mgr.save_history(&history_path);
+                                                } else {
+                                                    // Fall back to async creation if lock is contended
+                                                    let manager = self.chat_manager.clone();
+                                                    let contact_clone = contact.clone();
+                                                    let history_path = self.history_path.clone();
+                                                    tokio::spawn(async move {
+                                                        let mut mgr = manager.lock().await;
+                                                        let chat = Chat {
+                                                            id: chat_id,
+                                                            title: contact_clone.name.clone(),
+                                                            peer_fingerprint: contact_clone.fingerprint.clone(),
+                                                            participants: vec![contact_clone.id],
+                                                            messages: Vec::new(),
+                                                            created_at: chrono::Utc::now(),
+                                                            peer_typing: false,
+                                                            typing_since: None,
+                                                        };
+                                                        mgr.chats.insert(chat_id, chat);
+                                                        mgr.contact_to_chat.insert(contact_clone.id, chat_id);
+                                                        let _ = mgr.save_history(&history_path);
+                                                    });
+                                                }
+                                            }
+                                        }
+
+                                        if ui.small_button("🗑").on_hover_text("Delete contact").clicked() {
+                                            let manager = self.chat_manager.clone();
+                                            let contact_id = contact.id;
+                                            let history_path = self.history_path.clone();
+                                            tokio::spawn(async move {
+                                                let mut mgr = manager.lock().await;
+                                                mgr.remove_contact(contact_id);
+                                                let _ = mgr.save_history(&history_path);
+                                            });
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Close").clicked() {
+                                self.show_contacts = false;
+                            }
+                        });
+                    });
+            }
+
+            // Add Contact dialog
+            if self.show_add_contact {
+                egui::Window::new("➕ Add Contact")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut self.new_contact_name);
+
+                        ui.label("Fingerprint (optional):");
+                        ui.text_edit_singleline(&mut self.new_contact_fingerprint);
+
+                        ui.label("Public key (optional):");
+                        ui.text_edit_singleline(&mut self.new_contact_pubkey);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Add").clicked() {
+                                let name = self.new_contact_name.trim().to_string();
+                                let fp = if self.new_contact_fingerprint.trim().is_empty() { None } else { Some(self.new_contact_fingerprint.trim().to_string()) };
+                                let pk = if self.new_contact_pubkey.trim().is_empty() { None } else { Some(self.new_contact_pubkey.trim().to_string()) };
+                                let manager = self.chat_manager.clone();
+                                let history_path = self.history_path.clone();
+                                tokio::spawn(async move {
+                                    let mut mgr = manager.lock().await;
+                                    mgr.add_contact(name, fp, pk);
+                                    let _ = mgr.save_history(&history_path);
+                                });
+
+                                self.new_contact_name.clear();
+                                self.new_contact_fingerprint.clear();
+                                self.new_contact_pubkey.clear();
+                                self.show_add_contact = false;
+                            }
+
+                            if ui.button("Cancel").clicked() {
+                                self.show_add_contact = false;
+                            }
+                        });
+                    });
+            }
+
+            // Create Group dialog
+            if self.show_create_group {
+                egui::Window::new("🧩 Create Group")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label("Group title (optional):");
+                        ui.text_edit_singleline(&mut self.group_title);
+
+                        ui.label(format!("Selected: {}", self.group_selected.len()));
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Create").clicked() {
+                                let participants = self.group_selected.clone();
+                                let title = if self.group_title.trim().is_empty() { None } else { Some(self.group_title.trim().to_string()) };
+                                let manager = self.chat_manager.clone();
+                                let history_path = self.history_path.clone();
+                                tokio::spawn(async move {
+                                    let mut mgr = manager.lock().await;
+                                    let _chat_id = mgr.create_group_chat(participants, title);
+                                    let _ = mgr.save_history(&history_path);
+                                });
+
+                                // Close dialog and reset selection
+                                self.show_create_group = false;
+                                self.group_selected.clear();
+                                self.group_title.clear();
+                            }
+
+                            if ui.button("Cancel").clicked() {
+                                self.show_create_group = false;
+                            }
+                        });
+                    });
+            }
+
+            // Rename conversation dialog
+            if self.show_rename_dialog {
+                egui::Window::new("Rename Conversation")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label("New title:");
+                        ui.text_edit_singleline(&mut self.rename_input);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                if let Some(chat_id) = self.rename_chat_id {
+                                    let manager = self.chat_manager.clone();
+                                    let new_title = self.rename_input.clone();
+                                    let history_path = self.history_path.clone();
+                                    tokio::spawn(async move {
+                                        let mut mgr = manager.lock().await;
+                                        let _ = mgr.rename_chat(chat_id, new_title);
+                                        let _ = mgr.save_history(&history_path);
+                                    });
+                                }
+                                self.show_rename_dialog = false;
+                                self.rename_chat_id = None;
+                                self.rename_input.clear();
+                            }
+
+                            if ui.button("Cancel").clicked() {
+                                self.show_rename_dialog = false;
+                                self.rename_chat_id = None;
+                                self.rename_input.clear();
                             }
                         });
                     });

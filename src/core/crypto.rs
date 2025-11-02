@@ -15,6 +15,9 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
 use crate::AES_KEY_SIZE;
 
+/// Default RSA key size used in tests and key generation
+pub const RSA_KEY_BITS: usize = 2048;
+
 /// Generate RSA keypair (blocking operation)
 pub fn generate_rsa_keypair(bits: usize) -> Result<RsaPrivateKey> {
     RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| anyhow!("RSA keygen failed: {}", e))
@@ -127,6 +130,7 @@ pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
 }
 
 /// AES-GCM cipher wrapper for encrypting/decrypting messages
+#[derive(Clone)]
 pub struct AesCipher {
     cipher: Aes256Gcm,
 }
@@ -135,9 +139,11 @@ impl AesCipher {
     /// Create new cipher from 32-byte key
     pub fn new(key: &[u8]) -> Self {
         assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
-        let key = Key::<Aes256Gcm>::from_slice(key);
+    // Use TryFrom to construct key from slice (avoids deprecated GenericArray::from_slice)
+        let key = Key::<Aes256Gcm>::try_from(key).expect("Invalid AES key length");
         Self {
-            cipher: Aes256Gcm::new(key),
+            // Aes256Gcm::new accepts a reference to the key array
+            cipher: Aes256Gcm::new(&key),
         }
     }
 
@@ -145,11 +151,12 @@ impl AesCipher {
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        // Nonce::try_from accepts an array by value
+        let nonce = Nonce::try_from(nonce_bytes).expect("Invalid nonce length");
 
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .expect("AES-GCM encryption should not fail");
 
         // Format: nonce || ciphertext (includes tag)
@@ -166,9 +173,15 @@ impl AesCipher {
         }
 
         let (nonce_bytes, ciphertext) = payload.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        // Convert nonce slice to array then to Nonce
+        let nonce_arr: [u8; 12] = match <[u8; 12]>::try_from(nonce_bytes) {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
 
-        self.cipher.decrypt(nonce, ciphertext).ok()
+        let nonce = Nonce::try_from(nonce_arr).expect("Invalid nonce length");
+
+        self.cipher.decrypt(&nonce, ciphertext).ok()
     }
 }
 
@@ -264,8 +277,8 @@ mod tests {
 
     #[test]
     fn test_ephemeral_keypair_generation() {
-        let (secret1, public1) = generate_ephemeral_keypair();
-        let (secret2, public2) = generate_ephemeral_keypair();
+        let (_secret1, public1) = generate_ephemeral_keypair();
+        let (_secret2, public2) = generate_ephemeral_keypair();
 
         // Keys should be different
         assert_ne!(public1.as_bytes(), public2.as_bytes());
@@ -278,15 +291,15 @@ mod tests {
     #[test]
     fn test_ecdh_key_agreement() {
         // Alice generates keypair
-        let (alice_secret, alice_public) = generate_ephemeral_keypair();
+    let (alice_secret, _alice_public) = generate_ephemeral_keypair();
         
-        // Bob generates keypair
-        let (bob_secret, bob_public) = generate_ephemeral_keypair();
+    // Bob generates keypair
+    let (bob_secret, _bob_public) = generate_ephemeral_keypair();
         
         // Both derive the same session key
         let info = b"test-context";
-        let alice_session_key = derive_session_key(alice_secret, &bob_public, info);
-        let bob_session_key = derive_session_key(bob_secret, &alice_public, info);
+    let alice_session_key = derive_session_key(alice_secret, &_bob_public, info);
+    let bob_session_key = derive_session_key(bob_secret, &_alice_public, info);
         
         // Keys should match
         assert_eq!(alice_session_key, bob_session_key);
@@ -295,8 +308,8 @@ mod tests {
 
     #[test]
     fn test_ecdh_different_context() {
-        let (alice_secret, alice_public) = generate_ephemeral_keypair();
-        let (bob_secret, bob_public) = generate_ephemeral_keypair();
+    let (alice_secret, _alice_public) = generate_ephemeral_keypair();
+    let (_bob_secret, bob_public) = generate_ephemeral_keypair();
         
         // Different context strings produce different keys
         let key1 = derive_session_key(alice_secret, &bob_public, b"context1");

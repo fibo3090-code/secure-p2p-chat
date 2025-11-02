@@ -17,6 +17,9 @@ pub struct SessionHandle {
 /// Main chat manager - orchestrates sessions, messages, and file transfers
 pub struct ChatManager {
     pub chats: HashMap<Uuid, Chat>,
+    pub contacts: HashMap<Uuid, Contact>,
+    /// Map contact_id -> one-to-one chat id (if any). Used to find session/chat for a contact.
+    pub contact_to_chat: HashMap<Uuid, Uuid>,
     sessions: HashMap<Uuid, SessionHandle>,
     session_events: HashMap<Uuid, mpsc::UnboundedReceiver<SessionEvent>>,
     active_transfers: HashMap<Uuid, FileTransferState>,
@@ -30,12 +33,120 @@ impl ChatManager {
     pub fn new(config: Config) -> Self {
         Self {
             chats: HashMap::new(),
+            contacts: HashMap::new(),
+            contact_to_chat: HashMap::new(),
             sessions: HashMap::new(),
             session_events: HashMap::new(),
             active_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             toasts: Vec::new(),
             config,
+        }
+    }
+
+    /// Add a contact
+    pub fn add_contact(&mut self, name: String, fingerprint: Option<String>, public_key: Option<String>) -> Uuid {
+        let id = Uuid::new_v4();
+        let contact = Contact {
+            id,
+            name,
+            fingerprint,
+            public_key,
+            created_at: chrono::Utc::now(),
+        };
+        self.contacts.insert(id, contact);
+        // no chat association by default
+        id
+    }
+
+    /// Remove a contact
+    pub fn remove_contact(&mut self, contact_id: Uuid) {
+        self.contacts.remove(&contact_id);
+        self.contact_to_chat.remove(&contact_id);
+    }
+
+    /// Get a contact
+    pub fn get_contact(&self, contact_id: Uuid) -> Option<&Contact> {
+        self.contacts.get(&contact_id)
+    }
+
+    /// Associate a contact with a one-to-one chat (useful when a session is created for that contact)
+    pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
+        self.contact_to_chat.insert(contact_id, chat_id);
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            if !chat.participants.contains(&contact_id) {
+                chat.participants.push(contact_id);
+            }
+        }
+    }
+
+    /// Create a group chat with given participants and optional title
+    pub fn create_group_chat(&mut self, participants: Vec<Uuid>, title: Option<String>) -> Uuid {
+        let chat_id = Uuid::new_v4();
+        let default_title = title.unwrap_or_else(|| {
+            if participants.len() == 0 {
+                "Group".to_string()
+            } else {
+                format!("Group ({})", participants.len())
+            }
+        });
+
+        let chat = Chat {
+            id: chat_id,
+            title: default_title,
+            peer_fingerprint: None,
+            participants,
+            messages: Vec::new(),
+            created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
+        };
+
+        self.chats.insert(chat_id, chat);
+        chat_id
+    }
+
+    /// Send a text message to all participants of a group chat (convenience broadcast).
+    /// This looks up one-to-one chats associated with each contact and sends the message
+    /// via the existing session channels. Contacts without an active session are skipped.
+    pub fn send_group_message(&mut self, group_chat_id: Uuid, text: String) -> Result<()> {
+        let chat = self.chats.get(&group_chat_id).ok_or_else(|| anyhow::anyhow!("Group chat not found"))?;
+
+        let msg = ProtocolMessage::Text {
+            text: text.clone(),
+            timestamp: crate::util::current_timestamp_millis(),
+        };
+
+        // clone participants so we don't hold an immutable borrow while mutating chats
+        let participants = chat.participants.clone();
+
+        for contact_id in participants {
+            if let Some(one_chat_id) = self.contact_to_chat.get(&contact_id) {
+                if let Some(session) = self.sessions.get(one_chat_id) {
+                    let _ = session.from_app_tx.send(msg.clone());
+                    // add to local history for group chat
+                    if let Some(gchat) = self.chats.get_mut(&group_chat_id) {
+                        gchat.messages.push(Message {
+                            id: Uuid::new_v4(),
+                            from_me: true,
+                            content: MessageContent::Text { text: text.clone() },
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rename a conversation/chat
+    pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.title = new_title;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Chat not found"))
         }
     }
 
@@ -60,6 +171,7 @@ impl ChatManager {
             id: chat_id,
             title: format!("Host on :{}", port),
             peer_fingerprint: None,
+            participants: Vec::new(),
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
             peer_typing: false,
@@ -99,6 +211,7 @@ impl ChatManager {
             id: chat_id,
             title: format!("{}:{}", host, port),
             peer_fingerprint: None,
+            participants: Vec::new(),
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
             peer_typing: false,
