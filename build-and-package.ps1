@@ -42,8 +42,31 @@ if (-not (Test-Path $BuiltBinary)) {
 }
 
 Copy-Item $BuiltBinary -Destination (Join-Path $Dist $BinaryName)
-if (Test-Path ".\README.md") { Copy-Item ".\README.md" -Destination $Dist }
-if (Test-Path ".\LICENSE") { Copy-Item ".\LICENSE" -Destination $Dist }
+
+# Ensure documentation and license end up in dist. Prefer repo root README/LICENSE.
+if (Test-Path ".\README.md") {
+    Copy-Item ".\README.md" -Destination (Join-Path $Dist "README.md") -Force
+} elseif (Test-Path (Join-Path $RepoRoot "docs\Community\README.md")) {
+    Copy-Item (Join-Path $RepoRoot "docs\Community\README.md") -Destination (Join-Path $Dist "README.md") -Force
+} else {
+    # Create a minimal README so installer build does not fail
+    $placeholder = @(
+        "Encrypted P2P Messenger",
+        "",
+        "This distribution was packaged from the project repository. See the docs/ directory in the source for details."
+    ) -join "`n"
+    $placeholderPath = Join-Path $Dist "README.md"
+    Set-Content -Path $placeholderPath -Value $placeholder -Encoding UTF8
+}
+
+if (Test-Path ".\LICENSE") {
+    Copy-Item ".\LICENSE" -Destination (Join-Path $Dist "LICENSE") -Force
+} elseif (Test-Path (Join-Path $RepoRoot "docs\Community\LICENSE")) {
+    Copy-Item (Join-Path $RepoRoot "docs\Community\LICENSE") -Destination (Join-Path $Dist "LICENSE") -Force
+} else {
+    # No license file available in repo root or docs; do nothing (installer will proceed)
+    Write-Host "NOTICE: No LICENSE file found in repo root or docs/Community. Installer will be built without a LICENSE file."
+}
 
 # 3) Copy icon into dist if present near repo root or provided path
 $IconPathCandidates = @(
