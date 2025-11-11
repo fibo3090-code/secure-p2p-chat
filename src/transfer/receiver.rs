@@ -1,9 +1,9 @@
 use anyhow::Result;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-use std::io::Write;
 
 use crate::util::sanitize_filename;
 
@@ -22,7 +22,11 @@ impl IncomingFile {
         // Sanitize filename
         let safe_filename = sanitize_filename(filename);
 
-        tracing::info!("Starting file reception: {} ({} bytes)", safe_filename, size);
+        tracing::info!(
+            "Starting file reception: {} ({} bytes)",
+            safe_filename,
+            size
+        );
 
         // Create temporary file
         tokio::fs::create_dir_all(tmp_dir).await?;
@@ -53,11 +57,7 @@ impl IncomingFile {
             );
         }
 
-        tracing::trace!(
-            "Received chunk ({}/{} bytes)",
-            self.received,
-            self.expected
-        );
+        tracing::trace!("Received chunk ({}/{} bytes)", self.received, self.expected);
 
         Ok(())
     }
@@ -161,16 +161,20 @@ impl IncomingFileSync {
         // Create temp directory if needed
         let tmp_dir = dest_path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(tmp_dir)?;
-        
+
         let safe_filename = dest_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file");
-        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), sanitize_filename(safe_filename));
+        let tmp_name = format!(
+            "tmp_{}_{}",
+            Uuid::new_v4(),
+            sanitize_filename(safe_filename)
+        );
         let tmp_path = tmp_dir.join(tmp_name);
-        
+
         let file = std::fs::File::create(&tmp_path)?;
-        
+
         Ok(Self {
             tmp_path,
             file,
@@ -178,12 +182,12 @@ impl IncomingFileSync {
             expected: expected_size,
         })
     }
-    
+
     /// Write a chunk to the file
     pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         self.file.write_all(chunk)?;
         self.received += chunk.len() as u64;
-        
+
         if self.received > self.expected {
             anyhow::bail!(
                 "Received more data than expected: {} > {}",
@@ -191,22 +195,22 @@ impl IncomingFileSync {
                 self.expected
             );
         }
-        
+
         Ok(())
     }
-    
+
     /// Get bytes received so far
     pub fn bytes_received(&self) -> u64 {
         self.received
     }
-    
+
     /// Finalize the file transfer
     pub fn finalize(mut self) -> Result<PathBuf> {
         // Flush and sync
         self.file.flush()?;
         self.file.sync_all()?;
         drop(self.file);
-        
+
         // Verify size
         if self.received != self.expected {
             anyhow::bail!(
@@ -215,12 +219,11 @@ impl IncomingFileSync {
                 self.received
             );
         }
-        
+
         // The temp path is the final location
         Ok(self.tmp_path)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

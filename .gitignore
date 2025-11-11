@@ -89,6 +89,10 @@ keystore.json
 *.db
 *.sqlite
 
+# Application runtime directories (may contain sensitive user data)
+Downloads/
+temp/
+
 # Private keys and certificates (CRITICAL - never commit these!)
 private_key.pem
 id_rsa

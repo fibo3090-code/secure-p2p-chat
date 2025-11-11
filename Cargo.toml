@@ -43,6 +43,9 @@ anyhow = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+argon2 = "0.5"
+zeroize = "1"
 
 # File dialogs
 rfd = "0.14"
@@ -56,6 +59,10 @@ notify-rust = "4"
 # Emoji support
 emojis = "0.6"
 
+# QR code generation and scanning
+qrcode = "0.14"
+image = "0.25"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
@@ -64,3 +71,7 @@ tempfile = "3"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[features]
+default = []
+embed_fonts = []

@@ -1,7 +1,9 @@
+pub mod app;
 pub mod core;
+pub mod gui;
+pub mod identity;
 pub mod network;
 pub mod transfer;
-pub mod app;
 pub mod types;
 pub mod util;
 

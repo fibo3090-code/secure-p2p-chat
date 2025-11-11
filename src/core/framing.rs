@@ -82,10 +82,10 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(10 * 1024 * 1024);
 
         let payload = vec![42u8; 1024 * 1024]; // 1 MB
-            let payload_clone = payload.clone();
-            tokio::spawn(async move {
-                send_packet(&mut client, &payload_clone).await.unwrap();
-            });
+        let payload_clone = payload.clone();
+        tokio::spawn(async move {
+            send_packet(&mut client, &payload_clone).await.unwrap();
+        });
 
         let received = recv_packet(&mut server).await.unwrap();
 

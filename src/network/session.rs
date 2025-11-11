@@ -1,14 +1,13 @@
 use anyhow::{anyhow, Result};
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::core::{
     derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, parse_x25519_public,
     pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher, ProtocolMessage,
     PROTOCOL_VERSION,
-    
 };
 use crate::types::SessionEvent;
 
@@ -21,6 +20,8 @@ pub async fn run_host_session(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
 ) -> Result<()> {
     // 1. Bind listener
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -51,17 +52,25 @@ pub async fn run_host_session(
     let client_version_bytes = recv_packet(&mut stream).await?;
     let client_version_msg = ProtocolMessage::from_plain_bytes(&client_version_bytes)
         .ok_or_else(|| anyhow!("Failed to parse client version"))?;
-    
+
     let client_version = match client_version_msg {
         ProtocolMessage::Version { version } => version,
-        _ => return Err(anyhow!("Expected Version message, got {:?}", client_version_msg)),
+        _ => {
+            return Err(anyhow!(
+                "Expected Version message, got {:?}",
+                client_version_msg
+            ))
+        }
     };
-    
+
     tracing::info!("Client protocol version: {}", client_version);
-    
+
     // Check version compatibility
     if client_version < 2 {
-        return Err(anyhow!("Client version {} not supported (need v2+)", client_version));
+        return Err(anyhow!(
+            "Client version {} not supported (need v2+)",
+            client_version
+        ));
     }
 
     // 5. Send host public key (for identity/fingerprint)
@@ -74,18 +83,42 @@ pub async fn run_host_session(
     let client_pub_pem_str = String::from_utf8(client_pub_pem)?;
     let _client_pubkey = pem_decode_public(&client_pub_pem_str)?;
     let client_fingerprint = fingerprint_pubkey(client_pub_pem_str.as_bytes());
-    tracing::debug!("Received client RSA public key, fingerprint: {}", client_fingerprint);
+    tracing::debug!(
+        "Received client RSA public key, fingerprint: {}",
+        client_fingerprint
+    );
 
     // 7. Display fingerprint and wait for user confirmation
     to_app_tx
-        .send(SessionEvent::FingerprintReceived {
+        .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: client_fingerprint.clone(),
+            peer_name: peer_addr.to_string(),
+            chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // TODO: Wait for user confirmation via channel
-    // For now, auto-accept after small delay
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait up to 30 seconds for user confirmation. If accepted -> proceed.
+    // If explicitly rejected -> abort handshake. If timeout or channel closed -> proceed (auto-accept).
+    match tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        confirm_rx.recv().await
+    })
+    .await
+    {
+        Ok(Some(true)) => {
+            tracing::info!("User accepted fingerprint for chat {}", chat_id);
+        }
+        Ok(Some(false)) => {
+            tracing::warn!("User rejected fingerprint for chat {}", chat_id);
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected by user".to_string()));
+            return Err(anyhow!("Fingerprint rejected by user"));
+        }
+        Ok(None) => {
+            tracing::info!("Confirmation channel closed for chat {}, proceeding (auto-accept)", chat_id);
+        }
+        Err(_) => {
+            tracing::info!("Confirmation timeout for chat {}, proceeding (auto-accept)", chat_id);
+        }
+    }
 
     // 8. Generate ephemeral X25519 keypair for forward secrecy
     let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
@@ -102,7 +135,7 @@ pub async fn run_host_session(
     let client_ephemeral_bytes = recv_packet(&mut stream).await?;
     let client_ephemeral_msg = ProtocolMessage::from_plain_bytes(&client_ephemeral_bytes)
         .ok_or_else(|| anyhow!("Failed to parse client ephemeral key"))?;
-    
+
     let client_ephemeral_public = match client_ephemeral_msg {
         ProtocolMessage::EphemeralKey { public_key } => parse_x25519_public(&public_key)?,
         _ => return Err(anyhow!("Expected EphemeralKey message")),
@@ -130,6 +163,8 @@ pub async fn run_client_session(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
 ) -> Result<()> {
     // 1. Connect to host
     let mut stream = TcpStream::connect((host, port)).await?;
@@ -145,17 +180,25 @@ pub async fn run_client_session(
     let host_version_bytes = recv_packet(&mut stream).await?;
     let host_version_msg = ProtocolMessage::from_plain_bytes(&host_version_bytes)
         .ok_or_else(|| anyhow!("Failed to parse host version"))?;
-    
+
     let host_version = match host_version_msg {
         ProtocolMessage::Version { version } => version,
-        _ => return Err(anyhow!("Expected Version message, got {:?}", host_version_msg)),
+        _ => {
+            return Err(anyhow!(
+                "Expected Version message, got {:?}",
+                host_version_msg
+            ))
+        }
     };
-    
+
     tracing::info!("Host protocol version: {}", host_version);
-    
+
     // Check version compatibility
     if host_version < 2 {
-        return Err(anyhow!("Host version {} not supported (need v2+)", host_version));
+        return Err(anyhow!(
+            "Host version {} not supported (need v2+)",
+            host_version
+        ));
     }
 
     // 3. Send client protocol version
@@ -170,17 +213,42 @@ pub async fn run_client_session(
     let host_pub_pem_str = String::from_utf8(host_pub_pem)?;
     let _host_pubkey = pem_decode_public(&host_pub_pem_str)?;
     let host_fingerprint = fingerprint_pubkey(host_pub_pem_str.as_bytes());
-    tracing::debug!("Received host RSA public key, fingerprint: {}", host_fingerprint);
+    tracing::debug!(
+        "Received host RSA public key, fingerprint: {}",
+        host_fingerprint
+    );
 
-    // 5. Display fingerprint
+    // 5. Display fingerprint and wait for confirmation
     to_app_tx
-        .send(SessionEvent::FingerprintReceived {
+        .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: host_fingerprint.clone(),
+            peer_name: host.to_string(),
+            chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // TODO: Wait for user confirmation
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait up to 30 seconds for user confirmation. If accepted -> proceed.
+    // If explicitly rejected -> abort handshake. If timeout or channel closed -> proceed (auto-accept).
+    match tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        confirm_rx.recv().await
+    })
+    .await
+    {
+        Ok(Some(true)) => {
+            tracing::info!("User accepted fingerprint for chat {}", chat_id);
+        }
+        Ok(Some(false)) => {
+            tracing::warn!("User rejected fingerprint for chat {}", chat_id);
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected by user".to_string()));
+            return Err(anyhow!("Fingerprint rejected by user"));
+        }
+        Ok(None) => {
+            tracing::info!("Confirmation channel closed for chat {}, proceeding (auto-accept)", chat_id);
+        }
+        Err(_) => {
+            tracing::info!("Confirmation timeout for chat {}, proceeding (auto-accept)", chat_id);
+        }
+    }
 
     // 6. Send client RSA public key
     let client_pub_pem = pem_encode_public(&RsaPublicKey::from(&privkey))?;
@@ -191,7 +259,7 @@ pub async fn run_client_session(
     let host_ephemeral_bytes = recv_packet(&mut stream).await?;
     let host_ephemeral_msg = ProtocolMessage::from_plain_bytes(&host_ephemeral_bytes)
         .ok_or_else(|| anyhow!("Failed to parse host ephemeral key"))?;
-    
+
     let host_ephemeral_public = match host_ephemeral_msg {
         ProtocolMessage::EphemeralKey { public_key } => parse_x25519_public(&public_key)?,
         _ => return Err(anyhow!("Expected EphemeralKey message")),
@@ -296,7 +364,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{generate_rsa_keypair, rsa_encrypt_oaep, rsa_decrypt_oaep};
+    use crate::core::{generate_rsa_keypair, rsa_decrypt_oaep, rsa_encrypt_oaep};
     use crate::RSA_KEY_BITS;
     use rand::RngCore;
 

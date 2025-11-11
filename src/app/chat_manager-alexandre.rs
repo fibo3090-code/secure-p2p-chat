@@ -17,181 +17,25 @@ pub struct SessionHandle {
 /// Main chat manager - orchestrates sessions, messages, and file transfers
 pub struct ChatManager {
     pub chats: HashMap<Uuid, Chat>,
-    pub contacts: HashMap<Uuid, Contact>,
-    /// Map contact_id -> one-to-one chat id (if any). Used to find session/chat for a contact.
-    pub contact_to_chat: HashMap<Uuid, Uuid>,
     sessions: HashMap<Uuid, SessionHandle>,
     session_events: HashMap<Uuid, mpsc::UnboundedReceiver<SessionEvent>>,
-    /// Channels used to confirm fingerprint verification with the running session task
-    fingerprint_confirm_senders: HashMap<Uuid, mpsc::UnboundedSender<bool>>,
     active_transfers: HashMap<Uuid, FileTransferState>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
     pub toasts: Vec<Toast>,
     pub config: Config,
-    pub fingerprint_verification_request: Option<(String, String, Uuid)>,
 }
 
 impl ChatManager {
     pub fn new(config: Config) -> Self {
         Self {
             chats: HashMap::new(),
-            contacts: HashMap::new(),
-            contact_to_chat: HashMap::new(),
             sessions: HashMap::new(),
             session_events: HashMap::new(),
             active_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             toasts: Vec::new(),
             config,
-            fingerprint_verification_request: None,
-            fingerprint_confirm_senders: HashMap::new(),
-        }
-    }
-
-    /// Add a contact
-    pub fn add_contact(
-        &mut self,
-        name: String,
-        fingerprint: Option<String>,
-        public_key: Option<String>,
-    ) -> Uuid {
-        let id = Uuid::new_v4();
-        let contact = Contact {
-            id,
-            name,
-            fingerprint,
-            public_key,
-            created_at: chrono::Utc::now(),
-        };
-        self.contacts.insert(id, contact);
-        // no chat association by default
-        id
-    }
-
-    /// Remove a contact
-    pub fn remove_contact(&mut self, contact_id: Uuid) {
-        self.contacts.remove(&contact_id);
-        self.contact_to_chat.remove(&contact_id);
-    }
-
-    /// Get a contact
-    pub fn get_contact(&self, contact_id: Uuid) -> Option<&Contact> {
-        self.contacts.get(&contact_id)
-    }
-
-    /// Associate a contact with a one-to-one chat (useful when a session is created for that contact)
-    pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
-        self.contact_to_chat.insert(contact_id, chat_id);
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            if !chat.participants.contains(&contact_id) {
-                chat.participants.push(contact_id);
-            }
-        }
-    }
-
-    /// Create a group chat with given participants and optional title
-    pub fn create_group_chat(&mut self, participants: Vec<Uuid>, title: Option<String>) -> Uuid {
-        let chat_id = Uuid::new_v4();
-        let default_title = title.unwrap_or_else(|| {
-            if participants.is_empty() {
-                "Group".to_string()
-            } else {
-                format!("Group ({})", participants.len())
-            }
-        });
-
-        let chat = Chat {
-            id: chat_id,
-            title: default_title,
-            peer_fingerprint: None,
-            participants,
-            messages: Vec::new(),
-            created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
-        };
-
-        self.chats.insert(chat_id, chat);
-        chat_id
-    }
-
-    /// Send a text message to all participants of a group chat (convenience broadcast).
-    /// This looks up one-to-one chats associated with each contact and sends the message
-    /// via the existing session channels. Contacts without an active session are skipped.
-    ///
-    /// Returns the number of participants the message was successfully sent to.
-    pub fn send_group_message(&mut self, group_chat_id: Uuid, text: String) -> Result<usize> {
-        let chat = self
-            .chats
-            .get(&group_chat_id)
-            .ok_or_else(|| anyhow::anyhow!("Group chat not found"))?;
-
-        let msg = ProtocolMessage::Text {
-            text: text.clone(),
-            timestamp: crate::util::current_timestamp_millis(),
-        };
-
-        // Clone participants so we don't hold an immutable borrow while mutating chats
-        let participants = chat.participants.clone();
-
-        // Add message to group chat history ONCE (not per recipient)
-        if let Some(gchat) = self.chats.get_mut(&group_chat_id) {
-            gchat.messages.push(Message {
-                id: Uuid::new_v4(),
-                from_me: true,
-                content: MessageContent::Text { text: text.clone() },
-                timestamp: chrono::Utc::now(),
-            });
-        }
-
-        // Try to send to all participants with active sessions
-        let mut sent_count = 0;
-        let mut offline_contacts = Vec::new();
-
-        for contact_id in participants {
-            if let Some(contact) = self.contacts.get(&contact_id) {
-                if let Some(one_chat_id) = self.contact_to_chat.get(&contact_id) {
-                    if let Some(session) = self.sessions.get(one_chat_id) {
-                        if session.from_app_tx.send(msg.clone()).is_ok() {
-                            sent_count += 1;
-                        }
-                    } else {
-                        offline_contacts.push(contact.name.clone());
-                    }
-                } else {
-                    offline_contacts.push(contact.name.clone());
-                }
-            }
-        }
-
-        // Show toast notification about offline participants
-        if !offline_contacts.is_empty() {
-            let offline_str = offline_contacts.join(", ");
-            let message = if sent_count == 0 {
-                format!(
-                    "⚠ Message sent locally but all recipients are offline: {}",
-                    offline_str
-                )
-            } else {
-                format!(
-                    "⚠ Sent to {} recipient(s), but offline: {}",
-                    sent_count, offline_str
-                )
-            };
-            self.add_toast(ToastLevel::Warning, message);
-        }
-
-        Ok(sent_count)
-    }
-
-    /// Rename a conversation/chat
-    pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.title = new_title;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Chat not found"))
         }
     }
 
@@ -204,12 +48,9 @@ impl ChatManager {
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
 
-        // Create confirmation channel so UI can accept/reject the fingerprint
-        let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
-
         // Spawn session task
         tokio::spawn(async move {
-            if let Err(e) = run_host_session(port, privkey, to_app_tx, from_app_rx, confirm_rx, chat_id).await {
+            if let Err(e) = run_host_session(port, privkey, to_app_tx, from_app_rx).await {
                 tracing::error!("Host session error: {}", e);
             }
         });
@@ -219,19 +60,19 @@ impl ChatManager {
             id: chat_id,
             title: format!("Host on :{}", port),
             peer_fingerprint: None,
-            participants: Vec::new(),
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
+            is_connected: false,
         };
 
         self.chats.insert(chat_id, chat);
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
         self.session_events.insert(chat_id, to_app_rx);
-    self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
-        self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Listening on port {}", port),
+        );
 
         Ok(chat_id)
     }
@@ -245,12 +86,9 @@ impl ChatManager {
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
 
         let host_copy = host.to_string();
-        // confirmation channel for fingerprint verification acceptance
-        let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
-
         tokio::spawn(async move {
             if let Err(e) =
-                run_client_session(&host_copy, port, privkey, to_app_tx, from_app_rx, confirm_rx, chat_id).await
+                run_client_session(&host_copy, port, privkey, to_app_tx, from_app_rx).await
             {
                 tracing::error!("Client session error: {}", e);
             }
@@ -260,42 +98,29 @@ impl ChatManager {
             id: chat_id,
             title: format!("{}:{}", host, port),
             peer_fingerprint: None,
-            participants: Vec::new(),
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
+            is_connected: false,
         };
 
         self.chats.insert(chat_id, chat);
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
         self.session_events.insert(chat_id, to_app_rx);
-    self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
-        self.add_toast(ToastLevel::Info, format!("Connecting to {}:{}", host, port));
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Connecting to {}:{}", host, port),
+        );
 
         Ok(chat_id)
     }
 
-    /// Send a text message (handles both 1-on-1 chats and group chats)
+    /// Send a text message
     pub fn send_message(&mut self, chat_id: Uuid, text: String) -> Result<()> {
-        // Check if this is a group chat (has multiple participants but no direct session)
-        let is_group_chat = if let Some(chat) = self.chats.get(&chat_id) {
-            !chat.participants.is_empty() && !self.sessions.contains_key(&chat_id)
-        } else {
-            false
-        };
-
-        if is_group_chat {
-            // Send as group message (broadcasts to all participants)
-            self.send_group_message(chat_id, text)?;
-            return Ok(());
-        }
-
-        // Regular 1-on-1 message
-        let session = self.sessions.get(&chat_id).ok_or_else(|| {
-            anyhow::anyhow!("Not connected. Start a connection first or create a group chat.")
-        })?;
+        let session = self
+            .sessions
+            .get(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
         let msg = ProtocolMessage::Text {
             text: text.clone(),
@@ -336,7 +161,10 @@ impl ChatManager {
 
         self.active_transfers.insert(transfer_id, state);
 
-        self.add_toast(ToastLevel::Info, format!("Receiving file: {}", filename));
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Receiving file: {}", filename),
+        );
 
         Ok(transfer_id)
     }
@@ -356,7 +184,10 @@ impl ChatManager {
         };
 
         if let Some(filename) = should_notify {
-            self.add_toast(ToastLevel::Success, format!("File received: {}", filename));
+            self.add_toast(
+                ToastLevel::Success,
+                format!("File received: {}", filename),
+            );
         }
     }
 
@@ -374,67 +205,9 @@ impl ChatManager {
     /// Remove expired toasts
     pub fn cleanup_expired_toasts(&mut self) {
         let now = std::time::Instant::now();
-        self.toasts
-            .retain(|toast| now.duration_since(toast.created_at) < toast.duration);
-    }
-
-    /// Send typing start indicator
-    pub fn send_typing_start(&self, chat_id: Uuid) -> Result<()> {
-        if !self.config.enable_typing_indicators {
-            return Ok(());
-        }
-
-        let session = self
-            .sessions
-            .get(&chat_id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-
-        session.from_app_tx.send(ProtocolMessage::TypingStart)?;
-        Ok(())
-    }
-
-    /// Send typing stop indicator
-    pub fn send_typing_stop(&self, chat_id: Uuid) -> Result<()> {
-        if !self.config.enable_typing_indicators {
-            return Ok(());
-        }
-
-        let session = self
-            .sessions
-            .get(&chat_id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-
-        session.from_app_tx.send(ProtocolMessage::TypingStop)?;
-        Ok(())
-    }
-
-    /// Show desktop notification
-    pub fn show_notification(&self, title: &str, body: &str) {
-        if !self.config.enable_notifications {
-            return;
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            use notify_rust::Notification;
-            let _ = Notification::new()
-                .summary(title)
-                .body(body)
-                .icon("mail-message-new")
-                .timeout(5000)
-                .show();
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use notify_rust::{Notification, Timeout};
-            let _ = Notification::new()
-                .summary(title)
-                .body(body)
-                .icon("mail-message-new")
-                .timeout(Timeout::Milliseconds(5000))
-                .show();
-        }
+        self.toasts.retain(|toast| {
+            now.duration_since(toast.created_at) < toast.duration
+        });
     }
 
     /// Get a chat by ID
@@ -457,18 +230,7 @@ impl ChatManager {
         self.chats.remove(&chat_id);
         self.sessions.remove(&chat_id);
         self.session_events.remove(&chat_id);
-        self.fingerprint_confirm_senders.remove(&chat_id);
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
-    }
-
-    /// Send the user's accept/reject decision for a fingerprint verification to the session task
-    pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
-        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
-            tx.send(accept).map_err(|e| anyhow::anyhow!("Failed to send confirmation: {}", e))?;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("No confirmation channel for chat {}", chat_id))
-        }
     }
 
     /// Send a file to a chat
@@ -486,7 +248,7 @@ impl ChatManager {
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?
             .to_string();
-
+        
         let file_size = tokio::fs::metadata(&path).await?.len();
 
         // Send file metadata
@@ -532,7 +294,10 @@ impl ChatManager {
             });
         }
 
-        self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
+        self.add_toast(
+            ToastLevel::Success,
+            format!("File sent: {}", filename),
+        );
 
         Ok(())
     }
@@ -576,16 +341,24 @@ impl ChatManager {
                 }
             }
 
-            SessionEvent::ShowFingerprintVerification {
-                fingerprint,
-                peer_name,
-                chat_id,
-            } => {
-                self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
+            SessionEvent::FingerprintReceived { fingerprint } => {
+                tracing::info!("Session {} received fingerprint: {}", chat_id, &fingerprint[..16]);
+
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.peer_fingerprint = Some(fingerprint.clone());
+                }
+
+                self.add_toast(
+                    ToastLevel::Warning,
+                    format!("Verify fingerprint: {}...", &fingerprint[..16])
+                );
             }
 
             SessionEvent::Ready => {
                 tracing::info!("Session {} is ready", chat_id);
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.is_connected = true;
+                }
                 self.add_toast(ToastLevel::Success, "Connection established!".to_string());
             }
 
@@ -602,18 +375,6 @@ impl ChatManager {
                                 timestamp: chrono::Utc::now(),
                             });
 
-                            // Clear typing indicator
-                            chat.peer_typing = false;
-                            chat.typing_since = None;
-
-                            // Show desktop notification
-                            let preview = if text.len() > 50 {
-                                format!("{}...", &text[..50])
-                            } else {
-                                text.clone()
-                            };
-                            self.show_notification("New message", &preview);
-
                             tracing::info!("Added received message to chat {}", chat_id);
                         } else {
                             tracing::error!("Chat {} not found for received message", chat_id);
@@ -627,7 +388,7 @@ impl ChatManager {
                             Ok(transfer_id) => {
                                 // Create new IncomingFileSync for this transfer
                                 let file_path = self.config.download_dir.join(&filename);
-
+                                
                                 match IncomingFileSync::new(&file_path, size) {
                                     Ok(incoming) => {
                                         self.incoming_files.insert(transfer_id, incoming);
@@ -636,7 +397,7 @@ impl ChatManager {
                                         tracing::error!("Failed to create incoming file: {}", e);
                                         self.add_toast(
                                             ToastLevel::Error,
-                                            format!("Failed to receive file: {}", e),
+                                            format!("Failed to receive file: {}", e)
                                         );
                                     }
                                 }
@@ -645,7 +406,7 @@ impl ChatManager {
                                 tracing::error!("Failed to start receiving file: {}", e);
                                 self.add_toast(
                                     ToastLevel::Error,
-                                    format!("Failed to receive file: {}", e),
+                                    format!("Failed to receive file: {}", e)
                                 );
                             }
                         }
@@ -653,20 +414,26 @@ impl ChatManager {
 
                     ProtocolMessage::FileChunk { chunk, seq } => {
                         tracing::debug!("Received file chunk {} ({} bytes)", seq, chunk.len());
-
+                        
                         // Find the active transfer for this chat
-                        let transfer_ids: Vec<Uuid> =
-                            self.active_transfers.keys().copied().collect();
+                        let transfer_ids: Vec<Uuid> = self.active_transfers.keys().copied().collect();
                         for transfer_id in transfer_ids {
-                            if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
-                                if let Err(e) = incoming.write_chunk(&chunk) {
+                            let result = if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
+                                let write_result = incoming.write_chunk(&chunk);
+                                let bytes_received = incoming.bytes_received();
+                                Some((write_result, bytes_received))
+                            } else {
+                                None
+                            };
+                            
+                            if let Some((write_result, bytes_received)) = result {
+                                if let Err(e) = write_result {
                                     tracing::error!("Failed to write chunk: {}", e);
                                     self.add_toast(
                                         ToastLevel::Error,
-                                        format!("File transfer error: {}", e),
+                                        format!("File transfer error: {}", e)
                                     );
                                 } else {
-                                    let bytes_received = incoming.bytes_received();
                                     self.update_transfer_progress(transfer_id, bytes_received);
                                 }
                                 break;
@@ -676,7 +443,7 @@ impl ChatManager {
 
                     ProtocolMessage::FileEnd => {
                         tracing::info!("File transfer completed");
-
+                        
                         // Finalize all active transfers
                         let transfer_ids: Vec<Uuid> = self.incoming_files.keys().copied().collect();
                         for transfer_id in transfer_ids {
@@ -684,9 +451,7 @@ impl ChatManager {
                                 let bytes_received = incoming.bytes_received();
                                 match incoming.finalize() {
                                     Ok(final_path) => {
-                                        if let Some(transfer) =
-                                            self.active_transfers.get(&transfer_id)
-                                        {
+                                        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
                                             // Add to chat history
                                             if let Some(chat) = self.chats.get_mut(&chat_id) {
                                                 chat.messages.push(Message {
@@ -707,7 +472,7 @@ impl ChatManager {
                                         tracing::error!("Failed to finalize file: {}", e);
                                         self.add_toast(
                                             ToastLevel::Error,
-                                            format!("File transfer error: {}", e),
+                                            format!("File transfer error: {}", e)
                                         );
                                     }
                                 }
@@ -719,32 +484,18 @@ impl ChatManager {
                         tracing::trace!("Received ping");
                     }
 
-                    ProtocolMessage::TypingStart => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
-                            chat.peer_typing = true;
-                            chat.typing_since = Some(std::time::Instant::now());
-                        }
-                    }
-
-                    ProtocolMessage::TypingStop => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
-                            chat.peer_typing = false;
-                            chat.typing_since = None;
-                        }
-                    }
-
                     ProtocolMessage::Version { .. } | ProtocolMessage::EphemeralKey { .. } => {
                         // These are handshake messages, should not appear in message loop
-                        tracing::warn!(
-                            "Received handshake message in message loop: {:?}",
-                            proto_msg
-                        );
+                        tracing::warn!("Received handshake message in message loop: {:?}", proto_msg);
                     }
                 }
             }
 
             SessionEvent::Disconnected => {
                 tracing::warn!("Session {} disconnected", chat_id);
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.is_connected = false;
+                }
                 self.add_toast(ToastLevel::Warning, "Connection lost".to_string());
 
                 // Clean up session
@@ -757,94 +508,6 @@ impl ChatManager {
                 self.add_toast(ToastLevel::Error, format!("Connection error: {}", err));
             }
         }
-    }
-
-    /// Generate an invite link for sharing contact information
-    /// Format: chat-p2p://invite/<base64_json>
-    pub fn generate_invite_link(
-        &self,
-        name: &str,
-        fingerprint: &str,
-        public_key_pem: &str,
-    ) -> Result<String> {
-        use base64::Engine;
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize)]
-        struct InvitePayload {
-            name: String,
-            fingerprint: String,
-            public_key: String,
-        }
-
-        let payload = InvitePayload {
-            name: name.to_string(),
-            fingerprint: fingerprint.to_string(),
-            public_key: public_key_pem.to_string(),
-        };
-
-        let json = serde_json::to_string(&payload)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
-        Ok(format!("chat-p2p://invite/{}", encoded))
-    }
-
-    /// Parse an invite link and create a Contact
-    pub fn parse_invite_link(&self, link: &str) -> Result<Contact> {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize)]
-        struct InvitePayload {
-            name: String,
-            fingerprint: String,
-            public_key: String,
-        }
-
-        // Remove prefix if present
-        let encoded = link.strip_prefix("chat-p2p://invite/").unwrap_or(link);
-
-        // Decode base64
-        use base64::Engine;
-        let json = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| anyhow::anyhow!("Invalid invite link: {}", e))?;
-        let json_str = String::from_utf8(json)
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in invite link: {}", e))?;
-
-        // Parse JSON
-        let payload: InvitePayload = serde_json::from_str(&json_str)
-            .map_err(|e| anyhow::anyhow!("Invalid invite data: {}", e))?;
-
-        // Create contact
-        let contact = Contact {
-            id: Uuid::new_v4(),
-            name: payload.name,
-            fingerprint: Some(payload.fingerprint),
-            public_key: Some(payload.public_key),
-            created_at: chrono::Utc::now(),
-        };
-
-        Ok(contact)
-    }
-
-    /// Generate a QR code for an invite link (as PNG bytes)
-    pub fn generate_invite_qr(&self, invite_link: &str) -> Result<Vec<u8>> {
-        use qrcode::QrCode;
-
-        let code = QrCode::new(invite_link.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to generate QR code: {}", e))?;
-
-        let qr_image = code
-            .render::<image::Luma<u8>>()
-            .min_dimensions(200, 200)
-            .build();
-
-        let mut bytes = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut bytes);
-        image::DynamicImage::ImageLuma8(qr_image)
-            .write_to(&mut cursor, image::ImageFormat::Png)
-            .map_err(|e| anyhow::anyhow!("Failed to encode QR code: {}", e))?;
-
-        Ok(bytes)
     }
 }
 

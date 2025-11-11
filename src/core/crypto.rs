@@ -91,12 +91,12 @@ pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
 }
 
 /// Perform ECDH key agreement and derive AES key using HKDF-SHA256
-/// 
+///
 /// # Arguments
 /// * `our_secret` - Our ephemeral private key
 /// * `their_public` - Their ephemeral public key
 /// * `info` - Context string for HKDF (e.g., "p2p-messenger-v2")
-/// 
+///
 /// # Returns
 /// 32-byte AES-256 key derived from shared secret
 pub fn derive_session_key(
@@ -106,24 +106,27 @@ pub fn derive_session_key(
 ) -> [u8; AES_KEY_SIZE] {
     // Perform ECDH to get shared secret
     let shared_secret = our_secret.diffie_hellman(their_public);
-    
+
     // Use HKDF-SHA256 to derive session key
     // Salt is None (uses zeros), which is acceptable for ephemeral keys
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-    
+
     let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
-    
+
     session_key
 }
 
 /// Parse X25519 public key from 32 bytes
 pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
     if bytes.len() != 32 {
-        return Err(anyhow!("X25519 public key must be 32 bytes, got {}", bytes.len()));
+        return Err(anyhow!(
+            "X25519 public key must be 32 bytes, got {}",
+            bytes.len()
+        ));
     }
-    
+
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(bytes);
     Ok(X25519PublicKey::from(key_bytes))
@@ -139,7 +142,7 @@ impl AesCipher {
     /// Create new cipher from 32-byte key
     pub fn new(key: &[u8]) -> Self {
         assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
-    // Use TryFrom to construct key from slice (avoids deprecated GenericArray::from_slice)
+        // Use TryFrom to construct key from slice (avoids deprecated GenericArray::from_slice)
         let key = Key::<Aes256Gcm>::try_from(key).expect("Invalid AES key length");
         Self {
             // Aes256Gcm::new accepts a reference to the key array
@@ -152,7 +155,7 @@ impl AesCipher {
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         // Nonce::try_from accepts an array by value
-        let nonce = Nonce::try_from(nonce_bytes).expect("Invalid nonce length");
+        let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = self
             .cipher
@@ -179,7 +182,7 @@ impl AesCipher {
             Err(_) => return None,
         };
 
-        let nonce = Nonce::try_from(nonce_arr).expect("Invalid nonce length");
+        let nonce = Nonce::from(nonce_arr);
 
         self.cipher.decrypt(&nonce, ciphertext).ok()
     }
@@ -282,7 +285,7 @@ mod tests {
 
         // Keys should be different
         assert_ne!(public1.as_bytes(), public2.as_bytes());
-        
+
         // Public keys should be 32 bytes
         assert_eq!(public1.as_bytes().len(), 32);
         assert_eq!(public2.as_bytes().len(), 32);
@@ -291,16 +294,16 @@ mod tests {
     #[test]
     fn test_ecdh_key_agreement() {
         // Alice generates keypair
-    let (alice_secret, _alice_public) = generate_ephemeral_keypair();
-        
-    // Bob generates keypair
-    let (bob_secret, _bob_public) = generate_ephemeral_keypair();
-        
+        let (alice_secret, _alice_public) = generate_ephemeral_keypair();
+
+        // Bob generates keypair
+        let (bob_secret, _bob_public) = generate_ephemeral_keypair();
+
         // Both derive the same session key
         let info = b"test-context";
-    let alice_session_key = derive_session_key(alice_secret, &_bob_public, info);
-    let bob_session_key = derive_session_key(bob_secret, &_alice_public, info);
-        
+        let alice_session_key = derive_session_key(alice_secret, &_bob_public, info);
+        let bob_session_key = derive_session_key(bob_secret, &_alice_public, info);
+
         // Keys should match
         assert_eq!(alice_session_key, bob_session_key);
         assert_eq!(alice_session_key.len(), AES_KEY_SIZE);
@@ -308,15 +311,15 @@ mod tests {
 
     #[test]
     fn test_ecdh_different_context() {
-    let (alice_secret, _alice_public) = generate_ephemeral_keypair();
-    let (_bob_secret, bob_public) = generate_ephemeral_keypair();
-        
+        let (alice_secret, _alice_public) = generate_ephemeral_keypair();
+        let (_bob_secret, bob_public) = generate_ephemeral_keypair();
+
         // Different context strings produce different keys
         let key1 = derive_session_key(alice_secret, &bob_public, b"context1");
-        
+
         let (alice_secret2, _) = generate_ephemeral_keypair();
         let key2 = derive_session_key(alice_secret2, &bob_public, b"context2");
-        
+
         // Keys should be different (different secrets)
         assert_ne!(key1, key2);
     }
@@ -325,7 +328,7 @@ mod tests {
     fn test_x25519_public_key_parsing() {
         let (_, public) = generate_ephemeral_keypair();
         let bytes = public.as_bytes();
-        
+
         let parsed = parse_x25519_public(bytes).unwrap();
         assert_eq!(parsed.as_bytes(), bytes);
     }
@@ -339,35 +342,35 @@ mod tests {
     #[test]
     fn test_forward_secrecy_full_flow() {
         // Simulate full handshake with forward secrecy
-        
+
         // 1. Both parties generate ephemeral keys
         let (alice_ephemeral_secret, alice_ephemeral_public) = generate_ephemeral_keypair();
         let (bob_ephemeral_secret, bob_ephemeral_public) = generate_ephemeral_keypair();
-        
+
         // 2. Exchange public keys (simulated)
         let alice_public_bytes = alice_ephemeral_public.as_bytes();
         let bob_public_bytes = bob_ephemeral_public.as_bytes();
-        
+
         // 3. Parse received public keys
         let bob_public_parsed = parse_x25519_public(bob_public_bytes).unwrap();
         let alice_public_parsed = parse_x25519_public(alice_public_bytes).unwrap();
-        
+
         // 4. Derive session keys
         let info = b"p2p-messenger-v2";
         let alice_key = derive_session_key(alice_ephemeral_secret, &bob_public_parsed, info);
         let bob_key = derive_session_key(bob_ephemeral_secret, &alice_public_parsed, info);
-        
+
         // 5. Keys should match
         assert_eq!(alice_key, bob_key);
-        
+
         // 6. Use keys for encryption
         let alice_cipher = AesCipher::new(&alice_key);
         let bob_cipher = AesCipher::new(&bob_key);
-        
+
         let plaintext = b"Forward secrecy test message";
         let encrypted = alice_cipher.encrypt(plaintext);
         let decrypted = bob_cipher.decrypt(&encrypted).unwrap();
-        
+
         assert_eq!(plaintext, &decrypted[..]);
     }
 }

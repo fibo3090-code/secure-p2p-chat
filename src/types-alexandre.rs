@@ -4,19 +4,15 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 /// A chat session with a peer
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chat {
     pub id: Uuid,
     pub title: String,
     pub peer_fingerprint: Option<String>,
-    /// Participants (references to Contact IDs). Empty for one-to-one until contact added.
-    pub participants: Vec<Uuid>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
-    #[serde(skip)]
-    pub peer_typing: bool,
-    #[serde(skip)]
-    pub typing_since: Option<std::time::Instant>,
+    #[serde(default)]
+    pub is_connected: bool,
 }
 
 /// A single message in a chat
@@ -26,16 +22,6 @@ pub struct Message {
     pub from_me: bool,
     pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
-}
-
-/// A contact (a known peer)
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Contact {
-    pub id: Uuid,
-    pub name: String,
-    pub fingerprint: Option<String>,
-    pub public_key: Option<String>,
-    pub created_at: DateTime<Utc>,
 }
 
 /// Message content types
@@ -115,11 +101,7 @@ pub enum SessionStatus {
 pub enum SessionEvent {
     Listening { port: u16 },
     Connected { peer: String },
-    ShowFingerprintVerification {
-        fingerprint: String,
-        peer_name: String,
-        chat_id: Uuid,
-    },
+    FingerprintReceived { fingerprint: String },
     Ready,
     MessageReceived(crate::core::ProtocolMessage),
     Disconnected,
@@ -133,8 +115,6 @@ pub struct Config {
     pub temp_dir: PathBuf,
     pub auto_accept_files: bool,
     pub max_file_size: u64,
-    pub enable_notifications: bool,
-    pub enable_typing_indicators: bool,
 }
 
 impl Default for Config {
@@ -144,8 +124,6 @@ impl Default for Config {
             temp_dir: PathBuf::from("temp"),
             auto_accept_files: false,
             max_file_size: 1024 * 1024 * 1024, // 1 GB
-            enable_notifications: true,
-            enable_typing_indicators: true,
         }
     }
 }

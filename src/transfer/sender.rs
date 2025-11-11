@@ -61,12 +61,7 @@ where
         seq += 1;
         progress_callback(bytes_sent, total_size);
 
-        tracing::trace!(
-            "Sent chunk {} ({}/{} bytes)",
-            seq,
-            bytes_sent,
-            total_size
-        );
+        tracing::trace!("Sent chunk {} ({}/{} bytes)", seq, bytes_sent, total_size);
     }
 
     // 4. Send FileEnd
@@ -77,11 +72,7 @@ where
 }
 
 /// Helper to send encrypted protocol message
-async fn send_message<S>(
-    stream: &mut S,
-    cipher: &AesCipher,
-    msg: &ProtocolMessage,
-) -> Result<()>
+async fn send_message<S>(stream: &mut S, cipher: &AesCipher, msg: &ProtocolMessage) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {

@@ -1,7 +1,7 @@
 use crate::gui::app_ui::App;
+use crate::types::{Message, MessageContent};
 use eframe::egui;
 use uuid::Uuid;
-use crate::types::{Message, MessageContent};
 
 pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
     // Handle dropped files
@@ -29,10 +29,8 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                             egui::Color32::GRAY
                         };
 
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(40.0, 40.0),
-                            egui::Sense::hover(),
-                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
                         ui.painter().circle_filled(rect.center(), 20.0, color);
 
                         let initials = crate::gui::widgets::get_initials(&chat.title);
@@ -49,10 +47,13 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                         // Title and status
                         ui.vertical(|ui| {
                             ui.heading(&chat.title);
-
                             // Show typing indicator or connection status
                             if chat.peer_typing {
-ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::styling::SUBTLE_TEXT_COLOR));
+                                ui.label(
+                                    egui::RichText::new("✍️ typing...")
+                                        .size(12.0)
+                                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                );
                             } else {
                                 ui.label(
                                     egui::RichText::new("🟢 Connected")
@@ -64,11 +65,6 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
 
                         // Fingerprint on right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✏️").on_hover_text("Rename conversation").clicked() {
-                                app.rename_chat_id = Some(chat_id);
-                                app.rename_input = chat.title.clone();
-                                app.show_rename_dialog = true;
-                            }
                             if let Some(fp) = &chat.peer_fingerprint {
                                 if ui.button("📋 Copy Fingerprint").clicked() {
                                     ui.output_mut(|o| o.copied_text = fp.clone());
@@ -90,11 +86,7 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
             // File preview if selected
             if app.file_to_send.is_some() {
                 let file_path = app.file_to_send.clone().unwrap();
-                let filename = file_path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
+                let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
 
                 ui.horizontal(|ui| {
                     ui.label("📎 File to send:");
@@ -113,7 +105,10 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
                             tokio::spawn(async move {
                                 let mut mgr = manager.lock().await;
                                 if let Err(e) = mgr.send_file(chat_id, path).await {
-                                    mgr.add_toast(crate::types::ToastLevel::Error, format!("Failed to send file: {}", e));
+                                    mgr.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Failed to send file: {}", e),
+                                    );
                                 }
                             });
                         }
@@ -157,9 +152,10 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
                 // Handle typing indicators
                 if response.changed() && !app.input_text.is_empty() {
                     let now = std::time::Instant::now();
-                    let should_send_typing = app.last_typing_time
-                        .map_or(true, |last| now.duration_since(last).as_secs() >= 2);
-                    
+                    let should_send_typing = app
+                        .last_typing_time
+                        .is_none_or(|last| now.duration_since(last).as_secs() >= 2);
+
                     if should_send_typing {
                         let manager = app.chat_manager.clone();
                         tokio::spawn(async move {
@@ -197,10 +193,9 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
 
                 // Send button
                 let send_enabled = !app.input_text.trim().is_empty();
-                let mut send_button = egui::Button::new(
-                    egui::RichText::new("📤\nSend").size(14.0).strong()
-                )
-                .min_size(egui::vec2(65.0, 70.0));
+                let mut send_button =
+                    egui::Button::new(egui::RichText::new("📤\nSend").size(14.0).strong())
+                        .min_size(egui::vec2(65.0, 70.0));
 
                 if send_enabled {
                     send_button = send_button.fill(crate::gui::styling::ACCENT_PRIMARY);
@@ -221,12 +216,11 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
             .show(ui.ctx(), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let common_emojis = [
-                        "😊", "😂", "❤️", "👍", "👎", "🎉", "🔥", "💯",
-                        "😍", "😎", "😢", "😭", "😡", "🤔", "👋", "🙏",
-                        "✨", "⭐", "💪", "👏", "🎊", "🎈", "🚀", "💡",
+                        "😊", "😂", "❤️", "👍", "👎", "🎉", "🔥", "💯", "😍", "😎", "😢", "😭",
+                        "😡", "🤔", "👋", "🙏", "✨", "⭐", "💪", "👏", "🎊", "🎈", "🚀", "💡",
                         "📱", "💻", "📷", "🎵", "🎮", "⚽", "🍕", "🍰",
                     ];
-                    
+
                     for emoji in &common_emojis {
                         if ui.button(egui::RichText::new(*emoji).size(24.0)).clicked() {
                             app.input_text.push_str(emoji);
@@ -234,7 +228,7 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
                         }
                     }
                 });
-                
+
                 ui.separator();
                 if ui.button("Close").clicked() {
                     app.show_emoji_picker = false;
@@ -244,28 +238,39 @@ ui.label(egui::RichText::new("✍️ typing...").size(12.0).color(crate::gui::st
 
     // Messages area - fills remaining space
     egui::CentralPanel::default().show_inside(ui, |ui| {
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
-            if let Ok(manager) = app.chat_manager.try_lock() {
-                if let Some(chat) = manager.get_chat(chat_id) {
-                    if chat.messages.is_empty() {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(100.0);
-ui.label(egui::RichText::new("🔒 End-to-end encrypted conversation").size(16.0).color(crate::gui::styling::SUBTLE_TEXT_COLOR));
-                            ui.label(egui::RichText::new("Send your first message below!").size(14.0).color(crate::gui::styling::SUBTLE_TEXT_COLOR));
-                        });
-                    } else {
-                        for message in &chat.messages {
-                            render_message(app, ui, message);
-                            ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if let Ok(manager) = app.chat_manager.try_lock() {
+                    if let Some(chat) = manager.get_chat(chat_id) {
+                        if chat.messages.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(100.0);
+                                ui.label(
+                                    egui::RichText::new("🔒 End-to-end encrypted conversation")
+                                        .size(16.0)
+                                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Send your first message below!")
+                                        .size(14.0)
+                                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                );
+                            });
+                        } else {
+                            for message in &chat.messages {
+                                render_message(app, ui, message);
+                                ui.add_space(8.0);
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
     });
 }
 
-fn render_message(app: &App, ui: &mut egui::Ui, message: &Message) {
+fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
     let align = if message.from_me {
         egui::Layout::right_to_left(egui::Align::TOP)
     } else {
@@ -292,7 +297,11 @@ fn render_message(app: &App, ui: &mut egui::Ui, message: &Message) {
             match &message.content {
                 MessageContent::Text { text } => {
                     // Text message with white color
-                    ui.label(egui::RichText::new(text).color(crate::gui::styling::TEXT_PRIMARY).size(14.0));
+                    ui.label(
+                        egui::RichText::new(text)
+                            .color(crate::gui::styling::TEXT_PRIMARY)
+                            .size(14.0),
+                    );
 
                     // Small copy button
                     ui.add_space(2.0);
@@ -300,7 +309,7 @@ fn render_message(app: &App, ui: &mut egui::Ui, message: &Message) {
                         .small_button(
                             egui::RichText::new("📋 Copy")
                                 .size(10.0)
-                                .color(crate::gui::styling::TEXT_NORMAL),
+                                .color(crate::gui::styling::TEXT_PRIMARY),
                         )
                         .clicked()
                     {
@@ -319,8 +328,15 @@ fn render_message(app: &App, ui: &mut egui::Ui, message: &Message) {
                                 .color(crate::gui::styling::TEXT_PRIMARY),
                         );
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(filename).strong().color(crate::gui::styling::TEXT_PRIMARY));                            ui.label(
-                                crate::gui::styling::SUBTLE_TEXT_COLOR,
+                            ui.label(
+                                egui::RichText::new(filename)
+                                    .strong()
+                                    .color(crate::gui::styling::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(crate::util::format_size(*size))
+                                    .size(12.0)
+                                    .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
                             );
                         });
                     });
@@ -344,7 +360,11 @@ fn render_message(app: &App, ui: &mut egui::Ui, message: &Message) {
 
             // Timestamp with subtle styling
             let timestamp_text = crate::gui::widgets::format_timestamp_relative(&message.timestamp);
-ui.label(egui::RichText::new(timestamp_text).size(10.0).color(crate::gui::styling::SUBTLE_TEXT_COLOR));
+            ui.label(
+                egui::RichText::new(timestamp_text)
+                    .size(10.0)
+                    .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+            );
         });
 
         // Add hover effect
