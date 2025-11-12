@@ -16,6 +16,11 @@ pub const SUCCESS: Color32 = Color32::from_rgb(46, 204, 113); // Green
 pub const WARNING: Color32 = Color32::from_rgb(241, 196, 15); // Yellow
 pub const ERROR: Color32 = Color32::from_rgb(231, 76, 60); // Red
 
+// Spacing constants
+pub const SPACING_SMALL: f32 = 5.0;
+pub const SPACING_MEDIUM: f32 = 10.0;
+pub const SPACING_LARGE: f32 = 15.0;
+
 pub fn apply_custom_visuals() -> Visuals {
     let mut visuals = Visuals::dark();
 

@@ -123,3 +123,13 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
 
     response
 }
+
+/// A primary button with a prominent style for major actions.
+pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
+    ui.button(egui::RichText::new(text).size(16.0).strong())
+}
+
+/// A secondary button with a more subtle style for minor actions.
+pub fn secondary_button(ui: &mut Ui, text: &str) -> Response {
+    ui.button(text)
+}

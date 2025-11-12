@@ -14,6 +14,63 @@ This is a secure, peer-to-peer messaging application for desktop, built with Rus
 
 ---
 
+## 🔄 Recent Updates & Bug Fixes
+
+### Version 1.3.0 - Chat Creation & Network Synchronization Fix
+
+**Date**: November 12, 2025
+
+**Issue Resolved**: When creating a new chat from the contacts list, the chat was created locally but not propagated to the peer instance. Attempting to send messages resulted in "Message sent locally but all recipients offline" error.
+
+**Root Cause**: The chat creation flow was entirely local. When a user clicked "Open chat" on a contact, the application:
+1. Created a `Chat` object locally in the `ChatManager`
+2. Updated the UI immediately for responsiveness
+3. **BUT** never initiated a network connection with the peer
+
+This meant the peer didn't know about the new chat and couldn't process incoming messages properly.
+
+**Solution Implemented**:
+
+1. **Enhanced Network Protocol (`src/types.rs`)**:
+   - Added `SessionEvent::NewConnection` variant to the `SessionEvent` enum
+   - This event carries the peer address, fingerprint, and chat ID from the connecting client
+
+2. **Modified Session Handshake (`src/network/session.rs`)**:
+   - Client now sends its `chat_id` to the host after the RSA public key exchange (step 7)
+   - Host receives the client's `chat_id` and includes it in the `NewConnection` event sent to the application layer
+   - This ensures both peers reference the same chat ID throughout the session
+
+3. **Updated Connection Flow (`src/app/chat_manager.rs`)**:
+   - Refactored `connect_to_host()` to accept an optional `existing_chat_id` parameter
+   - If provided, the function uses this ID instead of generating a new one
+   - If `None`, it generates a new chat ID as before (for manual connections)
+   - Updated `connect_to_contact()` to propagate the optional `existing_chat_id`
+   - Added handler for `SessionEvent::NewConnection` to create chats on incoming connections
+
+4. **Improved UI Flow (`src/gui/dialogs.rs`)**:
+   - When "Open chat" is clicked from contacts:
+     1. A new `Chat` object is created locally with a new UUID
+     2. The UI updates immediately to show the new chat in the sidebar
+     3. An asynchronous task is spawned that calls `connect_to_contact()` with the newly created chat ID
+     4. The network connection is established in the background
+     5. A toast notification confirms the connection establishment
+
+5. **Consistent Call Sites Updated**:
+   - `src/gui/app_ui.rs`: Updated `connect_clicked()` to pass `None` for existing_chat_id (manual connections)
+   - Existing group message retry logic also passes `None` to maintain backward compatibility
+
+**Benefits**:
+- ✅ **Instant UI Feedback**: Chat appears in sidebar immediately
+- ✅ **Synchronized IDs**: Both peers reference the same chat throughout the session
+- ✅ **Reliable Messaging**: Messages are now properly routed to the correct session
+- ✅ **Backward Compatible**: Existing connection methods remain unchanged
+
+**Testing**:
+- All existing tests pass
+- Manual testing confirms new chats now sync properly across peers
+
+---
+
 # 🏗️ Architecture & Code Organization
 
 **Version**: 1.3.0-dev

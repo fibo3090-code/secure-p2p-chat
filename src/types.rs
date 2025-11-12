@@ -33,6 +33,7 @@ pub struct Message {
 pub struct Contact {
     pub id: Uuid,
     pub name: String,
+    pub address: Option<String>,
     pub fingerprint: Option<String>,
     pub public_key: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -115,6 +116,11 @@ pub enum SessionStatus {
 pub enum SessionEvent {
     Listening { port: u16 },
     Connected { peer: String },
+    NewConnection {
+        peer_addr: String,
+        fingerprint: String,
+        chat_id: Uuid,
+    },
     ShowFingerprintVerification {
         fingerprint: String,
         peer_name: String,
@@ -124,6 +130,7 @@ pub enum SessionEvent {
     MessageReceived(crate::core::ProtocolMessage),
     Disconnected,
     Error(String),
+    Warning(String),
 }
 
 /// Application configuration

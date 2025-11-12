@@ -150,6 +150,18 @@ pub struct IncomingFileSync {
     // filename removed: not used by sync helper (kept in transfer state instead)
 }
 
+impl Clone for IncomingFileSync {
+    fn clone(&self) -> Self {
+        let new_file = self.file.try_clone().expect("Failed to clone file handle");
+        Self {
+            tmp_path: self.tmp_path.clone(),
+            file: new_file,
+            received: self.received,
+            expected: self.expected,
+        }
+    }
+}
+
 impl IncomingFileSync {
     /// Create a new incoming file
     pub fn new(dest_path: &Path, expected_size: u64) -> Result<Self> {

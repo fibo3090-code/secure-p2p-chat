@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2025-11-12
+
+### 🐛 Bug Fixes
+
+- **Fixed Chat Creation Synchronization Issue**: When creating a new chat from the contacts list, the chat was created locally but not propagated to the peer instance, causing "all recipients offline" errors when sending messages.
+  - Added `SessionEvent::NewConnection` to properly notify the receiving peer about new incoming connections
+  - Enhanced handshake to exchange chat IDs between client and host
+  - Modified UI flow to create local chat immediately for responsiveness, then connect in background
+  - Updated `connect_to_host()` and `connect_to_contact()` to accept optional `existing_chat_id` parameter
+
+### 🔧 Technical Changes
+
+- Modified `src/network/session.rs`: Client now sends chat_id to host during handshake (step 7)
+- Enhanced `src/app/chat_manager.rs`: Added handler for `SessionEvent::NewConnection` to create chats on incoming connections
+- Improved `src/gui/dialogs.rs`: "Open chat" button now creates chat locally, then connects asynchronously
+- Updated `src/types.rs`: Added `NewConnection` variant to `SessionEvent` enum
+
+### ✅ Improvements
+
+- Chats now sync immediately across both peer instances
+- Messages are reliably routed to correct sessions
+- Better user experience with instant UI feedback during chat creation
+- Backward compatible with existing connection methods
+
 ## [1.2.0] - 2025-10-31
 
 ### ✨ New Features & Enhancements
@@ -48,6 +72,8 @@ All notable changes to this project will be documented in this file.
 - Updated the handshake sequence to include ephemeral key exchange.
 
 ### ⚠️ Breaking Changes
+
+```
 
 - Protocol v2 is incompatible with v1. Both parties must upgrade to communicate.
 

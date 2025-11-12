@@ -19,6 +19,7 @@ pub struct App {
     pub show_add_contact: bool,
     pub contact_tab: usize, // 0=Manual, 1=Invite Link, 2=Generate My Link
     pub new_contact_name: String,
+    pub new_contact_address: String,
     pub new_contact_fingerprint: String,
     pub new_contact_pubkey: String,
     pub invite_link_input: String,
@@ -166,6 +167,7 @@ impl App {
             show_add_contact: false,
             contact_tab: 0,
             new_contact_name: String::new(),
+            new_contact_address: String::new(),
             new_contact_fingerprint: String::new(),
             new_contact_pubkey: String::new(),
             invite_link_input: String::new(),
@@ -229,7 +231,7 @@ impl App {
 
         tokio::spawn(async move {
             let mut mgr = manager.lock().await;
-            if let Err(e) = mgr.connect_to_host(&host, port).await {
+            if let Err(e) = mgr.connect_to_host(&host, port, None).await {
                 mgr.add_toast(
                     crate::types::ToastLevel::Error,
                     format!("Failed to connect: {}", e),
@@ -272,28 +274,16 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Connection menu
-                if ui.button("🔌 Connection").clicked() {
-                    self.show_host_dialog = true;
-                }
-                if self.show_host_dialog {
-                    let mut show = true;
-                    egui::Window::new("Connection Menu")
-                        .open(&mut show)
-                        .auto_sized()
-                        .anchor(egui::Align2::LEFT_TOP, [40.0, 30.0])
-                        .show(ctx, |ui| {
-                            if ui.button("🎤 Start Host").clicked() {
-                                self.show_host_dialog = true;
-                            }
-                            if ui.button("🔌 Connect to Host").clicked() {
-                                self.show_connect_dialog = true;
-                                self.show_host_dialog = false;
-                            }
-                        });
-                    if !show {
-                        self.show_host_dialog = false;
+                ui.menu_button("🔌 Connection", |ui| {
+                    if ui.button("🎤 Start Host").clicked() {
+                        self.show_host_dialog = true;
+                        ui.close_menu();
                     }
-                }
+                    if ui.button("🔌 Connect to Host").clicked() {
+                        self.show_connect_dialog = true;
+                        ui.close_menu();
+                    }
+                });
 
                 if ui.button("Contacts").clicked() {
                     self.show_contacts = true;

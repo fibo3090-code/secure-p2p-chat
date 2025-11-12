@@ -31,7 +31,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "dist\encodeur_rsa_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Si tu as d'autres fichiers à inclure, ajoute-les ici
 ; Source: "dist\data\*"; DestDir: "{app}\data"; Flags: recursesubdirs createallsubdirs ignoreversion

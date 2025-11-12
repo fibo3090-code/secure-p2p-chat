@@ -73,7 +73,7 @@ fn render_fingerprint_dialog(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button("✅ Accept").clicked() {
+                    if crate::gui::widgets::primary_button(ui, "✅ Accept").clicked() {
                         if let Ok(mut manager) = app.chat_manager.try_lock() {
                             // Notify session/task that the fingerprint is accepted
                             let _ = manager.confirm_fingerprint(chat_id, true);
@@ -85,7 +85,7 @@ fn render_fingerprint_dialog(app: &mut App, ctx: &egui::Context) {
                         }
                         app.show_fingerprint_dialog = false;
                     }
-                    if ui.button("❌ Reject").clicked() {
+                    if crate::gui::widgets::secondary_button(ui, "❌ Reject").clicked() {
                         if let Ok(mut manager) = app.chat_manager.try_lock() {
                             // Notify session/task that the fingerprint is rejected so it can abort
                             let _ = manager.confirm_fingerprint(chat_id, false);
@@ -218,7 +218,7 @@ fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid:
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
-                if ui.button("❌ Delete").clicked() {
+                if crate::gui::widgets::primary_button(ui, "❌ Delete").clicked() {
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         manager.delete_chat(chat_id);
                         if app.selected_chat == Some(chat_id) {
@@ -229,7 +229,7 @@ fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid:
                     }
                     app.chat_to_delete = None;
                 }
-                if ui.button("Cancel").clicked() {
+                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                     app.chat_to_delete = None;
                 }
             });
@@ -245,12 +245,12 @@ fn render_host_dialog(app: &mut App, ctx: &egui::Context) {
             ui.text_edit_singleline(&mut app.host_port);
 
             ui.horizontal(|ui| {
-                if ui.button("Start").clicked() {
+                if crate::gui::widgets::primary_button(ui, "Start").clicked() {
                     app.start_host_clicked();
                     app.show_host_dialog = false;
                 }
 
-                if ui.button("Cancel").clicked() {
+                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                     app.show_host_dialog = false;
                 }
             });
@@ -269,12 +269,12 @@ fn render_connect_dialog(app: &mut App, ctx: &egui::Context) {
             ui.text_edit_singleline(&mut app.connect_port);
 
             ui.horizontal(|ui| {
-                if ui.button("Connect").clicked() {
+                if crate::gui::widgets::primary_button(ui, "Connect").clicked() {
                     app.connect_clicked();
                     app.show_connect_dialog = false;
                 }
 
-                if ui.button("Cancel").clicked() {
+                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                     app.show_connect_dialog = false;
                 }
             });
@@ -304,19 +304,14 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                 if let Ok(manager) = app.chat_manager.try_lock() {
                     for contact in manager.contacts.values() {
                         ui.horizontal(|ui| {
-                            let is_selected = app.group_selected.contains(&contact.id);
-                            let button_text = if is_selected { "☑️" } else { "⬜" };
-                            let button_color = if is_selected {
-                                crate::gui::styling::ACCENT_PRIMARY
-                            } else {
-                                crate::gui::styling::SUBTLE_TEXT_COLOR
-                            };
-                            
-                            if ui.button(egui::RichText::new(button_text).color(button_color)).clicked() {
+                            let mut is_selected = app.group_selected.contains(&contact.id);
+                            if ui.checkbox(&mut is_selected, "").changed() {
                                 if is_selected {
-                                    app.group_selected.retain(|id| id != &contact.id);
+                                    if !app.group_selected.contains(&contact.id) {
+                                        app.group_selected.push(contact.id);
+                                    }
                                 } else {
-                                    app.group_selected.push(contact.id);
+                                    app.group_selected.retain(|id| id != &contact.id);
                                 }
                             }
 
@@ -326,52 +321,60 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                             }
 
                             if ui.small_button("🔗").on_hover_text("Open chat").clicked() {
-                                // If there's a mapped chat, select it; otherwise create a new chat entry.
-                                if let Some(chat_id) = manager.contact_to_chat.get(&contact.id) {
-                                    app.selected_chat = Some(*chat_id);
+                                // Check if there's already a mapped chat for this contact
+                                let existing_chat_id = {
+                                    if let Ok(manager) = app.chat_manager.try_lock() {
+                                        manager.contact_to_chat.get(&contact.id).copied()
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some(chat_id) = existing_chat_id {
+                                    // If there's a mapped chat, select it.
+                                    app.selected_chat = Some(chat_id);
+                                    app.show_contacts = false;
                                 } else {
-                                    // Generate chat id locally so UI can select it immediately
+                                    // Otherwise, create a new chat entry locally first for responsiveness.
                                     let chat_id = uuid::Uuid::new_v4();
                                     app.selected_chat = Some(chat_id);
 
-                                    // Try to create chat synchronously if mutex is available to avoid races
+                                    // Clone the necessary data before spawning the task
+                                    let manager_clone = app.chat_manager.clone();
+                                    let contact_clone = contact.clone();
                                     let history_path = app.history_path.clone();
-                                    if let Ok(mut mgr) = app.chat_manager.try_lock() {
+
+                                    // Spawn a task to do the real work: create chat in manager and connect.
+                                    tokio::spawn(async move {
+                                        let mut mgr = manager_clone.lock().await;
+                                        // 1. Create the chat object and add it to the manager
                                         let chat = crate::types::Chat {
                                             id: chat_id,
-                                            title: contact.name.clone(),
-                                            peer_fingerprint: contact.fingerprint.clone(),
-                                            participants: vec![contact.id],
+                                            title: contact_clone.name.clone(),
+                                            peer_fingerprint: contact_clone.fingerprint.clone(),
+                                            participants: vec![contact_clone.id],
                                             messages: Vec::new(),
                                             created_at: chrono::Utc::now(),
                                             peer_typing: false,
                                             typing_since: None,
                                         };
                                         mgr.chats.insert(chat_id, chat);
-                                        mgr.contact_to_chat.insert(contact.id, chat_id);
-                                        let _ = mgr.save_history(&history_path);
-                                    } else {
-                                        // Fall back to async creation if lock is contended
-                                        let manager = app.chat_manager.clone();
-                                        let contact_clone = contact.clone();
-                                        let history_path = app.history_path.clone();
-                                        tokio::spawn(async move {
-                                            let mut mgr = manager.lock().await;
-                                            let chat = crate::types::Chat {
-                                                id: chat_id,
-                                                title: contact_clone.name.clone(),
-                                                peer_fingerprint: contact_clone.fingerprint.clone(),
-                                                participants: vec![contact_clone.id],
-                                                messages: Vec::new(),
-                                                created_at: chrono::Utc::now(),
-                                                peer_typing: false,
-                                                typing_since: None,
-                                            };
-                                            mgr.chats.insert(chat_id, chat);
-                                            mgr.contact_to_chat.insert(contact_clone.id, chat_id);
-                                            let _ = mgr.save_history(&history_path);
-                                        });
-                                    }
+                                        mgr.associate_contact_with_chat(contact_clone.id, chat_id);
+
+                                        // 2. Save history
+                                        if let Err(e) = mgr.save_history(&history_path) {
+                                            tracing::error!("Failed to save history after creating chat: {}", e);
+                                        }
+
+                                        // 3. Asynchronously connect to the peer
+                                        if let Err(e) = mgr.connect_to_contact(contact_clone.id, Some(chat_id)).await {
+                                            mgr.add_toast(
+                                                crate::types::ToastLevel::Error,
+                                                format!("Failed to connect to {}: {}", contact_clone.name, e),
+                                            );
+                                        }
+                                    });
+                                    app.show_contacts = false; // Close dialog after action
                                 }
                             }
 
@@ -455,6 +458,9 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("Name:");
                     ui.text_edit_singleline(&mut app.new_contact_name);
 
+                    ui.label("Address (IP:Port - optional):");
+                    ui.text_edit_singleline(&mut app.new_contact_address);
+
                     ui.label("Fingerprint (64 hex chars - optional):");
                     ui.text_edit_singleline(&mut app.new_contact_fingerprint);
 
@@ -463,8 +469,13 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("➕ Add Contact").clicked() {
+                        if crate::gui::widgets::primary_button(ui, "➕ Add Contact").clicked() {
                             let name = app.new_contact_name.trim().to_string();
+                            let address = if app.new_contact_address.trim().is_empty() {
+                                None
+                            } else {
+                                Some(app.new_contact_address.trim().to_string())
+                            };
                             let fp = if app.new_contact_fingerprint.trim().is_empty() {
                                 None
                             } else {
@@ -481,7 +492,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                                 let history_path = app.history_path.clone();
                                 tokio::spawn(async move {
                                     let mut mgr = manager.lock().await;
-                                    mgr.add_contact(name, fp, pk);
+                                    mgr.add_contact(name, address, fp, pk);
                                     let _ = mgr.save_history(&history_path);
                                     mgr.add_toast(
                                         crate::types::ToastLevel::Success,
@@ -490,13 +501,14 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                                 });
 
                                 app.new_contact_name.clear();
+                                app.new_contact_address.clear();
                                 app.new_contact_fingerprint.clear();
                                 app.new_contact_pubkey.clear();
                                 app.show_add_contact = false;
                             }
                         }
 
-                        if ui.button("Cancel").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                             app.show_add_contact = false;
                         }
                     });
@@ -514,45 +526,83 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                             egui::RichText::new("✅ Link detected")
                                 .color(crate::gui::styling::SUCCESS),
                         );
+                        // Attempt to parse the link and pre-fill fields
+                        if let Ok(manager) = app.chat_manager.try_lock() {
+                            match manager.parse_invite_link(&app.invite_link_input) {
+                                Ok(contact) => {
+                                    app.new_contact_name = contact.name;
+                                    app.new_contact_address = contact.address.unwrap_or_default();
+                                    app.new_contact_fingerprint = contact.fingerprint.unwrap_or_default();
+                                    app.new_contact_pubkey = contact.public_key.unwrap_or_default();
+                                }
+                                Err(e) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("❌ Invalid link: {}", e))
+                                            .color(crate::gui::styling::ERROR),
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     ui.add_space(10.0);
+
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut app.new_contact_name);
+
+                    ui.label("Address (IP:Port - optional):");
+                    ui.text_edit_singleline(&mut app.new_contact_address);
+
+                    ui.label("Fingerprint (64 hex chars - optional):");
+                    ui.text_edit_singleline(&mut app.new_contact_fingerprint);
+
+                    ui.label("Public key PEM (optional):");
+                    ui.text_edit_multiline(&mut app.new_contact_pubkey);
+
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("➕ Add from Link").clicked() {
-                            let link = app.invite_link_input.trim().to_string();
-                            let manager = app.chat_manager.clone();
-                            let history_path = app.history_path.clone();
+                        if crate::gui::widgets::primary_button(ui, "➕ Add from Link").clicked() {
+                            let name = app.new_contact_name.trim().to_string();
+                            let address = if app.new_contact_address.trim().is_empty() {
+                                None
+                            } else {
+                                Some(app.new_contact_address.trim().to_string())
+                            };
+                            let fp = if app.new_contact_fingerprint.trim().is_empty() {
+                                None
+                            } else {
+                                Some(app.new_contact_fingerprint.trim().to_string())
+                            };
+                            let pk = if app.new_contact_pubkey.trim().is_empty() {
+                                None
+                            } else {
+                                Some(app.new_contact_pubkey.trim().to_string())
+                            };
 
-                            tokio::spawn(async move {
-                                let mut mgr = manager.lock().await;
-                                match mgr.parse_invite_link(&link) {
-                                    Ok(contact) => {
-                                        let name = contact.name.clone();
-                                        mgr.add_contact(
-                                            contact.name,
-                                            contact.fingerprint,
-                                            contact.public_key,
-                                        );
-                                        let _ = mgr.save_history(&history_path);
-                                        mgr.add_toast(
-                                            crate::types::ToastLevel::Success,
-                                            format!("Added {}!", name),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        mgr.add_toast(
-                                            crate::types::ToastLevel::Error,
-                                            format!("Invalid link: {}", e),
-                                        );
-                                    }
-                                }
-                            });
+                            if !name.is_empty() {
+                                let manager = app.chat_manager.clone();
+                                let history_path = app.history_path.clone();
 
-                            app.invite_link_input.clear();
-                            app.show_add_contact = false;
+                                tokio::spawn(async move {
+                                    let mut mgr = manager.lock().await;
+                                    mgr.add_contact(name, address, fp, pk);
+                                    let _ = mgr.save_history(&history_path);
+                                    mgr.add_toast(
+                                        crate::types::ToastLevel::Success,
+                                        "Contact added!".to_string(),
+                                    );
+                                });
+
+                                app.invite_link_input.clear();
+                                app.new_contact_name.clear();
+                                app.new_contact_address.clear();
+                                app.new_contact_fingerprint.clear();
+                                app.new_contact_pubkey.clear();
+                                app.show_add_contact = false;
+                            }
                         }
 
-                        if ui.button("Cancel").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                             app.show_add_contact = false;
                         }
                     });
@@ -564,7 +614,10 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
 
                     // Generate link using actual identity
                     if app.my_invite_link.is_none() {
-                        match app.identity.generate_invite_link() {
+                        // For now, we'll use a placeholder address for the invite link.
+                        // In a real-world scenario, this would be the user's public IP and listening port.
+                        let my_address = Some("YOUR_IP:PORT".to_string()); 
+                        match app.identity.generate_invite_link(my_address) {
                             Ok(link) => {
                                 app.my_invite_link = Some(link);
                             }
@@ -584,7 +637,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(link).monospace());
-                                if ui.button("📋 Copy").clicked() {
+                                if crate::gui::widgets::secondary_button(ui, "📋 Copy").clicked() {
                                     ui.output_mut(|o| o.copied_text = link.clone());
                                 }
                             });
@@ -602,7 +655,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("  • QR code (future feature)");
 
                     ui.add_space(10.0);
-                    if ui.button("Close").clicked() {
+                    if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
                         app.show_add_contact = false;
                     }
                 }
@@ -664,7 +717,7 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                     ui.add_space(15.0);
 
                     ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                             app.show_create_group = false;
                             app.group_wizard_step = 0;
                             app.group_title.clear();
@@ -751,11 +804,11 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("◀ Back").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "◀ Back").clicked() {
                             app.group_wizard_step = 0;
                         }
 
-                        if ui.button("Cancel").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                             app.show_create_group = false;
                             app.group_wizard_step = 0;
                             app.group_title.clear();
@@ -815,11 +868,11 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("◀ Back").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "◀ Back").clicked() {
                             app.group_wizard_step = 1;
                         }
 
-                        if ui.button("Cancel").clicked() {
+                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
                             app.show_create_group = false;
                             app.group_wizard_step = 0;
                             app.group_title.clear();
@@ -828,7 +881,7 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(egui::RichText::new("✓ Create Group").strong()).clicked() {
+                            if crate::gui::widgets::primary_button(ui, "✓ Create Group").clicked() {
                                 let participants = app.group_selected.clone();
                                 let title = Some(app.group_title.trim().to_string());
                                 let manager = app.chat_manager.clone();
@@ -855,7 +908,7 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                 _ => {
                     // Fallback - should never happen
                     ui.label("Invalid wizard step");
-                    if ui.button("Reset").clicked() {
+                    if crate::gui::widgets::secondary_button(ui, "Reset").clicked() {
                         app.group_wizard_step = 0;
                     }
                 }
@@ -875,7 +928,7 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button("✅ Save").clicked() {
+                    if crate::gui::widgets::primary_button(ui, "✅ Save").clicked() {
                         if let Ok(mut manager) = app.chat_manager.try_lock() {
                             if let Err(e) = manager.rename_chat(chat_id, app.rename_input.clone()) {
                                 manager.add_toast(
@@ -896,7 +949,7 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                         app.rename_input.clear();
                     }
 
-                    if ui.button("❌ Cancel").clicked() {
+                    if crate::gui::widgets::secondary_button(ui, "❌ Cancel").clicked() {
                         app.show_rename_dialog = false;
                         app.rename_chat_id = None;
                         app.rename_input.clear();
@@ -968,7 +1021,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             ui.add_space(10.0);
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Close").clicked() {
+                if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
                     app.show_settings = false;
                 }
             });
@@ -1003,7 +1056,7 @@ fn render_about_dialog(app: &mut App, ctx: &egui::Context) {
             ui.add_space(10.0);
 
             ui.vertical_centered(|ui| {
-                if ui.button("Close").clicked() {
+                if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
                     app.show_about = false;
                 }
             });

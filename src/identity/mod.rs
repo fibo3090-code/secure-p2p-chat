@@ -88,12 +88,13 @@ impl Identity {
     }
 
     /// Generate invite link for this identity
-    pub fn generate_invite_link(&self) -> Result<String> {
+    pub fn generate_invite_link(&self, address: Option<String>) -> Result<String> {
         use base64::Engine;
         use serde_json::json;
 
         let payload = json!({
             "name": self.name,
+            "address": address,
             "fingerprint": self.fingerprint,
             "public_key": self.public_key_pem,
         });
@@ -186,7 +187,7 @@ mod tests {
     #[test]
     fn test_invite_link_generation() {
         let identity = Identity::new("Test User".to_string()).unwrap();
-        let link = identity.generate_invite_link().unwrap();
+        let link = identity.generate_invite_link(None).unwrap();
 
         assert!(link.starts_with("chat-p2p://invite/"));
         assert!(link.len() > 50); // Should be a substantial base64 string

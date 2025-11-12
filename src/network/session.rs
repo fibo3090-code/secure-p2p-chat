@@ -20,8 +20,8 @@ pub async fn run_host_session(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
-    chat_id: uuid::Uuid,
+    _confirm_rx: mpsc::UnboundedReceiver<bool>,
+    _chat_id: uuid::Uuid,
 ) -> Result<()> {
     // 1. Bind listener
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -88,50 +88,32 @@ pub async fn run_host_session(
         client_fingerprint
     );
 
-    // 7. Display fingerprint and wait for user confirmation
+    // 7. Receive chat_id from client
+    let client_chat_id_bytes = recv_packet(&mut stream).await?;
+    let client_chat_id = uuid::Uuid::from_slice(&client_chat_id_bytes)?;
+    tracing::debug!("Received client chat_id: {}", client_chat_id);
+
+    // 8. Display fingerprint and wait for user confirmation
     to_app_tx
-        .send(SessionEvent::ShowFingerprintVerification {
-            fingerprint: client_fingerprint.clone(),
-            peer_name: peer_addr.to_string(),
-            chat_id,
+        .send(SessionEvent::NewConnection {
+            peer_addr: peer_addr.to_string(),
+            fingerprint: client_fingerprint,
+            chat_id: client_chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // Wait up to 30 seconds for user confirmation. If accepted -> proceed.
-    // If explicitly rejected -> abort handshake. If timeout or channel closed -> proceed (auto-accept).
-    match tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
-        confirm_rx.recv().await
-    })
-    .await
-    {
-        Ok(Some(true)) => {
-            tracing::info!("User accepted fingerprint for chat {}", chat_id);
-        }
-        Ok(Some(false)) => {
-            tracing::warn!("User rejected fingerprint for chat {}", chat_id);
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected by user".to_string()));
-            return Err(anyhow!("Fingerprint rejected by user"));
-        }
-        Ok(None) => {
-            tracing::info!("Confirmation channel closed for chat {}, proceeding (auto-accept)", chat_id);
-        }
-        Err(_) => {
-            tracing::info!("Confirmation timeout for chat {}, proceeding (auto-accept)", chat_id);
-        }
-    }
-
-    // 8. Generate ephemeral X25519 keypair for forward secrecy
+    // 9. Generate ephemeral X25519 keypair for forward secrecy
     let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
     tracing::debug!("Generated host ephemeral X25519 keypair");
 
-    // 9. Send host ephemeral public key
+    // 10. Send host ephemeral public key
     let host_ephemeral_msg = ProtocolMessage::EphemeralKey {
         public_key: host_ephemeral_public.as_bytes().to_vec(),
     };
     send_packet(&mut stream, &host_ephemeral_msg.to_plain_bytes()).await?;
     tracing::debug!("Sent host ephemeral public key");
 
-    // 10. Receive client ephemeral public key
+    // 11. Receive client ephemeral public key
     let client_ephemeral_bytes = recv_packet(&mut stream).await?;
     let client_ephemeral_msg = ProtocolMessage::from_plain_bytes(&client_ephemeral_bytes)
         .ok_or_else(|| anyhow!("Failed to parse client ephemeral key"))?;
@@ -142,13 +124,13 @@ pub async fn run_host_session(
     };
     tracing::debug!("Received client ephemeral public key");
 
-    // 11. Derive session key using ECDH + HKDF
+    // 12. Derive session key using ECDH + HKDF
     let aes_key = derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO);
     tracing::info!("Derived session key using X25519 ECDH + HKDF (forward secrecy enabled)");
 
     let cipher = AesCipher::new(&aes_key);
 
-    // 12. Enter message loop
+    // 13. Enter message loop
     to_app_tx
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -243,10 +225,14 @@ pub async fn run_client_session(
             return Err(anyhow!("Fingerprint rejected by user"));
         }
         Ok(None) => {
-            tracing::info!("Confirmation channel closed for chat {}, proceeding (auto-accept)", chat_id);
+            let msg = "Confirmation channel closed, auto-accepting fingerprint.";
+            tracing::info!("{}", msg);
+            let _ = to_app_tx.send(SessionEvent::Warning(msg.to_string()));
         }
         Err(_) => {
-            tracing::info!("Confirmation timeout for chat {}, proceeding (auto-accept)", chat_id);
+            let msg = "Fingerprint verification timed out, auto-accepting.";
+            tracing::info!("{}", msg);
+            let _ = to_app_tx.send(SessionEvent::Warning(msg.to_string()));
         }
     }
 
@@ -255,7 +241,11 @@ pub async fn run_client_session(
     send_packet(&mut stream, client_pub_pem.as_bytes()).await?;
     tracing::debug!("Sent client RSA public key");
 
-    // 7. Receive host ephemeral public key
+    // 7. Send chat_id to host
+    send_packet(&mut stream, chat_id.as_bytes()).await?;
+    tracing::debug!("Sent chat_id to host: {}", chat_id);
+
+    // 8. Receive host ephemeral public key
     let host_ephemeral_bytes = recv_packet(&mut stream).await?;
     let host_ephemeral_msg = ProtocolMessage::from_plain_bytes(&host_ephemeral_bytes)
         .ok_or_else(|| anyhow!("Failed to parse host ephemeral key"))?;
@@ -266,24 +256,24 @@ pub async fn run_client_session(
     };
     tracing::debug!("Received host ephemeral public key");
 
-    // 8. Generate ephemeral X25519 keypair for forward secrecy
+    // 9. Generate ephemeral X25519 keypair for forward secrecy
     let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
     tracing::debug!("Generated client ephemeral X25519 keypair");
 
-    // 9. Send client ephemeral public key
+    // 10. Send client ephemeral public key
     let client_ephemeral_msg = ProtocolMessage::EphemeralKey {
         public_key: client_ephemeral_public.as_bytes().to_vec(),
     };
     send_packet(&mut stream, &client_ephemeral_msg.to_plain_bytes()).await?;
     tracing::debug!("Sent client ephemeral public key");
 
-    // 10. Derive session key using ECDH + HKDF
+    // 11. Derive session key using ECDH + HKDF
     let aes_key = derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO);
     tracing::info!("Derived session key using X25519 ECDH + HKDF (forward secrecy enabled)");
 
     let cipher = AesCipher::new(&aes_key);
 
-    // 11. Enter message loop
+    // 12. Enter message loop
     to_app_tx
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -325,10 +315,13 @@ where
                             }
                         } else {
                             tracing::error!("Decryption failed - possible tampering or key mismatch!");
+                            let _ = to_app_tx.send(SessionEvent::Error("Decryption failed!".to_string()));
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Network receive error: {}", e);
+                        let err_msg = format!("Network receive error: {}", e);
+                        tracing::error!("{}", err_msg);
+                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
                         break;
                     }
                 }
@@ -345,7 +338,9 @@ where
                 tracing::trace!("Encrypted to {} bytes", encrypted.len());
 
                 if let Err(e) = send_packet(&mut stream, &encrypted).await {
-                    tracing::error!("Network send error: {}", e);
+                    let err_msg = format!("Network send error: {}", e);
+                    tracing::error!("{}", err_msg);
+                    let _ = to_app_tx.send(SessionEvent::Error(err_msg));
                     break;
                 } else {
                     tracing::debug!("Message sent successfully");

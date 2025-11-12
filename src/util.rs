@@ -78,12 +78,12 @@ pub fn generate_color_grid(fingerprint: &str) -> [[Color32; 4]; 4] {
         Color32::from_rgb(128, 128, 0),   // Olive
     ];
 
-    for i in 0..4 {
-        for j in 0..4 {
+    for (i, row) in grid.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
             let byte_index = i * 4 + j;
             if byte_index < bytes.len() {
                 let color_index = bytes[byte_index] as usize % palette.len();
-                grid[i][j] = palette[color_index];
+                *cell = palette[color_index];
             }
         }
     }

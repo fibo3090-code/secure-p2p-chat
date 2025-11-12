@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -10,18 +11,20 @@ use crate::transfer::IncomingFileSync;
 use crate::types::*;
 
 /// Session handle for communication with network task
+#[derive(Clone)]
 pub struct SessionHandle {
     pub from_app_tx: mpsc::UnboundedSender<ProtocolMessage>,
 }
 
 /// Main chat manager - orchestrates sessions, messages, and file transfers
+#[derive(Clone)]
 pub struct ChatManager {
     pub chats: HashMap<Uuid, Chat>,
     pub contacts: HashMap<Uuid, Contact>,
     /// Map contact_id -> one-to-one chat id (if any). Used to find session/chat for a contact.
     pub contact_to_chat: HashMap<Uuid, Uuid>,
     sessions: HashMap<Uuid, SessionHandle>,
-    session_events: HashMap<Uuid, mpsc::UnboundedReceiver<SessionEvent>>,
+    session_events: HashMap<Uuid, Arc<Mutex<mpsc::UnboundedReceiver<SessionEvent>>>>,
     /// Channels used to confirm fingerprint verification with the running session task
     fingerprint_confirm_senders: HashMap<Uuid, mpsc::UnboundedSender<bool>>,
     active_transfers: HashMap<Uuid, FileTransferState>,
@@ -53,6 +56,7 @@ impl ChatManager {
     pub fn add_contact(
         &mut self,
         name: String,
+        address: Option<String>,
         fingerprint: Option<String>,
         public_key: Option<String>,
     ) -> Uuid {
@@ -60,6 +64,7 @@ impl ChatManager {
         let contact = Contact {
             id,
             name,
+            address,
             fingerprint,
             public_key,
             created_at: chrono::Utc::now(),
@@ -157,10 +162,36 @@ impl ChatManager {
                             sent_count += 1;
                         }
                     } else {
+                        // Contact has a chat but no session, try to connect
                         offline_contacts.push(contact.name.clone());
+                        let mut manager = self.clone();
+                        let contact_id_clone = contact_id;
+                        tokio::spawn(async move {
+                            if manager
+                                .connect_to_contact(contact_id_clone, None)
+                                .await
+                                .is_ok()
+                            {
+                                // After connecting, we could try to send the message again,
+                                // but for simplicity, we'll just establish the connection for next time.
+                            }
+                        });
                     }
                 } else {
+                    // Contact has no chat, try to connect
                     offline_contacts.push(contact.name.clone());
+                    let mut manager = self.clone();
+                    let contact_id_clone = contact_id;
+                    tokio::spawn(async move {
+                        if manager
+                            .connect_to_contact(contact_id_clone, None)
+                            .await
+                            .is_ok()
+                        {
+                            // After connecting, we could try to send the message again,
+                            // but for simplicity, we'll just establish the connection for next time.
+                        }
+                    });
                 }
             }
         }
@@ -228,7 +259,7 @@ impl ChatManager {
 
         self.chats.insert(chat_id, chat);
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
-        self.session_events.insert(chat_id, to_app_rx);
+        self.session_events.insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
     self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
@@ -237,44 +268,85 @@ impl ChatManager {
     }
 
     /// Connect to a host
-    pub async fn connect_to_host(&mut self, host: &str, port: u16) -> Result<Uuid> {
-        let chat_id = Uuid::new_v4();
+    pub async fn connect_to_host(
+        &mut self,
+        host: &str,
+        port: u16,
+        existing_chat_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         let privkey = generate_rsa_keypair_async(2048).await?;
 
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
 
         let host_copy = host.to_string();
-        // confirmation channel for fingerprint verification acceptance
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
             if let Err(e) =
-                run_client_session(&host_copy, port, privkey, to_app_tx, from_app_rx, confirm_rx, chat_id).await
+                run_client_session(&host_copy, port, privkey, to_app_tx, from_app_rx, confirm_rx, chat_id)
+                    .await
             {
                 tracing::error!("Client session error: {}", e);
             }
         });
 
-        let chat = Chat {
-            id: chat_id,
-            title: format!("{}:{}", host, port),
-            peer_fingerprint: None,
-            participants: Vec::new(),
-            messages: Vec::new(),
-            created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
-        };
+        if self.chats.get(&chat_id).is_none() {
+            let chat = Chat {
+                id: chat_id,
+                title: format!("{}:{}", host, port),
+                peer_fingerprint: None,
+                participants: Vec::new(),
+                messages: Vec::new(),
+                created_at: chrono::Utc::now(),
+                peer_typing: false,
+                typing_since: None,
+            };
+            self.chats.insert(chat_id, chat);
+        }
 
-        self.chats.insert(chat_id, chat);
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
-        self.session_events.insert(chat_id, to_app_rx);
-    self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
+        self.session_events
+            .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
+        self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
-        self.add_toast(ToastLevel::Info, format!("Connecting to {}:{}", host, port));
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Connecting to {}:{}", host, port),
+        );
 
         Ok(chat_id)
+    }
+
+    pub async fn connect_to_contact(
+        &mut self,
+        contact_id: Uuid,
+        existing_chat_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let contact = self
+            .contacts
+            .get(&contact_id)
+            .ok_or_else(|| anyhow::anyhow!("Contact not found"))?
+            .clone();
+
+        if let Some(address) = contact.address {
+            let parts: Vec<&str> = address.split(':').collect();
+            if parts.len() == 2 {
+                let host = parts[0];
+                if let Ok(port) = parts[1].parse::<u16>() {
+                    let chat_id = self.connect_to_host(host, port, existing_chat_id).await?;
+                    self.associate_contact_with_chat(contact_id, chat_id);
+                    Ok(chat_id)
+                } else {
+                    Err(anyhow::anyhow!("Invalid port in contact address"))
+                }
+            } else {
+                Err(anyhow::anyhow!("Invalid address format for contact"))
+            }
+        } else {
+            Err(anyhow::anyhow!("Contact has no address"))
+        }
     }
 
     /// Send a text message (handles both 1-on-1 chats and group chats)
@@ -544,9 +616,11 @@ impl ChatManager {
         for chat_id in chat_ids {
             // Collect all pending events for this session
             let mut events = Vec::new();
-            if let Some(rx) = self.session_events.get_mut(&chat_id) {
-                while let Ok(event) = rx.try_recv() {
-                    events.push(event);
+            if let Some(rx_mutex) = self.session_events.get(&chat_id) {
+                if let Ok(mut rx) = rx_mutex.try_lock() {
+                    while let Ok(event) = rx.try_recv() {
+                        events.push(event);
+                    }
                 }
             }
 
@@ -574,6 +648,36 @@ impl ChatManager {
                 if let Some(chat) = self.chats.get_mut(&chat_id) {
                     chat.title = peer;
                 }
+            }
+
+            SessionEvent::NewConnection {
+                peer_addr,
+                fingerprint,
+                chat_id: incoming_chat_id,
+            } => {
+                tracing::info!(
+                    "New incoming connection from {} with chat_id {}",
+                    peer_addr,
+                    incoming_chat_id
+                );
+                // Create a chat for this new connection
+                if self.chats.get(&incoming_chat_id).is_none() {
+                    let chat = Chat {
+                        id: incoming_chat_id,
+                        title: peer_addr.clone(),
+                        peer_fingerprint: Some(fingerprint.clone()),
+                        participants: Vec::new(),
+                        messages: Vec::new(),
+                        created_at: chrono::Utc::now(),
+                        peer_typing: false,
+                        typing_since: None,
+                    };
+                    self.chats.insert(incoming_chat_id, chat);
+                }
+                self.add_toast(
+                    ToastLevel::Info,
+                    format!("New connection from {}", peer_addr),
+                );
             }
 
             SessionEvent::ShowFingerprintVerification {
@@ -756,6 +860,11 @@ impl ChatManager {
                 tracing::error!("Session {} error: {}", chat_id, err);
                 self.add_toast(ToastLevel::Error, format!("Connection error: {}", err));
             }
+
+            SessionEvent::Warning(msg) => {
+                tracing::warn!("Session {} warning: {}", chat_id, msg);
+                self.add_toast(ToastLevel::Warning, msg);
+            }
         }
     }
 
@@ -764,6 +873,7 @@ impl ChatManager {
     pub fn generate_invite_link(
         &self,
         name: &str,
+        address: Option<String>,
         fingerprint: &str,
         public_key_pem: &str,
     ) -> Result<String> {
@@ -773,12 +883,14 @@ impl ChatManager {
         #[derive(Serialize, Deserialize)]
         struct InvitePayload {
             name: String,
+            address: Option<String>,
             fingerprint: String,
             public_key: String,
         }
 
         let payload = InvitePayload {
             name: name.to_string(),
+            address,
             fingerprint: fingerprint.to_string(),
             public_key: public_key_pem.to_string(),
         };
@@ -795,6 +907,7 @@ impl ChatManager {
         #[derive(Serialize, Deserialize)]
         struct InvitePayload {
             name: String,
+            address: Option<String>,
             fingerprint: String,
             public_key: String,
         }
@@ -818,6 +931,7 @@ impl ChatManager {
         let contact = Contact {
             id: Uuid::new_v4(),
             name: payload.name,
+            address: payload.address,
             fingerprint: Some(payload.fingerprint),
             public_key: Some(payload.public_key),
             created_at: chrono::Utc::now(),
