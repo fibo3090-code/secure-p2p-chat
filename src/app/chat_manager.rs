@@ -995,7 +995,6 @@ impl Default for ChatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose;
     use base64::Engine;
 
     #[test]
