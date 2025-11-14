@@ -927,11 +927,35 @@ impl ChatManager {
         let payload: InvitePayload = serde_json::from_str(&json_str)
             .map_err(|e| anyhow::anyhow!("Invalid invite data: {}", e))?;
 
+        // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
+        let address = payload.address.and_then(|addr| {
+            let trimmed = addr.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
+                None
+            } else {
+                // Basic validation: should contain a colon and a numeric port
+                if let Some(idx) = trimmed.rfind(':') {
+                    let (host, port_str) = trimmed.split_at(idx);
+                    let port_str = &port_str[1..]; // skip ':'
+                    if host.is_empty() || port_str.parse::<u16>().is_err() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                } else {
+                    // no port provided, treat as invalid for now
+                    None
+                }
+            }
+        });
+
         // Create contact
         let contact = Contact {
             id: Uuid::new_v4(),
             name: payload.name,
-            address: payload.address,
+            address,
             fingerprint: Some(payload.fingerprint),
             public_key: Some(payload.public_key),
             created_at: chrono::Utc::now(),
@@ -965,5 +989,92 @@ impl ChatManager {
 impl Default for ChatManager {
     fn default() -> Self {
         Self::new(Config::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose;
+    use base64::Engine;
+
+    #[test]
+    fn parse_invite_placeholder_is_ignored() {
+        let mgr = ChatManager::default();
+
+        let payload = serde_json::json!({
+            "name": "Alice",
+            "address": "YOUR_IP:PORT",
+            "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
+        });
+
+        let json = serde_json::to_string(&payload).unwrap();
+        use base64::engine::general_purpose;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("chat-p2p://invite/{}", encoded);
+
+        let contact = mgr.parse_invite_link(&link).expect("should parse invite");
+        assert!(contact.address.is_none(), "placeholder address must be ignored");
+    }
+
+    #[test]
+    fn parse_invite_with_valid_address_keeps_it() {
+        let mgr = ChatManager::default();
+
+        let payload = serde_json::json!({
+            "name": "Bob",
+            "address": "127.0.0.1:54321",
+            "fingerprint": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
+        });
+
+        let json = serde_json::to_string(&payload).unwrap();
+        use base64::engine::general_purpose;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("chat-p2p://invite/{}", encoded);
+
+        let contact = mgr.parse_invite_link(&link).expect("should parse invite");
+        assert_eq!(contact.address, Some("127.0.0.1:54321".to_string()));
+    }
+
+    #[test]
+    fn parse_invite_invalid_address_no_port() {
+        let mgr = ChatManager::default();
+
+        let payload = serde_json::json!({
+            "name": "Charlie",
+            "address": "127.0.0.1",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
+        });
+
+        let json = serde_json::to_string(&payload).unwrap();
+        use base64::engine::general_purpose;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("chat-p2p://invite/{}", encoded);
+
+        let contact = mgr.parse_invite_link(&link).expect("should parse invite");
+        assert!(contact.address.is_none(), "address without port should be None");
+    }
+
+    #[test]
+    fn parse_invite_invalid_address_bad_port() {
+        let mgr = ChatManager::default();
+
+        let payload = serde_json::json!({
+            "name": "Dana",
+            "address": "127.0.0.1:notaport",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
+        });
+
+        let json = serde_json::to_string(&payload).unwrap();
+        use base64::engine::general_purpose;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("chat-p2p://invite/{}", encoded);
+
+        let contact = mgr.parse_invite_link(&link).expect("should parse invite");
+        assert!(contact.address.is_none(), "address with non-numeric port should be None");
     }
 }

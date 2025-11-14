@@ -614,10 +614,11 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
 
                     // Generate link using actual identity
                     if app.my_invite_link.is_none() {
-                        // For now, we'll use a placeholder address for the invite link.
-                        // In a real-world scenario, this would be the user's public IP and listening port.
-                        let my_address = Some("YOUR_IP:PORT".to_string()); 
-                        match app.identity.generate_invite_link(my_address) {
+                        // Do not include a placeholder address in the generated invite link.
+                        // If the application knows the public IP and listening port it can be
+                        // supplied here; otherwise leave it empty so contacts won't receive
+                        // an invalid/default address like "YOUR_IP:PORT".
+                        match app.identity.generate_invite_link(None) {
                             Ok(link) => {
                                 app.my_invite_link = Some(link);
                             }
