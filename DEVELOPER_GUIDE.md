@@ -145,6 +145,21 @@ pub enum ProtocolMessage {
 }
 ```
 
+### 3.5. Invite Links
+
+Invite links are a convenient way to share contact information. They are base64-encoded JSON objects with the following structure:
+
+```json
+{
+  "name": "Alice",
+  "address": "192.168.1.10:12345", // Optional
+  "fingerprint": "a1b2c3d4e5f6...",
+  "public_key": "-----BEGIN PUBLIC KEY-----\n..."
+}
+```
+
+The `address` field is optional. If it is not included, the recipient will need to manually enter the host and port when connecting.
+
 ## 4. Building and Testing
 
 ### 4.1. Development Setup
@@ -168,6 +183,16 @@ pub enum ProtocolMessage {
 *   **Code Formatting**: `cargo fmt`
 *   **Linter**: `cargo clippy`
 
+#### Invite Link Parsing Tests
+
+The `chat_manager.rs` file contains a test module with several tests for parsing invite links. These tests cover various scenarios, including:
+*   Parsing a link with a placeholder address.
+*   Parsing a link with a valid address.
+*   Parsing a link with an invalid address (no port).
+*   Parsing a link with a bad port.
+
+You can run these tests with `cargo test`.
+
 ## 5. Recent Changes & Bug Fixes
 
 ### 5.1. Version 1.3.0 - Chat Creation & Network Synchronization Fix
@@ -178,7 +203,7 @@ pub enum ProtocolMessage {
     1.  **Enhanced Network Protocol**: Added `SessionEvent::NewConnection` to notify the application layer of new connections, including the `chat_id`.
     2.  **Modified Session Handshake**: The client now sends its `chat_id` to the host after the RSA public key exchange.
     3.  **Updated Connection Flow**: The `connect_to_host()` function now accepts an optional `existing_chat_id` to synchronize the chat ID between peers.
-    4.  **Improved UI Flow**: When "Open chat" is clicked, a local `Chat` is created immediately for UI responsiveness, and the network connection is established in the background.
+    4.  **Improved UI Flow**: When "Open chat" is clicked, a local `Chat` is created immediately for UI responsiveness, and the network connection is established in the background. The "Share My Link" tab now uses `app.identity.generate_invite_link(None)` to generate the invite link.
 
 ### 5.2. History Not Persisting After Installation
 
