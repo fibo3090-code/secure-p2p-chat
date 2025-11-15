@@ -54,7 +54,7 @@ The handshake process is designed to be secure and robust:
 
 ## Reporting Security Issues
 
-If you discover a security vulnerability, please **DO NOT** open a public GitHub issue. Instead, please report the vulnerability by emailing `security@example.com` (replace with a real address). We will investigate all reports and do our best to fix the issue as soon as possible.
+If you discover a security vulnerability, please **DO NOT** open a public GitHub issue. Instead, please report the vulnerability by emailing `[YOUR_SECURITY_EMAIL_ADDRESS_HERE]` (replace with a real address). We will investigate all reports and do our best to fix the issue as soon as possible.
 
 ### Contribution Guidelines
 

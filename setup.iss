@@ -13,14 +13,14 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 DefaultDirName={commonpf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
-OutputBaseFilename={#MyAppExe}-setup-{#MyAppVersion}
+; OutputBaseFilename is now provided by the build script via /F parameter
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 DisableWelcomePage=no
 DisableFinishedPage=no
 UninstallDisplayIcon={app}\{#MyAppExe}
-SetupIconFile=dist\encodeur_rsa_icon.ico
+SetupIconFile=encodeur_rsa_icon.ico
 ; PrivilegesRequired=admin   ; décommente si tu veux forcer l'install système
 
 [Languages]
@@ -28,7 +28,7 @@ Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "dist\encodeur_rsa_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\encodeur_rsa_icon.ico"; DestDir: "{app}"; DestName: "encodeur_rsa_icon.ico"; Flags: ignoreversion
 Source: "dist\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion

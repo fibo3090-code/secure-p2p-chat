@@ -43,7 +43,7 @@ chat-p2p/
 │   └── identity/ (Identity Layer)
 │       └── mod.rs (Persistent RSA keys)
 │
-├── docs/
+
 ├── Cargo.toml
 ├── README.md
 └── SECURITY.md
@@ -193,32 +193,6 @@ The `chat_manager.rs` file contains a test module with several tests for parsing
 
 You can run these tests with `cargo test`.
 
-## 5. Recent Changes & Bug Fixes
+## 5. Recent Changes
 
-### 5.1. Version 1.3.0 - Chat Creation & Network Synchronization Fix
-
-*   **Issue**: When creating a new chat from the contacts list, the chat was created locally but not propagated to the peer instance. Attempting to send messages resulted in a "Message sent locally but all recipients offline" error.
-*   **Root Cause**: The chat creation flow was entirely local. The application created a `Chat` object locally but never initiated a network connection with the peer.
-*   **Solution**:
-    1.  **Enhanced Network Protocol**: Added `SessionEvent::NewConnection` to notify the application layer of new connections, including the `chat_id`.
-    2.  **Modified Session Handshake**: The client now sends its `chat_id` to the host after the RSA public key exchange.
-    3.  **Updated Connection Flow**: The `connect_to_host()` function now accepts an optional `existing_chat_id` to synchronize the chat ID between peers.
-    4.  **Improved UI Flow**: When "Open chat" is clicked, a local `Chat` is created immediately for UI responsiveness, and the network connection is established in the background. The "Share My Link" tab now uses `app.identity.generate_invite_link(None)` to generate the invite link.
-
-### 5.2. History Not Persisting After Installation
-
-*   **Issue**: Conversations and contacts disappeared when the app was closed and reopened, but only when installed via an installer.
-*   **Root Cause**: Using a relative file path (`Downloads/history.json`) for history storage, which caused issues with permissions and inconsistent paths.
-*   **Solution**: Used the `directories` crate to store the history file in the platform-specific user data directory (`%APPDATA%` on Windows, `~/.local/share` on Linux).
-
-### 5.3. Invite Link Same for Everyone
-
-*   **Issue**: The generated invite link was a placeholder and the same for all users.
-*   **Root Cause**: No persistent identity system to generate unique user information.
-*   **Solution**: Implemented a persistent `Identity` module (`src/identity/mod.rs`) that generates and saves a unique RSA key pair and fingerprint for each user. The invite link is now generated from this unique identity.
-
-### 5.4. Group Chat Messages Disappearing
-
-*   **Issue**: Messages sent to group chats would not appear in the history if all participants were offline.
-*   **Root Cause**: The message was only added to the history *after* a successful send attempt. If no one was online, the message was never saved.
-*   **Solution**: The message is now added to the history *before* attempting to send it. A warning is displayed to the user if some or all of the recipients are offline.
+For a detailed history of changes, new features, and bug fixes, please refer to the [CHANGELOG.md](CHANGELOG.md) file.

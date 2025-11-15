@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use egui_tracing::tracing::EventCollector;
 
 pub struct App {
     pub chat_manager: Arc<Mutex<ChatManager>>,
@@ -52,10 +53,13 @@ pub struct App {
     pub fingerprint_to_verify: Option<String>,
     pub peer_name_to_verify: Option<String>,
     pub chat_id_to_verify: Option<Uuid>,
+    pub show_log_terminal: bool,
+    pub show_clear_history_dialog: bool,
+    pub event_collector: EventCollector,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, event_collector: EventCollector) -> Self {
         cc.egui_ctx
             .set_visuals(crate::gui::styling::apply_custom_visuals());
 
@@ -102,9 +106,15 @@ impl App {
             max_file_size: 1024 * 1024 * 1024,
             enable_notifications: true,
             enable_typing_indicators: true,
+            show_log_terminal: false,
+            theme: Theme::Light,
+            font_size: 14,
+            auto_connect: false,
+            notification_sound: NotificationSound::Default,
         };
 
         let mut chat_manager = ChatManager::new(config);
+        let initial_show_log_terminal = chat_manager.config.show_log_terminal;
 
         // Auto-restore conversation history from platform-specific user data directory
         // Windows: %APPDATA%\chat-p2p\history.json
@@ -189,6 +199,9 @@ impl App {
             fingerprint_to_verify: None,
             peer_name_to_verify: None,
             chat_id_to_verify: None,
+            show_log_terminal: initial_show_log_terminal,
+            show_clear_history_dialog: false,
+            event_collector,
         }
     }
 
@@ -239,7 +252,7 @@ impl App {
             }
         });
     }
-}
+} // Add this closing brace
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

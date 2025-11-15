@@ -52,6 +52,9 @@ pub enum MessageContent {
         size: u64,
         path: Option<PathBuf>,
     },
+    Edited {
+        new_text: String,
+    },
 }
 
 /// Toast notification for UI
@@ -134,7 +137,7 @@ pub enum SessionEvent {
 }
 
 /// Application configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub download_dir: PathBuf,
     pub temp_dir: PathBuf,
@@ -142,6 +145,26 @@ pub struct Config {
     pub max_file_size: u64,
     pub enable_notifications: bool,
     pub enable_typing_indicators: bool,
+    pub show_log_terminal: bool,
+    pub theme: Theme,
+    pub font_size: u8,
+    pub auto_connect: bool,
+    pub notification_sound: NotificationSound,
+}
+
+/// Theme options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+/// Notification sound options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationSound {
+    None,
+    Default,
+    // Vibrate (for mobile, if applicable)
 }
 
 impl Default for Config {
@@ -153,6 +176,11 @@ impl Default for Config {
             max_file_size: 1024 * 1024 * 1024, // 1 GB
             enable_notifications: true,
             enable_typing_indicators: true,
+            show_log_terminal: false,
+            theme: Theme::Dark,
+            font_size: 14,
+            auto_connect: false,
+            notification_sound: NotificationSound::Default,
         }
     }
 }

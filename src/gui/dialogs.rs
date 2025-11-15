@@ -2,6 +2,8 @@ use crate::gui::app_ui::App;
 use eframe::egui;
 use crate::gui::widgets::ColorGrid;
 use crate::util::generate_color_grid;
+use egui_tracing::ui::Logs;
+
 
 pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
     if app.show_welcome {
@@ -46,6 +48,14 @@ pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
 
     if app.show_fingerprint_dialog {
         render_fingerprint_dialog(app, ctx);
+    }
+
+    if app.show_log_terminal {
+        render_log_terminal(app, ctx);
+    }
+
+    if app.show_clear_history_dialog {
+        render_clear_history_dialog(app, ctx);
     }
 }
 
@@ -415,16 +425,6 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
             // Tabs - use simple buttons instead of selectable_label to avoid checkboxes
             ui.horizontal(|ui| {
                 if ui
-                    .button(egui::RichText::new("📝 Manual").color(if app.contact_tab == 0 {
-                        crate::gui::styling::ACCENT_PRIMARY
-                    } else {
-                        crate::gui::styling::SUBTLE_TEXT_COLOR
-                    }))
-                    .clicked()
-                {
-                    app.contact_tab = 0;
-                }
-                if ui
                     .button(egui::RichText::new("🔗 Invite Link").color(if app.contact_tab == 1 {
                         crate::gui::styling::ACCENT_PRIMARY
                     } else {
@@ -433,6 +433,16 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     .clicked()
                 {
                     app.contact_tab = 1;
+                }
+                if ui
+                    .button(egui::RichText::new("📝 Manual").color(if app.contact_tab == 0 {
+                        crate::gui::styling::ACCENT_PRIMARY
+                    } else {
+                        crate::gui::styling::SUBTLE_TEXT_COLOR
+                    }))
+                    .clicked()
+                {
+                    app.contact_tab = 0;
                 }
                 if ui
                     .button(egui::RichText::new("📤 Share My Link").color(if app.contact_tab == 2 {
@@ -518,7 +528,16 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("✨ Easy way: Just paste an invite link from your friend!");
                     ui.add_space(10.0);
 
-                    ui.label("Paste invite link (chat-p2p://invite/...");
+                    ui.horizontal(|ui| {
+                        ui.label("Paste invite link (chat-p2p://invite/...");
+                        if ui.button("📋 Paste").clicked() {
+                            if let Some(mut clipboard) = arboard::Clipboard::new().ok() {
+                                if let Ok(text) = clipboard.get_text() {
+                                    app.invite_link_input = text;
+                                }
+                            }
+                        }
+                    });
                     ui.text_edit_singleline(&mut app.invite_link_input);
 
                     if !app.invite_link_input.is_empty() {
@@ -943,6 +962,7 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                                 );
                                 // Save history to persist changes
                                 let _ = manager.save_history(&app.history_path);
+                                ctx.request_repaint();
                             }
                         }
                         app.show_rename_dialog = false;
@@ -962,6 +982,7 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         let _ = manager.rename_chat(chat_id, app.rename_input.clone());
                         let _ = manager.save_history(&app.history_path);
+                        ctx.request_repaint();
                     }
                     app.show_rename_dialog = false;
                     app.rename_chat_id = None;
@@ -986,37 +1007,121 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     if ui.button("📁 Browse").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             manager.config.download_dir = path;
+                            let _ = manager.save_history(&app.history_path);
                         }
                     }
                 });
 
                 ui.add_space(10.0);
 
-                ui.checkbox(
+                if ui.checkbox(
                     &mut manager.config.auto_accept_files,
                     "Auto-accept file transfers",
-                );
+                ).changed() {
+                    let _ = manager.save_history(&app.history_path);
+                }
 
                 ui.add_space(10.0);
 
                 ui.label("Maximum file size:");
                 let mut max_size_mb = (manager.config.max_file_size / (1024 * 1024)) as u32;
-                ui.add(egui::Slider::new(&mut max_size_mb, 1..=10240).suffix(" MB"));
-                manager.config.max_file_size = (max_size_mb as u64) * 1024 * 1024;
+                if ui.add(egui::Slider::new(&mut max_size_mb, 1..=10240).suffix(" MB")).changed() {
+                    manager.config.max_file_size = (max_size_mb as u64) * 1024 * 1024;
+                    let _ = manager.save_history(&app.history_path);
+                }
 
                 ui.add_space(10.0);
 
-                ui.checkbox(
+                if ui.checkbox(
                     &mut manager.config.enable_notifications,
                     "Enable desktop notifications",
-                );
+                ).changed() {
+                    let _ = manager.save_history(&app.history_path);
+                }
 
                 ui.add_space(10.0);
 
-                ui.checkbox(
+                if ui.checkbox(
                     &mut manager.config.enable_typing_indicators,
                     "Enable typing indicators",
-                );
+                ).changed() {
+                    let _ = manager.save_history(&app.history_path);
+                }
+
+                ui.add_space(10.0);
+
+                // Theme selection
+                ui.horizontal(|ui| {
+                    ui.label("Theme:");
+                    if egui::ComboBox::from_label("")
+                        .selected_text(format!("{:?}", manager.config.theme))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Light, "Light").changed() ||
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Dark, "Dark").changed()
+                        }).inner.unwrap_or(false) {
+                            let _ = manager.save_history(&app.history_path);
+                            // Apply theme immediately
+                            ctx.set_visuals(crate::gui::styling::apply_custom_visuals());
+                        }
+                });
+
+                ui.add_space(10.0);
+
+                // Font size slider
+                ui.horizontal(|ui| {
+                    ui.label("Font Size:");
+                    if ui.add(egui::Slider::new(&mut manager.config.font_size, 10..=20).suffix("px")).changed() {
+                        let _ = manager.save_history(&app.history_path);
+                        // Apply font size immediately
+                        let mut style = (*ctx.style()).clone();
+                        style.text_styles.get_mut(&egui::TextStyle::Body).map(|s| s.size = manager.config.font_size as f32);
+                        style.text_styles.get_mut(&egui::TextStyle::Button).map(|s| s.size = manager.config.font_size as f32);
+                        ctx.set_style(style);
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                // Auto-connect checkbox
+                if ui.checkbox(
+                    &mut manager.config.auto_connect,
+                    "Auto-connect to last known peer",
+                ).changed() {
+                    let _ = manager.save_history(&app.history_path);
+                }
+
+                ui.add_space(10.0);
+
+                // Notification sound selection
+                ui.horizontal(|ui| {
+                    ui.label("Notification Sound:");
+                    if egui::ComboBox::from_label("")
+                        .selected_text(format!("{:?}", manager.config.notification_sound))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::None, "None").changed() ||
+                            ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::Default, "Default").changed()
+                        }).inner.unwrap_or(false) {
+                            let _ = manager.save_history(&app.history_path);
+                        }
+                });
+
+                ui.add_space(10.0);
+
+                let mut show_log = app.show_log_terminal;
+                if ui.checkbox(&mut show_log, "Show Log Terminal").changed() {
+                    app.show_log_terminal = show_log;
+                    manager.config.show_log_terminal = show_log;
+                    let _ = manager.save_history(&app.history_path);
+                }
+            }
+
+            ui.add_space(20.0);
+            ui.heading("Danger Zone");
+            ui.separator();
+            ui.add_space(10.0);
+
+            if crate::gui::widgets::primary_button(ui, "Clear Chat History").clicked() {
+                app.show_clear_history_dialog = true;
             }
 
             ui.add_space(10.0);
@@ -1024,6 +1129,32 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
                     app.show_settings = false;
+                }
+            });
+        });
+}
+
+fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
+    egui::Window::new("⚠️ Clear Chat History")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Are you sure you want to clear all chat history?");
+            ui.label(egui::RichText::new("This action cannot be undone and will delete all messages and contacts.").color(crate::gui::styling::ERROR));
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if crate::gui::widgets::primary_button(ui, "❌ Clear All").clicked() {
+                    if let Ok(mut manager) = app.chat_manager.try_lock() {
+                        manager.clear_history(&app.history_path);
+                        app.selected_chat = None;
+                        manager.add_toast(crate::types::ToastLevel::Success, "Chat history cleared!".to_string());
+                    }
+                    app.show_clear_history_dialog = false;
+                }
+                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
+                    app.show_clear_history_dialog = false;
                 }
             });
         });
@@ -1061,5 +1192,16 @@ fn render_about_dialog(app: &mut App, ctx: &egui::Context) {
                     app.show_about = false;
                 }
             });
+        });
+}
+
+fn render_log_terminal(_app: &mut App, ctx: &egui::Context) {
+    egui::Window::new("Log Terminal")
+        .collapsible(true)
+        .resizable(true)
+        .default_width(600.0)
+        .default_height(400.0)
+        .show(ctx, |ui| {
+            ui.add(Logs::new(_app.event_collector.clone()));
         });
 }

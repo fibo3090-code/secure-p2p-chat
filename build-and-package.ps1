@@ -6,7 +6,7 @@
 #>
 
 param(
-  [string]$Version = "1.2.0",
+  [string]$Version = "1.3.0",
   [string]$Configuration = "release",
   [string]$Target = "x86_64-pc-windows-msvc",
   [string]$InnoPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -25,17 +25,20 @@ Write-Host "Target: $Target"
 $BinaryName = "encodeur_rsa_rust.exe"
 $BinaryBase = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
 
+# Determine repository root based on script location
+$RepoRoot = (Get-Item $PSScriptRoot).FullName
+Set-Location $RepoRoot
+
 # 1) Build release
 Write-Host "`n=== cargo build --release ==="
 cargo build --release --target $Target
 
 # 2) Prepare dist folder
-$RepoRoot = (Get-Location)
 $Dist = Join-Path -Path $RepoRoot -ChildPath "dist"
 if (Test-Path $Dist) { Remove-Item $Dist -Recurse -Force }
 New-Item -ItemType Directory -Path $Dist | Out-Null
 
-$BuiltBinary = Join-Path -Path (Join-Path -Path "target" -ChildPath $Target) -ChildPath (Join-Path -Path "release" -ChildPath $BinaryName)
+$BuiltBinary = Join-Path -Path $RepoRoot -ChildPath "target/$Target/release/$BinaryName"
 if (-not (Test-Path $BuiltBinary)) {
     Write-Error "Built binary not found at $BuiltBinary. Check target and binary name."
     exit 1
@@ -44,8 +47,8 @@ if (-not (Test-Path $BuiltBinary)) {
 Copy-Item $BuiltBinary -Destination (Join-Path $Dist $BinaryName)
 
 # Ensure documentation and LICENSE.md end up in dist. Prefer repo root README/LICENSE.md.
-if (Test-Path ".\README.md") {
-    Copy-Item ".\README.md" -Destination (Join-Path $Dist "README.md") -Force
+if (Test-Path (Join-Path $RepoRoot "README.md")) {
+    Copy-Item (Join-Path $RepoRoot "README.md") -Destination (Join-Path $Dist "README.md") -Force
 } elseif (Test-Path (Join-Path $RepoRoot "docs\Community\README.md")) {
     Copy-Item (Join-Path $RepoRoot "docs\Community\README.md") -Destination (Join-Path $Dist "README.md") -Force
 } else {
@@ -59,8 +62,8 @@ if (Test-Path ".\README.md") {
     Set-Content -Path $placeholderPath -Value $placeholder -Encoding UTF8
 }
 
-if (Test-Path ".\LICENSE.md") {
-    Copy-Item ".\LICENSE.md" -Destination (Join-Path $Dist "LICENSE.md") -Force
+if (Test-Path (Join-Path $RepoRoot "LICENSE.md")) {
+    Copy-Item (Join-Path $RepoRoot "LICENSE.md") -Destination (Join-Path $Dist "LICENSE.md") -Force
 } elseif (Test-Path (Join-Path $RepoRoot "docs\Community\LICENSE.md")) {
     Copy-Item (Join-Path $RepoRoot "docs\Community\LICENSE.md") -Destination (Join-Path $Dist "LICENSE.md") -Force
 } else {
@@ -76,8 +79,10 @@ $IconPathCandidates = @(
 )
 $FoundIcon = $null
 foreach ($p in $IconPathCandidates) {
-    if ([string]::IsNullOrWhiteSpace($p)) { continue }
-    if (Test-Path $p) { $FoundIcon = (Resolve-Path $p).Path; break }
+    if (-not ([string]::IsNullOrWhiteSpace($p)) -and (Test-Path $p)) {
+        $FoundIcon = (Resolve-Path $p).Path
+        break
+    }
 }
 if ($FoundIcon) {
     Write-Host "Copying icon from $FoundIcon to $Dist"
@@ -86,9 +91,10 @@ if ($FoundIcon) {
     Write-Host "No icon found at candidates: $($IconPathCandidates -join ' ; ') - continuing without icon."
 }
 
-# 4) Create zip artifact (optional)
-if (-not (Test-Path "release")) { New-Item -ItemType Directory -Path "release" | Out-Null }
-$zipOut = Join-Path -Path "release" -ChildPath ("$BinaryBase-$Version-windows-x64.zip")
+# 4) Create zip artifact
+$ReleaseDir = Join-Path $RepoRoot "release"
+if (-not (Test-Path $ReleaseDir)) { New-Item -ItemType Directory -Path $ReleaseDir | Out-Null }
+$zipOut = Join-Path -Path $ReleaseDir -ChildPath ("$BinaryBase-$Version-windows-x64.zip")
 if (Test-Path $zipOut) { Remove-Item $zipOut -Force }
 Write-Host "`nCreating zip $zipOut ..."
 Compress-Archive -Path (Join-Path $Dist '*') -DestinationPath $zipOut
@@ -100,14 +106,15 @@ if (-not (Test-Path $InnoPath)) {
 }
 
 $issPath = Join-Path $RepoRoot "setup.iss"
-$defines = "/DMyAppVersion=`"$Version`""
+$ExpectedSetupName = "$BinaryBase-setup-$Version.exe"
+$OutputDir = Join-Path $RepoRoot "Output"
+if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+$SetupPath = Join-Path $OutputDir $ExpectedSetupName
+$defines = "/DMyAppVersion=`"$Version`" /O`"$OutputDir`" /F`"$ExpectedSetupName`""
 Write-Host "`nRunning Inno Setup: $InnoPath $defines $issPath"
 & $InnoPath $defines $issPath
 
 # 6) Signing (optional) - sign the resulting installer if PFX provided
-$ExpectedSetupName = "$BinaryBase-setup-$Version.exe"
-$OutputDir = Join-Path $RepoRoot "Output"
-$SetupPath = Join-Path $OutputDir $ExpectedSetupName
 
 if ($PfxPath -and (Test-Path $PfxPath)) {
     Write-Host "`nPFX provided - attempting to sign the installer..."
@@ -122,27 +129,13 @@ if ($PfxPath -and (Test-Path $PfxPath)) {
         Write-Warning "signtool.exe not found. Install Windows SDK or provide -SignToolPath. Skipping signing."
     } else {
         if (-not (Test-Path $SetupPath)) {
-            # try to locate last exe in Output
-            $alt = Get-ChildItem -Path $OutputDir -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($alt) { $SetupPath = $alt.FullName }
-        }
-        if (-not (Test-Path $SetupPath)) {
             Write-Warning "Installer not found in Output: $SetupPath. Skipping signing."
         } else {
             $signArgs = @('sign')
             $signArgs += '/f'; $signArgs += $PfxPath
             if ($PfxPassword -ne $null) {
-                $bstr = $null
-                try {
-                    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($PfxPassword)
-                    $plainPwd = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-                    if (-not [string]::IsNullOrEmpty($plainPwd)) {
-                        $signArgs += '/p'; $signArgs += $plainPwd
-                    }
-                } finally {
-                    if ($bstr) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-                    Remove-Variable plainPwd -ErrorAction SilentlyContinue
-                }
+                $plainPwd = ConvertFrom-SecureString -SecureString $PfxPassword -AsPlainText
+                $signArgs += '/p'; $signArgs += $plainPwd
             }
             $signArgs += '/tr'; $signArgs += 'http://timestamp.digicert.com'
             $signArgs += '/td'; $signArgs += 'sha256'
@@ -151,7 +144,11 @@ if ($PfxPath -and (Test-Path $PfxPath)) {
 
             Write-Host "Signing with: $signtool $($signArgs -join ' ')"
             $proc = Start-Process -FilePath $signtool -ArgumentList $signArgs -Wait -NoNewWindow -PassThru
-            if ($proc.ExitCode -eq 0) { Write-Host "Signing successful: $SetupPath" } else { Write-Warning "signtool failed with exit code $($proc.ExitCode)" }
+            if ($plainPwd) { Clear-Variable plainPwd } # Clear the plain text password from memory
+
+            if ($proc.ExitCode -eq 0) {
+                Write-Host "Signing successful: $SetupPath"
+            } else { Write-Warning "signtool failed with exit code $($proc.ExitCode)" }
         }
     }
 } else {

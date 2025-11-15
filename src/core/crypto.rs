@@ -1,6 +1,6 @@
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
 use hkdf::Hkdf;
@@ -142,11 +142,8 @@ impl AesCipher {
     /// Create new cipher from 32-byte key
     pub fn new(key: &[u8]) -> Self {
         assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
-        // Use TryFrom to construct key from slice (avoids deprecated GenericArray::from_slice)
-        let key = Key::<Aes256Gcm>::try_from(key).expect("Invalid AES key length");
         Self {
-            // Aes256Gcm::new accepts a reference to the key array
-            cipher: Aes256Gcm::new(&key),
+            cipher: Aes256Gcm::new_from_slice(key).expect("Invalid AES key length"),
         }
     }
 

@@ -1,13 +1,13 @@
 # 🔒 Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.3.0-blue)](https://github.com/yourusername/chat-p2p)
-[![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
-[![Security](https://img.shields.io/badge/security-audited-success)](DEVELOPER_GUIDE.md#5-security)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue)](#)
+[![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
+[![Security](https://img.shields.io/badge/security-audited-success)](#)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/)
 
 > **Secure, private, peer-to-peer messaging with end-to-end encryption and forward secrecy.**
 
-A modern desktop application for encrypted messaging over local networks (LAN) or VPN, built with **Rust** and **egui**. It implements industry-standard encryption with no central server.
+A modern desktop application for encrypted messaging over local networks (LAN) or VPN, built with **Rust** and **egui**. It implements industry-standard encryption and has no central server.
 
 [Quick Start](#-quick-start) • [Documentation](#-documentation) • [Contributing](CONTRIBUTING.md)
 
@@ -51,9 +51,11 @@ When you connect to another user, you must verify their fingerprint to prevent m
 ---
 
 ## 📚 Documentation
+All project documentation is located in the root of the repository, not in a separate 'docs/' folder.
 
-- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: Technical details for developers and contributors, including architecture, protocol specifications, and full feature list.
-- **[ROADMAP.md](ROADMAP.md)**: The development roadmap and future plans.
+- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: The primary technical guide covering architecture, protocols, and build instructions.
+- **[ROADMAP.md](ROADMAP.md)**: Outlines the development roadmap and future plans.
+- **[SECURITY.md](SECURITY.md)**: Details the project's security policy and threat model.
 
 ---
 
@@ -65,4 +67,4 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for deta
 
 ## 📜 License
 
-This project is licensed under the **MIT License** - see [LICENSE](LICENSE) for details.
+This project is licensed under the **MIT License** - see [LICENSE.md](LICENSE.md) for details.

@@ -154,47 +154,22 @@ impl ChatManager {
         let mut sent_count = 0;
         let mut offline_contacts = Vec::new();
 
-        for contact_id in participants {
-            if let Some(contact) = self.contacts.get(&contact_id) {
-                if let Some(one_chat_id) = self.contact_to_chat.get(&contact_id) {
+        for participant_id in participants {
+            if let Some(contact) = self.contacts.get(&participant_id) {
+                if let Some(one_chat_id) = self.contact_to_chat.get(&participant_id) {
                     if let Some(session) = self.sessions.get(one_chat_id) {
                         if session.from_app_tx.send(msg.clone()).is_ok() {
                             sent_count += 1;
                         }
                     } else {
-                        // Contact has a chat but no session, try to connect
                         offline_contacts.push(contact.name.clone());
-                        let mut manager = self.clone();
-                        let contact_id_clone = contact_id;
-                        tokio::spawn(async move {
-                            if manager
-                                .connect_to_contact(contact_id_clone, None)
-                                .await
-                                .is_ok()
-                            {
-                                // After connecting, we could try to send the message again,
-                                // but for simplicity, we'll just establish the connection for next time.
-                            }
-                        });
                     }
                 } else {
-                    // Contact has no chat, try to connect
                     offline_contacts.push(contact.name.clone());
-                    let mut manager = self.clone();
-                    let contact_id_clone = contact_id;
-                    tokio::spawn(async move {
-                        if manager
-                            .connect_to_contact(contact_id_clone, None)
-                            .await
-                            .is_ok()
-                        {
-                            // After connecting, we could try to send the message again,
-                            // but for simplicity, we'll just establish the connection for next time.
-                        }
-                    });
                 }
             }
         }
+
 
         // Show toast notification about offline participants
         if !offline_contacts.is_empty() {
@@ -533,6 +508,23 @@ impl ChatManager {
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
     }
 
+    /// Clear all chat history and contacts
+    pub fn clear_history(&mut self, history_path: &std::path::PathBuf) {
+        self.chats.clear();
+        self.contacts.clear();
+        self.contact_to_chat.clear();
+        self.sessions.clear();
+        self.session_events.clear();
+        self.fingerprint_confirm_senders.clear();
+        self.active_transfers.clear();
+        self.incoming_files.clear();
+        self.toasts.clear();
+        self.fingerprint_verification_request = None;
+
+        // Save empty history to disk
+        let _ = self.save_history(history_path);
+    }
+
     /// Send the user's accept/reject decision for a fingerprint verification to the session task
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
@@ -560,6 +552,18 @@ impl ChatManager {
             .to_string();
 
         let file_size = tokio::fs::metadata(&path).await?.len();
+
+        if file_size > crate::MAX_PACKET_SIZE as u64 {
+            self.add_toast(
+                ToastLevel::Error,
+                format!(
+                    "File is too large ({} > {} bytes)",
+                    file_size,
+                    crate::MAX_PACKET_SIZE
+                ),
+            );
+            return Err(anyhow::anyhow!("File is too large"));
+        }
 
         // Send file metadata
         let meta_msg = ProtocolMessage::FileMeta {

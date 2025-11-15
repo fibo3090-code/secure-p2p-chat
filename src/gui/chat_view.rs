@@ -354,6 +354,13 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                         }
                     }
                 }
+                MessageContent::Edited { new_text } => {
+                    ui.label(
+                        egui::RichText::new(format!("{} (Edited)", new_text))
+                            .color(crate::gui::styling::TEXT_PRIMARY)
+                            .size(14.0),
+                    );
+                }
             }
 
             ui.add_space(2.0);

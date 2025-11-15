@@ -1,6 +1,9 @@
 use clap::Parser;
 
 use encodeur_rsa_rust::*;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use egui_tracing::tracing::EventCollector;
 
 #[derive(Parser)]
 #[command(author, version, about = "P2P Encrypted Messaging Application")]
@@ -25,11 +28,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let event_collector = EventCollector::new();
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,encodeur_rsa_rust=debug".into()),
         )
+        .with(event_collector.clone())
         .init();
 
     let args = Args::parse();
@@ -48,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = eframe::run_native(
             "Encrypted P2P Messenger",
             native_options,
-            Box::new(|cc| Box::new(gui::App::new(cc))),
+            Box::new(|cc| Ok(Box::new(gui::App::new(cc, event_collector.clone())))),
         );
     } else if args.host {
         // CLI host mode
