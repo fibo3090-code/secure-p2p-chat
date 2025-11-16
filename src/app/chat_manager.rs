@@ -45,6 +45,24 @@ pub struct ChatManager {
 }
 
 impl ChatManager {
+    /// Parse an address of the form host:port
+    /// Returns (host, port) or an error if the format is invalid.
+    fn parse_address(address: &str) -> Result<(String, u16)> {
+        let parts: Vec<&str> = address.split(':').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid address format for contact"));
+        }
+        let host = parts[0].trim();
+        let port: u16 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid port in contact address"))?;
+        if host.is_empty() {
+            return Err(anyhow::anyhow!("Host is empty in contact address"));
+        }
+        Ok((host.to_string(), port))
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             chats: HashMap::new(),
@@ -251,7 +269,7 @@ impl ChatManager {
         self.chats.insert(chat_id, chat);
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
         self.session_events.insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
-    self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
+        self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
@@ -331,6 +349,7 @@ impl ChatManager {
             if has_session {
                 return Ok(mapped);
             }
+
             // Try to re-associate to an existing active session by fingerprint first
             if let Some(fp) = contact.fingerprint.clone() {
                 if let Some((&active_chat_id, _)) = self
@@ -345,15 +364,11 @@ impl ChatManager {
             }
             // Otherwise, if the contact has an address, start a connection using the mapped chat id
             if let Some(address) = contact.address.clone() {
-                let parts: Vec<&str> = address.split(':').collect();
-                if parts.len() == 2 {
-                    let host = parts[0];
-                    if let Ok(port) = parts[1].parse::<u16>() {
-                        tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
-                        let chat_id = self.connect_to_host(host, port, Some(mapped)).await?;
-                        self.associate_contact_with_chat(contact_id, chat_id);
-                        return Ok(chat_id);
-                    }
+                if let Ok((host, port)) = Self::parse_address(&address) {
+                    tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
+                    let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
+                    self.associate_contact_with_chat(contact_id, chat_id);
+                    return Ok(chat_id);
                 }
             }
             // No way to create a session yet; fall through to fingerprint/address logic below
@@ -361,20 +376,11 @@ impl ChatManager {
 
         tracing::debug!("connect_to_contact: id={}, has_address={}, has_fp={}", contact_id, contact.address.is_some(), contact.fingerprint.is_some());
         if let Some(address) = contact.address.clone() {
-            let parts: Vec<&str> = address.split(':').collect();
-            if parts.len() == 2 {
-                let host = parts[0];
-                if let Ok(port) = parts[1].parse::<u16>() {
-                    tracing::info!("Connecting to contact {} via {}:{}", contact_id, host, port);
-                    let chat_id = self.connect_to_host(host, port, existing_chat_id).await?;
-                    self.associate_contact_with_chat(contact_id, chat_id);
-                    Ok(chat_id)
-                } else {
-                    Err(anyhow::anyhow!("Invalid port in contact address"))
-                }
-            } else {
-                Err(anyhow::anyhow!("Invalid address format for contact"))
-            }
+            let (host, port) = Self::parse_address(&address)?;
+            tracing::info!("Connecting to contact {} via {}:{}", contact_id, host, port);
+            let chat_id = self.connect_to_host(&host, port, existing_chat_id).await?;
+            self.associate_contact_with_chat(contact_id, chat_id);
+            Ok(chat_id)
         } else {
             // Try to match an existing active session by fingerprint
             if let Some(fp) = contact.fingerprint.clone() {
