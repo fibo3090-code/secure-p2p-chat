@@ -1,9 +1,8 @@
 use crate::gui::app_ui::App;
-use eframe::egui;
 use crate::gui::widgets::ColorGrid;
 use crate::util::generate_color_grid;
+use eframe::egui;
 use egui_tracing::ui::Logs;
-
 
 pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
     if app.show_welcome {
@@ -440,31 +439,37 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
             // Tabs - use simple buttons instead of selectable_label to avoid checkboxes
             ui.horizontal(|ui| {
                 if ui
-                    .button(egui::RichText::new("🔗 Invite Link").color(if app.contact_tab == 1 {
-                        crate::gui::styling::ACCENT_PRIMARY
-                    } else {
-                        crate::gui::styling::SUBTLE_TEXT_COLOR
-                    }))
+                    .button(
+                        egui::RichText::new("🔗 Invite Link").color(if app.contact_tab == 1 {
+                            crate::gui::styling::ACCENT_PRIMARY
+                        } else {
+                            crate::gui::styling::SUBTLE_TEXT_COLOR
+                        }),
+                    )
                     .clicked()
                 {
                     app.contact_tab = 1;
                 }
                 if ui
-                    .button(egui::RichText::new("📝 Manual").color(if app.contact_tab == 0 {
-                        crate::gui::styling::ACCENT_PRIMARY
-                    } else {
-                        crate::gui::styling::SUBTLE_TEXT_COLOR
-                    }))
+                    .button(
+                        egui::RichText::new("📝 Manual").color(if app.contact_tab == 0 {
+                            crate::gui::styling::ACCENT_PRIMARY
+                        } else {
+                            crate::gui::styling::SUBTLE_TEXT_COLOR
+                        }),
+                    )
                     .clicked()
                 {
                     app.contact_tab = 0;
                 }
                 if ui
-                    .button(egui::RichText::new("📤 Share My Link").color(if app.contact_tab == 2 {
-                        crate::gui::styling::ACCENT_PRIMARY
-                    } else {
-                        crate::gui::styling::SUBTLE_TEXT_COLOR
-                    }))
+                    .button(egui::RichText::new("📤 Share My Link").color(
+                        if app.contact_tab == 2 {
+                            crate::gui::styling::ACCENT_PRIMARY
+                        } else {
+                            crate::gui::styling::SUBTLE_TEXT_COLOR
+                        },
+                    ))
                     .clicked()
                 {
                     app.contact_tab = 2;
@@ -545,12 +550,11 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
 
                     ui.horizontal(|ui| {
                         ui.label("Paste invite link (chat-p2p://invite/...");
-                        if ui.button("📋 Paste").clicked() {
-                            if let Some(mut clipboard) = arboard::Clipboard::new().ok() {
-                                if let Ok(text) = clipboard.get_text() {
-                                    app.invite_link_input = text;
-                                }
-                            }
+                        if ui.button("📋 Paste").clicked()
+                            && let Ok(mut clipboard) = arboard::Clipboard::new()
+                            && let Ok(text) = clipboard.get_text()
+                        {
+                            app.invite_link_input = text;
                         }
                     });
                     ui.text_edit_singleline(&mut app.invite_link_input);
@@ -566,7 +570,8 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                                 Ok(contact) => {
                                     app.new_contact_name = contact.name;
                                     app.new_contact_address = contact.address.unwrap_or_default();
-                                    app.new_contact_fingerprint = contact.fingerprint.unwrap_or_default();
+                                    app.new_contact_fingerprint =
+                                        contact.fingerprint.unwrap_or_default();
                                     app.new_contact_pubkey = contact.public_key.unwrap_or_default();
                                 }
                                 Err(e) => {
@@ -672,7 +677,8 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(link).monospace());
-                                if crate::gui::widgets::secondary_button(ui, "📋 Copy").clicked() {
+                                if crate::gui::widgets::secondary_button(ui, "📋 Copy").clicked()
+                                {
                                     ui.output_mut(|o| o.copied_text = link.clone());
                                 }
                             });
@@ -951,7 +957,7 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-  fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
+fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
     if let Some(chat_id) = app.rename_chat_id {
         egui::Window::new("Rename Conversation")
             .collapsible(false)
@@ -1004,10 +1010,10 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                     app.rename_input.clear();
                 }
             });
-        }
     }
+}
 
-    fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
+fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("⚙️ Settings")
         .collapsible(false)
         .resizable(false)
@@ -1048,12 +1054,12 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     ui.label("Listen port:");
                     let mut port_str = manager.config.listen_port.to_string();
-                    if ui.text_edit_singleline(&mut port_str).changed() {
-                        if let Ok(p) = port_str.parse::<u16>() {
-                            manager.config.listen_port = p;
-                            app.host_port = p.to_string(); // keep Host dialog in sync
-                            let _ = manager.save_history(&app.history_path);
-                        }
+                    if ui.text_edit_singleline(&mut port_str).changed()
+                        && let Ok(p) = port_str.parse::<u16>()
+                    {
+                        manager.config.listen_port = p;
+                        app.host_port = p.to_string(); // keep Host dialog in sync
+                        let _ = manager.save_history(&app.history_path);
                     }
                 });
 
@@ -1078,11 +1084,11 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                 ui.label("Download Directory:");
                 ui.horizontal(|ui| {
                     ui.label(manager.config.download_dir.display().to_string());
-                    if ui.button("📁 Browse").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            manager.config.download_dir = path;
-                            let _ = manager.save_history(&app.history_path);
-                        }
+                    if ui.button("📁 Browse").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        manager.config.download_dir = path;
+                        let _ = manager.save_history(&app.history_path);
                     }
                 });
 
@@ -1148,8 +1154,12 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
                         let _ = manager.save_history(&app.history_path);
                         // Apply font size immediately
                         let mut style = (*ctx.style()).clone();
-                        style.text_styles.get_mut(&egui::TextStyle::Body).map(|s| s.size = manager.config.font_size as f32);
-                        style.text_styles.get_mut(&egui::TextStyle::Button).map(|s| s.size = manager.config.font_size as f32);
+                        if let Some(s) = style.text_styles.get_mut(&egui::TextStyle::Body) {
+                            s.size = manager.config.font_size as f32;
+                        }
+                        if let Some(s) = style.text_styles.get_mut(&egui::TextStyle::Button) {
+                            s.size = manager.config.font_size as f32;
+                        }
                         ctx.set_style(style);
                     }
                 });
@@ -1215,7 +1225,12 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.label("Are you sure you want to clear all chat history?");
-            ui.label(egui::RichText::new("This action cannot be undone and will delete all messages and contacts.").color(crate::gui::styling::ERROR));
+            ui.label(
+                egui::RichText::new(
+                    "This action cannot be undone and will delete all messages and contacts.",
+                )
+                .color(crate::gui::styling::ERROR),
+            );
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
@@ -1223,7 +1238,10 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         manager.clear_history(&app.history_path);
                         app.selected_chat = None;
-                        manager.add_toast(crate::types::ToastLevel::Success, "Chat history cleared!".to_string());
+                        manager.add_toast(
+                            crate::types::ToastLevel::Success,
+                            "Chat history cleared!".to_string(),
+                        );
                     }
                     app.show_clear_history_dialog = false;
                 }
