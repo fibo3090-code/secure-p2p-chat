@@ -301,6 +301,37 @@ impl eframe::App for App {
                     LAST_SAVE = Some(now);
                 }
             }
+
+            // Auto-rehost: if auto-host is enabled and no placeholder host chat exists,
+            // spawn a new host to replace the one that was consumed by a connection.
+            if manager.config.auto_host_on_startup {
+                let has_placeholder = manager
+                    .chats
+                    .values()
+                    .any(|c| c.title.starts_with("Host on :"));
+                if !has_placeholder {
+                    static mut LAST_REHOST: Option<std::time::Instant> = None;
+                    unsafe {
+                        let now = std::time::Instant::now();
+                        let should_rehost = LAST_REHOST
+                            .is_none_or(|last| now.duration_since(last).as_millis() > 1500);
+                        if should_rehost {
+                            let port = manager.config.listen_port;
+                            let mgr_arc = self.chat_manager.clone();
+                            tokio::spawn(async move {
+                                let mut mgr = mgr_arc.lock().await;
+                                if let Err(e) = mgr.start_host(port).await {
+                                    mgr.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Failed to re-start host: {}", e),
+                                    );
+                                }
+                            });
+                            LAST_REHOST = Some(now);
+                        }
+                    }
+                }
+            }
         }
 
         // Top panel - Menu bar
