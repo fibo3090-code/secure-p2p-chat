@@ -1,11 +1,11 @@
 ; setup.iss - Inno Setup script for Encrypted P2P Messenger
-; Call: ISCC.exe /DMyAppVersion="1.3.0" setup.iss
+; Call: ISCC.exe /DMyAppVersion="1.3.1" setup.iss
 
 #define MyAppName "Encrypted P2P Messenger"
 #define MyAppExe "encodeur_rsa_rust.exe"
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.3.0"
+  #define MyAppVersion "1.3.1"
 #endif
 ; Define icon only if it exists in dist
 #if FileExists("dist\encodeur_rsa_icon.ico")
