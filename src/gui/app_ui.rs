@@ -325,6 +325,11 @@ impl eframe::App for App {
                                         crate::types::ToastLevel::Error,
                                         format!("Failed to re-start host: {}", e),
                                     );
+                                } else {
+                                    mgr.add_toast(
+                                        crate::types::ToastLevel::Success,
+                                        "Host relancé".to_string(),
+                                    );
                                 }
                             });
                             LAST_REHOST = Some(now);

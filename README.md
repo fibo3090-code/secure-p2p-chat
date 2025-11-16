@@ -1,6 +1,6 @@
 # 🔒 Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.3.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.3.1-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
 [![Security](https://img.shields.io/badge/security-audited-success)](#)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/)
@@ -34,6 +34,7 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
 - **Emoji picker** and drag & drop files
 - **Invite links + QR codes** to onboard contacts quickly
 - **Local persistence** of history and identity (no server)
+- **Auto-host + Auto-rehost**: optional auto-start listening on launch and automatic re-listen after a connection consumes the placeholder host
 
 ---
 

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2025-11-16
+
+### 🔧 Improvements
+
+- Auto-rehost now shows a success toast: "Host relancé" after a listener is restarted.
+- Added a minimal guard to prevent multiple concurrent listeners on the same port, avoiding duplicate hosts during auto-rehost.
+
+### ✅ Tests
+
+- Added unit test to validate placeholder-host detection used by the listener guard.
+
 ## [1.3.0] - 2025-11-12
 
 ### 🐛 Bug Fixes

@@ -234,8 +234,18 @@ impl ChatManager {
         }
     }
 
+    fn has_placeholder_host(&self, port: u16) -> bool {
+        let expected = format!("Host on :{}", port);
+        self.chats.values().any(|c| c.title == expected)
+    }
+
     /// Start hosting on specified port
     pub async fn start_host(&mut self, port: u16) -> Result<Uuid> {
+        // Minimal guard: if a placeholder host already exists for this port, avoid spawning another
+        if self.has_placeholder_host(port) {
+            self.add_toast(ToastLevel::Info, format!("Already listening on port {}", port));
+            return Err(anyhow::anyhow!("Already listening on port {}", port));
+        }
         let chat_id = Uuid::new_v4();
         tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
         let privkey = generate_rsa_keypair_async(2048).await?;
@@ -1191,5 +1201,25 @@ mod tests {
 
         let contact = mgr.parse_invite_link(&link).expect("should parse invite");
         assert!(contact.address.is_none(), "address with non-numeric port should be None");
+    }
+
+    #[test]
+    fn placeholder_detection_works() {
+        let mut mgr = ChatManager::new(Config::default());
+        let port = 5001u16;
+        assert!(!mgr.has_placeholder_host(port));
+        let chat = Chat {
+            id: Uuid::new_v4(),
+            title: format!("Host on :{}", port),
+            peer_fingerprint: None,
+            participants: Vec::new(),
+            messages: Vec::new(),
+            created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
+        };
+        let id = chat.id;
+        mgr.chats.insert(id, chat);
+        assert!(mgr.has_placeholder_host(port));
     }
 }
