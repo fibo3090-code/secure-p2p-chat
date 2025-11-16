@@ -29,6 +29,7 @@ target/
 .vim/
 # Local AI/assistant settings
 .claude/
+.claude
 settings.local.json
 
 # OS generated files
