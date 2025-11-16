@@ -99,19 +99,7 @@ impl App {
 
         cc.egui_ctx.set_fonts(fonts);
 
-        let config = Config {
-            download_dir: PathBuf::from("Downloads"),
-            temp_dir: PathBuf::from("temp"),
-            auto_accept_files: false,
-            max_file_size: 1024 * 1024 * 1024,
-            enable_notifications: true,
-            enable_typing_indicators: true,
-            show_log_terminal: false,
-            theme: Theme::Light,
-            font_size: 14,
-            auto_connect: false,
-            notification_sound: NotificationSound::Default,
-        };
+        let config = Config::default();
 
         let mut chat_manager = ChatManager::new(config);
         let initial_show_log_terminal = chat_manager.config.show_log_terminal;
@@ -158,8 +146,30 @@ impl App {
             }
         }
 
+        // Capture config before moving manager
+        let auto_host_enabled = chat_manager.config.auto_host_on_startup;
+        let auto_host_port = chat_manager.config.listen_port;
+        // Capture listen_port for initializing the UI field before moving manager
+        let host_port_ui = auto_host_port.to_string();
+        // Wrap manager in Arc<Mutex<..>> once and reuse
+        let manager_arc = Arc::new(Mutex::new(chat_manager));
+        // Auto-start host on startup if enabled in settings
+        if auto_host_enabled {
+            tracing::info!(port = %auto_host_port, "Auto-host on startup is enabled; starting host");
+            let mgr_clone = manager_arc.clone();
+            tokio::spawn(async move {
+                let mut mgr = mgr_clone.lock().await;
+                if let Err(e) = mgr.start_host(auto_host_port).await {
+                    mgr.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Failed to auto-start host: {}", e),
+                    );
+                }
+            });
+        }
+
         Self {
-            chat_manager: Arc::new(Mutex::new(chat_manager)),
+            chat_manager: manager_arc,
             identity,
             selected_chat: None,
             input_text: String::new(),
@@ -167,7 +177,7 @@ impl App {
             connect_host: String::new(),
             connect_port: PORT_DEFAULT.to_string(),
             show_host_dialog: false,
-            host_port: PORT_DEFAULT.to_string(),
+            host_port: host_port_ui,
             show_settings: false,
             show_welcome: true, // Show welcome screen on first launch
             file_to_send: None,
@@ -242,12 +252,11 @@ impl App {
       let mut port = self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT);
       if let Some(colon) = host.find(':') {
           let (h, p) = host.split_at(colon);
-          host = h.to_string();
-          if p.len() > 1 { // skip the ':'
-              if let Ok(pn) = p[1..].parse::<u16>() {
-                  port = pn;
-              }
-          }
+          // Clone slices to owned Strings to avoid borrowing `host` while reassigning it
+          let h_str = h.to_string();
+          let p_str = p[1..].to_string(); // skip ':'
+          if let Ok(pn) = p_str.parse::<u16>() { port = pn; }
+          host = h_str;
       }
       let manager = self.chat_manager.clone();
       let existing_chat = self.selected_chat; // bind connection to the currently selected chat if any

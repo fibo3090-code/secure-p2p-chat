@@ -951,7 +951,7 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
+  fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
     if let Some(chat_id) = app.rename_chat_id {
         egui::Window::new("Rename Conversation")
             .collapsible(false)
@@ -1004,10 +1004,10 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                     app.rename_input.clear();
                 }
             });
+        }
     }
-}
 
-fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
+    fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("⚙️ Settings")
         .collapsible(false)
         .resizable(false)
@@ -1016,6 +1016,65 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             ui.separator();
 
             if let Ok(mut manager) = app.chat_manager.try_lock() {
+                // Auto-host on startup
+                ui.horizontal(|ui| {
+                    let mut auto_host = manager.config.auto_host_on_startup;
+                    if ui.checkbox(&mut auto_host, "Auto-host (listen) on startup").changed() {
+                        manager.config.auto_host_on_startup = auto_host;
+                        let _ = manager.save_history(&app.history_path);
+                        // If enabled, start hosting immediately using current listen_port
+                        if auto_host {
+                            let port = manager.config.listen_port;
+                            let mgr_arc = app.chat_manager.clone();
+                            tokio::spawn(async move {
+                                let mut mgr = mgr_arc.lock().await;
+                                if let Err(e) = mgr.start_host(port).await {
+                                    mgr.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Failed to start host: {}", e),
+                                    );
+                                }
+                            });
+                        } else {
+                            // No stop_host yet; inform user it will stop on next launch
+                            manager.add_toast(
+                                crate::types::ToastLevel::Info,
+                                "Auto-host disabled. Existing listeners (if any) will stop on next app restart.".to_string(),
+                            );
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Listen port:");
+                    let mut port_str = manager.config.listen_port.to_string();
+                    if ui.text_edit_singleline(&mut port_str).changed() {
+                        if let Ok(p) = port_str.parse::<u16>() {
+                            manager.config.listen_port = p;
+                            app.host_port = p.to_string(); // keep Host dialog in sync
+                            let _ = manager.save_history(&app.history_path);
+                        }
+                    }
+                });
+
+                // Show my IP address (best-effort primary local IPv4)
+                ui.add_space(8.0);
+                ui.label("My IP address (primary, best-effort):");
+                let my_ip = {
+                    use std::net::{SocketAddr, UdpSocket};
+                    (|| -> Option<String> {
+                        let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+                        // Use a public resolver to determine the outbound interface without sending data
+                        sock.connect("8.8.8.8:80").ok()?;
+                        let addr: SocketAddr = sock.local_addr().ok()?;
+                        Some(addr.ip().to_string())
+                    })()
+                    .unwrap_or_else(|| "Unavailable".to_string())
+                };
+                ui.monospace(my_ip);
+
+                ui.add_space(10.0);
+
                 ui.label("Download Directory:");
                 ui.horizontal(|ui| {
                     ui.label(manager.config.download_dir.display().to_string());

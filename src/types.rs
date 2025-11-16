@@ -150,6 +150,11 @@ pub struct Config {
     pub font_size: u8,
     pub auto_connect: bool,
     pub notification_sound: NotificationSound,
+    // Auto-host settings
+    #[serde(default)]
+    pub auto_host_on_startup: bool,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
 }
 
 /// Theme options
@@ -181,6 +186,10 @@ impl Default for Config {
             font_size: 14,
             auto_connect: false,
             notification_sound: NotificationSound::Default,
+            auto_host_on_startup: false,
+            listen_port: 5000,
         }
     }
 }
+
+fn default_listen_port() -> u16 { 5000 }

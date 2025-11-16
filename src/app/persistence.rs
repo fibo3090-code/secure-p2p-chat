@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::types::Chat;
+use crate::types::{Chat, Config};
 
 /// History file format for JSON serialization
 #[derive(Serialize, Deserialize)]
@@ -10,6 +10,8 @@ pub struct HistoryFile {
     pub version: String,
     pub chats: Vec<Chat>,
     pub contacts: Vec<crate::types::Contact>,
+    #[serde(default)]
+    pub config: Config,
 }
 
 impl HistoryFile {
@@ -18,6 +20,7 @@ impl HistoryFile {
             version: "1.0".to_string(),
             chats,
             contacts: Vec::new(),
+            config: Config::default(),
         }
     }
 
@@ -64,6 +67,9 @@ impl ChatManager {
             self.contacts.insert(contact.id, contact);
         }
 
+        // Load persisted config (if present)
+        self.config = history.config;
+
         Ok(())
     }
 
@@ -71,6 +77,7 @@ impl ChatManager {
     pub fn save_history(&self, path: &Path) -> Result<()> {
         let mut history = HistoryFile::new(self.chats.values().cloned().collect());
         history.contacts = self.contacts.values().cloned().collect();
+        history.config = self.config.clone();
         history.save(path)
     }
 
