@@ -48,6 +48,13 @@ pub struct App {
     pub show_emoji_picker: bool,
     pub last_typing_time: Option<std::time::Instant>,
     pub typing_stopped: bool,
+    // Password dialogs
+    pub show_password_dialog: bool,
+    pub show_set_password_dialog: bool,
+    pub password_input: String,
+    pub new_password_input: String,
+    pub confirm_password_input: String,
+    pub identity_locked: bool,
     // Fingerprint verification dialog
     pub show_fingerprint_dialog: bool,
     pub fingerprint_to_verify: Option<String>,
@@ -168,6 +175,8 @@ impl App {
             });
         }
 
+        let initial_identity_locked = identity.is_locked();
+
         Self {
             chat_manager: manager_arc,
             identity,
@@ -204,6 +213,12 @@ impl App {
             show_emoji_picker: false,
             last_typing_time: None,
             typing_stopped: false,
+            show_password_dialog: initial_identity_locked, // Show password dialog if identity is locked
+            show_set_password_dialog: false,
+            password_input: String::new(),
+            new_password_input: String::new(),
+            confirm_password_input: String::new(),
+            identity_locked: initial_identity_locked,
             // Fingerprint verification dialog
             show_fingerprint_dialog: false,
             fingerprint_to_verify: None,

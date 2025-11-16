@@ -252,6 +252,11 @@ impl Identity {
             Ok(identity)
         }
     }
+
+    /// Check if the identity's private key is encrypted and not currently decrypted.
+    pub fn is_locked(&self) -> bool {
+        self.encrypted_private_key.is_some() && self.private_key_pem_plaintext.is_none()
+    }
 }
 
 #[cfg(test)]
