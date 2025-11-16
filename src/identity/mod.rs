@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use argon2::Argon2;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit},
-    ChaCha20Poly1305, Nonce,
+    ChaCha20Poly1305,
 };
 use rsa::{
     pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
@@ -56,7 +56,7 @@ pub struct Identity {
 
     /// Plaintext private key, used temporarily after decryption.
     /// This field is NOT serialized.
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     private_key_pem_plaintext: Option<String>,
 }
 
@@ -154,7 +154,7 @@ impl Identity {
             .map_err(|e| anyhow!("Failed to derive key with Argon2: {}", e))?;
 
         let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = nonce_bytes.as_slice().into();
         let plaintext = cipher
             .decrypt(nonce, ciphertext.as_ref())
             .map_err(|e| anyhow!("Decryption failed (likely wrong password): {}", e))?;
@@ -197,18 +197,17 @@ impl Identity {
     /// Load identity from file
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut identity: Identity = serde_json::from_str(&content)?;
+        let identity: Identity = serde_json::from_str(&content)?;
         tracing::info!("Loaded identity: {} ({})", identity.name, identity.id);
 
-        // For backward compatibility, if the old plaintext field exists, use it.
-        if let Ok(id_with_old_field) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(old_pem) = id_with_old_field
-                .get("private_key_pem")
-                .and_then(|v| v.as_str())
-            {
-                identity.private_key_pem_plaintext = Some(old_pem.to_string());
-                tracing::warn!("Loaded an unencrypted identity file. Please set a password to encrypt it.");
-            }
+        // If the identity is not encrypted, the private_key_pem_plaintext should be present.
+        // If it is encrypted, it will be None, and decrypt() will populate it later.
+        if identity.encrypted_private_key.is_none() && identity.private_key_pem_plaintext.is_none() {
+            // This case should ideally not happen if the file was saved correctly as unencrypted.
+            // However, if it does, it means an unencrypted identity was loaded but its plaintext key is missing.
+            // This might indicate a corrupted file or a very old format.
+            // For now, we'll treat it as an error, as we expect private_key_pem_plaintext to be Some for unencrypted.
+            return Err(anyhow!("Unencrypted identity loaded but private key plaintext is missing."));
         }
 
         Ok(identity)

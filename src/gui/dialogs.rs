@@ -49,6 +49,14 @@ pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
         render_fingerprint_dialog(app, ctx);
     }
 
+    if app.show_password_dialog {
+        render_password_dialog(app, ctx);
+    }
+
+    if app.show_set_password_dialog {
+        render_set_password_dialog(app, ctx);
+    }
+
     if app.show_log_terminal {
         render_log_terminal(app, ctx);
     }
@@ -1001,9 +1009,20 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                 // Allow Enter key to save
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
-                        let _ = manager.rename_chat(chat_id, app.rename_input.clone());
-                        let _ = manager.save_history(&app.history_path);
-                        ctx.request_repaint();
+                        if let Err(e) = manager.rename_chat(chat_id, app.rename_input.clone()) {
+                            manager.add_toast(
+                                crate::types::ToastLevel::Error,
+                                format!("Failed to rename: {}", e),
+                            );
+                        } else {
+                            manager.add_toast(
+                                crate::types::ToastLevel::Success,
+                                "Chat renamed successfully!".to_string(),
+                            );
+                            // Save history to persist changes
+                            let _ = manager.save_history(&app.history_path);
+                            ctx.request_repaint();
+                        }
                     }
                     app.show_rename_dialog = false;
                     app.rename_chat_id = None;
@@ -1200,6 +1219,16 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             }
 
             ui.add_space(20.0);
+            ui.heading("Security");
+            ui.separator();
+            ui.add_space(10.0);
+
+            if crate::gui::widgets::primary_button(ui, "Set/Change Password").clicked() {
+                app.show_set_password_dialog = true;
+            }
+
+
+            ui.add_space(20.0);
             ui.heading("Danger Zone");
             ui.separator();
             ui.add_space(10.0);
@@ -1217,6 +1246,132 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             });
         });
 }
+
+fn render_password_dialog(app: &mut App, ctx: &egui::Context) {
+    egui::Window::new("🔒 Identity Locked")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Please enter your password to unlock your identity.");
+            ui.add_space(10.0);
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.password_input)
+                    .password(true)
+                    .hint_text("Password"),
+            );
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if crate::gui::widgets::primary_button(ui, "🔓 Unlock").clicked()
+                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    match app.identity.decrypt(&app.password_input) {
+                        Ok(_) => {
+                            app.identity_locked = false;
+                            app.show_password_dialog = false;
+                            app.password_input.clear();
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.add_toast(
+                                    crate::types::ToastLevel::Success,
+                                    "Identity unlocked!".to_string(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to decrypt: {}", e),
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        });
+}
+
+fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
+    egui::Window::new("🔑 Set Password")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Enter a new password to encrypt your identity file.");
+            ui.label("If you forget this password, you will lose access to your identity.");
+            ui.add_space(10.0);
+
+            ui.label("New Password:");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.new_password_input)
+                    .password(true)
+                    .hint_text("New Password"),
+            );
+
+            ui.label("Confirm Password:");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.confirm_password_input)
+                    .password(true)
+                    .hint_text("Confirm Password"),
+            );
+            ui.add_space(10.0);
+
+            if app.new_password_input != app.confirm_password_input {
+                ui.colored_label(crate::gui::styling::ERROR, "Passwords do not match.");
+            }
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !app.new_password_input.is_empty()
+                            && app.new_password_input == app.confirm_password_input,
+                        egui::Button::new("Set Password"),
+                    )
+                    .clicked()
+                {
+                    match app.identity.encrypt(&app.new_password_input) {
+                        Ok(_) => {
+                            if let Err(e) = app.identity.save(&app.history_path.with_file_name("identity.json")) {
+                                if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                    manager.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Failed to save identity: {}", e),
+                                    );
+                                }
+                            } else {
+                                if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                    manager.add_toast(
+                                        crate::types::ToastLevel::Success,
+                                        "Password set and identity encrypted!".to_string(),
+                                    );
+                                }
+                                app.show_set_password_dialog = false;
+                                app.new_password_input.clear();
+                                app.confirm_password_input.clear();
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to encrypt: {}", e),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
+                    app.show_set_password_dialog = false;
+                    app.new_password_input.clear();
+                    app.confirm_password_input.clear();
+                }
+            });
+        });
+}
+
 
 fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("⚠️ Clear Chat History")
