@@ -349,6 +349,13 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                     let chat_id = uuid::Uuid::new_v4();
                                     app.selected_chat = Some(chat_id);
 
+                                    // If contact has no address, prompt user to open Connect dialog and bind to this chat
+                                    let should_prompt_connect = contact.address.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true);
+                                    if should_prompt_connect {
+                                        // Pre-open connect dialog; the connect action will now bind to selected_chat
+                                        app.show_connect_dialog = true;
+                                    }
+
                                     // Clone the necessary data before spawning the task
                                     let manager_clone = app.chat_manager.clone();
                                     let contact_clone = contact.clone();
@@ -376,11 +383,19 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                             tracing::error!("Failed to save history after creating chat: {}", e);
                                         }
 
-                                        // 3. Asynchronously connect to the peer
-                                        if let Err(e) = mgr.connect_to_contact(contact_clone.id, Some(chat_id)).await {
+                                        // 3. Asynchronously connect to the peer — only if an address is present
+                                        if contact_clone.address.is_some() {
+                                            if let Err(e) = mgr.connect_to_contact(contact_clone.id, Some(chat_id)).await {
+                                                mgr.add_toast(
+                                                    crate::types::ToastLevel::Error,
+                                                    format!("Failed to connect to {}: {}", contact_clone.name, e),
+                                                );
+                                            }
+                                        } else {
+                                            // Inform the user a connection is needed via Connect dialog
                                             mgr.add_toast(
-                                                crate::types::ToastLevel::Error,
-                                                format!("Failed to connect to {}: {}", contact_clone.name, e),
+                                                crate::types::ToastLevel::Info,
+                                                format!("No address for {}. Open 'Connect to Host' to connect this chat.", contact_clone.name),
                                             );
                                         }
                                     });
@@ -1166,8 +1181,9 @@ fn render_about_dialog(app: &mut App, ctx: &egui::Context) {
         .resizable(false)
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
+                ui.add_space(10.0);
                 ui.heading("Encrypted P2P Messenger");
-                ui.label("Version 1.2.0");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.add_space(10.0);
             });
 
@@ -1202,6 +1218,12 @@ fn render_log_terminal(_app: &mut App, ctx: &egui::Context) {
         .default_width(600.0)
         .default_height(400.0)
         .show(ctx, |ui| {
-            ui.add(Logs::new(_app.event_collector.clone()));
+            let avail = ui.available_size();
+            egui::ScrollArea::both()
+                .auto_shrink([true, true])
+                .show(ui, |ui| {
+                    // Constrain the Logs widget to the current window size to prevent growth
+                    ui.add_sized(avail, Logs::new(_app.event_collector.clone()));
+                });
         });
 }

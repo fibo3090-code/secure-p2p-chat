@@ -6,7 +6,7 @@
 #>
 
 param(
-  [string]$Version = "1.3.0",
+  [string]$Version = "",
   [string]$Configuration = "release",
   [string]$Target = "x86_64-pc-windows-msvc",
   [string]$InnoPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -17,6 +17,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Determine repository root based on script location
+$RepoRoot = (Get-Item $PSScriptRoot).FullName
+Set-Location $RepoRoot
+
+# Resolve version from Cargo.toml if not provided or set to 'auto'
+if ([string]::IsNullOrWhiteSpace($Version) -or $Version -eq 'auto') {
+    $cargoToml = Join-Path $RepoRoot 'Cargo.toml'
+    if (Test-Path $cargoToml) {
+        $verLine = (Get-Content $cargoToml | Where-Object { $_ -match '^version\s*=\s*"([^"]+)"' } | Select-Object -First 1)
+        if ($verLine -and ($verLine -match '"([^"]+)"')) { $Version = $Matches[1] }
+    }
+    if ([string]::IsNullOrWhiteSpace($Version)) { $Version = '0.0.0' }
+}
+
 Write-Host "Version: $Version"
 Write-Host "Configuration: $Configuration"
 Write-Host "Target: $Target"
@@ -24,10 +39,6 @@ Write-Host "Target: $Target"
 # Nom du binaire produit par cargo (adapté à ton projet)
 $BinaryName = "encodeur_rsa_rust.exe"
 $BinaryBase = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
-
-# Determine repository root based on script location
-$RepoRoot = (Get-Item $PSScriptRoot).FullName
-Set-Location $RepoRoot
 
 # 1) Build release
 Write-Host "`n=== cargo build --release ==="
@@ -101,6 +112,12 @@ Compress-Archive -Path (Join-Path $Dist '*') -DestinationPath $zipOut
 
 # 5) Call Inno Setup compiler (ISCC.exe)
 if (-not (Test-Path $InnoPath)) {
+    $isccCmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($isccCmd) { $InnoPath = $isccCmd.Source }
+    elseif (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe') { $InnoPath = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' }
+    elseif (Test-Path 'C:\Program Files\Inno Setup 6\ISCC.exe') { $InnoPath = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
+}
+if (-not (Test-Path $InnoPath)) {
     Write-Warning "ISCC.exe not found at $InnoPath. Update -InnoPath parameter with the correct path to ISCC.exe."
     exit 1
 }
@@ -110,9 +127,9 @@ $ExpectedSetupName = "$BinaryBase-setup-$Version.exe"
 $OutputDir = Join-Path $RepoRoot "Output"
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 $SetupPath = Join-Path $OutputDir $ExpectedSetupName
-$defines = "/DMyAppVersion=`"$Version`" /O`"$OutputDir`" /F`"$ExpectedSetupName`""
-Write-Host "`nRunning Inno Setup: $InnoPath $defines $issPath"
-& $InnoPath $defines $issPath
+$isccArgs = @("/DMyAppVersion=$Version", "/O$OutputDir", "/F$ExpectedSetupName", $issPath)
+Write-Host "`nRunning Inno Setup: $InnoPath $($isccArgs -join ' ')"
+& $InnoPath @isccArgs
 
 # 6) Signing (optional) - sign the resulting installer if PFX provided
 

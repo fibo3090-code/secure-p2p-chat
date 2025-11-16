@@ -21,7 +21,7 @@ pub async fn run_host_session(
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     _confirm_rx: mpsc::UnboundedReceiver<bool>,
-    _chat_id: uuid::Uuid,
+    chat_id: uuid::Uuid,
 ) -> Result<()> {
     // 1. Bind listener
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -88,7 +88,7 @@ pub async fn run_host_session(
         client_fingerprint
     );
 
-    // 7. Receive chat_id from client
+    // 7. Receive chat_id from client (for logging/compat)
     let client_chat_id_bytes = recv_packet(&mut stream).await?;
     let client_chat_id = uuid::Uuid::from_slice(&client_chat_id_bytes)?;
     tracing::debug!("Received client chat_id: {}", client_chat_id);
@@ -98,7 +98,7 @@ pub async fn run_host_session(
         .send(SessionEvent::NewConnection {
             peer_addr: peer_addr.to_string(),
             fingerprint: client_fingerprint,
-            chat_id: client_chat_id,
+            chat_id, // use host session's chat id to avoid creating a second chat
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 

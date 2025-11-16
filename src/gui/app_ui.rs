@@ -238,21 +238,32 @@ impl App {
     }
 
     pub fn connect_clicked(&mut self) {
-        let host = self.connect_host.clone();
-        let port = self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT);
-        let manager = self.chat_manager.clone();
+      let mut host = self.connect_host.clone();
+      let mut port = self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT);
+      if let Some(colon) = host.find(':') {
+          let (h, p) = host.split_at(colon);
+          host = h.to_string();
+          if p.len() > 1 { // skip the ':'
+              if let Ok(pn) = p[1..].parse::<u16>() {
+                  port = pn;
+              }
+          }
+      }
+      let manager = self.chat_manager.clone();
+      let existing_chat = self.selected_chat; // bind connection to the currently selected chat if any
 
-        tokio::spawn(async move {
-            let mut mgr = manager.lock().await;
-            if let Err(e) = mgr.connect_to_host(&host, port, None).await {
-                mgr.add_toast(
-                    crate::types::ToastLevel::Error,
-                    format!("Failed to connect: {}", e),
-                );
-            }
-        });
-    }
-} // Add this closing brace
+      tokio::spawn(async move {
+          let mut mgr = manager.lock().await;
+          if let Err(e) = mgr.connect_to_host(&host, port, existing_chat).await {
+              mgr.add_toast(
+                  crate::types::ToastLevel::Error,
+                  format!("Failed to connect: {}", e),
+              );
+          }
+      });
+  }
+
+}
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

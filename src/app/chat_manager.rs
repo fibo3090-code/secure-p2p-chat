@@ -61,6 +61,7 @@ impl ChatManager {
         public_key: Option<String>,
     ) -> Uuid {
         let id = Uuid::new_v4();
+        tracing::info!(id = %id, name = %name, has_address = %address.is_some(), has_fp = %fingerprint.is_some(), "Adding contact");
         let contact = Contact {
             id,
             name,
@@ -71,13 +72,16 @@ impl ChatManager {
         };
         self.contacts.insert(id, contact);
         // no chat association by default
+        tracing::debug!(id = %id, total_contacts = %self.contacts.len(), "Contact added");
         id
     }
 
     /// Remove a contact
     pub fn remove_contact(&mut self, contact_id: Uuid) {
+        tracing::info!(contact_id = %contact_id, "Removing contact");
         self.contacts.remove(&contact_id);
         self.contact_to_chat.remove(&contact_id);
+        tracing::debug!(remaining_contacts = %self.contacts.len(), "Contact removed");
     }
 
     /// Get a contact
@@ -87,12 +91,14 @@ impl ChatManager {
 
     /// Associate a contact with a one-to-one chat (useful when a session is created for that contact)
     pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
+        tracing::debug!("associate_contact_with_chat: contact_id={}, chat_id={}", contact_id, chat_id);
         self.contact_to_chat.insert(contact_id, chat_id);
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             if !chat.participants.contains(&contact_id) {
                 chat.participants.push(contact_id);
             }
         }
+        tracing::info!("Associated contact {} -> chat {}", contact_id, chat_id);
     }
 
     /// Create a group chat with given participants and optional title
@@ -204,6 +210,7 @@ impl ChatManager {
     /// Start hosting on specified port
     pub async fn start_host(&mut self, port: u16) -> Result<Uuid> {
         let chat_id = Uuid::new_v4();
+        tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
         let privkey = generate_rsa_keypair_async(2048).await?;
 
         // Create channels
@@ -238,6 +245,7 @@ impl ChatManager {
     self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
+        tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 
         Ok(chat_id)
     }
@@ -250,6 +258,7 @@ impl ChatManager {
         existing_chat_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
+        tracing::info!(chat_id = %chat_id, host = %host, port = %port, "connect_to_host called");
         let privkey = generate_rsa_keypair_async(2048).await?;
 
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
@@ -279,12 +288,14 @@ impl ChatManager {
                 typing_since: None,
             };
             self.chats.insert(chat_id, chat);
+            tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
         }
 
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
+        tracing::debug!(session_count = %self.sessions.len(), has_events = %self.session_events.contains_key(&chat_id), "Client session initialized");
 
         self.add_toast(
             ToastLevel::Info,
@@ -304,12 +315,48 @@ impl ChatManager {
             .get(&contact_id)
             .ok_or_else(|| anyhow::anyhow!("Contact not found"))?
             .clone();
+        // If we already have a mapped chat for this contact, ensure it has a session; otherwise try to establish one
+        if let Some(mapped) = self.contact_to_chat.get(&contact_id).copied() {
+            let has_session = self.sessions.contains_key(&mapped);
+            tracing::debug!("connect_to_contact: mapped chat exists: {} (has_session={})", mapped, has_session);
+            if has_session {
+                return Ok(mapped);
+            }
+            // Try to re-associate to an existing active session by fingerprint first
+            if let Some(fp) = contact.fingerprint.clone() {
+                if let Some((&active_chat_id, _)) = self
+                    .chats
+                    .iter()
+                    .find(|(_, chat)| chat.peer_fingerprint.as_deref() == Some(fp.as_str()) && self.sessions.contains_key(&chat.id))
+                {
+                    tracing::info!("Re-associating mapped contact {} to active chat {} by fingerprint", contact_id, active_chat_id);
+                    self.associate_contact_with_chat(contact_id, active_chat_id);
+                    return Ok(active_chat_id);
+                }
+            }
+            // Otherwise, if the contact has an address, start a connection using the mapped chat id
+            if let Some(address) = contact.address.clone() {
+                let parts: Vec<&str> = address.split(':').collect();
+                if parts.len() == 2 {
+                    let host = parts[0];
+                    if let Ok(port) = parts[1].parse::<u16>() {
+                        tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
+                        let chat_id = self.connect_to_host(host, port, Some(mapped)).await?;
+                        self.associate_contact_with_chat(contact_id, chat_id);
+                        return Ok(chat_id);
+                    }
+                }
+            }
+            // No way to create a session yet; fall through to fingerprint/address logic below
+        }
 
-        if let Some(address) = contact.address {
+        tracing::debug!("connect_to_contact: id={}, has_address={}, has_fp={}", contact_id, contact.address.is_some(), contact.fingerprint.is_some());
+        if let Some(address) = contact.address.clone() {
             let parts: Vec<&str> = address.split(':').collect();
             if parts.len() == 2 {
                 let host = parts[0];
                 if let Ok(port) = parts[1].parse::<u16>() {
+                    tracing::info!("Connecting to contact {} via {}:{}", contact_id, host, port);
                     let chat_id = self.connect_to_host(host, port, existing_chat_id).await?;
                     self.associate_contact_with_chat(contact_id, chat_id);
                     Ok(chat_id)
@@ -320,29 +367,58 @@ impl ChatManager {
                 Err(anyhow::anyhow!("Invalid address format for contact"))
             }
         } else {
-            Err(anyhow::anyhow!("Contact has no address"))
+            // Try to match an existing active session by fingerprint
+            if let Some(fp) = contact.fingerprint.clone() {
+                // Find a chat with matching peer_fingerprint and active session
+                if let Some((&chat_id, _)) = self
+                    .chats
+                    .iter()
+                    .find(|(_, chat)| chat.peer_fingerprint.as_deref() == Some(fp.as_str()) && self.sessions.contains_key(&chat.id))
+                {
+                    tracing::info!("Found active chat {} by fingerprint match; associating", chat_id);
+                    self.associate_contact_with_chat(contact_id, chat_id);
+                    return Ok(chat_id);
+                }
+            }
+            Err(anyhow::anyhow!(
+                "Contact has no address. Edit the contact to set IP:PORT, or connect first so we can match by fingerprint."
+            ))
         }
     }
 
     /// Send a text message (handles both 1-on-1 chats and group chats)
     pub fn send_message(&mut self, chat_id: Uuid, text: String) -> Result<()> {
-        // Check if this is a group chat (has multiple participants but no direct session)
-        let is_group_chat = if let Some(chat) = self.chats.get(&chat_id) {
-            !chat.participants.is_empty() && !self.sessions.contains_key(&chat_id)
+        tracing::debug!("send_message called for chat_id={}, len(text)={} chars", chat_id, text.len());
+        // Determine if this is a true group chat
+        let (participants_len, has_session) = if let Some(chat) = self.chats.get(&chat_id) {
+            (chat.participants.len(), self.sessions.contains_key(&chat_id))
         } else {
-            false
+            (0, false)
         };
 
+        let is_group_chat = participants_len >= 2;
+        tracing::debug!(
+            "chat classification: is_group_chat={}, participants_len={}, has_session={}",
+            is_group_chat, participants_len, has_session
+        );
+
         if is_group_chat {
-            // Send as group message (broadcasts to all participants)
+            tracing::info!("Sending as group message to chat {}", chat_id);
             self.send_group_message(chat_id, text)?;
             return Ok(());
         }
 
-        // Regular 1-on-1 message
-        let session = self.sessions.get(&chat_id).ok_or_else(|| {
-            anyhow::anyhow!("Not connected. Start a connection first or create a group chat.")
-        })?;
+        // One-to-one chat path
+        if !has_session {
+            tracing::warn!("No active session for 1:1 chat {} yet. Likely still connecting.", chat_id);
+            self.add_toast(ToastLevel::Info, "Connecting... please wait before sending messages".to_string());
+            return Ok(()); // Do not error; just inform the user and skip sending
+        }
+
+        let session = self
+            .sessions
+            .get(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Session should exist but was not found"))?;
 
         let msg = ProtocolMessage::Text {
             text: text.clone(),
@@ -501,15 +577,23 @@ impl ChatManager {
 
     /// Delete a chat and its associated session
     pub fn delete_chat(&mut self, chat_id: Uuid) {
+        tracing::info!(chat_id = %chat_id, "Deleting chat");
         self.chats.remove(&chat_id);
         self.sessions.remove(&chat_id);
         self.session_events.remove(&chat_id);
         self.fingerprint_confirm_senders.remove(&chat_id);
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
+        tracing::debug!(remaining_chats = %self.chats.len(), remaining_sessions = %self.sessions.len(), "Chat deleted");
     }
 
     /// Clear all chat history and contacts
     pub fn clear_history(&mut self, history_path: &std::path::PathBuf) {
+        tracing::warn!(
+            chats = %self.chats.len(),
+            contacts = %self.contacts.len(),
+            sessions = %self.sessions.len(),
+            "Clearing all history and state"
+        );
         self.chats.clear();
         self.contacts.clear();
         self.contact_to_chat.clear();
@@ -523,10 +607,12 @@ impl ChatManager {
 
         // Save empty history to disk
         let _ = self.save_history(history_path);
+        tracing::info!("History cleared and saved");
     }
 
     /// Send the user's accept/reject decision for a fingerprint verification to the session task
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
+        tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");
         if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
             tx.send(accept).map_err(|e| anyhow::anyhow!("Failed to send confirmation: {}", e))?;
             Ok(())
@@ -540,6 +626,7 @@ impl ChatManager {
         use tokio::fs::File;
         use tokio::io::AsyncReadExt;
 
+        tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
         let session = self
             .sessions
             .get(&chat_id)
@@ -552,6 +639,7 @@ impl ChatManager {
             .to_string();
 
         let file_size = tokio::fs::metadata(&path).await?.len();
+        tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
         if file_size > crate::MAX_PACKET_SIZE as u64 {
             self.add_toast(
@@ -589,10 +677,12 @@ impl ChatManager {
             };
             session.from_app_tx.send(chunk_msg)?;
             seq += 1;
+            if seq % 64 == 0 { tracing::trace!(sent_chunks = %seq, "File sending progress"); }
         }
 
         // Send end marker
         session.from_app_tx.send(ProtocolMessage::FileEnd)?;
+        tracing::info!(file = %filename, total_bytes = %file_size, "File send complete");
 
         // Add to local history
         if let Some(chat) = self.chats.get_mut(&chat_id) {
@@ -616,6 +706,7 @@ impl ChatManager {
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
         let chat_ids: Vec<Uuid> = self.session_events.keys().copied().collect();
+        tracing::trace!(tracked_sessions = %chat_ids.len(), "Polling session events");
 
         for chat_id in chat_ids {
             // Collect all pending events for this session
@@ -629,6 +720,7 @@ impl ChatManager {
             }
 
             // Process collected events
+            tracing::trace!(chat_id = %chat_id, events = %events.len(), "Processing session events for chat");
             for event in events {
                 self.handle_session_event(chat_id, event);
             }
@@ -689,6 +781,11 @@ impl ChatManager {
                 peer_name,
                 chat_id,
             } => {
+                // Store peer fingerprint early so UI and mapping-by-fingerprint can work immediately
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.peer_fingerprint = Some(fingerprint.clone());
+                    tracing::debug!("Set peer_fingerprint for chat {} to {}", chat_id, fingerprint);
+                }
                 self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
             }
 

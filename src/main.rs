@@ -1,3 +1,4 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 use clap::Parser;
 
 use encodeur_rsa_rust::*;
@@ -5,7 +6,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use egui_tracing::tracing::EventCollector;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(author, version, about = "P2P Encrypted Messaging Application")]
 struct Args {
     /// Start as host (server mode)
@@ -37,7 +38,9 @@ async fn main() -> anyhow::Result<()> {
         .with(event_collector.clone())
         .init();
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Application starting");
     let args = Args::parse();
+    tracing::debug!(?args, "Parsed CLI arguments");
 
     if args.gui || (!args.host && args.connect.is_none()) {
         // Launch GUI
@@ -50,11 +53,17 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
 
-        let _ = eframe::run_native(
+        tracing::debug!("Creating native window and launching eframe");
+        let run_result = eframe::run_native(
             "Encrypted P2P Messenger",
             native_options,
             Box::new(|cc| Ok(Box::new(gui::App::new(cc, event_collector.clone())))),
         );
+        if let Err(e) = run_result {
+            tracing::error!(error = %e, "Failed to start GUI application");
+        } else {
+            tracing::info!("GUI application exited");
+        }
     } else if args.host {
         // CLI host mode
         tracing::info!("Starting host on port {}", args.port);
