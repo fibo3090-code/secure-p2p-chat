@@ -1,3 +1,19 @@
+//! Encrypted P2P Messenger core library.
+//!
+//! This crate powers the desktop application by providing:
+//! - End-to-end encrypted messaging with AES-256-GCM
+//! - Forward secrecy via X25519 ephemeral key exchange and HKDF-SHA256
+//! - A simple length-prefixed TCP protocol with a secure v2 handshake
+//! - Business logic, identity management, file transfer, and GUI integration points
+//!
+//! Modules:
+//! - `app`: High-level orchestration (`ChatManager`) and state handling.
+//! - `core`: Cryptography and wire protocol structures.
+//! - `network`: TCP sessions and handshake implementation.
+//! - `transfer`: Chunked file transfer utilities.
+//! - `identity`: Persistent identity (RSA keys, fingerprints).
+//! - `types`: Shared domain types used across layers.
+//! - `util`: Helpers and utilities.
 pub mod app;
 pub mod core;
 pub mod gui;

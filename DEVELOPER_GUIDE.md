@@ -80,6 +80,10 @@ chat-p2p/
 *   **`src/transfer/` - File Transfer**: Chunked file sending and receiving.
 *   **`src/types.rs` - Data Structures**: Shared types used throughout the application (`Chat`, `Message`, `Contact`).
 
+#### Notable runtime events
+
+- `SessionEvent::NewConnection(chat_id, peer_meta)`: emitted on the host when a client connects and presents a chat identifier. Used by `ChatManager` to create/sync chats across peers.
+
 ## 3. Protocol Specification
 
 ### 3.1. Constants
@@ -120,8 +124,8 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 3.  **X25519 Ephemeral Key Exchange**: For forward secrecy.
 4.  **ECDH Computation**: A shared secret is computed.
 5.  **HKDF-SHA256 Key Derivation**: The final AES session key is derived.
-6.  **Encrypted Communication**: All further communication is encrypted with the session key.
-7.  **Chat ID Exchange**: The client sends the `chat_id` to the host to synchronize the chat session.
+6.  **Chat ID Exchange**: The client sends the `chat_id` to the host to synchronize the chat session.
+7.  **Encrypted Communication**: All further communication is encrypted with the session key.
 
 ### 3.4. Message Format
 
@@ -192,6 +196,28 @@ The `chat_manager.rs` file contains a test module with several tests for parsing
 *   Parsing a link with a bad port.
 
 You can run these tests with `cargo test`.
+
+### 4.4. Logging & Diagnostics
+
+- Logging uses `tracing` with `tracing-subscriber`.
+- Set `RUST_LOG="info,chat_p2p=debug"` to increase verbosity.
+- The GUI integrates logs via `egui_tracing` for in-app viewing.
+
+### 4.5. Build Profiles
+
+- `dev`: faster builds, debug assertions on.
+- `release`: optimized with `lto = true` and `codegen-units = 1` (see `Cargo.toml`).
+
+### 4.6. Developer Workflow
+
+1.  **Create a feature branch**: `git checkout -b feature/new-feature`
+2.  **Make changes**: Implement your feature or bug fix.
+3.  **Run tests**: `cargo test`
+4.  **Format code**: `cargo fmt`
+5.  **Lint code**: `cargo clippy`
+6.  **Commit changes**: `git commit -m "Brief description of changes"`
+7.  **Push changes**: `git push origin feature/new-feature`
+8.  **Create a pull request**: Open a pull request on GitHub to merge your feature branch into `main`.
 
 ## 5. Recent Changes
 

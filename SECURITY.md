@@ -24,6 +24,12 @@ This security model makes the following assumptions:
 -   The operating system is **not compromised**.
 -   The application is used on a **trusted network** (e.g., a home LAN or a secure VPN).
 
+### Key Handling & Persistence
+
+- **Identity Keys**: Long-term RSA-2048 identity keys are generated locally and stored on disk. Future versions will support an encrypted keystore (Argon2 + AES-256).
+- **Session Keys**: Ephemeral AES-256-GCM session keys are derived via X25519 ECDH + HKDF and are kept in memory only for the session lifetime.
+- **Fingerprints**: The RSA public key fingerprint is SHA-256 over the PEM bytes in lowercase hex.
+
 ## Cryptographic Specifications
 
 ### Encryption Primitives
@@ -55,6 +61,12 @@ The handshake process is designed to be secure and robust:
 ## Reporting Security Issues
 
 If you discover a security vulnerability, please **DO NOT** open a public GitHub issue. Instead, please report the vulnerability by emailing `[YOUR_SECURITY_EMAIL_ADDRESS_HERE]` (replace with a real address). We will investigate all reports and do our best to fix the issue as soon as possible.
+
+When reporting, please include (to the extent possible):
+- A clear description of the issue and potential impact
+- Steps to reproduce and proof-of-concept if available
+- Affected versions/commits and environment details
+- Any mitigation ideas
 
 ### Contribution Guidelines
 

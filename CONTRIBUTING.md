@@ -62,7 +62,18 @@ The process described here has several goals:
 
 1. Follow all instructions in the template
 2. Follow the [styleguides](#styleguides)
-3. After you submit your pull request, verify that all status checks are passing
+3. Create your branch from `main` using a descriptive name (e.g., `feat/emoji-picker`, `fix/handshake-timeout`)
+4. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages (e.g., `feat: add typing indicators`)
+5. Ensure all tests pass locally and format/lints are clean
+6. After you submit your pull request, verify that all status checks are passing
+
+**PR Checklist**
+
+- [ ] Linked issue (if applicable)
+- [ ] Tests added/updated or rationale provided
+- [ ] `cargo fmt` applied
+- [ ] `cargo clippy` has no warnings (or warnings explained)
+- [ ] Updated docs (README/DEVELOPER_GUIDE/SECURITY/CHANGELOG as needed)
 
 While the prerequisites above must be satisfied prior to having your pull request reviewed, the reviewer(s) may ask you to complete additional design work, tests, or other changes before your pull request can be ultimately accepted.
 
@@ -74,6 +85,7 @@ While the prerequisites above must be satisfied prior to having your pull reques
 - Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
 - Limit the first line to 72 characters or less
 - Reference issues and pull requests liberally after the first line
+ - Prefer Conventional Commits types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 
 ### Rust Styleguide
 
@@ -87,6 +99,25 @@ While the prerequisites above must be satisfied prior to having your pull reques
 - Use [Markdown](https://daringfireball.net/projects/markdown) for documentation
 - Reference functions and variables with backticks
 - Follow the existing documentation style in the project
+
+## Local Development
+
+### Branching Strategy
+
+- Main development happens on `main`
+- Use feature branches per PR; keep them focused and small
+
+### Build and Test
+
+- Build: `cargo build` or `cargo build --release`
+- Run tests: `cargo test`
+- Lints/format: `cargo clippy && cargo fmt`
+
+### Releases
+
+- Update `CHANGELOG.md`
+- Bump version in `Cargo.toml`
+- Create a tagged release with release notes
 
 ## Additional Notes
 

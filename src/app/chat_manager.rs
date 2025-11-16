@@ -1,3 +1,12 @@
+//! Chat management and application state orchestration.
+//!
+//! Provides the `ChatManager` which coordinates:
+//! - Contacts and chats lifecycle (create, rename, group chats)
+//! - Network sessions and event handling (`SessionEvent`)
+//! - Message routing and typing indicators
+//! - File transfer state and toasts/notifications
+//! - Invite link generation and parsing (including QR codes)
+
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

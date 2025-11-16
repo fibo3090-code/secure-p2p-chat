@@ -23,6 +23,14 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 - **UI/UX**: Modern interface with avatars, timestamps, emoji picker, and drag & drop.
 - **Persistence**: Reliable history storage and a persistent identity system.
 
+### 🆕 Recent (v1.3.0)
+
+- Synchronized chat creation across peers (`SessionEvent::NewConnection`)
+- Handshake now exchanges `chat_id` to bind sessions to chats
+- Improved UI flow: local chat appears instantly, connection proceeds in background
+
+These changes improve reliability and eliminate “all recipients offline” misroutes during new chat creation.
+
 ### ⚠️ Known Limitations
 1.  **LAN-only**: No NAT traversal for WAN connectivity.
 2.  **Manual Fingerprint Verification**: No automated certificate authority.
@@ -32,7 +40,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 
 ## 🚀 High-Level Roadmap
 
-- **v1.3: The Usability Release**: Focus on critical UX issues like connection discovery, persistent identities, and reliability.
+- **v1.3: The Usability Release**: Delivered reliability fixes for chat creation and session sync.
 - **v2.0: The Professional Release**: Enterprise-ready features like moderation, NAT traversal, and message search.
 - **v3.0: The Next Generation**: Advanced features like post-quantum cryptography, mobile apps, and voice/video calls.
 
@@ -56,6 +64,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 2.  **Auto-Reconnection**: Automatically retry connections with exponential backoff.
 3.  **Message Delivery Status (✓✓)**: Provide feedback on message state (Sent, Delivered, Read).
 4.  **Offline Message Queue**: Queue messages sent while offline and send upon reconnection.
+5.  **Session/Chat Sync Improvements**: Delivered in v1.3.0 (see above).
 
 ### 🏃 Sprint 3: Identity & Trust (Week 5-6)
 *Goal: A robust and persistent identity system.*
