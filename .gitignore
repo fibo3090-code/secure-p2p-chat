@@ -27,6 +27,9 @@ target/
 *~
 *.sublime-*
 .vim/
+# Local AI/assistant settings
+.claude/
+settings.local.json
 
 # OS generated files
 .DS_Store
@@ -63,6 +66,8 @@ temp/
 build/
 dist/
 out/
+Output/
+release/
 
 # Configuration files that might contain sensitive information
 .env
