@@ -1,6 +1,6 @@
 use crate::gui::app_ui::App;
 use crate::types::{Message, MessageContent};
-use eframe::egui;
+use eframe::egui::{self, Color32};
 use uuid::Uuid;
 
 pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {

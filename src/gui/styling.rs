@@ -62,7 +62,11 @@ fn dark_visuals() -> Visuals {
     visuals.selection.stroke = Stroke::new(1.0, accent);
 
     visuals.window_rounding = Rounding::same(12.0);
-    visuals.window_shadow = eframe::epaint::Shadow::big_dark();
+    // visuals.window_shadow = eframe::epaint::Shadow::big_dark(); // Removed as it causes build error
+    visuals.window_shadow = eframe::epaint::Shadow {
+        extrusion: 32.0,
+        color: Color32::from_black_alpha(96),
+    };
     visuals
 }
 
@@ -103,7 +107,11 @@ fn midnight_visuals() -> Visuals {
     visuals.selection.bg_fill = accent;
     visuals.selection.stroke = Stroke::NONE;
 
-    visuals.window_shadow = eframe::epaint::Shadow::big_light(); // Glow effect
+    // visuals.window_shadow = eframe::epaint::Shadow::big_light(); // Glow effect
+    visuals.window_shadow = eframe::epaint::Shadow {
+        extrusion: 32.0,
+        color: Color32::from_rgb(100, 100, 255).gamma_multiply(0.5), // Violet glow
+    };
     visuals
 }
 
