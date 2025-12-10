@@ -92,10 +92,62 @@ fn light_visuals() -> Visuals {
 }
 
 
+
+/// Returns a full set of Midnight visuals.
+fn midnight_visuals() -> Visuals {
+    let mut visuals = Visuals::dark();
+    let _bg = Color32::from_rgb(10, 10, 20);
+    let primary = Color32::from_rgb(20, 20, 40);
+    let secondary = Color32::from_rgb(30, 30, 60);
+    let text = Color32::from_rgb(220, 220, 255);
+    let accent = Color32::from_rgb(100, 100, 255);
+
+    visuals.override_text_color = Some(text);
+    visuals.widgets.noninteractive.bg_fill = primary;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, secondary);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+
+    visuals.widgets.inactive.bg_fill = secondary;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.selection.bg_fill = accent;
+
+    visuals
+}
+
+/// Returns a full set of Forest visuals.
+fn forest_visuals() -> Visuals {
+    let mut visuals = Visuals::dark();
+    let _bg = Color32::from_rgb(20, 30, 20);
+    let primary = Color32::from_rgb(30, 45, 30);
+    let secondary = Color32::from_rgb(45, 60, 45);
+    let text = Color32::from_rgb(220, 240, 220);
+    let accent = Color32::from_rgb(46, 204, 113); // Green
+
+    visuals.override_text_color = Some(text);
+    visuals.widgets.noninteractive.bg_fill = primary;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, secondary);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+
+    visuals.widgets.inactive.bg_fill = secondary;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.selection.bg_fill = accent;
+
+    visuals
+}
+
+
 pub fn apply_custom_visuals(theme: &crate::types::Theme) -> Visuals {
     match theme {
         crate::types::Theme::Light => light_visuals(),
         crate::types::Theme::Dark => dark_visuals(),
+        crate::types::Theme::Midnight => midnight_visuals(),
+        crate::types::Theme::Forest => forest_visuals(),
     }
 }
 

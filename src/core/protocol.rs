@@ -80,6 +80,10 @@ impl ProtocolMessage {
             let public_key = b[14..].to_vec();
             Some(Self::EphemeralKey { public_key })
         } else if b.starts_with(b"TEXT:") {
+            // Security: Enforce a limit on text messages to prevent memory exhaustion
+            if b.len() > 64 * 1024 { // 64 KiB Limit
+                return None; // Invalid/Too large
+            }
             let text = String::from_utf8_lossy(&b[5..]).into_owned();
             Some(Self::Text {
                 text,
@@ -89,7 +93,8 @@ impl ProtocolMessage {
             let s = String::from_utf8_lossy(b);
             let parts: Vec<&str> = s.splitn(3, '|').collect();
             if parts.len() == 3 {
-                let filename = parts[1].to_string();
+                let raw_filename = parts[1];
+                let filename = crate::util::sanitize_filename(raw_filename);
                 if let Ok(size) = parts[2].parse::<u64>() {
                     return Some(Self::FileMeta { filename, size });
                 }

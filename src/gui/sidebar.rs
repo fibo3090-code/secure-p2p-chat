@@ -55,13 +55,10 @@ pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
                 response.context_menu(|ui| {
                     if ui.button("✏️ Rename chat").clicked() {
                         tracing::info!("Rename chat context menu clicked for chat_id: {}", chat_id);
-                        if let Ok(manager) = app.chat_manager.try_lock()
-                            && let Some(chat) = manager.get_chat(chat_id) {
-                                app.rename_chat_id = Some(chat_id);
-                                app.rename_input = chat.title.clone();
-                                app.show_rename_dialog = true;
-                                ui.close_menu();
-                        }
+                        app.rename_chat_id = Some(chat_id);
+                        app.rename_input = chat.title.clone();
+                        app.show_rename_dialog = true;
+                        ui.close_menu();
                     }
                     if ui.button("🗑 Delete chat").clicked() {
                         tracing::info!("Delete chat context menu clicked for chat_id: {}", chat_id);

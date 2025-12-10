@@ -23,6 +23,8 @@ pub struct App {
     pub new_contact_address: String,
     pub new_contact_fingerprint: String,
     pub new_contact_pubkey: String,
+    // Help tab state
+    pub help_tab: usize,
     pub invite_link_input: String,
     pub my_invite_link: Option<String>,
     pub show_create_group: bool,
@@ -155,6 +157,9 @@ impl App {
                 tracing::warn!("Failed to load history: {}", e);
             } else {
                 tracing::info!("Successfully loaded conversation history");
+                // Re-apply theme from loaded config
+                let loaded_theme = chat_manager.config.theme;
+                cc.egui_ctx.set_visuals(crate::gui::styling::apply_custom_visuals(&loaded_theme));
             }
         }
 
@@ -200,6 +205,7 @@ impl App {
             show_contacts: false,
             show_add_contact: false,
             contact_tab: 0,
+            help_tab: 0,
             new_contact_name: String::new(),
             new_contact_address: String::new(),
             new_contact_fingerprint: String::new(),

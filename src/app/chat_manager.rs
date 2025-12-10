@@ -81,6 +81,21 @@ impl ChatManager {
         }
     }
 
+    /// Helper to create a local chat for testing purposes without network sessions
+    pub fn create_local_chat_for_test(&mut self, id: Uuid, title: String) {
+        let chat = Chat {
+            id,
+            title,
+            peer_fingerprint: None,
+            participants: Vec::new(),
+            messages: Vec::new(),
+            created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
+        };
+        self.chats.insert(id, chat);
+    }
+
     /// Add a contact
     pub fn add_contact(
         &mut self,
@@ -227,8 +242,14 @@ impl ChatManager {
 
     /// Rename a conversation/chat
     pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
+        let title = if new_title.len() > 50 {
+            new_title[..50].to_string()
+        } else {
+            new_title
+        };
+
         if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.title = new_title;
+            chat.title = title;
             Ok(())
         } else {
             tracing::error!("Chat not found for rename: {}", chat_id);
@@ -671,14 +692,14 @@ impl ChatManager {
         let file_size = tokio::fs::metadata(&path).await?.len();
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
-        if file_size > crate::MAX_PACKET_SIZE as u64 {
-            tracing::error!("File is too large to send: {} > {}", file_size, crate::MAX_PACKET_SIZE);
+        if file_size > crate::MAX_FILE_SIZE {
+            tracing::error!("File is too large to send: {} > {}", file_size, crate::MAX_FILE_SIZE);
             self.add_toast(
                 ToastLevel::Error,
                 format!(
                     "File is too large ({} > {} bytes)",
                     file_size,
-                    crate::MAX_PACKET_SIZE
+                    crate::MAX_FILE_SIZE
                 ),
             );
             return Err(anyhow::anyhow!("File is too large"));

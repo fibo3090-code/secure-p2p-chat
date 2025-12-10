@@ -162,6 +162,8 @@ pub struct Config {
 pub enum Theme {
     Light,
     Dark,
+    Midnight,
+    Forest,
 }
 
 /// Notification sound options

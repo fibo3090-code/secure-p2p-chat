@@ -42,7 +42,7 @@ pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
     }
 
     if app.show_about {
-        render_about_dialog(app, ctx);
+        crate::gui::help_view::render_help_window(app, ctx);
     }
 
     if app.show_fingerprint_dialog {
@@ -535,7 +535,23 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                                 Some(app.new_contact_pubkey.trim().to_string())
                             };
 
-                            if !name.is_empty() {
+                            let mut validation_error = None;
+                            if let Some(ref addr) = address {
+                                // Basic validation: check if it has a colon
+                                if !addr.contains(':') {
+                                    validation_error = Some("Address must be in host:port format");
+                                }
+                            }
+
+                            if let Some(err) = validation_error {
+                                app.toasts.push(crate::types::Toast {
+                                    id: uuid::Uuid::new_v4(),
+                                    level: crate::types::ToastLevel::Error,
+                                    message: err.to_string(),
+                                    created_at: std::time::Instant::now(),
+                                    duration: std::time::Duration::from_secs(3),
+                                });
+                            } else if !name.is_empty() {
                                 tracing::info!("Adding contact manually: {}", name);
                                 let manager = app.chat_manager.clone();
                                 let history_path = app.history_path.clone();
@@ -1157,11 +1173,13 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 // Theme selection
                 ui.horizontal(|ui| {
                     ui.label("Theme:");
-                    if egui::ComboBox::from_label("")
+                    if egui::ComboBox::from_id_salt("theme_selector")
                         .selected_text(format!("{:?}", manager.config.theme))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Light, "Light").changed() ||
-                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Dark, "Dark").changed()
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Dark, "Dark").changed() ||
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Midnight, "Midnight").changed() ||
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Forest, "Forest").changed()
                         }).inner.unwrap_or(false) {
                             let _ = manager.save_history(&app.history_path);
                             // Apply theme immediately
@@ -1203,7 +1221,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 // Notification sound selection
                 ui.horizontal(|ui| {
                     ui.label("Notification Sound:");
-                    if egui::ComboBox::from_label("")
+                    if egui::ComboBox::from_id_salt("notification_sound_selector")
                         .selected_text(format!("{:?}", manager.config.notification_sound))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::None, "None").changed() ||
@@ -1412,41 +1430,8 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-fn render_about_dialog(app: &mut App, ctx: &egui::Context) {
-    egui::Window::new("ℹ️ About")
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(10.0);
-                ui.heading("Encrypted P2P Messenger");
-                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.add_space(10.0);
-            });
 
-            ui.separator();
-            ui.add_space(10.0);
 
-            ui.label("A secure, peer-to-peer messaging application");
-            ui.label("with end-to-end encryption and forward secrecy.");
-            ui.add_space(10.0);
-
-            ui.label("🔒 Encryption: RSA-2048-OAEP + AES-256-GCM");
-            ui.label("🔐 Forward Secrecy: X25519 ECDH + HKDF-SHA256");
-            ui.label("🛡️ Security: Fingerprint verification");
-            ui.label("📁 Features: File transfer, message history, typing indicators");
-            ui.add_space(10.0);
-
-            ui.separator();
-            ui.add_space(10.0);
-
-            ui.vertical_centered(|ui| {
-                if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
-                    app.show_about = false;
-                }
-            });
-        });
-}
 
 fn render_log_terminal(_app: &mut App, ctx: &egui::Context) {
     egui::Window::new("Log Terminal")
