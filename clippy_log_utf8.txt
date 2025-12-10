@@ -1,0 +1,318 @@
+﻿C:\Users\alexa\.cargo\bin\cargo.exe :     Checking encodeur_rsa_rust v1.3.1 
+(C:\Users\alexa\OneDrive\Documents\codding\projets\projets rust\messagerie crypt├®e\chat-p2p)
+Au caractère Ligne:1 : 1
++ C:\Users\alexa\.cargo\bin\cargo.exe clippy -- -D warnings > clippy_lo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking en...pt├®e\chat-p2p):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error: this `if` statement can be collapsed
+   --> src\app\chat_manager.rs:125:9
+    |
+125 | /         if let Some(chat) = self.chats.get_mut(&chat_id) {
+126 | |             if !chat.participants.contains(&contact_id) {
+127 | |                 chat.participants.push(contact_id);
+128 | |             }
+129 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+125 ~         if let Some(chat) = self.chats.get_mut(&chat_id)
+126 ~             && !chat.participants.contains(&contact_id) {
+127 |                 chat.participants.push(contact_id);
+128 ~             }
+    |
+
+error: unnecessary use of `get(&chat_id).is_none()`
+   --> src\app\chat_manager.rs:319:23
+    |
+319 |         if self.chats.get(&chat_id).is_none() {
+    |            -----------^^^^^^^^^^^^^^^^^^^^^^^
+    |            |
+    |            help: replace it with: `!self.chats.contains_key(&chat_id)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_get_then_check
+    = note: `-D clippy::unnecessary-get-then-check` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_get_then_check)]`
+
+error: this `if` statement can be collapsed
+   --> src\app\chat_manager.rs:367:13
+    |
+367 | /             if let Some(fp) = contact.fingerprint.clone() {
+368 | |                 if let Some((&active_chat_id, _)) = self
+369 | |                     .chats
+370 | |                     .iter()
+...   |
+377 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+367 ~             if let Some(fp) = contact.fingerprint.clone()
+368 ~                 && let Some((&active_chat_id, _)) = self
+369 |                     .chats
+...
+375 |                     return Ok(active_chat_id);
+376 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+   --> src\app\chat_manager.rs:379:13
+    |
+379 | /             if let Some(address) = contact.address.clone() {
+380 | |                 if let Ok((host, port)) = Self::parse_address(&address) {
+381 | |                     tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
+382 | |                     let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
+...   |
+386 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+379 ~             if let Some(address) = contact.address.clone()
+380 ~                 && let Ok((host, port)) = Self::parse_address(&address) {
+381 |                     tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
+...
+384 |                     return Ok(chat_id);
+385 ~                 }
+    |
+
+error: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+   --> src\app\chat_manager.rs:622:51
+    |
+622 |     pub fn clear_history(&mut self, history_path: &std::path::PathBuf) {
+    |                                                   ^^^^^^^^^^^^^^^^^^^ help: change this to: `&Path`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#ptr_arg
+    = note: `-D clippy::ptr-arg` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::ptr_arg)]`
+
+error: manual implementation of `.is_multiple_of()`
+   --> src\app\chat_manager.rs:714:16
+    |
+714 |             if seq % 64 == 0 { tracing::trace!(sent_chunks = %seq, "File sending progress"); }
+    |                ^^^^^^^^^^^^^ help: replace with: `seq.is_multiple_of(64)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_multiple_of
+    = note: `-D clippy::manual-is-multiple-of` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_is_multiple_of)]`
+
+error: this `if` statement can be collapsed
+   --> src\app\chat_manager.rs:748:13
+    |
+748 | /             if let Some(rx_mutex) = self.session_events.get(&chat_id) {
+749 | |                 if let Ok(mut rx) = rx_mutex.try_lock() {
+750 | |                     while let Ok(event) = rx.try_recv() {
+751 | |                         events.push(event);
+...   |
+754 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+748 ~             if let Some(rx_mutex) = self.session_events.get(&chat_id)
+749 ~                 && let Ok(mut rx) = rx_mutex.try_lock() {
+750 |                     while let Ok(event) = rx.try_recv() {
+751 |                         events.push(event);
+752 |                     }
+753 ~                 }
+    |
+
+error: unnecessary use of `get(&incoming_chat_id).is_none()`
+   --> src\app\chat_manager.rs:794:31
+    |
+794 |                 if self.chats.get(&incoming_chat_id).is_none() {
+    |                    -----------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |                    |
+    |                    help: replace it with: `!self.chats.contains_key(&incoming_chat_id)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_get_then_check
+
+error: this `if` has identical blocks
+    --> src\app\chat_manager.rs:1063:35
+     |
+1063 |               if trimmed.is_empty() {
+     |  ___________________________________^
+1064 | |                 None
+1065 | |             } else if trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
+     | |_____________^
+     |
+note: same as this
+    --> src\app\chat_manager.rs:1065:68
+     |
+1065 |               } else if trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
+     |  ____________________________________________________________________^
+1066 | |                 None
+1067 | |             } else {
+     | |_____________^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+     = note: `-D clippy::if-same-then-else` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::if_same_then_else)]`
+
+error: using `clone` on type `Theme` which implements the `Copy` trait
+  --> src\gui\app_ui.rs:72:21
+   |
+72 |         let theme = chat_manager.config.theme.clone();
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try removing the `clone` call: `chat_manager.config.theme`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#clone_on_copy
+   = note: `-D clippy::clone-on-copy` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::clone_on_copy)]`
+
+error: this `if` statement can be collapsed
+   --> src\gui\app_ui.rs:246:9
+    |
+246 | /         if let Ok(mut manager) = self.chat_manager.try_lock() {
+247 | |             if let Err(e) = manager.send_message(chat_id, text) {
+248 | |                 manager.add_toast(
+249 | |                     crate::types::ToastLevel::Error,
+...   |
+253 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+246 ~         if let Ok(mut manager) = self.chat_manager.try_lock()
+247 ~             && let Err(e) = manager.send_message(chat_id, text) {
+248 |                 manager.add_toast(
+...
+251 |                 );
+252 ~             }
+    |
+
+error: this `if` statement can be collapsed
+  --> src\gui\chat_view.rs:9:5
+   |
+ 9 | /     if !dropped_files.is_empty() {
+10 | |         if let Some(file) = dropped_files.first() {
+11 | |             if let Some(path) = &file.path {
+12 | |                 app.file_to_send = Some(path.clone());
+...  |
+15 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+   |
+ 9 ~     if !dropped_files.is_empty()
+10 ~         && let Some(file) = dropped_files.first() {
+11 |             if let Some(path) = &file.path {
+12 |                 app.file_to_send = Some(path.clone());
+13 |             }
+14 ~         }
+   |
+
+error: this `if` statement can be collapsed
+  --> src\gui\chat_view.rs:10:9
+   |
+10 | /         if let Some(file) = dropped_files.first() {
+11 | |             if let Some(path) = &file.path {
+12 | |                 app.file_to_send = Some(path.clone());
+13 | |             }
+14 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+   |
+10 ~         if let Some(file) = dropped_files.first()
+11 ~             && let Some(path) = &file.path {
+12 |                 app.file_to_send = Some(path.clone());
+13 ~             }
+   |
+
+error: this `if` statement can be collapsed
+  --> src\gui\chat_view.rs:21:13
+   |
+21 | /             if let Ok(manager) = app.chat_manager.try_lock() {
+22 | |                 if let Some(chat) = manager.get_chat(chat_id) {
+23 | |                     ui.add_space(8.0);
+24 | |                     ui.horizontal(|ui| {
+...  |
+77 | |             }
+   | |_____________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+   |
+21 ~             if let Ok(manager) = app.chat_manager.try_lock()
+22 ~                 && let Some(chat) = manager.get_chat(chat_id) {
+23 |                     ui.add_space(8.0);
+...
+75 |                     });
+76 ~                 }
+   |
+
+error: this `if` statement can be collapsed
+   --> src\gui\chat_view.rs:123:17
+    |
+123 | /                 if ui
+124 | |                     .button(egui::RichText::new("­ƒôÄ").size(20.0))
+125 | |                     .on_hover_text("Attach file (or drag & drop)")
+126 | |                     .clicked()
+...   |
+131 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+126 ~                     .clicked()
+127 ~                     && let Some(path) = rfd::FileDialog::new().pick_file() {
+128 |                         app.file_to_send = Some(path);
+129 ~                     }
+    |
+
+error: this `if` statement can be collapsed
+   --> src\gui\chat_view.rs:245:17
+    |
+245 | /                 if let Ok(manager) = app.chat_manager.try_lock() {
+246 | |                     if let Some(chat) = manager.get_chat(chat_id) {
+247 | |                         if chat.messages.is_empty() {
+248 | |                             ui.vertical_centered(|ui| {
+...   |
+268 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+245 ~                 if let Ok(manager) = app.chat_manager.try_lock()
+246 ~                     && let Some(chat) = manager.get_chat(chat_id) {
+247 |                         if chat.messages.is_empty() {
+...
+266 |                         }
+267 ~                     }
+    |
+
+error: this `if` statement can be collapsed
+  --> src\gui\sidebar.rs:58:25
+   |
+58 | /                         if let Ok(manager) = app.chat_manager.try_lock() {
+59 | |                             if let Some(chat) = manager.get_chat(chat_id) {
+60 | |                                 app.rename_chat_id = Some(chat_id);
+61 | |                                 app.rename_input = chat.title.clone();
+...  |
+65 | |                         }
+   | |_________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+   |
+58 ~                         if let Ok(manager) = app.chat_manager.try_lock()
+59 ~                             && let Some(chat) = manager.get_chat(chat_id) {
+60 |                                 app.rename_chat_id = Some(chat_id);
+...
+63 |                                 ui.close_menu();
+64 ~                             }
+   |
+
+error: could not compile `encodeur_rsa_rust` (lib) due to 17 previous errors

@@ -122,10 +122,9 @@ impl ChatManager {
     pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
         tracing::debug!("associate_contact_with_chat: contact_id={}, chat_id={}", contact_id, chat_id);
         self.contact_to_chat.insert(contact_id, chat_id);
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            if !chat.participants.contains(&contact_id) {
-                chat.participants.push(contact_id);
-            }
+        if let Some(chat) = self.chats.get_mut(&chat_id) 
+            && !chat.participants.contains(&contact_id) {
+            chat.participants.push(contact_id);
         }
         tracing::info!("Associated contact {} -> chat {}", contact_id, chat_id);
     }
@@ -316,7 +315,7 @@ impl ChatManager {
             }
         });
 
-        if self.chats.get(&chat_id).is_none() {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.chats.entry(chat_id) {
             let chat = Chat {
                 id: chat_id,
                 title: format!("{}:{}", host, port),
@@ -327,7 +326,7 @@ impl ChatManager {
                 peer_typing: false,
                 typing_since: None,
             };
-            self.chats.insert(chat_id, chat);
+            e.insert(chat);
             tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
         }
 
@@ -364,25 +363,23 @@ impl ChatManager {
             }
 
             // Try to re-associate to an existing active session by fingerprint first
-            if let Some(fp) = contact.fingerprint.clone() {
-                if let Some((&active_chat_id, _)) = self
+            if let Some(fp) = contact.fingerprint.clone()
+                && let Some((&active_chat_id, _)) = self
                     .chats
                     .iter()
                     .find(|(_, chat)| chat.peer_fingerprint.as_deref() == Some(fp.as_str()) && self.sessions.contains_key(&chat.id))
-                {
-                    tracing::info!("Re-associating mapped contact {} to active chat {} by fingerprint", contact_id, active_chat_id);
-                    self.associate_contact_with_chat(contact_id, active_chat_id);
-                    return Ok(active_chat_id);
-                }
+            {
+                tracing::info!("Re-associating mapped contact {} to active chat {} by fingerprint", contact_id, active_chat_id);
+                self.associate_contact_with_chat(contact_id, active_chat_id);
+                return Ok(active_chat_id);
             }
             // Otherwise, if the contact has an address, start a connection using the mapped chat id
-            if let Some(address) = contact.address.clone() {
-                if let Ok((host, port)) = Self::parse_address(&address) {
-                    tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
-                    let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
-                    self.associate_contact_with_chat(contact_id, chat_id);
-                    return Ok(chat_id);
-                }
+            if let Some(address) = contact.address.clone()
+                && let Ok((host, port)) = Self::parse_address(&address) {
+                tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
+                let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
+                self.associate_contact_with_chat(contact_id, chat_id);
+                return Ok(chat_id);
             }
             // No way to create a session yet; fall through to fingerprint/address logic below
         }
@@ -619,7 +616,7 @@ impl ChatManager {
     }
 
     /// Clear all chat history and contacts
-    pub fn clear_history(&mut self, history_path: &std::path::PathBuf) {
+    pub fn clear_history(&mut self, history_path: &std::path::Path) {
         tracing::warn!(
             chats = %self.chats.len(),
             contacts = %self.contacts.len(),
@@ -711,7 +708,7 @@ impl ChatManager {
             };
             session.from_app_tx.send(chunk_msg)?;
             seq += 1;
-            if seq % 64 == 0 { tracing::trace!(sent_chunks = %seq, "File sending progress"); }
+            if seq.is_multiple_of(64) { tracing::trace!(sent_chunks = %seq, "File sending progress"); }
         }
 
         // Send end marker
@@ -745,11 +742,10 @@ impl ChatManager {
         for chat_id in chat_ids {
             // Collect all pending events for this session
             let mut events = Vec::new();
-            if let Some(rx_mutex) = self.session_events.get(&chat_id) {
-                if let Ok(mut rx) = rx_mutex.try_lock() {
-                    while let Ok(event) = rx.try_recv() {
-                        events.push(event);
-                    }
+            if let Some(rx_mutex) = self.session_events.get(&chat_id) 
+                && let Ok(mut rx) = rx_mutex.try_lock() {
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
                 }
             }
 
@@ -791,8 +787,8 @@ impl ChatManager {
                     incoming_chat_id
                 );
                 // Create a chat for this new connection
-                if self.chats.get(&incoming_chat_id).is_none() {
-                    let chat = Chat {
+                self.chats.entry(incoming_chat_id).or_insert_with(|| {
+                    Chat {
                         id: incoming_chat_id,
                         title: peer_addr.clone(),
                         peer_fingerprint: Some(fingerprint.clone()),
@@ -801,9 +797,8 @@ impl ChatManager {
                         created_at: chrono::Utc::now(),
                         peer_typing: false,
                         typing_since: None,
-                    };
-                    self.chats.insert(incoming_chat_id, chat);
-                }
+                    }
+                });
                 self.add_toast(
                     ToastLevel::Info,
                     format!("New connection from {}", peer_addr),
@@ -1060,9 +1055,7 @@ impl ChatManager {
         // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
         let address = payload.address.and_then(|addr| {
             let trimmed = addr.trim();
-            if trimmed.is_empty() {
-                None
-            } else if trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
                 None
             } else {
                 // Basic validation: should contain a colon and a numeric port

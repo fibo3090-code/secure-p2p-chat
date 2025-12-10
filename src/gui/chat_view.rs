@@ -6,20 +6,18 @@ use uuid::Uuid;
 pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
     // Handle dropped files
     let dropped_files = ui.input(|i| i.raw.dropped_files.clone());
-    if !dropped_files.is_empty() {
-        if let Some(file) = dropped_files.first() {
-            if let Some(path) = &file.path {
-                app.file_to_send = Some(path.clone());
-            }
-        }
+    if !dropped_files.is_empty()
+        && let Some(file) = dropped_files.first()
+        && let Some(path) = &file.path {
+            app.file_to_send = Some(path.clone());
     }
 
     // Header with connection status
     egui::TopBottomPanel::top("chat_header")
         .exact_height(60.0)
         .show_inside(ui, |ui| {
-            if let Ok(manager) = app.chat_manager.try_lock() {
-                if let Some(chat) = manager.get_chat(chat_id) {
+            if let Ok(manager) = app.chat_manager.try_lock()
+                && let Some(chat) = manager.get_chat(chat_id) {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         // Avatar
@@ -73,7 +71,6 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                             }
                         });
                     });
-                }
             }
         });
 
@@ -124,10 +121,8 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     .button(egui::RichText::new("📎").size(20.0))
                     .on_hover_text("Attach file (or drag & drop)")
                     .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        app.file_to_send = Some(path);
-                    }
+                    && let Some(path) = rfd::FileDialog::new().pick_file() {
+                    app.file_to_send = Some(path);
                 }
 
                 // Emoji picker button
@@ -242,8 +237,8 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
             .auto_shrink([false; 2])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                if let Ok(manager) = app.chat_manager.try_lock() {
-                    if let Some(chat) = manager.get_chat(chat_id) {
+                if let Ok(manager) = app.chat_manager.try_lock()
+                    && let Some(chat) = manager.get_chat(chat_id) {
                         if chat.messages.is_empty() {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(100.0);
@@ -264,7 +259,6 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                                 ui.add_space(8.0);
                             }
                         }
-                    }
                 }
             });
     });

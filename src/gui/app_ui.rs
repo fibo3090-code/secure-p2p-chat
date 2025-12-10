@@ -69,7 +69,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, event_collector: EventCollector) -> Self {
         let chat_manager = ChatManager::new(Config::default());
-        let theme = chat_manager.config.theme.clone();
+        let theme = chat_manager.config.theme;
         cc.egui_ctx
             .set_visuals(crate::gui::styling::apply_custom_visuals(&theme));
 
@@ -243,13 +243,12 @@ impl App {
 
         let text = std::mem::take(&mut self.input_text);
 
-        if let Ok(mut manager) = self.chat_manager.try_lock() {
-            if let Err(e) = manager.send_message(chat_id, text) {
-                manager.add_toast(
-                    crate::types::ToastLevel::Error,
-                    format!("Failed to send: {}", e),
-                );
-            }
+        if let Ok(mut manager) = self.chat_manager.try_lock()
+            && let Err(e) = manager.send_message(chat_id, text) {
+            manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Failed to send: {}", e),
+            );
         }
     }
 
