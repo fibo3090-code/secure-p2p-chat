@@ -64,11 +64,14 @@ fn dark_visuals() -> Visuals {
     visuals.window_rounding = Rounding::same(12.0);
     // visuals.window_shadow = eframe::epaint::Shadow::big_dark(); // Removed as it causes build error
     visuals.window_shadow = eframe::epaint::Shadow {
-        extrusion: 32.0,
+        blur: 32.0,
+        spread: 10.0,
+        offset: egui::vec2(0.0, 0.0),
         color: Color32::from_black_alpha(96),
     };
     visuals
 }
+
 
 /// Returns a full set of light visuals.
 fn light_visuals() -> Visuals {
@@ -109,7 +112,9 @@ fn midnight_visuals() -> Visuals {
 
     // visuals.window_shadow = eframe::epaint::Shadow::big_light(); // Glow effect
     visuals.window_shadow = eframe::epaint::Shadow {
-        extrusion: 32.0,
+        blur: 32.0,
+        spread: 5.0,
+        offset: egui::vec2(0.0, 0.0),
         color: Color32::from_rgb(100, 100, 255).gamma_multiply(0.5), // Violet glow
     };
     visuals

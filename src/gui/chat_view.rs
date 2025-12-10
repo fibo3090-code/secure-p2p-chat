@@ -328,7 +328,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     // This is naive but works for simple cases without a parser crate
                     let mut chars = text.chars().peekable();
                     let mut current_text = String::new();
-                    let mut format = egui::TextFormat {
+                    let format = egui::TextFormat {
                         font_id: egui::FontId::proportional(15.0), // Slightly larger font
                         color: text_color,
                         ..Default::default()
