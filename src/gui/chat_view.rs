@@ -440,7 +440,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
             ui.add_space(4.0);
             
             // Timestamp (bottom right of bubble)
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 let timestamp_text = crate::gui::widgets::format_timestamp_relative(&message.timestamp);
                 ui.label(
                     egui::RichText::new(timestamp_text)
