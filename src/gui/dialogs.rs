@@ -191,18 +191,21 @@ fn render_welcome(app: &mut App, ctx: &egui::Context) {
 }
 
 pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
-    let toasts = if let Ok(manager) = app.chat_manager.try_lock() {
-        manager.toasts.clone()
-    } else {
-        Vec::new()
-    };
+    // Combine app-level and manager-level toasts
+    let mut all_toasts = app.toasts.clone();
+    if let Ok(manager) = app.chat_manager.try_lock() {
+        all_toasts.extend(manager.toasts.clone());
+    }
+
+    // Sort toasts by creation time
+    all_toasts.sort_by_key(|t| t.created_at);
 
     egui::Area::new(egui::Id::new("toasts"))
         .fixed_pos(egui::pos2(ctx.screen_rect().width() - 320.0, 60.0))
         .show(ctx, |ui| {
             ui.set_max_width(300.0);
 
-            for toast in &toasts {
+            for toast in &all_toasts {
                 let elapsed = toast.created_at.elapsed();
                 let progress = elapsed.as_secs_f32() / toast.duration.as_secs_f32();
 
@@ -222,6 +225,10 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                 }
             }
         });
+
+    // Cleanup expired app-level toasts
+    let now = std::time::Instant::now();
+    app.toasts.retain(|toast| now.duration_since(toast.created_at) < toast.duration);
 }
 
 fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid::Uuid) {
@@ -236,6 +243,7 @@ fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid:
 
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "❌ Delete").clicked() {
+                    tracing::info!("Delete button clicked for chat_id: {}", chat_id);
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         manager.delete_chat(chat_id);
                         if app.selected_chat == Some(chat_id) {
@@ -263,6 +271,7 @@ fn render_host_dialog(app: &mut App, ctx: &egui::Context) {
 
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "Start").clicked() {
+                    tracing::info!("Start host button clicked");
                     app.start_host_clicked();
                     app.show_host_dialog = false;
                 }
@@ -287,6 +296,7 @@ fn render_connect_dialog(app: &mut App, ctx: &egui::Context) {
 
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "Connect").clicked() {
+                    tracing::info!("Connect to host button clicked");
                     app.connect_clicked();
                     app.show_connect_dialog = false;
                 }
@@ -526,6 +536,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                             };
 
                             if !name.is_empty() {
+                                tracing::info!("Adding contact manually: {}", name);
                                 let manager = app.chat_manager.clone();
                                 let history_path = app.history_path.clone();
                                 tokio::spawn(async move {
@@ -627,6 +638,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                             };
 
                             if !name.is_empty() {
+                                tracing::info!("Adding contact from link: {}", name);
                                 let manager = app.chat_manager.clone();
                                 let history_path = app.history_path.clone();
 
@@ -967,6 +979,10 @@ fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
 
 fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
     if let Some(chat_id) = app.rename_chat_id {
+        tracing::info!("Rendering rename dialog for chat_id: {}", chat_id);
+        let mut close_dialog = false;
+        let mut show_lock_error = false;
+
         egui::Window::new("Rename Conversation")
             .collapsible(false)
             .resizable(false)
@@ -976,38 +992,11 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                 let response = ui.text_edit_singleline(&mut app.rename_input);
                 ui.add_space(10.0);
 
-                ui.horizontal(|ui| {
-                    if crate::gui::widgets::primary_button(ui, "✅ Save").clicked() {
-                        if let Ok(mut manager) = app.chat_manager.try_lock() {
-                            if let Err(e) = manager.rename_chat(chat_id, app.rename_input.clone()) {
-                                manager.add_toast(
-                                    crate::types::ToastLevel::Error,
-                                    format!("Failed to rename: {}", e),
-                                );
-                            } else {
-                                manager.add_toast(
-                                    crate::types::ToastLevel::Success,
-                                    "Chat renamed successfully!".to_string(),
-                                );
-                                // Save history to persist changes
-                                let _ = manager.save_history(&app.history_path);
-                                ctx.request_repaint();
-                            }
-                        }
-                        app.show_rename_dialog = false;
-                        app.rename_chat_id = None;
-                        app.rename_input.clear();
-                    }
+                let save_button = crate::gui::widgets::primary_button(ui, "✅ Save");
+                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                    if crate::gui::widgets::secondary_button(ui, "❌ Cancel").clicked() {
-                        app.show_rename_dialog = false;
-                        app.rename_chat_id = None;
-                        app.rename_input.clear();
-                    }
-                });
-
-                // Allow Enter key to save
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if save_button.clicked() || enter_pressed {
+                    tracing::info!("Save action triggered for rename dialog, chat_id: {}", chat_id);
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         if let Err(e) = manager.rename_chat(chat_id, app.rename_input.clone()) {
                             manager.add_toast(
@@ -1019,16 +1008,32 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                                 crate::types::ToastLevel::Success,
                                 "Chat renamed successfully!".to_string(),
                             );
-                            // Save history to persist changes
                             let _ = manager.save_history(&app.history_path);
                             ctx.request_repaint();
+                            close_dialog = true;
                         }
+                    } else {
+                        show_lock_error = true;
                     }
-                    app.show_rename_dialog = false;
-                    app.rename_chat_id = None;
-                    app.rename_input.clear();
+                }
+
+                if crate::gui::widgets::secondary_button(ui, "❌ Cancel").clicked() {
+                    close_dialog = true;
                 }
             });
+
+        if show_lock_error {
+            app.add_toast(
+                crate::types::ToastLevel::Error,
+                "Could not lock chat manager. Please try again.".to_string(),
+            );
+        }
+
+        if close_dialog {
+            app.show_rename_dialog = false;
+            app.rename_chat_id = None;
+            app.rename_input.clear();
+        }
     }
 }
 
@@ -1160,7 +1165,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                         }).inner.unwrap_or(false) {
                             let _ = manager.save_history(&app.history_path);
                             // Apply theme immediately
-                            ctx.set_visuals(crate::gui::styling::apply_custom_visuals());
+                            ctx.set_visuals(crate::gui::styling::apply_custom_visuals(&manager.config.theme));
                         }
                 });
 

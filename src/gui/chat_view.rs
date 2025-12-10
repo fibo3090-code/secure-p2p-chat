@@ -52,7 +52,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                                 ui.label(
                                     egui::RichText::new("✍️ typing...")
                                         .size(12.0)
-                                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
                                 );
                             } else {
                                 ui.label(
@@ -93,7 +93,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     ui.label(
                         egui::RichText::new(&filename)
                             .strong()
-                            .color(crate::gui::styling::ACCENT_PRIMARY),
+                            .color(ui.visuals().selection.bg_fill),
                     );
                     if ui.small_button("❌ Cancel").clicked() {
                         app.file_to_send = None;
@@ -198,7 +198,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                         .min_size(egui::vec2(65.0, 70.0));
 
                 if send_enabled {
-                    send_button = send_button.fill(crate::gui::styling::ACCENT_PRIMARY);
+                    send_button = send_button.fill(ui.visuals().selection.bg_fill);
                 }
 
                 if ui.add_enabled(send_enabled, send_button).clicked() {
@@ -250,12 +250,12 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                                 ui.label(
                                     egui::RichText::new("🔒 End-to-end encrypted conversation")
                                         .size(16.0)
-                                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
                                 );
                                 ui.label(
                                     egui::RichText::new("Send your first message below!")
                                         .size(14.0)
-                                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
                                 );
                             });
                         } else {
@@ -280,9 +280,9 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
     ui.with_layout(align, |ui| {
         // Message bubble with custom styling
         let bg_color = if message.from_me {
-            crate::gui::styling::ACCENT_PRIMARY
+            ui.visuals().selection.bg_fill
         } else {
-            crate::gui::styling::SECONDARY_BACKGROUND
+            ui.visuals().widgets.noninteractive.bg_fill
         };
 
         let frame = egui::Frame::none()
@@ -299,7 +299,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     // Text message with white color
                     ui.label(
                         egui::RichText::new(text)
-                            .color(crate::gui::styling::TEXT_PRIMARY)
+                            .color(ui.visuals().text_color())
                             .size(14.0),
                     );
 
@@ -309,7 +309,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                         .small_button(
                             egui::RichText::new("📋 Copy")
                                 .size(10.0)
-                                .color(crate::gui::styling::TEXT_PRIMARY),
+                                .color(ui.visuals().text_color()),
                         )
                         .clicked()
                     {
@@ -325,18 +325,18 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                         ui.label(
                             egui::RichText::new("📄")
                                 .size(24.0)
-                                .color(crate::gui::styling::TEXT_PRIMARY),
+                                .color(ui.visuals().text_color()),
                         );
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(filename)
                                     .strong()
-                                    .color(crate::gui::styling::TEXT_PRIMARY),
+                                    .color(ui.visuals().text_color()),
                             );
                             ui.label(
                                 egui::RichText::new(crate::util::format_size(*size))
                                     .size(12.0)
-                                    .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
                             );
                         });
                     });
@@ -346,7 +346,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                         if ui
                             .button(
                                 egui::RichText::new("📂 Open File")
-                                    .color(crate::gui::styling::TEXT_PRIMARY),
+                                    .color(ui.visuals().text_color()),
                             )
                             .clicked()
                         {
@@ -357,7 +357,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                 MessageContent::Edited { new_text } => {
                     ui.label(
                         egui::RichText::new(format!("{} (Edited)", new_text))
-                            .color(crate::gui::styling::TEXT_PRIMARY)
+                            .color(ui.visuals().text_color())
                             .size(14.0),
                     );
                 }
@@ -370,7 +370,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
             ui.label(
                 egui::RichText::new(timestamp_text)
                     .size(10.0)
-                    .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
             );
         });
 

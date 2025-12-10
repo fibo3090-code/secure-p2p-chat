@@ -63,12 +63,15 @@ pub struct App {
     pub show_log_terminal: bool,
     pub show_clear_history_dialog: bool,
     pub event_collector: EventCollector,
+    pub toasts: Vec<Toast>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, event_collector: EventCollector) -> Self {
+        let chat_manager = ChatManager::new(Config::default());
+        let theme = chat_manager.config.theme.clone();
         cc.egui_ctx
-            .set_visuals(crate::gui::styling::apply_custom_visuals());
+            .set_visuals(crate::gui::styling::apply_custom_visuals(&theme));
 
         // Load fonts. Embedding the TTF files at compile time requires the files to exist.
         // Make embedding optional so builds don't fail when the `assets/` files are not present.
@@ -145,6 +148,8 @@ impl App {
             &identity.fingerprint[..16]
         );
 
+        let show_welcome = !history_path.exists();
+
         if history_path.exists() {
             if let Err(e) = chat_manager.load_history(&history_path) {
                 tracing::warn!("Failed to load history: {}", e);
@@ -188,7 +193,7 @@ impl App {
             show_host_dialog: false,
             host_port: host_port_ui,
             show_settings: false,
-            show_welcome: true, // Show welcome screen on first launch
+            show_welcome, // Show welcome screen on first launch
             file_to_send: None,
             show_about: false,
             chat_to_delete: None,
@@ -227,6 +232,7 @@ impl App {
             show_log_terminal: initial_show_log_terminal,
             show_clear_history_dialog: false,
             event_collector,
+            toasts: Vec::new(),
         }
     }
 
@@ -263,30 +269,39 @@ impl App {
     }
 
     pub fn connect_clicked(&mut self) {
-      let mut host = self.connect_host.clone();
-      let mut port = self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT);
-      if let Some(colon) = host.find(':') {
-          let (h, p) = host.split_at(colon);
-          // Clone slices to owned Strings to avoid borrowing `host` while reassigning it
-          let h_str = h.to_string();
-          let p_str = p[1..].to_string(); // skip ':'
-          if let Ok(pn) = p_str.parse::<u16>() { port = pn; }
-          host = h_str;
-      }
-      let manager = self.chat_manager.clone();
-      let existing_chat = self.selected_chat; // bind connection to the currently selected chat if any
+        let mut host = self.connect_host.clone();
+        let mut port = self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT);
+        if let Some(colon) = host.find(':') {
+            let (h, p) = host.split_at(colon);
+            // Clone slices to owned Strings to avoid borrowing `host` while reassigning it
+            let h_str = h.to_string();
+            let p_str = p[1..].to_string(); // skip ':'
+            if let Ok(pn) = p_str.parse::<u16>() { port = pn; }
+            host = h_str;
+        }
+        let manager = self.chat_manager.clone();
+        let existing_chat = self.selected_chat; // bind connection to the currently selected chat if any
+  
+        tokio::spawn(async move {
+            let mut mgr = manager.lock().await;
+            if let Err(e) = mgr.connect_to_host(&host, port, existing_chat).await {
+                mgr.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Failed to connect: {}", e),
+                );
+            }
+        });
+    }
 
-      tokio::spawn(async move {
-          let mut mgr = manager.lock().await;
-          if let Err(e) = mgr.connect_to_host(&host, port, existing_chat).await {
-              mgr.add_toast(
-                  crate::types::ToastLevel::Error,
-                  format!("Failed to connect: {}", e),
-              );
-          }
-      });
-  }
-
+    pub fn add_toast(&mut self, level: ToastLevel, message: String) {
+        self.toasts.push(Toast {
+            id: Uuid::new_v4(),
+            level,
+            message,
+            created_at: std::time::Instant::now(),
+            duration: std::time::Duration::from_secs(4),
+        });
+    }
 }
 
 impl eframe::App for App {

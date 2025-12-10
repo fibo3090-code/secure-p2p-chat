@@ -82,7 +82,7 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
 
     // Background for selection
     if is_selected {
-        ui.painter().rect_filled(rect, 6.0, crate::gui::styling::ACCENT_PRIMARY);
+        ui.painter().rect_filled(rect, 6.0, ui.visuals().selection.bg_fill);
     }
 
     // Avatar
@@ -108,7 +108,7 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
         Align2::LEFT_TOP,
         &chat.title,
         FontId::proportional(15.0),
-        crate::gui::styling::TEXT_PRIMARY,
+        ui.visuals().text_color(),
     );
 
     // Timestamp of last message
@@ -118,7 +118,7 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
         Align2::RIGHT_TOP,
         ts,
         FontId::proportional(12.0),
-        crate::gui::styling::SUBTLE_TEXT_COLOR,
+        ui.visuals().text_color().gamma_multiply(0.7),
     );
 
     response

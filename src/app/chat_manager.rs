@@ -50,6 +50,7 @@ impl ChatManager {
     fn parse_address(address: &str) -> Result<(String, u16)> {
         let parts: Vec<&str> = address.split(':').collect();
         if parts.len() != 2 {
+            tracing::error!("Invalid address format for contact: {}", address);
             return Err(anyhow::anyhow!("Invalid address format for contact"));
         }
         let host = parts[0].trim();
@@ -58,6 +59,7 @@ impl ChatManager {
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid port in contact address"))?;
         if host.is_empty() {
+            tracing::error!("Host is empty in contact address: {}", address);
             return Err(anyhow::anyhow!("Host is empty in contact address"));
         }
         Ok((host.to_string(), port))
@@ -230,6 +232,7 @@ impl ChatManager {
             chat.title = new_title;
             Ok(())
         } else {
+            tracing::error!("Chat not found for rename: {}", chat_id);
             Err(anyhow::anyhow!("Chat not found"))
         }
     }
@@ -405,6 +408,7 @@ impl ChatManager {
                     return Ok(chat_id);
                 }
             }
+            tracing::error!("Contact {} has no address and no active session found by fingerprint", contact_id);
             Err(anyhow::anyhow!(
                 "Contact has no address. Edit the contact to set IP:PORT, or connect first so we can match by fingerprint."
             ))
@@ -450,7 +454,10 @@ impl ChatManager {
             timestamp: crate::util::current_timestamp_millis(),
         };
 
-        session.from_app_tx.send(msg)?;
+        if let Err(e) = session.from_app_tx.send(msg) {
+            tracing::error!("Failed to send message to chat {}: {}", chat_id, e);
+            return Err(e.into());
+        }
 
         // Add to local history
         if let Some(chat) = self.chats.get_mut(&chat_id) {
@@ -642,6 +649,7 @@ impl ChatManager {
             tx.send(accept).map_err(|e| anyhow::anyhow!("Failed to send confirmation: {}", e))?;
             Ok(())
         } else {
+            tracing::error!("No confirmation channel for chat {}", chat_id);
             Err(anyhow::anyhow!("No confirmation channel for chat {}", chat_id))
         }
     }
@@ -667,6 +675,7 @@ impl ChatManager {
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
         if file_size > crate::MAX_PACKET_SIZE as u64 {
+            tracing::error!("File is too large to send: {} > {}", file_size, crate::MAX_PACKET_SIZE);
             self.add_toast(
                 ToastLevel::Error,
                 format!(
@@ -962,13 +971,8 @@ impl ChatManager {
                             chat.typing_since = None;
                         }
                     }
-
-                    ProtocolMessage::Version { .. } | ProtocolMessage::EphemeralKey { .. } => {
-                        // These are handshake messages, should not appear in message loop
-                        tracing::warn!(
-                            "Received handshake message in message loop: {:?}",
-                            proto_msg
-                        );
+                    other => {
+                        tracing::warn!("Received unhandled protocol message in message loop: {:?}", other);
                     }
                 }
             }

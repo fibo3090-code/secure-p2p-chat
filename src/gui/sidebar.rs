@@ -9,10 +9,12 @@ pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
             if ui.button("➕").on_hover_text("New connection").clicked() {
                 ui.menu_button("", |ui| {
                     if ui.button("🎤 Host Connection").clicked() {
+                        tracing::info!("Host connection dialog opened");
                         app.show_host_dialog = true;
                         ui.close_menu();
                     }
                     if ui.button("🔌 Connect to Host").clicked() {
+                        tracing::info!("Connect to host dialog opened");
                         app.show_connect_dialog = true;
                         ui.close_menu();
                     }
@@ -51,16 +53,19 @@ pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
                 }
 
                 response.context_menu(|ui| {
-                    if ui.button("✏️ Rename chat").clicked()
-                        && let Ok(manager) = app.chat_manager.try_lock()
-                        && let Some(chat) = manager.get_chat(chat_id)
-                    {
-                        app.rename_chat_id = Some(chat_id);
-                        app.rename_input = chat.title.clone();
-                        app.show_rename_dialog = true;
-                        ui.close_menu();
+                    if ui.button("✏️ Rename chat").clicked() {
+                        tracing::info!("Rename chat context menu clicked for chat_id: {}", chat_id);
+                        if let Ok(manager) = app.chat_manager.try_lock() {
+                            if let Some(chat) = manager.get_chat(chat_id) {
+                                app.rename_chat_id = Some(chat_id);
+                                app.rename_input = chat.title.clone();
+                                app.show_rename_dialog = true;
+                                ui.close_menu();
+                            }
+                        }
                     }
                     if ui.button("🗑 Delete chat").clicked() {
+                        tracing::info!("Delete chat context menu clicked for chat_id: {}", chat_id);
                         app.chat_to_delete = Some(chat_id);
                         ui.close_menu();
                     }
