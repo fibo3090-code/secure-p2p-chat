@@ -113,6 +113,10 @@ impl ChatManager {
             fingerprint,
             public_key,
             created_at: chrono::Utc::now(),
+            trust_state: TrustState::Unverified,
+            notes: String::new(),
+            tags: Vec::new(),
+            last_seen: None,
         };
         self.contacts.insert(id, contact);
         // no chat association by default
@@ -1103,6 +1107,10 @@ impl ChatManager {
             fingerprint: Some(payload.fingerprint),
             public_key: Some(payload.public_key),
             created_at: chrono::Utc::now(),
+            trust_state: TrustState::Unverified,
+            notes: String::new(),
+            tags: Vec::new(),
+            last_seen: None,
         };
 
         Ok(contact)

@@ -37,6 +37,25 @@ pub struct Contact {
     pub fingerprint: Option<String>,
     pub public_key: Option<String>,
     pub created_at: DateTime<Utc>,
+    
+    // Contacts 2.0 Fields
+    #[serde(default)]
+    pub trust_state: TrustState,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+/// Trust level for a contact
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrustState {
+    #[default]
+    Unverified,
+    Verified,
+    Trusted,
+    Blocked,
 }
 
 /// Message content types
