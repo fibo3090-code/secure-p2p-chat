@@ -265,24 +265,51 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
 }
 
 fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
-    let align = if message.from_me {
+    let is_me = message.from_me;
+    let align = if is_me {
         egui::Layout::right_to_left(egui::Align::TOP)
     } else {
         egui::Layout::left_to_right(egui::Align::TOP)
     };
 
     ui.with_layout(align, |ui| {
-        // Message bubble with custom styling
-        let bg_color = if message.from_me {
-            ui.visuals().selection.bg_fill
+        // Modern Message Bubbles
+        // Differentiate colors:
+        // - Me: Accent color (Gradient-ish feel via bright accent)
+        // - Them: Muted secondary background
+        let bg_color = if is_me {
+            ui.visuals().widgets.active.bg_fill
         } else {
-            ui.visuals().widgets.noninteractive.bg_fill
+            ui.visuals().widgets.inactive.bg_fill
+        };
+
+        let text_color = if is_me {
+            Color32::WHITE // Always white on accent
+        } else {
+            ui.visuals().text_color()
+        };
+
+        // Rounding: bubble effect (sharper corner on the sender side)
+        let rounding = if is_me {
+            egui::Rounding {
+                nw: 18.0,
+                ne: 4.0, // Top-right sharp for "me"
+                sw: 18.0,
+                se: 18.0,
+            }
+        } else {
+            egui::Rounding {
+                nw: 4.0, // Top-left sharp for "them"
+                ne: 18.0,
+                sw: 18.0,
+                se: 18.0,
+            }
         };
 
         let frame = egui::Frame::none()
             .fill(bg_color)
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .rounding(rounding)
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0)) // More breathing room
             .stroke(egui::Stroke::NONE);
 
         let frame_response = frame.show(ui, |ui| {
@@ -290,24 +317,60 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
 
             match &message.content {
                 MessageContent::Text { text } => {
-                    // Text message with white color
-                    ui.label(
-                        egui::RichText::new(text)
-                            .color(ui.visuals().text_color())
-                            .size(14.0),
-                    );
+                    // Simple Markdown Parsing (Bold/Italic)
+                    // We split by whitespace and look for * or _ wrappers manually for now
+                    // keeping it simple to avoid deps. Or just use RichText which supports some stats?
+                    // egui::RichText doesn't auto-parse markdown.
+                    // For "way better", let's use a nice font size.
+                    
+                    let mut job = egui::text::LayoutJob::default();
+                    // Basic "Markdown" simulation for Bold and Code
+                    // This is naive but works for simple cases without a parser crate
+                    let mut chars = text.chars().peekable();
+                    let mut current_text = String::new();
+                    let mut format = egui::TextFormat {
+                        font_id: egui::FontId::proportional(15.0), // Slightly larger font
+                        color: text_color,
+                        ..Default::default()
+                    };
 
-                    // Small copy button
-                    ui.add_space(2.0);
-                    if ui
-                        .small_button(
-                            egui::RichText::new("📋 Copy")
-                                .size(10.0)
-                                .color(ui.visuals().text_color()),
-                        )
-                        .clicked()
-                    {
-                        ui.output_mut(|o| o.copied_text = text.clone());
+                    while let Some(c) = chars.next() {
+                        if c == '`' {
+                            // Flush current
+                            if !current_text.is_empty() {
+                                job.append(&current_text, 0.0, format.clone());
+                                current_text.clear();
+                            }
+                            // Read code block
+                            let mut code_text = String::new();
+                            while let Some(code_c) = chars.next() {
+                                if code_c == '`' { break; }
+                                code_text.push(code_c);
+                            }
+                            // Append code styled
+                            let code_format = egui::TextFormat {
+                                font_id: egui::FontId::monospace(13.0),
+                                background: Color32::BLACK.gamma_multiply(0.2), // Dim background
+                                color: if is_me { Color32::WHITE } else { crate::gui::styling::ACCENT_SECONDARY },
+                                ..format.clone()
+                            };
+                            job.append(&code_text, 0.0, code_format);
+                        } else {
+                            current_text.push(c);
+                        }
+                    }
+                    if !current_text.is_empty() {
+                        job.append(&current_text, 0.0, format);
+                    }
+                    
+                    ui.label(job);
+
+                    // Copy action (only visible on hover to reduce clutter)
+                    if ui.rect_contains_pointer(ui.max_rect()) {
+                         ui.add_space(4.0);
+                         if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                             ui.output_mut(|o| o.copied_text = text.clone());
+                         }
                     }
                 }
                 MessageContent::File {
@@ -315,65 +378,84 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     size,
                     path,
                 } => {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("📄")
-                                .size(24.0)
-                                .color(ui.visuals().text_color()),
-                        );
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(filename)
-                                    .strong()
-                                    .color(ui.visuals().text_color()),
+                    // Modern File Card
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            // Icon container
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(8.0),
+                                Color32::from_white_alpha(30)
                             );
-                            ui.label(
-                                egui::RichText::new(crate::util::format_size(*size))
-                                    .size(12.0)
-                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "📄",
+                                egui::FontId::proportional(24.0),
+                                text_color
                             );
-                        });
-                    });
 
-                    if let Some(p) = path {
-                        ui.add_space(4.0);
-                        if ui
-                            .button(
-                                egui::RichText::new("📂 Open File")
-                                    .color(ui.visuals().text_color()),
-                            )
-                            .clicked()
-                        {
-                            let _ = open::that(p);
+                            ui.add_space(8.0);
+                            
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(filename)
+                                        .strong()
+                                        .size(14.0)
+                                        .color(text_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new(crate::util::format_size(*size))
+                                        .size(11.0)
+                                        .color(text_color.gamma_multiply(0.8)),
+                                );
+                            });
+                        });
+
+                        if let Some(p) = path {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            if ui.add(
+                                egui::Button::new("📂 Open")
+                                    .fill(Color32::from_white_alpha(20))
+                                    .stroke(egui::Stroke::NONE)
+                            ).clicked() {
+                                let _ = open::that(p);
+                            }
                         }
-                    }
+                    });
                 }
                 MessageContent::Edited { new_text } => {
-                    ui.label(
+                     ui.label(
                         egui::RichText::new(format!("{} (Edited)", new_text))
-                            .color(ui.visuals().text_color())
+                            .italics()
+                            .color(text_color.gamma_multiply(0.8))
                             .size(14.0),
                     );
                 }
             }
-
-            ui.add_space(2.0);
-
-            // Timestamp with subtle styling
-            let timestamp_text = crate::gui::widgets::format_timestamp_relative(&message.timestamp);
-            ui.label(
-                egui::RichText::new(timestamp_text)
-                    .size(10.0)
-                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
-            );
+            
+            ui.add_space(4.0);
+            
+            // Timestamp (bottom right of bubble)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                let timestamp_text = crate::gui::widgets::format_timestamp_relative(&message.timestamp);
+                ui.label(
+                    egui::RichText::new(timestamp_text)
+                        .size(9.0)
+                        .color(text_color.gamma_multiply(0.6)),
+                );
+            });
         });
 
-        // Add hover effect
+        // Add subtle hover lift effect
         if frame_response.response.hovered() {
             ui.painter().rect_stroke(
                 frame_response.response.rect,
-                12.0,
-                egui::Stroke::new(1.0, crate::gui::styling::ACCENT_SECONDARY),
+                rounding,
+                egui::Stroke::new(1.5, ui.visuals().widgets.active.bg_fill.gamma_multiply(0.5)),
             );
         }
     });

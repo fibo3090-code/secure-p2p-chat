@@ -30,32 +30,39 @@ pub const SPACING_LARGE: f32 = 15.0;
 /// Returns a full set of dark visuals.
 fn dark_visuals() -> Visuals {
     let mut visuals = Visuals::dark();
-    visuals.override_text_color = Some(DARK_TEXT_PRIMARY);
-    visuals.widgets.noninteractive.bg_fill = DARK_PRIMARY_BACKGROUND;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DARK_SECONDARY_BACKGROUND);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, DARK_TEXT_PRIMARY);
-    visuals.widgets.noninteractive.rounding = Rounding::same(4.0);
+    // Modern Dark Theme: Deep Blue-Grey Backgrounds
+    let bg = Color32::from_rgb(15, 23, 42); // Slate 900
+    let primary = Color32::from_rgb(30, 41, 59); // Slate 800
+    let secondary = Color32::from_rgb(51, 65, 85); // Slate 700
+    let text = Color32::from_rgb(241, 245, 249); // Slate 100
+    let accent = Color32::from_rgb(56, 189, 248); // Sky 400
 
-    visuals.widgets.inactive.bg_fill = DARK_SECONDARY_BACKGROUND;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, DARK_TEXT_PRIMARY);
-    visuals.widgets.inactive.rounding = Rounding::same(4.0);
+    visuals.override_text_color = Some(text);
+    visuals.widgets.noninteractive.bg_fill = bg;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, primary);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.noninteractive.rounding = Rounding::same(8.0); // Softer corners
 
-    visuals.widgets.hovered.bg_fill = Color32::from_gray(60);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_gray(80));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, DARK_TEXT_PRIMARY);
-    visuals.widgets.hovered.rounding = Rounding::same(4.0);
+    visuals.widgets.inactive.bg_fill = primary;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(0.5, secondary);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.inactive.rounding = Rounding::same(6.0);
 
-    visuals.widgets.active.bg_fill = ACCENT_PRIMARY;
+    visuals.widgets.hovered.bg_fill = secondary;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent.gamma_multiply(0.5));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.rounding = Rounding::same(6.0);
+
+    visuals.widgets.active.bg_fill = accent;
     visuals.widgets.active.bg_stroke = Stroke::NONE;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.active.rounding = Rounding::same(4.0);
+    visuals.widgets.active.rounding = Rounding::same(6.0);
 
-    visuals.selection.bg_fill = ACCENT_PRIMARY;
-    visuals.selection.stroke = Stroke::new(1.0, DARK_TEXT_PRIMARY);
+    visuals.selection.bg_fill = accent.gamma_multiply(0.3); // Transparent accent for selection
+    visuals.selection.stroke = Stroke::new(1.0, accent);
 
-    visuals.window_rounding = Rounding::same(6.0);
-    visuals.window_shadow = eframe::epaint::Shadow::default();
+    visuals.window_rounding = Rounding::same(12.0);
+    visuals.window_shadow = eframe::epaint::Shadow::big_dark();
     visuals
 }
 
@@ -63,57 +70,40 @@ fn dark_visuals() -> Visuals {
 fn light_visuals() -> Visuals {
     let mut visuals = Visuals::light();
     visuals.override_text_color = Some(LIGHT_TEXT_PRIMARY);
-    visuals.widgets.noninteractive.bg_fill = LIGHT_PRIMARY_BACKGROUND;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LIGHT_SECONDARY_BACKGROUND);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, LIGHT_TEXT_PRIMARY);
-    visuals.widgets.noninteractive.rounding = Rounding::same(4.0);
-
-    visuals.widgets.inactive.bg_fill = LIGHT_SECONDARY_BACKGROUND;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, LIGHT_TEXT_PRIMARY);
-    visuals.widgets.inactive.rounding = Rounding::same(4.0);
-
-    visuals.widgets.hovered.bg_fill = Color32::from_gray(220);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_gray(200));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, LIGHT_TEXT_PRIMARY);
-    visuals.widgets.hovered.rounding = Rounding::same(4.0);
-
-    visuals.widgets.active.bg_fill = ACCENT_PRIMARY;
-    visuals.widgets.active.bg_stroke = Stroke::NONE;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.active.rounding = Rounding::same(4.0);
-
-    visuals.selection.bg_fill = ACCENT_PRIMARY;
-    visuals.selection.stroke = Stroke::new(1.0, LIGHT_TEXT_PRIMARY);
-
-    visuals.window_rounding = Rounding::same(6.0);
-    visuals.window_shadow = eframe::epaint::Shadow::default();
+    // Keep light theme mostly standard but refined
+    visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    visuals.menu_rounding = Rounding::same(6.0);
     visuals
 }
 
-
-
-/// Returns a full set of Midnight visuals.
+/// Returns a full set of Midnight visuals (Deep Black/Purple).
 fn midnight_visuals() -> Visuals {
     let mut visuals = Visuals::dark();
-    let _bg = Color32::from_rgb(10, 10, 20);
-    let primary = Color32::from_rgb(20, 20, 40);
-    let secondary = Color32::from_rgb(30, 30, 60);
+    let bg = Color32::from_rgb(0, 0, 0); // True Black
+    let primary = Color32::from_rgb(10, 10, 15);
+    let secondary = Color32::from_rgb(25, 25, 35);
     let text = Color32::from_rgb(220, 220, 255);
-    let accent = Color32::from_rgb(100, 100, 255);
+    let accent = Color32::from_rgb(124, 58, 237); // Violet 600
 
     visuals.override_text_color = Some(text);
-    visuals.widgets.noninteractive.bg_fill = primary;
+    visuals.widgets.noninteractive.bg_fill = bg;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, secondary);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.noninteractive.rounding = Rounding::same(8.0);
 
-    visuals.widgets.inactive.bg_fill = secondary;
+    visuals.widgets.inactive.bg_fill = primary;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.inactive.rounding = Rounding::same(6.0);
 
     visuals.widgets.active.bg_fill = accent;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.selection.bg_fill = accent;
+    visuals.widgets.active.rounding = Rounding::same(6.0);
 
+    visuals.selection.bg_fill = accent;
+    visuals.selection.stroke = Stroke::NONE;
+
+    visuals.window_shadow = eframe::epaint::Shadow::big_light(); // Glow effect
     visuals
 }
 
