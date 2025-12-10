@@ -1,6 +1,5 @@
 use encodeur_rsa_rust::app::chat_manager::ChatManager;
-use encodeur_rsa_rust::types::{Config, TrustState, Contact};
-use uuid::Uuid;
+use encodeur_rsa_rust::types::{Config, TrustState};
 
 #[tokio::test]
 async fn simulation_contacts_lifecycle() {

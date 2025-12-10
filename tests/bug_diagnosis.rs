@@ -7,7 +7,7 @@ mod diagnostics {
     use encodeur_rsa_rust::app::chat_manager::ChatManager;
     use encodeur_rsa_rust::types::Config;
     use encodeur_rsa_rust::util::sanitize_filename;
-    use std::path::PathBuf;
+// use std::path::PathBuf;
     use uuid::Uuid;
 
     #[tokio::test]
