@@ -4,11 +4,11 @@ use crate::types::*;
 use crate::PORT_DEFAULT;
 
 use eframe::egui;
+use egui_tracing::tracing::EventCollector;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use egui_tracing::tracing::EventCollector;
 
 pub struct App {
     pub chat_manager: Arc<Mutex<ChatManager>>,
@@ -77,10 +77,10 @@ impl App {
 
         // Load fonts. Embedding the TTF files at compile time requires the files to exist.
         // Make embedding optional so builds don't fail when the `assets/` files are not present.
-    #[cfg(feature = "embed_fonts")]
-    let mut fonts = egui::FontDefinitions::default();
-    #[cfg(not(feature = "embed_fonts"))]
-    let fonts = egui::FontDefinitions::default();
+        #[cfg(feature = "embed_fonts")]
+        let mut fonts = egui::FontDefinitions::default();
+        #[cfg(not(feature = "embed_fonts"))]
+        let fonts = egui::FontDefinitions::default();
 
         // If you want to embed the Inter fonts into the binary, enable the
         // `embed_fonts` feature in Cargo.toml and ensure the files exist at
@@ -159,13 +159,15 @@ impl App {
                 tracing::info!("Successfully loaded conversation history");
                 // Re-apply theme from loaded config
                 let loaded_theme = chat_manager.config.theme;
-                cc.egui_ctx.set_visuals(crate::gui::styling::apply_custom_visuals(&loaded_theme));
+                cc.egui_ctx
+                    .set_visuals(crate::gui::styling::apply_custom_visuals(&loaded_theme));
             }
         }
 
         // Capture config before moving manager
         let auto_host_enabled = chat_manager.config.auto_host_on_startup;
         let auto_host_port = chat_manager.config.listen_port;
+        let auto_connect_enabled = chat_manager.config.auto_connect;
         // Capture listen_port for initializing the UI field before moving manager
         let host_port_ui = auto_host_port.to_string();
         // Wrap manager in Arc<Mutex<..>> once and reuse
@@ -182,6 +184,15 @@ impl App {
                         format!("Failed to auto-start host: {}", e),
                     );
                 }
+            });
+        }
+
+        // Auto-reconnect to known contacts if enabled
+        if auto_connect_enabled {
+            let mgr_clone = manager_arc.clone();
+            tokio::spawn(async move {
+                let mut mgr = mgr_clone.lock().await;
+                mgr.auto_reconnect_contacts().await;
             });
         }
 
@@ -250,7 +261,8 @@ impl App {
         let text = std::mem::take(&mut self.input_text);
 
         if let Ok(mut manager) = self.chat_manager.try_lock()
-            && let Err(e) = manager.send_message(chat_id, text) {
+            && let Err(e) = manager.send_message(chat_id, text)
+        {
             manager.add_toast(
                 crate::types::ToastLevel::Error,
                 format!("Failed to send: {}", e),
@@ -281,12 +293,14 @@ impl App {
             // Clone slices to owned Strings to avoid borrowing `host` while reassigning it
             let h_str = h.to_string();
             let p_str = p[1..].to_string(); // skip ':'
-            if let Ok(pn) = p_str.parse::<u16>() { port = pn; }
+            if let Ok(pn) = p_str.parse::<u16>() {
+                port = pn;
+            }
             host = h_str;
         }
         let manager = self.chat_manager.clone();
         let existing_chat = self.selected_chat; // bind connection to the currently selected chat if any
-  
+
         tokio::spawn(async move {
             let mut mgr = manager.lock().await;
             if let Err(e) = mgr.connect_to_host(&host, port, existing_chat).await {
@@ -314,7 +328,9 @@ impl eframe::App for App {
         // Poll session events to process received messages
         if let Ok(mut manager) = self.chat_manager.try_lock() {
             manager.poll_session_events();
-            if let Some((fingerprint, peer_name, chat_id)) = manager.fingerprint_verification_request.take() {
+            if let Some((fingerprint, peer_name, chat_id)) =
+                manager.fingerprint_verification_request.take()
+            {
                 self.fingerprint_to_verify = Some(fingerprint);
                 self.peer_name_to_verify = Some(peer_name);
                 self.chat_id_to_verify = Some(chat_id);
@@ -403,6 +419,51 @@ impl eframe::App for App {
             });
         });
 
+        // Status bar: hosting + connectivity summary
+        egui::TopBottomPanel::top("status_panel")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                if let Ok(manager) = self.chat_manager.try_lock() {
+                    let listen_port = manager.config.listen_port;
+                    let host_title = format!("Host on :{}", listen_port);
+                    let is_listening = manager.chats.values().any(|c| c.title == host_title);
+                    let sessions = manager.sessions_len();
+                    let toasts = manager.toasts.len();
+
+                    ui.horizontal_wrapped(|ui| {
+                        if is_listening {
+                            ui.colored_label(
+                                crate::gui::styling::SUCCESS,
+                                format!("🟢 Hosting on :{}", listen_port),
+                            );
+                            if ui.button("Copy address").clicked() {
+                                if let Some(ip) = crate::util::primary_local_ipv4() {
+                                    ui.output_mut(|o| o.copied_text = format!("{ip}:{listen_port}"));
+                                } else {
+                                    ui.output_mut(|o| o.copied_text = format!("localhost:{listen_port}"));
+                                }
+                            }
+                        } else {
+                            ui.colored_label(
+                                crate::gui::styling::ERROR,
+                                "⚠ Not hosting",
+                            );
+                        }
+
+                        ui.separator();
+                        ui.label(format!("Sessions: {sessions}"));
+                        ui.separator();
+                        ui.label(format!("Toasts: {toasts}"));
+                    });
+                } else {
+                    ui.colored_label(
+                        crate::gui::styling::SUBTLE_TEXT_COLOR,
+                        "Status unavailable (busy)",
+                    );
+                }
+            });
+
         // Sidebar - Chat list
         egui::SidePanel::left("sidebar")
             .default_width(250.0)
@@ -416,7 +477,24 @@ impl eframe::App for App {
                 crate::gui::chat_view::render_chat(self, ui, chat_id);
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Select a chat or start a new connection");
+                    ui.vertical_centered(|ui| {
+                        ui.heading("No chat selected");
+                        ui.label("Start hosting, connect to a peer, or invite a friend.");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("🎤 Start Host").clicked() {
+                                self.show_host_dialog = true;
+                            }
+                            if ui.button("🔌 Connect").clicked() {
+                                self.show_connect_dialog = true;
+                            }
+                            if ui.button("📨 Invite").clicked() {
+                                self.show_contacts = true;
+                                self.show_add_contact = true;
+                                self.contact_tab = 1; // invite link tab
+                            }
+                        });
+                    });
                 });
             }
         });

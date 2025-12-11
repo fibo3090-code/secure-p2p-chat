@@ -8,8 +8,9 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
     let dropped_files = ui.input(|i| i.raw.dropped_files.clone());
     if !dropped_files.is_empty()
         && let Some(file) = dropped_files.first()
-        && let Some(path) = &file.path {
-            app.file_to_send = Some(path.clone());
+        && let Some(path) = &file.path
+    {
+        app.file_to_send = Some(path.clone());
     }
 
     // Header with connection status
@@ -17,60 +18,92 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
         .exact_height(60.0)
         .show_inside(ui, |ui| {
             if let Ok(manager) = app.chat_manager.try_lock()
-                && let Some(chat) = manager.get_chat(chat_id) {
+                && let Some(chat) = manager.get_chat(chat_id)
+            {
+                let connected = manager.is_connected(&chat_id);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    // Avatar
+                    let color = if let Some(fp) = &chat.peer_fingerprint {
+                        crate::gui::widgets::fingerprint_to_color(fp)
+                    } else {
+                        egui::Color32::GRAY
+                    };
+
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 20.0, color);
+
+                    let initials = crate::gui::widgets::get_initials(&chat.title);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        initials,
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::WHITE,
+                    );
+
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        // Avatar
-                        let color = if let Some(fp) = &chat.peer_fingerprint {
-                            crate::gui::widgets::fingerprint_to_color(fp)
+
+                    // Title and status
+                    ui.vertical(|ui| {
+                        ui.heading(&chat.title);
+                        // Show typing indicator or connection status
+                        if chat.peer_typing {
+                            ui.label(
+                                egui::RichText::new("✍️ typing...")
+                                    .size(12.0)
+                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                            );
+                        } else if connected {
+                            ui.label(
+                                egui::RichText::new("🟢 Connected")
+                                    .size(12.0)
+                                    .color(crate::gui::styling::SUCCESS),
+                            );
                         } else {
-                            egui::Color32::GRAY
-                        };
-
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 20.0, color);
-
-                        let initials = crate::gui::widgets::get_initials(&chat.title);
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            initials,
-                            egui::FontId::proportional(16.0),
-                            egui::Color32::WHITE,
-                        );
-
-                        ui.add_space(8.0);
-
-                        // Title and status
-                        ui.vertical(|ui| {
-                            ui.heading(&chat.title);
-                            // Show typing indicator or connection status
-                            if chat.peer_typing {
-                                ui.label(
-                                    egui::RichText::new("✍️ typing...")
-                                        .size(12.0)
-                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("🟢 Connected")
-                                        .size(12.0)
-                                        .color(crate::gui::styling::SUCCESS),
-                                );
-                            }
-                        });
-
-                        // Fingerprint on right
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(fp) = &chat.peer_fingerprint {
-                                if ui.button("📋 Copy Fingerprint").clicked() {
-                                    ui.output_mut(|o| o.copied_text = fp.clone());
-                                }
-                                ui.monospace(crate::util::format_fingerprint_short(fp));
-                            }
-                        });
+                            ui.label(
+                                egui::RichText::new("🟠 Disconnected")
+                                    .size(12.0)
+                                    .color(crate::gui::styling::WARNING),
+                            );
+                        }
                     });
+
+                    // Fingerprint on right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(fp) = &chat.peer_fingerprint {
+                            if ui.button("📋 Copy Fingerprint").clicked() {
+                                ui.output_mut(|o| o.copied_text = fp.clone());
+                            }
+                            ui.monospace(crate::util::format_fingerprint_short(fp));
+                        }
+
+                        if !connected {
+                            // Offer reconnect if a contact is associated
+                            if let Some((&contact_id, _)) = manager
+                                .contact_to_chat
+                                .iter()
+                                .find(|&(_, &cid)| cid == chat_id)
+                            {
+                                if ui.button("Retry connect").clicked() {
+                                    let mgr = app.chat_manager.clone();
+                                    tokio::spawn(async move {
+                                        let mut m = mgr.lock().await;
+                                        if let Err(e) =
+                                            m.connect_to_contact(contact_id, Some(chat_id)).await
+                                        {
+                                            m.add_toast(
+                                                crate::types::ToastLevel::Error,
+                                                format!("Reconnect failed: {}", e),
+                                            );
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    });
+                });
             }
         });
 
@@ -121,7 +154,8 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     .button(egui::RichText::new("📎").size(20.0))
                     .on_hover_text("Attach file (or drag & drop)")
                     .clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_file() {
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
                     app.file_to_send = Some(path);
                 }
 
@@ -238,27 +272,28 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if let Ok(manager) = app.chat_manager.try_lock()
-                    && let Some(chat) = manager.get_chat(chat_id) {
-                        if chat.messages.is_empty() {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(100.0);
-                                ui.label(
-                                    egui::RichText::new("🔒 End-to-end encrypted conversation")
-                                        .size(16.0)
-                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                                );
-                                ui.label(
-                                    egui::RichText::new("Send your first message below!")
-                                        .size(14.0)
-                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                                );
-                            });
-                        } else {
-                            for message in &chat.messages {
-                                render_message(app, ui, message);
-                                ui.add_space(8.0);
-                            }
+                    && let Some(chat) = manager.get_chat(chat_id)
+                {
+                    if chat.messages.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(100.0);
+                            ui.label(
+                                egui::RichText::new("🔒 End-to-end encrypted conversation")
+                                    .size(16.0)
+                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                            );
+                            ui.label(
+                                egui::RichText::new("Send your first message below!")
+                                    .size(14.0)
+                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                            );
+                        });
+                    } else {
+                        for message in &chat.messages {
+                            render_message(app, ui, message);
+                            ui.add_space(8.0);
                         }
+                    }
                 }
             });
     });
@@ -322,7 +357,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     // keeping it simple to avoid deps. Or just use RichText which supports some stats?
                     // egui::RichText doesn't auto-parse markdown.
                     // For "way better", let's use a nice font size.
-                    
+
                     let mut job = egui::text::LayoutJob::default();
                     // Basic "Markdown" simulation for Bold and Code
                     // This is naive but works for simple cases without a parser crate
@@ -344,14 +379,20 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                             // Read code block
                             let mut code_text = String::new();
                             while let Some(code_c) = chars.next() {
-                                if code_c == '`' { break; }
+                                if code_c == '`' {
+                                    break;
+                                }
                                 code_text.push(code_c);
                             }
                             // Append code styled
                             let code_format = egui::TextFormat {
                                 font_id: egui::FontId::monospace(13.0),
                                 background: Color32::BLACK.gamma_multiply(0.2), // Dim background
-                                color: if is_me { Color32::WHITE } else { crate::gui::styling::ACCENT_SECONDARY },
+                                color: if is_me {
+                                    Color32::WHITE
+                                } else {
+                                    crate::gui::styling::ACCENT_SECONDARY
+                                },
                                 ..format.clone()
                             };
                             job.append(&code_text, 0.0, code_format);
@@ -362,15 +403,15 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     if !current_text.is_empty() {
                         job.append(&current_text, 0.0, format);
                     }
-                    
+
                     ui.label(job);
 
                     // Copy action (only visible on hover to reduce clutter)
                     if ui.rect_contains_pointer(ui.max_rect()) {
-                         ui.add_space(4.0);
-                         if ui.small_button("📋").on_hover_text("Copy").clicked() {
-                             ui.output_mut(|o| o.copied_text = text.clone());
-                         }
+                        ui.add_space(4.0);
+                        if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = text.clone());
+                        }
                     }
                 }
                 MessageContent::File {
@@ -382,22 +423,23 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             // Icon container
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
                             ui.painter().rect_filled(
                                 rect,
                                 egui::Rounding::same(8.0),
-                                Color32::from_white_alpha(30)
+                                Color32::from_white_alpha(30),
                             );
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 "📄",
                                 egui::FontId::proportional(24.0),
-                                text_color
+                                text_color,
                             );
 
                             ui.add_space(8.0);
-                            
+
                             ui.vertical(|ui| {
                                 ui.label(
                                     egui::RichText::new(filename)
@@ -417,18 +459,21 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                             ui.add_space(8.0);
                             ui.separator();
                             ui.add_space(4.0);
-                            if ui.add(
-                                egui::Button::new("📂 Open")
-                                    .fill(Color32::from_white_alpha(20))
-                                    .stroke(egui::Stroke::NONE)
-                            ).clicked() {
+                            if ui
+                                .add(
+                                    egui::Button::new("📂 Open")
+                                        .fill(Color32::from_white_alpha(20))
+                                        .stroke(egui::Stroke::NONE),
+                                )
+                                .clicked()
+                            {
                                 let _ = open::that(p);
                             }
                         }
                     });
                 }
                 MessageContent::Edited { new_text } => {
-                     ui.label(
+                    ui.label(
                         egui::RichText::new(format!("{} (Edited)", new_text))
                             .italics()
                             .color(text_color.gamma_multiply(0.8))
@@ -436,12 +481,13 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     );
                 }
             }
-            
+
             ui.add_space(4.0);
-            
+
             // Timestamp (bottom right of bubble)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let timestamp_text = crate::gui::widgets::format_timestamp_relative(&message.timestamp);
+                let timestamp_text =
+                    crate::gui::widgets::format_timestamp_relative(&message.timestamp);
                 ui.label(
                     egui::RichText::new(timestamp_text)
                         .size(9.0)
