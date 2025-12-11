@@ -42,7 +42,7 @@ $BinaryBase = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
 
 # 1) Build release
 Write-Host "`n=== cargo build --release ==="
-cargo build --release --target $Target
+C:\Users\alexa\.cargo\bin\cargo.exe build --release --target $Target
 
 # 2) Prepare dist folder
 $Dist = Join-Path -Path $RepoRoot -ChildPath "dist"
