@@ -164,6 +164,23 @@ impl Identity {
         Ok(())
     }
 
+    /// Removes password protection from the identity.
+    /// It decrypts the private key with the given password and then
+    /// clears the encryption-related fields.
+    pub fn remove_password(&mut self, password: &str) -> Result<()> {
+        // First, decrypt the key to make sure the password is correct and
+        // to get the plaintext key.
+        self.decrypt(password)?;
+
+        // Now that `private_key_pem_plaintext` is populated, we can
+        // clear the encryption fields.
+        self.encrypted_private_key = None;
+        self.salt = None;
+        self.nonce = None;
+
+        Ok(())
+    }
+
     /// Get private key (if available)
     pub fn private_key(&self) -> Result<RsaPrivateKey> {
         let pem = self.private_key_pem_plaintext.as_ref().ok_or_else(|| {

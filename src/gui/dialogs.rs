@@ -57,6 +57,10 @@ pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
         render_set_password_dialog(app, ctx);
     }
 
+    if app.show_remove_password_dialog {
+        render_remove_password_dialog(app, ctx);
+    }
+
     if app.show_log_terminal {
         render_log_terminal(app, ctx);
     }
@@ -1261,9 +1265,17 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             ui.separator();
             ui.add_space(10.0);
 
-            if crate::gui::widgets::primary_button(ui, "Set/Change Password").clicked() {
-                app.show_set_password_dialog = true;
-            }
+            ui.horizontal(|ui| {
+                if crate::gui::widgets::primary_button(ui, "Set/Change Password").clicked() {
+                    app.show_set_password_dialog = true;
+                }
+
+                if app.identity.encrypted_private_key.is_some() {
+                    if crate::gui::widgets::secondary_button(ui, "Remove Password").clicked() {
+                        app.show_remove_password_dialog = true;
+                    }
+                }
+            });
 
 
             ui.add_space(20.0);
@@ -1408,6 +1420,69 @@ fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                     app.show_set_password_dialog = false;
                     app.new_password_input.clear();
                     app.confirm_password_input.clear();
+                }
+            });
+        });
+}
+
+fn render_remove_password_dialog(app: &mut App, ctx: &egui::Context) {
+    egui::Window::new("🔑 Remove Password")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Enter your current password to remove encryption from your identity file.");
+            ui.add_space(10.0);
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.remove_password_input)
+                    .password(true)
+                    .hint_text("Current Password"),
+            );
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if (crate::gui::widgets::primary_button(ui, "Confirm Removal").clicked()
+                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                    && !app.remove_password_input.is_empty()
+                {
+                    match app.identity.remove_password(&app.remove_password_input) {
+                        Ok(_) => {
+                            if let Err(e) = app
+                                .identity
+                                .save(&app.history_path.with_file_name("identity.json"))
+                            {
+                                if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                    manager.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Failed to save identity: {}", e),
+                                    );
+                                }
+                            } else {
+                                if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                    manager.add_toast(
+                                        crate::types::ToastLevel::Success,
+                                        "Password removed and identity is now unencrypted!".to_string(),
+                                    );
+                                }
+                                app.show_remove_password_dialog = false;
+                                app.remove_password_input.clear();
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to remove password: {}", e),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
+                    app.show_remove_password_dialog = false;
+                    app.remove_password_input.clear();
                 }
             });
         });

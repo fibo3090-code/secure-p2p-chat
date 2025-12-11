@@ -56,6 +56,8 @@ pub struct App {
     pub password_input: String,
     pub new_password_input: String,
     pub confirm_password_input: String,
+    pub show_remove_password_dialog: bool,
+    pub remove_password_input: String,
     pub identity_locked: bool,
     // Fingerprint verification dialog
     pub show_fingerprint_dialog: bool,
@@ -240,6 +242,8 @@ impl App {
             password_input: String::new(),
             new_password_input: String::new(),
             confirm_password_input: String::new(),
+            show_remove_password_dialog: false,
+            remove_password_input: String::new(),
             identity_locked: initial_identity_locked,
             // Fingerprint verification dialog
             show_fingerprint_dialog: false,
