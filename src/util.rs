@@ -1,6 +1,7 @@
-use rand::RngCore;
-use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::egui::Color32;
+use rand::RngCore;
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get current timestamp in milliseconds since Unix epoch
 pub fn current_timestamp_millis() -> u64 {
@@ -24,11 +25,22 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 /// Sanitize filename to prevent path traversal attacks
 pub fn sanitize_filename(filename: &str) -> String {
-    filename
+    let mut sanitized = filename
         .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
         .chars()
         .take(255)
-        .collect()
+        .collect::<String>();
+
+    // Collapse any path traversal patterns
+    while sanitized.contains("..") {
+        sanitized = sanitized.replace("..", "_");
+    }
+
+    if sanitized.is_empty() {
+        "file".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Format file size in human-readable format
@@ -60,7 +72,7 @@ pub fn generate_color_grid(fingerprint: &str) -> [[Color32; 4]; 4] {
     let bytes = hex::decode(fingerprint).unwrap_or_else(|_| vec![0; 16]);
 
     let palette = [
-        Color32::from_rgb(230, 25, 75),    // Red
+        Color32::from_rgb(230, 25, 75),   // Red
         Color32::from_rgb(60, 180, 75),   // Green
         Color32::from_rgb(255, 225, 25),  // Yellow
         Color32::from_rgb(0, 130, 200),   // Blue
@@ -91,6 +103,18 @@ pub fn generate_color_grid(fingerprint: &str) -> [[Color32; 4]; 4] {
     grid
 }
 
+/// Best-effort discovery of the primary local IPv4 address.
+/// Uses a UDP "connect" to a public resolver to learn the outbound interface.
+pub fn primary_local_ipv4() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Destination is never actually contacted for UDP connect; safe placeholder.
+    let _ = socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(v4) => Some(v4.ip().to_string()),
+        SocketAddr::V6(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,14 +122,12 @@ mod tests {
     #[test]
     fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("normal.txt"), "normal.txt");
-        assert_eq!(
-            sanitize_filename("../../../etc/passwd"),
-            ".._.._.._etc_passwd"
-        );
-        assert_eq!(
-            sanitize_filename("file:with*bad?chars"),
-            "file_with_bad_chars"
-        );
+        let trav = sanitize_filename("../../../etc/passwd");
+        assert!(!trav.contains(".."));
+        assert!(!trav.contains('/'));
+        assert!(!trav.contains('\\'));
+        assert!(!trav.is_empty());
+        assert_eq!(sanitize_filename("file:with*bad?chars"), "file_with_bad_chars");
     }
 
     #[test]

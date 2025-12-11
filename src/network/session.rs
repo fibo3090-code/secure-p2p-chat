@@ -1,13 +1,13 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::core::{
-    derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, parse_x25519_public,
-    pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher, ProtocolMessage,
-    PROTOCOL_VERSION,
+    AesCipher, PROTOCOL_VERSION, ProtocolMessage, derive_session_key, fingerprint_pubkey,
+    generate_ephemeral_keypair, parse_x25519_public, pem_decode_public, pem_encode_public,
+    recv_packet, send_packet,
 };
 use crate::types::SessionEvent;
 
@@ -59,7 +59,7 @@ pub async fn run_host_session(
             return Err(anyhow!(
                 "Expected Version message, got {:?}",
                 client_version_msg
-            ))
+            ));
         }
     };
 
@@ -169,7 +169,7 @@ pub async fn run_client_session(
             return Err(anyhow!(
                 "Expected Version message, got {:?}",
                 host_version_msg
-            ))
+            ));
         }
     };
 
@@ -221,7 +221,9 @@ pub async fn run_client_session(
         }
         Ok(Some(false)) => {
             tracing::warn!("User rejected fingerprint for chat {}", chat_id);
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected by user".to_string()));
+            let _ = to_app_tx.send(SessionEvent::Error(
+                "Fingerprint rejected by user".to_string(),
+            ));
             return Err(anyhow!("Fingerprint rejected by user"));
         }
         Ok(None) => {
@@ -359,8 +361,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{generate_rsa_keypair, rsa_decrypt_oaep, rsa_encrypt_oaep};
     use crate::RSA_KEY_BITS;
+    use crate::core::{generate_rsa_keypair, rsa_decrypt_oaep, rsa_encrypt_oaep};
     use rand::RngCore;
 
     #[tokio::test]

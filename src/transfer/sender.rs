@@ -4,8 +4,8 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 
-use crate::core::{send_packet, AesCipher, ProtocolMessage};
 use crate::FILE_CHUNK_SIZE;
+use crate::core::{AesCipher, ProtocolMessage, send_packet};
 
 /// Send a file over the network in chunks
 pub async fn send_file<S, F>(

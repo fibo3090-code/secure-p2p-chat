@@ -1,6 +1,6 @@
 use crate::gui::app_ui::App;
 use crate::gui::widgets::ColorGrid;
-use crate::util::generate_color_grid;
+use crate::util::{generate_color_grid, primary_local_ipv4};
 use eframe::egui;
 use egui_tracing::ui::Logs;
 
@@ -228,7 +228,8 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
 
     // Cleanup expired app-level toasts
     let now = std::time::Instant::now();
-    app.toasts.retain(|toast| now.duration_since(toast.created_at) < toast.duration);
+    app.toasts
+        .retain(|toast| now.duration_since(toast.created_at) < toast.duration);
 }
 
 fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid::Uuid) {
@@ -603,11 +604,20 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                         if let Ok(manager) = app.chat_manager.try_lock() {
                             match manager.parse_invite_link(&app.invite_link_input) {
                                 Ok(contact) => {
+                                    let had_address = contact.address.is_some();
                                     app.new_contact_name = contact.name;
                                     app.new_contact_address = contact.address.unwrap_or_default();
                                     app.new_contact_fingerprint =
                                         contact.fingerprint.unwrap_or_default();
                                     app.new_contact_pubkey = contact.public_key.unwrap_or_default();
+                                    if had_address {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "IP and port auto-filled from the link.",
+                                            )
+                                            .color(crate::gui::styling::SUCCESS),
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     ui.label(
@@ -687,24 +697,25 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("📤 Share this link with your friends so they can add you:");
                     ui.add_space(10.0);
 
-                    // Generate link using actual identity
+                    // Generate link using actual identity and best-effort local address
                     if app.my_invite_link.is_none() {
-                        // Do not include a placeholder address in the generated invite link.
-                        // If the application knows the public IP and listening port it can be
-                        // supplied here; otherwise leave it empty so contacts won't receive
-                        // an invalid/default address like "YOUR_IP:PORT".
-                        match app.identity.generate_invite_link(None) {
-                            Ok(link) => {
-                                app.my_invite_link = Some(link);
-                            }
-                            Err(e) => {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "❌ Failed to generate link: {}",
-                                        e
-                                    ))
-                                    .color(crate::gui::styling::ERROR),
-                                );
+                        if let Ok(manager) = app.chat_manager.try_lock() {
+                            let port = manager.config.listen_port;
+                            let invite_addr =
+                                primary_local_ipv4().map(|ip| format!("{}:{}", ip, port));
+                            match app.identity.generate_invite_link(invite_addr) {
+                                Ok(link) => {
+                                    app.my_invite_link = Some(link);
+                                }
+                                Err(e) => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "❌ Failed to generate link: {}",
+                                            e
+                                        ))
+                                        .color(crate::gui::styling::ERROR),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1009,10 +1020,14 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(10.0);
 
                 let save_button = crate::gui::widgets::primary_button(ui, "✅ Save");
-                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter_pressed =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                 if save_button.clicked() || enter_pressed {
-                    tracing::info!("Save action triggered for rename dialog, chat_id: {}", chat_id);
+                    tracing::info!(
+                        "Save action triggered for rename dialog, chat_id: {}",
+                        chat_id
+                    );
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         if let Err(e) = manager.rename_chat(chat_id, app.rename_input.clone()) {
                             manager.add_toast(
@@ -1356,7 +1371,10 @@ fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                 {
                     match app.identity.encrypt(&app.new_password_input) {
                         Ok(_) => {
-                            if let Err(e) = app.identity.save(&app.history_path.with_file_name("identity.json")) {
+                            if let Err(e) = app
+                                .identity
+                                .save(&app.history_path.with_file_name("identity.json"))
+                            {
                                 if let Ok(mut manager) = app.chat_manager.try_lock() {
                                     manager.add_toast(
                                         crate::types::ToastLevel::Error,
@@ -1395,7 +1413,6 @@ fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-
 fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("⚠️ Clear Chat History")
         .collapsible(false)
@@ -1429,9 +1446,6 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
             });
         });
 }
-
-
-
 
 fn render_log_terminal(_app: &mut App, ctx: &egui::Context) {
     egui::Window::new("Log Terminal")

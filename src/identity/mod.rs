@@ -8,23 +8,23 @@
 ///
 /// Identity is stored in a JSON file in the user's data directory.
 /// Keys are now encrypted with a password.
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use argon2::Argon2;
+use base64::Engine;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit},
     ChaCha20Poly1305,
+    aead::{Aead, AeadCore, KeyInit},
 };
+use rand::RngCore;
 use rsa::{
-    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
     RsaPrivateKey, RsaPublicKey,
+    pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use uuid::Uuid;
 use zeroize::Zeroizing;
-use base64::Engine;
-use rand::RngCore;
 
 // Constants for encryption
 const KEY_SIZE: usize = 32; // 256-bit key
@@ -166,10 +166,9 @@ impl Identity {
 
     /// Get private key (if available)
     pub fn private_key(&self) -> Result<RsaPrivateKey> {
-        let pem = self
-            .private_key_pem_plaintext
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key not available. Was the identity decrypted?"))?;
+        let pem = self.private_key_pem_plaintext.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Private key not available. Was the identity decrypted?")
+        })?;
         Ok(RsaPrivateKey::from_pkcs8_pem(pem)?)
     }
 
@@ -202,12 +201,15 @@ impl Identity {
 
         // If the identity is not encrypted, the private_key_pem_plaintext should be present.
         // If it is encrypted, it will be None, and decrypt() will populate it later.
-        if identity.encrypted_private_key.is_none() && identity.private_key_pem_plaintext.is_none() {
+        if identity.encrypted_private_key.is_none() && identity.private_key_pem_plaintext.is_none()
+        {
             // This case should ideally not happen if the file was saved correctly as unencrypted.
             // However, if it does, it means an unencrypted identity was loaded but its plaintext key is missing.
             // This might indicate a corrupted file or a very old format.
             // For now, we'll treat it as an error, as we expect private_key_pem_plaintext to be Some for unencrypted.
-            return Err(anyhow!("Unencrypted identity loaded but private key plaintext is missing."));
+            return Err(anyhow!(
+                "Unencrypted identity loaded but private key plaintext is missing."
+            ));
         }
 
         Ok(identity)
@@ -271,9 +273,11 @@ mod tests {
         assert_eq!(identity.name, "Test User");
         assert_eq!(identity.fingerprint.len(), 64); // SHA-256 in hex
         assert!(identity.private_key_pem_plaintext.is_some());
-        assert!(identity
-            .public_key_pem
-            .starts_with("-----BEGIN PUBLIC KEY-----"));
+        assert!(
+            identity
+                .public_key_pem
+                .starts_with("-----BEGIN PUBLIC KEY-----")
+        );
     }
 
     #[test]
@@ -307,10 +311,7 @@ mod tests {
         // Decrypt
         identity.decrypt("password123").unwrap();
         assert!(identity.private_key_pem_plaintext.is_some());
-        assert_eq!(
-            identity.private_key_pem_plaintext.unwrap(),
-            original_pem
-        );
+        assert_eq!(identity.private_key_pem_plaintext.unwrap(), original_pem);
     }
 
     #[test]
@@ -348,5 +349,24 @@ mod tests {
 
         assert!(link.starts_with("chat-p2p://invite/"));
         assert!(link.len() > 50); // Should be a substantial base64 string
+    }
+
+    #[test]
+    fn test_invite_link_includes_address_when_provided() {
+        let identity = Identity::new("Tester".to_string()).unwrap();
+        let addr = Some("10.0.0.5:5000".to_string());
+        let link = identity.generate_invite_link(addr.clone()).unwrap();
+        assert!(link.contains("chat-p2p://invite/"));
+
+        // Parse payload back to verify address is preserved
+        let encoded = link.strip_prefix("chat-p2p://invite/").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(
+            payload.get("address").and_then(|v| v.as_str()),
+            addr.as_deref()
+        );
     }
 }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::types::{Chat, Config};
+use uuid::Uuid;
 
 /// History file format for JSON serialization
 #[derive(Serialize, Deserialize)]
@@ -12,6 +13,9 @@ pub struct HistoryFile {
     pub contacts: Vec<crate::types::Contact>,
     #[serde(default)]
     pub config: Config,
+    /// Contact -> chat association map so we can reconnect automatically
+    #[serde(default)]
+    pub contact_chat_map: Vec<(Uuid, Uuid)>,
 }
 
 impl HistoryFile {
@@ -21,6 +25,7 @@ impl HistoryFile {
             chats,
             contacts: Vec::new(),
             config: Config::default(),
+            contact_chat_map: Vec::new(),
         }
     }
 
@@ -67,6 +72,10 @@ impl ChatManager {
             self.contacts.insert(contact.id, contact);
         }
 
+        // Restore persisted contact/chat associations for reconnect
+        self.contact_to_chat
+            .extend(history.contact_chat_map.into_iter());
+
         // Load persisted config (if present)
         self.config = history.config;
 
@@ -78,6 +87,7 @@ impl ChatManager {
         let mut history = HistoryFile::new(self.chats.values().cloned().collect());
         history.contacts = self.contacts.values().cloned().collect();
         history.config = self.config.clone();
+        history.contact_chat_map = self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
         history.save(path)
     }
 
@@ -91,6 +101,7 @@ impl ChatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::ChatManager;
     use tempfile::NamedTempFile;
     use uuid::Uuid;
 
@@ -121,5 +132,52 @@ mod tests {
         assert_eq!(loaded.chats.len(), 1);
         assert_eq!(loaded.chats[0].id, chat.id);
         assert_eq!(loaded.chats[0].title, chat.title);
+    }
+
+    #[test]
+    fn history_persists_contact_mapping() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        let mut manager = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        let contact_id = Uuid::new_v4();
+
+        manager.chats.insert(
+            chat_id,
+            Chat {
+                id: chat_id,
+                title: "Chat".into(),
+                peer_fingerprint: None,
+                participants: Vec::new(),
+                messages: Vec::new(),
+                created_at: chrono::Utc::now(),
+                peer_typing: false,
+                typing_since: None,
+            },
+        );
+
+        manager.contacts.insert(
+            contact_id,
+            crate::types::Contact {
+                id: contact_id,
+                name: "Alice".into(),
+                address: Some("127.0.0.1:5000".into()),
+                fingerprint: None,
+                public_key: None,
+                created_at: chrono::Utc::now(),
+                trust_state: crate::types::TrustState::Unverified,
+                notes: String::new(),
+                tags: Vec::new(),
+                last_seen: None,
+            },
+        );
+
+        manager.associate_contact_with_chat(contact_id, chat_id);
+        manager.save_history(temp_file.path()).unwrap();
+
+        let mut reloaded = ChatManager::new(Config::default());
+        reloaded.load_history(temp_file.path()).unwrap();
+
+        assert_eq!(reloaded.contact_to_chat.get(&contact_id), Some(&chat_id));
     }
 }

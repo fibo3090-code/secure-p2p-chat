@@ -1,8 +1,8 @@
+use crate::types::Chat;
+use crate::types::Message;
+use chrono::Local;
 use eframe::egui;
 use egui::{Color32, Rect, Response, Sense, Ui, Vec2, Widget};
-use chrono::Local;
-use crate::types::Message;
-use crate::types::Chat;
 
 pub struct ColorGrid {
     grid: [[Color32; 4]; 4],
@@ -82,7 +82,8 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
 
     // Background for selection
     if is_selected {
-        ui.painter().rect_filled(rect, 6.0, ui.visuals().selection.bg_fill);
+        ui.painter()
+            .rect_filled(rect, 6.0, ui.visuals().selection.bg_fill);
     }
 
     // Avatar
@@ -112,7 +113,11 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
     );
 
     // Timestamp of last message
-    let ts = chat.messages.last().map(|m: &Message| format_timestamp_relative(&m.timestamp)).unwrap_or_default();
+    let ts = chat
+        .messages
+        .last()
+        .map(|m: &Message| format_timestamp_relative(&m.timestamp))
+        .unwrap_or_default();
     ui.painter().text(
         rect.max + Vec2::new(-8.0, -22.0),
         Align2::RIGHT_TOP,

@@ -81,7 +81,8 @@ impl ProtocolMessage {
             Some(Self::EphemeralKey { public_key })
         } else if b.starts_with(b"TEXT:") {
             // Security: Enforce a limit on text messages to prevent memory exhaustion
-            if b.len() > 64 * 1024 { // 64 KiB Limit
+            if b.len() > 64 * 1024 {
+                // 64 KiB Limit
                 return None; // Invalid/Too large
             }
             let text = String::from_utf8_lossy(&b[5..]).into_owned();

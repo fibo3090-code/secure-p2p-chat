@@ -63,6 +63,7 @@ cargo run --release
 - Recommended shell: PowerShell or Windows Terminal
 - If SmartScreen warns about an unknown app when running packaged binaries, choose “More info” → “Run anyway” (if you trust the source)
 - Packaging script (optional): `./build-and-package.ps1` produces a distributable build
+- If `cargo` is missing from PATH, run `$env:Path += ';$HOME\\.cargo\\bin'` in PowerShell, then retry `cargo build`
 
 ### Verify Fingerprints (CRITICAL for Security!)
 When you connect to another user, you must verify their fingerprint to prevent man-in-the-middle attacks. Compare the 64-character fingerprint shown in the application with the other user's fingerprint through a separate, secure channel (like a phone call).
@@ -82,6 +83,24 @@ All project documentation is located in the root of the repository, not in a sep
 - **[SECURITY.md](SECURITY.md)**: Details the project's security policy and threat model.
 - **[CHANGELOG.md](CHANGELOG.md)**: Release notes, fixes, and improvements.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)**: How to open issues and send PRs.
+- **[docs/ui_ux_principles.md](docs/ui_ux_principles.md)** and **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: UX principles, flows, and design system starter for the app.
+
+---
+
+## 🧭 Usage Notes (Invites, Contacts, Auto-Host/Reconnect)
+
+- **Invite links**: Paste a `chat-p2p://invite/...` link in Contacts → “Invite Link” tab. If the link contains `IP:PORT`, the fields auto-fill; invalid addresses are ignored safely.
+- **Generate my link**: Contacts → “Share my link” tab; we include your best-effort local IP + listen port when available.
+- **Contacts mapping**: Contact-to-chat associations are persisted so reconnects can resume sessions automatically.
+- **Auto-host**: Enable in Settings to start listening on launch; stale placeholder hosts are cleaned before rehosting.
+- **Auto-reconnect**: Enable `auto_connect` in settings to re-associate mapped contacts on startup with backoff-friendly logging.
+
+---
+
+## 🛠️ Troubleshooting
+
+- **PATH on Windows**: If commands like `cargo` fail, run `$env:Path += ';$HOME\\.cargo\\bin'` in your shell or set it permanently via `[Environment]::SetEnvironmentVariable("Path", $env:Path + ';$HOME\\.cargo\\bin', 'User')` and restart the terminal.
+- **Accented paths**: If your project path includes accented characters, use PowerShell and `-LiteralPath` to avoid encoding issues.
 
 ---
 

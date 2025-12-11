@@ -7,10 +7,13 @@ use uuid::Uuid;
 async fn test_chat_lifecycle() {
     let mut manager = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
-    
+
     // 1. Create (Simulated)
     manager.create_local_chat_for_test(chat_id, "Initial Title".to_string());
-    assert!(manager.chats.contains_key(&chat_id), "Chat should be present after creation");
+    assert!(
+        manager.chats.contains_key(&chat_id),
+        "Chat should be present after creation"
+    );
     assert_eq!(manager.chats.get(&chat_id).unwrap().title, "Initial Title");
 
     // 2. Rename
@@ -20,19 +23,22 @@ async fn test_chat_lifecycle() {
 
     // 3. Delete
     manager.delete_chat(chat_id);
-    assert!(!manager.chats.contains_key(&chat_id), "Chat should be gone after deletion");
+    assert!(
+        !manager.chats.contains_key(&chat_id),
+        "Chat should be gone after deletion"
+    );
 }
 
 /// Test contact management logic
 #[tokio::test]
 async fn test_contact_management() {
     let mut manager = ChatManager::new(Config::default());
-    
+
     // 1. Add Valid Contact
     let name = "Test User".to_string();
     let addr = Some("127.0.0.1:5000".to_string());
     let id = manager.add_contact(name.clone(), addr.clone(), None, None);
-    
+
     assert!(manager.contacts.contains_key(&id));
     let contact = manager.contacts.get(&id).unwrap();
     assert_eq!(contact.name, name);
@@ -43,9 +49,13 @@ async fn test_contact_management() {
 #[test]
 fn test_config_and_theme() {
     let mut config = Config::default();
-    
+
     // Default check
-    assert_eq!(config.theme, Theme::Dark, "Default theme should be Dark (as per types.rs)");
+    assert_eq!(
+        config.theme,
+        Theme::Dark,
+        "Default theme should be Dark (as per types.rs)"
+    );
     assert_eq!(config.auto_host_on_startup, false);
 
     // Change settings

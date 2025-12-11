@@ -1,4 +1,4 @@
-use eframe::egui::{style::Visuals, Color32, Rounding, Stroke};
+use eframe::egui::{Color32, Rounding, Stroke, style::Visuals};
 
 // Define color palettes for both dark and light themes to ensure a consistent look and feel.
 
@@ -72,7 +72,6 @@ fn dark_visuals() -> Visuals {
     visuals
 }
 
-
 /// Returns a full set of light visuals.
 fn light_visuals() -> Visuals {
     let mut visuals = Visuals::light();
@@ -144,7 +143,6 @@ fn forest_visuals() -> Visuals {
     visuals
 }
 
-
 pub fn apply_custom_visuals(theme: &crate::types::Theme) -> Visuals {
     match theme {
         crate::types::Theme::Light => light_visuals(),
@@ -153,4 +151,3 @@ pub fn apply_custom_visuals(theme: &crate::types::Theme) -> Visuals {
         crate::types::Theme::Forest => forest_visuals(),
     }
 }
-

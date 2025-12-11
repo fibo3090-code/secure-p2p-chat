@@ -37,7 +37,7 @@ pub struct Contact {
     pub fingerprint: Option<String>,
     pub public_key: Option<String>,
     pub created_at: DateTime<Utc>,
-    
+
     // Contacts 2.0 Fields
     #[serde(default)]
     pub trust_state: TrustState,
@@ -63,7 +63,9 @@ pub enum TrustState {
 #[serde(tag = "type")]
 pub enum MessageContent {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+    },
 
     #[serde(rename = "file")]
     File {
@@ -136,8 +138,12 @@ pub enum SessionStatus {
 /// Events sent from network session to app
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    Listening { port: u16 },
-    Connected { peer: String },
+    Listening {
+        port: u16,
+    },
+    Connected {
+        peer: String,
+    },
     NewConnection {
         peer_addr: String,
         fingerprint: String,
@@ -213,4 +219,6 @@ impl Default for Config {
     }
 }
 
-fn default_listen_port() -> u16 { 5000 }
+fn default_listen_port() -> u16 {
+    5000
+}

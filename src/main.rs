@@ -1,10 +1,13 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 use clap::Parser;
 
+use egui_tracing::tracing::EventCollector;
 use encodeur_rsa_rust::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use egui_tracing::tracing::EventCollector;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "P2P Encrypted Messaging Application")]
