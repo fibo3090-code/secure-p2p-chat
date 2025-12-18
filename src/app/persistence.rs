@@ -57,7 +57,7 @@ impl HistoryFile {
 
         // Extract nonce (first 12 bytes) and ciphertext
         let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
-        let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+        let nonce = chacha20poly1305::Nonce::from(*<&[u8; 12]>::try_from(nonce_bytes)?);
         
         let cipher = ChaCha20Poly1305::new(key.into());
         let plaintext = cipher
@@ -182,6 +182,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             peer_typing: false,
             typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
         };
 
         let history = HistoryFile::new(vec![chat.clone()]);
@@ -217,6 +219,8 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 peer_typing: false,
                 typing_since: None,
+                send_seq: 0,
+                recv_seq: 0,
             },
         );
 

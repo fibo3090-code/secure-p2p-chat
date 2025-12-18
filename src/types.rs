@@ -14,6 +14,10 @@ pub struct Chat {
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     #[serde(skip)]
+    pub send_seq: u64,
+    #[serde(skip)]
+    pub recv_seq: u64,
+    #[serde(skip)]
     pub peer_typing: bool,
     #[serde(skip)]
     pub typing_since: Option<std::time::Instant>,
@@ -101,10 +105,12 @@ pub enum ToastLevel {
 #[derive(Debug, Clone)]
 pub struct FileTransferState {
     pub id: Uuid,
+    pub chat_id: Uuid,
     pub filename: String,
     pub size: u64,
     pub received: u64,
     pub status: TransferStatus,
+    pub seq: u64,
 }
 
 /// File transfer status

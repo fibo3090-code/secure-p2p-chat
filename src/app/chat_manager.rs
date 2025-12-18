@@ -92,6 +92,8 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
             peer_typing: false,
             typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
         };
         self.chats.insert(id, chat);
     }
@@ -220,6 +222,8 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
             peer_typing: false,
             typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
         };
 
         self.chats.insert(chat_id, chat);
@@ -237,12 +241,6 @@ impl ChatManager {
             .get(&group_chat_id)
             .ok_or_else(|| anyhow::anyhow!("Group chat not found"))?;
 
-        let msg = ProtocolMessage::Text {
-            text: text.clone(),
-            timestamp: crate::util::current_timestamp_millis(),
-            seq: 0, // TODO: Use proper sequence tracking
-        };
-
         // Clone participants so we don't hold an immutable borrow while mutating chats
         let participants = chat.participants.clone();
 
@@ -255,17 +253,25 @@ impl ChatManager {
                 timestamp: chrono::Utc::now(),
             });
         }
-
+        
         // Try to send to all participants with active sessions
         let mut sent_count = 0;
         let mut offline_contacts = Vec::new();
 
         for participant_id in participants {
             if let Some(contact) = self.contacts.get(&participant_id) {
-                if let Some(one_chat_id) = self.contact_to_chat.get(&participant_id) {
-                    if let Some(session) = self.sessions.get(one_chat_id) {
-                        if session.from_app_tx.send(msg.clone()).is_ok() {
-                            sent_count += 1;
+                if let Some(one_chat_id) = self.contact_to_chat.get(&participant_id).copied() {
+                    if let Some(session) = self.sessions.get(&one_chat_id) {
+                        if let Some(chat) = self.chats.get_mut(&one_chat_id) {
+                            chat.send_seq += 1;
+                            let msg = ProtocolMessage::Text {
+                                text: text.clone(),
+                                timestamp: crate::util::current_timestamp_millis(),
+                                seq: chat.send_seq,
+                            };
+                            if session.from_app_tx.send(msg).is_ok() {
+                                sent_count += 1;
+                            }
                         }
                     } else {
                         offline_contacts.push(contact.name.clone());
@@ -381,6 +387,8 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
             peer_typing: false,
             typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
         };
 
         self.chats.insert(chat_id, chat);
@@ -438,6 +446,8 @@ impl ChatManager {
                 created_at: chrono::Utc::now(),
                 peer_typing: false,
                 typing_since: None,
+                send_seq: 0,
+                recv_seq: 0,
             };
             e.insert(chat);
             tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
@@ -595,10 +605,16 @@ impl ChatManager {
             .get(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Session should exist but was not found"))?;
 
+        let chat = self
+            .chats
+            .get_mut(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Chat not found for sending message"))?;
+
+        chat.send_seq += 1;
         let msg = ProtocolMessage::Text {
             text: text.clone(),
             timestamp: crate::util::current_timestamp_millis(),
-            seq: 0, // TODO: Use proper sequence tracking
+            seq: chat.send_seq,
         };
 
         if let Err(e) = session.from_app_tx.send(msg) {
@@ -607,14 +623,12 @@ impl ChatManager {
         }
 
         // Add to local history
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.messages.push(Message {
-                id: Uuid::new_v4(),
-                from_me: true,
-                content: MessageContent::Text { text },
-                timestamp: chrono::Utc::now(),
-            });
-        }
+        chat.messages.push(Message {
+            id: Uuid::new_v4(),
+            from_me: true,
+            content: MessageContent::Text { text },
+            timestamp: chrono::Utc::now(),
+        });
 
         Ok(())
     }
@@ -622,7 +636,7 @@ impl ChatManager {
     /// Start receiving a file
     pub fn start_receiving_file(
         &mut self,
-        _chat_id: Uuid,
+        chat_id: Uuid,
         filename: &str,
         size: u64,
     ) -> Result<Uuid> {
@@ -630,10 +644,12 @@ impl ChatManager {
 
         let state = FileTransferState {
             id: transfer_id,
+            chat_id,
             filename: filename.to_string(),
             size,
             received: 0,
             status: TransferStatus::Pending,
+            seq: 0,
         };
 
         self.active_transfers.insert(transfer_id, state);
@@ -681,7 +697,7 @@ impl ChatManager {
     }
 
     /// Send typing start indicator
-    pub fn send_typing_start(&self, chat_id: Uuid) -> Result<()> {
+    pub fn send_typing_start(&mut self, chat_id: Uuid) -> Result<()> {
         if !self.config.enable_typing_indicators {
             return Ok(());
         }
@@ -691,12 +707,17 @@ impl ChatManager {
             .get(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
-        session.from_app_tx.send(ProtocolMessage::TypingStart { seq: 0 })?;
+        let chat = self
+            .chats
+            .get_mut(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Chat not found"))?;
+        chat.send_seq += 1;
+        session.from_app_tx.send(ProtocolMessage::TypingStart { seq: chat.send_seq })?;
         Ok(())
     }
 
     /// Send typing stop indicator
-    pub fn send_typing_stop(&self, chat_id: Uuid) -> Result<()> {
+    pub fn send_typing_stop(&mut self, chat_id: Uuid) -> Result<()> {
         if !self.config.enable_typing_indicators {
             return Ok(());
         }
@@ -706,7 +727,12 @@ impl ChatManager {
             .get(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
-        session.from_app_tx.send(ProtocolMessage::TypingStop { seq: 0 })?;
+        let chat = self
+            .chats
+            .get_mut(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Chat not found"))?;
+        chat.send_seq += 1;
+        session.from_app_tx.send(ProtocolMessage::TypingStop { seq: chat.send_seq })?;
         Ok(())
     }
 
@@ -853,10 +879,17 @@ impl ChatManager {
         }
 
         // Send file metadata
-        let meta_msg = ProtocolMessage::FileMeta {
-            filename: filename.clone(),
-            size: file_size,
-            seq: 0, // TODO: Use proper sequence tracking
+        let meta_msg = {
+            let chat = self
+                .chats
+                .get_mut(&chat_id)
+                .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
+            chat.send_seq += 1;
+            ProtocolMessage::FileMeta {
+                filename: filename.clone(),
+                size: file_size,
+                seq: chat.send_seq,
+            }
         };
         session.from_app_tx.send(meta_msg)?;
 
@@ -883,7 +916,7 @@ impl ChatManager {
         }
 
         // Send end marker
-        session.from_app_tx.send(ProtocolMessage::FileEnd { seq: 0 })?;
+        session.from_app_tx.send(ProtocolMessage::FileEnd { seq })?;
         tracing::info!(file = %filename, total_bytes = %file_size, "File send complete");
 
         // Add to local history
@@ -968,6 +1001,8 @@ impl ChatManager {
                     created_at: chrono::Utc::now(),
                     peer_typing: false,
                     typing_since: None,
+                    send_seq: 0,
+                    recv_seq: 0,
                 });
                 self.add_toast(
                     ToastLevel::Info,
@@ -1001,89 +1036,109 @@ impl ChatManager {
                 tracing::debug!("Session {} received message: {:?}", chat_id, proto_msg);
 
                 match proto_msg {
-                    ProtocolMessage::Text { text, .. } => {
+                    ProtocolMessage::Text { text, seq, .. } => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
-                            chat.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                from_me: false,
-                                content: MessageContent::Text { text: text.clone() },
-                                timestamp: chrono::Utc::now(),
-                            });
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                chat.messages.push(Message {
+                                    id: Uuid::new_v4(),
+                                    from_me: false,
+                                    content: MessageContent::Text { text: text.clone() },
+                                    timestamp: chrono::Utc::now(),
+                                });
 
-                            // Clear typing indicator
-                            chat.peer_typing = false;
-                            chat.typing_since = None;
+                                // Clear typing indicator
+                                chat.peer_typing = false;
+                                chat.typing_since = None;
 
-                            // Show desktop notification
-                            let preview = if text.len() > 50 {
-                                format!("{}...", &text[..50])
+                                // Show desktop notification
+                                let preview = if text.len() > 50 {
+                                    format!("{}...", &text[..50])
+                                } else {
+                                    text.clone()
+                                };
+                                self.show_notification("New message", &preview);
+
+                                tracing::info!("Added received message to chat {}", chat_id);
                             } else {
-                                text.clone()
-                            };
-                            self.show_notification("New message", &preview);
-
-                            tracing::info!("Added received message to chat {}", chat_id);
+                                tracing::warn!("Received message with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                            }
                         } else {
                             tracing::error!("Chat {} not found for received message", chat_id);
                         }
                     }
 
-                    ProtocolMessage::FileMeta { filename, size, .. } => {
-                        tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
+                    ProtocolMessage::FileMeta { filename, size, seq } => {
+                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
 
-                        match self.start_receiving_file(chat_id, &filename, size) {
-                            Ok(transfer_id) => {
-                                // Create new IncomingFileSync for this transfer
-                                let file_path = self.config.download_dir.join(&filename);
+                                match self.start_receiving_file(chat_id, &filename, size) {
+                                    Ok(transfer_id) => {
+                                        // Create new IncomingFileSync for this transfer
+                                        let file_path = self.config.download_dir.join(&filename);
 
-                                match IncomingFileSync::new(&file_path, size) {
-                                    Ok(incoming) => {
-                                        self.incoming_files.insert(transfer_id, incoming);
+                                        match IncomingFileSync::new(&file_path, size) {
+                                            Ok(incoming) => {
+                                                self.incoming_files.insert(transfer_id, incoming);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to create incoming file: {}", e);
+                                                self.add_toast(
+                                                    ToastLevel::Error,
+                                                    format!("Failed to receive file: {}", e),
+                                                );
+                                            }
+                                        }
                                     }
                                     Err(e) => {
-                                        tracing::error!("Failed to create incoming file: {}", e);
+                                        tracing::error!("Failed to start receiving file: {}", e);
                                         self.add_toast(
                                             ToastLevel::Error,
                                             format!("Failed to receive file: {}", e),
                                         );
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to start receiving file: {}", e);
-                                self.add_toast(
-                                    ToastLevel::Error,
-                                    format!("Failed to receive file: {}", e),
-                                );
+                            } else {
+                                tracing::warn!("Received FileMeta with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
                             }
                         }
                     }
 
                     ProtocolMessage::FileChunk { chunk, seq } => {
-                        tracing::debug!("Received file chunk {} ({} bytes)", seq, chunk.len());
+                        let transfer_id = self.active_transfers.values().find(|t| t.chat_id == chat_id).map(|t| t.id);
+                        if let Some(transfer_id) = transfer_id {
+                            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                                if seq == transfer.seq {
+                                    transfer.seq += 1;
+                                    tracing::debug!("Received file chunk {} ({} bytes)", seq, chunk.len());
 
-                        // Find the active transfer for this chat
-                        let transfer_ids: Vec<Uuid> =
-                            self.active_transfers.keys().copied().collect();
-                        for transfer_id in transfer_ids {
-                            if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
-                                if let Err(e) = incoming.write_chunk(&chunk) {
-                                    tracing::error!("Failed to write chunk: {}", e);
-                                    self.add_toast(
-                                        ToastLevel::Error,
-                                        format!("File transfer error: {}", e),
-                                    );
+                                    if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
+                                        if let Err(e) = incoming.write_chunk(&chunk) {
+                                            tracing::error!("Failed to write chunk: {}", e);
+                                            self.add_toast(
+                                                ToastLevel::Error,
+                                                format!("File transfer error: {}", e),
+                                            );
+                                        } else {
+                                            let bytes_received = incoming.bytes_received();
+                                            self.update_transfer_progress(transfer_id, bytes_received);
+                                        }
+                                    }
                                 } else {
-                                    let bytes_received = incoming.bytes_received();
-                                    self.update_transfer_progress(transfer_id, bytes_received);
+                                    tracing::warn!("Received file chunk with invalid sequence number for transfer {}. Expected {}, got {}. Discarding.", transfer_id, transfer.seq, seq);
                                 }
-                                break;
                             }
                         }
                     }
 
-                    ProtocolMessage::FileEnd { .. } => {
-                        tracing::info!("File transfer completed");
+                    ProtocolMessage::FileEnd { seq } => {
+                        let transfer_id = self.active_transfers.values().find(|t| t.chat_id == chat_id).map(|t| t.id);
+                        if let Some(transfer_id) = transfer_id {
+                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                                if seq == transfer.seq {
+                                    tracing::info!("File transfer completed");
 
                         // Finalize all active transfers
                         let transfer_ids: Vec<Uuid> = self.incoming_files.keys().copied().collect();
@@ -1119,25 +1174,47 @@ impl ChatManager {
                                         );
                                     }
                                 }
+                                    }
+                                }
+                                } else {
+                                    tracing::warn!("Received FileEnd with invalid sequence number for transfer {}. Expected {}, got {}. Discarding.", transfer_id, transfer.seq, seq);
+                                }
                             }
                         }
                     }
 
-                    ProtocolMessage::Ping { .. } => {
-                        tracing::trace!("Received ping");
-                    }
-
-                    ProtocolMessage::TypingStart { .. } => {
+                    ProtocolMessage::Ping { seq } => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
-                            chat.peer_typing = true;
-                            chat.typing_since = Some(std::time::Instant::now());
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                tracing::trace!("Received ping with seq {}", seq);
+                            } else {
+                                tracing::warn!("Received Ping with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                            }
                         }
                     }
 
-                    ProtocolMessage::TypingStop { .. } => {
+                    ProtocolMessage::TypingStart { seq } => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
-                            chat.peer_typing = false;
-                            chat.typing_since = None;
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                chat.peer_typing = true;
+                                chat.typing_since = Some(std::time::Instant::now());
+                            } else {
+                                tracing::warn!("Received TypingStart with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                            }
+                        }
+                    }
+
+                    ProtocolMessage::TypingStop { seq } => {
+                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                chat.peer_typing = false;
+                                chat.typing_since = None;
+                            } else {
+                                tracing::warn!("Received TypingStop with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                            }
                         }
                     }
                     other => {
@@ -1412,6 +1489,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             peer_typing: false,
             typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
         };
         let id = chat.id;
         mgr.chats.insert(id, chat);

@@ -28,6 +28,7 @@ This application implements **military-grade end-to-end encryption** with **forw
 **Overall Risk Assessment:** **MEDIUM** (improved from CRITICAL)
 
 **Security Achievements:**
+
 - ✅ Strong cryptographic primitives (RSA-2048, AES-256-GCM, X25519)
 - ✅ Forward secrecy via ephemeral key exchange
 - ✅ Authenticated encryption (AES-GCM)
@@ -38,6 +39,7 @@ This application implements **military-grade end-to-end encryption** with **forw
 - ✅ Fingerprint verification enforcement
 
 **Recent Security Improvements (Dec 2025):**
+
 - Fixed race conditions in static mutable variables
 - Implemented encrypted storage for chat history
 - Added sequence numbers for replay attack protection
@@ -52,21 +54,21 @@ The application is designed to protect against the following threats:
 
 ### Protected Against
 
--   **Eavesdropping**: All messages are encrypted end-to-end with AES-256-GCM, making them unreadable to anyone who intercepts the traffic.
--   **Tampering**: GCM authentication tags detect any modification of messages in transit.
--   **Replay Attacks**: Sequence numbers prevent attackers from replaying old messages.
--   **Key Compromise**: Forward secrecy via X25519 ECDH ensures that past sessions remain secure even if long-term identity keys are compromised.
--   **Downgrade Attacks**: Protocol version negotiation prevents forcing use of weaker protocols.
--   **Data at Rest Compromise**: Chat history is encrypted with ChaCha20-Poly1305.
--   **Nonce Reuse**: Counter-based nonces guarantee uniqueness.
+- **Eavesdropping**: All messages are encrypted end-to-end with AES-256-GCM, making them unreadable to anyone who intercepts the traffic.
+- **Tampering**: GCM authentication tags detect any modification of messages in transit.
+- **Replay Attacks**: Sequence numbers prevent attackers from replaying old messages.
+- **Key Compromise**: Forward secrecy via X25519 ECDH ensures that past sessions remain secure even if long-term identity keys are compromised.
+- **Downgrade Attacks**: Protocol version negotiation prevents forcing use of weaker protocols.
+- **Data at Rest Compromise**: Chat history is encrypted with ChaCha20-Poly1305.
+- **Nonce Reuse**: Counter-based nonces guarantee uniqueness.
 
 ### Assumptions
 
 This security model makes the following assumptions:
 
--   Users **verify fingerprints** on the first connection to prevent man-in-the-middle attacks.
--   The operating system is **not compromised**.
--   The application is used on a **trusted network** (e.g., a home LAN or a secure VPN).
+- Users **verify fingerprints** on the first connection to prevent man-in-the-middle attacks.
+- The operating system is **not compromised**.
+- The application is used on a **trusted network** (e.g., a home LAN or a secure VPN).
 
 ### Key Handling & Persistence
 
@@ -80,29 +82,29 @@ This security model makes the following assumptions:
 
 ### Encryption Primitives
 
--   **Message Encryption**: AES-256-GCM
--   **Key Exchange**: X25519 ECDH
--   **Identity**: RSA-2048-OAEP
--   **Fingerprinting**: SHA-256
+- **Message Encryption**: AES-256-GCM
+- **Key Exchange**: X25519 ECDH
+- **Identity**: RSA-2048-OAEP
+- **Fingerprinting**: SHA-256
 
 ### Forward Secrecy
 
 Forward secrecy is a critical feature of this application, ensuring that a compromise of long-term keys does not compromise past session keys. This is achieved as follows:
 
-1.  **Ephemeral Keys**: For each new session, a new X25519 key pair is generated. These keys are used only once and are discarded at the end of the session.
-2.  **Key Derivation**: The shared secret derived from the ECDH key exchange is used as input to a Key Derivation Function (HKDF-SHA256) to generate a unique 32-byte AES-256 session key.
-3.  **Identity vs. Encryption**: Long-term RSA keys are used only for identity verification (fingerprints) and are not used for session encryption.
+1. **Ephemeral Keys**: For each new session, a new X25519 key pair is generated. These keys are used only once and are discarded at the end of the session.
+2. **Key Derivation**: The shared secret derived from the ECDH key exchange is used as input to a Key Derivation Function (HKDF-SHA256) to generate a unique 32-byte AES-256 session key.
+3. **Identity vs. Encryption**: Long-term RSA keys are used only for identity verification (fingerprints) and are not used for session encryption.
 
 ### Handshake Sequence (Protocol v2)
 
 The handshake process is designed to be secure and robust:
 
-1.  **Version Negotiation**: Both peers exchange and verify the protocol version to prevent downgrade attacks.
-2.  **RSA Public Key Exchange**: Peers exchange their long-term RSA public keys for identity and fingerprint verification.
-3.  **X25519 Ephemeral Key Exchange**: For each session, new ephemeral X25519 keys are exchanged to provide forward secrecy.
-4.  **ECDH Computation**: A shared secret is computed using the ephemeral keys.
-5.  **HKDF-SHA256 Key Derivation**: The final AES session key is derived from the shared secret.
-6.  **Encrypted Communication**: All subsequent communication is encrypted with the derived session key.
+1. **Version Negotiation**: Both peers exchange and verify the protocol version to prevent downgrade attacks.
+2. **RSA Public Key Exchange**: Peers exchange their long-term RSA public keys for identity and fingerprint verification.
+3. **X25519 Ephemeral Key Exchange**: For each session, new ephemeral X25519 keys are exchanged to provide forward secrecy.
+4. **ECDH Computation**: A shared secret is computed using the ephemeral keys.
+5. **HKDF-SHA256 Key Derivation**: The final AES session key is derived from the shared secret.
+6. **Encrypted Communication**: All subsequent communication is encrypted with the derived session key.
 
 ---
 
@@ -114,11 +116,7 @@ The handshake process is designed to be secure and robust:
 
 ### Executive Summary
 
-
-
 **Overall Risk Assessment:** **MEDIUM**
-
-
 
 **Key Findings:**
 
@@ -140,11 +138,7 @@ The handshake process is designed to be secure and robust:
 
 - ⚠️ **MEDIUM**: No rate limiting or DoS protection
 
-
-
 ### Vulnerability Status Summary
-
-
 
 | Severity | Total | Fixed | Remaining | % Fixed |
 
@@ -160,8 +154,6 @@ The handshake process is designed to be secure and robust:
 
 | **Total**| **14**| **7** | **7**     | **50%** |
 
-
-
 ---
 
 ## Applied Security Fixes
@@ -169,28 +161,33 @@ The handshake process is designed to be secure and robust:
 ### Phase 1 Fixes (4 vulnerabilities)
 
 **1. Thread Safety (CRITICAL-001)**
+
 - Replaced `unsafe static mut` with `OnceLock<AtomicU64>`
 - Files: `src/gui/app_ui.rs`
 - Impact: Eliminated all undefined behavior
 
 **2. Fingerprint Verification (HIGH-002)**
+
 - Removed auto-accept behavior
 - Changed timeout: 30s → 300s
 - Files: `src/network/session.rs`
 - Impact: Prevents MITM attacks
 
 **3. File Size Validation (MEDIUM-003)**
+
 - Added early size validation
 - Files: `src/transfer/receiver.rs`
 - Impact: Prevents DoS attacks
 
 **4. Cargo Edition Fix**
+
 - Changed edition from "2025" to "2021"
 - Files: `Cargo.toml`
 
 ### Phase 2 Fixes (3 vulnerabilities)
 
 **5. Encrypted Chat History (CRITICAL-002)**
+
 - Implemented ChaCha20-Poly1305 encryption
 - New methods: `save_encrypted()`, `load_encrypted()`
 - Files: `src/app/persistence.rs`
@@ -201,11 +198,17 @@ The handshake process is designed to be secure and robust:
   - Restrictive file permissions (0600)
 
 **6. Replay Attack Protection (HIGH-001)**
+
 - Added `seq: u64` to all protocol messages
-- Files: `src/core/protocol.rs`, `src/app/chat_manager.rs`, `src/transfer/sender.rs`
-- Status: Protocol ready, session validation pending
+- Implemented per-chat `send_seq` and `recv_seq` tracking
+- All outgoing messages increment `send_seq` before sending
+- All incoming messages validate `seq > recv_seq` before processing
+- Invalid sequence numbers are logged and discarded
+- Files: `src/core/protocol.rs`, `src/app/chat_manager.rs`, `src/transfer/sender.rs`, `src/types.rs`
+- Status: ✅ **COMPLETED** - Full session sequence validation operational
 
 **7. Counter-Based Nonces (HIGH-003)**
+
 - Replaced random nonces with deterministic counters
 - Files: `src/core/crypto.rs`
 - Structure: `session_id (4 bytes) || counter (8 bytes)`
@@ -214,6 +217,7 @@ The handshake process is designed to be secure and robust:
 ### Compilation Fixes (December 18, 2025)
 
 **8. Rust 2021 Compatibility**
+
 - Refactored let chains to nested if-let statements
 - Files: `src/app/chat_manager.rs`, `src/gui/*.rs`
 - Fixed deprecated ChaCha20-Poly1305 API usage
@@ -223,46 +227,41 @@ The handshake process is designed to be secure and robust:
 
 ## Remaining Security Work
 
-### High Priority
+### Remaining High Priority Work
 
 1. **Enforce Password-Protected Identities**
-   - Modify identity creation to require encryption
+   - Make password encryption mandatory
    - Set restrictive file permissions
    - Consider OS keychain integration
 
-2. **Implement Session Sequence Validation**
-   - Add `send_seq` and `recv_seq` tracking
-   - Validate sequence numbers on receive
-   - Reject out-of-order or duplicate messages
-
-3. **Version Downgrade Protection**
+2. **Version Downgrade Protection**
    - Add signed version announcements
    - Include version in authenticated handshake
 
 ### Medium Priority
 
-4. **Reduce .unwrap() Usage**
+1. **Reduce .unwrap() Usage**
    - Replace with proper error handling
    - Add safety comments for infallible operations
 
-5. **Connection Rate Limiting**
+2. **Connection Rate Limiting**
    - Implement semaphore-based limits
    - Add per-IP connection throttling
 
-6. **Secure Memory Wiping**
+3. **Secure Memory Wiping**
    - Use `zeroize` crate for session keys
    - Implement Drop trait for sensitive structs
 
 ### Long-term Improvements
 
-7. **TOFU Implementation**
+1. **TOFU Implementation**
    - Persistent fingerprint storage
    - Warnings on fingerprint changes
 
-8. **Session Key Rotation**
+2. **Session Key Rotation**
    - Periodic rekeying (hourly or per GB)
 
-9. **Professional Security Audit**
+3. **Professional Security Audit**
    - Third-party cryptographic review
 
 ---
