@@ -53,7 +53,7 @@ chat-p2p/
 
 ```
 ┌─────────────────────────────────────┐
-│   GUI Layer (egui/eframe)          │  ← User interaction
+│   GUI Layer (egui/eframe)           │  ← User interaction
 └──────────────┬──────────────────────┘
                │ Arc<Mutex<ChatManager>>
 ┌──────────────▼──────────────────────┐

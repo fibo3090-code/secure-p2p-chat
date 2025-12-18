@@ -18,15 +18,9 @@ This document provides a comprehensive index and summary of all project document
 - **[02_getting_started.md](02_getting_started.md)** - Installation and setup guide
 - **[03_architecture.md](03_architecture.md)** - System architecture and components
 - **[04_protocol.md](04_protocol.md)** - Protocol specification and message formats
-- **[05_contributing.md](05_contributing.md)** - Detailed contributing guidelines
-- **[06_roadmap.md](06_roadmap.md)** - Detailed feature roadmap
-- **[07_security.md](07_security.md)** - Security overview (see SECURITY.md for complete info)
-- **[08_changelog.md](08_changelog.md)** - Full changelog
 
-### Security Documentation (docs/ folder)
-- **[SECURITY_AUDIT_REPORT.md](SECURITY_AUDIT_REPORT.md)** - Complete security audit findings (892 lines)
-- **[SECURITY_FIXES_APPLIED.md](SECURITY_FIXES_APPLIED.md)** - Phase 1 security fixes documentation
-- **[SECURITY_IMPROVEMENTS_V2.md](SECURITY_IMPROVEMENTS_V2.md)** - Phase 2 security improvements
+
+
 
 ---
 

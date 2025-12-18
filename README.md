@@ -92,13 +92,7 @@ Tips:
 - **[docs/02_getting_started.md](docs/02_getting_started.md)**: Installation and setup guide
 - **[docs/03_architecture.md](docs/03_architecture.md)**: System architecture and components
 - **[docs/04_protocol.md](docs/04_protocol.md)**: Protocol specification and message formats
-- **[docs/05_contributing.md](docs/05_contributing.md)**: Contributing guidelines
-- **[docs/06_roadmap.md](docs/06_roadmap.md)**: Detailed feature roadmap
-- **[docs/07_security.md](docs/07_security.md)**: Security overview (see SECURITY.md for complete info)
-- **[docs/08_changelog.md](docs/08_changelog.md)**: Full changelog
-- **[docs/SECURITY_AUDIT_REPORT.md](docs/SECURITY_AUDIT_REPORT.md)**: Complete security audit findings
-- **[docs/SECURITY_FIXES_APPLIED.md](docs/SECURITY_FIXES_APPLIED.md)**: Detailed security fix documentation
-- **[docs/SECURITY_IMPROVEMENTS_V2.md](docs/SECURITY_IMPROVEMENTS_V2.md)**: Phase 2 security improvements
+
 
 ---
 

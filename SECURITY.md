@@ -2,11 +2,8 @@
 
 **Last Updated:** December 18, 2024  
 **Application:** Encrypted P2P Messenger v1.3.1  
-**Latest Security Audit:** [December 18, 2024](SECURITY_AUDIT_2024-12-18.md)
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
-
-> 📋 **Latest Audit Report:** A comprehensive security audit was conducted on December 18, 2024. See [SECURITY_AUDIT_2024-12-18.md](SECURITY_AUDIT_2024-12-18.md) for detailed findings, code quality metrics, and cryptographic implementation review.
 
 ---
 
@@ -15,7 +12,7 @@ This document provides comprehensive security information including the threat m
 1. [Security Overview](#security-overview)
 2. [Threat Model](#threat-model)
 3. [Cryptographic Specifications](#cryptographic-specifications)
-4. [Security Audit Summary](#security-audit-summary)
+4. [Security Audit Report (December 18, 2024)](#security-audit-report-december-18-2024)
 5. [Applied Security Fixes](#applied-security-fixes)
 6. [Remaining Security Work](#remaining-security-work)
 7. [Reporting Security Issues](#reporting-security-issues)
@@ -77,6 +74,8 @@ This security model makes the following assumptions:
 - **Session Keys**: Ephemeral AES-256-GCM session keys are derived via X25519 ECDH + HKDF and are kept in memory only for the session lifetime.
 - **Fingerprints**: The RSA public key fingerprint is SHA-256 over the PEM bytes in lowercase hex.
 
+---
+
 ## Cryptographic Specifications
 
 ### Encryption Primitives
@@ -107,97 +106,36 @@ The handshake process is designed to be secure and robust:
 
 ---
 
-## Security Audit Summary
+## Security Audit Report (December 18, 2024)
 
-**Comprehensive Security Audit:** December 18, 2024
+**Application:** Encrypted P2P Messenger v1.3.1  
+**Audit Date:** December 18, 2024  
+**Auditor:** Automated Security Analysis + Manual Review
 
-### Vulnerabilities Identified and Fixed
+### Executive Summary
+
+**Overall Risk Assessment:** **MEDIUM-HIGH**
+
+**Key Findings:**
+- ✅ Strong cryptographic primitives correctly implemented
+- ✅ Forward secrecy via X25519 ephemeral keys
+- ⚠️ **CRITICAL**: Unsafe static mutable variables with race conditions
+- ⚠️ **HIGH**: No replay attack protection in protocol
+- ⚠️ **HIGH**: Plaintext chat history storage (no encryption at rest)
+- ⚠️ **HIGH**: Fingerprint verification can be auto-accepted/bypassed
+- ⚠️ **MEDIUM**: Excessive use of `.unwrap()` and `.expect()` (118 instances)
+- ⚠️ **MEDIUM**: Missing nonce uniqueness guarantees across sessions
+- ⚠️ **MEDIUM**: No rate limiting or DoS protection
+
+### Vulnerability Status Summary
 
 | Severity | Total | Fixed | Remaining | % Fixed |
-|----------|-------|-------|-----------|----------|
-| CRITICAL | 2     | 2     | 0         | 100%     |
-| HIGH     | 5     | 4     | 1         | 80%      |
-| MEDIUM   | 5     | 1     | 4         | 20%      |
-| LOW      | 2     | 0     | 2         | 0%       |
-| **Total**| **14**| **7** | **7**     | **50%**  |
-
-### Critical Vulnerabilities Fixed
-
-1. **[CRITICAL-001] Race Condition in Unsafe Static Mutable Variables** ✅
-   - **Issue:** Unsafe static mutable variables without synchronization
-   - **Fix:** Replaced with `OnceLock<AtomicU64>` for thread-safe access
-   - **Impact:** Eliminated undefined behavior and data races
-
-2. **[CRITICAL-002] Plaintext Storage of Chat History** ✅
-   - **Issue:** Chat messages stored in plaintext JSON
-   - **Fix:** Implemented ChaCha20-Poly1305 encryption for history files
-   - **Impact:** Complete protection of chat history at rest
-
-### High Priority Vulnerabilities Fixed
-
-3. **[HIGH-001] No Replay Attack Protection** ✅
-   - **Issue:** Protocol lacked sequence numbers
-   - **Fix:** Added `seq` field to all protocol messages
-   - **Impact:** Prevents message replay attacks
-   - **Note:** Session-level validation still needs implementation
-
-4. **[HIGH-002] Fingerprint Verification Bypass** ✅
-   - **Issue:** Auto-accept on timeout or channel closure
-   - **Fix:** Removed auto-accept, increased timeout to 5 minutes
-   - **Impact:** Prevents MITM attacks
-
-5. **[HIGH-003] AES-GCM Nonce Reuse Risk** ✅
-   - **Issue:** Random nonces could collide
-   - **Fix:** Implemented counter-based nonces with session ID
-   - **Impact:** Guaranteed nonce uniqueness
-
-6. **[MEDIUM-003] File Size Validation** ✅
-   - **Issue:** File size checked after allocation
-   - **Fix:** Early validation before disk allocation
-   - **Impact:** Prevents DoS via disk exhaustion
-
-### Remaining Vulnerabilities
-
-**[HIGH-004] Identity Private Key Storage**
-- **Status:** Partially addressed (encryption available, not enforced)
-- **Priority:** HIGH
-- **Recommendation:** Require password encryption for all identities
-
-**[HIGH-005] Version Downgrade Protection**
-- **Status:** NOT YET FIXED
-- **Priority:** MEDIUM-HIGH
-- **Recommendation:** Add cryptographic binding of version to handshake
-
-**[MEDIUM-001] Excessive .unwrap() Usage**
-- **Status:** NOT YET FIXED
-- **Priority:** MEDIUM
-- **Count:** 118 instances
-- **Recommendation:** Replace with proper error handling
-
-**[MEDIUM-002] No Rate Limiting**
-- **Status:** NOT YET FIXED
-- **Priority:** MEDIUM
-- **Recommendation:** Implement connection limits and throttling
-
-**[MEDIUM-004] Timing Attack on Password Verification**
-- **Status:** NOT YET FIXED
-- **Priority:** MEDIUM
-- **Recommendation:** Add constant-time delay on auth failure
-
-**[MEDIUM-005] No Secure Memory Wiping**
-- **Status:** NOT YET FIXED
-- **Priority:** MEDIUM
-- **Recommendation:** Use `zeroize` crate for sensitive data
-
-**[LOW-001] Fingerprint Display Truncation**
-- **Status:** NOT YET FIXED
-- **Priority:** LOW
-
-**[LOW-002] No Logging Sanitization**
-- **Status:** NOT YET FIXED
-- **Priority:** LOW
-
-For detailed audit findings, see `docs/SECURITY_AUDIT_REPORT.md`.
+|----------|-------|-------|-----------|---------|
+| CRITICAL | 2     | 2     | 0         | 100%    |
+| HIGH     | 5     | 4     | 1         | 80%     |
+| MEDIUM   | 5     | 1     | 4         | 20%     |
+| LOW      | 2     | 0     | 2         | 0%      |
+| **Total**| **14**| **7** | **7**     | **50%** |
 
 ---
 
@@ -330,20 +268,3 @@ We recognize security researchers who responsibly disclose vulnerabilities:
 ### Bug Bounty
 
 Currently, we do not offer a formal bug bounty program. However, we deeply appreciate security contributions and will acknowledge your work.
-
----
-
-## Additional Resources
-
-- **Latest Security Audit (Dec 18, 2024):** [SECURITY_AUDIT_2024-12-18.md](SECURITY_AUDIT_2024-12-18.md)
-- **Initial Security Audit:** See `docs/SECURITY_AUDIT_REPORT.md` for complete findings
-- **Contributing Guidelines:** See [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Developer Guide:** See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)
-- **Architecture:** See `docs/03_architecture.md`
-- **Protocol Specification:** See `docs/04_protocol.md`
-
----
-
-**Last Security Review:** December 18, 2024  
-**Next Scheduled Review:** March 2025  
-**Latest Audit Report:** [SECURITY_AUDIT_2024-12-18.md](SECURITY_AUDIT_2024-12-18.md)
