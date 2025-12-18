@@ -54,8 +54,8 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 *Goal: Make connection "just work".*
 
 1. **Smart Connection Discovery (mDNS/Bonjour)**: Auto-discover other users on the same network.
-2. **QR Code Connection**: Scan a QR code to connect to a peer.
-3. **Visual Fingerprint Verification**: Use colored grids or memorable words instead of hex strings.
+2. **✅ QR Code Connection**: Scan a QR code to connect to a peer.
+3. **⏳ Visual Fingerprint Verification**: Use colored grids or memorable words instead of hex strings.
 4. **Intelligent Error Messages**: Provide actionable advice when connections fail.
 5. **Connection History**: Easily reconnect to previous peers.
 

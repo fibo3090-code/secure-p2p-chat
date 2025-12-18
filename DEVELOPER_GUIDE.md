@@ -119,8 +119,8 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 
 #### Handshake (Protocol v2)
 
-1. **Version Negotiation**: Both peers exchange and verify the protocol version.
-2. **RSA Public Key Exchange**: For identity and fingerprint verification.
+1. **RSA Public Key Exchange**: For identity and fingerprint verification.
+2. **Signed Version Negotiation**: Both peers exchange and verify the protocol version. The version is signed with the sender's private RSA key to prevent tampering.
 3. **X25519 Ephemeral Key Exchange**: For forward secrecy.
 4. **ECDH Computation**: A shared secret is computed.
 5. **HKDF-SHA256 Key Derivation**: The final AES session key is derived.

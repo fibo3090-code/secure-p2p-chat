@@ -4,13 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### ✨ New Features & Enhancements
+
+- **QR Code Connection**: Generated invite links can now be displayed as QR codes for easy scanning and contact addition.
+  - Files: `src/gui/dialogs.rs`, `src/gui/app_ui.rs`
+  - Impact: Simplifies contact onboarding and sharing of invite links.
+
 ### 🔐 Security Fixes (December 18, 2025)
 
-- **[CRITICAL] Encrypted Chat History at Rest**: Implemented ChaCha20-Poly1305 encryption for chat history storage
-  - Added `save_encrypted()` and `load_encrypted()` methods to `HistoryFile`
-  - Random nonce generation per save operation
-  - Authenticated encryption prevents tampering
-  - Restrictive file permissions (0600 on Unix)
+- **[HIGH] Version Downgrade Protection**: Implemented signed version announcements during handshake.
+  - Peers now exchange digitally signed protocol versions, verified with RSA public keys.
+  - Files: `src/network/session.rs`
+  - Impact: Prevents attackers from forcing communication over older, less secure protocol versions.
 - **[HIGH] Replay Attack Protection**: Fully implemented session sequence validation
   - Added `seq: u64` field to all `ProtocolMessage` variants
   - Per-chat `send_seq` and `recv_seq` tracking in `Chat` struct
@@ -18,6 +23,11 @@ All notable changes to this project will be documented in this file.
   - All incoming messages validate `seq > recv_seq` before processing
   - Invalid/duplicate sequence numbers are logged and discarded
   - Covers all message types: Text, FileMeta, FileChunk, FileEnd, Ping, TypingStart, TypingStop
+- **[CRITICAL] Encrypted Chat History at Rest**: Implemented ChaCha20-Poly1305 encryption for chat history storage
+  - Added `save_encrypted()` and `load_encrypted()` methods to `HistoryFile`
+  - Random nonce generation per save operation
+  - Authenticated encryption prevents tampering
+  - Restrictive file permissions (0600 on Unix)
 - **[HIGH] Counter-Based Nonces**: Replaced random nonces with deterministic counters
   - Guaranteed nonce uniqueness for AES-GCM
   - Structure: `session_id (4 bytes) || counter (8 bytes)`
@@ -28,16 +38,15 @@ All notable changes to this project will be documented in this file.
 - **Rust 2021 Compatibility**: Refactored let chains to nested if-let statements
   - Fixed ~20 instances across `src/app/chat_manager.rs` and `src/gui/*.rs`
   - Removed deprecated ChaCha20-Poly1305 API usage (`Nonce::from_slice` → `Nonce::from`)
-  - Fixed unreachable code in `chat_manager.rs`
   - Fixed RSA-PSS signing by using `RandomizedSigner::sign_with_rng`
   - Project now compiles successfully on Rust 2021 edition
 
 ### 📊 Security Posture
 
 - **Overall Risk:** Improved from CRITICAL → MEDIUM
-- **Vulnerabilities Fixed:** 7 out of 14 (50%)
+- **Vulnerabilities Fixed:** 8 out of 14 (57%)
 - **Critical Issues:** 2/2 fixed (100%)
-- **High Priority:** 4/5 fixed (80%)
+- **High Priority:** 5/5 fixed (100%)
 
 ## [1.3.1] - 2025-11-16
 

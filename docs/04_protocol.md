@@ -43,8 +43,8 @@ The receiver reads the 4-byte header first to determine the size of the incoming
 
 The handshake is the most critical part of the protocol. It establishes a secure, forward-secret session between two peers.
 
-1. **Version Negotiation**: The client and server exchange their supported protocol versions. If the versions are incompatible, the connection is terminated. This prevents downgrade attacks.
-2. **RSA Public Key Exchange**: Both peers exchange their long-term RSA public keys. These keys are used to verify the identity of the peers via their fingerprints.
+1. **RSA Public Key Exchange**: Both peers exchange their long-term RSA public keys. These keys are used to verify the identity of the peers via their fingerprints.
+2. **Signed Version Negotiation**: The client and server exchange their supported protocol versions, signed with their respective RSA private keys. This prevents downgrade attacks.
 3. **X25519 Ephemeral Key Exchange**: For each new session, both peers generate a new, temporary X25519 key pair. These ephemeral keys are exchanged.
 4. **ECDH Computation**: A shared secret is computed using the local private ephemeral key and the remote public ephemeral key.
 5. **HKDF-SHA256 Key Derivation**: The shared secret from the ECDH computation is used as input to the HKDF-SHA256 key derivation function to generate a unique 32-byte AES session key.

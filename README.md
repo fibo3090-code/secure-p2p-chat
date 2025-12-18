@@ -32,7 +32,7 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
 - **File transfer** with chunking and progress
 - **Typing indicators** and desktop notifications
 - **Emoji picker** and drag & drop files
-- **Invite links + QR codes** to onboard contacts quickly
+- **Invite links & QR codes**: Share your contact info easily with a link or a scannable QR code.
 - **Local persistence** of history and identity (no server)
 - **Auto-host + Auto-rehost**: optional auto-start listening on launch and automatic re-listen after a connection consumes the placeholder host
 

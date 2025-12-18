@@ -146,13 +146,13 @@ The handshake process is designed to be secure and robust:
 
 | CRITICAL | 2     | 2     | 0         | 100%    |
 
-| HIGH     | 5     | 4     | 1         | 80%     |
+| HIGH     | 5     | 5     | 0         | 100%    |
 
 | MEDIUM   | 5     | 1     | 4         | 20%     |
 
 | LOW      | 2     | 0     | 2         | 0%       |
 
-| **Total**| **14**| **7** | **7**     | **50%** |
+| **Total**| **14**| **8** | **6**     | **57%** |
 
 ---
 
@@ -214,7 +214,13 @@ The handshake process is designed to be secure and robust:
 - Structure: `session_id (4 bytes) || counter (8 bytes)`
 - Impact: Zero collision probability
 
-### Compilation Fixes (December 18, 2025)
+**8. Version Downgrade Protection (HIGH-004)**
+
+- Implemented signed version exchange during handshake.
+- Peers now exchange digitally signed protocol versions.
+- Signatures are verified using RSA public keys to prevent tampering.
+- Files: `src/network/session.rs`
+- Impact: Prevents attackers from forcing peers to use weaker, older protocol versions.
 
 **8. Rust 2021 Compatibility**
 

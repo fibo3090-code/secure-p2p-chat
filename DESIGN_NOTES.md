@@ -91,6 +91,8 @@ This document consolidates UI/UX principles, design patterns, component specific
 
 - Invite paste:
   - Field + “Paste” → parse → show “Link valid” + autofill name/address/fingerprint → inline error if bad.
+- QR Code Scan:
+  - Button to open camera → scan QR code → parse invite link → autofill contact details.
 - Add contact:
   - Name (required), Address IP:PORT (optional/validated), Fingerprint (64 hex), Notes/Tags; success toast.
 - Auto-host:
@@ -120,6 +122,7 @@ This document consolidates UI/UX principles, design patterns, component specific
 
 ### Onboarding / Invites
 
+- **QR Code Sharing**: Display a QR code for the invite link to be scanned by another device.
 - **Paste Invite**: Auto-parse → show status + autofilled fields
 - **Validation**: Reject malformed links with inline error
 - **Safety**: Never prefill partial IP without port
