@@ -48,9 +48,22 @@ coverage/
 *.profraw
 tarpaulin-report.html
 
-# Logs
+# Logs (may contain sensitive debug information)
 *.log
 logs/
+*.log.*
+log.txt
+debug.log
+error.log
+trace.log
+
+# Core dumps and crash reports (may contain memory dumps)
+core
+core.*
+*.dmp
+*.mdmp
+crash-*.log
+*.crashlog
 
 # Editor artifacts
 *.code-workspace
@@ -74,7 +87,10 @@ release/
 .env
 .env.local
 .env.*.local
+.env.production
+.env.development
 *.secret
+*.secrets
 *.key
 *.pem
 *.pfx
@@ -82,29 +98,88 @@ release/
 *.cert
 *.crt
 *.der
+*.cer
+*.p7b
+*.p7c
+*.spc
 !**/test*.pem
 !.github/**/*.pem
 
+# API keys and tokens
+api_keys.txt
+*.apikey
+.api-key
+.secret-key
+
 # Application data files that might contain sensitive information
 history.json
+history.json.enc
 *.history
+*.history.enc
 config.json
 secrets.json
 identity.json
+identity.json.enc
 keystore.json
 *.db
 *.sqlite
+*.sqlite3
+*.db-journal
+
+# Chat history and user data (CRITICAL - contains encrypted messages)
+chats/
+data/
+userdata/
+*.chat
+*.messages
+
+# Backup files that might contain sensitive data
+*.bak
+*.backup
+*.old
+*~
+*.swp
+*.swo
 
 # Application runtime directories (may contain sensitive user data)
 Downloads/
 temp/
+runtime/
+cache/
+.cache/
+
+# User-specific application data directories
+AppData/
+LocalAppData/
+.local/
+.config/chat-p2p/
+~/Library/Application Support/chat-p2p/
 
 # Private keys and certificates (CRITICAL - never commit these!)
 private_key.pem
 id_rsa
 id_rsa.pub
+id_ed25519
+id_ed25519.pub
 *.priv
 *.private
+*.key.pem
+*.privatekey
+
+# Password and credential files
+passwords.txt
+credentials.txt
+*.credentials
+auth.json
+token.json
+*.token
+
+# Session and authentication data
+session.json
+*.session
+auth_token
+access_token
+refresh_token
 
 # Build artifacts that might contain embedded secrets
 *.exe
@@ -143,3 +218,50 @@ __pycache__/
 !docs/
 !docs/archived/
 !docs/archived/*.md.orig
+
+# Security: Prevent accidental commit of test data with real credentials
+test_data/real/
+test_data/production/
+*.real.json
+*.prod.json
+
+# Prevent committing local development overrides
+local.json
+local.*.json
+override.json
+dev.json
+
+# Memory dumps and debugging artifacts
+*.mem
+*.heapsnapshot
+*.hprof
+
+# Encrypted files that shouldn't be in repo (user data)
+*.enc
+*.encrypted
+*.aes
+*.gpg
+!docs/**/*.enc  # Allow encrypted docs if needed
+
+# Personal notes and TODO files that might contain sensitive info
+NOTES.txt
+TODO.private
+*.personal
+personal/
+private/
+
+# Fingerprint databases (user verification data)
+fingerprints.json
+*.fingerprints
+trusted_keys.json
+
+# Network captures and packet dumps
+*.pcap
+*.pcapng
+*.cap
+
+# Profiling and performance data
+*.prof
+*.perf
+perf.data
+perf.data.old
