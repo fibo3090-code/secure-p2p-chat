@@ -590,11 +590,12 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
 
                     ui.horizontal(|ui| {
                         ui.label("Paste invite link (chat-p2p://invite/...");
-                        if ui.button("📋 Paste").clicked()
-                            && let Ok(mut clipboard) = arboard::Clipboard::new()
-                            && let Ok(text) = clipboard.get_text()
-                        {
-                            app.invite_link_input = text;
+                        if ui.button("📋 Paste").clicked() {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Ok(text) = clipboard.get_text() {
+                                    app.invite_link_input = text;
+                                }
+                            }
                         }
                     });
                     ui.text_edit_singleline(&mut app.invite_link_input);
@@ -1113,12 +1114,12 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     ui.label("Listen port:");
                     let mut port_str = manager.config.listen_port.to_string();
-                    if ui.text_edit_singleline(&mut port_str).changed()
-                        && let Ok(p) = port_str.parse::<u16>()
-                    {
-                        manager.config.listen_port = p;
-                        app.host_port = p.to_string(); // keep Host dialog in sync
-                        let _ = manager.save_history(&app.history_path);
+                    if ui.text_edit_singleline(&mut port_str).changed() {
+                        if let Ok(p) = port_str.parse::<u16>() {
+                            manager.config.listen_port = p;
+                            app.host_port = p.to_string(); // keep Host dialog in sync
+                            let _ = manager.save_history(&app.history_path);
+                        }
                     }
                 });
 
@@ -1143,11 +1144,11 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 ui.label("Download Directory:");
                 ui.horizontal(|ui| {
                     ui.label(manager.config.download_dir.display().to_string());
-                    if ui.button("📁 Browse").clicked()
-                        && let Some(path) = rfd::FileDialog::new().pick_folder()
-                    {
-                        manager.config.download_dir = path;
-                        let _ = manager.save_history(&app.history_path);
+                    if ui.button("📁 Browse").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            manager.config.download_dir = path;
+                            let _ = manager.save_history(&app.history_path);
+                        }
                     }
                 });
 

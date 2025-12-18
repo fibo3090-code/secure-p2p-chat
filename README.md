@@ -76,14 +76,30 @@ Tips:
 ---
 
 ## 📚 Documentation
-All project documentation is located in the root of the repository, not in a separate 'docs/' folder.
 
-- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: The primary technical guide covering architecture, protocols, and build instructions.
-- **[ROADMAP.md](ROADMAP.md)**: Outlines the development roadmap and future plans.
-- **[SECURITY.md](SECURITY.md)**: Details the project's security policy and threat model.
-- **[CHANGELOG.md](CHANGELOG.md)**: Release notes, fixes, and improvements.
-- **[CONTRIBUTING.md](CONTRIBUTING.md)**: How to open issues and send PRs.
-- **[docs/ui_ux_principles.md](docs/ui_ux_principles.md)** and **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: UX principles, flows, and design system starter for the app.
+### Quick Reference (Root Directory)
+
+- **[SECURITY.md](SECURITY.md)**: Comprehensive security policy, audit findings, and applied fixes
+- **[CHANGELOG.md](CHANGELOG.md)**: Release notes, fixes, and improvements
+- **[CONTRIBUTING.md](CONTRIBUTING.md)**: How to open issues and send PRs
+- **[ROADMAP.md](ROADMAP.md)**: Development roadmap and future plans
+- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: Technical guide covering architecture and protocols
+- **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: Design system and UI/UX principles
+
+### Detailed Documentation (`docs/` folder)
+
+- **[docs/01_introduction.md](docs/01_introduction.md)**: Project overview and goals
+- **[docs/02_getting_started.md](docs/02_getting_started.md)**: Installation and setup guide
+- **[docs/03_architecture.md](docs/03_architecture.md)**: System architecture and components
+- **[docs/04_protocol.md](docs/04_protocol.md)**: Protocol specification and message formats
+- **[docs/05_contributing.md](docs/05_contributing.md)**: Contributing guidelines
+- **[docs/06_roadmap.md](docs/06_roadmap.md)**: Detailed feature roadmap
+- **[docs/07_security.md](docs/07_security.md)**: Security overview (see SECURITY.md for complete info)
+- **[docs/08_changelog.md](docs/08_changelog.md)**: Full changelog
+- **[docs/SECURITY_AUDIT_REPORT.md](docs/SECURITY_AUDIT_REPORT.md)**: Complete security audit findings
+- **[docs/SECURITY_FIXES_APPLIED.md](docs/SECURITY_FIXES_APPLIED.md)**: Detailed security fix documentation
+- **[docs/SECURITY_IMPROVEMENTS_V2.md](docs/SECURITY_IMPROVEMENTS_V2.md)**: Phase 2 security improvements
+- **[docs/ui_ux_principles.md](docs/ui_ux_principles.md)**: UI/UX design principles
 
 ---
 

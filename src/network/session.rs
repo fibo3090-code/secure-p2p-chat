@@ -209,9 +209,9 @@ pub async fn run_client_session(
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // Wait up to 30 seconds for user confirmation. If accepted -> proceed.
-    // If explicitly rejected -> abort handshake. If timeout or channel closed -> proceed (auto-accept).
-    match tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+    // Wait up to 5 minutes for user confirmation. If accepted -> proceed.
+    // If explicitly rejected, timeout, or channel closed -> REJECT connection (security fix).
+    match tokio::time::timeout(tokio::time::Duration::from_secs(300), async {
         confirm_rx.recv().await
     })
     .await
@@ -227,14 +227,16 @@ pub async fn run_client_session(
             return Err(anyhow!("Fingerprint rejected by user"));
         }
         Ok(None) => {
-            let msg = "Confirmation channel closed, auto-accepting fingerprint.";
-            tracing::info!("{}", msg);
-            let _ = to_app_tx.send(SessionEvent::Warning(msg.to_string()));
+            let msg = "Confirmation channel closed - REJECTING connection for security";
+            tracing::error!("{}", msg);
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification failed: channel closed"));
         }
         Err(_) => {
-            let msg = "Fingerprint verification timed out, auto-accepting.";
-            tracing::info!("{}", msg);
-            let _ = to_app_tx.send(SessionEvent::Warning(msg.to_string()));
+            let msg = "Fingerprint verification timed out (5 min) - REJECTING connection for security";
+            tracing::error!("{}", msg);
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification timed out"));
         }
     }
 

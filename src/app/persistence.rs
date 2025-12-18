@@ -1,4 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use chacha20poly1305::{
+    ChaCha20Poly1305, KeyInit,
+    aead::{Aead, AeadCore},
+};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -29,7 +34,7 @@ impl HistoryFile {
         }
     }
 
-    /// Load history from JSON file
+    /// Load history from JSON file (plaintext - legacy support)
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let history: HistoryFile = serde_json::from_str(&content)?;
@@ -42,7 +47,34 @@ impl HistoryFile {
         Ok(history)
     }
 
-    /// Save history to JSON file
+    /// Load encrypted history from file
+    pub fn load_encrypted(path: &Path, key: &[u8; 32]) -> Result<Self> {
+        let encrypted_data = std::fs::read(path)?;
+        
+        if encrypted_data.len() < 12 {
+            return Err(anyhow!("Invalid encrypted history file: too short"));
+        }
+
+        // Extract nonce (first 12 bytes) and ciphertext
+        let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+        let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+        
+        let cipher = ChaCha20Poly1305::new(key.into());
+        let plaintext = cipher
+            .decrypt(&nonce, ciphertext)
+            .map_err(|e| anyhow!("Decryption failed (wrong password?): {}", e))?;
+        
+        let history: HistoryFile = serde_json::from_slice(&plaintext)?;
+        
+        if history.version != "1.0" {
+            anyhow::bail!("Unsupported history version: {}", history.version);
+        }
+
+        tracing::info!("Loaded {} chats from encrypted history", history.chats.len());
+        Ok(history)
+    }
+
+    /// Save history to JSON file (plaintext - NOT RECOMMENDED)
     pub fn save(&self, path: &Path) -> Result<()> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
@@ -52,7 +84,39 @@ impl HistoryFile {
         let content = serde_json::to_string_pretty(&self)?;
         std::fs::write(path, content)?;
 
-        tracing::info!("Saved {} chats to history", self.chats.len());
+        tracing::warn!("Saved {} chats to UNENCRYPTED history - use save_encrypted instead!", self.chats.len());
+        Ok(())
+    }
+
+    /// Save encrypted history to file (RECOMMENDED)
+    pub fn save_encrypted(&self, path: &Path, key: &[u8; 32]) -> Result<()> {
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let json = serde_json::to_string_pretty(&self)?;
+        
+        let cipher = ChaCha20Poly1305::new(key.into());
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, json.as_bytes())
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+        
+        // Format: nonce (12 bytes) || ciphertext
+        let mut output = nonce.to_vec();
+        output.extend_from_slice(&ciphertext);
+        
+        std::fs::write(path, output)?;
+        
+        // Set restrictive file permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        tracing::info!("Saved {} chats to encrypted history", self.chats.len());
         Ok(())
     }
 }

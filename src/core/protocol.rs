@@ -12,26 +12,26 @@ pub enum ProtocolMessage {
     /// Ephemeral X25519 public key for forward secrecy
     EphemeralKey { public_key: Vec<u8> },
 
-    /// Text message
-    Text { text: String, timestamp: u64 },
+    /// Text message (with sequence number for replay protection)
+    Text { text: String, timestamp: u64, seq: u64 },
 
     /// File metadata (sent before chunks)
-    FileMeta { filename: String, size: u64 },
+    FileMeta { filename: String, size: u64, seq: u64 },
 
     /// File data chunk
     FileChunk { chunk: Vec<u8>, seq: u64 },
 
     /// File transfer complete
-    FileEnd,
+    FileEnd { seq: u64 },
 
     /// Keep-alive ping
-    Ping,
+    Ping { seq: u64 },
 
     /// Typing indicator - user started typing
-    TypingStart,
+    TypingStart { seq: u64 },
 
     /// Typing indicator - user stopped typing
-    TypingStop,
+    TypingStop { seq: u64 },
 }
 
 impl ProtocolMessage {
@@ -46,10 +46,10 @@ impl ProtocolMessage {
                 v
             }
 
-            Self::Text { text, .. } => format!("TEXT:{}", text).into_bytes(),
+            Self::Text { text, seq, .. } => format!("TEXT:{}:{}", seq, text).into_bytes(),
 
-            Self::FileMeta { filename, size } => {
-                format!("FILE_META|{}|{}", filename, size).into_bytes()
+            Self::FileMeta { filename, size, seq } => {
+                format!("FILE_META|{}|{}|{}", seq, filename, size).into_bytes()
             }
 
             Self::FileChunk { chunk, .. } => {
@@ -58,13 +58,13 @@ impl ProtocolMessage {
                 v
             }
 
-            Self::FileEnd => b"FILE_END:".to_vec(),
+            Self::FileEnd { seq } => format!("FILE_END:{}", seq).into_bytes(),
 
-            Self::Ping => b"PING".to_vec(),
+            Self::Ping { seq } => format!("PING:{}", seq).into_bytes(),
 
-            Self::TypingStart => b"TYPING_START".to_vec(),
+            Self::TypingStart { seq } => format!("TYPING_START:{}", seq).into_bytes(),
 
-            Self::TypingStop => b"TYPING_STOP".to_vec(),
+            Self::TypingStop { seq } => format!("TYPING_STOP:{}", seq).into_bytes(),
         }
     }
 
@@ -85,33 +85,50 @@ impl ProtocolMessage {
                 // 64 KiB Limit
                 return None; // Invalid/Too large
             }
-            let text = String::from_utf8_lossy(&b[5..]).into_owned();
-            Some(Self::Text {
-                text,
-                timestamp: crate::util::current_timestamp_millis(),
-            })
+            let s = String::from_utf8_lossy(&b[5..]);
+            let parts: Vec<&str> = s.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                let seq = parts[0].parse::<u64>().ok()?;
+                let text = parts[1].to_string();
+                Some(Self::Text {
+                    text,
+                    timestamp: crate::util::current_timestamp_millis(),
+                    seq,
+                })
+            } else {
+                None
+            }
         } else if b.starts_with(b"FILE_META|") {
             let s = String::from_utf8_lossy(b);
-            let parts: Vec<&str> = s.splitn(3, '|').collect();
-            if parts.len() == 3 {
-                let raw_filename = parts[1];
+            let parts: Vec<&str> = s.splitn(4, '|').collect();
+            if parts.len() == 4 {
+                let seq = parts[1].parse::<u64>().ok()?;
+                let raw_filename = parts[2];
                 let filename = crate::util::sanitize_filename(raw_filename);
-                if let Ok(size) = parts[2].parse::<u64>() {
-                    return Some(Self::FileMeta { filename, size });
+                if let Ok(size) = parts[3].parse::<u64>() {
+                    return Some(Self::FileMeta { filename, size, seq });
                 }
             }
             None
         } else if b.starts_with(b"FILE_CHUNK:") {
             let chunk = b[11..].to_vec();
             Some(Self::FileChunk { chunk, seq: 0 })
-        } else if b == b"FILE_END:" {
-            Some(Self::FileEnd)
-        } else if b == b"PING" {
-            Some(Self::Ping)
-        } else if b == b"TYPING_START" {
-            Some(Self::TypingStart)
-        } else if b == b"TYPING_STOP" {
-            Some(Self::TypingStop)
+        } else if b.starts_with(b"FILE_END:") {
+            let s = String::from_utf8_lossy(&b[9..]);
+            let seq = s.trim().parse::<u64>().ok()?;
+            Some(Self::FileEnd { seq })
+        } else if b.starts_with(b"PING:") {
+            let s = String::from_utf8_lossy(&b[5..]);
+            let seq = s.trim().parse::<u64>().ok()?;
+            Some(Self::Ping { seq })
+        } else if b.starts_with(b"TYPING_START:") {
+            let s = String::from_utf8_lossy(&b[13..]);
+            let seq = s.trim().parse::<u64>().ok()?;
+            Some(Self::TypingStart { seq })
+        } else if b.starts_with(b"TYPING_STOP:") {
+            let s = String::from_utf8_lossy(&b[12..]);
+            let seq = s.trim().parse::<u64>().ok()?;
+            Some(Self::TypingStop { seq })
         } else {
             None
         }
@@ -127,14 +144,16 @@ mod tests {
         let msg = ProtocolMessage::Text {
             text: "Hello, world!".to_string(),
             timestamp: 1234567890,
+            seq: 42,
         };
 
         let bytes = msg.to_plain_bytes();
         let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
 
         match parsed {
-            ProtocolMessage::Text { text, .. } => {
+            ProtocolMessage::Text { text, seq, .. } => {
                 assert_eq!(text, "Hello, world!");
+                assert_eq!(seq, 42);
             }
             _ => panic!("Wrong message type"),
         }
@@ -145,6 +164,7 @@ mod tests {
         let msg = ProtocolMessage::FileMeta {
             filename: "test.txt".to_string(),
             size: 12345,
+            seq: 1,
         };
 
         let bytes = msg.to_plain_bytes();
@@ -174,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_file_end() {
-        let msg = ProtocolMessage::FileEnd;
+        let msg = ProtocolMessage::FileEnd { seq: 100 };
         let bytes = msg.to_plain_bytes();
         let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
 
@@ -183,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_ping() {
-        let msg = ProtocolMessage::Ping;
+        let msg = ProtocolMessage::Ping { seq: 5 };
         let bytes = msg.to_plain_bytes();
         let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
 

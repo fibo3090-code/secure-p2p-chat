@@ -133,25 +133,40 @@ pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
 }
 
 /// AES-GCM cipher wrapper for encrypting/decrypting messages
+/// Uses counter-based nonces for guaranteed uniqueness
 #[derive(Clone)]
 pub struct AesCipher {
     cipher: Aes256Gcm,
+    nonce_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_id: [u8; 4],
 }
 
 impl AesCipher {
-    /// Create new cipher from 32-byte key
+    /// Create new cipher from 32-byte key with random session ID
     pub fn new(key: &[u8]) -> Self {
         assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
+        
+        let mut session_id = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut session_id);
+        
         Self {
             cipher: Aes256Gcm::new_from_slice(key).expect("Invalid AES key length"),
+            nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session_id,
         }
     }
 
     /// Encrypt plaintext, returns nonce(12) || ciphertext || tag(16)
+    /// Uses counter-based nonce: session_id(4) || counter(8) for guaranteed uniqueness
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+        // Get next counter value atomically
+        let counter = self.nonce_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        // Build nonce: session_id (4 bytes) || counter (8 bytes)
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        // Nonce::try_from accepts an array by value
+        nonce_bytes[0..4].copy_from_slice(&self.session_id);
+        nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
+        
         let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = self

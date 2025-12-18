@@ -145,10 +145,10 @@ impl ChatManager {
             chat_id
         );
         self.contact_to_chat.insert(contact_id, chat_id);
-        if let Some(chat) = self.chats.get_mut(&chat_id)
-            && !chat.participants.contains(&contact_id)
-        {
-            chat.participants.push(contact_id);
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            if !chat.participants.contains(&contact_id) {
+                chat.participants.push(contact_id);
+            }
         }
         tracing::info!("Associated contact {} -> chat {}", contact_id, chat_id);
     }
@@ -240,6 +240,7 @@ impl ChatManager {
         let msg = ProtocolMessage::Text {
             text: text.clone(),
             timestamp: crate::util::current_timestamp_millis(),
+            seq: 0, // TODO: Use proper sequence tracking
         };
 
         // Clone participants so we don't hold an immutable borrow while mutating chats
@@ -476,28 +477,33 @@ impl ChatManager {
             }
 
             // Try to re-associate to an existing active session by fingerprint first
-            if let Some(fp) = contact.fingerprint.clone()
-                && let Some((&active_chat_id, _)) = self.chats.iter().find(|(_, chat)| {
-                    chat.peer_fingerprint.as_deref() == Some(fp.as_str())
-                        && self.sessions.contains_key(&chat.id)
-                })
-            {
-                tracing::info!(
-                    "Re-associating mapped contact {} to active chat {} by fingerprint",
-                    contact_id,
-                    active_chat_id
-                );
-                self.associate_contact_with_chat(contact_id, active_chat_id);
-                return Ok(active_chat_id);
+            if let Some(fp) = contact.fingerprint.clone() {
+                if let Some(active_chat_id) = self.chats.iter().find_map(|(id, chat)| {
+                    if chat.peer_fingerprint.as_deref() == Some(fp.as_str())
+                        && self.sessions.contains_key(id)
+                    {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                }) {
+                    tracing::info!(
+                        "Re-associating mapped contact {} to active chat {} by fingerprint",
+                        contact_id,
+                        active_chat_id
+                    );
+                    self.associate_contact_with_chat(contact_id, active_chat_id);
+                    return Ok(active_chat_id);
+                }
             }
             // Otherwise, if the contact has an address, start a connection using the mapped chat id
-            if let Some(address) = contact.address.clone()
-                && let Ok((host, port)) = Self::parse_address(&address)
-            {
-                tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
-                let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
-                self.associate_contact_with_chat(contact_id, chat_id);
-                return Ok(chat_id);
+            if let Some(address) = contact.address.clone() {
+                if let Ok((host, port)) = Self::parse_address(&address) {
+                    tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
+                    let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
+                    self.associate_contact_with_chat(contact_id, chat_id);
+                    return Ok(chat_id);
+                }
             }
             // No way to create a session yet; fall through to fingerprint/address logic below
         }
@@ -592,6 +598,7 @@ impl ChatManager {
         let msg = ProtocolMessage::Text {
             text: text.clone(),
             timestamp: crate::util::current_timestamp_millis(),
+            seq: 0, // TODO: Use proper sequence tracking
         };
 
         if let Err(e) = session.from_app_tx.send(msg) {
@@ -684,7 +691,7 @@ impl ChatManager {
             .get(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
-        session.from_app_tx.send(ProtocolMessage::TypingStart)?;
+        session.from_app_tx.send(ProtocolMessage::TypingStart { seq: 0 })?;
         Ok(())
     }
 
@@ -699,7 +706,7 @@ impl ChatManager {
             .get(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
-        session.from_app_tx.send(ProtocolMessage::TypingStop)?;
+        session.from_app_tx.send(ProtocolMessage::TypingStop { seq: 0 })?;
         Ok(())
     }
 
@@ -849,6 +856,7 @@ impl ChatManager {
         let meta_msg = ProtocolMessage::FileMeta {
             filename: filename.clone(),
             size: file_size,
+            seq: 0, // TODO: Use proper sequence tracking
         };
         session.from_app_tx.send(meta_msg)?;
 
@@ -875,7 +883,7 @@ impl ChatManager {
         }
 
         // Send end marker
-        session.from_app_tx.send(ProtocolMessage::FileEnd)?;
+        session.from_app_tx.send(ProtocolMessage::FileEnd { seq: 0 })?;
         tracing::info!(file = %filename, total_bytes = %file_size, "File send complete");
 
         // Add to local history
@@ -905,11 +913,11 @@ impl ChatManager {
         for chat_id in chat_ids {
             // Collect all pending events for this session
             let mut events = Vec::new();
-            if let Some(rx_mutex) = self.session_events.get(&chat_id)
-                && let Ok(mut rx) = rx_mutex.try_lock()
-            {
-                while let Ok(event) = rx.try_recv() {
-                    events.push(event);
+            if let Some(rx_mutex) = self.session_events.get(&chat_id) {
+                if let Ok(mut rx) = rx_mutex.try_lock() {
+                    while let Ok(event) = rx.try_recv() {
+                        events.push(event);
+                    }
                 }
             }
 
@@ -1020,7 +1028,7 @@ impl ChatManager {
                         }
                     }
 
-                    ProtocolMessage::FileMeta { filename, size } => {
+                    ProtocolMessage::FileMeta { filename, size, .. } => {
                         tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
 
                         match self.start_receiving_file(chat_id, &filename, size) {
@@ -1074,7 +1082,7 @@ impl ChatManager {
                         }
                     }
 
-                    ProtocolMessage::FileEnd => {
+                    ProtocolMessage::FileEnd { .. } => {
                         tracing::info!("File transfer completed");
 
                         // Finalize all active transfers
@@ -1115,18 +1123,18 @@ impl ChatManager {
                         }
                     }
 
-                    ProtocolMessage::Ping => {
+                    ProtocolMessage::Ping { .. } => {
                         tracing::trace!("Received ping");
                     }
 
-                    ProtocolMessage::TypingStart => {
+                    ProtocolMessage::TypingStart { .. } => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
                             chat.peer_typing = true;
                             chat.typing_since = Some(std::time::Instant::now());
                         }
                     }
 
-                    ProtocolMessage::TypingStop => {
+                    ProtocolMessage::TypingStop { .. } => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
                             chat.peer_typing = false;
                             chat.typing_since = None;

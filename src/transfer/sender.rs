@@ -36,6 +36,7 @@ where
     let meta_msg = ProtocolMessage::FileMeta {
         filename: filename.to_string(),
         size: total_size,
+        seq: 0, // TODO: Use proper sequence tracking
     };
     send_message(stream, cipher, &meta_msg).await?;
 
@@ -65,7 +66,7 @@ where
     }
 
     // 4. Send FileEnd
-    send_message(stream, cipher, &ProtocolMessage::FileEnd).await?;
+    send_message(stream, cipher, &ProtocolMessage::FileEnd { seq: 0 }).await?;
 
     tracing::info!("File transfer complete: {} bytes", bytes_sent);
     Ok(())

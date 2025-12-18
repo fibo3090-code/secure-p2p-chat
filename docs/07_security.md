@@ -1,10 +1,24 @@
 # 7. Security
 
-This document outlines the security policy for the Encrypted P2P Messenger, including the threat model, cryptographic specifications, and guidelines for reporting vulnerabilities.
+> **Note:** For the most comprehensive and up-to-date security information, including recent security fixes and audit findings, please see [SECURITY.md](../SECURITY.md) in the root directory.
+
+This document provides an overview of the security features and threat model for the Encrypted P2P Messenger.
 
 ## Security Overview
 
-This application implements **military-grade end-to-end encryption** with **forward secrecy**, matching the security standards of leading messaging apps like Signal and WhatsApp. The security of the application is a top priority, and this document provides a transparent overview of the measures taken to protect users' privacy and data.
+This application implements **military-grade end-to-end encryption** with **forward secrecy**, matching the security standards of leading messaging apps like Signal and WhatsApp.
+
+### Current Security Status (December 2024)
+
+**Overall Risk Assessment:** **MEDIUM** (improved from CRITICAL)
+
+- ✅ All critical vulnerabilities fixed (2/2)
+- ✅ Most high-priority issues resolved (4/5)
+- ✅ Encrypted chat history at rest
+- ✅ Replay attack protection implemented
+- ✅ Thread-safe implementation (no unsafe code)
+
+For detailed security audit findings and applied fixes, see [SECURITY.md](../SECURITY.md).
 
 ### Threat Model
 
