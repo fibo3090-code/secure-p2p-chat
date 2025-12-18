@@ -1,6 +1,6 @@
 # Security Policy & Documentation
 
-**Last Updated:** December 18, 2024  
+**Last Updated:** December 18, 2025  
 **Application:** Encrypted P2P Messenger v1.3.1  
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
@@ -12,7 +12,7 @@ This document provides comprehensive security information including the threat m
 1. [Security Overview](#security-overview)
 2. [Threat Model](#threat-model)
 3. [Cryptographic Specifications](#cryptographic-specifications)
-4. [Security Audit Report (December 18, 2024)](#security-audit-report-december-18-2024)
+4. [Security Audit Report (December 18, 2025)](#security-audit-report-december-18-2025)
 5. [Applied Security Fixes](#applied-security-fixes)
 6. [Remaining Security Work](#remaining-security-work)
 7. [Reporting Security Issues](#reporting-security-issues)
@@ -37,7 +37,7 @@ This application implements **military-grade end-to-end encryption** with **forw
 - ✅ Thread-safe implementation (no unsafe code)
 - ✅ Fingerprint verification enforcement
 
-**Recent Security Improvements (Dec 2024):**
+**Recent Security Improvements (Dec 2025):**
 - Fixed race conditions in static mutable variables
 - Implemented encrypted storage for chat history
 - Added sequence numbers for replay attack protection
@@ -106,10 +106,10 @@ The handshake process is designed to be secure and robust:
 
 ---
 
-## Security Audit Report (December 18, 2024)
+## Security Audit Report (December 18, 2025)
 
 **Application:** Encrypted P2P Messenger v1.3.1  
-**Audit Date:** December 18, 2024  
+**Audit Date:** December 18, 2025  
 **Auditor:** Automated Security Analysis + Manual Review
 
 ### Executive Summary
@@ -185,7 +185,7 @@ The handshake process is designed to be secure and robust:
 - Impact: Prevents DoS attacks
 
 **4. Cargo Edition Fix**
-- Changed edition from "2024" to "2021"
+- Changed edition from "2025" to "2021"
 - Files: `Cargo.toml`
 
 ### Phase 2 Fixes (3 vulnerabilities)
@@ -211,7 +211,7 @@ The handshake process is designed to be secure and robust:
 - Structure: `session_id (4 bytes) || counter (8 bytes)`
 - Impact: Zero collision probability
 
-### Compilation Fixes (December 18, 2024)
+### Compilation Fixes (December 18, 2025)
 
 **8. Rust 2021 Compatibility**
 - Refactored let chains to nested if-let statements

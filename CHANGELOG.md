@@ -114,12 +114,6 @@ All notable changes to this project will be documented in this file.
 - Extended the protocol with `Version` and `EphemeralKey` messages.
 - Updated the handshake sequence to include ephemeral key exchange.
 
-### ⚠️ Breaking Changes
-
-```
-
-- Protocol v2 is incompatible with v1. Both parties must upgrade to communicate.
-
 ## [1.0.2] - 2025-10-23
 
 ### 🐛 Critical Bug Fix: Messages Not Being Received
