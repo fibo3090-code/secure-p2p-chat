@@ -15,7 +15,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 
 ---
 
-## 📊 Current Status (v1.3.0-dev)
+## 📊 Current Status (v1.3.1)
 
 ### ✅ What Works
 - **Core Security**: RSA-2048-OAEP + AES-256-GCM encryption with X25519 ECDH Forward Secrecy.
@@ -23,18 +23,17 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 - **UI/UX**: Modern interface with avatars, timestamps, emoji picker, and drag & drop.
 - **Persistence**: Reliable history storage and a persistent identity system.
 
-### 🆕 Recent (v1.3.0)
+### 🆕 Recent (v1.3.1)
 
-- Synchronized chat creation across peers (`SessionEvent::NewConnection`)
-- Handshake now exchanges `chat_id` to bind sessions to chats
-- Improved UI flow: local chat appears instantly, connection proceeds in background
-
-These changes improve reliability and eliminate “all recipients offline” misroutes during new chat creation.
+- Auto-rehost now shows a success toast: "Host relancé" after a listener is restarted.
+- Added a minimal guard to prevent multiple concurrent listeners on the same port, avoiding duplicate hosts during auto-rehost.
+- Added unit test to validate placeholder-host detection used by the listener guard.
 
 ### ⚠️ Known Limitations
 1.  **LAN-only**: No NAT traversal for WAN connectivity.
 2.  **Manual Fingerprint Verification**: No automated certificate authority.
 3.  **Some unit tests need updates**.
+4.  **Some security vulnerabilities are still open**.
 
 ---
 

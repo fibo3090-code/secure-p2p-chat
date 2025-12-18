@@ -7,42 +7,35 @@ This document provides a detailed look at the architecture of the Encrypted P2P 
 The project is organized into the following directory structure:
 
 ```
-chat-p2p/
+`chat-p2p/
 ├── src/
-│   ├── main.rs           # GUI application entry point
-│   ├── lib.rs            # Main library module, exports other modules
-│   ├── types.rs          # Core data structures (Chat, Message, etc.)
-│   ├── util.rs           # Utility functions and helpers
+│   ├── main.rs (GUI application)
+│   ├── lib.rs (Module exports)
+│   ├── types.rs (Data structures)
+│   ├── util.rs (Helpers)
 │   │
-│   ├── app/              # Business Logic Layer
-│   │   ├── chat_manager.rs # Core state management and event handling
-│   │   └── persistence.rs  # Handles saving and loading data to/from disk
+│   ├── app/ (Business Logic Layer)
+│   │   ├── chat_manager.rs (Core state management)
+│   │   └── persistence.rs (JSON save/load)
 │   │
-│   ├── core/             # Cryptography and Protocol Layer
-│   │   ├── crypto.rs       # All cryptographic operations (RSA, AES, X25519)
-│   │   ├── framing.rs      # Handles message framing (length-prefixing)
-│   │   └── protocol.rs     # Defines the wire protocol and message types
+│   ├── core/ (Cryptography Layer)
+│   │   ├── crypto.rs (RSA, AES-GCM, X25519)
+│   │   └── protocol.rs (Message types)
 │   │
-│   ├── gui/              # GUI Layer
-│   │   ├── app_ui.rs       # The main application UI structure
-│   │   ├── chat_view.rs    # UI for the chat window
-│   │   ├── dialogs.rs      # UI for various dialog boxes (e.g., settings, new chat)
-│   │   ├── sidebar.rs      # UI for the contact list/sidebar
-│   │   └── ...             # Other UI components
+│   ├── network/ (Network Layer)
+│   │   └── session.rs (TCP sessions, handshake)
 │   │
-│   ├── identity/         # Identity Management Layer
-│   │   └── mod.rs          # Manages the user's persistent RSA identity
+│   ├── transfer/ (File Transfer Layer)
+│   │   ├── receiver.rs (Receiving files)
+│   │   └── sender.rs (Sending files)
 │   │
-│   ├── network/          # Network Layer
-│   │   └── session.rs      # Manages TCP sessions and the handshake process
-│   │
-│   └── transfer/         # File Transfer Layer
-│       ├── receiver.rs     # Logic for receiving files
-│       └── sender.rs       # Logic for sending files
+│   └── identity/ (Identity Layer)
+│       └── mod.rs (Persistent RSA keys)
 │
 ├── Cargo.toml
 ├── README.md
 └── SECURITY.md
+`
 ```
 
 ## 3.2. Layered Architecture

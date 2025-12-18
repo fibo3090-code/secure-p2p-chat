@@ -114,28 +114,53 @@ The handshake process is designed to be secure and robust:
 
 ### Executive Summary
 
-**Overall Risk Assessment:** **MEDIUM-HIGH**
+
+
+**Overall Risk Assessment:** **MEDIUM**
+
+
 
 **Key Findings:**
+
 - ✅ Strong cryptographic primitives correctly implemented
+
 - ✅ Forward secrecy via X25519 ephemeral keys
+
 - ⚠️ **CRITICAL**: Unsafe static mutable variables with race conditions
+
 - ⚠️ **HIGH**: No replay attack protection in protocol
+
 - ⚠️ **HIGH**: Plaintext chat history storage (no encryption at rest)
+
 - ⚠️ **HIGH**: Fingerprint verification can be auto-accepted/bypassed
+
 - ⚠️ **MEDIUM**: Excessive use of `.unwrap()` and `.expect()` (118 instances)
+
 - ⚠️ **MEDIUM**: Missing nonce uniqueness guarantees across sessions
+
 - ⚠️ **MEDIUM**: No rate limiting or DoS protection
+
+
 
 ### Vulnerability Status Summary
 
+
+
 | Severity | Total | Fixed | Remaining | % Fixed |
+
 |----------|-------|-------|-----------|---------|
+
 | CRITICAL | 2     | 2     | 0         | 100%    |
+
 | HIGH     | 5     | 4     | 1         | 80%     |
+
 | MEDIUM   | 5     | 1     | 4         | 20%     |
-| LOW      | 2     | 0     | 2         | 0%      |
+
+| LOW      | 2     | 0     | 2         | 0%       |
+
 | **Total**| **14**| **7** | **7**     | **50%** |
+
+
 
 ---
 
