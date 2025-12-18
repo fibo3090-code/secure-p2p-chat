@@ -13,20 +13,23 @@ Before you begin, ensure you have the following installed on your system:
 
 Follow these steps to get the application running on your machine:
 
-1.  **Clone the Repository**:
+1. **Clone the Repository**:
+
     ```bash
     git clone <repository-url>
     cd chat-p2p
     ```
 
-2.  **Build the Application**:
+2. **Build the Application**:
     For the best performance, it is recommended to build the application in release mode.
+
     ```bash
     cargo build --release
     ```
 
-3.  **Run the Application**:
+3. **Run the Application**:
     Once the build is complete, you can run the application with the following command:
+
     ```bash
     cargo run --release
     ```
@@ -35,9 +38,10 @@ Follow these steps to get the application running on your machine:
 
 #### Windows
 
--   **Recommended Shell**: It is recommended to use PowerShell or the Windows Terminal for the best experience.
--   **SmartScreen Warning**: When running a packaged binary for the first time, Windows SmartScreen may show a warning. If you trust the source of the application, you can bypass this by clicking "More info" and then "Run anyway".
--   **Packaging Script**: For developers, a PowerShell script is provided to build and package the application for distribution:
+- **Recommended Shell**: It is recommended to use PowerShell or the Windows Terminal for the best experience.
+- **SmartScreen Warning**: When running a packaged binary for the first time, Windows SmartScreen may show a warning. If you trust the source of the application, you can bypass this by clicking "More info" and then "Run anyway".
+- **Packaging Script**: For developers, a PowerShell script is provided to build and package the application for distribution:
+
     ```powershell
     ./build-and-package.ps1
     ```
@@ -52,12 +56,13 @@ Verifying fingerprints prevents **Man-in-the-Middle (MITM)** attacks, where an a
 **How to Verify:**
 When you connect to another user for the first time, the application will display their 64-character fingerprint. You must verify this fingerprint through a **separate, secure channel**.
 
--   **Good methods**: A phone call, a video call, or in-person verification.
--   **Bad methods**: Verifying over an unencrypted chat or email.
+- **Good methods**: A phone call, a video call, or in-person verification.
+- **Bad methods**: Verifying over an unencrypted chat or email.
 
 **What to do:**
-1.  One person reads their fingerprint aloud while the other person checks it against the fingerprint displayed in the application.
-2.  If the fingerprints match exactly, you can trust the connection.
-3.  **If the fingerprints do not match, do not proceed.** Disconnect immediately and investigate the cause.
+
+1. One person reads their fingerprint aloud while the other person checks it against the fingerprint displayed in the application.
+2. If the fingerprints match exactly, you can trust the connection.
+3. **If the fingerprints do not match, do not proceed.** Disconnect immediately and investigate the cause.
 
 You should re-verify fingerprints whenever a contact's device changes or if you have any reason to be suspicious.

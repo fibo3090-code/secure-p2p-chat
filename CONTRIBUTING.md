@@ -85,7 +85,7 @@ While the prerequisites above must be satisfied prior to having your pull reques
 - Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
 - Limit the first line to 72 characters or less
 - Reference issues and pull requests liberally after the first line
- - Prefer Conventional Commits types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
+- Prefer Conventional Commits types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 
 ### Rust Styleguide
 

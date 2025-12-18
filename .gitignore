@@ -72,6 +72,7 @@ crash-*.log
 .settings/
 .obsidian/
 
+
 # Temporary files
 tmp/
 temp/

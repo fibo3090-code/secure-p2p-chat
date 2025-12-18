@@ -41,6 +41,7 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
 ## 🚀 Quick Start
 
 ### Prerequisites
+
 - **Rust 1.70+** (install from [rustup.rs](https://rustup.rs/))
 - **Network access** (same LAN or VPN)
 
@@ -66,9 +67,11 @@ cargo run --release
 - If `cargo` is missing from PATH, run `$env:Path += ';$HOME\\.cargo\\bin'` in PowerShell, then retry `cargo build`
 
 ### Verify Fingerprints (CRITICAL for Security!)
+
 When you connect to another user, you must verify their fingerprint to prevent man-in-the-middle attacks. Compare the 64-character fingerprint shown in the application with the other user's fingerprint through a separate, secure channel (like a phone call).
 
 Tips:
+
 - Always verify at first contact and when a peer’s device changes.
 - Prefer voice or in-person verification over chat.
 - If fingerprints don’t match, disconnect and investigate.
@@ -92,7 +95,6 @@ Tips:
 - **[docs/02_getting_started.md](docs/02_getting_started.md)**: Installation and setup guide
 - **[docs/03_architecture.md](docs/03_architecture.md)**: System architecture and components
 - **[docs/04_protocol.md](docs/04_protocol.md)**: Protocol specification and message formats
-
 
 ---
 
@@ -128,5 +130,3 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for deta
 ## 📜 License
 
 This project is licensed under the **MIT License** - see [LICENSE.md](LICENSE.md) for details.
-
-

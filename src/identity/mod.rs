@@ -246,7 +246,7 @@ impl Identity {
     }
 
     /// Get or create identity from user data directory
-    pub fn get_or_create(data_dir: &Path, default_name: &str) -> Result<Self> {
+    pub fn get_or_create(data_dir: &Path, default_name: &str) -> Result<(Self, bool)> {
         let identity_path = data_dir.join("identity.json");
 
         if identity_path.exists() {
@@ -254,21 +254,19 @@ impl Identity {
             match Self::load(&identity_path) {
                 Ok(identity) => {
                     tracing::info!("Using existing identity: {}", identity.name);
-                    Ok(identity)
+                    Ok((identity, false))
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load identity, creating new one: {}", e);
                     let identity = Self::new(default_name.to_string())?;
-                    identity.save(&identity_path)?;
-                    Ok(identity)
+                    Ok((identity, true))
                 }
             }
         } else {
             // Create new identity
             tracing::info!("No existing identity found, creating new one");
             let identity = Self::new(default_name.to_string())?;
-            identity.save(&identity_path)?;
-            Ok(identity)
+            Ok((identity, true))
         }
     }
 

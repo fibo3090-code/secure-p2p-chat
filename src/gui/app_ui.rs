@@ -68,6 +68,8 @@ pub struct App {
     pub show_clear_history_dialog: bool,
     pub event_collector: EventCollector,
     pub toasts: Vec<Toast>,
+    pub is_new_identity: bool,
+    pub qr_code_texture: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -122,27 +124,34 @@ impl App {
         // Windows: %APPDATA%\chat-p2p\history.json
         // Linux: ~/.local/share/chat-p2p/history.json
         // macOS: ~/Library/Application Support/chat-p2p/history.json
-        let (history_path, identity) = if let Some(proj_dirs) =
+        let (history_path, identity, is_new_identity) = if let Some(proj_dirs) =
             directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger")
         {
             let data_dir = proj_dirs.data_dir();
             std::fs::create_dir_all(data_dir).ok(); // Ensure directory exists
 
             // Load or create user identity
-            let identity = crate::identity::Identity::get_or_create(data_dir, "User")
+            let (identity, is_new) = crate::identity::Identity::get_or_create(data_dir, "User")
                 .unwrap_or_else(|e| {
                     tracing::error!("Failed to load/create identity: {}", e);
-                    crate::identity::Identity::new("User".to_string())
-                        .expect("Failed to create identity")
+                    (
+                        crate::identity::Identity::new("User".to_string())
+                            .expect("Failed to create identity"),
+                        true,
+                    )
                 });
 
-            (data_dir.join("history.json"), identity)
+            (data_dir.join("history.json"), identity, is_new)
         } else {
             // Fallback to relative path if directories crate fails
             tracing::warn!("Could not determine user data directory, using fallback path");
             let identity = crate::identity::Identity::new("User".to_string())
                 .expect("Failed to create identity");
-            (PathBuf::from("Downloads").join("history.json"), identity)
+            (
+                PathBuf::from("Downloads").join("history.json"),
+                identity,
+                true,
+            )
         };
 
         tracing::info!("Using history path: {}", history_path.display());
@@ -254,6 +263,8 @@ impl App {
             show_clear_history_dialog: false,
             event_collector,
             toasts: Vec::new(),
+            is_new_identity,
+            qr_code_texture: None,
         }
     }
 
@@ -329,6 +340,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.is_new_identity {
+            crate::gui::dialogs::render_set_password_dialog(self, ctx);
+            return;
+        }
         // Poll session events to process received messages
         if let Ok(mut manager) = self.chat_manager.try_lock() {
             manager.poll_session_events();

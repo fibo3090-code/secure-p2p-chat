@@ -396,6 +396,8 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                             created_at: chrono::Utc::now(),
                                             peer_typing: false,
                                             typing_since: None,
+                                            send_seq: 0,
+                                            recv_seq: 0,
                                         };
                                         mgr.chats.insert(chat_id, chat);
                                         mgr.associate_contact_with_chat(contact_clone.id, chat_id);
@@ -735,6 +737,35 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                                 }
                             });
                         });
+                        ui.add_space(10.0);
+
+                        // Generate and display QR code
+                        if app.qr_code_texture.is_none() {
+                            if let Ok(manager) = app.chat_manager.try_lock() {
+                                if let Ok(qr_bytes) = manager.generate_invite_qr(link) {
+                                    let image = image::load_from_memory_with_format(
+                                        &qr_bytes,
+                                        image::ImageFormat::Png,
+                                    )
+                                    .expect("Failed to load QR image");
+                                    let size = [image.width() as _, image.height() as _];
+                                    let image_buffer = image.to_rgba8();
+                                    let pixels = image_buffer.as_flat_samples();
+                                    let texture = ctx.load_texture(
+                                        "qr_code",
+                                        egui::ImageData::Color(std::sync::Arc::new(egui::ColorImage {
+                                            size,
+                                            pixels: pixels.as_slice().to_vec().chunks_exact(4).map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect(),
+                                        })),
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    app.qr_code_texture = Some(texture);
+                                }
+                            }
+                        }
+                        if let Some(texture) = &app.qr_code_texture {
+                            ui.image(texture);
+                        }
                     }
 
                     ui.add_space(10.0);
@@ -745,8 +776,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.add_space(10.0);
                     ui.label("💡 Tip: You can share this via:");
                     ui.label("  • Email, WhatsApp, SMS");
-                    ui.label("  • QR code (future feature)");
-
+                    
                     ui.add_space(10.0);
                     if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
                         app.show_add_contact = false;
@@ -1344,7 +1374,7 @@ fn render_password_dialog(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
+pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("🔑 Set Password")
         .collapsible(false)
         .resizable(false)
@@ -1401,6 +1431,10 @@ fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                                         "Password set and identity encrypted!".to_string(),
                                     );
                                 }
+                                if app.is_new_identity {
+                                    app.is_new_identity = false;
+                                    app.show_welcome = true;
+                                }
                                 app.show_set_password_dialog = false;
                                 app.new_password_input.clear();
                                 app.confirm_password_input.clear();
@@ -1417,7 +1451,7 @@ fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 }
 
-                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
+                if ui.add_enabled(!app.is_new_identity, egui::Button::new("Cancel")).clicked() {
                     app.show_set_password_dialog = false;
                     app.new_password_input.clear();
                     app.confirm_password_input.clear();

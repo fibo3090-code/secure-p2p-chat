@@ -190,7 +190,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     if should_send_typing {
                         let manager = app.chat_manager.clone();
                         tokio::spawn(async move {
-                            let mgr = manager.lock().await;
+                            let mut mgr = manager.lock().await;
                             let _ = mgr.send_typing_start(chat_id);
                         });
                         app.last_typing_time = Some(now);
@@ -202,7 +202,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                 if app.input_text.is_empty() && !app.typing_stopped {
                     let manager = app.chat_manager.clone();
                     tokio::spawn(async move {
-                        let mgr = manager.lock().await;
+                        let mut mgr = manager.lock().await;
                         let _ = mgr.send_typing_stop(chat_id);
                     });
                     app.typing_stopped = true;
@@ -216,7 +216,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     // Stop typing on send
                     let manager = app.chat_manager.clone();
                     tokio::spawn(async move {
-                        let mgr = manager.lock().await;
+                        let mut mgr = manager.lock().await;
                         let _ = mgr.send_typing_stop(chat_id);
                     });
                     app.typing_stopped = true;

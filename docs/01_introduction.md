@@ -27,10 +27,10 @@ The application comes with a rich set of features designed to provide a secure a
 - **Peer Discovery Ready**: While currently requiring manual connection, the application is designed to support automatic peer discovery in the future using technologies like mDNS.
 - **File Transfer**: Securely send and receive files of any size, with chunking and progress indicators.
 - **Rich User Experience**:
-    - **Typing Indicators**: See when the other person is typing.
-    - **Desktop Notifications**: Get notified of new messages even when the application is in the background.
-    - **Emoji Picker**: Easily add emojis to your messages.
-    - **Drag & Drop**: Drag and drop files directly into the chat window to send them.
+  - **Typing Indicators**: See when the other person is typing.
+  - **Desktop Notifications**: Get notified of new messages even when the application is in the background.
+  - **Emoji Picker**: Easily add emojis to your messages.
+  - **Drag & Drop**: Drag and drop files directly into the chat window to send them.
 - **Invite Links & QR Codes**: Quickly and easily add new contacts by sharing an invite link or QR code.
 - **Local Persistence**: All your chat history and your unique identity are stored locally on your computer, giving you full control over your data.
 - **Auto-Host & Auto-Rehost**: The application can be configured to automatically start listening for connections on launch and to automatically re-listen after a connection is established, ensuring you are always available to your contacts.
