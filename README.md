@@ -84,7 +84,7 @@ Tips:
 - **[CONTRIBUTING.md](CONTRIBUTING.md)**: How to open issues and send PRs
 - **[ROADMAP.md](ROADMAP.md)**: Development roadmap and future plans
 - **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: Technical guide covering architecture and protocols
-- **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: Design system and UI/UX principles
+- **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: Comprehensive design & UI/UX guide
 
 ### Detailed Documentation (`docs/` folder)
 
@@ -99,7 +99,6 @@ Tips:
 - **[docs/SECURITY_AUDIT_REPORT.md](docs/SECURITY_AUDIT_REPORT.md)**: Complete security audit findings
 - **[docs/SECURITY_FIXES_APPLIED.md](docs/SECURITY_FIXES_APPLIED.md)**: Detailed security fix documentation
 - **[docs/SECURITY_IMPROVEMENTS_V2.md](docs/SECURITY_IMPROVEMENTS_V2.md)**: Phase 2 security improvements
-- **[docs/ui_ux_principles.md](docs/ui_ux_principles.md)**: UI/UX design principles
 
 ---
 
