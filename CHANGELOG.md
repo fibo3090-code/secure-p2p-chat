@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### 🔐 Security Fixes (December 18, 2024)
+### 🔐 Security Fixes (December 18, 2025)
 
 - **[CRITICAL] Encrypted Chat History at Rest**: Implemented ChaCha20-Poly1305 encryption for chat history storage
   - Added `save_encrypted()` and `load_encrypted()` methods to `HistoryFile`
@@ -19,7 +19,7 @@ All notable changes to this project will be documented in this file.
   - Structure: `session_id (4 bytes) || counter (8 bytes)`
   - Eliminates birthday paradox collision risk
 
-### 🔧 Compilation Fixes (December 18, 2024)
+### 🔧 Compilation Fixes (December 18, 2025)
 
 - **Rust 2021 Compatibility**: Refactored let chains to nested if-let statements
   - Fixed ~20 instances across `src/app/chat_manager.rs` and `src/gui/*.rs`
@@ -34,7 +34,7 @@ All notable changes to this project will be documented in this file.
 - **Critical Issues:** 2/2 fixed (100%)
 - **High Priority:** 4/5 fixed (80%)
 
-## [1.3.1] - 2024-11-16
+## [1.3.1] - 2025-11-16
 
 ### 🔧 Improvements
 

@@ -70,6 +70,7 @@ crash-*.log
 .project
 .classpath
 .settings/
+.obsidian/
 
 # Temporary files
 tmp/
