@@ -116,7 +116,7 @@ mod tests {
         let msg = ProtocolMessage::from_plain_bytes(&plaintext).unwrap();
 
         match msg {
-            ProtocolMessage::FileMeta { filename, size } => {
+            ProtocolMessage::FileMeta { filename, size, seq: _ } => {
                 assert!(filename.ends_with(".tmp") || !filename.is_empty());
                 assert_eq!(size, 21);
             }

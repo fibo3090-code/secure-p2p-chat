@@ -1,9 +1,12 @@
 # Security Policy & Documentation
 
 **Last Updated:** December 18, 2024  
-**Application:** Encrypted P2P Messenger v1.3.1
+**Application:** Encrypted P2P Messenger v1.3.1  
+**Latest Security Audit:** [December 18, 2024](SECURITY_AUDIT_2024-12-18.md)
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
+
+> 📋 **Latest Audit Report:** A comprehensive security audit was conducted on December 18, 2024. See [SECURITY_AUDIT_2024-12-18.md](SECURITY_AUDIT_2024-12-18.md) for detailed findings, code quality metrics, and cryptographic implementation review.
 
 ---
 
@@ -332,7 +335,8 @@ Currently, we do not offer a formal bug bounty program. However, we deeply appre
 
 ## Additional Resources
 
-- **Full Security Audit:** See `docs/SECURITY_AUDIT_REPORT.md` for complete findings
+- **Latest Security Audit (Dec 18, 2024):** [SECURITY_AUDIT_2024-12-18.md](SECURITY_AUDIT_2024-12-18.md)
+- **Initial Security Audit:** See `docs/SECURITY_AUDIT_REPORT.md` for complete findings
 - **Contributing Guidelines:** See [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Developer Guide:** See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)
 - **Architecture:** See `docs/03_architecture.md`
@@ -341,4 +345,5 @@ Currently, we do not offer a formal bug bounty program. However, we deeply appre
 ---
 
 **Last Security Review:** December 18, 2024  
-**Next Scheduled Review:** March 2025
+**Next Scheduled Review:** March 2025  
+**Latest Audit Report:** [SECURITY_AUDIT_2024-12-18.md](SECURITY_AUDIT_2024-12-18.md)
