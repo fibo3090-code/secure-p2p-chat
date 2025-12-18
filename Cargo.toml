@@ -36,8 +36,8 @@ egui_tracing = { version = "0.2.6", features = ["egui-default"] }
 clap = { version = "4", features = ["derive"] }
 
 # GUI
-eframe = "0.29"
-egui = "0.29"
+eframe = "0.29.0"
+egui = "0.29.0"
 
 # Utilities
 anyhow = "1"
@@ -49,7 +49,7 @@ argon2 = "0.5"
 zeroize = "1"
 
 # File dialogs
-rfd = "0.14"
+rfd = "0.14.1"
 
 # Open files
 open = "5"
@@ -61,8 +61,8 @@ notify-rust = "4"
 emojis = "0.6"
 
 # QR code generation and scanning
-qrcode = "0.14"
-image = "0.25"
+qrcode = "0.14.0"
+image = "0.25.9"
 arboard = "3"
 chacha20poly1305 = "0.10.1"
 
