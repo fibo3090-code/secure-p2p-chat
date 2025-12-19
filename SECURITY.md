@@ -1,7 +1,7 @@
 # Security Policy & Documentation
 
 **Last Updated:** December 18, 2025  
-**Application:** Encrypted P2P Messenger v1.3.1  
+Application: Encrypted P2P Messenger v1.4.0  
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
 
@@ -110,7 +110,7 @@ The handshake process is designed to be secure and robust:
 
 ## Security Audit Report (December 18, 2025)
 
-**Application:** Encrypted P2P Messenger v1.3.1  
+Application: Encrypted P2P Messenger v1.4.0  
 **Audit Date:** December 18, 2025  
 **Auditor:** Automated Security Analysis + Manual Review
 

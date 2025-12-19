@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2025-12-19
+
 ### ✨ New Features & Enhancements
 
 - **QR Code Connection**: Generated invite links can now be displayed as QR codes for easy scanning and contact addition.

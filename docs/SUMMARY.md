@@ -79,7 +79,7 @@ The project has clear guidelines for contributions, including:
 
 The project has an ambitious roadmap for future development:
 
-- **v1.3.1** (Current): Usability improvements and security fixes
+- **v1.4.0** (Current): Usability improvements and security fixes
 - **v2.0**: The Professional Release
   - Automatic peer discovery (mDNS)
   - NAT traversal for internet connectivity

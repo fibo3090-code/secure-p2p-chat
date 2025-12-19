@@ -15,7 +15,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 
 ---
 
-## 📊 Current Status (v1.3.1)
+## 📊 Current Status (v1.4.0)
 
 ### ✅ What Works
 
@@ -24,7 +24,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 - **UI/UX**: Modern interface with avatars, timestamps, emoji picker, and drag & drop.
 - **Persistence**: Reliable history storage and a persistent identity system.
 
-### 🆕 Recent (v1.3.1)
+### 🆕 Recent (v1.4.0)
 
 - Auto-rehost now shows a success toast: "Host relancé" after a listener is restarted.
 - Added a minimal guard to prevent multiple concurrent listeners on the same port, avoiding duplicate hosts during auto-rehost.
