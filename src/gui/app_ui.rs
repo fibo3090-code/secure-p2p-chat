@@ -59,6 +59,7 @@ pub struct App {
     pub show_remove_password_dialog: bool,
     pub remove_password_input: String,
     pub identity_locked: bool,
+    pub force_password_setup: bool,
     // Fingerprint verification dialog
     pub show_fingerprint_dialog: bool,
     pub fingerprint_to_verify: Option<String>,
@@ -208,6 +209,7 @@ impl App {
         }
 
         let initial_identity_locked = identity.is_locked();
+        let force_password_setup = !is_new_identity && !initial_identity_locked;
 
         Self {
             chat_manager: manager_arc,
@@ -254,6 +256,7 @@ impl App {
             show_remove_password_dialog: false,
             remove_password_input: String::new(),
             identity_locked: initial_identity_locked,
+            force_password_setup,
             // Fingerprint verification dialog
             show_fingerprint_dialog: false,
             fingerprint_to_verify: None,
@@ -340,7 +343,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.is_new_identity {
+        if self.is_new_identity || self.force_password_setup {
             crate::gui::dialogs::render_set_password_dialog(self, ctx);
             return;
         }

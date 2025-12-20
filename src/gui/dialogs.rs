@@ -1418,7 +1418,11 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.label("Enter a new password to encrypt your identity file.");
+            if app.is_new_identity {
+                ui.label("Welcome! Please create a password to secure your new identity.");
+            } else {
+                ui.label("Please set a password to encrypt your existing identity file.");
+            }
             ui.label("If you forget this password, you will lose access to your identity.");
             ui.add_space(10.0);
 
@@ -1473,6 +1477,8 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                                     app.is_new_identity = false;
                                     app.show_welcome = true;
                                 }
+                                // Reset flags on success
+                                app.force_password_setup = false;
                                 app.show_set_password_dialog = false;
                                 app.new_password_input.clear();
                                 app.confirm_password_input.clear();
@@ -1489,7 +1495,7 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 }
 
-                if ui.add_enabled(!app.is_new_identity, egui::Button::new("Cancel")).clicked() {
+                if ui.add_enabled(!app.is_new_identity && !app.force_password_setup, egui::Button::new("Cancel")).clicked() {
                     app.show_set_password_dialog = false;
                     app.new_password_input.clear();
                     app.confirm_password_input.clear();
