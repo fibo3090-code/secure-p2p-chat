@@ -110,7 +110,8 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
 
     // Input area - FIXED AT BOTTOM
     egui::TopBottomPanel::bottom("chat_input")
-        .exact_height(120.0)
+        .min_height(70.0) // Minimum height for the input panel
+        .max_height(200.0) // Maximum height for the input panel
         .show_inside(ui, |ui| {
             ui.add_space(5.0);
 
@@ -171,14 +172,19 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                 }
 
                 // Multiline text input
-                let text_width = ui.available_width() - 70.0;
-                let response = ui.add_sized(
-                    [text_width, 70.0],
-                    egui::TextEdit::multiline(&mut app.input_text)
-                        .hint_text("💬 Type a message... (Ctrl+Enter to send)")
-                        .desired_rows(3)
-                        .lock_focus(false),
-                );
+                // let text_width = ui.available_width() - 70.0; // This is no longer needed directly
+                let response = egui::ScrollArea::vertical()
+                    .max_height(100.0) // Set max height for the text input before it scrolls
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut app.input_text)
+                                .hint_text("💬 Type a message... (Ctrl+Enter to send)")
+                                .desired_rows(1) // Start with 1 desired row, let it grow
+                                .lock_focus(false)
+                                .desired_width(ui.available_width()), // Use available width
+                        )
+                    })
+                    .inner; // Get the response from the inner TextEdit
 
                 // Handle typing indicators
                 if response.changed() && !app.input_text.is_empty() {
