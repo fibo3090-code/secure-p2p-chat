@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive"] }
 # GUI
 eframe = "0.29.0"
 egui = "0.29.0"
+egui_commonmark = { version = "0.18", features = ["default"] }
 
 # Utilities
 anyhow = "1"

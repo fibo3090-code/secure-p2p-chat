@@ -360,59 +360,12 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
 
             match &message.content {
                 MessageContent::Text { text } => {
-                    // Simple Markdown Parsing (Bold/Italic)
-                    // We split by whitespace and look for * or _ wrappers manually for now
-                    // keeping it simple to avoid deps. Or just use RichText which supports some stats?
-                    // egui::RichText doesn't auto-parse markdown.
-                    // For "way better", let's use a nice font size.
-
-                    let mut job = egui::text::LayoutJob::default();
-                    // Basic "Markdown" simulation for Bold and Code
-                    // This is naive but works for simple cases without a parser crate
-                    let mut chars = text.chars().peekable();
-                    let mut current_text = String::new();
-                    let format = egui::TextFormat {
-                        font_id: egui::FontId::proportional(15.0), // Slightly larger font
-                        color: text_color,
-                        ..Default::default()
-                    };
-
-                    while let Some(c) = chars.next() {
-                        if c == '`' {
-                            // Flush current
-                            if !current_text.is_empty() {
-                                job.append(&current_text, 0.0, format.clone());
-                                current_text.clear();
-                            }
-                            // Read code block
-                            let mut code_text = String::new();
-                            for code_c in chars.by_ref() {
-                                if code_c == '`' {
-                                    break;
-                                }
-                                code_text.push(code_c);
-                            }
-                            // Append code styled
-                            let code_format = egui::TextFormat {
-                                font_id: egui::FontId::monospace(13.0),
-                                background: Color32::BLACK.gamma_multiply(0.2), // Dim background
-                                color: if is_me {
-                                    Color32::WHITE
-                                } else {
-                                    crate::gui::styling::ACCENT_SECONDARY
-                                },
-                                ..format.clone()
-                            };
-                            job.append(&code_text, 0.0, code_format);
-                        } else {
-                            current_text.push(c);
-                        }
-                    }
-                    if !current_text.is_empty() {
-                        job.append(&current_text, 0.0, format);
-                    }
-
-                    ui.label(job);
+                    // Use egui_commonmark for proper Markdown rendering
+                    // We create a unique ID for cache based on message ID
+                    let mut cache = egui_commonmark::CommonMarkCache::default();
+                    ui.visuals_mut().override_text_color = Some(text_color);
+                    egui_commonmark::CommonMarkViewer::new()
+                        .show(ui, &mut cache, text);
 
                     // Copy action (only visible on hover to reduce clutter)
                     if ui.rect_contains_pointer(ui.max_rect()) {
