@@ -147,7 +147,7 @@ pub async fn run_host_session(
     let aes_key = derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO);
     tracing::info!("Derived session key using X25519 ECDH + HKDF (forward secrecy enabled)");
 
-    let cipher = AesCipher::new(&aes_key);
+    let cipher = AesCipher::new(&aes_key)?;
 
     // 13. Enter message loop
     to_app_tx
@@ -304,7 +304,7 @@ pub async fn run_client_session(
     let aes_key = derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO);
     tracing::info!("Derived session key using X25519 ECDH + HKDF (forward secrecy enabled)");
 
-    let cipher = AesCipher::new(&aes_key);
+    let cipher = AesCipher::new(&aes_key)?;
 
     // 12. Enter message loop
     to_app_tx
@@ -393,12 +393,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::generate_rsa_keypair;
     use crate::RSA_KEY_BITS;
-    use crate::core::{generate_rsa_keypair, rsa_decrypt_oaep, rsa_encrypt_oaep};
-    use rand::RngCore;
 
     #[tokio::test]
-    async fn test_full_handshake() {
+    async fn test_full_handshake_with_forward_secrecy() {
         let host_privkey = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let client_privkey = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
 
@@ -406,44 +405,76 @@ mod tests {
 
         // Host side
         let host_handle = tokio::spawn(async move {
-            // Send host pubkey
+            // 1. Exchange RSA pubkeys for identity
             let host_pub_pem = pem_encode_public(&RsaPublicKey::from(&host_privkey)).unwrap();
             send_packet(&mut host_stream, host_pub_pem.as_bytes())
                 .await
                 .unwrap();
-
-            // Receive client pubkey
             let client_pub_pem = recv_packet(&mut host_stream).await.unwrap();
-            let client_pubkey =
+            let _client_pubkey =
                 pem_decode_public(&String::from_utf8(client_pub_pem).unwrap()).unwrap();
 
-            // Generate and send AES key
-            let mut aes_key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut aes_key);
-            let encrypted_aes = rsa_encrypt_oaep(&client_pubkey, &aes_key).unwrap();
-            send_packet(&mut host_stream, &encrypted_aes).await.unwrap();
+            // 2. Exchange ephemeral keys
+            let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
+            let host_ephemeral_msg = ProtocolMessage::EphemeralKey {
+                public_key: host_ephemeral_public.as_bytes().to_vec(),
+            };
+            send_packet(&mut host_stream, &host_ephemeral_msg.to_plain_bytes())
+                .await
+                .unwrap();
 
-            aes_key
+            let client_ephemeral_bytes = recv_packet(&mut host_stream).await.unwrap();
+            let client_ephemeral_msg =
+                ProtocolMessage::from_plain_bytes(&client_ephemeral_bytes).unwrap();
+            let client_ephemeral_public = match client_ephemeral_msg {
+                ProtocolMessage::EphemeralKey { public_key } => {
+                    parse_x25519_public(&public_key).unwrap()
+                }
+                _ => panic!("Expected EphemeralKey message"),
+            };
+
+            // 3. Derive final key
+            let host_aes_key =
+                derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO);
+
+            host_aes_key
         });
 
         // Client side
         let client_handle = tokio::spawn(async move {
-            // Receive host pubkey
+            // 1. Exchange RSA pubkeys for identity
             let _host_pub_pem = recv_packet(&mut client_stream).await.unwrap();
-
-            // Send client pubkey
             let client_pub_pem = pem_encode_public(&RsaPublicKey::from(&client_privkey)).unwrap();
             send_packet(&mut client_stream, client_pub_pem.as_bytes())
                 .await
                 .unwrap();
 
-            // Receive encrypted AES key
-            let encrypted_aes = recv_packet(&mut client_stream).await.unwrap();
-            let aes_key_vec = rsa_decrypt_oaep(&client_privkey, &encrypted_aes).unwrap();
+            // 2. Exchange ephemeral keys
+            let host_ephemeral_bytes = recv_packet(&mut client_stream).await.unwrap();
+            let host_ephemeral_msg =
+                ProtocolMessage::from_plain_bytes(&host_ephemeral_bytes).unwrap();
+            let host_ephemeral_public = match host_ephemeral_msg {
+                ProtocolMessage::EphemeralKey { public_key } => {
+                    parse_x25519_public(&public_key).unwrap()
+                }
+                _ => panic!("Expected EphemeralKey message"),
+            };
 
-            let mut aes_key = [0u8; 32];
-            aes_key.copy_from_slice(&aes_key_vec);
-            aes_key
+            let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
+            let client_ephemeral_msg = ProtocolMessage::EphemeralKey {
+                public_key: client_ephemeral_public.as_bytes().to_vec(),
+            };
+            send_packet(&mut client_stream, &client_ephemeral_msg.to_plain_bytes())
+                .await
+                .unwrap();
+
+            // 3. Derive final key
+            let client_aes_key = derive_session_key(
+                client_ephemeral_secret,
+                &host_ephemeral_public,
+                HKDF_INFO,
+            );
+            client_aes_key
         });
 
         let host_aes = host_handle.await.unwrap();

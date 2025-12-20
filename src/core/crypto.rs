@@ -142,20 +142,20 @@ pub struct AesCipher {
 }
 
 impl AesCipher {
-    /// Create new cipher from 32-byte key with random session ID
-    pub fn new(key: &[u8]) -> Self {
-        assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
-        
-        let mut session_id = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut session_id);
-        
-        Self {
-            cipher: Aes256Gcm::new_from_slice(key).expect("Invalid AES key length"),
-            nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            session_id,
+        /// Create new cipher from 32-byte key with random session ID
+        pub fn new(key: &[u8]) -> Result<Self> {
+            assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
+    
+            let mut session_id = [0u8; 4];
+            rand::thread_rng().fill_bytes(&mut session_id);
+    
+            Ok(Self {
+                cipher: Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| anyhow!("Invalid AES key length: {}", e))?,
+                nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                session_id,
+            })
         }
-    }
-
     /// Encrypt plaintext, returns nonce(12) || ciphertext || tag(16)
     /// Uses counter-based nonce: session_id(4) || counter(8) for guaranteed uniqueness
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -208,7 +208,7 @@ mod tests {
     fn test_aes_roundtrip() {
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        let cipher = AesCipher::new(&key);
+        let cipher = AesCipher::new(&key).unwrap();
 
         let plaintext = b"Hello, secure world!";
         let encrypted = cipher.encrypt(plaintext);
@@ -221,7 +221,7 @@ mod tests {
     fn test_aes_nonce_randomness() {
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        let cipher = AesCipher::new(&key);
+        let cipher = AesCipher::new(&key).unwrap();
 
         let plaintext = b"Same message";
         let enc1 = cipher.encrypt(plaintext);
@@ -239,7 +239,7 @@ mod tests {
     fn test_aes_tamper_detection() {
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        let cipher = AesCipher::new(&key);
+        let cipher = AesCipher::new(&key).unwrap();
 
         let mut encrypted = cipher.encrypt(b"Test");
         if encrypted.len() > 20 {
@@ -379,8 +379,8 @@ mod tests {
         assert_eq!(alice_key, bob_key);
 
         // 6. Use keys for encryption
-        let alice_cipher = AesCipher::new(&alice_key);
-        let bob_cipher = AesCipher::new(&bob_key);
+        let alice_cipher = AesCipher::new(&alice_key).unwrap();
+        let bob_cipher = AesCipher::new(&bob_key).unwrap();
 
         let plaintext = b"Forward secrecy test message";
         let encrypted = alice_cipher.encrypt(plaintext);

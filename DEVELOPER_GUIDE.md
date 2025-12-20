@@ -104,7 +104,7 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 
 * **RSA**: 2048 bits, OAEP with SHA-256 (RSA-OAEP-SHA256)
 * **AES**: AES-256-GCM
-* **Nonce AES**: 12 bytes, generated randomly for each message, prefixed to the ciphertext.
+* **Nonce AES**: 12 bytes, counter-based for guaranteed uniqueness. Format: `session_id(4 bytes) || counter(8 bytes)`. Prefixed to the ciphertext.
 * **Fingerprint**: sha256_hex(pem_bytes) in lowercase hex.
 * **Transport Format (Encrypted)**: `nonce(12) || ciphertext || tag(16)`
 
@@ -130,22 +130,34 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 ### 3.4. Message Format
 
 ```rust
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum ProtocolMessage {
-    Text {
-        text: String,
-        timestamp: u64
-    },
-    FileMeta {
-        filename: String,
-        size: u64
-    },
-    FileChunk {
-        chunk: Vec<u8>,
-        seq: u64
-    },
-    FileEnd,
-    Ping,
+    /// Protocol version announcement (first message)
+    Version { version: u8 },
+
+    /// Ephemeral X25519 public key for forward secrecy
+    EphemeralKey { public_key: Vec<u8> },
+
+    /// Text message (with sequence number for replay protection)
+    Text { text: String, timestamp: u64, seq: u64 },
+
+    /// File metadata (sent before chunks)
+    FileMeta { filename: String, size: u64, seq: u64 },
+
+    /// File data chunk
+    FileChunk { chunk: Vec<u8>, seq: u64 },
+
+    /// File transfer complete
+    FileEnd { seq: u64 },
+
+    /// Keep-alive ping
+    Ping { seq: u64 },
+
+    /// Typing indicator - user started typing
+    TypingStart { seq: u64 },
+
+    /// Typing indicator - user stopped typing
+    TypingStop { seq: u64 },
 }
 ```
 
