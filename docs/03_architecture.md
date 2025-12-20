@@ -6,7 +6,7 @@ This document provides a detailed look at the architecture of the Encrypted P2P 
 
 The project is organized into the following directory structure:
 
-```
+```text
 `chat-p2p/
 ├── src/
 │   ├── main.rs (GUI application)
@@ -42,7 +42,7 @@ The project is organized into the following directory structure:
 
 The application is designed with a clear separation of concerns, following a layered architecture. This makes the codebase easier to understand, maintain, and test.
 
-```
+```text
 ┌─────────────────────────────────────┐
 │   GUI Layer (egui/eframe)           │  ← Handles all user interaction and rendering.
 └──────────────┬──────────────────────┘

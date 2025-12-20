@@ -150,5 +150,5 @@ Security is a primary focus of the project, with:
 **For Security Researchers:**
 
 - Security policy: [SECURITY.md](../SECURITY.md)
-- Audit report: [SECURITY_AUDIT_REPORT.md](SECURITY_AUDIT_REPORT.md)
-- Applied fixes: [SECURITY_FIXES_APPLIED.md](SECURITY_FIXES_APPLIED.md)
+- Audit report: [SECURITY.md#security-audit-report-december-18-2025](../SECURITY.md#security-audit-report-december-18-2025)
+- Applied fixes: [SECURITY.md#applied-security-fixes](../SECURITY.md#applied-security-fixes)

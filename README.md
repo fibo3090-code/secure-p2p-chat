@@ -1,8 +1,8 @@
 # 🔒 Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.4.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.4.0-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
-[![Security](https://img.shields.io/badge/security-audited-success)](#)
+[![Security](https://img.shields.io/badge/security-audited-success)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/)
 
 > **Secure, private, peer-to-peer messaging with end-to-end encryption and forward secrecy.**

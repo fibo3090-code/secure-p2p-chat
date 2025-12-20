@@ -12,12 +12,12 @@ This project and everyone participating in it is governed by our Code of Conduct
 
 This section guides you through submitting a bug report. Following these guidelines helps maintainers and the community understand your report, reproduce the behavior, and find related reports.
 
-**Before Submitting A Bug Report**
+#### Before Submitting A Bug Report
 
 - Check the documentation for tips on troubleshooting
 - Perform a cursory search to see if the problem has already been reported
 
-**How Do I Submit A (Good) Bug Report?**
+#### How Do I Submit A (Good) Bug Report?
 
 Bugs are tracked as GitHub issues. Create an issue and provide the following information:
 
@@ -33,12 +33,12 @@ Bugs are tracked as GitHub issues. Create an issue and provide the following inf
 
 This section guides you through submitting an enhancement suggestion, including completely new features and minor improvements to existing functionality.
 
-**Before Submitting An Enhancement Suggestion**
+#### Before Submitting An Enhancement Suggestion
 
 - Check if the enhancement has already been suggested
 - Determine which repository the enhancement should be suggested in
 
-**How Do I Submit A (Good) Enhancement Suggestion?**
+#### How Do I Submit A (Good) Enhancement Suggestion?
 
 Enhancement suggestions are tracked as GitHub issues. Create an issue and provide the following information:
 
@@ -67,7 +67,7 @@ The process described here has several goals:
 5. Ensure all tests pass locally and format/lints are clean
 6. After you submit your pull request, verify that all status checks are passing
 
-**PR Checklist**
+#### PR Checklist
 
 - [ ] Linked issue (if applicable)
 - [ ] Tests added/updated or rationale provided

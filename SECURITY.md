@@ -160,33 +160,33 @@ Application: Encrypted P2P Messenger v1.4.0
 
 ### Phase 1 Fixes (4 vulnerabilities)
 
-**1. Thread Safety (CRITICAL-001)**
+#### 1. Thread Safety (CRITICAL-001)
 
 - Replaced `unsafe static mut` with `OnceLock<AtomicU64>`
 - Files: `src/gui/app_ui.rs`
 - Impact: Eliminated all undefined behavior
 
-**2. Fingerprint Verification (HIGH-002)**
+#### 2. Fingerprint Verification (HIGH-002)
 
 - Removed auto-accept behavior
 - Changed timeout: 30s → 300s
 - Files: `src/network/session.rs`
 - Impact: Prevents MITM attacks
 
-**3. File Size Validation (MEDIUM-003)**
+#### 3. File Size Validation (MEDIUM-003)
 
 - Added early size validation
 - Files: `src/transfer/receiver.rs`
 - Impact: Prevents DoS attacks
 
-**4. Cargo Edition Fix**
+#### 4. Cargo Edition Fix
 
 - Changed edition from "2025" to "2021"
 - Files: `Cargo.toml`
 
 ### Phase 2 Fixes (3 vulnerabilities)
 
-**5. Encrypted Chat History (CRITICAL-002)**
+#### 5. Encrypted Chat History (CRITICAL-002)
 
 - Implemented ChaCha20-Poly1305 encryption
 - New methods: `save_encrypted()`, `load_encrypted()`
@@ -197,7 +197,7 @@ Application: Encrypted P2P Messenger v1.4.0
   - Authenticated encryption
   - Restrictive file permissions (0600)
 
-**6. Replay Attack Protection (HIGH-001)**
+#### 6. Replay Attack Protection (HIGH-001)
 
 - Added `seq: u64` to all protocol messages
 - Implemented per-chat `send_seq` and `recv_seq` tracking
@@ -207,14 +207,14 @@ Application: Encrypted P2P Messenger v1.4.0
 - Files: `src/core/protocol.rs`, `src/app/chat_manager.rs`, `src/transfer/sender.rs`, `src/types.rs`
 - Status: ✅ **COMPLETED** - Full session sequence validation operational
 
-**7. Counter-Based Nonces (HIGH-003)**
+#### 7. Counter-Based Nonces (HIGH-003)
 
 - Replaced random nonces with deterministic counters
 - Files: `src/core/crypto.rs`
 - Structure: `session_id (4 bytes) || counter (8 bytes)`
 - Impact: Zero collision probability
 
-**8. Version Downgrade Protection (HIGH-004)**
+#### 8. Version Downgrade Protection (HIGH-004)
 
 - Implemented signed version exchange during handshake.
 - Peers now exchange digitally signed protocol versions.
@@ -222,7 +222,7 @@ Application: Encrypted P2P Messenger v1.4.0
 - Files: `src/network/session.rs`
 - Impact: Prevents attackers from forcing peers to use weaker, older protocol versions.
 
-**8. Rust 2021 Compatibility**
+#### 8. Rust 2021 Compatibility
 
 - Refactored let chains to nested if-let statements
 - Files: `src/app/chat_manager.rs`, `src/gui/*.rs`
@@ -237,34 +237,34 @@ This list is prioritized based on the project's strategic roadmap to deliver the
 
 ### 🔥 Phase 1: Foundational Security & Trust (Immediate Priority)
 
-1.  **Trust on First Use (TOFU) & Mandatory Identity Encryption**:
-    -   **Task**: On first launch, force the user to create a password for their identity. On subsequent launches, require the password to unlock the app.
-    -   **Task**: When connecting to a new peer, automatically save and trust their fingerprint. On future connections, raise a severe, blocking warning if the fingerprint changes.
-    -   **Why**: This drastically improves baseline security for all users and removes the user-fatigue of constant manual verification.
+1. **Trust on First Use (TOFU) & Mandatory Identity Encryption**:
+    - **Task**: On first launch, force the user to create a password for their identity. On subsequent launches, require the password to unlock the app.
+    - **Task**: When connecting to a new peer, automatically save and trust their fingerprint. On future connections, raise a severe, blocking warning if the fingerprint changes.
+    - **Why**: This drastically improves baseline security for all users and removes the user-fatigue of constant manual verification.
 
 ### 🏃 Phase 2: Application Hardening (Medium Priority)
 
-1.  **Complete Error Handling Refactor**:
-    -   **Task**: Systematically eliminate all remaining `.unwrap()` and `.expect()` calls from the application logic.
-    -   **Why**: This will prevent the application from ever crashing due to unexpected data or network states, making it far more reliable.
+1. **Complete Error Handling Refactor**:
+    - **Task**: Systematically eliminate all remaining `.unwrap()` and `.expect()` calls from the application logic.
+    - **Why**: This will prevent the application from ever crashing due to unexpected data or network states, making it far more reliable.
 
-2.  **Connection Rate Limiting**:
-    -   **Task**: Implement a mechanism to limit the number of incoming connection attempts from a single IP address.
-    -   **Why**: Provides basic protection against simple Denial of Service (DoS) attacks.
+2. **Connection Rate Limiting**:
+    - **Task**: Implement a mechanism to limit the number of incoming connection attempts from a single IP address.
+    - **Why**: Provides basic protection against simple Denial of Service (DoS) attacks.
 
-3.  **Secure Memory Wiping**:
-    -   **Task**: Use the `zeroize` crate to securely wipe sensitive keys from memory when they go out of scope.
-    -   **Why**: Protects secrets from being recovered from a memory dump.
+3. **Secure Memory Wiping**:
+    - **Task**: Use the `zeroize` crate to securely wipe sensitive keys from memory when they go out of scope.
+    - **Why**: Protects secrets from being recovered from a memory dump.
 
 ### 🏃 Phase 3: Long-term Cryptographic Hygiene (Future)
 
-1.  **Session Key Rotation**:
-    -   **Task**: Automatically re-negotiate the AES session key periodically.
-    -   **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised.
+1. **Session Key Rotation**:
+    - **Task**: Automatically re-negotiate the AES session key periodically.
+    - **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised.
 
-2.  **Professional Security Audit**:
-    -   **Task**: Engage a third-party firm to perform a professional cryptographic review of the codebase.
-    -   **Why**: Provides expert, unbiased validation of the application's security.
+2. **Professional Security Audit**:
+    - **Task**: Engage a third-party firm to perform a professional cryptographic review of the codebase.
+    - **Why**: Provides expert, unbiased validation of the application's security.
 
 ---
 

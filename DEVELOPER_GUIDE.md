@@ -18,7 +18,7 @@ This is a secure, peer-to-peer messaging application for desktop, built with Rus
 
 ### 2.1. Directory Structure
 
-```
+```text
 chat-p2p/
 ├── src/
 │   ├── main.rs (GUI application)
@@ -51,7 +51,7 @@ chat-p2p/
 
 ### 2.2. Layer Architecture
 
-```
+```text
 ┌─────────────────────────────────────┐
 │   GUI Layer (egui/eframe)           │  ← User interaction
 └──────────────┬──────────────────────┘

@@ -31,23 +31,23 @@ All notable changes to this project will be documented in this file.
 
 ### 🔐 Security Fixes (December 18, 2025)
 
-- **[HIGH] Version Downgrade Protection**: Implemented signed version announcements during handshake.
+- **\[HIGH\] Version Downgrade Protection**: Implemented signed version announcements during handshake.
   - Peers now exchange digitally signed protocol versions, verified with RSA public keys.
   - Files: `src/network/session.rs`
   - Impact: Prevents attackers from forcing communication over older, less secure protocol versions.
-- **[HIGH] Replay Attack Protection**: Fully implemented session sequence validation
+- **\[HIGH\] Replay Attack Protection**: Fully implemented session sequence validation
   - Added `seq: u64` field to all `ProtocolMessage` variants
   - Per-chat `send_seq` and `recv_seq` tracking in `Chat` struct
   - All outgoing messages increment `send_seq` before transmission
   - All incoming messages validate `seq > recv_seq` before processing
   - Invalid/duplicate sequence numbers are logged and discarded
   - Covers all message types: Text, FileMeta, FileChunk, FileEnd, Ping, TypingStart, TypingStop
-- **[CRITICAL] Encrypted Chat History at Rest**: Implemented ChaCha20-Poly1305 encryption for chat history storage
+- **\[CRITICAL\] Encrypted Chat History at Rest**: Implemented ChaCha20-Poly1305 encryption for chat history storage
   - Added `save_encrypted()` and `load_encrypted()` methods to `HistoryFile`
   - Random nonce generation per save operation
   - Authenticated encryption prevents tampering
   - Restrictive file permissions (0600 on Unix)
-- **[HIGH] Counter-Based Nonces**: Replaced random nonces with deterministic counters
+- **\[HIGH\] Counter-Based Nonces**: Replaced random nonces with deterministic counters
   - Guaranteed nonce uniqueness for AES-GCM
   - Structure: `session_id (4 bytes) || counter (8 bytes)`
   - Eliminates birthday paradox collision risk
@@ -185,3 +185,14 @@ This release transformed the application from a functional prototype into a poli
 - File transfer support.
 - Simple GUI interface.
 - Message history persistence.
+
+[Unreleased]: #
+[1.5.0]: #
+[1.4.0]: #
+[1.3.1]: #
+[1.3.0]: #
+[1.2.0]: #
+[1.1.0]: #
+[1.0.2]: #
+[1.0.0]: #
+[0.9.0]: #
