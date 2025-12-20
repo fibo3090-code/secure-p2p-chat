@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.0] - 2025-12-20
+
+### 🔐 Security & Hardening
+
+- **Remediated Hard-coded Keys**: Replaced hard-coded cryptographic keys in all test suites (`crypto.rs`, `sender.rs`) with securely generated random keys. This resolves five critical CodeQL warnings.
+- **Hardened Cipher Initialization**: Refactored `AesCipher::new` to return a `Result`, preventing the application from crashing on an invalid AES key length. All call sites in production and test code were updated to handle the new return type.
+
+### ✅ Tests & Verification
+
+- **Corrected Handshake Test**: Rewrote the `test_full_handshake` integration test to accurately test the production code's modern, forward-secret ECDH handshake, resolving a major discrepancy between the test suite and the actual implementation.
+- **Fixed Security Test**: Corrected a bug in `test_file_meta_parsing_robustness` where the test was using a malformed payload, allowing it to properly validate input sanitization logic.
+
+### 🔧 Code Quality & Documentation
+
+- **Linter Clean-up**: Fixed all (8) `clippy` warnings across the codebase, improving code style and idiomaticity.
+- **Documentation Sync**: Updated `DEVELOPER_GUIDE.md` to be consistent with the production codebase. Corrected the AES nonce generation description and updated the `ProtocolMessage` enum definition to include all variants.
+
 ## [1.4.0] - 2025-12-19
 
 ### ✨ New Features & Enhancements

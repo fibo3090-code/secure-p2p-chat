@@ -210,22 +210,61 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
             ui.set_max_width(300.0);
 
             for toast in &all_toasts {
-                let elapsed = toast.created_at.elapsed();
-                let progress = elapsed.as_secs_f32() / toast.duration.as_secs_f32();
+                let elapsed = toast.created_at.elapsed().as_secs_f32();
+                let duration = toast.duration.as_secs_f32();
+                let progress = elapsed / duration;
 
                 if progress < 1.0 {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        let color = match toast.level {
-                            crate::types::ToastLevel::Info => crate::gui::styling::ACCENT_PRIMARY,
-                            crate::types::ToastLevel::Success => crate::gui::styling::SUCCESS,
-                            crate::types::ToastLevel::Warning => crate::gui::styling::WARNING,
-                            crate::types::ToastLevel::Error => crate::gui::styling::ERROR,
-                        };
+                    // --- Animation Alpha ---
+                    let alpha_f32 = if progress < 0.15 {
+                        progress / 0.15
+                    } else if progress > 0.75 {
+                        1.0 - ((progress - 0.75) / 0.25)
+                    } else {
+                        1.0
+                    };
+                    let alpha = (alpha_f32 * 255.0).min(255.0) as u8;
 
-                        ui.colored_label(color, &toast.message);
+                    // --- Get Style based on Level ---
+                    let (icon, base_color) = match toast.level {
+                        crate::types::ToastLevel::Info => ("ℹ", crate::gui::styling::ACCENT_PRIMARY),
+                        crate::types::ToastLevel::Success => ("✔", crate::gui::styling::SUCCESS),
+                        crate::types::ToastLevel::Warning => ("⚠", crate::gui::styling::WARNING),
+                        crate::types::ToastLevel::Error => ("❌", crate::gui::styling::ERROR),
+                    };
+
+                    // --- Define Colors with correct API ---
+                    let frame_fill = egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 25);
+                    let text_color = ui.style().visuals.text_color();
+                    let final_text_color = egui::Color32::from_rgba_unmultiplied(text_color.r(), text_color.g(), text_color.b(), alpha);
+                    let icon_color = egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), alpha);
+                    let stroke_color = icon_color;
+
+                    // --- Define the Frame ---
+                    let toast_frame = egui::Frame {
+                        inner_margin: egui::Margin::symmetric(12.0, 8.0),
+                        outer_margin: egui::Margin::same(0.0),
+                        rounding: egui::Rounding::same(6.0),
+                        shadow: egui::epaint::Shadow {
+                            blur: 8.0,
+                            spread: 2.0,
+                            color: egui::Color32::from_black_alpha(alpha / 5),
+                            ..Default::default()
+                        },
+                        fill: frame_fill,
+                        stroke: egui::Stroke::new(1.0, stroke_color),
+                    };
+
+                    // --- Render the Frame and its contents ---
+                    toast_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(icon).color(icon_color).size(16.0));
+                            ui.add_space(5.0);
+                            ui.label(egui::RichText::new(&toast.message).color(final_text_color));
+                        });
                     });
 
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
                 }
             }
         });
