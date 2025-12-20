@@ -1015,16 +1015,50 @@ impl ChatManager {
                 peer_name,
                 chat_id,
             } => {
-                // Store peer fingerprint early so UI and mapping-by-fingerprint can work immediately
-                if let Some(chat) = self.chats.get_mut(&chat_id) {
-                    chat.peer_fingerprint = Some(fingerprint.clone());
-                    tracing::debug!(
-                        "Set peer_fingerprint for chat {} to {}",
-                        chat_id,
-                        fingerprint
-                    );
+                let chat = match self.chats.get_mut(&chat_id) {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!("TOFU check failed: Chat {} not found", chat_id);
+                        return;
+                    }
+                };
+
+                match &chat.peer_fingerprint {
+                    // CASE 1: No stored fingerprint. This is the FIRST USE.
+                    None => {
+                        tracing::info!("Trust on First Use: Storing new fingerprint for chat {}", chat_id);
+                        // Store the new fingerprint
+                        chat.peer_fingerprint = Some(fingerprint);
+                        // Automatically confirm this connection. No UI dialog needed.
+                        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
+                            if let Err(e) = tx.send(true) {
+                                tracing::error!("Failed to auto-confirm fingerprint: {}", e);
+                            }
+                        }
+                    }
+                    // CASE 2: Stored fingerprint matches the new one.
+                    Some(stored_fp) if stored_fp == &fingerprint => {
+                        tracing::debug!("Fingerprint matches stored value for chat {}. Proceeding automatically.", chat_id);
+                        // Automatically confirm this connection.
+                        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
+                            if let Err(e) = tx.send(true) {
+                                tracing::error!("Failed to auto-confirm fingerprint: {}", e);
+                            }
+                        }
+                    }
+                    // CASE 3: Stored fingerprint MISMATCHES. Security alert!
+                    Some(stored_fp) => {
+                        tracing::warn!(
+                            "FINGERPRINT MISMATCH for chat {}! Stored: `{}`, New: `{}`",
+                            chat_id,
+                            stored_fp,
+                            fingerprint
+                        );
+                        // Trigger the UI dialog for manual verification.
+                        self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
+                        self.add_toast(ToastLevel::Warning, "SECURITY WARNING: Peer fingerprint has changed!".to_string());
+                    }
                 }
-                self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
             }
 
             SessionEvent::Ready => {
@@ -1495,5 +1529,70 @@ mod tests {
         let id = chat.id;
         mgr.chats.insert(id, chat);
         assert!(mgr.has_placeholder_host(port));
+    }
+
+    #[test]
+    fn test_tofu_logic() {
+        let mut mgr = ChatManager::default();
+        let chat_id = Uuid::new_v4();
+        let peer_name = "peer".to_string();
+        let fingerprint1 = "fingerprint1".to_string();
+        let fingerprint2 = "fingerprint2".to_string();
+
+        // 1. First Use: No fingerprint exists.
+        let chat = Chat {
+            id: chat_id,
+            title: "Test Chat".to_string(),
+            peer_fingerprint: None,
+            participants: Vec::new(),
+            messages: Vec::new(),
+            created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
+        };
+        // Add a dummy confirmation sender for the test
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.fingerprint_confirm_senders.insert(chat_id, tx);
+        mgr.chats.insert(chat_id, chat);
+
+        let event1 = SessionEvent::ShowFingerprintVerification {
+            fingerprint: fingerprint1.clone(),
+            peer_name: peer_name.clone(),
+            chat_id,
+        };
+        mgr.handle_session_event(chat_id, event1);
+
+        // Assert: Fingerprint is stored, no UI request is made, and connection is confirmed.
+        assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, Some(fingerprint1.clone()));
+        assert!(mgr.fingerprint_verification_request.is_none());
+        assert_eq!(rx.try_recv(), Ok(true));
+
+        // 2. Second Use: Matching fingerprint.
+        let event2 = SessionEvent::ShowFingerprintVerification {
+            fingerprint: fingerprint1.clone(),
+            peer_name: peer_name.clone(),
+            chat_id,
+        };
+        mgr.handle_session_event(chat_id, event2);
+
+        // Assert: Still no UI request, and connection is confirmed again.
+        assert!(mgr.fingerprint_verification_request.is_none());
+        assert_eq!(rx.try_recv(), Ok(true));
+
+        // 3. Third Use: Mismatched fingerprint.
+        let event3 = SessionEvent::ShowFingerprintVerification {
+            fingerprint: fingerprint2.clone(),
+            peer_name: peer_name.clone(),
+            chat_id,
+        };
+        mgr.handle_session_event(chat_id, event3);
+
+        // Assert: A UI request IS made, and no confirmation is sent automatically.
+        assert!(mgr.fingerprint_verification_request.is_some());
+        let (fp, _, _) = mgr.fingerprint_verification_request.unwrap();
+        assert_eq!(fp, fingerprint2);
+        assert!(rx.try_recv().is_err());
     }
 }
