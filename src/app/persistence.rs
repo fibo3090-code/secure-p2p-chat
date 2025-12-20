@@ -138,7 +138,7 @@ impl ChatManager {
 
         // Restore persisted contact/chat associations for reconnect
         self.contact_to_chat
-            .extend(history.contact_chat_map.into_iter());
+            .extend(history.contact_chat_map);
 
         // Load persisted config (if present)
         self.config = history.config;

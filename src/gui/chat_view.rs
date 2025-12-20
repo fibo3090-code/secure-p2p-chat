@@ -380,7 +380,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                             }
                             // Read code block
                             let mut code_text = String::new();
-                            while let Some(code_c) = chars.next() {
+                            for code_c in chars.by_ref() {
                                 if code_c == '`' {
                                     break;
                                 }

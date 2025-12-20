@@ -1301,11 +1301,10 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     app.show_set_password_dialog = true;
                 }
 
-                if app.identity.encrypted_private_key.is_some() {
-                    if crate::gui::widgets::secondary_button(ui, "Remove Password").clicked() {
+                if app.identity.encrypted_private_key.is_some()
+                    && crate::gui::widgets::secondary_button(ui, "Remove Password").clicked() {
                         app.show_remove_password_dialog = true;
                     }
-                }
             });
 
 

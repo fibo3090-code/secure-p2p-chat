@@ -69,7 +69,7 @@ pub async fn run_host_session(
     // 5. Send signed protocol version
     let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
     let mut hasher = Sha256::new();
-    hasher.update(&version_bytes);
+    hasher.update(version_bytes);
     let hashed_version = hasher.finalize();
     
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());
@@ -90,7 +90,7 @@ pub async fn run_host_session(
     
     let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey.clone());
     let mut client_hasher = Sha256::new();
-    client_hasher.update(&client_signed_version.version.to_be_bytes());
+    client_hasher.update(client_signed_version.version.to_be_bytes());
     let client_hashed_version = client_hasher.finalize();
 
     verifying_key.verify(&client_hashed_version, &rsa::pss::Signature::try_from(client_signed_version.signature.as_slice())?)
@@ -198,7 +198,7 @@ pub async fn run_client_session(
     
     let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey.clone());
     let mut host_hasher = Sha256::new();
-    host_hasher.update(&host_signed_version.version.to_be_bytes());
+    host_hasher.update(host_signed_version.version.to_be_bytes());
     let host_hashed_version = host_hasher.finalize();
 
     verifying_key.verify(&host_hashed_version, &rsa::pss::Signature::try_from(host_signed_version.signature.as_slice())?)
@@ -219,7 +219,7 @@ pub async fn run_client_session(
     // 5. Send signed client protocol version
     let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
     let mut hasher = Sha256::new();
-    hasher.update(&version_bytes);
+    hasher.update(version_bytes);
     let hashed_version = hasher.finalize();
 
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());

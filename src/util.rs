@@ -108,7 +108,7 @@ pub fn generate_color_grid(fingerprint: &str) -> [[Color32; 4]; 4] {
 pub fn primary_local_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     // Destination is never actually contacted for UDP connect; safe placeholder.
-    let _ = socket.connect("8.8.8.8:80").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
     match socket.local_addr().ok()? {
         SocketAddr::V4(v4) => Some(v4.ip().to_string()),
         SocketAddr::V6(_) => None,
