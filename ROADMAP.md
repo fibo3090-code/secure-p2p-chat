@@ -15,94 +15,86 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 
 ---
 
-## 📊 Current Status (v1.4.0)
+## 📊 Current Status (v1.5.0)
 
 ### ✅ What Works
 
-- **Core Security**: RSA-2048-OAEP + AES-256-GCM encryption with X25519 ECDH Forward Secrecy.
-- **Messaging**: Bidirectional text messaging, file transfer, typing indicators, and desktop notifications.
-- **UI/UX**: Modern interface with avatars, timestamps, emoji picker, and drag & drop.
-- **Persistence**: Reliable history storage and a persistent identity system.
+- **Core Security**: End-to-end encryption with Forward Secrecy (X25519 ECDH).
+- **Messaging**: All core messaging features including text, file transfer, and real-time indicators.
+- **UI/UX**: Modern, polished interface with toasts, themes, and improved layout.
+- **Persistence**: Encrypted-at-rest chat history and a persistent identity system.
 
-### 🆕 Recent (v1.4.0)
+### ⚠️ Known Limitations & Areas for Improvement
 
-- Auto-rehost now shows a success toast: "Host relancé" after a listener is restarted.
-- Added a minimal guard to prevent multiple concurrent listeners on the same port, avoiding duplicate hosts during auto-rehost.
-- Added unit test to validate placeholder-host detection used by the listener guard.
-
-### ⚠️ Known Limitations
-
-1. **LAN-only**: No NAT traversal for WAN connectivity.
-2. **Manual Fingerprint Verification**: No automated certificate authority.
-3. **Some unit tests need updates**.
-4. **Some security vulnerabilities are still open**.
+1.  **Manual IP Exchange**: The largest point of friction is the need to manually share IP addresses.
+2.  **Trust Management**: The user must manually verify fingerprints on every new session, and the identity key is not password-protected by default.
+3.  **Robustness**: The application can still crash under certain error conditions due to remaining `.unwrap()` calls.
+4.  **DoS Vulnerability**: No protection against simple DoS attacks via connection flooding.
 
 ---
 
 ## 🚀 High-Level Roadmap
 
-- **v1.3: The Usability Release**: Delivered reliability fixes for chat creation and session sync.
-- **v2.0: The Professional Release**: Enterprise-ready features like moderation, NAT traversal, and message search.
-- **v3.0: The Next Generation**: Advanced features like post-quantum cryptography, mobile apps, and voice/video calls.
+The immediate focus is on solidifying the application's security foundation and dramatically improving the core user experience of connecting with peers.
+
+- **v1.6: The Trust & Usability Release**: Implement a "Trust on First Use" model and automatic peer discovery to make the app both more secure and vastly easier to use.
+- **v1.7: The Hardening Release**: Focus on stability and resilience by refactoring all error handling and adding protection against simple network attacks.
+- **v2.0: The Ecosystem Release**: Expand capabilities with features like a command palette, session key rotation, and preparations for internet connectivity (NAT traversal).
 
 ---
 
 ## 🎯 Detailed Feature Roadmap
 
-### 🔥 Sprint 1: Connection UX (Week 1-2)
+The roadmap is organized into prioritized sprints, focusing on delivering the most impactful changes first.
 
-*Goal: Make connection "just work".*
+### 🔥 Sprint 1: Foundational Security & Trust (Immediate Priority)
 
-1. **Smart Connection Discovery (mDNS/Bonjour)**: Auto-discover other users on the same network.
-2. **✅ QR Code Connection**: Scan a QR code to connect to a peer.
-3. **⏳ Visual Fingerprint Verification**: Use colored grids or memorable words instead of hex strings.
-4. **Intelligent Error Messages**: Provide actionable advice when connections fail.
-5. **Connection History**: Easily reconnect to previous peers.
+*Goal: Make the app secure by default and simplify the trust process.*
 
-### 🏃 Sprint 2: Reliability (Week 3-4)
+1.  **Trust on First Use (TOFU) & Mandatory Identity Encryption**:
+    -   **Task**: On first launch, force the user to create a password for their identity. On subsequent launches, require the password to unlock the app.
+    -   **Task**: When connecting to a new peer, automatically save and trust their fingerprint. On future connections, raise a severe, blocking warning if the fingerprint changes.
+    -   **Why**: This drastically improves baseline security for all users and removes the user-fatigue of constant manual verification.
 
-*Goal: The app never loses messages.*
+2.  **Refine Fingerprint Verification UX**:
+    -   **Task**: Overhaul the fingerprint verification dialog to be clearer and more user-friendly, as outlined in the Design Roadmap.
+    -   **Why**: A better UX encourages users to engage with this critical security step when it's needed (e.g., on a TOFU warning).
 
-1. **Heartbeat/Keepalive System**: Detect and handle dropped connections.
-2. **Auto-Reconnection**: Automatically retry connections with exponential backoff.
-3. **Message Delivery Status (✓✓)**: Provide feedback on message state (Sent, Delivered, Read).
-4. **Offline Message Queue**: Queue messages sent while offline and send upon reconnection.
-5. **Session/Chat Sync Improvements**: Delivered in v1.3.0 (see above).
+### 🏃 Sprint 2: Core User Experience (High Priority)
 
-### 🏃 Sprint 3: Identity & Trust (Week 5-6)
+*Goal: Eliminate the biggest friction point: manual IP address exchange.*
 
-*Goal: A robust and persistent identity system.*
+1.  **Local Peer Discovery (mDNS/Bonjour)**:
+    -   **Task**: Integrate a library to automatically discover and display other users on the same local network.
+    -   **Why**: This is the single largest usability improvement. Users will be able to see and connect to peers with a single click, without ever needing to know what an IP address is.
 
-1. **Encrypted Keystore**: Protect the user's private key with a password (Argon2 + AES-256).
-2. **First-Time Setup Wizard**: Guide users through creating their identity.
-3. **Password Management UI**: Allow users to change their password.
-4. **Device Recognition (TOFU)**: Warn users if a contact's fingerprint changes.
+2.  **Enhance Empty States with Quick Actions**:
+    -   **Task**: (Already Implemented) The UI now shows helpful actions when no chat is open. This task will be to ensure it's fully polished.
+    -   **Why**: Guides new users on how to get started.
 
-### 🏃 Sprint 4: Messaging++ (Week 7-8)
+### 🏃 Sprint 3: Application Hardening (Medium Priority)
 
-*Goal: Rich messaging features.*
+*Goal: Make the application resilient and stable.*
 
-1. **Message Search**: Full-text search within and across chats.
-2. **Rich Text Formatting (Markdown)**: Support for bold, italics, code blocks, etc.
-3. **File Transfer Polish**: Inline previews for images and progress visualization.
-4. **Reply to Specific Message**: Add context to replies.
-5. **Emoji Reactions**: React to messages with emojis.
+1.  **Complete Error Handling Refactor**:
+    -   **Task**: Systematically eliminate all remaining `.unwrap()` and `.expect()` calls from the application logic.
+    -   **Why**: This will prevent the application from ever crashing due to unexpected data or network states, making it far more reliable.
 
-### 🏃 Sprint 5: Internet Connectivity (Week 9-12)
+2.  **Connection Rate Limiting**:
+    -   **Task**: Implement a mechanism to limit the number of incoming connection attempts from a single IP address.
+    -   **Why**: Provides basic protection against simple Denial of Service (DoS) attacks.
 
-*Goal: Work across the internet, not just LAN.*
+### 🏃 Sprint 4: Power-User Features & Long-Term Security (Future)
 
-1. **STUN Client**: Discover public IP addresses.
-2. **TURN Support**: Use a relay server as a fallback for difficult NATs.
-3. **NAT Traversal Logic**: Implement hole-punching techniques.
+*Goal: Add quality-of-life features and long-term cryptographic hygiene.*
 
-### 🏃 Sprint 6+: Innovation (Month 4+)
+1.  **"Quick Switcher" Command Palette (Ctrl+K)**:
+    -   **Task**: Implement a floating search bar to instantly find and switch between chats and contacts.
+    -   **Why**: A modern power-user feature that dramatically speeds up navigation.
 
-*Goal: Differentiate from competitors.*
-
-1. **Zero-Knowledge File Sync**: A P2P Dropbox-like feature.
-2. **P2P Video/Audio Calls**: Using WebRTC for secure, direct calls.
-3. **Collaborative Editing**: Real-time, serverless document collaboration.
+2.  **Session Key Rotation**:
+    -   **Task**: Automatically re-negotiate the AES session key periodically.
+    -   **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised.
 
 ---
 

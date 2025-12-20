@@ -233,42 +233,38 @@ Application: Encrypted P2P Messenger v1.4.0
 
 ## Remaining Security Work
 
-### Remaining High Priority Work
+This list is prioritized based on the project's strategic roadmap to deliver the most impactful security improvements first.
 
-1. **Enforce Password-Protected Identities**
-   - Make password encryption mandatory
-   - Set restrictive file permissions
-   - Consider OS keychain integration
+### 🔥 Phase 1: Foundational Security & Trust (Immediate Priority)
 
-2. **Version Downgrade Protection**
-   - Add signed version announcements
-   - Include version in authenticated handshake
+1.  **Trust on First Use (TOFU) & Mandatory Identity Encryption**:
+    -   **Task**: On first launch, force the user to create a password for their identity. On subsequent launches, require the password to unlock the app.
+    -   **Task**: When connecting to a new peer, automatically save and trust their fingerprint. On future connections, raise a severe, blocking warning if the fingerprint changes.
+    -   **Why**: This drastically improves baseline security for all users and removes the user-fatigue of constant manual verification.
 
-### Medium Priority
+### 🏃 Phase 2: Application Hardening (Medium Priority)
 
-1. **Reduce .unwrap() Usage**
-   - Replace with proper error handling
-   - Add safety comments for infallible operations
+1.  **Complete Error Handling Refactor**:
+    -   **Task**: Systematically eliminate all remaining `.unwrap()` and `.expect()` calls from the application logic.
+    -   **Why**: This will prevent the application from ever crashing due to unexpected data or network states, making it far more reliable.
 
-2. **Connection Rate Limiting**
-   - Implement semaphore-based limits
-   - Add per-IP connection throttling
+2.  **Connection Rate Limiting**:
+    -   **Task**: Implement a mechanism to limit the number of incoming connection attempts from a single IP address.
+    -   **Why**: Provides basic protection against simple Denial of Service (DoS) attacks.
 
-3. **Secure Memory Wiping**
-   - Use `zeroize` crate for session keys
-   - Implement Drop trait for sensitive structs
+3.  **Secure Memory Wiping**:
+    -   **Task**: Use the `zeroize` crate to securely wipe sensitive keys from memory when they go out of scope.
+    -   **Why**: Protects secrets from being recovered from a memory dump.
 
-### Long-term Improvements
+### 🏃 Phase 3: Long-term Cryptographic Hygiene (Future)
 
-1. **TOFU Implementation**
-   - Persistent fingerprint storage
-   - Warnings on fingerprint changes
+1.  **Session Key Rotation**:
+    -   **Task**: Automatically re-negotiate the AES session key periodically.
+    -   **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised.
 
-2. **Session Key Rotation**
-   - Periodic rekeying (hourly or per GB)
-
-3. **Professional Security Audit**
-   - Third-party cryptographic review
+2.  **Professional Security Audit**:
+    -   **Task**: Engage a third-party firm to perform a professional cryptographic review of the codebase.
+    -   **Why**: Provides expert, unbiased validation of the application's security.
 
 ---
 

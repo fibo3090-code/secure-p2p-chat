@@ -239,30 +239,43 @@ This document consolidates UI/UX principles, design patterns, component specific
 
 ## Design Roadmap
 
-### Phase 1: Quick Wins (1–2 weeks)
+This roadmap is prioritized to deliver the most impactful user experience improvements first.
 
-- ✅ Improve invite/contact dialogs with inline validation
-- ✅ Add connection/host status banner and reconnect chips
-- ⏳ Polish toasts (actions + consistent colors)
-- ⏳ Enhance empty states with quick actions
+### 🔥 Phase 1: Core UX (High Priority)
 
-### Phase 2: Core UX (3–4 weeks)
+*Goal: Eliminate major friction points and make the app intuitive.*
 
-- 🔄 Fingerprint verification flow refresh
-- 🔄 File transfer progress UX improvements
-- 📋 Quick switch (Ctrl+K) for chats/contacts
-- 📋 Better search/filter functionality
-- 📋 Reduced motion + font scale handling
-- 📋 WCAG AA contrast audit
+1.  **Local Peer Discovery (mDNS/Bonjour)**:
+    -   **Task**: Implement automatic discovery of peers on the local network.
+    -   **UX Goal**: Replace manual IP address entry with a simple, clickable list of available users.
 
-### Phase 3: Polish & Enhancement (Later)
+2.  **Refined Fingerprint Verification Flow**:
+    -   **Task**: Redesign the verification dialog to be clearer, incorporating visual aids (like colored grids) and better instructional text.
+    -   **UX Goal**: Make the critical security step of fingerprint verification less intimidating and easier to complete successfully.
 
-- 📋 Theme refinement (light/midnight modes)
-- 📋 Icon pass for consistency
-- 📋 Microcopy polish across all surfaces
-- 📋 mDNS/peer discovery UI
-- 📋 Richer notification system
-- 📋 Advanced accessibility features
+### 🏃 Phase 2: Power-User Features (Medium Priority)
+
+*Goal: Add features that improve speed and efficiency for experienced users.*
+
+1.  **"Quick Switcher" Command Palette (Ctrl+K)**:
+    -   **Task**: Add a keyboard-driven command palette to quickly search and navigate to any chat or contact.
+    -   **UX Goal**: Provide a fast path for navigation that doesn't require using the mouse.
+
+2.  **File Transfer Polish**:
+    -   **Task**: Add inline image previews and more detailed progress visualization for file transfers.
+    -   **UX Goal**: Give users better context and feedback during file transfers.
+
+### 🏃 Phase 3: Polish & Accessibility (Future)
+
+*Goal: Refine the application's look-and-feel and ensure it's accessible to all users.*
+
+1.  **WCAG AA Contrast Audit**:
+    -   **Task**: Review all UI components to ensure they meet WCAG AA color contrast standards.
+    -   **UX Goal**: Improve readability and usability for visually impaired users.
+
+2.  **Advanced Accessibility (ARIA)**:
+    -   **Task**: Implement ARIA tags to improve compatibility with screen readers.
+    -   **UX Goal**: Make the application fully accessible to users who rely on assistive technologies.
 
 **Legend**: ✅ Done | ⏳ In Progress | 🔄 Next Up | 📋 Planned
 
