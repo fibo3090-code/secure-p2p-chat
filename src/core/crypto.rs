@@ -206,7 +206,8 @@ mod tests {
 
     #[test]
     fn test_aes_roundtrip() {
-        let key = [42u8; 32];
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
         let cipher = AesCipher::new(&key);
 
         let plaintext = b"Hello, secure world!";
@@ -218,7 +219,8 @@ mod tests {
 
     #[test]
     fn test_aes_nonce_randomness() {
-        let key = [42u8; 32];
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
         let cipher = AesCipher::new(&key);
 
         let plaintext = b"Same message";
@@ -235,7 +237,8 @@ mod tests {
 
     #[test]
     fn test_aes_tamper_detection() {
-        let key = [42u8; 32];
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
         let cipher = AesCipher::new(&key);
 
         let mut encrypted = cipher.encrypt(b"Test");

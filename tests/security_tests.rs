@@ -37,12 +37,13 @@ fn test_protocol_message_input_limits() {
 
 #[test]
 fn test_file_meta_parsing_robustness() {
-    // Malformed metadata
-    let bad_meta = b"FILE_META|filename|not_a_number";
+    // Malformed metadata (size is not a number)
+    let bad_meta = b"FILE_META|0|filename|not_a_number";
     let parsed = ProtocolMessage::from_plain_bytes(bad_meta);
     assert!(parsed.is_none());
 
-    let injection = b"FILE_META|../../evil|100";
+    // Malicious filename that should be sanitized
+    let injection = b"FILE_META|0|../../evil|100";
     let parsed = ProtocolMessage::from_plain_bytes(injection);
     // It parses, but filename should be sanitized
     if let Some(ProtocolMessage::FileMeta { filename, .. }) = parsed {
