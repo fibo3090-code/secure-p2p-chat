@@ -30,6 +30,7 @@ target/
 # Local AI/assistant settings
 .claude/
 .claude
+.github
 settings.local.json
 
 # OS generated files

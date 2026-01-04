@@ -73,7 +73,7 @@ pub async fn run_host_session(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
-    _confirm_rx: mpsc::UnboundedReceiver<bool>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
 ) -> Result<()> {
     // 1. Bind listener (bind to all interfaces for now, could be configurable)
@@ -106,7 +106,8 @@ pub async fn run_host_session(
     if client_version_bytes.len() != 4 {
         return Err(anyhow!("Invalid version packet length"));
     }
-    let client_version = u32::from_be_bytes(client_version_bytes.try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
+    // Fix: Use as_slice().try_into() to avoid consuming Vec
+    let client_version = u32::from_be_bytes(client_version_bytes.as_slice().try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
     tracing::info!("Client protocol version: {}", client_version);
 
     if client_version < 3 {
@@ -128,7 +129,20 @@ pub async fn run_host_session(
     let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
     // 8. Derive Session Key & Init Cipher
-    let aes_key = Zeroizing::new(derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO));
+    // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(&version_bytes); // Host Version
+    transcript.extend_from_slice(&client_version_bytes); // Client Version
+    transcript.extend_from_slice(host_ephemeral_bytes); // Host Ephemeral
+    transcript.extend_from_slice(&client_ephemeral_bytes); // Client Ephemeral
+    let salt = Sha256::digest(&transcript);
+
+    let aes_key = Zeroizing::new(derive_session_key(
+        host_ephemeral_secret, 
+        &client_ephemeral_public, 
+        Some(&salt),
+        HKDF_INFO
+    ));
     let cipher = AesCipher::new(&aes_key[..])?;
     tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
 
@@ -186,6 +200,32 @@ pub async fn run_host_session(
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
+    // Wait for user confirmation (up to 5 minutes) before proceeding
+    match tokio::time::timeout(tokio::time::Duration::from_secs(300), async {
+        confirm_rx.recv().await
+    })
+    .await
+    {
+        Ok(Some(true)) => {
+            tracing::info!("User accepted fingerprint for chat {} (host)", chat_id);
+        }
+        Ok(Some(false)) => {
+            tracing::warn!("User rejected fingerprint for chat {} (host)", chat_id);
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
+            return Err(anyhow!("Fingerprint rejected by user"));
+        }
+        Ok(None) => {
+            let msg = "Confirmation channel closed";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification failed: channel closed"));
+        }
+        Err(_) => {
+            let msg = "Fingerprint verification timed out";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification timed out"));
+        }
+    }
+
     // 13. Enter message loop
     to_app_tx
         .send(SessionEvent::Ready)
@@ -221,7 +261,8 @@ pub async fn run_client_session(
     if host_version_bytes.len() != 4 {
         return Err(anyhow!("Invalid version packet length"));
     }
-    let host_version = u32::from_be_bytes(host_version_bytes.try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
+    // Fix: Use as_slice().try_into() to copy bytes into array without consuming Vec
+    let host_version = u32::from_be_bytes(host_version_bytes.as_slice().try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
     tracing::info!("Host protocol version: {}", host_version);
 
     if host_version < 3 {
@@ -247,7 +288,22 @@ pub async fn run_client_session(
     send_packet(&mut stream, client_ephemeral_bytes).await?;
     
     // 7. Derive Session Key & Init Cipher
-    let aes_key = Zeroizing::new(derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO));
+    // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
+    // Note: host_version_bytes received first, version_bytes sent second.
+    // Order must match Host side: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(&host_version_bytes); // Host Version
+    transcript.extend_from_slice(&version_bytes); // Client Version
+    transcript.extend_from_slice(&host_ephemeral_bytes); // Host Ephemeral
+    transcript.extend_from_slice(client_ephemeral_bytes); // Client Ephemeral
+    let salt = Sha256::digest(&transcript);
+
+    let aes_key = Zeroizing::new(derive_session_key(
+        client_ephemeral_secret, 
+        &host_ephemeral_public, 
+        Some(&salt),
+        HKDF_INFO
+    ));
     let cipher = AesCipher::new(&aes_key[..])?;
     tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
 
@@ -441,7 +497,20 @@ mod tests {
             let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
             // 3. Derive key
-            let host_aes_key = derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO);
+            // Transcript: HostVersion || _client_version || HostEphemeral || client_ephemeral_bytes
+            let mut transcript = Vec::new();
+            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes());
+            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes()); // Assuming client sends same version
+            transcript.extend_from_slice(host_ephemeral_public.as_bytes());
+            transcript.extend_from_slice(&client_ephemeral_bytes);
+            let salt = Sha256::digest(&transcript);
+            
+            let host_aes_key = derive_session_key(
+                host_ephemeral_secret, 
+                &client_ephemeral_public, 
+                Some(&salt),
+                HKDF_INFO
+            );
             let cipher = AesCipher::new(&host_aes_key)?;
 
             // 4. Send Identity Proof (Encrypted)
@@ -484,7 +553,20 @@ mod tests {
             send_packet(&mut client_stream, client_ephemeral_public.as_bytes()).await?;
 
             // 3. Derive key
-            let client_aes_key = derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO);
+            // Transcript: _host_version || Version || host_ephemeral_bytes || ClientEphemeral
+            let mut transcript = Vec::new();
+            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes()); // Host version (simulated)
+            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes()); // Client version
+            transcript.extend_from_slice(&host_ephemeral_bytes);
+            transcript.extend_from_slice(client_ephemeral_public.as_bytes());
+            let salt = Sha256::digest(&transcript);
+
+            let client_aes_key = derive_session_key(
+                client_ephemeral_secret, 
+                &host_ephemeral_public, 
+                Some(&salt),
+                HKDF_INFO
+            );
             let cipher = AesCipher::new(&client_aes_key)?;
 
             // 4. Recv Host Identity Proof (Encrypted)

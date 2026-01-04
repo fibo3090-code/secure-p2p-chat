@@ -12,6 +12,8 @@ use rsa::{
 };
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 
 use crate::AES_KEY_SIZE;
 
@@ -73,9 +75,24 @@ pub fn rsa_decrypt_oaep(privkey: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Ve
 
 /// Calculate SHA-256 fingerprint of public key PEM
 pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(pem_bytes);
-    let hash = hasher.finalize();
+    // Try to extract DER bytes from PEM and hash the canonical DER (SubjectPublicKeyInfo)
+    if let Ok(s) = std::str::from_utf8(pem_bytes) {
+        if let (Some(begin), Some(end)) = (
+            s.find("-----BEGIN PUBLIC KEY-----"),
+            s.find("-----END PUBLIC KEY-----"),
+        ) {
+            let body = &s[begin + "-----BEGIN PUBLIC KEY-----".len()..end];
+            // Remove whitespace/newlines from PEM body
+            let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Ok(der) = BASE64_STANDARD.decode(&b64) {
+                let hash = Sha256::digest(&der);
+                return hex::encode(hash);
+            }
+        }
+    }
+
+    // Fallback: hash raw bytes
+    let hash = Sha256::digest(pem_bytes);
     hex::encode(hash)
 }
 
@@ -95,6 +112,7 @@ pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
 /// # Arguments
 /// * `our_secret` - Our ephemeral private key
 /// * `their_public` - Their ephemeral public key
+/// * `salt` - Optional salt (e.g., hash of handshake transcript)
 /// * `info` - Context string for HKDF (e.g., "p2p-messenger-v2")
 ///
 /// # Returns
@@ -102,14 +120,15 @@ pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
 pub fn derive_session_key(
     our_secret: EphemeralSecret,
     their_public: &X25519PublicKey,
+    salt: Option<&[u8]>,
     info: &[u8],
 ) -> [u8; AES_KEY_SIZE] {
     // Perform ECDH to get shared secret
     let shared_secret = our_secret.diffie_hellman(their_public);
 
     // Use HKDF-SHA256 to derive session key
-    // Salt is None (uses zeros), which is acceptable for ephemeral keys
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+    // Salt is now supported (and recommended to be transcript hash)
+    let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
 
     let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
@@ -147,7 +166,8 @@ impl AesCipher {
             assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
     
             let mut session_id = [0u8; 4];
-            rand::thread_rng().fill_bytes(&mut session_id);
+                // Use OS RNG explicitly for cryptographic session IDs
+                OsRng.fill_bytes(&mut session_id);
     
             Ok(Self {
                 cipher: Aes256Gcm::new_from_slice(key)
@@ -316,8 +336,8 @@ mod tests {
 
         // Both derive the same session key
         let info = b"test-context";
-        let alice_session_key = derive_session_key(alice_secret, &_bob_public, info);
-        let bob_session_key = derive_session_key(bob_secret, &_alice_public, info);
+        let alice_session_key = derive_session_key(alice_secret, &_bob_public, None, info);
+        let bob_session_key = derive_session_key(bob_secret, &_alice_public, None, info);
 
         // Keys should match
         assert_eq!(alice_session_key, bob_session_key);
@@ -330,10 +350,10 @@ mod tests {
         let (_bob_secret, bob_public) = generate_ephemeral_keypair();
 
         // Different context strings produce different keys
-        let key1 = derive_session_key(alice_secret, &bob_public, b"context1");
+        let key1 = derive_session_key(alice_secret, &bob_public, None, b"context1");
 
         let (alice_secret2, _) = generate_ephemeral_keypair();
-        let key2 = derive_session_key(alice_secret2, &bob_public, b"context2");
+        let key2 = derive_session_key(alice_secret2, &bob_public, None, b"context2");
 
         // Keys should be different (different secrets)
         assert_ne!(key1, key2);
@@ -372,8 +392,8 @@ mod tests {
 
         // 4. Derive session keys
         let info = b"p2p-messenger-v2";
-        let alice_key = derive_session_key(alice_ephemeral_secret, &bob_public_parsed, info);
-        let bob_key = derive_session_key(bob_ephemeral_secret, &alice_public_parsed, info);
+        let alice_key = derive_session_key(alice_ephemeral_secret, &bob_public_parsed, None, info);
+        let bob_key = derive_session_key(bob_ephemeral_secret, &alice_public_parsed, None, info);
 
         // 5. Keys should match
         assert_eq!(alice_key, bob_key);

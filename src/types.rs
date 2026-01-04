@@ -186,6 +186,13 @@ pub struct Config {
     pub auto_host_on_startup: bool,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    #[serde(default)]
+    pub auto_trust_on_first_use: bool,
+    /// Enable broadcasting and discovery via mDNS (Bonjour).
+    /// Disabled by default for privacy; enabling will advertise a hostname
+    /// and a fingerprint on the local network.
+    #[serde(default)]
+    pub enable_mdns: bool,
 }
 
 /// Theme options
@@ -221,6 +228,8 @@ impl Default for Config {
             notification_sound: NotificationSound::Default,
             auto_host_on_startup: false,
             listen_port: 5000,
+            auto_trust_on_first_use: false,
+            enable_mdns: false,
         }
     }
 }

@@ -141,7 +141,7 @@ impl App {
                 .unwrap_or_else(|e| {
                     tracing::error!("Failed to load/create identity: {}", e);
                     (
-                        crate::identity::Identity::new("User".to_string())
+                        crate::identity::Identity::new_with_plaintext("User".to_string())
                             .expect("Failed to create identity"),
                         true,
                     )
@@ -151,7 +151,7 @@ impl App {
         } else {
             // Fallback to relative path if directories crate fails
             tracing::warn!("Could not determine user data directory, using fallback path");
-            let identity = crate::identity::Identity::new("User".to_string())
+            let identity = crate::identity::Identity::new_with_plaintext("User".to_string())
                 .expect("Failed to create identity");
             (
                 PathBuf::from("Downloads").join("history.json"),
@@ -185,6 +185,7 @@ impl App {
         let auto_host_enabled = chat_manager.config.auto_host_on_startup;
         let auto_host_port = chat_manager.config.listen_port;
         let auto_connect_enabled = chat_manager.config.auto_connect;
+        let enable_mdns = chat_manager.config.enable_mdns;
         // Capture listen_port for initializing the UI field before moving manager
         let host_port_ui = auto_host_port.to_string();
         // Wrap manager in Arc<Mutex<..>> once and reuse
@@ -214,7 +215,9 @@ impl App {
         }
 
         let initial_identity_locked = identity.is_locked();
-        let force_password_setup = !is_new_identity && !initial_identity_locked;
+            // Force password setup whenever the identity is not locked (i.e., private key available in plaintext)
+            // This covers: newly created identities and legacy identities loaded with plaintext.
+            let force_password_setup = !initial_identity_locked;
 
         Self {
             chat_manager: manager_arc,
@@ -274,7 +277,13 @@ impl App {
             is_new_identity,
             qr_code_texture: None,
             discovered_peers: Arc::new(StdMutex::new(Vec::new())),
-            discovery: Discovery::new().ok(),
+            discovery: if enable_mdns {
+                // Create discovery only when mDNS is explicitly enabled in config.
+                // This avoids broadcasting hostname and fingerprint by default.
+                Discovery::new().ok()
+            } else {
+                None
+            },
         }
     }
 

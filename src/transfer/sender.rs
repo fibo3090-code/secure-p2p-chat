@@ -12,6 +12,7 @@ pub async fn send_file<S, F>(
     path: &Path,
     stream: &mut S,
     cipher: &AesCipher,
+    start_seq: u64,
     mut progress_callback: F,
 ) -> Result<()>
 where
@@ -32,11 +33,11 @@ where
         total_size
     );
 
-    // 2. Send FileMeta
+    // 2. Send FileMeta (use provided start_seq so caller can preserve sequence semantics)
     let meta_msg = ProtocolMessage::FileMeta {
         filename: filename.to_string(),
         size: total_size,
-        seq: 0, // TODO: Use proper sequence tracking
+        seq: start_seq,
     };
     send_message(stream, cipher, &meta_msg).await?;
 
@@ -44,6 +45,9 @@ where
     let mut file = File::open(path).await?;
     let mut buffer = vec![0u8; FILE_CHUNK_SIZE];
     let mut bytes_sent = 0u64;
+    // Chunk sequence numbers start at 0 for this transfer but are communicated alongside the
+    // FileMeta which carries the global/send sequence `start_seq`. Callers may choose to
+    // increment their chat-level `send_seq` when initiating a transfer and pass it here.
     let mut seq = 0u64;
 
     loop {
@@ -65,8 +69,8 @@ where
         tracing::trace!("Sent chunk {} ({}/{} bytes)", seq, bytes_sent, total_size);
     }
 
-    // 4. Send FileEnd
-    send_message(stream, cipher, &ProtocolMessage::FileEnd { seq: 0 }).await?;
+    // 4. Send FileEnd (include final chunk seq to help receiver validate completeness)
+    send_message(stream, cipher, &ProtocolMessage::FileEnd { seq }).await?;
 
     tracing::info!("File transfer complete: {} bytes", bytes_sent);
     Ok(())
@@ -107,7 +111,7 @@ mod tests {
         let path = temp_file.path().to_path_buf();
         let send_cipher = cipher.clone();
         tokio::spawn(async move {
-            send_file(&path, &mut client, &send_cipher, |_, _| {})
+            send_file(&path, &mut client, &send_cipher, 0u64, |_, _| {})
                 .await
                 .unwrap();
         });

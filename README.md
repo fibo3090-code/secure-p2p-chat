@@ -60,6 +60,8 @@ cargo build --release
 # Run the application
 cargo run --release
 ```
+---
+**Automated update:** Documentation reviewed and annotated on 2026-01-04. Please verify and commit if acceptable.
 
 ### Windows
 

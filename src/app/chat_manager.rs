@@ -829,6 +829,20 @@ impl ChatManager {
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");
         if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
+            // If the user accepted and we have a pending verification request matching this chat,
+            // persist the fingerprint in the chat record before confirming the session.
+            if accept {
+                if let Some((fp, _peer_name, req_chat_id)) = &self.fingerprint_verification_request {
+                    if *req_chat_id == chat_id {
+                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                            chat.peer_fingerprint = Some(fp.clone());
+                        }
+                        // Clear the pending request now that we've stored it
+                        self.fingerprint_verification_request = None;
+                    }
+                }
+            }
+
             tx.send(accept)
                 .map_err(|e| anyhow::anyhow!("Failed to send confirmation: {}", e))?;
             Ok(())
@@ -1026,14 +1040,20 @@ impl ChatManager {
                 match &chat.peer_fingerprint {
                     // CASE 1: No stored fingerprint. This is the FIRST USE.
                     None => {
-                        tracing::info!("Trust on First Use: Storing new fingerprint for chat {}", chat_id);
-                        // Store the new fingerprint
-                        chat.peer_fingerprint = Some(fingerprint);
-                        // Automatically confirm this connection. No UI dialog needed.
-                        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
-                            if let Err(e) = tx.send(true) {
-                                tracing::error!("Failed to auto-confirm fingerprint: {}", e);
+                        tracing::info!("Trust on First Use for chat {}. Requesting user confirmation.", chat_id);
+                        // If user opted into auto-trust (not recommended), allow it.
+                        if self.config.auto_trust_on_first_use {
+                            tracing::info!("auto_trust_on_first_use enabled: auto-storing fingerprint for chat {}", chat_id);
+                            chat.peer_fingerprint = Some(fingerprint.clone());
+                            if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
+                                if let Err(e) = tx.send(true) {
+                                    tracing::error!("Failed to auto-confirm fingerprint: {}", e);
+                                }
                             }
+                        } else {
+                            // Request explicit user verification via UI
+                            self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
+                            self.add_toast(ToastLevel::Warning, "Fingerprint verification required".to_string());
                         }
                     }
                     // CASE 2: Stored fingerprint matches the new one.
@@ -1556,7 +1576,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         mgr.fingerprint_confirm_senders.insert(chat_id, tx);
         mgr.chats.insert(chat_id, chat);
-
+        // 1. First Use: No fingerprint exists -> UI prompt expected (no auto-confirm)
         let event1 = SessionEvent::ShowFingerprintVerification {
             fingerprint: fingerprint1.clone(),
             peer_name: peer_name.clone(),
@@ -1564,12 +1584,19 @@ mod tests {
         };
         mgr.handle_session_event(chat_id, event1);
 
-        // Assert: Fingerprint is stored, no UI request is made, and connection is confirmed.
-        assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, Some(fingerprint1.clone()));
-        assert!(mgr.fingerprint_verification_request.is_none());
-        assert_eq!(rx.try_recv(), Ok(true));
+        // Assert: No auto-storage, request pending, and no confirmation sent automatically.
+        assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, None);
+        assert!(mgr.fingerprint_verification_request.is_some());
+        assert!(rx.try_recv().is_err());
 
-        // 2. Second Use: Matching fingerprint.
+        // Simulate user accepting the fingerprint via UI
+        mgr.confirm_fingerprint(chat_id, true).expect("confirm should succeed");
+        // Now the session should receive confirmation
+        assert_eq!(rx.try_recv(), Ok(true));
+        // And the fingerprint should now be stored
+        assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, Some(fingerprint1.clone()));
+
+        // 2. Second Use: Matching fingerprint -> auto-confirm
         let event2 = SessionEvent::ShowFingerprintVerification {
             fingerprint: fingerprint1.clone(),
             peer_name: peer_name.clone(),
@@ -1577,11 +1604,11 @@ mod tests {
         };
         mgr.handle_session_event(chat_id, event2);
 
-        // Assert: Still no UI request, and connection is confirmed again.
+        // Assert: No UI request, and connection is confirmed automatically.
         assert!(mgr.fingerprint_verification_request.is_none());
         assert_eq!(rx.try_recv(), Ok(true));
 
-        // 3. Third Use: Mismatched fingerprint.
+        // 3. Third Use: Mismatched fingerprint -> UI prompt, no auto-confirm
         let event3 = SessionEvent::ShowFingerprintVerification {
             fingerprint: fingerprint2.clone(),
             peer_name: peer_name.clone(),
@@ -1591,7 +1618,7 @@ mod tests {
 
         // Assert: A UI request IS made, and no confirmation is sent automatically.
         assert!(mgr.fingerprint_verification_request.is_some());
-        let (fp, _, _) = mgr.fingerprint_verification_request.unwrap();
+        let (fp, _, _) = mgr.fingerprint_verification_request.clone().unwrap();
         assert_eq!(fp, fingerprint2);
         assert!(rx.try_recv().is_err());
     }

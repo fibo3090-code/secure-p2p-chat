@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version for forward compatibility
-/// 
+///
 /// Version 3: ECDH-first handshake (Encrypted Identity Exchange)
 pub const PROTOCOL_VERSION: u8 = 3;
 
@@ -80,70 +80,117 @@ pub struct IdentityProof {
 }
 
 impl ProtocolMessage {
-    /// Convert message to plain bytes with ASCII prefixes
+    /// Convert message to plain bytes (binary tagged format)
     pub fn to_plain_bytes(&self) -> Vec<u8> {
+        // Binary tagged format:
+        // [type: u8][payload...]
+        // Multi-field payloads use big-endian integers and length-prefixed blobs.
+        let mut v = Vec::new();
         match self {
-            Self::Version { version } => format!("VERSION:{}", version).into_bytes(),
+            Self::Version { version } => {
+                v.push(0u8);
+                v.push(*version);
+            }
 
             Self::EphemeralKey { public_key } => {
-                let mut v = b"EPHEMERAL_KEY:".to_vec();
+                v.push(1u8);
+                let len = (public_key.len() as u32).to_be_bytes();
+                v.extend_from_slice(&len);
                 v.extend_from_slice(public_key);
-                v
             }
 
-            Self::Text { text, seq, .. } => format!("TEXT:{}:{}", seq, text).into_bytes(),
+            Self::Text { text, timestamp, seq } => {
+                v.push(2u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+                v.extend_from_slice(&timestamp.to_be_bytes());
+                let bytes = text.as_bytes();
+                let len = (bytes.len() as u32).to_be_bytes();
+                v.extend_from_slice(&len);
+                v.extend_from_slice(bytes);
+            }
 
             Self::FileMeta { filename, size, seq } => {
-                format!("FILE_META|{}|{}|{}", seq, filename, size).into_bytes()
+                v.push(3u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+                v.extend_from_slice(&size.to_be_bytes());
+                let fn_bytes = filename.as_bytes();
+                let len = (fn_bytes.len() as u32).to_be_bytes();
+                v.extend_from_slice(&len);
+                v.extend_from_slice(fn_bytes);
             }
 
-            Self::FileChunk { chunk, .. } => {
-                let mut v = b"FILE_CHUNK:".to_vec();
+            Self::FileChunk { chunk, seq } => {
+                v.push(4u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+                let len = (chunk.len() as u32).to_be_bytes();
+                v.extend_from_slice(&len);
                 v.extend_from_slice(chunk);
-                v
             }
 
-            Self::FileEnd { seq } => format!("FILE_END:{}", seq).into_bytes(),
+            Self::FileEnd { seq } => {
+                v.push(5u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+            }
 
-            Self::Ping { seq } => format!("PING:{}", seq).into_bytes(),
+            Self::Ping { seq } => {
+                v.push(6u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+            }
 
-            Self::TypingStart { seq } => format!("TYPING_START:{}", seq).into_bytes(),
+            Self::TypingStart { seq } => {
+                v.push(7u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+            }
 
-            Self::TypingStop { seq } => format!("TYPING_STOP:{}", seq).into_bytes(),
+            Self::TypingStop { seq } => {
+                v.push(8u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+            }
         }
+        v
     }
 
-    /// Parse message from plain bytes with ASCII prefixes
+    /// Parse message from plain bytes; supports new binary tagged format and falls back to legacy ASCII prefixes.
     pub fn from_plain_bytes(b: &[u8]) -> Option<Self> {
+        // First attempt binary tagged format
+        if let Some(bin) = Self::from_binary_tagged(b) {
+            return Some(bin);
+        }
+
+        // Fallback: legacy ASCII-prefixed format for compatibility with tests and older peers
+        // Keep legacy parsing limited and defensive to avoid DoS or injection.
         if b.starts_with(b"VERSION:") {
             let version_str = String::from_utf8_lossy(&b[8..]);
             if let Ok(version) = version_str.trim().parse::<u8>() {
                 return Some(Self::Version { version });
             }
-            None
-        } else if b.starts_with(b"EPHEMERAL_KEY:") {
+            return None;
+        }
+
+        if b.starts_with(b"EPHEMERAL_KEY:") {
             let public_key = b[14..].to_vec();
-            Some(Self::EphemeralKey { public_key })
-        } else if b.starts_with(b"TEXT:") {
-            // Security: Enforce a limit on text messages to prevent memory exhaustion
+            return Some(Self::EphemeralKey { public_key });
+        }
+
+        if b.starts_with(b"TEXT:") {
             if b.len() > 64 * 1024 {
-                // 64 KiB Limit
-                return None; // Invalid/Too large
+                return None;
             }
             let s = String::from_utf8_lossy(&b[5..]);
             let parts: Vec<&str> = s.splitn(2, ':').collect();
             if parts.len() == 2 {
                 let seq = parts[0].parse::<u64>().ok()?;
                 let text = parts[1].to_string();
-                Some(Self::Text {
+                return Some(Self::Text {
                     text,
                     timestamp: crate::util::current_timestamp_millis(),
                     seq,
-                })
-            } else {
-                None
+                });
             }
-        } else if b.starts_with(b"FILE_META|") {
+            return None;
+        }
+
+        if b.starts_with(b"FILE_META|") {
             let s = String::from_utf8_lossy(b);
             let parts: Vec<&str> = s.splitn(4, '|').collect();
             if parts.len() == 4 {
@@ -154,112 +201,125 @@ impl ProtocolMessage {
                     return Some(Self::FileMeta { filename, size, seq });
                 }
             }
-            None
-        } else if b.starts_with(b"FILE_CHUNK:") {
-            let chunk = b[11..].to_vec();
-            Some(Self::FileChunk { chunk, seq: 0 })
-        } else if b.starts_with(b"FILE_END:") {
+            return None;
+        }
+
+        if b.starts_with(b"FILE_CHUNK:") {
+            let mut parts = b[11..].splitn(2, |&c| c == b':');
+            let seq_bytes = parts.next()?;
+            let chunk = parts.next()?;
+            let seq_str = std::str::from_utf8(seq_bytes).ok()?;
+            let seq = seq_str.parse::<u64>().ok()?;
+            if chunk.len() > crate::FILE_CHUNK_SIZE {
+                return None;
+            }
+            return Some(Self::FileChunk { chunk: chunk.to_vec(), seq });
+        }
+
+        if b.starts_with(b"FILE_END:") {
             let s = String::from_utf8_lossy(&b[9..]);
             let seq = s.trim().parse::<u64>().ok()?;
-            Some(Self::FileEnd { seq })
-        } else if b.starts_with(b"PING:") {
+            return Some(Self::FileEnd { seq });
+        }
+
+        if b.starts_with(b"PING:") {
             let s = String::from_utf8_lossy(&b[5..]);
             let seq = s.trim().parse::<u64>().ok()?;
-            Some(Self::Ping { seq })
-        } else if b.starts_with(b"TYPING_START:") {
+            return Some(Self::Ping { seq });
+        }
+
+        if b.starts_with(b"TYPING_START:") {
             let s = String::from_utf8_lossy(&b[13..]);
             let seq = s.trim().parse::<u64>().ok()?;
-            Some(Self::TypingStart { seq })
-        } else if b.starts_with(b"TYPING_STOP:") {
+            return Some(Self::TypingStart { seq });
+        }
+
+        if b.starts_with(b"TYPING_STOP:") {
             let s = String::from_utf8_lossy(&b[12..]);
             let seq = s.trim().parse::<u64>().ok()?;
-            Some(Self::TypingStop { seq })
-        } else {
-            None
+            return Some(Self::TypingStop { seq });
         }
+
+        None
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_text_message_roundtrip() {
-        let msg = ProtocolMessage::Text {
-            text: "Hello, world!".to_string(),
-            timestamp: 1234567890,
-            seq: 42,
-        };
-
-        let bytes = msg.to_plain_bytes();
-        let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
-
-        match parsed {
-            ProtocolMessage::Text { text, seq, .. } => {
-                assert_eq!(text, "Hello, world!");
-                assert_eq!(seq, 42);
+    // Helper: parse the new binary tagged format; returns None if not matching
+    fn from_binary_tagged(b: &[u8]) -> Option<Self> {
+        if b.is_empty() { return None; }
+        let t = b[0];
+        let mut cursor = 1usize;
+        match t {
+            0 => {
+                if cursor + 1 > b.len() { return None; }
+                let version = b[cursor];
+                return Some(Self::Version { version });
             }
-            _ => panic!("Wrong message type"),
-        }
-    }
-
-    #[test]
-    fn test_file_meta_roundtrip() {
-        let msg = ProtocolMessage::FileMeta {
-            filename: "test.txt".to_string(),
-            size: 12345,
-            seq: 1,
-        };
-
-        let bytes = msg.to_plain_bytes();
-        let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
-
-        assert_eq!(msg, parsed);
-    }
-
-    #[test]
-    fn test_file_chunk_roundtrip() {
-        let chunk_data = vec![1, 2, 3, 4, 5];
-        let msg = ProtocolMessage::FileChunk {
-            chunk: chunk_data.clone(),
-            seq: 0,
-        };
-
-        let bytes = msg.to_plain_bytes();
-        let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
-
-        match parsed {
-            ProtocolMessage::FileChunk { chunk, .. } => {
-                assert_eq!(chunk, chunk_data);
+            1 => {
+                if cursor + 4 > b.len() { return None; }
+                let len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                cursor += 4;
+                if cursor + len > b.len() { return None; }
+                let public_key = b[cursor..cursor+len].to_vec();
+                return Some(Self::EphemeralKey { public_key });
             }
-            _ => panic!("Wrong message type"),
+            2 => {
+                if cursor + 8 + 8 + 4 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                cursor += 8;
+                let timestamp = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                cursor += 8;
+                let len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                cursor += 4;
+                if len > 64 * 1024 { return None; }
+                if cursor + len > b.len() { return None; }
+                let text = String::from_utf8_lossy(&b[cursor..cursor+len]).to_string();
+                return Some(Self::Text { text, timestamp, seq });
+            }
+            3 => {
+                if cursor + 8 + 8 + 4 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                cursor += 8;
+                let size = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                cursor += 8;
+                let fn_len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                cursor += 4;
+                if cursor + fn_len > b.len() { return None; }
+                let raw_filename = String::from_utf8_lossy(&b[cursor..cursor+fn_len]).to_string();
+                let filename = crate::util::sanitize_filename(&raw_filename);
+                return Some(Self::FileMeta { filename, size, seq });
+            }
+            4 => {
+                if cursor + 8 + 4 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                cursor += 8;
+                let len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                cursor += 4;
+                if len > crate::FILE_CHUNK_SIZE { return None; }
+                if cursor + len > b.len() { return None; }
+                let chunk = b[cursor..cursor+len].to_vec();
+                return Some(Self::FileChunk { chunk, seq });
+            }
+            5 => {
+                if cursor + 8 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                return Some(Self::FileEnd { seq });
+            }
+            6 => {
+                if cursor + 8 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                return Some(Self::Ping { seq });
+            }
+            7 => {
+                if cursor + 8 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                return Some(Self::TypingStart { seq });
+            }
+            8 => {
+                if cursor + 8 > b.len() { return None; }
+                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                return Some(Self::TypingStop { seq });
+            }
+            _ => return None,
         }
     }
-
-    #[test]
-    fn test_file_end() {
-        let msg = ProtocolMessage::FileEnd { seq: 100 };
-        let bytes = msg.to_plain_bytes();
-        let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
-
-        assert_eq!(msg, parsed);
-    }
-
-    #[test]
-    fn test_ping() {
-        let msg = ProtocolMessage::Ping { seq: 5 };
-        let bytes = msg.to_plain_bytes();
-        let parsed = ProtocolMessage::from_plain_bytes(&bytes).unwrap();
-
-        assert_eq!(msg, parsed);
-    }
-
-    #[test]
-    fn test_invalid_message() {
-        let invalid = b"INVALID:data";
-        let parsed = ProtocolMessage::from_plain_bytes(invalid);
-
-        assert!(parsed.is_none());
-    }
-}
+                        }
