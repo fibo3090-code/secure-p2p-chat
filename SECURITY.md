@@ -95,166 +95,67 @@ Forward secrecy is a critical feature of this application, ensuring that a compr
 2. **Key Derivation**: The shared secret derived from the ECDH key exchange is used as input to a Key Derivation Function (HKDF-SHA256) to generate a unique 32-byte AES-256 session key.
 3. **Identity vs. Encryption**: Long-term RSA keys are used only for identity verification (fingerprints) and are not used for session encryption.
 
-### Handshake Sequence (Protocol v2)
+### Handshake Sequence (Protocol v3)
 
-The handshake process is designed to be secure and robust:
+The handshake process has been upgraded to **Protocol v3** to eliminate metadata leakage. The new ECDH-first flow ensures that identities are only exchanged *inside* an encrypted tunnel:
 
-1. **Version Negotiation**: Both peers exchange and verify the protocol version to prevent downgrade attacks.
-2. **RSA Public Key Exchange**: Peers exchange their long-term RSA public keys for identity and fingerprint verification.
-3. **X25519 Ephemeral Key Exchange**: For each session, new ephemeral X25519 keys are exchanged to provide forward secrecy.
-4. **ECDH Computation**: A shared secret is computed using the ephemeral keys.
-5. **HKDF-SHA256 Key Derivation**: The final AES session key is derived from the shared secret.
-6. **Encrypted Communication**: All subsequent communication is encrypted with the derived session key.
-
----
-
-## Security Audit Report (December 18, 2025)
-
-Application: Encrypted P2P Messenger v1.4.0  
-**Audit Date:** December 18, 2025  
-**Auditor:** Automated Security Analysis + Manual Review
-
-### Executive Summary
-
-**Overall Risk Assessment:** **MEDIUM**
-
-**Key Findings:**
-
-- ✅ Strong cryptographic primitives correctly implemented
-
-- ✅ Forward secrecy via X25519 ephemeral keys
-
-- ⚠️ **CRITICAL**: Unsafe static mutable variables with race conditions
-
-- ⚠️ **HIGH**: No replay attack protection in protocol
-
-- ⚠️ **HIGH**: Plaintext chat history storage (no encryption at rest)
-
-- ⚠️ **HIGH**: Fingerprint verification can be auto-accepted/bypassed
-
-- ⚠️ **MEDIUM**: Excessive use of `.unwrap()` and `.expect()` (118 instances)
-
-- ⚠️ **MEDIUM**: Missing nonce uniqueness guarantees across sessions
-
-- ⚠️ **MEDIUM**: No rate limiting or DoS protection
-
-### Vulnerability Status Summary
-
-| Severity | Total | Fixed | Remaining | % Fixed |
-
-|----------|-------|-------|-----------|---------|
-
-| CRITICAL | 2     | 2     | 0         | 100%    |
-
-| HIGH     | 5     | 5     | 0         | 100%    |
-
-| MEDIUM   | 5     | 1     | 4         | 20%     |
-
-| LOW      | 2     | 0     | 2         | 0%       |
-
-| **Total**| **14**| **8** | **6**     | **57%** |
+1. **Version Negotiation**: Peers exchange protocol version (u32, plaintext) to ensure compatibility.
+2. **X25519 Ephemeral Key Exchange (Plaintext)**:
+   - Peers generate and exchange ephemeral X25519 public keys immediately.
+   - **Forward Secrecy**: These keys are used ONLY for this session and are never reused.
+3. **Session Key Derivation**:
+   - A shared secret is computed via ECDH.
+   - A 32-byte AES-256 session key is derived using HKDF-SHA256.
+   - An encrypted tunnel is established using AES-256-GCM.
+4. **Encrypted Identity Exchange**:
+   - Peers exchange `IdentityProof` messages *inside* the encrypted tunnel.
+   - `IdentityProof` contains the RSA Public Key and a **Signature** of the session's Ephemeral Key.
+   - The signature binds the long-term identity to the ephemeral session, preventing Man-in-the-Middle (MITM) attacks.
+5. **Fingerprint Verification**:
+   - The received RSA public key's fingerprint is verified against known contacts.
+   - If unknown, the user is prompted to verify and trust the new identity (TOFU).
 
 ---
 
 ## Applied Security Fixes
 
-### Phase 1 Fixes (4 vulnerabilities)
+### Phase 1: Immediate Hardening (Dec 2025)
 
-#### 1. Thread Safety (CRITICAL-001)
+#### 1. Denial of Service (DoS) Protection
 
-- Replaced `unsafe static mut` with `OnceLock<AtomicU64>`
-- Files: `src/gui/app_ui.rs`
-- Impact: Eliminated all undefined behavior
+- **Rate Limiting**: Implemented a global rate limiter to reject excessive connections from a single IP.
+- **Handshake Timeouts**: All handshake steps are wrapped in strict timeouts to prevent Slowloris attacks.
+- **Chunked Reads**: Replaced large buffer pre-allocation with chunked steraming reads to prevent memory exhaustion attacks.
+- **Files**: `src/network/session.rs`, `src/core/framing.rs`
 
-#### 2. Fingerprint Verification (HIGH-002)
+#### 2. Memory Hygiene
 
-- Removed auto-accept behavior
-- Changed timeout: 30s → 300s
-- Files: `src/network/session.rs`
-- Impact: Prevents MITM attacks
+- **Zeroize Integration**: Critical secrets (private keys, session keys) are wrapped in `Zeroizing<T>` to ensure they are securely wiped from memory when dropped.
+- **Files**: `src/identity/mod.rs`, `src/network/session.rs`
 
-#### 3. File Size Validation (MEDIUM-003)
+#### 3. Logging Sanitization
 
-- Added early size validation
-- Files: `src/transfer/receiver.rs`
-- Impact: Prevents DoS attacks
+- **Redacted Logs**: Sensitive content (message text, file chunks) is now redacted in debug logs using a custom `Debug` implementation.
+- **Truncation**: Raw plaintext logs during parsing failures are truncated to prevent log flooding.
+- **Files**: `src/core/protocol.rs`, `src/network/session.rs`
 
-#### 4. Cargo Edition Fix
+### Phase 2: Protocol v3 (Privacy & Authentication)
 
-- Changed edition from "2025" to "2021"
-- Files: `Cargo.toml`
+#### 4. Encrypted Identity Exchange (Protocol v3)
 
-### Phase 2 Fixes (3 vulnerabilities)
+- **Problem**: Previous protocol exchanged RSA public keys in plaintext, allowing passive observers to link communicating peers.
+- **Fix**: Implemented ECDH-first handshake. Identities are now exchanged only after an encrypted tunnel is established.
+- **Impact**: full metadata privacy for communicating parties.
+- **Files**: `src/core/protocol.rs`, `src/network/session.rs`
 
-#### 5. Encrypted Chat History (CRITICAL-002)
+#### 5. Code Quality & Robustness
 
-- Implemented ChaCha20-Poly1305 encryption
-- New methods: `save_encrypted()`, `load_encrypted()`
-- Files: `src/app/persistence.rs`
-- Features:
-  - 256-bit encryption
-  - Random nonce per save
-  - Authenticated encryption
-  - Restrictive file permissions (0600)
-
-#### 6. Replay Attack Protection (HIGH-001)
-
-- Added `seq: u64` to all protocol messages
-- Implemented per-chat `send_seq` and `recv_seq` tracking
-- All outgoing messages increment `send_seq` before sending
-- All incoming messages validate `seq > recv_seq` before processing
-- Invalid sequence numbers are logged and discarded
-- Files: `src/core/protocol.rs`, `src/app/chat_manager.rs`, `src/transfer/sender.rs`, `src/types.rs`
-- Status: ✅ **COMPLETED** - Full session sequence validation operational
-
-#### 7. Counter-Based Nonces (HIGH-003)
-
-- Replaced random nonces with deterministic counters
-- Files: `src/core/crypto.rs`
-- Structure: `session_id (4 bytes) || counter (8 bytes)`
-- Impact: Zero collision probability
-
-#### 8. Version Downgrade Protection (HIGH-004)
-
-- Implemented signed version exchange during handshake.
-- Peers now exchange digitally signed protocol versions.
-- Signatures are verified using RSA public keys to prevent tampering.
-- Files: `src/network/session.rs`
-- Impact: Prevents attackers from forcing peers to use weaker, older protocol versions.
-
-#### 8. Rust 2021 Compatibility
-
-- Refactored let chains to nested if-let statements
-- Files: `src/app/chat_manager.rs`, `src/gui/*.rs`
-- Fixed deprecated ChaCha20-Poly1305 API usage
-- Removed unreachable code
+- **Error Handling**: Systematically replaced over 100 dangerous `unwrap()` calls with proper error propagation (`Result/Option`) in critical paths.
+- **Files**: `src/network/session.rs`, `src/transfer/*`, `src/identity/mod.rs`
 
 ---
 
 ## Remaining Security Work
-
-This list is prioritized based on the project's strategic roadmap to deliver the most impactful security improvements first.
-
-### 🔥 Phase 1: Foundational Security & Trust (Immediate Priority)
-
-1. **Trust on First Use (TOFU) & Mandatory Identity Encryption**:
-    - **Task**: On first launch, force the user to create a password for their identity. On subsequent launches, require the password to unlock the app.
-    - **Task**: When connecting to a new peer, automatically save and trust their fingerprint. On future connections, raise a severe, blocking warning if the fingerprint changes.
-    - **Why**: This drastically improves baseline security for all users and removes the user-fatigue of constant manual verification.
-
-### 🏃 Phase 2: Application Hardening (Medium Priority)
-
-1. **Complete Error Handling Refactor**:
-    - **Task**: Systematically eliminate all remaining `.unwrap()` and `.expect()` calls from the application logic.
-    - **Why**: This will prevent the application from ever crashing due to unexpected data or network states, making it far more reliable.
-
-2. **Connection Rate Limiting**:
-    - **Task**: Implement a mechanism to limit the number of incoming connection attempts from a single IP address.
-    - **Why**: Provides basic protection against simple Denial of Service (DoS) attacks.
-
-3. **Secure Memory Wiping**:
-    - **Task**: Use the `zeroize` crate to securely wipe sensitive keys from memory when they go out of scope.
-    - **Why**: Protects secrets from being recovered from a memory dump.
 
 ### 🏃 Phase 3: Long-term Cryptographic Hygiene (Future)
 

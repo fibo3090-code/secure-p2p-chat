@@ -3,6 +3,10 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use rsa::pss::{SigningKey, VerifyingKey};
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
 use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -10,22 +14,60 @@ use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
 use crate::core::{
-    AesCipher, PROTOCOL_VERSION, ProtocolMessage, derive_session_key, fingerprint_pubkey,
+    AesCipher, PROTOCOL_VERSION, ProtocolMessage, IdentityProof, derive_session_key, fingerprint_pubkey,
     generate_ephemeral_keypair, parse_x25519_public, pem_decode_public, pem_encode_public,
     recv_packet, send_packet,
 };
 use crate::types::SessionEvent;
+use crate::HANDSHAKE_TIMEOUT_SECS;
 
 /// HKDF context string for key derivation
 const HKDF_INFO: &[u8] = b"p2p-messenger-v2-forward-secrecy";
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SignedVersion {
-    version: u32,
-    signature: Vec<u8>,
+/// Rate limiting: max connections per IP in the time window
+const RATE_LIMIT_MAX_CONNECTIONS: usize = 5;
+const RATE_LIMIT_WINDOW_SECS: u64 = 10;
+
+/// Global rate limiter state
+static RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, Vec<Instant>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Check if an IP is rate-limited. Returns true if connection should be rejected.
+fn is_rate_limited(ip: IpAddr) -> bool {
+    let mut limiter = RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+    
+    let attempts = limiter.entry(ip).or_insert_with(Vec::new);
+    
+    // Remove old attempts outside the window
+    attempts.retain(|t| now.duration_since(*t) < window);
+    
+    if attempts.len() >= RATE_LIMIT_MAX_CONNECTIONS {
+        tracing::warn!("Rate limiting IP {}: {} attempts in {}s", ip, attempts.len(), RATE_LIMIT_WINDOW_SECS);
+        return true;
+    }
+    
+    attempts.push(now);
+    false
 }
 
-/// Run host session: listen, accept, handshake, message loop
+/// Receive packet with handshake timeout to prevent Slowloris attacks
+async fn recv_packet_with_timeout<S>(stream: &mut S) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let timeout = std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+    match tokio::time::timeout(timeout, recv_packet(stream)).await {
+        Ok(Ok(data)) => Ok(data),
+        Ok(Err(e)) => Err(anyhow!("Receive failed: {}", e)),
+        Err(_) => Err(anyhow!("Handshake timeout ({}s)", HANDSHAKE_TIMEOUT_SECS)),
+    }
+}
+
+
+
+/// Run host session: listen, accept, handshake (v3), message loop
 pub async fn run_host_session(
     port: u16,
     privkey: RsaPrivateKey,
@@ -34,7 +76,7 @@ pub async fn run_host_session(
     _confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
 ) -> Result<()> {
-    // 1. Bind listener
+    // 1. Bind listener (bind to all interfaces for now, could be configurable)
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("Host listening on port {}", port);
 
@@ -42,113 +84,107 @@ pub async fn run_host_session(
         .send(SessionEvent::Listening { port })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // 2. Accept connection
+    // 2. Accept connection with rate limiting
     let (mut stream, peer_addr) = listener.accept().await?;
+    
+    // Check rate limit
+    if is_rate_limited(peer_addr.ip()) {
+        tracing::warn!("Rejecting connection from {} due to rate limiting", peer_addr);
+        return Err(anyhow!("Connection rejected: rate limit exceeded"));
+    }
+    
     tracing::info!("Client connected from {}", peer_addr);
+    
+    // --- HANDSHAKE v3 (ECDH First) ---
 
-    to_app_tx
-        .send(SessionEvent::Connected {
-            peer: peer_addr.to_string(),
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    // 3. Send host public key (for identity/fingerprint)
-    let host_pub_pem = pem_encode_public(&RsaPublicKey::from(&privkey))?;
-    send_packet(&mut stream, host_pub_pem.as_bytes()).await?;
-    tracing::debug!("Sent host RSA public key");
-
-    // 4. Receive client public key
-    let client_pub_pem = recv_packet(&mut stream).await?;
-    let client_pub_pem_str = String::from_utf8(client_pub_pem)?;
-    let client_pubkey = pem_decode_public(&client_pub_pem_str)?;
-    let client_fingerprint = fingerprint_pubkey(client_pub_pem_str.as_bytes());
-    tracing::debug!(
-        "Received client RSA public key, fingerprint: {}",
-        client_fingerprint
-    );
-
-    // 5. Send signed protocol version
+    // 3. Send Protocol Version (u32, plaintext)
     let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
-    let mut hasher = Sha256::new();
-    hasher.update(version_bytes);
-    let hashed_version = hasher.finalize();
+    send_packet(&mut stream, &version_bytes).await?;
     
-    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
-    let signature = signing_key.sign_with_rng(&mut rng, &hashed_version);
-
-    let signed_version = SignedVersion {
-        version: PROTOCOL_VERSION as u32,
-        signature: signature.to_vec(),
-    };
-    let signed_version_bytes = bincode::serialize(&signed_version)?;
-    send_packet(&mut stream, &signed_version_bytes).await?;
-    tracing::debug!("Sent signed protocol version: {}", PROTOCOL_VERSION);
-
-    // 6. Receive signed client protocol version
-    let client_signed_version_bytes = recv_packet(&mut stream).await?;
-    let client_signed_version: SignedVersion = bincode::deserialize(&client_signed_version_bytes)?;
-    
-    let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey.clone());
-    let mut client_hasher = Sha256::new();
-    client_hasher.update(client_signed_version.version.to_be_bytes());
-    let client_hashed_version = client_hasher.finalize();
-
-    verifying_key.verify(&client_hashed_version, &rsa::pss::Signature::try_from(client_signed_version.signature.as_slice())?)
-        .map_err(|e| anyhow!("Client version signature verification failed: {}", e))?;
-
-    let client_version = client_signed_version.version;
+    // 4. Receive Protocol Version (u32, plaintext)
+    let client_version_bytes = recv_packet_with_timeout(&mut stream).await?;
+    if client_version_bytes.len() != 4 {
+        return Err(anyhow!("Invalid version packet length"));
+    }
+    let client_version = u32::from_be_bytes(client_version_bytes.try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
     tracing::info!("Client protocol version: {}", client_version);
 
-    // Check version compatibility
-    if client_version < 2 {
-        return Err(anyhow!(
-            "Client version {} not supported (need v2+)",
-            client_version
-        ));
+    if client_version < 3 {
+        return Err(anyhow!("Client version {} too old (need v3+)", client_version));
     }
 
-    // 7. Receive chat_id from client (for logging/compat)
-    let client_chat_id_bytes = recv_packet(&mut stream).await?;
-    let client_chat_id = uuid::Uuid::from_slice(&client_chat_id_bytes)?;
-    tracing::debug!("Received client chat_id: {}", client_chat_id);
+    // 5. Generate Ephemeral Keys (X25519)
+    let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
+    let host_ephemeral_bytes = host_ephemeral_public.as_bytes();
+    
+    // 6. Send Ephemeral Public Key (plaintext)
+    send_packet(&mut stream, host_ephemeral_bytes).await?;
+    
+    // 7. Receive Ephemeral Public Key (plaintext)
+    let client_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
+    if client_ephemeral_bytes.len() != 32 {
+        return Err(anyhow!("Invalid ephemeral key length"));
+    }
+    let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
-    // 8. Display fingerprint and wait for user confirmation
+    // 8. Derive Session Key & Init Cipher
+    let aes_key = Zeroizing::new(derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO));
+    let cipher = AesCipher::new(&aes_key[..])?;
+    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
+
+    // --- ENCRYPTED IDENTITY EXCHANGE ---
+    
+    // 9. Create Identity Proof
+    // We sign our own ephemeral key to bind it to our identity (prevent MITM)
+    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+    let mut rng = OsRng;
+    let mut hasher = Sha256::new();
+    hasher.update(b"IDENTITY_PROOF");
+    hasher.update(host_ephemeral_bytes); // Bind to my ephemeral key
+    let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+
+    let my_proof = IdentityProof {
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
+        signature: signature.to_vec(),
+        version: PROTOCOL_VERSION as u32,
+        chat_id,
+    };
+    
+    // Serialize & Encrypt Proof
+    let my_proof_bytes = bincode::serialize(&my_proof)?;
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+    send_packet(&mut stream, &encrypted_proof).await?;
+    
+    // 10. Receive Client's Identity Proof (Encrypted)
+    let encrypted_client_proof = recv_packet_with_timeout(&mut stream).await?;
+    let client_proof_bytes = cipher.decrypt(&encrypted_client_proof)
+        .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
+    let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    
+    // 11. Verify Client Identity
+    let client_pubkey = pem_decode_public(&client_proof.public_key_pem)?;
+    let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey.clone());
+    
+    // Verify signature: It must verify the CLIENT'S ephemeral key
+    let mut client_hasher = Sha256::new();
+    client_hasher.update(b"IDENTITY_PROOF");
+    client_hasher.update(&client_ephemeral_bytes); // Verify against what we received earlier
+    let client_digest = client_hasher.finalize();
+    
+    verifying_key.verify(&client_digest, &rsa::pss::Signature::try_from(client_proof.signature.as_slice())?)
+         .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
+
+    let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
+    tracing::debug!("Verified client identity: {}...", &client_fingerprint[..8]);
+
+    // 12. Display Fingerprint & Wait for Confirmation
     to_app_tx
         .send(SessionEvent::NewConnection {
             peer_addr: peer_addr.to_string(),
             fingerprint: client_fingerprint,
-            chat_id, // use host session's chat id to avoid creating a second chat
+            chat_id, 
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
-        
-    // 9. Generate ephemeral X25519 keypair for forward secrecy
-    let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
-    tracing::debug!("Generated host ephemeral X25519 keypair");
-
-    // 10. Send host ephemeral public key
-    let host_ephemeral_msg = ProtocolMessage::EphemeralKey {
-        public_key: host_ephemeral_public.as_bytes().to_vec(),
-    };
-    send_packet(&mut stream, &host_ephemeral_msg.to_plain_bytes()).await?;
-    tracing::debug!("Sent host ephemeral public key");
-
-    // 11. Receive client ephemeral public key
-    let client_ephemeral_bytes = recv_packet(&mut stream).await?;
-    let client_ephemeral_msg = ProtocolMessage::from_plain_bytes(&client_ephemeral_bytes)
-        .ok_or_else(|| anyhow!("Failed to parse client ephemeral key"))?;
-
-    let client_ephemeral_public = match client_ephemeral_msg {
-        ProtocolMessage::EphemeralKey { public_key } => parse_x25519_public(&public_key)?,
-        _ => return Err(anyhow!("Expected EphemeralKey message")),
-    };
-    tracing::debug!("Received client ephemeral public key");
-
-    // 12. Derive session key using ECDH + HKDF
-    let aes_key = Zeroizing::new(derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO));
-    tracing::info!("Derived session key using X25519 ECDH + HKDF (forward secrecy enabled)");
-
-    let cipher = AesCipher::new(&aes_key[..])?;
 
     // 13. Enter message loop
     to_app_tx
@@ -158,7 +194,7 @@ pub async fn run_host_session(
     run_message_loop(stream, cipher, to_app_tx, from_app_rx).await
 }
 
-/// Run client session: connect, handshake, message loop
+/// Run client session: connect, handshake (v3), message loop
 pub async fn run_client_session(
     host: &str,
     port: u16,
@@ -178,64 +214,88 @@ pub async fn run_client_session(
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // 2. Receive host RSA public key (for identity/fingerprint)
-    let host_pub_pem = recv_packet(&mut stream).await?;
-    let host_pub_pem_str = String::from_utf8(host_pub_pem)?;
-    let host_pubkey = pem_decode_public(&host_pub_pem_str)?;
-    let host_fingerprint = fingerprint_pubkey(host_pub_pem_str.as_bytes());
-    tracing::debug!(
-        "Received host RSA public key, fingerprint: {}",
-        host_fingerprint
-    );
-
-    // 3. Send client RSA public key
-    let client_pub_pem = pem_encode_public(&RsaPublicKey::from(&privkey))?;
-    send_packet(&mut stream, client_pub_pem.as_bytes()).await?;
-    tracing::debug!("Sent client RSA public key");
+    // --- HANDSHAKE v3 (ECDH First) ---
     
-    // 4. Receive signed host protocol version
-    let host_signed_version_bytes = recv_packet(&mut stream).await?;
-    let host_signed_version: SignedVersion = bincode::deserialize(&host_signed_version_bytes)?;
-    
-    let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey.clone());
-    let mut host_hasher = Sha256::new();
-    host_hasher.update(host_signed_version.version.to_be_bytes());
-    let host_hashed_version = host_hasher.finalize();
-
-    verifying_key.verify(&host_hashed_version, &rsa::pss::Signature::try_from(host_signed_version.signature.as_slice())?)
-        .map_err(|e| anyhow!("Host version signature verification failed: {}", e))?;
-    
-    let host_version = host_signed_version.version;
-
+    // 2. Receive Host Protocol Version
+    let host_version_bytes = recv_packet_with_timeout(&mut stream).await?;
+    if host_version_bytes.len() != 4 {
+        return Err(anyhow!("Invalid version packet length"));
+    }
+    let host_version = u32::from_be_bytes(host_version_bytes.try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
     tracing::info!("Host protocol version: {}", host_version);
 
-    // Check version compatibility
-    if host_version < 2 {
-        return Err(anyhow!(
-            "Host version {} not supported (need v2+)",
-            host_version
-        ));
+    if host_version < 3 {
+        return Err(anyhow!("Host version {} too old (need v3+)", host_version));
     }
 
-    // 5. Send signed client protocol version
+    // 3. Send Client Protocol Version
     let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
-    let mut hasher = Sha256::new();
-    hasher.update(version_bytes);
-    let hashed_version = hasher.finalize();
+    send_packet(&mut stream, &version_bytes).await?;
 
+    // 4. Receive Host Ephemeral Public Key
+    let host_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
+    if host_ephemeral_bytes.len() != 32 {
+        return Err(anyhow!("Invalid ephemeral key length"));
+    }
+    let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
+
+    // 5. Generate Client Ephemeral Keys
+    let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
+    let client_ephemeral_bytes = client_ephemeral_public.as_bytes();
+    
+    // 6. Send Client Ephemeral Public Key
+    send_packet(&mut stream, client_ephemeral_bytes).await?;
+    
+    // 7. Derive Session Key & Init Cipher
+    let aes_key = Zeroizing::new(derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO));
+    let cipher = AesCipher::new(&aes_key[..])?;
+    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
+
+    // --- ENCRYPTED IDENTITY EXCHANGE ---
+    
+    // 8. Receive Host Identity Proof (Encrypted)
+    let encrypted_host_proof = recv_packet_with_timeout(&mut stream).await?;
+    let host_proof_bytes = cipher.decrypt(&encrypted_host_proof)
+        .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
+    let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    
+    // 9. Verify Host Identity
+    let host_pubkey = pem_decode_public(&host_proof.public_key_pem)?;
+    let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey.clone());
+    
+    // Verify signature: It must verify the HOST'S ephemeral key
+    let mut host_hasher = Sha256::new();
+    host_hasher.update(b"IDENTITY_PROOF");
+    host_hasher.update(&host_ephemeral_bytes); // Verify against what we received earlier
+    let host_digest = host_hasher.finalize();
+    
+    verifying_key.verify(&host_digest, &rsa::pss::Signature::try_from(host_proof.signature.as_slice())?)
+         .map_err(|e| anyhow!("Host identity signature verification failed: {}", e))?;
+
+    let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
+    tracing::debug!("Verified host identity: {}...", &host_fingerprint[..8]);
+
+    // 10. Create Identity Proof
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());
     let mut rng = OsRng;
-    let signature = signing_key.sign_with_rng(&mut rng, &hashed_version);
+    let mut hasher = Sha256::new();
+    hasher.update(b"IDENTITY_PROOF");
+    hasher.update(client_ephemeral_bytes); // Bind to my ephemeral key
+    let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
 
-    let signed_version = SignedVersion {
-        version: PROTOCOL_VERSION as u32,
+    let my_proof = IdentityProof {
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
         signature: signature.to_vec(),
+        version: PROTOCOL_VERSION as u32,
+        chat_id,
     };
-    let signed_version_bytes = bincode::serialize(&signed_version)?;
-    send_packet(&mut stream, &signed_version_bytes).await?;
-    tracing::debug!("Sent signed protocol version: {}", PROTOCOL_VERSION);
+    
+    // Serialize & Encrypt Proof
+    let my_proof_bytes = bincode::serialize(&my_proof)?;
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+    send_packet(&mut stream, &encrypted_proof).await?;
 
-    // 6. Display fingerprint and wait for confirmation
+    // 11. Display Fingerprint & Wait for Confirmation
     to_app_tx
         .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: host_fingerprint.clone(),
@@ -244,8 +304,7 @@ pub async fn run_client_session(
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
         
-    // Wait up to 5 minutes for user confirmation. If accepted -> proceed.
-    // If explicitly rejected, timeout, or channel closed -> REJECT connection (security fix).
+    // Wait up to 5 minutes for user confirmation
     match tokio::time::timeout(tokio::time::Duration::from_secs(300), async {
         confirm_rx.recv().await
     })
@@ -256,56 +315,20 @@ pub async fn run_client_session(
         }
         Ok(Some(false)) => {
             tracing::warn!("User rejected fingerprint for chat {}", chat_id);
-            let _ = to_app_tx.send(SessionEvent::Error(
-                "Fingerprint rejected by user".to_string(),
-            ));
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
             return Err(anyhow!("Fingerprint rejected by user"));
         }
         Ok(None) => {
-            let msg = "Confirmation channel closed - REJECTING connection for security";
-            tracing::error!("{}", msg);
+            let msg = "Confirmation channel closed";
             let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
             return Err(anyhow!("Fingerprint verification failed: channel closed"));
         }
         Err(_) => {
-            let msg = "Fingerprint verification timed out (5 min) - REJECTING connection for security";
-            tracing::error!("{}", msg);
+            let msg = "Fingerprint verification timed out";
             let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
             return Err(anyhow!("Fingerprint verification timed out"));
         }
     }
-
-    // 7. Send chat_id to host
-    send_packet(&mut stream, chat_id.as_bytes()).await?;
-    tracing::debug!("Sent chat_id to host: {}", chat_id);
-
-    // 8. Receive host ephemeral public key
-    let host_ephemeral_bytes = recv_packet(&mut stream).await?;
-    let host_ephemeral_msg = ProtocolMessage::from_plain_bytes(&host_ephemeral_bytes)
-        .ok_or_else(|| anyhow!("Failed to parse host ephemeral key"))?;
-
-    let host_ephemeral_public = match host_ephemeral_msg {
-        ProtocolMessage::EphemeralKey { public_key } => parse_x25519_public(&public_key)?,
-        _ => return Err(anyhow!("Expected EphemeralKey message")),
-    };
-    tracing::debug!("Received host ephemeral public key");
-
-    // 9. Generate ephemeral X25519 keypair for forward secrecy
-    let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
-    tracing::debug!("Generated client ephemeral X25519 keypair");
-
-    // 10. Send client ephemeral public key
-    let client_ephemeral_msg = ProtocolMessage::EphemeralKey {
-        public_key: client_ephemeral_public.as_bytes().to_vec(),
-    };
-    send_packet(&mut stream, &client_ephemeral_msg.to_plain_bytes()).await?;
-    tracing::debug!("Sent client ephemeral public key");
-
-    // 11. Derive session key using ECDH + HKDF
-    let aes_key = Zeroizing::new(derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO));
-    tracing::info!("Derived session key using X25519 ECDH + HKDF (forward secrecy enabled)");
-
-    let cipher = AesCipher::new(&aes_key[..])?;
 
     // 12. Enter message loop
     to_app_tx
@@ -346,7 +369,7 @@ where
                                 }
                             } else {
                                 tracing::warn!("Failed to parse message from {} bytes", plaintext.len());
-                                tracing::debug!("Raw plaintext: {:?}", String::from_utf8_lossy(&plaintext));
+                                tracing::debug!("Raw plaintext (truncated): {:.64}", String::from_utf8_lossy(&plaintext));
                             }
                         } else {
                             tracing::error!("Decryption failed - possible tampering or key mismatch!");
@@ -394,7 +417,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::generate_rsa_keypair;
+    use crate::core::{generate_rsa_keypair, IdentityProof};
     use crate::RSA_KEY_BITS;
     use anyhow::Result;
 
@@ -407,74 +430,94 @@ mod tests {
 
         // Host side
         let host_handle = tokio::spawn(async move {
-            // 1. Exchange RSA pubkeys for identity
-            let host_pub_pem = pem_encode_public(&RsaPublicKey::from(&host_privkey))?;
-            send_packet(&mut host_stream, host_pub_pem.as_bytes()).await?;
-            let client_pub_pem = recv_packet(&mut host_stream).await?;
-            let _client_pubkey =
-                pem_decode_public(&String::from_utf8(client_pub_pem)?)?;
+            // 1. Send/Recv Version
+            send_packet(&mut host_stream, &(PROTOCOL_VERSION as u32).to_be_bytes()).await?;
+            let _client_version = recv_packet(&mut host_stream).await?;
 
-            // 2. Exchange ephemeral keys
+            // 2. Exchange ephemeral keys (Raw Bytes)
             let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
-            let host_ephemeral_msg = ProtocolMessage::EphemeralKey {
-                public_key: host_ephemeral_public.as_bytes().to_vec(),
-            };
-            send_packet(&mut host_stream, &host_ephemeral_msg.to_plain_bytes()).await?;
-
+            send_packet(&mut host_stream, host_ephemeral_public.as_bytes()).await?;
             let client_ephemeral_bytes = recv_packet(&mut host_stream).await?;
-            let client_ephemeral_msg =
-                ProtocolMessage::from_plain_bytes(&client_ephemeral_bytes)
-                    .ok_or_else(|| anyhow!("Host failed to parse client ephemeral key"))?;
+            let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
-            let client_ephemeral_public = match client_ephemeral_msg {
-                ProtocolMessage::EphemeralKey { public_key } => parse_x25519_public(&public_key)?,
-                _ => return Err(anyhow!("Host expected EphemeralKey message")),
+            // 3. Derive key
+            let host_aes_key = derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO);
+            let cipher = AesCipher::new(&host_aes_key)?;
+
+            // 4. Send Identity Proof (Encrypted)
+            let signing_key = SigningKey::<Sha256>::new(host_privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(host_ephemeral_public.as_bytes());
+            let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+
+            let my_proof = IdentityProof {
+                public_key_pem: pem_encode_public(&RsaPublicKey::from(&host_privkey))?,
+                signature: signature.to_vec(),
+                version: PROTOCOL_VERSION as u32,
+                chat_id: uuid::Uuid::new_v4(),
             };
+            let my_proof_bytes = bincode::serialize(&my_proof)?;
+            let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+            send_packet(&mut host_stream, &encrypted_proof).await?;
 
-            // 3. Derive final key
-            let host_aes_key =
-                derive_session_key(host_ephemeral_secret, &client_ephemeral_public, HKDF_INFO);
+            // 5. Recv Client Identity Proof (Encrypted)
+            let encrypted_client_proof = recv_packet(&mut host_stream).await?;
+            let client_proof_bytes = cipher.decrypt(&encrypted_client_proof).unwrap();
+            let _client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
 
             Ok(host_aes_key)
         });
 
         // Client side
         let client_handle = tokio::spawn(async move {
-            // 1. Exchange RSA pubkeys for identity
-            let _host_pub_pem = recv_packet(&mut client_stream).await?;
-            let client_pub_pem = pem_encode_public(&RsaPublicKey::from(&client_privkey))?;
-            send_packet(&mut client_stream, client_pub_pem.as_bytes()).await?;
+            // 1. Recv/Send Version
+            let _host_version = recv_packet(&mut client_stream).await?;
+            send_packet(&mut client_stream, &(PROTOCOL_VERSION as u32).to_be_bytes()).await?;
 
-            // 2. Exchange ephemeral keys
+            // 2. Exchange ephemeral keys (Raw Bytes)
             let host_ephemeral_bytes = recv_packet(&mut client_stream).await?;
-            let host_ephemeral_msg =
-                ProtocolMessage::from_plain_bytes(&host_ephemeral_bytes)
-                    .ok_or_else(|| anyhow!("Client failed to parse host ephemeral key"))?;
-            let host_ephemeral_public = match host_ephemeral_msg {
-                ProtocolMessage::EphemeralKey { public_key } => parse_x25519_public(&public_key)?,
-                _ => return Err(anyhow!("Client expected EphemeralKey message")),
-            };
-
+            let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
+            
             let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
-            let client_ephemeral_msg = ProtocolMessage::EphemeralKey {
-                public_key: client_ephemeral_public.as_bytes().to_vec(),
-            };
-            send_packet(&mut client_stream, &client_ephemeral_msg.to_plain_bytes()).await?;
+            send_packet(&mut client_stream, client_ephemeral_public.as_bytes()).await?;
 
-            // 3. Derive final key
-            let client_aes_key = derive_session_key(
-                client_ephemeral_secret,
-                &host_ephemeral_public,
-                HKDF_INFO,
-            );
+            // 3. Derive key
+            let client_aes_key = derive_session_key(client_ephemeral_secret, &host_ephemeral_public, HKDF_INFO);
+            let cipher = AesCipher::new(&client_aes_key)?;
+
+            // 4. Recv Host Identity Proof (Encrypted)
+            let encrypted_host_proof = recv_packet(&mut client_stream).await?;
+            let host_proof_bytes = cipher.decrypt(&encrypted_host_proof).unwrap();
+            let _host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+
+            // 5. Send Client Identity Proof (Encrypted)
+            let signing_key = SigningKey::<Sha256>::new(client_privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(client_ephemeral_public.as_bytes());
+            let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+
+            let my_proof = IdentityProof {
+                public_key_pem: pem_encode_public(&RsaPublicKey::from(&client_privkey))?,
+                signature: signature.to_vec(),
+                version: PROTOCOL_VERSION as u32,
+                chat_id: uuid::Uuid::new_v4(),
+            };
+            let my_proof_bytes = bincode::serialize(&my_proof)?;
+            let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+            send_packet(&mut client_stream, &encrypted_proof).await?;
+
             Ok(client_aes_key)
         });
 
-        let host_aes_res = host_handle.await?;
-        let client_aes_res = client_handle.await?;
+        let host_aes_res: Result<[u8; 32]> = host_handle.await.unwrap();
+        let client_aes_res: Result<[u8; 32]> = client_handle.await.unwrap();
 
-        let host_aes = host_aes_res?;
-        let client_aes = client_aes_res?;
+        let host_aes = host_aes_res.unwrap();
+        let client_aes = client_aes_res.unwrap();
 
         // Keys should match
         assert_eq!(host_aes, client_aes);
@@ -482,3 +525,4 @@ mod tests {
         Ok(())
     }
 }
+

@@ -28,8 +28,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 
 ### ⚠️ Known Limitations & Areas for Improvement
 
-1. **Manual IP Exchange**: (Solved by mDNS for local network, still relevant for WAN).
-2. **DoS Vulnerability**: No protection against simple DoS attacks via connection flooding.
+1. **Internet Peer Discovery**: Determining peers over the internet (outside LAN) still requires manual IP exchange or port forwarding. NAT traversal is scheduled for v2.0.
 
 ---
 
@@ -63,16 +62,25 @@ The roadmap is organized into prioritized sprints, focusing on delivering the mo
     - Automatically discovers peers on the local network.
     - "Nearby Users" list in Connect dialog.
 
-### 🏃 Sprint 3: Application Hardening (In Progress)
+### 🔥 Sprint 3: Application Hardening & Privacy (Completed)
 
-*Goal: Make the application resilient and stable.*
+*Goal: Make the application resilient, stable, and completely private.*
 
-1. **Error Handling Refactor**: ✅ **Completed**
-    - Removed unsafe `.unwrap()` calls from critical paths.
+1. **Protocol v3 Privacy Upgrade**: ✅ **Completed** (Dec 2025)
+    - **Feature**: Implemented ECDH-first handshake to encrypt identity exchanges.
+    - **Impact**: Eliminates metadata leakage (passersby cannot see who is talking to whom).
 
-2. **Connection Rate Limiting**:
-    - **Task**: Implement a mechanism to limit the number of incoming connection attempts from a single IP address.
-    - **Why**: Provides basic protection against simple Denial of Service (DoS) attacks.
+2. **DoS Protection**: ✅ **Completed** (Dec 2025)
+    - **Feature**: Global connection rate limiting and strict handshake timeouts.
+    - **Impact**: Protects against flooding and slowloris attacks.
+
+3. **Memory Hygiene**: ✅ **Completed** (Dec 2025)
+    - **Feature**: Self-wiping memory for private keys using `Zeroize`.
+    - **Impact**: Protects against memory dump attacks.
+
+4. **Error Handling Refactor**: ✅ **Completed** (Dec 2025)
+    - **Feature**: Removed unsafe `.unwrap()` calls from critical paths.
+    - **Impact**: Prevents crashes and undefined behavior.
 
 ### 🏃 Sprint 4: Power-User Features & Long-Term Security (Future)
 

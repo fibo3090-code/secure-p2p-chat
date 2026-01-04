@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version for forward compatibility
-pub const PROTOCOL_VERSION: u8 = 2;
+/// 
+/// Version 3: ECDH-first handshake (Encrypted Identity Exchange)
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Protocol messages exchanged between peers
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub enum ProtocolMessage {
     /// Protocol version announcement (first message)
     Version { version: u8 },
@@ -32,6 +34,49 @@ pub enum ProtocolMessage {
 
     /// Typing indicator - user stopped typing
     TypingStop { seq: u64 },
+}
+
+impl std::fmt::Debug for ProtocolMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version { version } => f.debug_struct("Version").field("version", version).finish(),
+            Self::EphemeralKey { public_key } => f.debug_struct("EphemeralKey").field("public_key_len", &public_key.len()).finish(),
+            Self::Text { seq, timestamp, .. } => f.debug_struct("Text")
+                .field("seq", seq)
+                .field("timestamp", timestamp)
+                .field("text", &"***REDACTED***")
+                .finish(),
+            Self::FileMeta { filename, size, seq } => f.debug_struct("FileMeta")
+                .field("seq", seq)
+                .field("filename", filename)
+                .field("size", size)
+                .finish(),
+            Self::FileChunk { seq, chunk } => f.debug_struct("FileChunk")
+                .field("seq", seq)
+                .field("chunk_len", &chunk.len())
+                .finish(),
+            Self::FileEnd { seq } => f.debug_struct("FileEnd").field("seq", seq).finish(),
+            Self::Ping { seq } => f.debug_struct("Ping").field("seq", seq).finish(),
+            Self::TypingStart { seq } => f.debug_struct("TypingStart").field("seq", seq).finish(),
+            Self::TypingStop { seq } => f.debug_struct("TypingStop").field("seq", seq).finish(),
+        }
+    }
+}
+
+/// Identity Proof for Encrypted Handshake (Protocol v3)
+/// Sent inside the encrypted tunnel to prove identity.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IdentityProof {
+    /// Public Key PEM (Identity)
+    pub public_key_pem: String,
+    /// Signature of the Ephemeral Public Key used in this session
+    /// Signed by the Identity Private Key.
+    /// Format: Sign(SHA256("IDENTITY_PROOF" || ephemeral_pubkey))
+    pub signature: Vec<u8>,
+    /// Protocol Version
+    pub version: u32,
+    /// Chat ID (optional here, or separate message)
+    pub chat_id: uuid::Uuid,
 }
 
 impl ProtocolMessage {

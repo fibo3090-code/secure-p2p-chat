@@ -31,6 +31,9 @@ where
 
 /// Receive a length-prefixed packet from TCP
 /// Format: 4 bytes big-endian length || payload
+/// 
+/// SECURITY: Uses chunked reading to prevent DoS via allocation pressure.
+/// Instead of pre-allocating the full buffer, we read in chunks.
 pub async fn recv_packet<S>(stream: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
@@ -38,21 +41,32 @@ where
     // Read length header
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
-    let len = u32::from_be_bytes(header) as usize;
+    let total_len = u32::from_be_bytes(header) as usize;
 
     // Validate length
-    if len > MAX_PACKET_SIZE {
+    if total_len > MAX_PACKET_SIZE {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("packet size exceeds limit: {} > {}", len, MAX_PACKET_SIZE),
+            format!("packet size exceeds limit: {} > {}", total_len, MAX_PACKET_SIZE),
         ));
     }
 
-    // Read payload
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
+    // Use chunked reading to prevent DoS via allocation pressure
+    // Start with a small buffer and grow as data arrives
+    const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
+    let mut buf = Vec::with_capacity(CHUNK_SIZE.min(total_len));
+    let mut remaining = total_len;
 
-    tracing::trace!("Received packet: {} bytes", len);
+    while remaining > 0 {
+        let to_read = remaining.min(CHUNK_SIZE);
+        let start = buf.len();
+        buf.resize(start + to_read, 0);
+        
+        stream.read_exact(&mut buf[start..]).await?;
+        remaining -= to_read;
+    }
+
+    tracing::trace!("Received packet: {} bytes", total_len);
     Ok(buf)
 }
 
