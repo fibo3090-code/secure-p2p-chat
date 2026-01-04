@@ -116,9 +116,11 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
             ui.add_space(5.0);
 
             // File preview if selected
-            if app.file_to_send.is_some() {
-                let file_path = app.file_to_send.clone().unwrap();
-                let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
+            if let Some(file_path) = app.file_to_send.clone() {
+                let filename = file_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 ui.horizontal(|ui| {
                     ui.label("📎 File to send:");

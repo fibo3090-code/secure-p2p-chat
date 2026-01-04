@@ -1,4 +1,5 @@
 use crate::app::ChatManager;
+use crate::network::{Discovery, DiscoveredPeer};
 use crate::types::*;
 
 use crate::PORT_DEFAULT;
@@ -6,7 +7,7 @@ use crate::PORT_DEFAULT;
 use eframe::egui;
 use egui_tracing::tracing::EventCollector;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -71,6 +72,10 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub is_new_identity: bool,
     pub qr_code_texture: Option<egui::TextureHandle>,
+    /// Discovered peers on the local network via mDNS.
+    pub discovered_peers: Arc<StdMutex<Vec<DiscoveredPeer>>>,
+    /// mDNS Discovery service instance.
+    pub discovery: Option<Discovery>,
 }
 
 impl App {
@@ -268,6 +273,8 @@ impl App {
             toasts: Vec::new(),
             is_new_identity,
             qr_code_texture: None,
+            discovered_peers: Arc::new(StdMutex::new(Vec::new())),
+            discovery: Discovery::new().ok(),
         }
     }
 

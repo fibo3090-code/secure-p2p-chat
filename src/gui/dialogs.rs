@@ -328,10 +328,38 @@ fn render_host_dialog(app: &mut App, ctx: &egui::Context) {
 }
 
 fn render_connect_dialog(app: &mut App, ctx: &egui::Context) {
+    // Poll for discovered peers
+    if let Some(ref discovery) = app.discovery {
+        discovery.poll(&app.discovered_peers);
+    }
+
     egui::Window::new("Connect to Host")
         .collapsible(false)
         .resizable(false)
+        .min_width(350.0)
         .show(ctx, |ui| {
+            // Show discovered peers
+            let peers = app.discovered_peers.lock().ok().map(|p| p.clone()).unwrap_or_default();
+            if !peers.is_empty() {
+                ui.heading("📡 Nearby Users");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                    for peer in &peers {
+                        ui.horizontal(|ui| {
+                            let label = format!("{} ({}:{})", peer.name, peer.address, peer.port);
+                            if ui.button(&label).clicked() {
+                                app.connect_host = peer.address.clone();
+                                app.connect_port = peer.port.to_string();
+                            }
+                        });
+                    }
+                });
+                ui.separator();
+            } else {
+                ui.label(egui::RichText::new("🔍 Searching for nearby users...").italics().color(crate::gui::styling::SUBTLE_TEXT_COLOR));
+                ui.add_space(8.0);
+            }
+
             ui.label("Host:");
             ui.text_edit_singleline(&mut app.connect_host);
 

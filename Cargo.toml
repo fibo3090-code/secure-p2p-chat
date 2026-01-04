@@ -1,6 +1,6 @@
 [package]
 name = "encodeur_rsa_rust"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 authors = ["fibo3090 <fibo3090@.com>"]
 description = "Encrypted P2P Messenger - A secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
@@ -66,6 +66,10 @@ qrcode = "0.14.0"
 image = "0.25.9"
 arboard = "3"
 chacha20poly1305 = "0.10.1"
+
+# Local peer discovery (mDNS/Bonjour)
+mdns-sd = "0.11"
+hostname = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"
