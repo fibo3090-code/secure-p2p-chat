@@ -15,7 +15,7 @@ This document outlines the development roadmap for the Encrypted P2P Messenger, 
 
 ---
 
-## 📊 Current Status (v1.5.0)
+## 📊 Current Status (v1.6.0)
 
 ### ✅ What Works
 
