@@ -35,6 +35,7 @@ chat-p2p/
 │   │   └── protocol.rs (Message types)
 │   │
 │   ├── network/ (Network Layer)
+│   │   ├── discovery.rs (mDNS Peer Discovery)
 │   │   └── session.rs (TCP sessions, handshake)
 │   │
 │   ├── transfer/ (File Transfer Layer)
@@ -77,6 +78,7 @@ chat-p2p/
 * **`src/core/crypto.rs` - Cryptography**: All cryptographic operations (RSA, AES-GCM, X25519).
 * **`src/core/protocol.rs` - Wire Protocol**: Message serialization and deserialization.
 * **`src/network/session.rs` - Network Sessions**: TCP connection management and handshake logic.
+* **`src/network/discovery.rs` - Peer Discovery**: Handles mDNS/Bonjour broadcasting and discovery of local peers.
 * **`src/transfer/` - File Transfer**: Chunked file sending and receiving.
 * **`src/types.rs` - Data Structures**: Shared types used throughout the application (`Chat`, `Message`, `Contact`).
 

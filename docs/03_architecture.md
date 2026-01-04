@@ -23,6 +23,7 @@ The project is organized into the following directory structure:
 │   │   └── protocol.rs (Message types)
 │   │
 │   ├── network/ (Network Layer)
+│   │   ├── discovery.rs (mDNS Peer Discovery)
 │   │   └── session.rs (TCP sessions, handshake)
 │   │
 │   ├── transfer/ (File Transfer Layer)
@@ -72,6 +73,7 @@ The application is designed with a clear separation of concerns, following a lay
 - **`src/core/protocol.rs` - Wire Protocol**: Defines the structure of messages that are sent over the network. It uses `serde` for serialization and deserialization of these messages.
 
 - **`src/network/session.rs` - Network Sessions**: Manages the lifecycle of a TCP connection between two peers. This includes the secure handshake process, sending and receiving messages, and handling connection errors.
+- **`src/network/discovery.rs` - Peer Discovery**: Uses mDNS-SD (Bonjour) to broadcast presence and discover other peers on the local network.
 
 - **`src/transfer/` - File Transfer**: This module implements the logic for sending and receiving large files by breaking them down into smaller chunks.
 

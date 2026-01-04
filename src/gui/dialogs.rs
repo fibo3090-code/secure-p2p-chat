@@ -146,9 +146,10 @@ fn render_welcome(app: &mut App, ctx: &egui::Context) {
 
             ui.label("🔒 End-to-end encryption with RSA-2048 & AES-256-GCM");
             ui.label("🔐 Forward secrecy with X25519 ECDH (protects past messages)");
+            ui.label("📡 Local Peer Discovery: Automatically find peers nearby");
             ui.label("📁 Secure file transfer with progress tracking");
             ui.label("👥 Direct peer-to-peer connections (no server!)");
-            ui.label("🛡️ Fingerprint verification for security");
+            ui.label("🛡️ Fingerprint verification & Trust-on-First-Use (TOFU)");
             ui.label("💾 Message history persistence");
             ui.label("😊 Emoji picker, typing indicators, desktop notifications");
 
@@ -161,17 +162,17 @@ fn render_welcome(app: &mut App, ctx: &egui::Context) {
 
             ui.label("1️⃣ Host Mode: Start hosting to accept connections");
             ui.label("   • Click 'Connection' → 'Start Host'");
-            ui.label("   • Share your IP address with others");
+            ui.label("   • You'll automatically appear to others on your local network!");
             ui.add_space(5.0);
 
-            ui.label("2️⃣ Client Mode: Connect to someone hosting");
+            ui.label("2️⃣ Client Mode: Connect to someone");
             ui.label("   • Click 'Connection' → 'Connect to Host'");
-            ui.label("   • Enter the host's IP address and port");
+            ui.label("   • Pick a peer from the list or enter an address manually");
             ui.add_space(5.0);
 
-            ui.label("3️⃣ Verify Fingerprints: Always verify the fingerprint!");
-            ui.label("   • Compare fingerprints via another channel");
-            ui.label("   • This protects against man-in-the-middle attacks");
+            ui.label("3️⃣ Security: Trust on First Use");
+            ui.label("   • The first time you connect, we save the peer's fingerprint.");
+            ui.label("   • If it changes later, we'll warn you!");
 
             ui.add_space(15.0);
             ui.separator();
