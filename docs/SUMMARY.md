@@ -58,14 +58,14 @@ The application follows a layered architecture:
 
 ## Protocol
 
-The application uses a custom TCP-based protocol (version 2) with the following characteristics:
+The application uses a custom TCP-based protocol (version 3) with the following characteristics:
 
 - **Length-Prefixed Framing**: Each message is prefixed with its length.
-- **Secure Handshake**: A multi-step handshake process establishes a secure session, including:
-  - Version negotiation to prevent downgrade attacks.
-  - Exchange of RSA public keys for identity verification.
-  - Exchange of ephemeral X25519 keys to ensure forward secrecy.
-  - Derivation of a session-specific AES key using HKDF.
+- **Secure Handshake (ECDH-First)**:
+  - Exchange of ephemeral X25519 keys (Plaintext).
+  - Encrypted Tunnel Establishment (AES-GCM).
+  - Exchange of RSA identity proofs *inside* the tunnel (Metadata Protection).
+  - Session key derivation using HKDF.
 
 ## Contribution and Development
 
@@ -79,9 +79,9 @@ The project has clear guidelines for contributions, including:
 
 The project has an ambitious roadmap for future development:
 
-- **v1.4.0** (Current): Usability improvements and security fixes
+- **v1.6.0** (Current): Protocol v3 privacy upgrade and security hardening
 - **v2.0**: The Professional Release
-  - Automatic peer discovery (mDNS)
+  - Automatic peer discovery (mDNS) - *Partially implemented in 1.5.0*
   - NAT traversal for internet connectivity
   - Message search and moderation tools
 - **v3.0**: The Next Generation
@@ -96,35 +96,24 @@ Security is a primary focus of the project, with:
 - A detailed **threat model** that considers eavesdropping, tampering, and key compromise.
 - A strong emphasis on **fingerprint verification** to prevent man-in-the-middle attacks.
 - A responsible **vulnerability disclosure policy**.
-- **Current Security Status**: MEDIUM risk (improved from CRITICAL)
-  - 7 out of 14 vulnerabilities fixed (50%)
+- **Current Security Status**: HIGH risk (improved from MEDIUM)
+  - 13 out of 14 vulnerabilities fixed (92%)
   - All critical issues resolved (2/2)
-  - Most high-priority issues resolved (4/5)
+  - All high-priority issues resolved (5/5)
 
-## Recent Updates (December 2024)
+## Recent Updates (January 2026)
 
-### Documentation Consolidation
+### Security Hardening (v1.6.0)
 
-- Merged security documentation into comprehensive SECURITY.md
-- Consolidated design documentation (DESIGN_NOTES.md + ui_ux_principles.md)
-- Organized detailed security reports in docs/ folder
-- Updated all cross-references and links
-- Removed redundant and temporary files
+- **Protocol v3 Privacy Upgrade**: Identity exchange is now encrypted, protecting user metadata from eavesdroppers.
+- **Robustness**: Eliminated crashing bugs by removing pervasive `unwrap()` calls in network handling.
+- **DoS Protection**: Implemented streaming packet reads and strict handshake timeouts to prevent denial-of-service attacks.
+- **Memory Safety**: Integrated `zeroize` to wipe sensitive keys from memory when not in use.
 
-### Security Improvements
+### Previous Updates (v1.5.0)
 
-- Encrypted chat history at rest (ChaCha20-Poly1305)
-- Replay attack protection (sequence numbers)
-- Counter-based nonces for AES-GCM
-- Thread-safe implementation (no unsafe code)
-- Fingerprint verification enforcement
-
-### Compilation Fixes
-
-- Rust 2021 compatibility (let chains → nested if-let)
-- Deprecated API fixes (ChaCha20-Poly1305)
-- Unreachable code removal
-- Project now compiles successfully
+- **Local Peer Discovery**: mDNS implementation for auto-discovering peers on LAN.
+- **App Hardening**: Initial round of stability improvements.
 
 ---
 

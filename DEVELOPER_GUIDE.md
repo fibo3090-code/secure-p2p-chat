@@ -119,15 +119,25 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 3. Send header: 4 bytes big-endian = `payload.len() as u32`.
 4. Send `payload`.
 
-#### Handshake (Protocol v2)
+#### Handshake (Protocol v3)
 
-1. **RSA Public Key Exchange**: For identity and fingerprint verification.
-2. **Signed Version Negotiation**: Both peers exchange and verify the protocol version. The version is signed with the sender's private RSA key to prevent tampering.
-3. **X25519 Ephemeral Key Exchange**: For forward secrecy.
-4. **ECDH Computation**: A shared secret is computed.
-5. **HKDF-SHA256 Key Derivation**: The final AES session key is derived.
-6. **Chat ID Exchange**: The client sends the `chat_id` to the host to synchronize the chat session.
-7. **Encrypted Communication**: All further communication is encrypted with the session key.
+1. **Version Exchange**: Peers exchange `u32` (Big Endian) protocol version. Must be >= 3.
+2. **Ephemeral Key Exchange (Plaintext)**:
+   * Peers exchange 32-byte X25519 ephemeral public keys.
+   * These keys are unique to the session.
+3. **Session Key Derivation**:
+   * `SharedSecret = ECDH(MyEphemeralPriv, PeerEphemeralPub)`
+   * `SessionKey = HKDF-SHA256(SharedSecret)`
+   * An encrypted tunnel (AES-256-GCM) is established immediately.
+4. **Encrypted Identity Exchange**:
+   * Peers exchange `IdentityProof` messages inside the encrypted tunnel.
+   * `IdentityProof` contains:
+     * `public_key_pem`: RSA Identity Key.
+     * `signature`: `RSA_Sign(SHA256("IDENTITY_PROOF" || MyEphemeralPub))`
+   * The signature binds the ephemeral key to the long-term identity, preventing MITM.
+5. **Fingerprint Verification**:
+   * The received RSA key fingerprint is checked against trusted contacts.
+   * If unknown, the user is prompted to verify and trust the new identity (TOFU).
 
 ### 3.4. Message Format
 

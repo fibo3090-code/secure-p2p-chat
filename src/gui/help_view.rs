@@ -38,7 +38,7 @@ fn render_about_tab(ui: &mut egui::Ui) {
                 .strong(),
         );
         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-        ui.label(egui::RichText::new("Security Status: MEDIUM").color(egui::Color32::from_rgb(230, 180, 0)));
+        ui.label(egui::RichText::new("Security Status: HIGH").color(egui::Color32::from_rgb(0, 200, 50)));
         ui.add_space(10.0);
         ui.label("A secure, private, and decentralized peer-to-peer messaging application.");
         ui.add_space(20.0);
@@ -63,6 +63,9 @@ fn render_about_tab(ui: &mut egui::Ui) {
     ui.group(|ui| {
         ui.heading("Recent Security Improvements");
         ui.add_space(5.0);
+        ui.label("✅ Protocol v3 Encrypted Identity (Metadata Protection)");
+        ui.label("✅ DoS Protection (Rate Limiting & Timeouts)");
+        ui.label("✅ Secure Memory Wiping (Zeroize)");
         ui.label("✅ Encrypted chat history at rest (ChaCha20-Poly1305)");
         ui.label("✅ Replay attack protection with sequence numbers");
         ui.label("✅ Counter-based nonces for AES-GCM");

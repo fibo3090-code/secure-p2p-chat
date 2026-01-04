@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-01-04
+
+### 🔐 Critical Security Upgrade: Protocol v3
+
+- **Encrypted Identity Exchange**: Implemented Protocol v3 where identity proofs are exchanged *inside* an encrypted tunnel. This prevents observers from seeing public keys or fingerprints (metadata protection).
+- **DoS Protection**:
+  - **Streaming Reads**: Protected against memory exhaustion attacks by validating packet headers before allocation.
+  - **Handshake Timeouts**: Enforced strict timeouts for all handshake steps.
+  - **Rate Limiting**: Added connection rate limiting per IP.
+- **Improved Robustness**: Removed over 100 `unwrap()` calls from critical network paths to prevent crashes on malformed data.
+- **Memory Hygiene**: Implemented `Zeroize` for sensitive keys to ensure they are wiped from memory.
+
+### 📝 Documentation
+
+- Updated `SECURITY.md`, `ROADMAP.md`, and `docs/04_protocol.md` to reflect the new security posture.
+
 ## [1.5.0] - 2025-12-20
 
 ### 🔐 Security & Hardening
