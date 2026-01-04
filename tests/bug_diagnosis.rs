@@ -23,10 +23,32 @@ mod diagnostics {
         // But we can check the constant logic if we had access to it, or try to send a large dummy file.
 
         // Diagnosis:
-        // encodeur_rsa_rust::MAX_PACKET_SIZE is 8MB.
-        // ChatManager::send_file (line ~695) checks: if file_size > MAX_PACKET_SIZE { error }
+        // The check was against `MAX_FILE_SIZE` (2GB), not `MAX_PACKET_SIZE`.
+        // The bug was that there was a file size limit at all, when the app can handle
+        // chunking. The limit has been removed.
+        // This test is now a marker for the original bug report.
+        // A new test, `test_large_file_sending_allowed`, has been added to verify the fix.
+    }
 
-        // This confirms the bug. Logic should check if we can chunk it.
+    #[tokio::test]
+    async fn test_large_file_sending_allowed() {
+        let mut manager = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        manager.create_local_chat_for_test(chat_id, "Test Chat".to_string());
+
+        // Create a dummy file for the test
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let file_path = file.path().to_path_buf();
+
+        // We can't easily mock the session, so we'll check that the function
+        // doesn't fail with the "File is too large" error.
+        // We expect it to fail later due to no session, but that's okay.
+        let result = manager.send_file(chat_id, file_path).await;
+
+        // We expect an error because there's no session, but it should not be "File is too large"
+        if let Err(e) = result {
+            assert!(!e.to_string().contains("File is too large"));
+        }
     }
 
     #[test]

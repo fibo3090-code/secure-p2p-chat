@@ -1261,12 +1261,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
 
                 ui.add_space(10.0);
 
-                ui.label("Maximum file size:");
-                let mut max_size_mb = (manager.config.max_file_size / (1024 * 1024)) as u32;
-                if ui.add(egui::Slider::new(&mut max_size_mb, 1..=10240).suffix(" MB")).changed() {
-                    manager.config.max_file_size = (max_size_mb as u64) * 1024 * 1024;
-                    let _ = manager.save_history(&app.history_path);
-                }
+
 
                 ui.add_space(10.0);
 

@@ -173,7 +173,6 @@ pub struct Config {
     pub download_dir: PathBuf,
     pub temp_dir: PathBuf,
     pub auto_accept_files: bool,
-    pub max_file_size: u64,
     pub enable_notifications: bool,
     pub enable_typing_indicators: bool,
     pub show_log_terminal: bool,
@@ -218,7 +217,6 @@ impl Default for Config {
             download_dir: PathBuf::from("Downloads"),
             temp_dir: PathBuf::from("temp"),
             auto_accept_files: false,
-            max_file_size: 1024 * 1024 * 1024, // 1 GB
             enable_notifications: true,
             enable_typing_indicators: true,
             show_log_terminal: false,

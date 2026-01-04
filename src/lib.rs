@@ -35,4 +35,5 @@ pub const AES_KEY_SIZE: usize = 32; // 256 bits
 pub const AES_NONCE_SIZE: usize = 12; // 96 bits (GCM standard)
 pub const RSA_KEY_BITS: usize = 2048;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
-pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024 * 1024 * 1024; // 100 TB
+

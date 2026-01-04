@@ -1,10 +1,14 @@
 # Changelog
----
-**Automated update:** Documentation reviewed and annotated on 2026-01-04. Please verify and commit if acceptable.
 
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [1.7.0] - 2026-01-04
+
+### 🐛 Bug Fixes
+
+- **Removed File Size Limit**: Removed the 2GB file size limit for transfers. The application now relies on chunking to send large files, so there is no hard-coded limit. This fixes a critical bug that prevented large files from being sent.
 
 ## [1.6.0] - 2026-01-04
 

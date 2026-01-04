@@ -19,15 +19,6 @@ pub struct IncomingFile {
 impl IncomingFile {
     /// Start receiving a file (create temporary file)
     pub async fn start_meta(filename: &str, size: u64, tmp_dir: &Path) -> Result<Self> {
-        // Validate file size against maximum allowed
-        if size > crate::MAX_FILE_SIZE {
-            anyhow::bail!(
-                "File size {} bytes exceeds maximum allowed {} bytes",
-                size,
-                crate::MAX_FILE_SIZE
-            );
-        }
-
         // Sanitize filename
         let safe_filename = sanitize_filename(filename);
 

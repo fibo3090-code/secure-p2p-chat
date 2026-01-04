@@ -875,23 +875,6 @@ impl ChatManager {
         let file_size = tokio::fs::metadata(&path).await?.len();
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
-        if file_size > crate::MAX_FILE_SIZE {
-            tracing::error!(
-                "File is too large to send: {} > {}",
-                file_size,
-                crate::MAX_FILE_SIZE
-            );
-            self.add_toast(
-                ToastLevel::Error,
-                format!(
-                    "File is too large ({} > {} bytes)",
-                    file_size,
-                    crate::MAX_FILE_SIZE
-                ),
-            );
-            return Err(anyhow::anyhow!("File is too large"));
-        }
-
         // Send file metadata
         let meta_msg = {
             let chat = self
