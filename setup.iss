@@ -1,15 +1,10 @@
 ; setup.iss - Inno Setup script for Encrypted P2P Messenger
-; Call: ISCC.exe /DMyAppVersion="1.4.0" setup.iss
+; Call: ISCC.exe /DMyAppVersion="1.7.1" setup.iss
 
 #define MyAppName "Encrypted P2P Messenger"
-#define MyAppVersion "1.4.0"
 #define MyAppPublisher "fibo3090"
 #define MyAppURL "https://github.com/fibo3090/secure-p2p-chat"
 #define MyAppExe "encodeur_rsa_rust.exe"
-
-#ifndef MyAppVersion
-  #define MyAppVersion "1.4.0"
-#endif
 
 ; Define icon only if it exists in dist
 #if FileExists("dist\encodeur_rsa_icon.ico")
@@ -24,6 +19,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
+UninstallDisplayName={#MyAppName} {#MyAppVersion}
 
 ; Installation Paths
 DefaultDirName={commonpf}\{#MyAppName}

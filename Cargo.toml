@@ -83,3 +83,6 @@ codegen-units = 1
 [features]
 default = []
 embed_fonts = []
+
+[windows]
+icon = "encodeur_rsa_icon.ico"
