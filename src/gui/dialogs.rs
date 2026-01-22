@@ -1467,6 +1467,8 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
 
             if app.new_password_input != app.confirm_password_input {
                 ui.colored_label(crate::gui::styling::ERROR, "Passwords do not match.");
+            } else if app.new_password_input.is_empty() {
+                ui.colored_label(crate::gui::styling::SUBTLE_TEXT_COLOR, "Enter and confirm a password to enable the button.");
             }
 
             ui.horizontal(|ui| {
