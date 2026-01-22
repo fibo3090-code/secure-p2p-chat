@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "encodeur_rsa_rust"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -32,6 +32,7 @@ target/
 .claude
 .github
 settings.local.json
+GEMINI.md
 
 # OS generated files
 .DS_Store
