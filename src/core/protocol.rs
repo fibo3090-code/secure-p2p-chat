@@ -15,10 +15,18 @@ pub enum ProtocolMessage {
     EphemeralKey { public_key: Vec<u8> },
 
     /// Text message (with sequence number for replay protection)
-    Text { text: String, timestamp: u64, seq: u64 },
+    Text {
+        text: String,
+        timestamp: u64,
+        seq: u64,
+    },
 
     /// File metadata (sent before chunks)
-    FileMeta { filename: String, size: u64, seq: u64 },
+    FileMeta {
+        filename: String,
+        size: u64,
+        seq: u64,
+    },
 
     /// File data chunk
     FileChunk { chunk: Vec<u8>, seq: u64 },
@@ -39,19 +47,31 @@ pub enum ProtocolMessage {
 impl std::fmt::Debug for ProtocolMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Version { version } => f.debug_struct("Version").field("version", version).finish(),
-            Self::EphemeralKey { public_key } => f.debug_struct("EphemeralKey").field("public_key_len", &public_key.len()).finish(),
-            Self::Text { seq, timestamp, .. } => f.debug_struct("Text")
+            Self::Version { version } => {
+                f.debug_struct("Version").field("version", version).finish()
+            }
+            Self::EphemeralKey { public_key } => f
+                .debug_struct("EphemeralKey")
+                .field("public_key_len", &public_key.len())
+                .finish(),
+            Self::Text { seq, timestamp, .. } => f
+                .debug_struct("Text")
                 .field("seq", seq)
                 .field("timestamp", timestamp)
                 .field("text", &"***REDACTED***")
                 .finish(),
-            Self::FileMeta { filename, size, seq } => f.debug_struct("FileMeta")
+            Self::FileMeta {
+                filename,
+                size,
+                seq,
+            } => f
+                .debug_struct("FileMeta")
                 .field("seq", seq)
                 .field("filename", filename)
                 .field("size", size)
                 .finish(),
-            Self::FileChunk { seq, chunk } => f.debug_struct("FileChunk")
+            Self::FileChunk { seq, chunk } => f
+                .debug_struct("FileChunk")
                 .field("seq", seq)
                 .field("chunk_len", &chunk.len())
                 .finish(),
@@ -99,7 +119,11 @@ impl ProtocolMessage {
                 v.extend_from_slice(public_key);
             }
 
-            Self::Text { text, timestamp, seq } => {
+            Self::Text {
+                text,
+                timestamp,
+                seq,
+            } => {
                 v.push(2u8);
                 v.extend_from_slice(&seq.to_be_bytes());
                 v.extend_from_slice(&timestamp.to_be_bytes());
@@ -109,7 +133,11 @@ impl ProtocolMessage {
                 v.extend_from_slice(bytes);
             }
 
-            Self::FileMeta { filename, size, seq } => {
+            Self::FileMeta {
+                filename,
+                size,
+                seq,
+            } => {
                 v.push(3u8);
                 v.extend_from_slice(&seq.to_be_bytes());
                 v.extend_from_slice(&size.to_be_bytes());
@@ -198,7 +226,11 @@ impl ProtocolMessage {
                 let raw_filename = parts[2];
                 let filename = crate::util::sanitize_filename(raw_filename);
                 if let Ok(size) = parts[3].parse::<u64>() {
-                    return Some(Self::FileMeta { filename, size, seq });
+                    return Some(Self::FileMeta {
+                        filename,
+                        size,
+                        seq,
+                    });
                 }
             }
             return None;
@@ -213,7 +245,10 @@ impl ProtocolMessage {
             if chunk.len() > crate::FILE_CHUNK_SIZE {
                 return None;
             }
-            return Some(Self::FileChunk { chunk: chunk.to_vec(), seq });
+            return Some(Self::FileChunk {
+                chunk: chunk.to_vec(),
+                seq,
+            });
         }
 
         if b.starts_with(b"FILE_END:") {
@@ -245,81 +280,121 @@ impl ProtocolMessage {
 
     // Helper: parse the new binary tagged format; returns None if not matching
     fn from_binary_tagged(b: &[u8]) -> Option<Self> {
-        if b.is_empty() { return None; }
+        if b.is_empty() {
+            return None;
+        }
         let t = b[0];
         let mut cursor = 1usize;
         match t {
             0 => {
-                if cursor + 1 > b.len() { return None; }
+                if cursor + 1 > b.len() {
+                    return None;
+                }
                 let version = b[cursor];
-                return Some(Self::Version { version });
+                Some(Self::Version { version })
             }
             1 => {
-                if cursor + 4 > b.len() { return None; }
-                let len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                if cursor + 4 > b.len() {
+                    return None;
+                }
+                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
-                if cursor + len > b.len() { return None; }
-                let public_key = b[cursor..cursor+len].to_vec();
-                return Some(Self::EphemeralKey { public_key });
+                if cursor + len > b.len() {
+                    return None;
+                }
+                let public_key = b[cursor..cursor + len].to_vec();
+                Some(Self::EphemeralKey { public_key })
             }
             2 => {
-                if cursor + 8 + 8 + 4 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                if cursor + 8 + 8 + 4 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 cursor += 8;
-                let timestamp = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                let timestamp = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 cursor += 8;
-                let len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
-                if len > 64 * 1024 { return None; }
-                if cursor + len > b.len() { return None; }
-                let text = String::from_utf8_lossy(&b[cursor..cursor+len]).to_string();
-                return Some(Self::Text { text, timestamp, seq });
+                if len > 64 * 1024 {
+                    return None;
+                }
+                if cursor + len > b.len() {
+                    return None;
+                }
+                let text = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
+                Some(Self::Text {
+                    text,
+                    timestamp,
+                    seq,
+                })
             }
             3 => {
-                if cursor + 8 + 8 + 4 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                if cursor + 8 + 8 + 4 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 cursor += 8;
-                let size = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                let size = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 cursor += 8;
-                let fn_len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                let fn_len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
-                if cursor + fn_len > b.len() { return None; }
-                let raw_filename = String::from_utf8_lossy(&b[cursor..cursor+fn_len]).to_string();
+                if cursor + fn_len > b.len() {
+                    return None;
+                }
+                let raw_filename = String::from_utf8_lossy(&b[cursor..cursor + fn_len]).to_string();
                 let filename = crate::util::sanitize_filename(&raw_filename);
-                return Some(Self::FileMeta { filename, size, seq });
+                Some(Self::FileMeta {
+                    filename,
+                    size,
+                    seq,
+                })
             }
             4 => {
-                if cursor + 8 + 4 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
+                if cursor + 8 + 4 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 cursor += 8;
-                let len = u32::from_be_bytes(b[cursor..cursor+4].try_into().ok()?) as usize;
+                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
-                if len > crate::FILE_CHUNK_SIZE { return None; }
-                if cursor + len > b.len() { return None; }
-                let chunk = b[cursor..cursor+len].to_vec();
-                return Some(Self::FileChunk { chunk, seq });
+                if len > crate::FILE_CHUNK_SIZE {
+                    return None;
+                }
+                if cursor + len > b.len() {
+                    return None;
+                }
+                let chunk = b[cursor..cursor + len].to_vec();
+                Some(Self::FileChunk { chunk, seq })
             }
             5 => {
-                if cursor + 8 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
-                return Some(Self::FileEnd { seq });
+                if cursor + 8 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                Some(Self::FileEnd { seq })
             }
             6 => {
-                if cursor + 8 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
-                return Some(Self::Ping { seq });
+                if cursor + 8 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                Some(Self::Ping { seq })
             }
             7 => {
-                if cursor + 8 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
-                return Some(Self::TypingStart { seq });
+                if cursor + 8 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                Some(Self::TypingStart { seq })
             }
             8 => {
-                if cursor + 8 > b.len() { return None; }
-                let seq = u64::from_be_bytes(b[cursor..cursor+8].try_into().ok()?);
-                return Some(Self::TypingStop { seq });
+                if cursor + 8 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                Some(Self::TypingStop { seq })
             }
-            _ => return None,
+            _ => None,
         }
     }
-                        }
+}

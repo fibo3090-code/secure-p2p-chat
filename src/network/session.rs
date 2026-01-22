@@ -1,8 +1,9 @@
-use anyhow::{Result, anyhow};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use anyhow::{anyhow, Result};
+use rand::rngs::OsRng;
 use rsa::pss::{SigningKey, VerifyingKey};
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
-use sha2::{Sha256, Digest};
+use rsa::{RsaPrivateKey, RsaPublicKey};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -10,13 +11,12 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
 use crate::core::{
-    AesCipher, PROTOCOL_VERSION, ProtocolMessage, IdentityProof, derive_session_key, fingerprint_pubkey,
-    generate_ephemeral_keypair, parse_x25519_public, pem_decode_public, pem_encode_public,
-    recv_packet, send_packet,
+    derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, parse_x25519_public,
+    pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher, IdentityProof,
+    ProtocolMessage, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -37,17 +37,22 @@ fn is_rate_limited(ip: IpAddr) -> bool {
     let mut limiter = RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-    
-    let attempts = limiter.entry(ip).or_insert_with(Vec::new);
-    
+
+    let attempts = limiter.entry(ip).or_default();
+
     // Remove old attempts outside the window
     attempts.retain(|t| now.duration_since(*t) < window);
-    
+
     if attempts.len() >= RATE_LIMIT_MAX_CONNECTIONS {
-        tracing::warn!("Rate limiting IP {}: {} attempts in {}s", ip, attempts.len(), RATE_LIMIT_WINDOW_SECS);
+        tracing::warn!(
+            "Rate limiting IP {}: {} attempts in {}s",
+            ip,
+            attempts.len(),
+            RATE_LIMIT_WINDOW_SECS
+        );
         return true;
     }
-    
+
     attempts.push(now);
     false
 }
@@ -64,8 +69,6 @@ where
         Err(_) => Err(anyhow!("Handshake timeout ({}s)", HANDSHAKE_TIMEOUT_SECS)),
     }
 }
-
-
 
 /// Run host session: listen, accept, handshake (v3), message loop
 pub async fn run_host_session(
@@ -86,41 +89,52 @@ pub async fn run_host_session(
 
     // 2. Accept connection with rate limiting
     let (mut stream, peer_addr) = listener.accept().await?;
-    
+
     // Check rate limit
     if is_rate_limited(peer_addr.ip()) {
-        tracing::warn!("Rejecting connection from {} due to rate limiting", peer_addr);
+        tracing::warn!(
+            "Rejecting connection from {} due to rate limiting",
+            peer_addr
+        );
         return Err(anyhow!("Connection rejected: rate limit exceeded"));
     }
-    
+
     tracing::info!("Client connected from {}", peer_addr);
-    
+
     // --- HANDSHAKE v3 (ECDH First) ---
 
     // 3. Send Protocol Version (u32, plaintext)
     let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
     send_packet(&mut stream, &version_bytes).await?;
-    
+
     // 4. Receive Protocol Version (u32, plaintext)
     let client_version_bytes = recv_packet_with_timeout(&mut stream).await?;
     if client_version_bytes.len() != 4 {
         return Err(anyhow!("Invalid version packet length"));
     }
     // Fix: Use as_slice().try_into() to avoid consuming Vec
-    let client_version = u32::from_be_bytes(client_version_bytes.as_slice().try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
+    let client_version = u32::from_be_bytes(
+        client_version_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid version bytes"))?,
+    );
     tracing::info!("Client protocol version: {}", client_version);
 
     if client_version < 3 {
-        return Err(anyhow!("Client version {} too old (need v3+)", client_version));
+        return Err(anyhow!(
+            "Client version {} too old (need v3+)",
+            client_version
+        ));
     }
 
     // 5. Generate Ephemeral Keys (X25519)
     let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
     let host_ephemeral_bytes = host_ephemeral_public.as_bytes();
-    
+
     // 6. Send Ephemeral Public Key (plaintext)
     send_packet(&mut stream, host_ephemeral_bytes).await?;
-    
+
     // 7. Receive Ephemeral Public Key (plaintext)
     let client_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
     if client_ephemeral_bytes.len() != 32 {
@@ -138,16 +152,16 @@ pub async fn run_host_session(
     let salt = Sha256::digest(&transcript);
 
     let aes_key = Zeroizing::new(derive_session_key(
-        host_ephemeral_secret, 
-        &client_ephemeral_public, 
+        host_ephemeral_secret,
+        &client_ephemeral_public,
         Some(&salt),
-        HKDF_INFO
+        HKDF_INFO,
     ));
     let cipher = AesCipher::new(&aes_key[..])?;
     tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
 
     // --- ENCRYPTED IDENTITY EXCHANGE ---
-    
+
     // 9. Create Identity Proof
     // We sign our own ephemeral key to bind it to our identity (prevent MITM)
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());
@@ -163,30 +177,35 @@ pub async fn run_host_session(
         version: PROTOCOL_VERSION as u32,
         chat_id,
     };
-    
+
     // Serialize & Encrypt Proof
     let my_proof_bytes = bincode::serialize(&my_proof)?;
     let encrypted_proof = cipher.encrypt(&my_proof_bytes);
     send_packet(&mut stream, &encrypted_proof).await?;
-    
+
     // 10. Receive Client's Identity Proof (Encrypted)
     let encrypted_client_proof = recv_packet_with_timeout(&mut stream).await?;
-    let client_proof_bytes = cipher.decrypt(&encrypted_client_proof)
+    let client_proof_bytes = cipher
+        .decrypt(&encrypted_client_proof)
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
     let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
-    
+
     // 11. Verify Client Identity
     let client_pubkey = pem_decode_public(&client_proof.public_key_pem)?;
     let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey.clone());
-    
+
     // Verify signature: It must verify the CLIENT'S ephemeral key
     let mut client_hasher = Sha256::new();
     client_hasher.update(b"IDENTITY_PROOF");
     client_hasher.update(&client_ephemeral_bytes); // Verify against what we received earlier
     let client_digest = client_hasher.finalize();
-    
-    verifying_key.verify(&client_digest, &rsa::pss::Signature::try_from(client_proof.signature.as_slice())?)
-         .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
+
+    verifying_key
+        .verify(
+            &client_digest,
+            &rsa::pss::Signature::try_from(client_proof.signature.as_slice())?,
+        )
+        .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
 
     let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
     tracing::debug!("Verified client identity: {}...", &client_fingerprint[..8]);
@@ -196,7 +215,7 @@ pub async fn run_host_session(
         .send(SessionEvent::NewConnection {
             peer_addr: peer_addr.to_string(),
             fingerprint: client_fingerprint,
-            chat_id, 
+            chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
@@ -255,14 +274,19 @@ pub async fn run_client_session(
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
     // --- HANDSHAKE v3 (ECDH First) ---
-    
+
     // 2. Receive Host Protocol Version
     let host_version_bytes = recv_packet_with_timeout(&mut stream).await?;
     if host_version_bytes.len() != 4 {
         return Err(anyhow!("Invalid version packet length"));
     }
     // Fix: Use as_slice().try_into() to copy bytes into array without consuming Vec
-    let host_version = u32::from_be_bytes(host_version_bytes.as_slice().try_into().map_err(|_| anyhow!("Invalid version bytes"))?);
+    let host_version = u32::from_be_bytes(
+        host_version_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid version bytes"))?,
+    );
     tracing::info!("Host protocol version: {}", host_version);
 
     if host_version < 3 {
@@ -283,10 +307,10 @@ pub async fn run_client_session(
     // 5. Generate Client Ephemeral Keys
     let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
     let client_ephemeral_bytes = client_ephemeral_public.as_bytes();
-    
+
     // 6. Send Client Ephemeral Public Key
     send_packet(&mut stream, client_ephemeral_bytes).await?;
-    
+
     // 7. Derive Session Key & Init Cipher
     // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
     // Note: host_version_bytes received first, version_bytes sent second.
@@ -299,34 +323,39 @@ pub async fn run_client_session(
     let salt = Sha256::digest(&transcript);
 
     let aes_key = Zeroizing::new(derive_session_key(
-        client_ephemeral_secret, 
-        &host_ephemeral_public, 
+        client_ephemeral_secret,
+        &host_ephemeral_public,
         Some(&salt),
-        HKDF_INFO
+        HKDF_INFO,
     ));
     let cipher = AesCipher::new(&aes_key[..])?;
     tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
 
     // --- ENCRYPTED IDENTITY EXCHANGE ---
-    
+
     // 8. Receive Host Identity Proof (Encrypted)
     let encrypted_host_proof = recv_packet_with_timeout(&mut stream).await?;
-    let host_proof_bytes = cipher.decrypt(&encrypted_host_proof)
+    let host_proof_bytes = cipher
+        .decrypt(&encrypted_host_proof)
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
     let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
-    
+
     // 9. Verify Host Identity
     let host_pubkey = pem_decode_public(&host_proof.public_key_pem)?;
     let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey.clone());
-    
+
     // Verify signature: It must verify the HOST'S ephemeral key
     let mut host_hasher = Sha256::new();
     host_hasher.update(b"IDENTITY_PROOF");
     host_hasher.update(&host_ephemeral_bytes); // Verify against what we received earlier
     let host_digest = host_hasher.finalize();
-    
-    verifying_key.verify(&host_digest, &rsa::pss::Signature::try_from(host_proof.signature.as_slice())?)
-         .map_err(|e| anyhow!("Host identity signature verification failed: {}", e))?;
+
+    verifying_key
+        .verify(
+            &host_digest,
+            &rsa::pss::Signature::try_from(host_proof.signature.as_slice())?,
+        )
+        .map_err(|e| anyhow!("Host identity signature verification failed: {}", e))?;
 
     let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
     tracing::debug!("Verified host identity: {}...", &host_fingerprint[..8]);
@@ -345,7 +374,7 @@ pub async fn run_client_session(
         version: PROTOCOL_VERSION as u32,
         chat_id,
     };
-    
+
     // Serialize & Encrypt Proof
     let my_proof_bytes = bincode::serialize(&my_proof)?;
     let encrypted_proof = cipher.encrypt(&my_proof_bytes);
@@ -359,7 +388,7 @@ pub async fn run_client_session(
             chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
-        
+
     // Wait up to 5 minutes for user confirmation
     match tokio::time::timeout(tokio::time::Duration::from_secs(300), async {
         confirm_rx.recv().await
@@ -393,7 +422,6 @@ pub async fn run_client_session(
 
     run_message_loop(stream, cipher, to_app_tx, from_app_rx).await
 }
-
 
 /// Main message loop: send and receive encrypted messages
 async fn run_message_loop<S>(
@@ -504,12 +532,12 @@ mod tests {
             transcript.extend_from_slice(host_ephemeral_public.as_bytes());
             transcript.extend_from_slice(&client_ephemeral_bytes);
             let salt = Sha256::digest(&transcript);
-            
+
             let host_aes_key = derive_session_key(
-                host_ephemeral_secret, 
-                &client_ephemeral_public, 
+                host_ephemeral_secret,
+                &client_ephemeral_public,
                 Some(&salt),
-                HKDF_INFO
+                HKDF_INFO,
             );
             let cipher = AesCipher::new(&host_aes_key)?;
 
@@ -548,7 +576,7 @@ mod tests {
             // 2. Exchange ephemeral keys (Raw Bytes)
             let host_ephemeral_bytes = recv_packet(&mut client_stream).await?;
             let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
-            
+
             let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
             send_packet(&mut client_stream, client_ephemeral_public.as_bytes()).await?;
 
@@ -562,10 +590,10 @@ mod tests {
             let salt = Sha256::digest(&transcript);
 
             let client_aes_key = derive_session_key(
-                client_ephemeral_secret, 
-                &host_ephemeral_public, 
+                client_ephemeral_secret,
+                &host_ephemeral_public,
                 Some(&salt),
-                HKDF_INFO
+                HKDF_INFO,
             );
             let cipher = AesCipher::new(&client_aes_key)?;
 
@@ -607,4 +635,3 @@ mod tests {
         Ok(())
     }
 }
-
