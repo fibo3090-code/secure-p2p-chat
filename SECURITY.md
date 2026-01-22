@@ -1,7 +1,7 @@
 # Security Policy & Documentation
 
-**Last Updated:** January 4, 2026  
-Application: Encrypted P2P Messenger v1.6.0  
+**Last Updated:** January 22, 2026
+Application: Encrypted P2P Messenger v1.7.0
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
 
@@ -25,7 +25,7 @@ This application implements **military-grade end-to-end encryption** with **forw
 
 ### Current Security Posture
 
-**Overall Risk Assessment:** **MEDIUM** (improved from CRITICAL)
+**Overall Risk Assessment:** **LOW** (improved from MEDIUM)
 
 **Security Achievements:**
 
@@ -38,13 +38,11 @@ This application implements **military-grade end-to-end encryption** with **forw
 - ✅ Thread-safe implementation (no unsafe code)
 - ✅ Fingerprint verification enforcement
 
-**Recent Security Improvements (Dec 2025):**
+**Recent Security Improvements (Jan 2026):**
 
-- Fixed race conditions in static mutable variables
-- Implemented encrypted storage for chat history
-- Added sequence numbers for replay attack protection
-- Replaced random nonces with deterministic counters
-- Removed fingerprint auto-accept vulnerability
+- Patched `rsa` crate vulnerability (CVE-2026-21895).
+- Updated all dependencies to latest versions.
+- Remediated multiple CodeQL warnings.
 
 ---
 
@@ -152,6 +150,19 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 
 - **Error Handling**: Systematically replaced over 100 dangerous `unwrap()` calls with proper error propagation (`Result/Option`) in critical paths.
 - **Files**: `src/network/session.rs`, `src/transfer/*`, `src/identity/mod.rs`
+
+### Phase 3: Dependency and Codebase Hardening (Jan 2026)
+
+#### 6. Dependency Vulnerability Patching
+
+- **rsa Crate Panic (CVE-2026-21895)**: Upgraded the `rsa` crate to version `0.9.10` to patch a vulnerability where creating a private key from components with a prime equal to 1 could cause a panic.
+- **General Dependency Update**: Updated all dependencies to their latest compatible versions to incorporate security fixes and improvements from the ecosystem.
+- **Files**: `Cargo.toml`, `Cargo.lock`
+
+#### 7. CodeQL Warning Remediation
+
+- **Hard-coded Cryptographic Values**: Addressed multiple CodeQL warnings about hard-coded cryptographic values in test functions by generating random keys directly instead of initializing with zeros first.
+- **Files**: `src/core/crypto.rs`, `src/transfer/sender.rs`
 
 ---
 
