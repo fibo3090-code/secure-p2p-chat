@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-01-22
+
+### 🔐 Security Fixes
+
+- **Patched `rsa` Crate Vulnerability (CVE-2026-21895)**: Upgraded the `rsa` crate to version `0.9.10` to mitigate the "Marvin Attack", a timing side-channel vulnerability.
+- **Remediated CodeQL Warnings**: Addressed multiple warnings about hard-coded cryptographic values in test functions by generating random keys directly.
+- **Updated Dependencies**: Updated all project dependencies to their latest compatible versions to incorporate security fixes and improvements from the ecosystem.
+
 ## [1.7.0] - 2026-01-04
 
 ### 🐛 Bug Fixes
