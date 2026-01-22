@@ -91,7 +91,7 @@ where
 mod tests {
     use super::*;
     use crate::core::recv_packet;
-    use rand::{rngs::OsRng, RngCore};
+    use rand::Rng;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -103,8 +103,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let (mut client, mut server) = tokio::io::duplex(8192);
-        let mut aes_key = [0u8; 32];
-        OsRng.fill_bytes(&mut aes_key);
+        let aes_key: [u8; 32] = rand::thread_rng().gen();
         let cipher = AesCipher::new(&aes_key).unwrap();
 
         // Send file

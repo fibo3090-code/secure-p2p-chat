@@ -223,11 +223,11 @@ impl AesCipher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     #[test]
     fn test_aes_roundtrip() {
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        let key: [u8; 32] = rand::thread_rng().gen();
         let cipher = AesCipher::new(&key).unwrap();
 
         let plaintext = b"Hello, secure world!";
@@ -239,8 +239,7 @@ mod tests {
 
     #[test]
     fn test_aes_nonce_randomness() {
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        let key: [u8; 32] = rand::thread_rng().gen();
         let cipher = AesCipher::new(&key).unwrap();
 
         let plaintext = b"Same message";
@@ -257,8 +256,7 @@ mod tests {
 
     #[test]
     fn test_aes_tamper_detection() {
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        let key: [u8; 32] = rand::thread_rng().gen();
         let cipher = AesCipher::new(&key).unwrap();
 
         let mut encrypted = cipher.encrypt(b"Test");
