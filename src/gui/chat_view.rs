@@ -22,88 +22,89 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                 if let Some(chat) = manager.get_chat(chat_id) {
                     let connected = manager.is_connected(&chat_id);
                     ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    // Avatar
-                    let color = if let Some(fp) = &chat.peer_fingerprint {
-                        crate::gui::widgets::fingerprint_to_color(fp)
-                    } else {
-                        egui::Color32::GRAY
-                    };
-
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 20.0, color);
-
-                    let initials = crate::gui::widgets::get_initials(&chat.title);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        initials,
-                        egui::FontId::proportional(16.0),
-                        egui::Color32::WHITE,
-                    );
-
-                    ui.add_space(8.0);
-
-                    // Title and status
-                    ui.vertical(|ui| {
-                        ui.heading(&chat.title);
-                        // Show typing indicator or connection status
-                        if chat.peer_typing {
-                            ui.label(
-                                egui::RichText::new("✍️ typing...")
-                                    .size(12.0)
-                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                            );
-                        } else if connected {
-                            ui.label(
-                                egui::RichText::new("🟢 Connected")
-                                    .size(12.0)
-                                    .color(crate::gui::styling::SUCCESS),
-                            );
+                    ui.horizontal(|ui| {
+                        // Avatar
+                        let color = if let Some(fp) = &chat.peer_fingerprint {
+                            crate::gui::widgets::fingerprint_to_color(fp)
                         } else {
-                            ui.label(
-                                egui::RichText::new("🟠 Disconnected")
-                                    .size(12.0)
-                                    .color(crate::gui::styling::WARNING),
-                            );
-                        }
-                    });
+                            egui::Color32::GRAY
+                        };
 
-                    // Fingerprint on right
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(fp) = &chat.peer_fingerprint {
-                            if ui.button("📋 Copy Fingerprint").clicked() {
-                                ui.output_mut(|o| o.copied_text = fp.clone());
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 20.0, color);
+
+                        let initials = crate::gui::widgets::get_initials(&chat.title);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            initials,
+                            egui::FontId::proportional(16.0),
+                            egui::Color32::WHITE,
+                        );
+
+                        ui.add_space(8.0);
+
+                        // Title and status
+                        ui.vertical(|ui| {
+                            ui.heading(&chat.title);
+                            // Show typing indicator or connection status
+                            if chat.peer_typing {
+                                ui.label(
+                                    egui::RichText::new("✍️ typing...")
+                                        .size(12.0)
+                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                                );
+                            } else if connected {
+                                ui.label(
+                                    egui::RichText::new("🟢 Connected")
+                                        .size(12.0)
+                                        .color(crate::gui::styling::SUCCESS),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("🟠 Disconnected")
+                                        .size(12.0)
+                                        .color(crate::gui::styling::WARNING),
+                                );
                             }
-                            ui.monospace(crate::util::format_fingerprint_short(fp));
-                        }
+                        });
 
-                        if !connected {
-                            // Offer reconnect if a contact is associated
-                            if let Some((&contact_id, _)) = manager
-                                .contact_to_chat
-                                .iter()
-                                .find(|&(_, &cid)| cid == chat_id)
-                            {
-                                if ui.button("Retry connect").clicked() {
-                                    let mgr = app.chat_manager.clone();
-                                    tokio::spawn(async move {
-                                        let mut m = mgr.lock().await;
-                                        if let Err(e) =
-                                            m.connect_to_contact(contact_id, Some(chat_id)).await
-                                        {
-                                            m.add_toast(
-                                                crate::types::ToastLevel::Error,
-                                                format!("Reconnect failed: {}", e),
-                                            );
-                                        }
-                                    });
+                        // Fingerprint on right
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(fp) = &chat.peer_fingerprint {
+                                if ui.button("📋 Copy Fingerprint").clicked() {
+                                    ui.output_mut(|o| o.copied_text = fp.clone());
+                                }
+                                ui.monospace(crate::util::format_fingerprint_short(fp));
+                            }
+
+                            if !connected {
+                                // Offer reconnect if a contact is associated
+                                if let Some((&contact_id, _)) = manager
+                                    .contact_to_chat
+                                    .iter()
+                                    .find(|&(_, &cid)| cid == chat_id)
+                                {
+                                    if ui.button("Retry connect").clicked() {
+                                        let mgr = app.chat_manager.clone();
+                                        tokio::spawn(async move {
+                                            let mut m = mgr.lock().await;
+                                            if let Err(e) = m
+                                                .connect_to_contact(contact_id, Some(chat_id))
+                                                .await
+                                            {
+                                                m.add_toast(
+                                                    crate::types::ToastLevel::Error,
+                                                    format!("Reconnect failed: {}", e),
+                                                );
+                                            }
+                                        });
+                                    }
                                 }
                             }
-                        }
+                        });
                     });
-                });
                 }
             }
         });
@@ -285,18 +286,18 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     if let Some(chat) = manager.get_chat(chat_id) {
                         if chat.messages.is_empty() {
                             ui.vertical_centered(|ui| {
-                            ui.add_space(100.0);
-                            ui.label(
-                                egui::RichText::new("🔒 End-to-end encrypted conversation")
-                                    .size(16.0)
-                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                            );
-                            ui.label(
-                                egui::RichText::new("Send your first message below!")
-                                    .size(14.0)
-                                    .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                            );
-                        });
+                                ui.add_space(100.0);
+                                ui.label(
+                                    egui::RichText::new("🔒 End-to-end encrypted conversation")
+                                        .size(16.0)
+                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Send your first message below!")
+                                        .size(14.0)
+                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                                );
+                            });
                         } else {
                             for message in &chat.messages {
                                 render_message(app, ui, message);
@@ -366,8 +367,7 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                     // We create a unique ID for cache based on message ID
                     let mut cache = egui_commonmark::CommonMarkCache::default();
                     ui.visuals_mut().override_text_color = Some(text_color);
-                    egui_commonmark::CommonMarkViewer::new()
-                        .show(ui, &mut cache, text);
+                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, text);
 
                     // Copy action (only visible on hover to reduce clutter)
                     if ui.rect_contains_pointer(ui.max_rect()) {

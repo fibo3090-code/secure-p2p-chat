@@ -31,7 +31,7 @@ where
 
 /// Receive a length-prefixed packet from TCP
 /// Format: 4 bytes big-endian length || payload
-/// 
+///
 /// SECURITY: Uses chunked reading to prevent DoS via allocation pressure.
 /// Instead of pre-allocating the full buffer, we read in chunks.
 pub async fn recv_packet<S>(stream: &mut S) -> Result<Vec<u8>>
@@ -47,7 +47,10 @@ where
     if total_len > MAX_PACKET_SIZE {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("packet size exceeds limit: {} > {}", total_len, MAX_PACKET_SIZE),
+            format!(
+                "packet size exceeds limit: {} > {}",
+                total_len, MAX_PACKET_SIZE
+            ),
         ));
     }
 
@@ -61,7 +64,7 @@ where
         let to_read = remaining.min(CHUNK_SIZE);
         let start = buf.len();
         buf.resize(start + to_read, 0);
-        
+
         stream.read_exact(&mut buf[start..]).await?;
         remaining -= to_read;
     }

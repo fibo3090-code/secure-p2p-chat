@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::core::{ProtocolMessage, generate_rsa_keypair_async};
+use crate::core::{generate_rsa_keypair_async, ProtocolMessage};
 use crate::network::{run_client_session, run_host_session};
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
@@ -253,7 +253,7 @@ impl ChatManager {
                 timestamp: chrono::Utc::now(),
             });
         }
-        
+
         // Try to send to all participants with active sessions
         let mut sent_count = 0;
         let mut offline_contacts = Vec::new();
@@ -712,7 +712,9 @@ impl ChatManager {
             .get_mut(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Chat not found"))?;
         chat.send_seq += 1;
-        session.from_app_tx.send(ProtocolMessage::TypingStart { seq: chat.send_seq })?;
+        session
+            .from_app_tx
+            .send(ProtocolMessage::TypingStart { seq: chat.send_seq })?;
         Ok(())
     }
 
@@ -732,7 +734,9 @@ impl ChatManager {
             .get_mut(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Chat not found"))?;
         chat.send_seq += 1;
-        session.from_app_tx.send(ProtocolMessage::TypingStop { seq: chat.send_seq })?;
+        session
+            .from_app_tx
+            .send(ProtocolMessage::TypingStop { seq: chat.send_seq })?;
         Ok(())
     }
 
@@ -832,7 +836,8 @@ impl ChatManager {
             // If the user accepted and we have a pending verification request matching this chat,
             // persist the fingerprint in the chat record before confirming the session.
             if accept {
-                if let Some((fp, _peer_name, req_chat_id)) = &self.fingerprint_verification_request {
+                if let Some((fp, _peer_name, req_chat_id)) = &self.fingerprint_verification_request
+                {
                     if *req_chat_id == chat_id {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
                             chat.peer_fingerprint = Some(fp.clone());
@@ -1023,7 +1028,10 @@ impl ChatManager {
                 match &chat.peer_fingerprint {
                     // CASE 1: No stored fingerprint. This is the FIRST USE.
                     None => {
-                        tracing::info!("Trust on First Use for chat {}. Requesting user confirmation.", chat_id);
+                        tracing::info!(
+                            "Trust on First Use for chat {}. Requesting user confirmation.",
+                            chat_id
+                        );
                         // If user opted into auto-trust (not recommended), allow it.
                         if self.config.auto_trust_on_first_use {
                             tracing::info!("auto_trust_on_first_use enabled: auto-storing fingerprint for chat {}", chat_id);
@@ -1035,8 +1043,12 @@ impl ChatManager {
                             }
                         } else {
                             // Request explicit user verification via UI
-                            self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
-                            self.add_toast(ToastLevel::Warning, "Fingerprint verification required".to_string());
+                            self.fingerprint_verification_request =
+                                Some((fingerprint, peer_name, chat_id));
+                            self.add_toast(
+                                ToastLevel::Warning,
+                                "Fingerprint verification required".to_string(),
+                            );
                         }
                     }
                     // CASE 2: Stored fingerprint matches the new one.
@@ -1058,8 +1070,12 @@ impl ChatManager {
                             fingerprint
                         );
                         // Trigger the UI dialog for manual verification.
-                        self.fingerprint_verification_request = Some((fingerprint, peer_name, chat_id));
-                        self.add_toast(ToastLevel::Warning, "SECURITY WARNING: Peer fingerprint has changed!".to_string());
+                        self.fingerprint_verification_request =
+                            Some((fingerprint, peer_name, chat_id));
+                        self.add_toast(
+                            ToastLevel::Warning,
+                            "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
+                        );
                     }
                 }
             }
@@ -1105,11 +1121,19 @@ impl ChatManager {
                         }
                     }
 
-                    ProtocolMessage::FileMeta { filename, size, seq } => {
+                    ProtocolMessage::FileMeta {
+                        filename,
+                        size,
+                        seq,
+                    } => {
                         if let Some(chat) = self.chats.get_mut(&chat_id) {
                             if seq > chat.recv_seq {
                                 chat.recv_seq = seq;
-                                tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
+                                tracing::info!(
+                                    "Received file metadata: {} ({} bytes)",
+                                    filename,
+                                    size
+                                );
 
                                 match self.start_receiving_file(chat_id, &filename, size) {
                                     Ok(transfer_id) => {
@@ -1121,7 +1145,10 @@ impl ChatManager {
                                                 self.incoming_files.insert(transfer_id, incoming);
                                             }
                                             Err(e) => {
-                                                tracing::error!("Failed to create incoming file: {}", e);
+                                                tracing::error!(
+                                                    "Failed to create incoming file: {}",
+                                                    e
+                                                );
                                                 self.add_toast(
                                                     ToastLevel::Error,
                                                     format!("Failed to receive file: {}", e),
@@ -1144,14 +1171,24 @@ impl ChatManager {
                     }
 
                     ProtocolMessage::FileChunk { chunk, seq } => {
-                        let transfer_id = self.active_transfers.values().find(|t| t.chat_id == chat_id).map(|t| t.id);
+                        let transfer_id = self
+                            .active_transfers
+                            .values()
+                            .find(|t| t.chat_id == chat_id)
+                            .map(|t| t.id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                                 if seq == transfer.seq {
                                     transfer.seq += 1;
-                                    tracing::debug!("Received file chunk {} ({} bytes)", seq, chunk.len());
+                                    tracing::debug!(
+                                        "Received file chunk {} ({} bytes)",
+                                        seq,
+                                        chunk.len()
+                                    );
 
-                                    if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
+                                    if let Some(incoming) =
+                                        self.incoming_files.get_mut(&transfer_id)
+                                    {
                                         if let Err(e) = incoming.write_chunk(&chunk) {
                                             tracing::error!("Failed to write chunk: {}", e);
                                             self.add_toast(
@@ -1160,7 +1197,10 @@ impl ChatManager {
                                             );
                                         } else {
                                             let bytes_received = incoming.bytes_received();
-                                            self.update_transfer_progress(transfer_id, bytes_received);
+                                            self.update_transfer_progress(
+                                                transfer_id,
+                                                bytes_received,
+                                            );
                                         }
                                     }
                                 } else {
@@ -1171,48 +1211,65 @@ impl ChatManager {
                     }
 
                     ProtocolMessage::FileEnd { seq } => {
-                        let transfer_id = self.active_transfers.values().find(|t| t.chat_id == chat_id).map(|t| t.id);
+                        let transfer_id = self
+                            .active_transfers
+                            .values()
+                            .find(|t| t.chat_id == chat_id)
+                            .map(|t| t.id);
                         if let Some(transfer_id) = transfer_id {
-                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                                 if seq == transfer.seq {
                                     tracing::info!("File transfer completed");
 
-                        // Finalize all active transfers
-                        let transfer_ids: Vec<Uuid> = self.incoming_files.keys().copied().collect();
-                        for transfer_id in transfer_ids {
-                            if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
-                                let bytes_received = incoming.bytes_received();
-                                match incoming.finalize() {
-                                    Ok(final_path) => {
-                                        if let Some(transfer) =
-                                            self.active_transfers.get(&transfer_id)
+                                    // Finalize all active transfers
+                                    let transfer_ids: Vec<Uuid> =
+                                        self.incoming_files.keys().copied().collect();
+                                    for transfer_id in transfer_ids {
+                                        if let Some(incoming) =
+                                            self.incoming_files.remove(&transfer_id)
                                         {
-                                            // Add to chat history
-                                            if let Some(chat) = self.chats.get_mut(&chat_id) {
-                                                chat.messages.push(Message {
-                                                    id: Uuid::new_v4(),
-                                                    from_me: false,
-                                                    content: MessageContent::File {
-                                                        filename: transfer.filename.clone(),
-                                                        size: transfer.size,
-                                                        path: Some(final_path),
-                                                    },
-                                                    timestamp: chrono::Utc::now(),
-                                                });
+                                            let bytes_received = incoming.bytes_received();
+                                            match incoming.finalize() {
+                                                Ok(final_path) => {
+                                                    if let Some(transfer) =
+                                                        self.active_transfers.get(&transfer_id)
+                                                    {
+                                                        // Add to chat history
+                                                        if let Some(chat) =
+                                                            self.chats.get_mut(&chat_id)
+                                                        {
+                                                            chat.messages.push(Message {
+                                                                id: Uuid::new_v4(),
+                                                                from_me: false,
+                                                                content: MessageContent::File {
+                                                                    filename: transfer
+                                                                        .filename
+                                                                        .clone(),
+                                                                    size: transfer.size,
+                                                                    path: Some(final_path),
+                                                                },
+                                                                timestamp: chrono::Utc::now(),
+                                                            });
+                                                        }
+                                                    }
+                                                    self.update_transfer_progress(
+                                                        transfer_id,
+                                                        bytes_received,
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to finalize file: {}",
+                                                        e
+                                                    );
+                                                    self.add_toast(
+                                                        ToastLevel::Error,
+                                                        format!("File transfer error: {}", e),
+                                                    );
+                                                }
                                             }
                                         }
-                                        self.update_transfer_progress(transfer_id, bytes_received);
                                     }
-                                    Err(e) => {
-                                        tracing::error!("Failed to finalize file: {}", e);
-                                        self.add_toast(
-                                            ToastLevel::Error,
-                                            format!("File transfer error: {}", e),
-                                        );
-                                    }
-                                }
-                                    }
-                                }
                                 } else {
                                     tracing::warn!("Received FileEnd with invalid sequence number for transfer {}. Expected {}, got {}. Discarding.", transfer_id, transfer.seq, seq);
                                 }
@@ -1573,11 +1630,15 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         // Simulate user accepting the fingerprint via UI
-        mgr.confirm_fingerprint(chat_id, true).expect("confirm should succeed");
+        mgr.confirm_fingerprint(chat_id, true)
+            .expect("confirm should succeed");
         // Now the session should receive confirmation
         assert_eq!(rx.try_recv(), Ok(true));
         // And the fingerprint should now be stored
-        assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, Some(fingerprint1.clone()));
+        assert_eq!(
+            mgr.chats.get(&chat_id).unwrap().peer_fingerprint,
+            Some(fingerprint1.clone())
+        );
 
         // 2. Second Use: Matching fingerprint -> auto-confirm
         let event2 = SessionEvent::ShowFingerprintVerification {

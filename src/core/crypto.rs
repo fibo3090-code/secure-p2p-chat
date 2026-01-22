@@ -1,19 +1,19 @@
 use aes_gcm::{
-    Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use hkdf::Hkdf;
-use rand::{RngCore, rngs::OsRng};
+use rand::{rngs::OsRng, RngCore};
 use rsa::{
-    Oaep, RsaPrivateKey, RsaPublicKey,
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey},
     pkcs8::{DecodePublicKey, EncodePublicKey},
+    Oaep, RsaPrivateKey, RsaPublicKey,
 };
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 
 use crate::AES_KEY_SIZE;
 
@@ -161,32 +161,34 @@ pub struct AesCipher {
 }
 
 impl AesCipher {
-        /// Create new cipher from 32-byte key with random session ID
-        pub fn new(key: &[u8]) -> Result<Self> {
-            assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
-    
-            let mut session_id = [0u8; 4];
-                // Use OS RNG explicitly for cryptographic session IDs
-                OsRng.fill_bytes(&mut session_id);
-    
-            Ok(Self {
-                cipher: Aes256Gcm::new_from_slice(key)
-                    .map_err(|e| anyhow!("Invalid AES key length: {}", e))?,
-                nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                session_id,
-            })
-        }
+    /// Create new cipher from 32-byte key with random session ID
+    pub fn new(key: &[u8]) -> Result<Self> {
+        assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
+
+        let mut session_id = [0u8; 4];
+        // Use OS RNG explicitly for cryptographic session IDs
+        OsRng.fill_bytes(&mut session_id);
+
+        Ok(Self {
+            cipher: Aes256Gcm::new_from_slice(key)
+                .map_err(|e| anyhow!("Invalid AES key length: {}", e))?,
+            nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session_id,
+        })
+    }
     /// Encrypt plaintext, returns nonce(12) || ciphertext || tag(16)
     /// Uses counter-based nonce: session_id(4) || counter(8) for guaranteed uniqueness
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
         // Get next counter value atomically
-        let counter = self.nonce_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        
+        let counter = self
+            .nonce_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         // Build nonce: session_id (4 bytes) || counter (8 bytes)
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[0..4].copy_from_slice(&self.session_id);
         nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
-        
+
         let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = self

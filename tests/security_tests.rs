@@ -26,7 +26,7 @@ fn test_filename_sanitization_security() {
 fn test_protocol_message_input_limits() {
     // Ensure we don't crash on huge inputs
     let huge_data = vec![0u8; 10 * 1024 * 1024]; // 10MB
-    // ProtocolMessage::from_plain_bytes has a check for TEXT: len > 64KB
+                                                 // ProtocolMessage::from_plain_bytes has a check for TEXT: len > 64KB
 
     let mut text_msg = b"TEXT:".to_vec();
     text_msg.extend_from_slice(&huge_data);

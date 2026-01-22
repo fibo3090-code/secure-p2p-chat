@@ -56,7 +56,7 @@ impl Discovery {
 
         // Construct the service info
         let host_ipv4 = crate::util::primary_local_ipv4().unwrap_or_else(|| "0.0.0.0".to_string());
-        
+
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             name,
@@ -65,12 +65,12 @@ impl Discovery {
             port,
             properties,
         )?;
-        
+
         let fullname = service_info.get_fullname().to_string();
-        
+
         self.daemon.register(service_info)?;
         self.registered_service_fullname = Some(fullname.clone());
-        
+
         tracing::info!(
             name = %name,
             port = %port,
@@ -100,7 +100,10 @@ impl Discovery {
                     let _fullname = info.get_fullname().to_string();
                     let addresses = info.get_addresses();
                     let port = info.get_port();
-                    let fingerprint = info.get_properties().get("fingerprint").map(|p| p.val_str().to_string());
+                    let fingerprint = info
+                        .get_properties()
+                        .get("fingerprint")
+                        .map(|p| p.val_str().to_string());
 
                     if let Some(addr) = addresses.iter().next() {
                         let peer = DiscoveredPeer {
@@ -109,17 +112,20 @@ impl Discovery {
                             port,
                             fingerprint,
                         };
-                        
+
                         tracing::info!(
                             name = %peer.name,
                             address = %peer.address,
                             port = %peer.port,
                             "Discovered peer via mDNS"
                         );
-                        
+
                         if let Ok(mut peers) = discovered_peers.lock() {
                             // Avoid duplicates
-                            if !peers.iter().any(|p| p.address == peer.address && p.port == peer.port) {
+                            if !peers
+                                .iter()
+                                .any(|p| p.address == peer.address && p.port == peer.port)
+                            {
                                 peers.push(peer);
                             }
                         }

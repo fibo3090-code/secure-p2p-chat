@@ -38,7 +38,9 @@ fn render_about_tab(ui: &mut egui::Ui) {
                 .strong(),
         );
         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-        ui.label(egui::RichText::new("Security Status: LOW").color(egui::Color32::from_rgb(255, 165, 0)));
+        ui.label(
+            egui::RichText::new("Security Status: LOW").color(egui::Color32::from_rgb(255, 165, 0)),
+        );
         ui.add_space(10.0);
         ui.label("A secure, private, and decentralized peer-to-peer messaging application.");
         ui.add_space(20.0);
@@ -51,9 +53,7 @@ fn render_about_tab(ui: &mut egui::Ui) {
         ui.label(
             "• End-to-End Encryption: Every message is encrypted with military-grade cryptography.",
         );
-        ui.label(
-            "• Privacy First: No phone numbers, no email. Just cryptographic identities.",
-        );
+        ui.label("• Privacy First: No phone numbers, no email. Just cryptographic identities.");
         ui.label(
             "• Forward Secrecy: Past conversations remain secure even if keys are compromised.",
         );
@@ -80,7 +80,7 @@ fn render_about_tab(ui: &mut egui::Ui) {
 fn render_features_tab(ui: &mut egui::Ui) {
     ui.heading("Security Features");
     ui.add_space(5.0);
-    
+
     let security_features = [
         (
             "🔒 Military-Grade Encryption",
@@ -238,71 +238,102 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("Troubleshooting Guide").heading());
     ui.add_space(10.0);
 
-    ui.collapsing(egui::RichText::new("🔴 Cannot connect to peer").strong(), |ui| {
-        ui.label("1. Verify the host is running and shows 'Listening on port XXXX' status.");
-        ui.label("2. Double-check the IP address and port number (format: 192.168.1.100:8080).");
-        ui.label("3. Check firewall settings:");
-        ui.label("   • Windows: Allow 'chat-p2p.exe' through Windows Defender Firewall");
-        ui.label("   • Linux: sudo ufw allow <port>/tcp");
-        ui.label("   • macOS: System Preferences → Security & Privacy → Firewall");
-        ui.label("4. If connecting over internet, ensure port forwarding is configured on router.");
-        ui.label("5. Try pinging the host: ping <IP_ADDRESS>");
-        ui.label("6. Verify both users are on the same network (or using VPN/port forwarding).");
-    });
+    ui.collapsing(
+        egui::RichText::new("🔴 Cannot connect to peer").strong(),
+        |ui| {
+            ui.label("1. Verify the host is running and shows 'Listening on port XXXX' status.");
+            ui.label(
+                "2. Double-check the IP address and port number (format: 192.168.1.100:8080).",
+            );
+            ui.label("3. Check firewall settings:");
+            ui.label("   • Windows: Allow 'chat-p2p.exe' through Windows Defender Firewall");
+            ui.label("   • Linux: sudo ufw allow <port>/tcp");
+            ui.label("   • macOS: System Preferences → Security & Privacy → Firewall");
+            ui.label(
+                "4. If connecting over internet, ensure port forwarding is configured on router.",
+            );
+            ui.label("5. Try pinging the host: ping <IP_ADDRESS>");
+            ui.label(
+                "6. Verify both users are on the same network (or using VPN/port forwarding).",
+            );
+        },
+    );
     ui.add_space(5.0);
 
-    ui.collapsing(egui::RichText::new("⚠️ Messages not delivering").strong(), |ui| {
-        ui.label("• Check the connection status indicator in the chat header.");
-        ui.label("• Ensure both parties are online and connected.");
-        ui.label("• If status shows 'Reconnecting', wait for automatic reconnection.");
-        ui.label("• Try manually reconnecting: click contact → Connect button.");
-        ui.label("• Check the Log Terminal (Settings → Show Log Terminal) for errors.");
-    });
+    ui.collapsing(
+        egui::RichText::new("⚠️ Messages not delivering").strong(),
+        |ui| {
+            ui.label("• Check the connection status indicator in the chat header.");
+            ui.label("• Ensure both parties are online and connected.");
+            ui.label("• If status shows 'Reconnecting', wait for automatic reconnection.");
+            ui.label("• Try manually reconnecting: click contact → Connect button.");
+            ui.label("• Check the Log Terminal (Settings → Show Log Terminal) for errors.");
+        },
+    );
     ui.add_space(5.0);
 
-    ui.collapsing(egui::RichText::new("🔑 Fingerprint verification failed").strong(), |ui| {
-        ui.label("• Ensure you're comparing the SAME fingerprint on both devices.");
-        ui.label("• Fingerprints are case-insensitive but must match exactly.");
-        ui.label("• If fingerprints don't match, DO NOT proceed - this indicates a security issue.");
-        ui.label("• Try reconnecting and verify fingerprints again.");
-        ui.label("• Verify through a trusted channel (phone call, video, in person).");
-    });
+    ui.collapsing(
+        egui::RichText::new("🔑 Fingerprint verification failed").strong(),
+        |ui| {
+            ui.label("• Ensure you're comparing the SAME fingerprint on both devices.");
+            ui.label("• Fingerprints are case-insensitive but must match exactly.");
+            ui.label(
+                "• If fingerprints don't match, DO NOT proceed - this indicates a security issue.",
+            );
+            ui.label("• Try reconnecting and verify fingerprints again.");
+            ui.label("• Verify through a trusted channel (phone call, video, in person).");
+        },
+    );
     ui.add_space(5.0);
 
-    ui.collapsing(egui::RichText::new("📁 File transfer issues").strong(), |ui| {
-        ui.label("• Maximum file size is 2GB - larger files will be rejected.");
-        ui.label("• Ensure you have enough disk space in your Downloads folder.");
-        ui.label("• Check file permissions on the Downloads directory.");
-        ui.label("• Large files may take time - check the progress indicator.");
-        ui.label("• If transfer fails, try again or use a smaller file.");
-    });
+    ui.collapsing(
+        egui::RichText::new("📁 File transfer issues").strong(),
+        |ui| {
+            ui.label("• Maximum file size is 2GB - larger files will be rejected.");
+            ui.label("• Ensure you have enough disk space in your Downloads folder.");
+            ui.label("• Check file permissions on the Downloads directory.");
+            ui.label("• Large files may take time - check the progress indicator.");
+            ui.label("• If transfer fails, try again or use a smaller file.");
+        },
+    );
     ui.add_space(5.0);
 
-    ui.collapsing(egui::RichText::new("🔐 Identity/password issues").strong(), |ui| {
-        ui.label("• If you forgot your password, you cannot recover your identity.");
-        ui.label("• You'll need to create a new identity and re-verify with contacts.");
-        ui.label("• To backup your identity: copy identity.json from the app data folder.");
-        ui.label("• To restore: replace identity.json and restart the application.");
-        ui.label("• Password uses Argon2 - there's no way to bypass or reset it.");
-    });
+    ui.collapsing(
+        egui::RichText::new("🔐 Identity/password issues").strong(),
+        |ui| {
+            ui.label("• If you forgot your password, you cannot recover your identity.");
+            ui.label("• You'll need to create a new identity and re-verify with contacts.");
+            ui.label("• To backup your identity: copy identity.json from the app data folder.");
+            ui.label("• To restore: replace identity.json and restart the application.");
+            ui.label("• Password uses Argon2 - there's no way to bypass or reset it.");
+        },
+    );
     ui.add_space(5.0);
 
-    ui.collapsing(egui::RichText::new("💾 Chat history not loading").strong(), |ui| {
-        ui.label("• If using encrypted history, ensure you enter the correct password.");
-        ui.label("• Check that history.json.enc exists in the app data folder.");
-        ui.label("• Corrupted history file: restore from backup or start fresh.");
-        ui.label("• Old unencrypted history.json will be migrated on first run.");
-    });
+    ui.collapsing(
+        egui::RichText::new("💾 Chat history not loading").strong(),
+        |ui| {
+            ui.label("• If using encrypted history, ensure you enter the correct password.");
+            ui.label("• Check that history.json.enc exists in the app data folder.");
+            ui.label("• Corrupted history file: restore from backup or start fresh.");
+            ui.label("• Old unencrypted history.json will be migrated on first run.");
+        },
+    );
     ui.add_space(5.0);
 
-    ui.collapsing(egui::RichText::new("🌐 Internet/WAN connectivity").strong(), |ui| {
-        ui.label("For internet connectivity, you need:");
-        ui.label("1. Port forwarding on the host's router (forward external port → internal port).");
-        ui.label("2. Host's public IP address (check whatismyip.com).");
-        ui.label("3. Or use a VPN solution like Tailscale, ZeroTier, or WireGuard.");
-        ui.label("4. Dynamic DNS if host's IP changes frequently.");
-        ui.label("\nEasiest solution: Use Tailscale (free, no port forwarding needed).");
-    });
+    ui.collapsing(
+        egui::RichText::new("🌐 Internet/WAN connectivity").strong(),
+        |ui| {
+            ui.label("For internet connectivity, you need:");
+            ui.label(
+                "1. Port forwarding on the host's router (forward external port → internal port).",
+            );
+            ui.label("2. Host's public IP address (check whatismyip.com).");
+            ui.label("3. Or use a VPN solution like Tailscale, ZeroTier, or WireGuard.");
+            ui.label("4. Dynamic DNS if host's IP changes frequently.");
+            ui.label("\nEasiest solution: Use Tailscale (free, no port forwarding needed).");
+        },
+    );
 
     ui.add_space(15.0);
     ui.separator();

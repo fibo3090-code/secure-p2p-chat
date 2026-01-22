@@ -5,6 +5,12 @@ use eframe::egui;
 use egui_tracing::ui::Logs;
 
 pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
+    // Initial password setup dialog: highest priority (must be done first)
+    if app.is_new_identity || app.force_password_setup {
+        render_set_password_dialog(app, ctx);
+        return; // Block other dialogs while password setup is mandatory
+    }
+
     if app.show_welcome {
         render_welcome(app, ctx);
     }
@@ -228,17 +234,34 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
 
                     // --- Get Style based on Level ---
                     let (icon, base_color) = match toast.level {
-                        crate::types::ToastLevel::Info => ("ℹ", crate::gui::styling::ACCENT_PRIMARY),
+                        crate::types::ToastLevel::Info => {
+                            ("ℹ", crate::gui::styling::ACCENT_PRIMARY)
+                        }
                         crate::types::ToastLevel::Success => ("✔", crate::gui::styling::SUCCESS),
                         crate::types::ToastLevel::Warning => ("⚠", crate::gui::styling::WARNING),
                         crate::types::ToastLevel::Error => ("❌", crate::gui::styling::ERROR),
                     };
 
                     // --- Define Colors with correct API ---
-                    let frame_fill = egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 25);
+                    let frame_fill = egui::Color32::from_rgba_unmultiplied(
+                        base_color.r(),
+                        base_color.g(),
+                        base_color.b(),
+                        25,
+                    );
                     let text_color = ui.style().visuals.text_color();
-                    let final_text_color = egui::Color32::from_rgba_unmultiplied(text_color.r(), text_color.g(), text_color.b(), alpha);
-                    let icon_color = egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), alpha);
+                    let final_text_color = egui::Color32::from_rgba_unmultiplied(
+                        text_color.r(),
+                        text_color.g(),
+                        text_color.b(),
+                        alpha,
+                    );
+                    let icon_color = egui::Color32::from_rgba_unmultiplied(
+                        base_color.r(),
+                        base_color.g(),
+                        base_color.b(),
+                        alpha,
+                    );
                     let stroke_color = icon_color;
 
                     // --- Define the Frame ---
@@ -340,24 +363,36 @@ fn render_connect_dialog(app: &mut App, ctx: &egui::Context) {
         .min_width(350.0)
         .show(ctx, |ui| {
             // Show discovered peers
-            let peers = app.discovered_peers.lock().ok().map(|p| p.clone()).unwrap_or_default();
+            let peers = app
+                .discovered_peers
+                .lock()
+                .ok()
+                .map(|p| p.clone())
+                .unwrap_or_default();
             if !peers.is_empty() {
                 ui.heading("📡 Nearby Users");
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                    for peer in &peers {
-                        ui.horizontal(|ui| {
-                            let label = format!("{} ({}:{})", peer.name, peer.address, peer.port);
-                            if ui.button(&label).clicked() {
-                                app.connect_host = peer.address.clone();
-                                app.connect_port = peer.port.to_string();
-                            }
-                        });
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for peer in &peers {
+                            ui.horizontal(|ui| {
+                                let label =
+                                    format!("{} ({}:{})", peer.name, peer.address, peer.port);
+                                if ui.button(&label).clicked() {
+                                    app.connect_host = peer.address.clone();
+                                    app.connect_port = peer.port.to_string();
+                                }
+                            });
+                        }
+                    });
                 ui.separator();
             } else {
-                ui.label(egui::RichText::new("🔍 Searching for nearby users...").italics().color(crate::gui::styling::SUBTLE_TEXT_COLOR));
+                ui.label(
+                    egui::RichText::new("🔍 Searching for nearby users...")
+                        .italics()
+                        .color(crate::gui::styling::SUBTLE_TEXT_COLOR),
+                );
                 ui.add_space(8.0);
             }
 
@@ -821,10 +856,21 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                                     let pixels = image_buffer.as_flat_samples();
                                     let texture = ctx.load_texture(
                                         "qr_code",
-                                        egui::ImageData::Color(std::sync::Arc::new(egui::ColorImage {
-                                            size,
-                                            pixels: pixels.as_slice().to_vec().chunks_exact(4).map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect(),
-                                        })),
+                                        egui::ImageData::Color(std::sync::Arc::new(
+                                            egui::ColorImage {
+                                                size,
+                                                pixels: pixels
+                                                    .as_slice()
+                                                    .to_vec()
+                                                    .chunks_exact(4)
+                                                    .map(|p| {
+                                                        egui::Color32::from_rgba_unmultiplied(
+                                                            p[0], p[1], p[2], p[3],
+                                                        )
+                                                    })
+                                                    .collect(),
+                                            },
+                                        )),
                                         egui::TextureOptions::LINEAR,
                                     );
                                     app.qr_code_texture = Some(texture);
@@ -844,7 +890,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.add_space(10.0);
                     ui.label("💡 Tip: You can share this via:");
                     ui.label("  • Email, WhatsApp, SMS");
-                    
+
                     ui.add_space(10.0);
                     if crate::gui::widgets::secondary_button(ui, "Close").clicked() {
                         app.show_add_contact = false;
@@ -1468,7 +1514,10 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
             if app.new_password_input != app.confirm_password_input {
                 ui.colored_label(crate::gui::styling::ERROR, "Passwords do not match.");
             } else if app.new_password_input.is_empty() {
-                ui.colored_label(crate::gui::styling::SUBTLE_TEXT_COLOR, "Enter and confirm a password to enable the button.");
+                ui.colored_label(
+                    crate::gui::styling::SUBTLE_TEXT_COLOR,
+                    "Enter and confirm a password to enable the button.",
+                );
             }
 
             ui.horizontal(|ui| {
@@ -1521,7 +1570,13 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 }
 
-                if ui.add_enabled(!app.is_new_identity && !app.force_password_setup, egui::Button::new("Cancel")).clicked() {
+                if ui
+                    .add_enabled(
+                        !app.is_new_identity && !app.force_password_setup,
+                        egui::Button::new("Cancel"),
+                    )
+                    .clicked()
+                {
                     app.show_set_password_dialog = false;
                     app.new_password_input.clear();
                     app.confirm_password_input.clear();
@@ -1567,7 +1622,8 @@ fn render_remove_password_dialog(app: &mut App, ctx: &egui::Context) {
                                 if let Ok(mut manager) = app.chat_manager.try_lock() {
                                     manager.add_toast(
                                         crate::types::ToastLevel::Success,
-                                        "Password removed and identity is now unencrypted!".to_string(),
+                                        "Password removed and identity is now unencrypted!"
+                                            .to_string(),
                                     );
                                 }
                                 app.show_remove_password_dialog = false;

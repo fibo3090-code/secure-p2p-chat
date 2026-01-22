@@ -1,4 +1,4 @@
-use eframe::egui::{Color32, Rounding, Stroke, style::Visuals};
+use eframe::egui::{style::Visuals, Color32, Rounding, Stroke};
 
 // Define color palettes for both dark and light themes to ensure a consistent look and feel.
 

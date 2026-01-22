@@ -127,7 +127,10 @@ mod tests {
         assert!(!trav.contains('/'));
         assert!(!trav.contains('\\'));
         assert!(!trav.is_empty());
-        assert_eq!(sanitize_filename("file:with*bad?chars"), "file_with_bad_chars");
+        assert_eq!(
+            sanitize_filename("file:with*bad?chars"),
+            "file_with_bad_chars"
+        );
     }
 
     #[test]

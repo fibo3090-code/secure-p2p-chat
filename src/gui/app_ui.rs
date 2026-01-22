@@ -1,5 +1,5 @@
 use crate::app::ChatManager;
-use crate::network::{Discovery, DiscoveredPeer};
+use crate::network::{DiscoveredPeer, Discovery};
 use crate::types::*;
 
 use crate::PORT_DEFAULT;
@@ -215,9 +215,9 @@ impl App {
         }
 
         let initial_identity_locked = identity.is_locked();
-            // Force password setup whenever the identity is not locked (i.e., private key available in plaintext)
-            // This covers: newly created identities and legacy identities loaded with plaintext.
-            let force_password_setup = !initial_identity_locked;
+        // Force password setup whenever the identity is not locked (i.e., private key available in plaintext)
+        // This covers: newly created identities and legacy identities loaded with plaintext.
+        let force_password_setup = !initial_identity_locked;
 
         Self {
             chat_manager: manager_arc,
@@ -359,11 +359,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.is_new_identity || self.force_password_setup {
-            crate::gui::dialogs::render_set_password_dialog(self, ctx);
-            return;
-        }
-        // Poll session events to process received messages
+        // Always poll session events to keep the app responsive
         if let Ok(mut manager) = self.chat_manager.try_lock() {
             manager.poll_session_events();
             if let Some((fingerprint, peer_name, chat_id)) =
@@ -380,7 +376,7 @@ impl eframe::App for App {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::sync::OnceLock;
             static LAST_SAVE_MILLIS: OnceLock<AtomicU64> = OnceLock::new();
-            
+
             let last_save = LAST_SAVE_MILLIS.get_or_init(|| AtomicU64::new(0));
             let now_millis = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -408,7 +404,7 @@ impl eframe::App for App {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     use std::sync::OnceLock;
                     static LAST_REHOST_MILLIS: OnceLock<AtomicU64> = OnceLock::new();
-                    
+
                     let last_rehost = LAST_REHOST_MILLIS.get_or_init(|| AtomicU64::new(0));
                     let now_millis = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -416,7 +412,7 @@ impl eframe::App for App {
                         .as_millis() as u64;
                     let last = last_rehost.load(Ordering::Relaxed);
                     let should_rehost = last == 0 || now_millis.saturating_sub(last) > 1500;
-                    
+
                     if should_rehost {
                         last_rehost.store(now_millis, Ordering::Relaxed);
                         let port = manager.config.listen_port;
@@ -489,16 +485,17 @@ impl eframe::App for App {
                             );
                             if ui.button("Copy address").clicked() {
                                 if let Some(ip) = crate::util::primary_local_ipv4() {
-                                    ui.output_mut(|o| o.copied_text = format!("{ip}:{listen_port}"));
+                                    ui.output_mut(|o| {
+                                        o.copied_text = format!("{ip}:{listen_port}")
+                                    });
                                 } else {
-                                    ui.output_mut(|o| o.copied_text = format!("localhost:{listen_port}"));
+                                    ui.output_mut(|o| {
+                                        o.copied_text = format!("localhost:{listen_port}")
+                                    });
                                 }
                             }
                         } else {
-                            ui.colored_label(
-                                crate::gui::styling::ERROR,
-                                "⚠ Not hosting",
-                            );
+                            ui.colored_label(crate::gui::styling::ERROR, "⚠ Not hosting");
                         }
 
                         ui.separator();
