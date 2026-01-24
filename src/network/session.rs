@@ -503,7 +503,62 @@ pub async fn run_client_session(
     run_message_loop(stream, cipher, to_app_tx, from_app_rx).await
 }
 
-/// Main message loop: send and receive encrypted messages
+/// Extract sequence number from a ProtocolMessage
+/// Returns None if the message type doesn't have a sequence number (shouldn't happen in practice)
+fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
+    match msg {
+        ProtocolMessage::Version { .. } => None,    // Handshake only
+        ProtocolMessage::EphemeralKey { .. } => None, // Handshake only
+        ProtocolMessage::SupportedSignatureSchemes { .. } => None, // Handshake only
+        ProtocolMessage::Text { seq, .. } => Some(*seq),
+        ProtocolMessage::FileMeta { seq, .. } => Some(*seq),
+        ProtocolMessage::FileChunk { seq, .. } => Some(*seq),
+        ProtocolMessage::FileEnd { seq } => Some(*seq),
+        ProtocolMessage::Ping { seq } => Some(*seq),
+        ProtocolMessage::TypingStart { seq } => Some(*seq),
+        ProtocolMessage::TypingStop { seq } => Some(*seq),
+    }
+}
+
+/// Validate message sequence number for replay attack protection
+/// 
+/// Transport-layer validation ensures that:
+/// 1. Messages are strictly monotonically increasing (seq > last_valid_seq)
+/// 2. Replayed messages (old seq) are rejected
+/// 3. Out-of-order messages are rejected
+/// 4. Duplicate messages are rejected
+///
+/// This is enforced BEFORE the message is emitted to the app layer.
+///
+/// # Arguments
+/// * `msg` - The parsed ProtocolMessage
+/// * `last_valid_seq` - Mutable reference to track the last accepted sequence number
+///
+/// # Returns
+/// * `Ok(())` if the sequence is valid and last_valid_seq is updated
+/// * `Err(String)` if the sequence is invalid (with descriptive reason)
+fn validate_message_sequence(msg: &ProtocolMessage, last_valid_seq: &mut u64) -> Result<(), String> {
+    // Handshake messages don't have sequence numbers - always allow
+    if extract_sequence(msg).is_none() {
+        return Ok(());
+    }
+
+    let seq = extract_sequence(msg).unwrap();
+
+    // Strict monotonic increase: new sequence must be strictly greater than last valid
+    if seq <= *last_valid_seq {
+        return Err(format!(
+            "Replay/Out-of-order detected: received seq={}, expected seq > {}",
+            seq, last_valid_seq
+        ));
+    }
+
+    // Update to new valid sequence
+    *last_valid_seq = seq;
+    Ok(())
+}
+
+/// Main message loop: send and receive encrypted messages with replay protection
 async fn run_message_loop<S>(
     mut stream: S,
     cipher: AesCipher,
@@ -514,6 +569,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+
+    // Track last valid sequence number to detect replays and out-of-order messages
+    // This is enforced at the transport layer, not just in the app layer
+    let mut last_valid_seq: u64 = 0;
 
     loop {
         tokio::select! {
@@ -529,9 +588,21 @@ where
                             if let Some(msg) = ProtocolMessage::from_plain_bytes(&plaintext) {
                                 tracing::debug!("Received message: {:?}", msg);
 
-                                if let Err(e) = to_app_tx.send(SessionEvent::MessageReceived(msg)) {
-                                    tracing::error!("Failed to send MessageReceived event: {}", e);
-                                    return Err(anyhow!("Event channel closed: {}", e));
+                                // --- TRANSPORT-LAYER REPLAY PROTECTION ---
+                                // Extract sequence number from message and validate it
+                                match validate_message_sequence(&msg, &mut last_valid_seq) {
+                                    Ok(_) => {
+                                        // Sequence is valid, emit the message
+                                        if let Err(e) = to_app_tx.send(SessionEvent::MessageReceived(msg)) {
+                                            tracing::error!("Failed to send MessageReceived event: {}", e);
+                                            return Err(anyhow!("Event channel closed: {}", e));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        // Invalid sequence detected - replay attempt or out-of-order
+                                        tracing::warn!("Rejecting message due to invalid sequence: {}", e);
+                                        // Don't emit event, silently drop the message
+                                    }
                                 }
                             } else {
                                 tracing::warn!("Failed to parse message from {} bytes", plaintext.len());
@@ -733,35 +804,161 @@ mod tests {
         Ok(())
     }
 
-    /// PHASE 0 REGRESSION TEST: Sequence validation should occur in session layer.
-    /// Currently, sequence checks happen only in ChatManager (app layer), not in the
-    /// session transport layer. This test verifies the current (vulnerable) behavior:
-    /// out-of-order messages are dispatched to app without pre-filtering.
-    /// EXPECTED: This test documents that replay/out-of-order messages reach MessageReceived.
-    /// GOAL (Phase 2): Move validation to transport layer so invalid seq is rejected before dispatch.
+    /// Test: Replay protection now works at transport layer
+    /// Transport-layer sequence validation rejects:
+    /// - Duplicate messages (seq == last_valid_seq)
+    /// - Old messages (seq < last_valid_seq)
+    /// - Only allows strictly increasing sequence numbers
     #[test]
-    fn test_regression_seq_validation_scope() {
-        // This is a documentation test. In Phase 2, we'll add actual sequence validation
-        // in the session loop (run_message_loop) to reject replayed/out-of-order messages
-        // before they are emitted as SessionEvent::MessageReceived.
-        //
-        // Current state (HIGH RISK):
-        // - Session::handle_message() decrypts and parses ProtocolMessage.
-        // - If seq is valid for decryption, the message is wrapped in SessionEvent::MessageReceived.
-        // - App layer (ChatManager::handle_session_event) then filters on recv_seq.
-        // - This means invalid seq messages have already passed through network boundary.
-        //
-        // Fix (Phase 2):
-        // - Maintain last_valid_seq in Session state.
-        // - In handle_message_loop, check seq >= last_valid_seq.
-        // - If invalid, log + drop (never emit MessageReceived).
-        // - Update tests to verify this transport-level filtering.
+    fn test_transport_layer_replay_protection() {
+        let mut last_valid_seq = 0u64;
 
-        // For now, we document that the issue exists so Phase 2 can fix it.
-        assert!(
-            true,
-            "Sequence validation currently happens in app layer, not transport. \
-             Phase 2 must move it to Session::run_message_loop."
-        );
+        // Test 1: Accept first message with seq=1
+        let msg1 = ProtocolMessage::Text {
+            text: "Hello".to_string(),
+            timestamp: 0,
+            seq: 1,
+        };
+        assert!(validate_message_sequence(&msg1, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 1);
+
+        // Test 2: Accept second message with seq=2
+        let msg2 = ProtocolMessage::Text {
+            text: "World".to_string(),
+            timestamp: 1,
+            seq: 2,
+        };
+        assert!(validate_message_sequence(&msg2, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 2);
+
+        // Test 3: Reject replay with seq=1 (older than last_valid_seq)
+        let replay1 = ProtocolMessage::Text {
+            text: "Replay".to_string(),
+            timestamp: 2,
+            seq: 1,
+        };
+        let result = validate_message_sequence(&replay1, &mut last_valid_seq);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Replay"));
+        // last_valid_seq should NOT be updated
+        assert_eq!(last_valid_seq, 2);
+
+        // Test 4: Reject duplicate with seq=2 (equal to last_valid_seq)
+        let duplicate2 = ProtocolMessage::Text {
+            text: "Duplicate".to_string(),
+            timestamp: 3,
+            seq: 2,
+        };
+        let result = validate_message_sequence(&duplicate2, &mut last_valid_seq);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Replay"));
+        assert_eq!(last_valid_seq, 2);
+
+        // Test 5: Accept message with seq=3 (strictly greater)
+        let msg3 = ProtocolMessage::Text {
+            text: "Next".to_string(),
+            timestamp: 4,
+            seq: 3,
+        };
+        assert!(validate_message_sequence(&msg3, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 3);
+
+        // Test 6: Reject out-of-order with seq=2 (after accepting seq=3)
+        let out_of_order = ProtocolMessage::Text {
+            text: "Out of order".to_string(),
+            timestamp: 5,
+            seq: 2,
+        };
+        let result = validate_message_sequence(&out_of_order, &mut last_valid_seq);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Out-of-order"));
+        assert_eq!(last_valid_seq, 3);
+
+        // Test 7: Large gap in sequences is acceptable (seq=100)
+        let msg100 = ProtocolMessage::Text {
+            text: "Big gap".to_string(),
+            timestamp: 6,
+            seq: 100,
+        };
+        assert!(validate_message_sequence(&msg100, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 100);
+    }
+
+    /// Test: Handshake messages bypass sequence validation
+    /// (Version, EphemeralKey, SupportedSignatureSchemes have no seq field)
+    #[test]
+    fn test_handshake_messages_bypass_sequence_check() {
+        let mut last_valid_seq = 5;
+
+        // Handshake messages should always pass, even with no sequence number
+        let version_msg = ProtocolMessage::Version { version: 3 };
+        assert!(validate_message_sequence(&version_msg, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 5); // Unchanged
+
+        let ephemeral_msg = ProtocolMessage::EphemeralKey {
+            public_key: vec![0u8; 32],
+        };
+        assert!(validate_message_sequence(&ephemeral_msg, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 5); // Unchanged
+    }
+
+    /// Test: Different message types all respect sequence numbers
+    #[test]
+    fn test_replay_protection_all_message_types() {
+        let mut last_valid_seq = 0u64;
+
+        // Test FileChunk sequence validation
+        let chunk1 = ProtocolMessage::FileChunk {
+            chunk: vec![1, 2, 3],
+            seq: 1,
+        };
+        assert!(validate_message_sequence(&chunk1, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 1);
+
+        // Replayed chunk should be rejected
+        let replay_chunk = ProtocolMessage::FileChunk {
+            chunk: vec![1, 2, 3],
+            seq: 1,
+        };
+        assert!(validate_message_sequence(&replay_chunk, &mut last_valid_seq).is_err());
+
+        // Test FileMeta sequence validation
+        let meta = ProtocolMessage::FileMeta {
+            filename: "test.txt".to_string(),
+            size: 1024,
+            seq: 2,
+        };
+        assert!(validate_message_sequence(&meta, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 2);
+
+        // Test Ping sequence validation
+        let ping = ProtocolMessage::Ping { seq: 3 };
+        assert!(validate_message_sequence(&ping, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 3);
+
+        // Test TypingStart sequence validation
+        let typing = ProtocolMessage::TypingStart { seq: 4 };
+        assert!(validate_message_sequence(&typing, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 4);
+    }
+
+    /// Previous regression test - now replaced with comprehensive tests above
+    /// This documents that Phase 2 (Issue #6) is now COMPLETE
+    #[test]
+    fn test_issue_6_replay_protection_complete() {
+        // Issue #6: Replay Protection & Key Rotation
+        // 
+        // Phase 2 (Transport-Layer Validation) - COMPLETED ✅
+        // - Sequence numbers are now validated in transport layer (run_message_loop)
+        // - Replayed/out-of-order messages are rejected before app receives them
+        // - See test_transport_layer_replay_protection() for comprehensive validation
+        //
+        // Phase 3 (Key Rotation) - FUTURE WORK
+        // - Implement periodic session key re-negotiation
+        // - Add RekeyRequest protocol message
+        // - Both sides independently track rekey schedule
+        
+        assert!(true, "Transport-layer replay protection is now implemented in Issue #6 Phase 2");
     }
 }
+
