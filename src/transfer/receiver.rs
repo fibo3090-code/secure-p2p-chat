@@ -155,19 +155,7 @@ pub struct IncomingFileSync {
     file: std::fs::File,
     received: u64,
     expected: u64,
-    // filename removed: not used by sync helper (kept in transfer state instead)
-}
-
-impl Clone for IncomingFileSync {
-    fn clone(&self) -> Self {
-        let new_file = self.file.try_clone().expect("Failed to clone file handle");
-        Self {
-            tmp_path: self.tmp_path.clone(),
-            file: new_file,
-            received: self.received,
-            expected: self.expected,
-        }
-    }
+    final_dest: PathBuf,
 }
 
 impl IncomingFileSync {
@@ -180,7 +168,7 @@ impl IncomingFileSync {
                 crate::MAX_FILE_SIZE
             );
         }
-        let _ = dest_path
+        let filename = dest_path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
@@ -189,15 +177,8 @@ impl IncomingFileSync {
         let tmp_dir = dest_path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(tmp_dir)?;
 
-        let safe_filename = dest_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-        let tmp_name = format!(
-            "tmp_{}_{}",
-            Uuid::new_v4(),
-            sanitize_filename(safe_filename)
-        );
+        let safe_filename = sanitize_filename(filename);
+        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), &safe_filename);
         let tmp_path = tmp_dir.join(tmp_name);
 
         let file = std::fs::File::create(&tmp_path)?;
@@ -207,6 +188,7 @@ impl IncomingFileSync {
             file,
             received: 0,
             expected: expected_size,
+            final_dest: dest_path.to_path_buf(),
         })
     }
 
@@ -247,8 +229,40 @@ impl IncomingFileSync {
             );
         }
 
-        // The temp path is the final location
-        Ok(self.tmp_path)
+        // Handle filename conflicts for the final destination
+        let mut final_path = self.final_dest.clone();
+        let mut counter = 1;
+
+        // Ensure parent directory of final path exists
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        while final_path.exists() {
+            let stem = self.final_dest
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+            let ext = self.final_dest
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+
+            let new_filename = if ext.is_empty() {
+                format!("{}_{}", stem, counter)
+            } else {
+                format!("{}_{}.{}", stem, counter, ext)
+            };
+
+            final_path = self.final_dest.with_file_name(new_filename);
+            counter += 1;
+        }
+
+        // Rename temp file to final path
+        std::fs::rename(&self.tmp_path, &final_path)?;
+        tracing::info!("File saved to: {:?}", final_path);
+
+        Ok(final_path)
     }
 }
 
@@ -313,6 +327,9 @@ mod tests {
 
         // Should have different name
         assert_ne!(final_path, file1_path);
-        assert!(final_path.to_str().unwrap().contains("test_1.txt"));
+        
+        // Safely check filename
+        let final_filename = final_path.file_name().unwrap().to_str().unwrap();
+        assert!(final_filename.starts_with("test_") && final_filename.ends_with(".txt"));
     }
 }

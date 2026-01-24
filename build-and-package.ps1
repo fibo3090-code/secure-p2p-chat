@@ -225,6 +225,8 @@ try {
         else {
             $signArgs = @('sign', '/f', $PfxPath)
             if ($PfxPassword -ne $null) {
+                # Security Note: Passing the password via /p can expose it in the process command line.
+                # For higher security, use a certificate store or a password file with /pf.
                 $plainPwd = ConvertFrom-SecureString -SecureString $PfxPassword -AsPlainText
                 $signArgs += '/p'; $signArgs += $plainPwd
             }

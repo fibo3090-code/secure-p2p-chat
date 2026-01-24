@@ -21,31 +21,45 @@ This is a secure, peer-to-peer messaging application for desktop, built with Rus
 ```text
 chat-p2p/
 ├── src/
-│   ├── main.rs (GUI application)
-│   ├── lib.rs (Module exports)
-│   ├── types.rs (Data structures)
-│   ├── util.rs (Helpers)
+│   ├── main.rs (GUI application entrypoint)
+│   ├── lib.rs (Module exports and constants)
+│   ├── types.rs (Core data structures)
+│   ├── util.rs (Utility functions)
 │   │
 │   ├── app/ (Business Logic Layer)
+│   │   ├── mod.rs
 │   │   ├── chat_manager.rs (Core state management)
-│   │   └── persistence.rs (JSON save/load)
+│   │   └── persistence.rs (JSON history save/load)
 │   │
 │   ├── core/ (Cryptography & Protocol)
+│   │   ├── mod.rs
 │   │   ├── crypto.rs (RSA, AES-GCM, X25519)
-│   │   ├── framing.rs (Length-prefixed send/recv, DoS-safe reads)
-│   │   └── protocol.rs (Message types, binary/legacy parsing)
+│   │   ├── framing.rs (Length-prefixed send/recv)
+│   │   └── protocol.rs (Message types and serialization)
+│   │
+│   ├── gui/ (GUI Layer)
+│   │   ├── mod.rs
+│   │   ├── app_ui.rs (Main application state)
+│   │   ├── chat_view.rs (Message display)
+│   │   ├── dialogs.rs (All pop-up dialogs)
+│   │   ├── help_view.rs (Help and about windows)
+│   │   ├── sidebar.rs (Chat list)
+│   │   ├── styling.rs (Theme and visuals)
+│   │   └── widgets.rs (Custom UI components)
 │   │
 │   ├── network/ (Network Layer)
+│   │   ├── mod.rs
 │   │   ├── discovery.rs (mDNS Peer Discovery)
-│   │   └── session.rs (TCP sessions, handshake)
+│   │   └── session.rs (TCP sessions and handshake)
 │   │
 │   ├── transfer/ (File Transfer Layer)
-│   │   ├── mod.rs, receiver.rs, sender.rs (Chunked send/receive)
+│   │   ├── mod.rs
+│   │   ├── receiver.rs (Receiving files)
+│   │   └── sender.rs (Sending files)
 │   │
 │   └── identity/ (Identity Layer)
-│       └── mod.rs (Persistent RSA keys)
+│       └── mod.rs (Persistent user identity and RSA keys)
 │
-
 ├── Cargo.toml
 ├── README.md
 └── SECURITY.md
@@ -202,8 +216,8 @@ The `address` field is optional. If it is not included, the recipient will need 
 * **Build**: `cargo build`
 * **Build (Release)**: `cargo build --release`
 * **Run (GUI)**: `cargo run --release`
-* **Run (CLI Host)**: `cargo run --release -- --host --port 12345`
-* **Run (CLI Client)**: `cargo run --release -- --connect 192.168.1.10:12345`
+
+> **Note**: Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
 
 ### 4.3. Testing
 
@@ -226,7 +240,7 @@ You can run these tests with `cargo test`.
 ### 4.4. Logging & Diagnostics
 
 * Logging uses `tracing` with `tracing-subscriber`.
-* Set `RUST_LOG="info,chat_p2p=debug"` to increase verbosity.
+* Set `RUST_LOG="info,encodeur_rsa_rust=debug"` to increase verbosity.
 * The GUI integrates logs via `egui_tracing` for in-app viewing.
 
 ### 4.5. Build Profiles

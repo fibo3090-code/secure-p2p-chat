@@ -61,6 +61,8 @@ cargo build --release
 cargo run --release
 ```
 
+> **Note**: The CLI is for launching the GUI. Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
+
 On first run (or when your identity is password-protected), you must **unlock with your password** or **set a password** for a new identity. The main app (chats, connections) is not available until that step is complete.
 
 ### Windows

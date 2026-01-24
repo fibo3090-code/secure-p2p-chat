@@ -64,18 +64,10 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desk
 #endif
 
 [Tasks]
-Name: "desktopicon"; Description: "Créer un raccourci sur le bureau"; GroupDescription: "Tâches optionnelles :"
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Optional tasks:"
 
 [Run]
-Filename: "{app}\{#MyAppExe}"; Description: "Lancer {#MyAppName}"; Flags: nowait postinstall skipifsilent
-
-[UninstallDelete]
-; Clean up app data on uninstall (optional, user confirms via uninstaller standard flow usually, 
-; but here we force delete specific cache if it's considered part of the 'clean' uninstall request).
-; Note: standard Inno Setup doesn't ask "Do you want to delete data?", it just follows the script.
-; To be safe, we only delete the folder if it's empty or we can add a custom Code query.
-; For now, we'll assume a "clean" uninstall instruction meant we should define the path.
-Type: filesandordirs; Name: "{userappdata}\chat-p2p\EncryptedMessenger"
+Filename: "{app}\{#MyAppExe}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 // Helper function to find and close the application before install/uninstall
@@ -99,13 +91,13 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
-    // You could prompt the user here if they want to delete their data
-    if MsgBox('Voulez-vous supprimer vos données de conversation et clés locales (recommandé pour une désinstallation complète) ?', mbConfirmation, MB_YESNO) = IDYES then
+    // Prompt the user if they want to delete their data
+    if MsgBox('Do you want to delete your conversation data and local keys (recommended for a complete uninstall)?', mbConfirmation, MB_YESNO) = IDYES then
     begin
-        // The deletion happens in [UninstallDelete] section automatically if defined, 
-        // OR we can manually delete here if we want it conditional.
-        // Since [UninstallDelete] runs unconditionally, we should use DelTree here for conditional.
-        DelTree(ExpandConstant('{userappdata}\chat-p2p\EncryptedMessenger'), True, True, True);
+        // Manually delete the application data directory.
+        // This path MUST match the one used by `directories::ProjectDirs` in the application.
+        // On Windows, this is typically %LOCALAPPDATA%\<organization>.<app>.<author>
+        DelTree(ExpandConstant('{localappdata}\com.chat-p2p.EncryptedMessenger'), True, True, True);
     end;
   end;
 end;

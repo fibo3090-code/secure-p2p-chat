@@ -14,8 +14,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::core::{generate_rsa_keypair_async, ProtocolMessage};
+use crate::core::ProtocolMessage;
 use crate::network::{run_client_session, run_host_session};
+use rsa::RsaPrivateKey;
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
 
@@ -26,7 +27,6 @@ pub struct SessionHandle {
 }
 
 /// Main chat manager - orchestrates sessions, messages, and file transfers
-#[derive(Clone)]
 pub struct ChatManager {
     pub chats: HashMap<Uuid, Chat>,
     pub contacts: HashMap<Uuid, Contact>,
@@ -157,7 +157,7 @@ impl ChatManager {
 
     /// Attempt to reconnect to previously mapped contacts based on persisted history.
     /// Best-effort: skips missing contacts and logs warnings instead of failing fast.
-    pub async fn auto_reconnect_contacts(&mut self) {
+    pub async fn auto_reconnect_contacts(&mut self, privkey: &RsaPrivateKey) {
         if !self.config.auto_connect {
             tracing::info!("auto_connect disabled; skipping auto reconnect");
             return;
@@ -189,7 +189,7 @@ impl ChatManager {
             );
 
             match self
-                .connect_to_contact(contact_id, Some(mapped_chat_id))
+                .connect_to_contact(contact_id, Some(mapped_chat_id), privkey)
                 .await
             {
                 Ok(chat_id) => {
@@ -325,7 +325,7 @@ impl ChatManager {
     }
 
     /// Start hosting on specified port
-    pub async fn start_host(&mut self, port: u16) -> Result<Uuid> {
+    pub async fn start_host(&mut self, port: u16, privkey: RsaPrivateKey) -> Result<Uuid> {
         // Guard: if a placeholder host already exists for this port, avoid spawning another.
         // If the placeholder has no active session, clean it up so we can rehost.
         if self.has_placeholder_host(port) {
@@ -359,7 +359,6 @@ impl ChatManager {
         }
         let chat_id = Uuid::new_v4();
         tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
-        let privkey = generate_rsa_keypair_async(crate::RSA_KEY_BITS).await?;
 
         // Create channels
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
@@ -409,10 +408,10 @@ impl ChatManager {
         host: &str,
         port: u16,
         existing_chat_id: Option<Uuid>,
+        privkey: RsaPrivateKey,
     ) -> Result<Uuid> {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         tracing::info!(chat_id = %chat_id, host = %host, port = %port, "connect_to_host called");
-        let privkey = generate_rsa_keypair_async(crate::RSA_KEY_BITS).await?;
 
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
@@ -468,6 +467,7 @@ impl ChatManager {
         &mut self,
         contact_id: Uuid,
         existing_chat_id: Option<Uuid>,
+        privkey: &RsaPrivateKey,
     ) -> Result<Uuid> {
         let contact = self
             .contacts
@@ -510,7 +510,9 @@ impl ChatManager {
             if let Some(address) = contact.address.clone() {
                 if let Ok((host, port)) = Self::parse_address(&address) {
                     tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
-                    let chat_id = self.connect_to_host(&host, port, Some(mapped)).await?;
+                    let chat_id = self
+                        .connect_to_host(&host, port, Some(mapped), privkey.clone())
+                        .await?;
                     self.associate_contact_with_chat(contact_id, chat_id);
                     return Ok(chat_id);
                 }
@@ -527,7 +529,9 @@ impl ChatManager {
         if let Some(address) = contact.address.clone() {
             let (host, port) = Self::parse_address(&address)?;
             tracing::info!("Connecting to contact {} via {}:{}", contact_id, host, port);
-            let chat_id = self.connect_to_host(&host, port, existing_chat_id).await?;
+            let chat_id = self
+                .connect_to_host(&host, port, existing_chat_id, privkey.clone())
+                .await?;
             self.associate_contact_with_chat(contact_id, chat_id);
             Ok(chat_id)
         } else {

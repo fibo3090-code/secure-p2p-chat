@@ -60,7 +60,15 @@ async fn main() -> anyhow::Result<()> {
         let run_result = eframe::run_native(
             "Encrypted P2P Messenger",
             native_options,
-            Box::new(|cc| Ok(Box::new(gui::App::new(cc, event_collector.clone())))),
+            Box::new(|cc| {
+                match gui::App::new(cc, event_collector.clone()) {
+                    Ok(app) => Ok(Box::new(app)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to create app state");
+                        Err(e.into())
+                    }
+                }
+            }),
         );
         if let Err(e) = run_result {
             tracing::error!(error = %e, "Failed to start GUI application");
@@ -69,29 +77,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("GUI application exited");
     } else if args.host {
         // CLI host mode
-        tracing::info!("Starting host on port {}", args.port);
-        println!("Starting host on port {}...", args.port);
-        println!("Waiting for connections...");
-
-        // Keep running
-        tokio::signal::ctrl_c().await?;
+        tracing::warn!("CLI host mode is not implemented. Please use the GUI.");
+        println!("CLI host mode is not implemented. Please use the GUI.");
+        std::process::exit(1);
     } else if let Some(addr) = args.connect {
         // CLI client mode
-        let (host, port) = if addr.contains(':') {
-            let parts: Vec<&str> = addr.split(':').collect();
-            (
-                parts[0].to_string(),
-                parts[1].parse().unwrap_or(PORT_DEFAULT),
-            )
-        } else {
-            (addr, args.port)
-        };
-
-        tracing::info!("Connecting to {}:{}", host, port);
-        println!("Connecting to {}:{}...", host, port);
-
-        // Keep running
-        tokio::signal::ctrl_c().await?;
+        tracing::warn!(
+            "CLI connect mode is not implemented. Please use the GUI. Got address: {}",
+            addr
+        );
+        println!("CLI connect mode is not implemented. Please use the GUI.");
+        std::process::exit(1);
     }
 
     Ok(())

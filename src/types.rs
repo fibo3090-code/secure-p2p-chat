@@ -225,7 +225,7 @@ impl Default for Config {
             auto_connect: false,
             notification_sound: NotificationSound::Default,
             auto_host_on_startup: false,
-            listen_port: 5000,
+            listen_port: crate::PORT_DEFAULT,
             auto_trust_on_first_use: false,
             enable_mdns: false,
         }
@@ -233,5 +233,5 @@ impl Default for Config {
 }
 
 fn default_listen_port() -> u16 {
-    5000
+    crate::PORT_DEFAULT
 }

@@ -18,23 +18,42 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
     egui::TopBottomPanel::top("chat_header")
         .exact_height(60.0)
         .show_inside(ui, |ui| {
-            if let Ok(manager) = app.chat_manager.try_lock() {
-                if let Some(chat) = manager.get_chat(chat_id) {
-                    let connected = manager.is_connected(&chat_id);
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        // Avatar
-                        let color = if let Some(fp) = &chat.peer_fingerprint {
-                            crate::gui::widgets::fingerprint_to_color(fp)
-                        } else {
-                            egui::Color32::GRAY
-                        };
+            let (title, peer_typing, peer_fingerprint, connected, contact_id_opt) =
+                if let Ok(manager) = app.chat_manager.try_lock() {
+                    if let Some(chat) = manager.get_chat(chat_id) {
+                        let contact_id = manager
+                            .contact_to_chat
+                            .iter()
+                            .find(|&(_, &cid)| cid == chat_id)
+                            .map(|(id, _)| *id);
+                        (
+                            chat.title.clone(),
+                            chat.peer_typing,
+                            chat.peer_fingerprint.clone(),
+                            manager.is_connected(&chat_id),
+                            contact_id,
+                        )
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                };
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                // Avatar
+                let color = if let Some(fp) = &peer_fingerprint {
+                    crate::gui::widgets::fingerprint_to_color(fp)
+                } else {
+                    egui::Color32::GRAY
+                };
 
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
                         ui.painter().circle_filled(rect.center(), 20.0, color);
 
-                        let initials = crate::gui::widgets::get_initials(&chat.title);
+                let initials = crate::gui::widgets::get_initials(&title);
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -46,52 +65,50 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                         ui.add_space(8.0);
 
                         // Title and status
-                        ui.vertical(|ui| {
-                            ui.heading(&chat.title);
-                            // Show typing indicator or connection status
-                            if chat.peer_typing {
-                                ui.label(
-                                    egui::RichText::new("✍️ typing...")
-                                        .size(12.0)
-                                        .color(ui.visuals().text_color().gamma_multiply(0.7)),
-                                );
-                            } else if connected {
-                                ui.label(
-                                    egui::RichText::new("🟢 Connected")
-                                        .size(12.0)
-                                        .color(crate::gui::styling::SUCCESS),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("🟠 Disconnected")
-                                        .size(12.0)
-                                        .color(crate::gui::styling::WARNING),
-                                );
-                            }
-                        });
+                ui.vertical(|ui| {
+                    ui.heading(&title);
+                    // Show typing indicator or connection status
+                    if peer_typing {
+                        ui.label(
+                            egui::RichText::new("✍️ typing...")
+                                .size(12.0)
+                                .color(ui.visuals().text_color().gamma_multiply(0.7)),
+                        );
+                    } else if connected {
+                        ui.label(
+                            egui::RichText::new("🟢 Connected")
+                                .size(12.0)
+                                .color(crate::gui::styling::SUCCESS),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("🟠 Disconnected")
+                                .size(12.0)
+                                .color(crate::gui::styling::WARNING),
+                        );
+                    }
+                });
 
                         // Fingerprint on right
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(fp) = &chat.peer_fingerprint {
-                                if ui.button("📋 Copy Fingerprint").clicked() {
-                                    ui.output_mut(|o| o.copied_text = fp.clone());
-                                }
-                                ui.monospace(crate::util::format_fingerprint_short(fp));
-                            }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(fp) = &peer_fingerprint {
+                        if ui.button("📋 Copy Fingerprint").clicked() {
+                            ui.output_mut(|o| o.copied_text = fp.clone());
+                        }
+                        ui.monospace(crate::util::format_fingerprint_short(fp));
+                    }
 
-                            if !connected {
-                                // Offer reconnect if a contact is associated
-                                if let Some((&contact_id, _)) = manager
-                                    .contact_to_chat
-                                    .iter()
-                                    .find(|&(_, &cid)| cid == chat_id)
-                                {
-                                    if ui.button("Retry connect").clicked() {
+                    if !connected {
+                        // Offer reconnect if a contact is associated
+                        if let Some(contact_id) = contact_id_opt {
+                            if ui.button("Retry connect").clicked() {
+                                match app.identity.private_key() {
+                                    Ok(privkey) => {
                                         let mgr = app.chat_manager.clone();
                                         tokio::spawn(async move {
                                             let mut m = mgr.lock().await;
                                             if let Err(e) = m
-                                                .connect_to_contact(contact_id, Some(chat_id))
+                                                .connect_to_contact(contact_id, Some(chat_id), &privkey)
                                                 .await
                                             {
                                                 m.add_toast(
@@ -101,12 +118,18 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                                             }
                                         });
                                     }
+                                    Err(e) => {
+                                        app.add_toast(
+                                            crate::types::ToastLevel::Error,
+                                            format!("Cannot reconnect: {}", e),
+                                        );
+                                    }
                                 }
                             }
-                        });
-                    });
-                }
-            }
+                        }
+                    }
+                });
+            });
         });
 
     // Input area - FIXED AT BOTTOM

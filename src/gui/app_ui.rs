@@ -6,6 +6,7 @@ use crate::PORT_DEFAULT;
 
 use eframe::egui;
 use egui_tracing::tracing::EventCollector;
+use directories::UserDirs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -79,7 +80,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, event_collector: EventCollector) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        event_collector: EventCollector,
+    ) -> anyhow::Result<Self> {
         let chat_manager = ChatManager::new(Config::default());
         let theme = chat_manager.config.theme;
         cc.egui_ctx
@@ -110,7 +114,7 @@ impl App {
                 .families
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
-                .insert(0, "Inter-Regular".to_owned());
+                .insert(0, "Inter-regular".to_owned());
 
             fonts
                 .families
@@ -121,38 +125,34 @@ impl App {
 
         cc.egui_ctx.set_fonts(fonts);
 
-        let config = Config::default();
-
-        let mut chat_manager = ChatManager::new(config);
+        let mut chat_manager = ChatManager::new(Config::default());
         let initial_show_log_terminal = chat_manager.config.show_log_terminal;
 
+        let proj_dirs =
+            directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
+
         // Auto-restore conversation history from platform-specific user data directory
-        // Windows: %APPDATA%\chat-p2p\history.json
-        // Linux: ~/.local/share/chat-p2p/history.json
-        // macOS: ~/Library/Application Support/chat-p2p/history.json
-        let (history_path, identity, is_new_identity) = if let Some(proj_dirs) =
-            directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger")
-        {
-            let data_dir = proj_dirs.data_dir();
+        let (history_path, identity, is_new_identity) = if let Some(ref dirs) = proj_dirs {
+            let data_dir = dirs.data_dir();
             std::fs::create_dir_all(data_dir).ok(); // Ensure directory exists
 
             // Load or create user identity
-            let (identity, is_new) = crate::identity::Identity::get_or_create(data_dir, "User")
-                .unwrap_or_else(|e| {
-                    tracing::error!("Failed to load/create identity: {}", e);
-                    (
-                        crate::identity::Identity::new_with_plaintext("User".to_string())
-                            .expect("Failed to create identity"),
-                        true,
-                    )
-                });
+            let (identity, is_new) =
+                match crate::identity::Identity::get_or_create(data_dir, "User") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!("Failed to load/create identity: {}. Trying fallback.", e);
+                        let identity =
+                            crate::identity::Identity::new_with_plaintext("User".to_string())?;
+                        (identity, true)
+                    }
+                };
 
             (data_dir.join("history.json"), identity, is_new)
         } else {
             // Fallback to relative path if directories crate fails
             tracing::warn!("Could not determine user data directory, using fallback path");
-            let identity = crate::identity::Identity::new_with_plaintext("User".to_string())
-                .expect("Failed to create identity");
+            let identity = crate::identity::Identity::new_with_plaintext("User".to_string())?;
             (
                 PathBuf::from("Downloads").join("history.json"),
                 identity,
@@ -181,6 +181,21 @@ impl App {
             }
         }
 
+        // After loading history, override default relative paths with absolute paths if possible
+        if let Some(dirs) = proj_dirs {
+            // If download_dir is still the default "Downloads", resolve it to an absolute path.
+            if chat_manager.config.download_dir == PathBuf::from("Downloads") {
+                let download_path = UserDirs::new()
+                    .and_then(|user_dirs| user_dirs.download_dir().map(|dir| dir.to_path_buf()))
+                    .unwrap_or_else(|| dirs.data_dir().to_path_buf());
+                chat_manager.config.download_dir = download_path.join("EncryptedP2PMessenger");
+            }
+            // If temp_dir is still the default "temp", resolve it.
+            if chat_manager.config.temp_dir == PathBuf::from("temp") {
+                chat_manager.config.temp_dir = dirs.data_dir().join("temp");
+            }
+        }
+
         // Capture config before moving manager
         let auto_host_enabled = chat_manager.config.auto_host_on_startup;
         let auto_host_port = chat_manager.config.listen_port;
@@ -197,28 +212,42 @@ impl App {
         let auth_blocked = initial_identity_locked || is_new_identity || force_password_setup;
         if !auth_blocked {
             if auto_host_enabled {
-                tracing::info!(port = %auto_host_port, "Auto-host on startup is enabled; starting host");
-                let mgr_clone = manager_arc.clone();
-                tokio::spawn(async move {
-                    let mut mgr = mgr_clone.lock().await;
-                    if let Err(e) = mgr.start_host(auto_host_port).await {
-                        mgr.add_toast(
-                            crate::types::ToastLevel::Error,
-                            format!("Failed to auto-start host: {}", e),
-                        );
+                match identity.private_key() {
+                    Ok(privkey) => {
+                        tracing::info!(port = %auto_host_port, "Auto-host on startup is enabled; starting host");
+                        let mgr_clone = manager_arc.clone();
+                        tokio::spawn(async move {
+                            let mut mgr = mgr_clone.lock().await;
+                            if let Err(e) = mgr.start_host(auto_host_port, privkey).await {
+                                mgr.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to auto-start host: {}", e),
+                                );
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Skipping auto-host: identity key unavailable");
+                    }
+                }
             }
             if auto_connect_enabled {
-                let mgr_clone = manager_arc.clone();
-                tokio::spawn(async move {
-                    let mut mgr = mgr_clone.lock().await;
-                    mgr.auto_reconnect_contacts().await;
-                });
+                match identity.private_key() {
+                    Ok(privkey) => {
+                        let mgr_clone = manager_arc.clone();
+                        tokio::spawn(async move {
+                            let mut mgr = mgr_clone.lock().await;
+                            mgr.auto_reconnect_contacts(&privkey).await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Skipping auto-reconnect: identity key unavailable");
+                    }
+                }
             }
         }
 
-        Self {
+        Ok(Self {
             chat_manager: manager_arc,
             identity,
             selected_chat: None,
@@ -283,7 +312,7 @@ impl App {
             } else {
                 None
             },
-        }
+        })
     }
 
     pub fn send_message_clicked(&mut self, chat_id: Uuid) {
@@ -305,11 +334,21 @@ impl App {
 
     pub fn start_host_clicked(&mut self) {
         let port = self.host_port.parse().unwrap_or(crate::PORT_DEFAULT);
+        let privkey = match self.identity.private_key() {
+            Ok(k) => k,
+            Err(e) => {
+                self.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Cannot start host: {}", e),
+                );
+                return;
+            }
+        };
         let manager = self.chat_manager.clone();
 
         tokio::spawn(async move {
             let mut mgr = manager.lock().await;
-            if let Err(e) = mgr.start_host(port).await {
+            if let Err(e) = mgr.start_host(port, privkey).await {
                 mgr.add_toast(
                     crate::types::ToastLevel::Error,
                     format!("Failed to start host: {}", e),
@@ -331,12 +370,22 @@ impl App {
             }
             host = h_str;
         }
+        let privkey = match self.identity.private_key() {
+            Ok(k) => k,
+            Err(e) => {
+                self.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Cannot connect: {}", e),
+                );
+                return;
+            }
+        };
         let manager = self.chat_manager.clone();
         let existing_chat = self.selected_chat; // bind connection to the currently selected chat if any
 
         tokio::spawn(async move {
             let mut mgr = manager.lock().await;
-            if let Err(e) = mgr.connect_to_host(&host, port, existing_chat).await {
+            if let Err(e) = mgr.connect_to_host(&host, port, existing_chat, privkey).await {
                 mgr.add_toast(
                     crate::types::ToastLevel::Error,
                     format!("Failed to connect: {}", e),
@@ -423,21 +472,31 @@ impl eframe::App for App {
                     if should_rehost {
                         last_rehost.store(now_millis, Ordering::Relaxed);
                         let port = manager.config.listen_port;
-                        let mgr_arc = self.chat_manager.clone();
-                        tokio::spawn(async move {
-                            let mut mgr = mgr_arc.lock().await;
-                            if let Err(e) = mgr.start_host(port).await {
-                                mgr.add_toast(
+                        match self.identity.private_key() {
+                            Ok(privkey) => {
+                                let mgr_arc = self.chat_manager.clone();
+                                tokio::spawn(async move {
+                                    let mut mgr = mgr_arc.lock().await;
+                                    if let Err(e) = mgr.start_host(port, privkey).await {
+                                        mgr.add_toast(
+                                            crate::types::ToastLevel::Error,
+                                            format!("Failed to re-start host: {}", e),
+                                        );
+                                    } else {
+                                        mgr.add_toast(
+                                            crate::types::ToastLevel::Success,
+                                            "Host restarted".to_string(),
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                manager.add_toast(
                                     crate::types::ToastLevel::Error,
-                                    format!("Failed to re-start host: {}", e),
-                                );
-                            } else {
-                                mgr.add_toast(
-                                    crate::types::ToastLevel::Success,
-                                    "Host restarted".to_string(),
+                                    format!("Cannot re-host: {}", e),
                                 );
                             }
-                        });
+                        }
                     }
                 }
             }

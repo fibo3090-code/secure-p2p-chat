@@ -372,27 +372,9 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                 let progress = elapsed / duration;
 
                 if progress < 1.0 {
-                    // --- Animation Alpha ---
-                    let alpha_f32 = if progress < 0.15 {
-                        progress / 0.15
-                    } else if progress > 0.75 {
-                        1.0 - ((progress - 0.75) / 0.25)
-                    } else {
-                        1.0
-                    };
-                    let alpha = (alpha_f32 * 255.0).min(255.0) as u8;
+                    let alpha = toast_alpha(progress);
+                    let (icon, base_color) = toast_style(toast.level);
 
-                    // --- Get Style based on Level ---
-                    let (icon, base_color) = match toast.level {
-                        crate::types::ToastLevel::Info => {
-                            ("ℹ", crate::gui::styling::ACCENT_PRIMARY)
-                        }
-                        crate::types::ToastLevel::Success => ("✔", crate::gui::styling::SUCCESS),
-                        crate::types::ToastLevel::Warning => ("⚠", crate::gui::styling::WARNING),
-                        crate::types::ToastLevel::Error => ("❌", crate::gui::styling::ERROR),
-                    };
-
-                    // --- Define Colors with correct API ---
                     let frame_fill = egui::Color32::from_rgba_unmultiplied(
                         base_color.r(),
                         base_color.g(),
@@ -414,7 +396,6 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                     );
                     let stroke_color = icon_color;
 
-                    // --- Define the Frame ---
                     let toast_frame = egui::Frame {
                         inner_margin: egui::Margin::symmetric(12.0, 8.0),
                         outer_margin: egui::Margin::same(0.0),
@@ -429,7 +410,6 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                         stroke: egui::Stroke::new(1.0, stroke_color),
                     };
 
-                    // --- Render the Frame and its contents ---
                     toast_frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(icon).color(icon_color).size(16.0));
@@ -447,6 +427,27 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
     let now = std::time::Instant::now();
     app.toasts
         .retain(|toast| now.duration_since(toast.created_at) < toast.duration);
+}
+
+fn toast_style(level: crate::types::ToastLevel) -> (&'static str, egui::Color32) {
+    match level {
+        crate::types::ToastLevel::Info => ("ℹ", crate::gui::styling::ACCENT_PRIMARY),
+        crate::types::ToastLevel::Success => ("✔", crate::gui::styling::SUCCESS),
+        crate::types::ToastLevel::Warning => ("⚠", crate::gui::styling::WARNING),
+        crate::types::ToastLevel::Error => ("❌", crate::gui::styling::ERROR),
+    }
+}
+
+fn toast_alpha(progress: f32) -> u8 {
+    let alpha_f32 = if progress < 0.15 {
+        progress / 0.15
+    } else if progress > 0.75 {
+        1.0 - ((progress - 0.75) / 0.25)
+    } else {
+        1.0
+    };
+
+    (alpha_f32 * 255.0).min(255.0) as u8
 }
 
 fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid::Uuid) {
@@ -585,118 +586,146 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
 
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            let contact_snapshots: Vec<(crate::types::Contact, Option<uuid::Uuid>)> =
                 if let Ok(manager) = app.chat_manager.try_lock() {
-                    for contact in manager.contacts.values() {
-                        ui.horizontal(|ui| {
-                            let mut is_selected = app.group_selected.contains(&contact.id);
-                            if ui.checkbox(&mut is_selected, "").changed() {
-                                if is_selected {
-                                    if !app.group_selected.contains(&contact.id) {
-                                        app.group_selected.push(contact.id);
-                                    }
-                                } else {
-                                    app.group_selected.retain(|id| id != &contact.id);
+                    manager
+                        .contacts
+                        .values()
+                        .map(|contact| {
+                            let chat_id = manager.contact_to_chat.get(&contact.id).copied();
+                            (contact.clone(), chat_id)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (contact, existing_chat_id) in contact_snapshots {
+                    ui.horizontal(|ui| {
+                        let mut is_selected = app.group_selected.contains(&contact.id);
+                        if ui.checkbox(&mut is_selected, "").changed() {
+                            if is_selected {
+                                if !app.group_selected.contains(&contact.id) {
+                                    app.group_selected.push(contact.id);
                                 }
+                            } else {
+                                app.group_selected.retain(|id| id != &contact.id);
                             }
+                        }
 
-                            ui.label(&contact.name);
-                            if let Some(fp) = &contact.fingerprint {
-                                ui.monospace(crate::util::format_fingerprint_short(fp));
-                            }
+                        ui.label(&contact.name);
+                        if let Some(fp) = &contact.fingerprint {
+                            ui.monospace(crate::util::format_fingerprint_short(fp));
+                        }
 
-                            if ui.small_button("🔗").on_hover_text("Open chat").clicked() {
-                                // Check if there's already a mapped chat for this contact
-                                let existing_chat_id = {
-                                    if let Ok(manager) = app.chat_manager.try_lock() {
-                                        manager.contact_to_chat.get(&contact.id).copied()
-                                    } else {
-                                        None
+                        if ui.small_button("🔗").on_hover_text("Open chat").clicked() {
+                            if let Some(chat_id) = existing_chat_id {
+                                // If there's a mapped chat, select it.
+                                app.selected_chat = Some(chat_id);
+                                app.show_contacts = false;
+                            } else {
+                                // Otherwise, create a new chat entry locally first for responsiveness.
+                                let chat_id = uuid::Uuid::new_v4();
+                                app.selected_chat = Some(chat_id);
+
+                                // If contact has no address, prompt user to open Connect dialog and bind to this chat
+                                let should_prompt_connect = contact
+                                    .address
+                                    .as_ref()
+                                    .map(|s| s.trim().is_empty())
+                                    .unwrap_or(true);
+                                if should_prompt_connect {
+                                    // Pre-open connect dialog; the connect action will now bind to selected_chat
+                                    app.show_connect_dialog = true;
+                                }
+
+                                // Clone the necessary data before spawning the task
+                                let manager_clone = app.chat_manager.clone();
+                                let contact_clone = contact.clone();
+                                let history_path = app.history_path.clone();
+                                let privkey = app.identity.private_key().ok();
+                                if privkey.is_none() && contact_clone.address.is_some() {
+                                    app.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        "Cannot connect: identity key unavailable".to_string(),
+                                    );
+                                }
+
+                                // Spawn a task to do the real work: create chat in manager and connect.
+                                tokio::spawn(async move {
+                                    let mut mgr = manager_clone.lock().await;
+                                    // 1. Create the chat object and add it to the manager
+                                    let chat = crate::types::Chat {
+                                        id: chat_id,
+                                        title: contact_clone.name.clone(),
+                                        peer_fingerprint: contact_clone.fingerprint.clone(),
+                                        participants: vec![contact_clone.id],
+                                        messages: Vec::new(),
+                                        created_at: chrono::Utc::now(),
+                                        peer_typing: false,
+                                        typing_since: None,
+                                        send_seq: 0,
+                                        recv_seq: 0,
+                                    };
+                                    mgr.chats.insert(chat_id, chat);
+                                    mgr.associate_contact_with_chat(contact_clone.id, chat_id);
+
+                                    // 2. Save history
+                                    if let Err(e) = mgr.save_history(&history_path) {
+                                        tracing::error!(
+                                            "Failed to save history after creating chat: {}",
+                                            e
+                                        );
                                     }
-                                };
 
-                                if let Some(chat_id) = existing_chat_id {
-                                    // If there's a mapped chat, select it.
-                                    app.selected_chat = Some(chat_id);
-                                    app.show_contacts = false;
-                                } else {
-                                    // Otherwise, create a new chat entry locally first for responsiveness.
-                                    let chat_id = uuid::Uuid::new_v4();
-                                    app.selected_chat = Some(chat_id);
-
-                                    // If contact has no address, prompt user to open Connect dialog and bind to this chat
-                                    let should_prompt_connect = contact.address.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true);
-                                    if should_prompt_connect {
-                                        // Pre-open connect dialog; the connect action will now bind to selected_chat
-                                        app.show_connect_dialog = true;
-                                    }
-
-                                    // Clone the necessary data before spawning the task
-                                    let manager_clone = app.chat_manager.clone();
-                                    let contact_clone = contact.clone();
-                                    let history_path = app.history_path.clone();
-
-                                    // Spawn a task to do the real work: create chat in manager and connect.
-                                    tokio::spawn(async move {
-                                        let mut mgr = manager_clone.lock().await;
-                                        // 1. Create the chat object and add it to the manager
-                                        let chat = crate::types::Chat {
-                                            id: chat_id,
-                                            title: contact_clone.name.clone(),
-                                            peer_fingerprint: contact_clone.fingerprint.clone(),
-                                            participants: vec![contact_clone.id],
-                                            messages: Vec::new(),
-                                            created_at: chrono::Utc::now(),
-                                            peer_typing: false,
-                                            typing_since: None,
-                                            send_seq: 0,
-                                            recv_seq: 0,
-                                        };
-                                        mgr.chats.insert(chat_id, chat);
-                                        mgr.associate_contact_with_chat(contact_clone.id, chat_id);
-
-                                        // 2. Save history
-                                        if let Err(e) = mgr.save_history(&history_path) {
-                                            tracing::error!("Failed to save history after creating chat: {}", e);
-                                        }
-
-                                        // 3. Asynchronously connect to the peer — only if an address is present
-                                        if contact_clone.address.is_some() {
-                                            if let Err(e) = mgr.connect_to_contact(contact_clone.id, Some(chat_id)).await {
+                                    // 3. Asynchronously connect to the peer — only if an address is present
+                                    if contact_clone.address.is_some() {
+                                        if let Some(ref pk) = privkey {
+                                            if let Err(e) = mgr
+                                                .connect_to_contact(contact_clone.id, Some(chat_id), pk)
+                                                .await
+                                            {
                                                 mgr.add_toast(
                                                     crate::types::ToastLevel::Error,
-                                                    format!("Failed to connect to {}: {}", contact_clone.name, e),
+                                                    format!(
+                                                        "Failed to connect to {}: {}",
+                                                        contact_clone.name, e
+                                                    ),
                                                 );
                                             }
-                                        } else {
-                                            // Inform the user a connection is needed via Connect dialog
-                                            mgr.add_toast(
-                                                crate::types::ToastLevel::Info,
-                                                format!("No address for {}. Open 'Connect to Host' to connect this chat.", contact_clone.name),
-                                            );
                                         }
-                                    });
-                                    app.show_contacts = false; // Close dialog after action
-                                }
-                            }
-
-                            if ui
-                                .small_button("🗑")
-                                .on_hover_text("Delete contact")
-                                .clicked()
-                            {
-                                let manager = app.chat_manager.clone();
-                                let contact_id = contact.id;
-                                let history_path = app.history_path.clone();
-                                tokio::spawn(async move {
-                                    let mut mgr = manager.lock().await;
-                                    mgr.remove_contact(contact_id);
-                                    let _ = mgr.save_history(&history_path);
+                                    } else {
+                                        // Inform the user a connection is needed via Connect dialog
+                                        mgr.add_toast(
+                                            crate::types::ToastLevel::Info,
+                                            format!(
+                                                "No address for {}. Open 'Connect to Host' to connect this chat.",
+                                                contact_clone.name
+                                            ),
+                                        );
+                                    }
                                 });
+                                app.show_contacts = false; // Close dialog after action
                             }
-                        });
-                        ui.separator();
-                    }
+                        }
+
+                        if ui
+                            .small_button("🗑")
+                            .on_hover_text("Delete contact")
+                            .clicked()
+                        {
+                            let manager = app.chat_manager.clone();
+                            let contact_id = contact.id;
+                            let history_path = app.history_path.clone();
+                            tokio::spawn(async move {
+                                let mut mgr = manager.lock().await;
+                                mgr.remove_contact(contact_id);
+                                let _ = mgr.save_history(&history_path);
+                            });
+                        }
+                    });
+                    ui.separator();
                 }
             });
 
@@ -996,34 +1025,36 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                         if app.qr_code_texture.is_none() {
                             if let Ok(manager) = app.chat_manager.try_lock() {
                                 if let Ok(qr_bytes) = manager.generate_invite_qr(link) {
-                                    let image = image::load_from_memory_with_format(
+                                    if let Ok(image) = image::load_from_memory_with_format(
                                         &qr_bytes,
                                         image::ImageFormat::Png,
-                                    )
-                                    .expect("Failed to load QR image");
-                                    let size = [image.width() as _, image.height() as _];
-                                    let image_buffer = image.to_rgba8();
-                                    let pixels = image_buffer.as_flat_samples();
-                                    let texture = ctx.load_texture(
-                                        "qr_code",
-                                        egui::ImageData::Color(std::sync::Arc::new(
-                                            egui::ColorImage {
-                                                size,
-                                                pixels: pixels
-                                                    .as_slice()
-                                                    .to_vec()
-                                                    .chunks_exact(4)
-                                                    .map(|p| {
-                                                        egui::Color32::from_rgba_unmultiplied(
-                                                            p[0], p[1], p[2], p[3],
-                                                        )
-                                                    })
-                                                    .collect(),
-                                            },
-                                        )),
-                                        egui::TextureOptions::LINEAR,
-                                    );
-                                    app.qr_code_texture = Some(texture);
+                                    ) {
+                                        let size = [image.width() as _, image.height() as _];
+                                        let image_buffer = image.to_rgba8();
+                                        let pixels = image_buffer.as_flat_samples();
+                                        let texture = ctx.load_texture(
+                                            "qr_code",
+                                            egui::ImageData::Color(std::sync::Arc::new(
+                                                egui::ColorImage {
+                                                    size,
+                                                    pixels: pixels
+                                                        .as_slice()
+                                                        .to_vec()
+                                                        .chunks_exact(4)
+                                                        .map(|p| {
+                                                            egui::Color32::from_rgba_unmultiplied(
+                                                                p[0], p[1], p[2], p[3],
+                                                            )
+                                                        })
+                                                        .collect(),
+                                                },
+                                            )),
+                                            egui::TextureOptions::LINEAR,
+                                        );
+                                        app.qr_code_texture = Some(texture);
+                                    } else {
+                                        tracing::warn!("Failed to decode QR image from bytes");
+                                    }
                                 }
                             }
                         }
@@ -1384,17 +1415,27 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                         let _ = manager.save_history(&app.history_path);
                         // If enabled, start hosting immediately using current listen_port
                         if auto_host {
-                            let port = manager.config.listen_port;
-                            let mgr_arc = app.chat_manager.clone();
-                            tokio::spawn(async move {
-                                let mut mgr = mgr_arc.lock().await;
-                                if let Err(e) = mgr.start_host(port).await {
-                                    mgr.add_toast(
+                            match app.identity.private_key() {
+                                Ok(privkey) => {
+                                    let port = manager.config.listen_port;
+                                    let mgr_arc = app.chat_manager.clone();
+                                    tokio::spawn(async move {
+                                        let mut mgr = mgr_arc.lock().await;
+                                        if let Err(e) = mgr.start_host(port, privkey).await {
+                                            mgr.add_toast(
+                                                crate::types::ToastLevel::Error,
+                                                format!("Failed to start host: {}", e),
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    manager.add_toast(
                                         crate::types::ToastLevel::Error,
-                                        format!("Failed to start host: {}", e),
+                                        format!("Cannot start host: {}", e),
                                     );
                                 }
-                            });
+                            }
                         } else {
                             // No stop_host yet; inform user it will stop on next launch
                             manager.add_toast(

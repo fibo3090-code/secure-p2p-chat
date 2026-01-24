@@ -433,12 +433,14 @@ async fn run_message_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+
     loop {
         tokio::select! {
-            // Receive from network
-            result = recv_packet(&mut stream) => {
+            // Receive from network with timeout
+            result = tokio::time::timeout(RECV_IDLE_TIMEOUT, recv_packet(&mut stream)) => {
                 match result {
-                    Ok(encrypted) => {
+                    Ok(Ok(encrypted)) => {
                         tracing::trace!("Received {} bytes encrypted", encrypted.len());
 
                         if let Some(plaintext) = cipher.decrypt(&encrypted) {
@@ -460,9 +462,16 @@ where
                             let _ = to_app_tx.send(SessionEvent::Error("Decryption failed!".to_string()));
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let err_msg = format!("Network receive error: {}", e);
                         tracing::error!("{}", err_msg);
+                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout occurred
+                        let err_msg = format!("Receive idle timeout ({}s)", RECV_IDLE_TIMEOUT.as_secs());
+                        tracing::warn!("{}", err_msg);
                         let _ = to_app_tx.send(SessionEvent::Error(err_msg));
                         break;
                     }

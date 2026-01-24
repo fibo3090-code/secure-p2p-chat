@@ -65,6 +65,8 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
    cargo run --release
    ```
 
+   > **Note**: The CLI is for launching the GUI. Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
+
    On first run (or when your identity is encrypted), you will see a **blocking unlock/set-password screen**. You must enter your password to unlock, or set a password for a new identity, before the main UI (chats, connections, etc.) is available. This cannot be bypassed.
 
 ### Platform-Specific

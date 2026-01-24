@@ -3,7 +3,7 @@
 //! This crate powers the desktop application by providing:
 //! - End-to-end encrypted messaging with AES-256-GCM
 //! - Forward secrecy via X25519 ephemeral key exchange and HKDF-SHA256
-//! - A simple length-prefixed TCP protocol with a secure v2 handshake
+//! - A simple length-prefixed TCP protocol with a secure v3 handshake
 //! - Business logic, identity management, file transfer, and GUI integration points
 //!
 //! Modules:
@@ -35,4 +35,5 @@ pub const AES_KEY_SIZE: usize = 32; // 256 bits
 pub const AES_NONCE_SIZE: usize = 12; // 96 bits (GCM standard)
 pub const RSA_KEY_BITS: usize = 2048;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
-pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024 * 1024 * 1024; // 100 TB
+/// Maximum file size for transfers: 10 GiB
+pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
