@@ -14,9 +14,9 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::core::{
-    derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, parse_x25519_public,
-    pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher, IdentityProof,
-    SignatureScheme, ProtocolMessage, PROTOCOL_VERSION,
+    derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, negotiate_signature_scheme,
+    parse_x25519_public, pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher,
+    IdentityProof, SignatureScheme, ProtocolMessage, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -142,6 +142,29 @@ pub async fn run_host_session(
     }
     let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
+    // 7.5. Negotiate Signature Scheme
+    // Host and Client advertise supported signature schemes
+    // Default: [RsaPss, Ed25519] = [1, 2]
+    let our_schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
+    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes { schemes: our_schemes.clone() };
+    let schemes_bytes = schemes_msg.to_plain_bytes();
+    send_packet(&mut stream, &schemes_bytes).await?;
+    
+    // Receive client's supported schemes
+    let client_schemes_bytes = recv_packet_with_timeout(&mut stream).await?;
+    let client_schemes = match ProtocolMessage::from_plain_bytes(&client_schemes_bytes) {
+        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
+        _ => {
+            tracing::warn!("Invalid or missing signature schemes from client");
+            return Err(anyhow!("Client did not send valid signature schemes"));
+        }
+    };
+    
+    // Negotiate the best common scheme (Ed25519 preferred, fallback to RSA-PSS)
+    let selected_scheme = negotiate_signature_scheme(&our_schemes, &client_schemes)
+        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
+    tracing::debug!("Negotiated signature scheme: {}", selected_scheme.name());
+
     // 8. Derive Session Key & Init Cipher
     // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
     let mut transcript = Vec::new();
@@ -162,21 +185,37 @@ pub async fn run_host_session(
 
     // --- ENCRYPTED IDENTITY EXCHANGE ---
 
-    // 9. Create Identity Proof
+    // 9. Create Identity Proof (using negotiated scheme)
     // We sign our own ephemeral key to bind it to our identity (prevent MITM)
-    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
-    let mut hasher = Sha256::new();
-    hasher.update(b"IDENTITY_PROOF");
-    hasher.update(host_ephemeral_bytes); // Bind to my ephemeral key
-    let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+    let signature = match selected_scheme {
+        SignatureScheme::RsaPss => {
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(host_ephemeral_bytes); // Bind to my ephemeral key
+            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
+        },
+        SignatureScheme::Ed25519 => {
+            // For Ed25519, we would need to have Ed25519 identity key
+            // For now, we'll fall back to RSA-PSS if Ed25519 not available
+            // TODO: Support Ed25519 identity key storage and use
+            tracing::debug!("Ed25519 signature scheme requested but not yet fully supported, using RSA-PSS fallback");
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(host_ephemeral_bytes);
+            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
+        },
+    };
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
-        signature: signature.to_vec(),
+        signature,
         version: PROTOCOL_VERSION as u32,
         chat_id,
-        signature_scheme: SignatureScheme::RsaPss,
+        signature_scheme: selected_scheme,
     };
 
     // Serialize & Encrypt Proof
@@ -313,6 +352,28 @@ pub async fn run_client_session(
     // 6. Send Client Ephemeral Public Key
     send_packet(&mut stream, client_ephemeral_bytes).await?;
 
+    // 6.5. Negotiate Signature Scheme (Client side)
+    // Receive host's supported schemes
+    let host_schemes_bytes = recv_packet_with_timeout(&mut stream).await?;
+    let host_schemes = match ProtocolMessage::from_plain_bytes(&host_schemes_bytes) {
+        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
+        _ => {
+            tracing::warn!("Invalid or missing signature schemes from host");
+            return Err(anyhow!("Host did not send valid signature schemes"));
+        }
+    };
+
+    // Send our supported schemes (same as host: [RsaPss, Ed25519])
+    let our_schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
+    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes { schemes: our_schemes.clone() };
+    let schemes_bytes = schemes_msg.to_plain_bytes();
+    send_packet(&mut stream, &schemes_bytes).await?;
+
+    // Negotiate the best common scheme
+    let selected_scheme = negotiate_signature_scheme(&host_schemes, &our_schemes)
+        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
+    tracing::debug!("Negotiated signature scheme: {}", selected_scheme.name());
+
     // 7. Derive Session Key & Init Cipher
     // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
     // Note: host_version_bytes received first, version_bytes sent second.
@@ -362,20 +423,36 @@ pub async fn run_client_session(
     let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
     tracing::debug!("Verified host identity: {}...", &host_fingerprint[..8]);
 
-    // 10. Create Identity Proof
-    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
-    let mut hasher = Sha256::new();
-    hasher.update(b"IDENTITY_PROOF");
-    hasher.update(client_ephemeral_bytes); // Bind to my ephemeral key
-    let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+    // 10. Create Identity Proof (using negotiated scheme)
+    let signature = match selected_scheme {
+        SignatureScheme::RsaPss => {
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(client_ephemeral_bytes); // Bind to my ephemeral key
+            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
+        },
+        SignatureScheme::Ed25519 => {
+            // For Ed25519, we would need to have Ed25519 identity key
+            // For now, we'll fall back to RSA-PSS if Ed25519 not available
+            // TODO: Support Ed25519 identity key storage and use
+            tracing::debug!("Ed25519 signature scheme requested but not yet fully supported, using RSA-PSS fallback");
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(client_ephemeral_bytes);
+            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
+        },
+    };
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
-        signature: signature.to_vec(),
+        signature,
         version: PROTOCOL_VERSION as u32,
         chat_id,
-        signature_scheme: SignatureScheme::RsaPss,
+        signature_scheme: selected_scheme,
     };
 
     // Serialize & Encrypt Proof

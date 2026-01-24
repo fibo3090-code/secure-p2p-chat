@@ -197,6 +197,24 @@ pub fn ed25519_private_from_hex(hex_str: &str) -> Result<Ed25519SigningKey> {
     Ok(Ed25519SigningKey::from_bytes(&key_bytes))
 }
 
+/// Negotiate signature scheme from lists of supported schemes
+/// 
+/// Selects the highest priority common scheme:
+/// - Returns Ed25519 (2) if both support it (preferred)
+/// - Returns RsaPss (1) if both support it (fallback)
+/// - Returns None if no common scheme found
+/// 
+/// Both lists should contain u8 values from SignatureScheme enum (1 or 2)
+pub fn negotiate_signature_scheme(our_schemes: &[u8], their_schemes: &[u8]) -> Option<SignatureScheme> {
+    // Prefer Ed25519 first, fall back to RsaPss
+    for &preferred in &[2u8, 1u8] {
+        if our_schemes.contains(&preferred) && their_schemes.contains(&preferred) {
+            return SignatureScheme::from_u8(preferred);
+        }
+    }
+    None
+}
+
 
 // X25519 ECDH for Forward Secrecy
 // ============================================================================
@@ -712,5 +730,56 @@ mod tests {
         wrong_data.extend_from_slice(b"IDENTITY_PROOF");
         wrong_data.extend_from_slice(&[99u8; 32]);
         assert!(verify_ed25519(&verifying_key, &wrong_data, &signature).is_err());
+    }
+
+    #[test]
+    fn test_signature_scheme_negotiation() {
+        // Test that negotiation prefers Ed25519 over RSA-PSS
+        let our_schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
+        let their_schemes = vec![SignatureScheme::Ed25519.to_u8(), SignatureScheme::RsaPss.to_u8()];
+        
+        let negotiated = negotiate_signature_scheme(&our_schemes, &their_schemes);
+        assert_eq!(negotiated, Some(SignatureScheme::Ed25519));
+        
+        // Test fallback to RSA-PSS when Ed25519 not available
+        let our_schemes_rsa_only = vec![SignatureScheme::RsaPss.to_u8()];
+        let their_schemes_rsa_only = vec![SignatureScheme::RsaPss.to_u8()];
+        
+        let negotiated = negotiate_signature_scheme(&our_schemes_rsa_only, &their_schemes_rsa_only);
+        assert_eq!(negotiated, Some(SignatureScheme::RsaPss));
+        
+        // Test no common scheme
+        let our_schemes_ed = vec![SignatureScheme::Ed25519.to_u8()];
+        let their_schemes_rsa = vec![SignatureScheme::RsaPss.to_u8()];
+        
+        let negotiated = negotiate_signature_scheme(&our_schemes_ed, &their_schemes_rsa);
+        assert_eq!(negotiated, None);
+        
+        // Test reverse order doesn't matter (Ed25519 still preferred)
+        let our_schemes_rev = vec![SignatureScheme::Ed25519.to_u8()];
+        let their_schemes_rev = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
+        
+        let negotiated = negotiate_signature_scheme(&our_schemes_rev, &their_schemes_rev);
+        assert_eq!(negotiated, Some(SignatureScheme::Ed25519));
+    }
+
+    #[test]
+    fn test_supported_signature_schemes_message() {
+        // Test SupportedSignatureSchemes message encoding/decoding
+        let schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
+        let msg = crate::core::ProtocolMessage::SupportedSignatureSchemes { schemes: schemes.clone() };
+        
+        let bytes = msg.to_plain_bytes();
+        assert!(!bytes.is_empty());
+        
+        let decoded = crate::core::ProtocolMessage::from_plain_bytes(&bytes);
+        assert!(decoded.is_some());
+        
+        match decoded {
+            Some(crate::core::ProtocolMessage::SupportedSignatureSchemes { schemes: decoded_schemes }) => {
+                assert_eq!(decoded_schemes, schemes);
+            },
+            _ => panic!("Expected SupportedSignatureSchemes message"),
+        }
     }
 }

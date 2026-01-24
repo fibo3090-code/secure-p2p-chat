@@ -15,6 +15,11 @@ pub enum ProtocolMessage {
     /// Ephemeral X25519 public key for forward secrecy
     EphemeralKey { public_key: Vec<u8> },
 
+    /// Supported signature schemes for negotiation (sent before identity proof)
+    /// Encoded as: u8 count | [u8 scheme]*
+    /// Allows peers to agree on a common signature scheme (RSA-PSS or Ed25519)
+    SupportedSignatureSchemes { schemes: Vec<u8> },
+
     /// Text message (with sequence number for replay protection)
     Text {
         text: String,
@@ -54,6 +59,10 @@ impl std::fmt::Debug for ProtocolMessage {
             Self::EphemeralKey { public_key } => f
                 .debug_struct("EphemeralKey")
                 .field("public_key_len", &public_key.len())
+                .finish(),
+            Self::SupportedSignatureSchemes { schemes } => f
+                .debug_struct("SupportedSignatureSchemes")
+                .field("schemes", schemes)
                 .finish(),
             Self::Text { seq, timestamp, .. } => f
                 .debug_struct("Text")
@@ -128,6 +137,12 @@ impl ProtocolMessage {
                 let len = (public_key.len() as u32).to_be_bytes();
                 v.extend_from_slice(&len);
                 v.extend_from_slice(public_key);
+            }
+
+            Self::SupportedSignatureSchemes { schemes } => {
+                v.push(9u8);
+                v.push(schemes.len() as u8);
+                v.extend_from_slice(schemes);
             }
 
             Self::Text {
@@ -322,6 +337,22 @@ impl ProtocolMessage {
                 }
                 let public_key = b[cursor..cursor + len].to_vec();
                 Some(Self::EphemeralKey { public_key })
+            }
+            9 => {
+                if cursor + 1 > b.len() {
+                    return None;
+                }
+                let count = b[cursor] as usize;
+                cursor += 1;
+                if count > 8 {
+                    // Cap to prevent abuse (reasonable max of 8 signature schemes)
+                    return None;
+                }
+                if cursor + count > b.len() {
+                    return None;
+                }
+                let schemes = b[cursor..cursor + count].to_vec();
+                Some(Self::SupportedSignatureSchemes { schemes })
             }
             2 => {
                 if cursor + 8 + 8 + 4 > b.len() {
