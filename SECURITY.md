@@ -1,7 +1,7 @@
 # Security Policy & Documentation
 
-**Last Updated:** January 22, 2026
-Application: Encrypted P2P Messenger v1.7.0
+**Last Updated:** January 24, 2026
+Application: Encrypted P2P Messenger v1.7.0+
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
 
@@ -15,7 +15,8 @@ This document provides comprehensive security information including the threat m
 4. [Security Audit Report (December 18, 2025)](#security-audit-report-december-18-2025)
 5. [Applied Security Fixes](#applied-security-fixes)
 6. [Remaining Security Work](#remaining-security-work)
-7. [Reporting Security Issues](#reporting-security-issues)
+7. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
+8. [Security Roadmap](#security-roadmap)
 
 ---
 
@@ -49,6 +50,15 @@ This application implements **military-grade end-to-end encryption** with **forw
 ## Threat Model
 
 The application is designed to protect against the following threats:
+
+**→ See [THREAT_MODEL.md](THREAT_MODEL.md) for comprehensive threat analysis, attack scenarios, and mitigations.**
+
+This document summarizes key protections; the detailed threat model covers:
+
+- **Threat Actor Profiles** (passive eavesdropper, MITM, local attacker, malicious peer, cryptanalytic attacker)
+- **Detailed Attack Scenarios** (with mitigation analysis)
+- **Known Limitations** (what we cannot protect against)
+- **Future Improvements** (planned security enhancements)
 
 ### Protected Against
 
@@ -189,29 +199,212 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 
 ---
 
-## Reporting Security Issues
+## Vulnerability Reporting & Responsible Disclosure
 
-### Responsible Disclosure
+We take security seriously and welcome responsible vulnerability reports from security researchers, developers, and users.
 
-If you discover a security vulnerability, please **DO NOT** open a public GitHub issue. Instead:
+### Policy Overview
 
-1. **Email:** Report to `[YOUR_SECURITY_EMAIL_ADDRESS_HERE]` (replace with actual address)
-2. **Include:**
-   - Clear description of the issue and potential impact
-   - Steps to reproduce with proof-of-concept if available
-   - Affected versions/commits and environment details
-   - Any mitigation ideas you may have
+- **Coordinated Disclosure**: We follow responsible disclosure practices and ask researchers to keep reports confidential until a fix is released
+- **No Public Issues**: Security vulnerabilities should NOT be reported via GitHub public issues
+- **Timely Response**: We aim to acknowledge all reports within 48 hours
+- **Transparent Process**: We will keep you informed throughout the remediation process
+- **Credit**: Researchers who help us improve security will be recognized (with permission)
 
-3. **Response Time:** We will acknowledge within 48 hours and provide updates on fix timeline
+### How to Report a Vulnerability
 
-4. **Disclosure:** We follow coordinated disclosure - please allow us time to fix before public disclosure
+#### Step 1: Prepare Your Report
+
+Gather information about the vulnerability:
+
+- **Clear Description**: What is the vulnerability? (e.g., buffer overflow, weak crypto, logic flaw)
+- **Impact Assessment**: What could an attacker achieve? (e.g., code execution, data disclosure, DoS)
+- **Affected Versions**: Which versions of the application are vulnerable?
+- **Affected Components**: Which modules or files are involved?
+- **Reproducibility**: Can you provide steps to reproduce or a proof-of-concept?
+- **Environment**: OS, Rust version, dependency versions where applicable
+- **Mitigation Ideas**: Any suggestions for fixes (optional but helpful)
+
+#### Step 2: Submit Responsibly
+
+**Email**: security@fibo3090-code.dev *(replace with actual contact)*
+
+**DO NOT**:
+- ❌ Post on social media
+- ❌ Create public GitHub issues
+- ❌ Share the vulnerability with others without researcher agreement
+- ❌ Attempt to profit from the vulnerability (use bug bounty programs if available)
+
+**DO**:
+- ✅ Email only the security contact
+- ✅ Use PGP encryption if available (public key: see below)
+- ✅ Provide detailed technical information
+- ✅ Include your contact information (name, email, GitHub username)
+- ✅ Indicate whether you'd like credit for the discovery
+
+#### Step 3: Our Response
+
+Upon receiving your report, we will:
+
+1. **Initial Acknowledgment** (within 48 hours)
+   - Confirm receipt of your report
+   - Assign a ticket number for reference
+   - Ask any clarifying questions
+
+2. **Investigation & Validation** (3-10 days)
+   - Reproduce the vulnerability in our environment
+   - Assess severity and impact
+   - Identify affected versions
+   - Confirm root cause
+
+3. **Fix Development** (variable timeline)
+   - **Critical Severity** (RCE, loss of encryption): Fix within 1 week
+   - **High Severity** (auth bypass, data disclosure): Fix within 2 weeks
+   - **Medium Severity** (DoS, weak crypto): Fix within 1 month
+   - **Low Severity** (minor logic flaws): Fix in next release
+
+4. **Disclosure Coordination**
+   - We will propose a disclosure timeline (typically 30-90 days)
+   - Researcher must agree to embargo period
+   - Patch is released before public disclosure
+
+5. **Post-Release**
+   - Security advisory published on GitHub (in releases section)
+   - CVE requested (if applicable)
+   - Researcher credited (if desired)
+   - Post-mortem analysis published
+
+### Severity Levels & Response Times
+
+| Severity | Description | Response SLA | Fix SLA | Example |
+|----------|-------------|--------------|---------|---------|
+| **Critical** | Immediate threat to user security; remote code execution; loss of encryption | 2 hours | 1 week | Buffer overflow, key disclosure |
+| **High** | Significant impact; data disclosure or loss; authentication bypass | 4 hours | 2 weeks | Weak random number generation; plaintext key storage |
+| **Medium** | Moderate impact; requires attacker effort; limited exposure | 24 hours | 1 month | DoS attack; logic flaw in protocol |
+| **Low** | Minor impact; low exploitability; documentation improvement | 1 week | Next release | Typo; unused variable; weak log messages |
+
+### Vulnerability Embargo & Coordinated Disclosure Timeline
+
+**Default Embargo Period**: 30-90 days (negotiable based on severity)
+
+- **Day 0**: Vulnerability reported to us privately
+- **Day N (Disclosure Date)**: Patch released on GitHub
+- **Day N**: CVE (if applicable) is published
+- **Day N**: Security advisory published
+- **Day N + 1**: Researcher free to discuss publicly
+- **Day N + 7**: Full post-mortem (what happened, how we fixed it, how to prevent similar issues)
+
+### Encryption & Communication
+
+For extra confidentiality, researchers may encrypt reports using our security team's PGP key:
+
+```
+Public Key: [PGP KEY ID - TO BE ADDED]
+Fingerprint: [FINGERPRINT - TO BE ADDED]
+```
+
+**To Encrypt**:
+```bash
+gpg --import security-key.asc
+echo "Your vulnerability report" | gpg --encrypt --armor --recipient security@fibo3090-code.dev
+```
+
+*(PGP key and process to be finalized before public release)*
 
 ### Security Hall of Fame
 
-We recognize security researchers who responsibly disclose vulnerabilities:
+We recognize and thank researchers who responsibly disclose vulnerabilities:
 
-- *Your name could be here!*
+| Researcher | Date | Vulnerability | Severity |
+|-----------|------|-----------------|----------|
+| *First researcher* | TBD | TBD | TBD |
 
-### Bug Bounty
+**Want your name here?** Help us improve security through responsible disclosure!
 
-Currently, we do not offer a formal bug bounty program. However, we deeply appreciate security contributions and will acknowledge your work.
+---
+
+## Security Roadmap
+
+### Completed Milestones ✅
+
+| Phase | Date | Work | Status |
+|-------|------|------|--------|
+| **Phase 1** | Dec 2025 | Immediate hardening (DoS protection, memory hygiene, logging sanitization) | ✅ Complete |
+| **Phase 2** | Dec 2025 | Protocol v3 (encrypted identity exchange, privacy) | ✅ Complete |
+| **Phase 3** | Jan 2026 | Dependency hardening, GitHub Actions CI, AAD in AES-GCM | ✅ Complete |
+| **Phase 4** | Jan 2026 | Threat model documentation, responsible disclosure policy | ✅ Complete |
+
+### Active Work 🔄
+
+| Phase | Target | Work | Timeline | Owner |
+|-------|--------|------|----------|-------|
+| **Phase 5** | v1.8.0 | Encrypted identity keystore (Argon2 + AES-256) | 2-3 weeks | @fibo3090-code |
+| **Phase 5** | v1.8.0 | Ed25519 migration (replace RSA-2048) | 3-4 weeks | @fibo3090-code |
+| **Phase 5** | v1.8.0 | Professional security audit | 4-6 weeks | TBD (external) |
+
+### Planned Work 📋
+
+| Phase | Target | Work | Timeline | Rationale |
+|-------|--------|------|----------|-----------|
+| **Phase 6** | v1.9.0 | Session key rotation policy | 2 weeks | Long-term key exposure reduction |
+| **Phase 6** | v1.9.0 | Clipboard auto-clear (30s timeout) | 1 week | UX security improvement |
+| **Phase 6** | v1.9.0 | Out-of-band fingerprint verification (QR codes) | 2 weeks | Improve TOFU UX |
+| **Phase 7** | v2.0.0 | Post-quantum cryptography (hybrid PQC) | 8-12 weeks | Future-proof against quantum threats |
+| **Phase 7** | v2.0.0 | Hardware signing support (FIDO2) | 4-6 weeks | Enterprise security |
+| **Phase 7** | v2.0.0 | Formal protocol verification (ProVerif) | 4-8 weeks | Mathematical proof of security |
+
+### Current Focus (January 24, 2026)
+
+**Issue #1-#3**: ✅ COMPLETE
+- Added AAD support to AES-256-GCM
+- Verified payload size validation
+- Deployed GitHub Actions CI/CD
+
+**Issue #4**: 🔄 IN PROGRESS
+- Created comprehensive [THREAT_MODEL.md](THREAT_MODEL.md) with threat scenarios and mitigations
+- Expanded SECURITY.md with responsible disclosure policy
+- Documented severity levels and response SLAs
+
+**Issue #5**: 📋 NEXT
+- Decision required: Ed25519 (recommended, 8-10h) vs. RSA-PSS interim (3-4h)
+- Scope: Identity migration, dual-mode handshake for compatibility
+
+---
+
+## Related Documentation
+
+- **[THREAT_MODEL.md](THREAT_MODEL.md)** - Comprehensive threat analysis, attack scenarios, mitigations, known limitations
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Guidelines for security-focused contributions
+- **[docs/04_protocol.md](docs/04_protocol.md)** - Protocol v3 technical specification
+
+---
+
+## References & Standards
+
+- **Encryption**: [NIST SP 800-38D (AES-GCM)](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf)
+- **Key Derivation**: [RFC 5869 (HKDF)](https://tools.ietf.org/html/rfc5869)
+- **Key Exchange**: [RFC 7748 (Elliptic Curves for Security)](https://tools.ietf.org/html/rfc7748)
+- **Digital Signatures**: [RFC 3447 (RSA Cryptography)](https://tools.ietf.org/html/rfc3447)
+- **Responsible Disclosure**: [ISO/IEC 29147:2018](https://www.iso.org/standard/72319.html)
+
+---
+
+## Acknowledgments
+
+We thank the following for contributions to our security posture:
+
+- Security researchers who have helped identify and responsibly disclose vulnerabilities
+- The Rust cryptography community for excellent libraries (aes-gcm, x25519-dalek, etc.)
+- Contributors who have reviewed code, tested, and provided feedback
+
+---
+
+## Questions?
+
+For security-related inquiries:
+
+- **Vulnerability Reports**: See [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
+- **General Questions**: Open an issue on GitHub (non-sensitive questions only)
+- **Direct Contact**: [TBD - add contact info]
+
+*This security policy is effective as of January 24, 2026 and supersedes all previous versions.*
