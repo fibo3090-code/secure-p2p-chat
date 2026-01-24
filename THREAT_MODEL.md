@@ -2,7 +2,7 @@
 
 **Version:** 1.0  
 **Last Updated:** January 24, 2026  
-**Application:** Encrypted P2P Messenger v1.7.0+
+**Application:** Encrypted P2P Messenger v1.7.2+
 
 ---
 
