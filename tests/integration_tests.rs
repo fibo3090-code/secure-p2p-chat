@@ -1,10 +1,11 @@
 use encodeur_rsa_rust::app::chat_manager::ChatManager;
 use encodeur_rsa_rust::types::{Config, Theme};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-/// Test the full lifecycle of a chat: Creation -> Renaming -> Selection -> Deletion
-#[tokio::test]
-async fn test_chat_lifecycle() {
+/// Test the full lifecycle of a chat: Creation -> Renaming -> Persistence -> Deletion
+#[test]
+fn test_chat_lifecycle() {
     let mut manager = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
 
@@ -21,7 +22,17 @@ async fn test_chat_lifecycle() {
     assert!(rename_res.is_ok(), "Renaming should succeed");
     assert_eq!(manager.chats.get(&chat_id).unwrap().title, "Renamed Title");
 
-    // 3. Delete
+    // 3. Persist history and reload
+    let history_file = NamedTempFile::new().unwrap();
+    manager.save_history(history_file.path()).unwrap();
+    let mut reloaded = ChatManager::new(Config::default());
+    reloaded.load_history(history_file.path()).unwrap();
+    assert_eq!(
+        reloaded.chats.get(&chat_id).unwrap().title,
+        "Renamed Title"
+    );
+
+    // 4. Delete
     manager.delete_chat(chat_id);
     assert!(
         !manager.chats.contains_key(&chat_id),
@@ -30,8 +41,8 @@ async fn test_chat_lifecycle() {
 }
 
 /// Test contact management logic
-#[tokio::test]
-async fn test_contact_management() {
+#[test]
+fn test_contact_management() {
     let mut manager = ChatManager::new(Config::default());
 
     // 1. Add Valid Contact
@@ -67,13 +78,14 @@ fn test_config_and_theme() {
     assert!(config.auto_host_on_startup);
 }
 
-/// Test address parsing logic indirectly via contact addition
+/// Test address parsing logic with real parser
 #[test]
 fn test_address_parsing_logic() {
-    // This logic mimics the validation added to the UI
     let valid_addr = "192.168.1.1:8080";
     let invalid_addr = "192.168.1.1"; // Missing port
 
-    assert!(valid_addr.contains(':'));
-    assert!(!invalid_addr.contains(':'));
+    let parsed = ChatManager::parse_address(valid_addr).unwrap();
+    assert_eq!(parsed.0, "192.168.1.1");
+    assert_eq!(parsed.1, 8080);
+    assert!(ChatManager::parse_address(invalid_addr).is_err());
 }

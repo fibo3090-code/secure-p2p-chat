@@ -1,5 +1,7 @@
 use encodeur_rsa_rust::core::ProtocolMessage;
 use encodeur_rsa_rust::util::sanitize_filename;
+use encodeur_rsa_rust::{FILE_CHUNK_SIZE, MAX_FILE_SIZE};
+use tempfile::TempDir;
 
 #[test]
 fn test_filename_sanitization_security() {
@@ -23,6 +25,19 @@ fn test_filename_sanitization_security() {
 }
 
 #[test]
+fn test_sanitized_filename_stays_within_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let filename = sanitize_filename("../../etc/passwd");
+    let target_path = temp_dir.path().join(filename);
+
+    std::fs::write(&target_path, b"test").unwrap();
+    let base = std::fs::canonicalize(temp_dir.path()).unwrap();
+    let file = std::fs::canonicalize(&target_path).unwrap();
+
+    assert!(file.starts_with(base));
+}
+
+#[test]
 fn test_protocol_message_input_limits() {
     // Ensure we don't crash on huge inputs
     let huge_data = vec![0u8; 10 * 1024 * 1024]; // 10MB
@@ -33,6 +48,33 @@ fn test_protocol_message_input_limits() {
 
     let parsed = ProtocolMessage::from_plain_bytes(&text_msg);
     assert!(parsed.is_none(), "Huge text message should be rejected");
+}
+
+#[test]
+fn test_binary_protocol_limits() {
+    let mut oversized_text = Vec::new();
+    oversized_text.push(2u8); // Text tag
+    oversized_text.extend_from_slice(&0u64.to_be_bytes());
+    oversized_text.extend_from_slice(&0u64.to_be_bytes());
+    let text_len = (70 * 1024u32).to_be_bytes();
+    oversized_text.extend_from_slice(&text_len);
+    oversized_text.extend_from_slice(&vec![b'a'; 70 * 1024]);
+    assert!(ProtocolMessage::from_plain_bytes(&oversized_text).is_none());
+
+    let mut oversized_meta = Vec::new();
+    oversized_meta.push(3u8); // FileMeta tag
+    oversized_meta.extend_from_slice(&1u64.to_be_bytes());
+    oversized_meta.extend_from_slice(&(MAX_FILE_SIZE + 1).to_be_bytes());
+    oversized_meta.extend_from_slice(&(4u32).to_be_bytes());
+    oversized_meta.extend_from_slice(b"test");
+    assert!(ProtocolMessage::from_plain_bytes(&oversized_meta).is_none());
+
+    let mut oversized_chunk = Vec::new();
+    oversized_chunk.push(4u8); // FileChunk tag
+    oversized_chunk.extend_from_slice(&1u64.to_be_bytes());
+    oversized_chunk.extend_from_slice(&((FILE_CHUNK_SIZE + 1) as u32).to_be_bytes());
+    oversized_chunk.extend_from_slice(&vec![0u8; FILE_CHUNK_SIZE + 1]);
+    assert!(ProtocolMessage::from_plain_bytes(&oversized_chunk).is_none());
 }
 
 #[test]

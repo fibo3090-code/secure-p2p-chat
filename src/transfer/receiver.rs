@@ -332,4 +332,27 @@ mod tests {
         let final_filename = final_path.file_name().unwrap().to_str().unwrap();
         assert!(final_filename.starts_with("test_") && final_filename.ends_with(".txt"));
     }
+
+    #[tokio::test]
+    async fn test_abort_cleanup_removes_temp_file() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let incoming = IncomingFile::start_meta("test.txt", 5, temp_dir.path())
+            .await
+            .unwrap();
+        incoming.abort_cleanup().await.unwrap();
+
+        let remaining: Vec<_> = std::fs::read_dir(temp_dir.path()).unwrap().collect();
+        assert!(remaining.is_empty(), "Temp directory should be empty after abort");
+    }
+
+    #[test]
+    fn test_sync_write_chunk_overflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest_path = temp_dir.path().join("test.txt");
+        let mut incoming = IncomingFileSync::new(&dest_path, 4).unwrap();
+
+        let err = incoming.write_chunk(b"hello").expect_err("should reject oversize chunk");
+        assert!(err.to_string().contains("Received more data than expected"));
+    }
 }

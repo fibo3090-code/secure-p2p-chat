@@ -47,7 +47,7 @@ pub struct ChatManager {
 impl ChatManager {
     /// Parse an address of the form host:port
     /// Returns (host, port) or an error if the format is invalid.
-    fn parse_address(address: &str) -> Result<(String, u16)> {
+    pub fn parse_address(address: &str) -> Result<(String, u16)> {
         let parts: Vec<&str> = address.split(':').collect();
         if parts.len() != 2 {
             tracing::error!("Invalid address format for contact: {}", address);

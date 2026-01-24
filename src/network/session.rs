@@ -570,8 +570,11 @@ mod tests {
 
             // 5. Recv Client Identity Proof (Encrypted)
             let encrypted_client_proof = recv_packet(&mut host_stream).await?;
-            let client_proof_bytes = cipher.decrypt(&encrypted_client_proof).unwrap();
-            let _client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+            let client_proof_bytes = cipher
+                .decrypt(&encrypted_client_proof)
+                .expect("client proof decrypt should succeed");
+            let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+            assert_eq!(client_proof.version, PROTOCOL_VERSION as u32);
 
             Ok(host_aes_key)
         });
@@ -608,8 +611,11 @@ mod tests {
 
             // 4. Recv Host Identity Proof (Encrypted)
             let encrypted_host_proof = recv_packet(&mut client_stream).await?;
-            let host_proof_bytes = cipher.decrypt(&encrypted_host_proof).unwrap();
-            let _host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+            let host_proof_bytes = cipher
+                .decrypt(&encrypted_host_proof)
+                .expect("host proof decrypt should succeed");
+            let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+            assert_eq!(host_proof.version, PROTOCOL_VERSION as u32);
 
             // 5. Send Client Identity Proof (Encrypted)
             let signing_key = SigningKey::<Sha256>::new(client_privkey.clone());
