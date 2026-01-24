@@ -46,9 +46,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: rustsec/audit-check-action@v1
+      - uses: rustsec/audit-check-action@v2
         with:
           log-level: warn
+          # RUSTSEC-2020-0001: OpenSSL timing attack vulnerability
+          # Suppressed because:
+          #   - Not directly used in crypto operations (we use aes-gcm, x25519-dalek)
+          #   - OpenSSL is a transitive dependency via mdns-sd
+          #   - Risk is mitigated by our use of constant-time AEAD operations
+          #   - Awaiting upstream mdns-sd dependency update
           ignore: RUSTSEC-2020-0001
 
   build-release:
