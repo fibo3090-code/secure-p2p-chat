@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::core::{
     derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, parse_x25519_public,
     pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher, IdentityProof,
-    ProtocolMessage, PROTOCOL_VERSION,
+    SignatureScheme, ProtocolMessage, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -176,6 +176,7 @@ pub async fn run_host_session(
         signature: signature.to_vec(),
         version: PROTOCOL_VERSION as u32,
         chat_id,
+        signature_scheme: SignatureScheme::RsaPss,
     };
 
     // Serialize & Encrypt Proof
@@ -374,6 +375,7 @@ pub async fn run_client_session(
         signature: signature.to_vec(),
         version: PROTOCOL_VERSION as u32,
         chat_id,
+        signature_scheme: SignatureScheme::RsaPss,
     };
 
     // Serialize & Encrypt Proof
@@ -565,6 +567,7 @@ mod tests {
                 signature: signature.to_vec(),
                 version: PROTOCOL_VERSION as u32,
                 chat_id: uuid::Uuid::new_v4(),
+                signature_scheme: SignatureScheme::RsaPss,
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
             let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
@@ -632,6 +635,7 @@ mod tests {
                 signature: signature.to_vec(),
                 version: PROTOCOL_VERSION as u32,
                 chat_id: uuid::Uuid::new_v4(),
+                signature_scheme: SignatureScheme::RsaPss,
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
             let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);

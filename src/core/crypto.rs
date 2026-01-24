@@ -5,6 +5,7 @@ use aes_gcm::{
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use ed25519_dalek::{Signature, SigningKey as Ed25519SigningKey, Signer, VerifyingKey as Ed25519VerifyingKey, Verifier};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use rsa::{
@@ -13,6 +14,7 @@ use rsa::{
     Oaep, RsaPrivateKey, RsaPublicKey,
 };
 use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
 use crate::AES_KEY_SIZE;
@@ -97,6 +99,105 @@ pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> String {
 }
 
 // ============================================================================
+// Ed25519 EDDSA Signatures for Modern Key Exchanges
+// ============================================================================
+
+/// Signature scheme for identity proofs
+/// Determines which algorithm is used to sign the ephemeral key during handshake
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SignatureScheme {
+    /// RSA-PSS with SHA-256 (current default, will be deprecated)
+    RsaPss = 1,
+    /// Ed25519 EdDSA (recommended, future default)
+    Ed25519 = 2,
+}
+
+impl SignatureScheme {
+    /// Get the numeric value for wire protocol
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse from numeric value
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(SignatureScheme::RsaPss),
+            2 => Some(SignatureScheme::Ed25519),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name
+    pub fn name(&self) -> &'static str {
+        match self {
+            SignatureScheme::RsaPss => "RSA-PSS",
+            SignatureScheme::Ed25519 => "Ed25519",
+        }
+    }
+}
+
+impl std::fmt::Display for SignatureScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Generate Ed25519 keypair
+pub fn generate_ed25519_keypair() -> (Ed25519SigningKey, Ed25519VerifyingKey) {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    let signing_key = Ed25519SigningKey::from_bytes(&seed);
+    let verifying_key = signing_key.verifying_key();
+    (signing_key, verifying_key)
+}
+
+/// Sign data with Ed25519
+pub fn sign_ed25519(signing_key: &Ed25519SigningKey, data: &[u8]) -> Signature {
+    signing_key.sign(data)
+}
+
+/// Verify Ed25519 signature
+pub fn verify_ed25519(verifying_key: &Ed25519VerifyingKey, data: &[u8], signature: &Signature) -> Result<()> {
+    verifying_key
+        .verify(data, signature)
+        .map_err(|e| anyhow!("Ed25519 signature verification failed: {}", e))
+}
+
+/// Export Ed25519 public key to hex format (32 bytes)
+pub fn ed25519_public_to_hex(vkey: &Ed25519VerifyingKey) -> String {
+    hex::encode(vkey.to_bytes())
+}
+
+/// Import Ed25519 public key from hex format
+pub fn ed25519_public_from_hex(hex_str: &str) -> Result<Ed25519VerifyingKey> {
+    let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("Ed25519 public key must be 32 bytes, got {}", bytes.len()));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&bytes);
+    Ed25519VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| anyhow!("Invalid Ed25519 public key: {}", e))
+}
+
+/// Export Ed25519 private key to hex format (32 bytes) - CAREFUL: SENSITIVE DATA
+pub fn ed25519_private_to_hex(skey: &Ed25519SigningKey) -> String {
+    hex::encode(skey.to_bytes())
+}
+
+/// Import Ed25519 private key from hex format
+pub fn ed25519_private_from_hex(hex_str: &str) -> Result<Ed25519SigningKey> {
+    let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("Ed25519 private key must be 32 bytes, got {}", bytes.len()));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&bytes);
+    Ok(Ed25519SigningKey::from_bytes(&key_bytes))
+}
+
+
 // X25519 ECDH for Forward Secrecy
 // ============================================================================
 
@@ -493,5 +594,123 @@ mod tests {
         let decrypted = bob_cipher.decrypt(&encrypted, None).unwrap();
 
         assert_eq!(plaintext, &decrypted[..]);
+    }
+
+    // ========== Ed25519 Signature Tests ==========
+
+    #[test]
+    fn test_ed25519_keypair_generation() {
+        let (skey1, vkey1) = generate_ed25519_keypair();
+        let (skey2, vkey2) = generate_ed25519_keypair();
+
+        // Keys should be different
+        assert_ne!(skey1.to_bytes(), skey2.to_bytes());
+        assert_ne!(vkey1.to_bytes(), vkey2.to_bytes());
+
+        // Keys should be correct size
+        assert_eq!(skey1.to_bytes().len(), 32);
+        assert_eq!(vkey1.to_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_ed25519_sign_verify() {
+        let (signing_key, verifying_key) = generate_ed25519_keypair();
+        let message = b"Test message for Ed25519";
+
+        // Sign
+        let signature = sign_ed25519(&signing_key, message);
+
+        // Verify should succeed
+        let result = verify_ed25519(&verifying_key, message, &signature);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ed25519_verify_wrong_message() {
+        let (signing_key, verifying_key) = generate_ed25519_keypair();
+        let message1 = b"Test message 1";
+        let message2 = b"Test message 2";
+
+        // Sign message1
+        let signature = sign_ed25519(&signing_key, message1);
+
+        // Verify against message2 should fail
+        let result = verify_ed25519(&verifying_key, message2, &signature);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ed25519_verify_wrong_key() {
+        let (signing_key1, _) = generate_ed25519_keypair();
+        let (_, verifying_key2) = generate_ed25519_keypair();
+        let message = b"Test message";
+
+        // Sign with key1
+        let signature = sign_ed25519(&signing_key1, message);
+
+        // Verify with key2 should fail
+        let result = verify_ed25519(&verifying_key2, message, &signature);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ed25519_hex_roundtrip() {
+        let (_, vkey_orig) = generate_ed25519_keypair();
+
+        // Export to hex
+        let hex_str = ed25519_public_to_hex(&vkey_orig);
+        assert_eq!(hex_str.len(), 64); // 32 bytes = 64 hex chars
+
+        // Import from hex
+        let vkey_imported = ed25519_public_from_hex(&hex_str).unwrap();
+
+        // Should match
+        assert_eq!(vkey_orig.to_bytes(), vkey_imported.to_bytes());
+    }
+
+    #[test]
+    fn test_signature_scheme_enum() {
+        // Test RsaPss
+        assert_eq!(SignatureScheme::RsaPss.to_u8(), 1);
+        assert_eq!(SignatureScheme::RsaPss.name(), "RSA-PSS");
+        assert_eq!(SignatureScheme::from_u8(1), Some(SignatureScheme::RsaPss));
+
+        // Test Ed25519
+        assert_eq!(SignatureScheme::Ed25519.to_u8(), 2);
+        assert_eq!(SignatureScheme::Ed25519.name(), "Ed25519");
+        assert_eq!(SignatureScheme::from_u8(2), Some(SignatureScheme::Ed25519));
+
+        // Test unknown
+        assert_eq!(SignatureScheme::from_u8(99), None);
+
+        // Test Display
+        assert_eq!(format!("{}", SignatureScheme::RsaPss), "RSA-PSS");
+        assert_eq!(format!("{}", SignatureScheme::Ed25519), "Ed25519");
+    }
+
+    #[test]
+    fn test_ed25519_identity_proof_binding() {
+        // Simulate the identity proof signing scenario
+        let (signing_key, verifying_key) = generate_ed25519_keypair();
+
+        // Ephemeral key bytes (simulated X25519 key)
+        let ephemeral_bytes = [42u8; 32];
+
+        // Create the message to sign (like in the handshake)
+        let mut data = Vec::new();
+        data.extend_from_slice(b"IDENTITY_PROOF");
+        data.extend_from_slice(&ephemeral_bytes);
+
+        // Sign
+        let signature = sign_ed25519(&signing_key, &data);
+
+        // Verify with correct data
+        assert!(verify_ed25519(&verifying_key, &data, &signature).is_ok());
+
+        // Verify with different ephemeral key should fail
+        let mut wrong_data = Vec::new();
+        wrong_data.extend_from_slice(b"IDENTITY_PROOF");
+        wrong_data.extend_from_slice(&[99u8; 32]);
+        assert!(verify_ed25519(&verifying_key, &wrong_data, &signature).is_err());
     }
 }

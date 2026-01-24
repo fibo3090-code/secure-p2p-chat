@@ -21,6 +21,7 @@ aes-gcm = "0.10.3"
 rand = "0.8"
 getrandom = "0.2"
 x25519-dalek = "2.0"
+ed25519-dalek = { version = "2.1", features = ["zeroize"] }
 hkdf = "0.12"
 
 # Encodage

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use super::SignatureScheme;
 
 /// Protocol version for forward compatibility
 ///
@@ -87,7 +88,8 @@ impl std::fmt::Debug for ProtocolMessage {
 /// Sent inside the encrypted tunnel to prove identity.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IdentityProof {
-    /// Public Key PEM (Identity)
+    /// Public Key PEM (Identity) - currently only RSA
+    /// Future: could support PEM-encoded Ed25519 keys
     pub public_key_pem: String,
     /// Signature of the Ephemeral Public Key used in this session
     /// Signed by the Identity Private Key.
@@ -97,6 +99,15 @@ pub struct IdentityProof {
     pub version: u32,
     /// Chat ID (optional here, or separate message)
     pub chat_id: uuid::Uuid,
+    /// Signature scheme used (RSA-PSS or Ed25519)
+    /// Default: RSA-PSS for v3.0 compatibility
+    #[serde(default = "default_signature_scheme")]
+    pub signature_scheme: SignatureScheme,
+}
+
+/// Default signature scheme for backward compatibility
+fn default_signature_scheme() -> SignatureScheme {
+    SignatureScheme::RsaPss
 }
 
 impl ProtocolMessage {
