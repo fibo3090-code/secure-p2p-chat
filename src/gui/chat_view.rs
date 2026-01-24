@@ -49,22 +49,22 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     egui::Color32::GRAY
                 };
 
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 20.0, color);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 20.0, color);
 
                 let initials = crate::gui::widgets::get_initials(&title);
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            initials,
-                            egui::FontId::proportional(16.0),
-                            egui::Color32::WHITE,
-                        );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initials,
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::WHITE,
+                );
 
-                        ui.add_space(8.0);
+                ui.add_space(8.0);
 
-                        // Title and status
+                // Title and status
                 ui.vertical(|ui| {
                     ui.heading(&title);
                     // Show typing indicator or connection status
@@ -89,7 +89,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     }
                 });
 
-                        // Fingerprint on right
+                // Fingerprint on right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(fp) = &peer_fingerprint {
                         if ui.button("📋 Copy Fingerprint").clicked() {
@@ -108,7 +108,11 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                                         tokio::spawn(async move {
                                             let mut m = mgr.lock().await;
                                             if let Err(e) = m
-                                                .connect_to_contact(contact_id, Some(chat_id), &privkey)
+                                                .connect_to_contact(
+                                                    contact_id,
+                                                    Some(chat_id),
+                                                    &privkey,
+                                                )
                                                 .await
                                             {
                                                 m.add_toast(

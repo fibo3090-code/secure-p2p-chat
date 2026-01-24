@@ -16,9 +16,9 @@ use uuid::Uuid;
 
 use crate::core::ProtocolMessage;
 use crate::network::{run_client_session, run_host_session};
-use rsa::RsaPrivateKey;
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
+use rsa::RsaPrivateKey;
 
 /// Session handle for communication with network task
 #[derive(Clone)]
@@ -42,6 +42,7 @@ pub struct ChatManager {
     pub toasts: Vec<Toast>,
     pub config: Config,
     pub fingerprint_verification_request: Option<(String, String, Uuid)>,
+    pub history_key: Option<[u8; 32]>,
 }
 
 impl ChatManager {
@@ -78,7 +79,13 @@ impl ChatManager {
             config,
             fingerprint_verification_request: None,
             fingerprint_confirm_senders: HashMap::new(),
+            history_key: None,
         }
+    }
+
+    /// Provide the history encryption key after the identity is unlocked.
+    pub fn set_history_key(&mut self, key: [u8; 32]) {
+        self.history_key = Some(key);
     }
 
     /// Helper to create a local chat for testing purposes without network sessions
@@ -1233,8 +1240,7 @@ impl ChatManager {
                                     tracing::info!("File transfer completed");
 
                                     // Finalize only the matching transfer, not all incoming files
-                                    if let Some(incoming) =
-                                        self.incoming_files.remove(&transfer_id)
+                                    if let Some(incoming) = self.incoming_files.remove(&transfer_id)
                                     {
                                         let bytes_received = incoming.bytes_received();
                                         match incoming.finalize() {
@@ -1243,16 +1249,13 @@ impl ChatManager {
                                                     self.active_transfers.get(&transfer_id)
                                                 {
                                                     // Add to chat history
-                                                    if let Some(chat) =
-                                                        self.chats.get_mut(&chat_id)
+                                                    if let Some(chat) = self.chats.get_mut(&chat_id)
                                                     {
                                                         chat.messages.push(Message {
                                                             id: Uuid::new_v4(),
                                                             from_me: false,
                                                             content: MessageContent::File {
-                                                                filename: transfer
-                                                                    .filename
-                                                                    .clone(),
+                                                                filename: transfer.filename.clone(),
                                                                 size: transfer.size,
                                                                 path: Some(final_path),
                                                             },
@@ -1266,10 +1269,7 @@ impl ChatManager {
                                                 );
                                             }
                                             Err(e) => {
-                                                tracing::error!(
-                                                    "Failed to finalize file: {}",
-                                                    e
-                                                );
+                                                tracing::error!("Failed to finalize file: {}", e);
                                                 self.add_toast(
                                                     ToastLevel::Error,
                                                     format!("File transfer error: {}", e),
@@ -1672,5 +1672,67 @@ mod tests {
         let (fp, _, _) = mgr.fingerprint_verification_request.clone().unwrap();
         assert_eq!(fp, fingerprint2);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// PHASE 0 REGRESSION TEST: auto_trust_on_first_use must default to false.
+    /// If this test fails, the TOFU auto-trust MEDIUM-priority issue is present.
+    /// auto_trust_on_first_use=true silently accepts first-contact MITM without verification prompt.
+    #[test]
+    fn test_regression_auto_trust_default_off() {
+        let config = Config::default();
+        assert!(
+            !config.auto_trust_on_first_use,
+            "auto_trust_on_first_use MUST default to false for security"
+        );
+
+        // When auto_trust_on_first_use=false (the default), first fingerprint should require user verification.
+        let mut mgr = ChatManager::new(config);
+        let chat_id = Uuid::new_v4();
+
+        let chat = Chat {
+            id: chat_id,
+            title: "Test Chat".to_string(),
+            peer_fingerprint: None,
+            participants: Vec::new(),
+            messages: Vec::new(),
+            created_at: chrono::Utc::now(),
+            peer_typing: false,
+            typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
+        };
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        mgr.fingerprint_confirm_senders.insert(chat_id, tx);
+        mgr.chats.insert(chat_id, chat);
+
+        // When a new fingerprint is received (first use), it should prompt the user
+        let event = SessionEvent::ShowFingerprintVerification {
+            fingerprint: "first_fingerprint".to_string(),
+            peer_name: "Alice".to_string(),
+            chat_id,
+        };
+
+        mgr.handle_session_event(chat_id, event);
+
+        // With auto_trust=false, fingerprint should NOT be auto-stored
+        assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, None);
+        // And a verification request should be pending
+        assert!(
+            mgr.fingerprint_verification_request.is_some(),
+            "Should show fingerprint verification dialog when auto_trust_on_first_use=false"
+        );
+    }
+
+    /// PHASE 0 REGRESSION TEST: mDNS discovery should be disabled by default.
+    /// If this test fails, the mDNS metadata exposure LOW-priority issue is present.
+    /// Enabling mDNS broadcasts fingerprint + hostname on the local network.
+    #[test]
+    fn test_regression_mdns_default_off() {
+        let config = Config::default();
+        assert!(
+            !config.enable_mdns,
+            "enable_mdns MUST default to false for privacy (LAN fingerprint disclosure risk)"
+        );
     }
 }

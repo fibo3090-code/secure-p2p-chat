@@ -529,6 +529,17 @@ impl Identity {
     pub fn is_locked(&self) -> bool {
         self.encrypted_private_key.is_some() && self.private_key_pem_plaintext.is_none()
     }
+
+    /// Derive a stable 32-byte history encryption key from the private key.
+    /// Requires the identity to be unlocked (private key available).
+    pub fn history_key(&self) -> Result<[u8; 32]> {
+        let privkey = self.private_key()?;
+        let der = privkey.to_pkcs8_der()?;
+        let digest = Sha256::digest(der.as_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&digest);
+        Ok(key)
+    }
 }
 
 #[cfg(test)]

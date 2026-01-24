@@ -27,10 +27,7 @@ fn test_chat_lifecycle() {
     manager.save_history(history_file.path()).unwrap();
     let mut reloaded = ChatManager::new(Config::default());
     reloaded.load_history(history_file.path()).unwrap();
-    assert_eq!(
-        reloaded.chats.get(&chat_id).unwrap().title,
-        "Renamed Title"
-    );
+    assert_eq!(reloaded.chats.get(&chat_id).unwrap().title, "Renamed Title");
 
     // 4. Delete
     manager.delete_chat(chat_id);

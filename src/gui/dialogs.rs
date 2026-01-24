@@ -127,10 +127,41 @@ fn render_unlock_form(app: &mut App, ui: &mut egui::Ui) {
                     app.identity_locked = false;
                     app.show_password_dialog = false;
                     app.password_input.clear();
-                    if let Ok(mut manager) = app.chat_manager.try_lock() {
+
+                    // Derive and set history key from unlocked identity
+                    if let Ok(history_key) = app.identity.history_key() {
+                        // Scope for lock
+                        {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.set_history_key(history_key);
+
+                                // Try to load history if not already loaded
+                                if !app.history_loaded {
+                                    match manager.load_history_auto(&app.history_path, &history_key)
+                                    {
+                                        Ok(_) => {
+                                            tracing::info!("History loaded and unlocked");
+                                            app.history_loaded = true;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to load history: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Lock dropped, now we can safely use app
+                        if let Ok(mut manager) = app.chat_manager.try_lock() {
+                            manager.add_toast(
+                                crate::types::ToastLevel::Success,
+                                "Identity unlocked!".to_string(),
+                            );
+                        }
+                    } else if let Ok(mut manager) = app.chat_manager.try_lock() {
                         manager.add_toast(
-                            crate::types::ToastLevel::Success,
-                            "Identity unlocked!".to_string(),
+                            crate::types::ToastLevel::Warning,
+                            "Unlocked but could not derive history key. History may not auto-save."
+                                .to_string(),
                         );
                     }
                 }
@@ -156,7 +187,11 @@ fn render_set_password_form(app: &mut App, ui: &mut egui::Ui, allow_cancel: bool
         } else {
             ui.label("Set a password to encrypt your identity file.");
         }
-        ui.label(egui::RichText::new("If you forget it, you cannot recover your identity.").small().weak());
+        ui.label(
+            egui::RichText::new("If you forget it, you cannot recover your identity.")
+                .small()
+                .weak(),
+        );
         ui.add_space(12.0);
 
         ui.label("New Password:");
@@ -173,30 +208,51 @@ fn render_set_password_form(app: &mut App, ui: &mut egui::Ui, allow_cancel: bool
         );
         ui.add_space(8.0);
 
-        if app.new_password_input != app.confirm_password_input && !app.confirm_password_input.is_empty() {
+        if app.new_password_input != app.confirm_password_input
+            && !app.confirm_password_input.is_empty()
+        {
             ui.colored_label(crate::gui::styling::ERROR, "Passwords do not match.");
         } else if app.new_password_input.is_empty() {
-            ui.colored_label(crate::gui::styling::SUBTLE_TEXT_COLOR, "Enter and confirm a password.");
+            ui.colored_label(
+                crate::gui::styling::SUBTLE_TEXT_COLOR,
+                "Enter and confirm a password.",
+            );
         }
 
         ui.horizontal(|ui| {
             let can_set = !app.new_password_input.is_empty()
                 && app.new_password_input == app.confirm_password_input;
-            if ui.add_enabled(can_set, egui::Button::new("Set Password")).clicked() {
+            if ui
+                .add_enabled(can_set, egui::Button::new("Set Password"))
+                .clicked()
+            {
                 match app.identity.encrypt(&app.new_password_input) {
                     Ok(_) => {
                         let path = app.history_path.with_file_name("identity.json");
                         if let Err(e) = app.identity.save(&path) {
                             if let Ok(mut m) = app.chat_manager.try_lock() {
-                                m.add_toast(crate::types::ToastLevel::Error, format!("Failed to save: {}", e));
+                                m.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to save: {}", e),
+                                );
                             }
                         } else {
                             if let Ok(mut m) = app.chat_manager.try_lock() {
-                                m.add_toast(crate::types::ToastLevel::Success, "Password set. Unlocking…".to_string());
+                                m.add_toast(
+                                    crate::types::ToastLevel::Success,
+                                    "Password set. Unlocking…".to_string(),
+                                );
                             }
                             // Decrypt in memory so we stay unlocked for this session
                             if app.identity.decrypt(&app.new_password_input).is_ok() {
                                 app.identity_locked = false;
+
+                                // Derive and set history key from unlocked identity
+                                if let Ok(history_key) = app.identity.history_key() {
+                                    if let Ok(mut m) = app.chat_manager.try_lock() {
+                                        m.set_history_key(history_key);
+                                    }
+                                }
                             }
                             if app.is_new_identity {
                                 app.is_new_identity = false;
@@ -210,17 +266,18 @@ fn render_set_password_form(app: &mut App, ui: &mut egui::Ui, allow_cancel: bool
                     }
                     Err(e) => {
                         if let Ok(mut m) = app.chat_manager.try_lock() {
-                            m.add_toast(crate::types::ToastLevel::Error, format!("Encryption failed: {}", e));
+                            m.add_toast(
+                                crate::types::ToastLevel::Error,
+                                format!("Encryption failed: {}", e),
+                            );
                         }
                     }
                 }
             }
-            if allow_cancel {
-                if ui.button("Cancel").clicked() {
-                    app.show_set_password_dialog = false;
-                    app.new_password_input.clear();
-                    app.confirm_password_input.clear();
-                }
+            if allow_cancel && ui.button("Cancel").clicked() {
+                app.show_set_password_dialog = false;
+                app.new_password_input.clear();
+                app.confirm_password_input.clear();
             }
         });
     });

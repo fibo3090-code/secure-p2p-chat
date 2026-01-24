@@ -239,11 +239,13 @@ impl IncomingFileSync {
         }
 
         while final_path.exists() {
-            let stem = self.final_dest
+            let stem = self
+                .final_dest
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("file");
-            let ext = self.final_dest
+            let ext = self
+                .final_dest
                 .extension()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
@@ -327,7 +329,7 @@ mod tests {
 
         // Should have different name
         assert_ne!(final_path, file1_path);
-        
+
         // Safely check filename
         let final_filename = final_path.file_name().unwrap().to_str().unwrap();
         assert!(final_filename.starts_with("test_") && final_filename.ends_with(".txt"));
@@ -343,7 +345,10 @@ mod tests {
         incoming.abort_cleanup().await.unwrap();
 
         let remaining: Vec<_> = std::fs::read_dir(temp_dir.path()).unwrap().collect();
-        assert!(remaining.is_empty(), "Temp directory should be empty after abort");
+        assert!(
+            remaining.is_empty(),
+            "Temp directory should be empty after abort"
+        );
     }
 
     #[test]
@@ -352,7 +357,9 @@ mod tests {
         let dest_path = temp_dir.path().join("test.txt");
         let mut incoming = IncomingFileSync::new(&dest_path, 4).unwrap();
 
-        let err = incoming.write_chunk(b"hello").expect_err("should reject oversize chunk");
+        let err = incoming
+            .write_chunk(b"hello")
+            .expect_err("should reject oversize chunk");
         assert!(err.to_string().contains("Received more data than expected"));
     }
 }

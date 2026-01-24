@@ -60,13 +60,11 @@ async fn main() -> anyhow::Result<()> {
         let run_result = eframe::run_native(
             "Encrypted P2P Messenger",
             native_options,
-            Box::new(|cc| {
-                match gui::App::new(cc, event_collector.clone()) {
-                    Ok(app) => Ok(Box::new(app)),
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to create app state");
-                        Err(e.into())
-                    }
+            Box::new(|cc| match gui::App::new(cc, event_collector.clone()) {
+                Ok(app) => Ok(Box::new(app)),
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create app state");
+                    Err(e.into())
                 }
             }),
         );

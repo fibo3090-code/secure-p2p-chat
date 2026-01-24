@@ -4,9 +4,9 @@ use crate::types::*;
 
 use crate::PORT_DEFAULT;
 
+use directories::UserDirs;
 use eframe::egui;
 use egui_tracing::tracing::EventCollector;
-use directories::UserDirs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -49,6 +49,7 @@ pub struct App {
     pub show_about: bool,
     pub chat_to_delete: Option<Uuid>,
     pub history_path: PathBuf,
+    pub history_loaded: bool,
     pub show_emoji_picker: bool,
     pub last_typing_time: Option<std::time::Instant>,
     pub typing_stopped: bool,
@@ -128,8 +129,7 @@ impl App {
         let mut chat_manager = ChatManager::new(Config::default());
         let initial_show_log_terminal = chat_manager.config.show_log_terminal;
 
-        let proj_dirs =
-            directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
+        let proj_dirs = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
 
         // Auto-restore conversation history from platform-specific user data directory
         let (history_path, identity, is_new_identity) = if let Some(ref dirs) = proj_dirs {
@@ -148,13 +148,13 @@ impl App {
                     }
                 };
 
-            (data_dir.join("history.json"), identity, is_new)
+            (data_dir.join("history.json.enc"), identity, is_new)
         } else {
             // Fallback to relative path if directories crate fails
             tracing::warn!("Could not determine user data directory, using fallback path");
             let identity = crate::identity::Identity::new_with_plaintext("User".to_string())?;
             (
-                PathBuf::from("Downloads").join("history.json"),
+                PathBuf::from("Downloads").join("history.json.enc"),
                 identity,
                 true,
             )
@@ -169,17 +169,25 @@ impl App {
 
         let show_welcome = !history_path.exists();
 
-        if history_path.exists() {
-            if let Err(e) = chat_manager.load_history(&history_path) {
-                tracing::warn!("Failed to load history: {}", e);
+        // Derive history key from identity if it's not locked
+        if !identity.is_locked() {
+            if let Ok(key) = identity.history_key() {
+                chat_manager.set_history_key(key);
+
+                // Try to load history with auto-migration support
+                if let Err(e) = chat_manager.load_history_auto(&history_path, &key) {
+                    tracing::warn!("Failed to load history: {}", e);
+                }
             } else {
-                tracing::info!("Successfully loaded conversation history");
-                // Re-apply theme from loaded config
-                let loaded_theme = chat_manager.config.theme;
-                cc.egui_ctx
-                    .set_visuals(crate::gui::styling::apply_custom_visuals(&loaded_theme));
+                tracing::warn!("Could not derive history key from identity");
             }
+        } else if history_path.exists() {
+            // History exists but identity is locked - can't load yet
+            tracing::warn!("History exists but identity is locked. Will load after unlock.");
         }
+
+        // If history wasn't loaded yet and no key was available (identity locked),
+        // the history will be loaded/decrypted after the user unlocks the identity.
 
         // After loading history, override default relative paths with absolute paths if possible
         if let Some(dirs) = proj_dirs {
@@ -281,6 +289,7 @@ impl App {
             rename_chat_id: None,
             rename_input: String::new(),
             history_path,
+            history_loaded: false,
             show_emoji_picker: false,
             last_typing_time: None,
             typing_stopped: false,
@@ -385,7 +394,10 @@ impl App {
 
         tokio::spawn(async move {
             let mut mgr = manager.lock().await;
-            if let Err(e) = mgr.connect_to_host(&host, port, existing_chat, privkey).await {
+            if let Err(e) = mgr
+                .connect_to_host(&host, port, existing_chat, privkey)
+                .await
+            {
                 mgr.add_toast(
                     crate::types::ToastLevel::Error,
                     format!("Failed to connect: {}", e),
