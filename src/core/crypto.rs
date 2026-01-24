@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
@@ -182,9 +182,13 @@ impl AesCipher {
             session_id,
         })
     }
-    /// Encrypt plaintext, returns nonce(12) || ciphertext || tag(16)
+    /// Encrypt plaintext with optional AAD, returns nonce(12) || ciphertext || tag(16)
     /// Uses counter-based nonce: session_id(4) || counter(8) for guaranteed uniqueness
-    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+    ///
+    /// # Arguments
+    /// * `plaintext` - Data to encrypt
+    /// * `aad` - Optional Additional Authenticated Data (binds authenticity context)
+    pub fn encrypt(&self, plaintext: &[u8], aad: Option<&[u8]>) -> Vec<u8> {
         // Get next counter value atomically
         let counter = self
             .nonce_counter
@@ -197,9 +201,22 @@ impl AesCipher {
 
         let nonce = Nonce::from(nonce_bytes);
 
+        // Use aead::Payload to handle AAD
+        let payload = if let Some(aad_bytes) = aad {
+            Payload {
+                msg: plaintext,
+                aad: aad_bytes,
+            }
+        } else {
+            Payload {
+                msg: plaintext,
+                aad: b"",
+            }
+        };
+
         let ciphertext = self
             .cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(&nonce, payload)
             .expect("AES-GCM encryption should not fail");
 
         // Format: nonce || ciphertext (includes tag)
@@ -209,8 +226,12 @@ impl AesCipher {
         output
     }
 
-    /// Decrypt payload: nonce(12) || ciphertext || tag(16)
-    pub fn decrypt(&self, payload: &[u8]) -> Option<Vec<u8>> {
+    /// Decrypt payload with optional AAD: nonce(12) || ciphertext || tag(16)
+    ///
+    /// # Arguments
+    /// * `payload` - Encrypted data in format nonce || ciphertext
+    /// * `aad` - Optional Additional Authenticated Data (must match encryption AAD)
+    pub fn decrypt(&self, payload: &[u8], aad: Option<&[u8]>) -> Option<Vec<u8>> {
         if payload.len() < 12 + 16 {
             return None; // Too small
         }
@@ -224,7 +245,20 @@ impl AesCipher {
 
         let nonce = Nonce::from(nonce_arr);
 
-        self.cipher.decrypt(&nonce, ciphertext).ok()
+        // Use aead::Payload to handle AAD
+        let aead_payload = if let Some(aad_bytes) = aad {
+            Payload {
+                msg: ciphertext,
+                aad: aad_bytes,
+            }
+        } else {
+            Payload {
+                msg: ciphertext,
+                aad: b"",
+            }
+        };
+
+        self.cipher.decrypt(&nonce, aead_payload).ok()
     }
 }
 
@@ -239,10 +273,56 @@ mod tests {
         let cipher = AesCipher::new(&key).unwrap();
 
         let plaintext = b"Hello, secure world!";
-        let encrypted = cipher.encrypt(plaintext);
-        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        let encrypted = cipher.encrypt(plaintext, None);
+        let decrypted = cipher.decrypt(&encrypted, None).unwrap();
 
         assert_eq!(plaintext, &decrypted[..]);
+    }
+
+    #[test]
+    fn test_aes_roundtrip_with_aad() {
+        let key: [u8; 32] = rand::thread_rng().gen();
+        let cipher = AesCipher::new(&key).unwrap();
+
+        let plaintext = b"Hello with AAD";
+        let aad = b"additional_context";
+        let encrypted = cipher.encrypt(plaintext, Some(aad));
+        let decrypted = cipher.decrypt(&encrypted, Some(aad)).unwrap();
+
+        assert_eq!(plaintext, &decrypted[..]);
+    }
+
+    #[test]
+    fn test_aes_aad_mismatch_fails() {
+        let key: [u8; 32] = rand::thread_rng().gen();
+        let cipher = AesCipher::new(&key).unwrap();
+
+        let plaintext = b"Secret message";
+        let aad = b"original_context";
+        let encrypted = cipher.encrypt(plaintext, Some(aad));
+
+        // Try to decrypt with different AAD
+        let wrong_aad = b"wrong_context";
+        let result = cipher.decrypt(&encrypted, Some(wrong_aad));
+
+        // Should fail due to AAD mismatch
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_aes_aad_stripped_fails() {
+        let key: [u8; 32] = rand::thread_rng().gen();
+        let cipher = AesCipher::new(&key).unwrap();
+
+        let plaintext = b"Secret message";
+        let aad = b"required_context";
+        let encrypted = cipher.encrypt(plaintext, Some(aad));
+
+        // Try to decrypt without AAD when it was used
+        let result = cipher.decrypt(&encrypted, None);
+
+        // Should fail because AAD is not provided
+        assert!(result.is_none());
     }
 
     #[test]
@@ -251,15 +331,15 @@ mod tests {
         let cipher = AesCipher::new(&key).unwrap();
 
         let plaintext = b"Same message";
-        let enc1 = cipher.encrypt(plaintext);
-        let enc2 = cipher.encrypt(plaintext);
+        let enc1 = cipher.encrypt(plaintext, None);
+        let enc2 = cipher.encrypt(plaintext, None);
 
         // Ciphertexts should be different due to random nonces
         assert_ne!(enc1, enc2);
 
         // But both should decrypt correctly
-        assert_eq!(cipher.decrypt(&enc1).unwrap(), plaintext);
-        assert_eq!(cipher.decrypt(&enc2).unwrap(), plaintext);
+        assert_eq!(cipher.decrypt(&enc1, None).unwrap(), plaintext);
+        assert_eq!(cipher.decrypt(&enc2, None).unwrap(), plaintext);
     }
 
     #[test]
@@ -267,12 +347,12 @@ mod tests {
         let key: [u8; 32] = rand::thread_rng().gen();
         let cipher = AesCipher::new(&key).unwrap();
 
-        let mut encrypted = cipher.encrypt(b"Test");
+        let mut encrypted = cipher.encrypt(b"Test", None);
         if encrypted.len() > 20 {
             encrypted[20] ^= 1; // Tamper with ciphertext
         }
 
-        assert!(cipher.decrypt(&encrypted).is_none());
+        assert!(cipher.decrypt(&encrypted, None).is_none());
     }
 
     #[test]
@@ -409,8 +489,8 @@ mod tests {
         let bob_cipher = AesCipher::new(&bob_key).unwrap();
 
         let plaintext = b"Forward secrecy test message";
-        let encrypted = alice_cipher.encrypt(plaintext);
-        let decrypted = bob_cipher.decrypt(&encrypted).unwrap();
+        let encrypted = alice_cipher.encrypt(plaintext, None);
+        let decrypted = bob_cipher.decrypt(&encrypted, None).unwrap();
 
         assert_eq!(plaintext, &decrypted[..]);
     }

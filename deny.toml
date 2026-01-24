@@ -1,0 +1,24 @@
+[advisories]
+vulnerability = "deny"
+unmaintained = "deny"
+unsound = "deny"
+notice = "warn"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"]
+deny = ["GPL-3.0", "AGPL-3.0"]
+copyleft = "warn"
+allow-osi-fsf-free = true
+default = "deny"
+
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+# Deny wildcard versions
+wildcards = "warn"
+# Deny crates with security vulnerabilities
+skip-tree = []
+
+[sources]
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

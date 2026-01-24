@@ -120,6 +120,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_framing_recv_reject_oversized_header() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        // Send a packet header claiming oversized payload
+        let oversized_len = (MAX_PACKET_SIZE as u32 + 1).to_be_bytes();
+
+        tokio::spawn(async move {
+            client.write_all(&oversized_len).await.ok();
+            // Don't send the actual data—recv should fail immediately
+        });
+
+        let result = recv_packet(&mut server).await;
+        assert!(
+            result.is_err(),
+            "recv_packet should reject oversized header"
+        );
+    }
+
+    #[tokio::test]
     async fn test_framing_multiple_packets() {
         let (mut client, mut server) = tokio::io::duplex(4096);
 

@@ -180,13 +180,14 @@ pub async fn run_host_session(
 
     // Serialize & Encrypt Proof
     let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+    // TODO: Use transcript hash as AAD to bind handshake to encrypted proof
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
     send_packet(&mut stream, &encrypted_proof).await?;
 
     // 10. Receive Client's Identity Proof (Encrypted)
     let encrypted_client_proof = recv_packet_with_timeout(&mut stream).await?;
     let client_proof_bytes = cipher
-        .decrypt(&encrypted_client_proof)
+        .decrypt(&encrypted_client_proof, None)
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
     let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
 
@@ -336,7 +337,7 @@ pub async fn run_client_session(
     // 8. Receive Host Identity Proof (Encrypted)
     let encrypted_host_proof = recv_packet_with_timeout(&mut stream).await?;
     let host_proof_bytes = cipher
-        .decrypt(&encrypted_host_proof)
+        .decrypt(&encrypted_host_proof, None)
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
     let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
 
@@ -377,7 +378,7 @@ pub async fn run_client_session(
 
     // Serialize & Encrypt Proof
     let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
     send_packet(&mut stream, &encrypted_proof).await?;
 
     // 11. Display Fingerprint & Wait for Confirmation
@@ -443,7 +444,7 @@ where
                     Ok(Ok(encrypted)) => {
                         tracing::trace!("Received {} bytes encrypted", encrypted.len());
 
-                        if let Some(plaintext) = cipher.decrypt(&encrypted) {
+                        if let Some(plaintext) = cipher.decrypt(&encrypted, None) {
                             tracing::trace!("Decrypted {} bytes", plaintext.len());
 
                             if let Some(msg) = ProtocolMessage::from_plain_bytes(&plaintext) {
@@ -485,7 +486,8 @@ where
                 let plaintext = msg.to_plain_bytes();
                 tracing::trace!("Plaintext {} bytes", plaintext.len());
 
-                let encrypted = cipher.encrypt(&plaintext);
+                // TODO: Bind AAD to include chat_id or message sequence
+                let encrypted = cipher.encrypt(&plaintext, None);
                 tracing::trace!("Encrypted to {} bytes", encrypted.len());
 
                 if let Err(e) = send_packet(&mut stream, &encrypted).await {
@@ -565,13 +567,13 @@ mod tests {
                 chat_id: uuid::Uuid::new_v4(),
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
-            let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+            let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
             send_packet(&mut host_stream, &encrypted_proof).await?;
 
             // 5. Recv Client Identity Proof (Encrypted)
             let encrypted_client_proof = recv_packet(&mut host_stream).await?;
             let client_proof_bytes = cipher
-                .decrypt(&encrypted_client_proof)
+                .decrypt(&encrypted_client_proof, None)
                 .expect("client proof decrypt should succeed");
             let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
             assert_eq!(client_proof.version, PROTOCOL_VERSION as u32);
@@ -612,7 +614,7 @@ mod tests {
             // 4. Recv Host Identity Proof (Encrypted)
             let encrypted_host_proof = recv_packet(&mut client_stream).await?;
             let host_proof_bytes = cipher
-                .decrypt(&encrypted_host_proof)
+                .decrypt(&encrypted_host_proof, None)
                 .expect("host proof decrypt should succeed");
             let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
             assert_eq!(host_proof.version, PROTOCOL_VERSION as u32);
@@ -632,7 +634,7 @@ mod tests {
                 chat_id: uuid::Uuid::new_v4(),
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
-            let encrypted_proof = cipher.encrypt(&my_proof_bytes);
+            let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
             send_packet(&mut client_stream, &encrypted_proof).await?;
 
             Ok(client_aes_key)

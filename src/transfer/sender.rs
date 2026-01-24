@@ -82,7 +82,8 @@ where
     S: AsyncWrite + Unpin,
 {
     let plaintext = msg.to_plain_bytes();
-    let encrypted = cipher.encrypt(&plaintext);
+    // TODO: Bind AAD to include chat_id or message sequence for stronger authenticity
+    let encrypted = cipher.encrypt(&plaintext, None);
     send_packet(stream, &encrypted).await?;
     Ok(())
 }
@@ -117,7 +118,7 @@ mod tests {
 
         // Verify FileMeta received
         let encrypted = recv_packet(&mut server).await.unwrap();
-        let plaintext = cipher.decrypt(&encrypted).unwrap();
+        let plaintext = cipher.decrypt(&encrypted, None).unwrap();
         let msg = ProtocolMessage::from_plain_bytes(&plaintext).unwrap();
 
         match msg {

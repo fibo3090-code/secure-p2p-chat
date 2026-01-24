@@ -1,0 +1,65 @@
+# GitHub Issues Created — Quick Reference
+
+All issues are now live on: https://github.com/fibo3090-code/secure-p2p-chat
+
+## Issues by Type
+
+### 🔐 Cryptography (Issues #1, #5)
+- **#1 [CRITICAL]**: Add AAD to AES-GCM (4h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/1
+- **#5 [HIGH]**: Harden/migrate signatures: Ed25519 or RSA-PSS (3–10h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/5
+
+### 🛡️ Protocol & Security (Issues #2, #6, #7)
+- **#2 [CRITICAL]**: Add payload size validation DoS prevention (45 min) — https://github.com/fibo3090-code/secure-p2p-chat/issues/2
+- **#6 [HIGH]**: Replay protection & rekey policy (4–5h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/6
+- **#7 [HIGH]**: Harden invite links: sign + URL-safe base64 (1–4h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/7
+
+### 📚 Documentation & Transparency (Issues #4, #9)
+- **#4 [CRITICAL]**: Create THREAT_MODEL.md + expand SECURITY.md (2h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/4
+- **#9 [MEDIUM]**: Add CONTRIBUTING.md, CODE_OF_CONDUCT.md, signed releases (2–2.5h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/9
+
+### 🔧 Infrastructure & CI (Issue #3)
+- **#3 [CRITICAL]**: Set up GitHub Actions CI (1h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/3
+
+### 🧪 Testing & Quality (Issues #8, #10)
+- **#8 [MEDIUM]**: Add unit/integration tests & fuzzing (9–12h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/8
+- **#10 [MEDIUM]**: Typed errors & structured logging (4–7h) — https://github.com/fibo3090-code/secure-p2p-chat/issues/10
+
+---
+
+## Work Prioritization Matrix
+
+```
+CRITICAL (This Week)          HIGH (Weeks 1–2)            MEDIUM (Weeks 4+)
+├─ #1 AAD in AEAD (4h)       ├─ #5 Signatures (3–10h)    ├─ #8 Tests (9–12h)
+├─ #2 DoS validation (45m)   ├─ #6 Replay protect (4–5h) ├─ #9 Community docs (2–2.5h)
+├─ #3 CI setup (1h)          └─ #7 Invite hardening (1–4h)└─ #10 Logging (4–7h)
+└─ #4 Threat model (2h)
+
+Total: ~7.75h               Total: ~12–19h              Total: ~15–21.5h
+```
+
+---
+
+## Next Steps (Choose One)
+
+1. **Assign issues** to team members or start with #3 (CI) as foundational
+2. **Review issue details** in GitHub UI for full acceptance criteria
+3. **Ask clarifying questions** by commenting on specific issues
+4. **Track progress** using GitHub Projects or milestone features
+
+---
+
+## Key Decisions to Make
+
+You'll need to decide on these issues:
+
+- **#5**: Option A (Ed25519, 8–10h, recommended) or Option B (RSA-PSS, 3–4h, interim)?
+- **#7**: Option A (Signed invites, 3–4h, recommended) or Option B (Checksum, 1h, simpler)?
+
+These decisions affect implementation scope. Discuss with team and comment on issues to lock in decisions.
+
+---
+
+**Created**: 2026-01-24  
+**Repository**: https://github.com/fibo3090-code/secure-p2p-chat  
+**Roadmap Doc**: [SECURITY_ROADMAP.md](SECURITY_ROADMAP.md)
