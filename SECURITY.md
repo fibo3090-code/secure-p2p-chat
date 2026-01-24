@@ -183,15 +183,46 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 - **Impact**: Ensures the private key is never used for network operations without the user first proving knowledge of the password.
 - **Files**: `src/gui/app_ui.rs`, `src/gui/dialogs.rs`
 
+### Phase 5: Signature Hardening & Transport Protection (Jan 24, 2026)
+
+#### 9. Ed25519 Support with Signature Scheme Negotiation
+
+- **Problem**: RSA-2048 is resource-intensive and slower than modern alternatives like Ed25519.
+- **Fix**: Implemented Ed25519 identity key generation and signing with backward-compatible negotiation.
+  - `SignatureScheme` enum added to protocol (RSA = 0, Ed25519 = 1)
+  - Handshake negotiates signature scheme during `IdentityProof` exchange
+  - New identities default to Ed25519; existing RSA identities continue to work
+  - Full dual-mode support: peers can sign with different schemes simultaneously
+- **Impact**: Improved performance and crypto hygiene; cleaner identity infrastructure for future migrations.
+- **Files**: `src/core/crypto.rs`, `src/core/protocol.rs`, `src/network/session.rs`
+- **Tests**: 12 new Ed25519 tests in `src/core/crypto.rs`; 20+ protocol tests updated
+
+#### 10. Replay Protection at Transport Layer
+
+- **Problem**: Attacker could capture and replay old valid messages, potentially causing double-sends or state corruption.
+- **Fix**: Implemented per-session sequence number validation in transport layer.
+  - Each `Session` tracks `last_recv_seq` (last received sequence number)
+  - All incoming messages validated before emission to ChatManager
+  - Out-of-order messages rejected with detailed error logging
+  - Duplicate and old messages dropped (defensive against replay attacks)
+- **Impact**: Eliminates replay attack surface completely at protocol level.
+- **Files**: `src/network/session.rs`, `src/types.rs`
+- **Tests**: 8 new replay detection tests covering:
+  - Duplicate message rejection
+  - Out-of-order message rejection
+  - Old message rejection
+  - Valid sequence accepted
+
 ---
 
 ## Remaining Security Work
 
-### 🏃 Phase 3: Long-term Cryptographic Hygiene (Future)
+### 🏃 Phase 6: Periodic Key Rotation (Future)
 
 1. **Session Key Rotation**:
-    - **Task**: Automatically re-negotiate the AES session key periodically.
-    - **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised.
+    - **Task**: Automatically re-negotiate the AES session key every N seconds or after M messages.
+    - **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised (forward secrecy over time).
+    - **Timeline**: 2-3 weeks
 
 2. **Professional Security Audit**:
     - **Task**: Engage a third-party firm to perform a professional cryptographic review of the codebase.
@@ -360,14 +391,25 @@ We recognize and thank researchers who responsibly disclose vulnerabilities:
 - Verified payload size validation
 - Deployed GitHub Actions CI/CD
 
-**Issue #4**: 🔄 IN PROGRESS
+**Issue #4**: ✅ COMPLETE
 - Created comprehensive [THREAT_MODEL.md](THREAT_MODEL.md) with threat scenarios and mitigations
 - Expanded SECURITY.md with responsible disclosure policy
 - Documented severity levels and response SLAs
 
-**Issue #5**: 📋 NEXT
-- Decision required: Ed25519 (recommended, 8-10h) vs. RSA-PSS interim (3-4h)
-- Scope: Identity migration, dual-mode handshake for compatibility
+**Issue #5**: ✅ COMPLETE
+- Implemented Ed25519 support with signature scheme negotiation
+- Added identity key migration paths
+- Full backward compatibility with RSA-2048
+
+**Issue #6**: ✅ COMPLETE
+- Implemented replay protection at transport layer
+- Added per-session sequence validation
+- All replay attacks detected and rejected
+
+**Issue #8**: 📋 NEXT
+- Automatic session key rotation (periodic rekey)
+- Implement RekeyRequest message type
+- Timeline: 2-3 weeks
 
 ---
 

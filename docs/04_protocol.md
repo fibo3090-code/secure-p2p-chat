@@ -20,10 +20,13 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 
 The protocol relies on a combination of cryptographic primitives to ensure confidentiality, integrity, and authenticity.
 
-- **RSA**: 2048-bit RSA with OAEP padding and SHA-256 (RSA-OAEP-SHA256) is used for Identity Proofs (signatures) during the handshake.
+- **RSA**: 2048-bit RSA with OAEP padding and SHA-256 (RSA-OAEP-SHA256) is used for Identity Proofs (signatures) during the handshake. RSA support is maintained for backward compatibility.
+- **Ed25519**: Edwards-curve Digital Signature Algorithm (Ed25519) is supported as a modern alternative to RSA-2048. New identities default to Ed25519.
+- **Signature Scheme Negotiation**: The `IdentityProof` message includes the `SignatureScheme` (RSA = 0, Ed25519 = 1) to allow peers to support multiple signature algorithms simultaneously.
 - **AES**: AES-256-GCM is used for symmetric encryption of all messages after the handshake is complete.
 - **Nonce**: A 12-byte (96-bit) nonce is used. It is **counter-based** (4 bytes random session ID + 8 bytes counter) to guarantee uniqueness and prevent replay attacks within the session.
-- **Fingerprint**: The fingerprint of a user's public key is the SHA-256 hash of the PEM-encoded key, represented as a lowercase hexadecimal string.
+- **Sequence Numbers**: All messages include a sequence number (`seq`) for replay detection at the transport layer.
+- **Fingerprint**: The fingerprint of a user's public key is the SHA-256 hash of the PEM-encoded key (RSA) or the raw public key bytes (Ed25519), represented as a lowercase hexadecimal string.
 - **Transport Format (Encrypted)**: Encrypted messages are sent over the wire in the following format: `nonce(12) || ciphertext || tag(16)`.
 
 ## 4.3. Network Protocol
@@ -50,13 +53,28 @@ The handshake uses an **ECDH-first** approach (Protocol v3) to ensure forward se
 4. **Encrypted Identity Exchange**:
    - Peers exchange `IdentityProof` messages inside the encrypted tunnel.
    - `IdentityProof` contains:
-     - `public_key_pem`: RSA Identity Key.
-     - `signature`: `RSA_Sign(SHA256("IDENTITY_PROOF" || MyEphemeralPub))`
+     - `signature_scheme`: Negotiated scheme (0 = RSA, 1 = Ed25519)
+     - `public_key_pem`: Identity Key (RSA or Ed25519 in PEM format)
+     - `signature`: Signature of the session's Ephemeral Key
+       - RSA: `RSA_Sign(SHA256("IDENTITY_PROOF" || MyEphemeralPub))`
+       - Ed25519: `Ed25519_Sign("IDENTITY_PROOF" || MyEphemeralPub)`
    - The signature binds the ephemeral key to the long-term identity, preventing MITM.
 5. **Fingerprint Verification**:
-   - The received RSA key fingerprint is checked against trusted contacts.
+   - The received identity key fingerprint is checked against trusted contacts.
+   - RSA fingerprint: SHA-256 of PEM-encoded key
+   - Ed25519 fingerprint: SHA-256 of raw public key bytes
 
-## 4.4. Message Format
+## 4.4. Replay Protection
+
+All messages include a **sequence number** (`seq: u64`) assigned by the sender. The transport layer maintains per-session state:
+
+- **Sender**: Increments `seq` with each message (starting from 1)
+- **Receiver**: Tracks `last_recv_seq` and rejects any message with `seq <= last_recv_seq`
+- **Effect**: Out-of-order, duplicate, and old messages are rejected before emission to the application
+
+This provides defense-in-depth against replay attacks at the protocol level, complementing nonce-based replay detection in the encryption layer.
+
+## 4.5. Message Format
 
 All application messages are of the `ProtocolMessage` enum type, serialized using `bincode`.
 
@@ -89,9 +107,7 @@ pub enum ProtocolMessage {
     TypingStart { seq: u64 },
     TypingStop { seq: u64 },
 }
-```
-
-## 4.5. Invite Links
+## 4.6. Invite Links
 
 Invite links are base64-encoded JSON objects:
 

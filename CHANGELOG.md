@@ -6,19 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### 🔐 Security
 
-- **Issue #5 (Pending)**: Signature scheme hardening - planned Ed25519 migration from RSA-2048
-- **Issue #6 (Pending)**: Replay protection and session key rotation policy
 - **Issue #7 (Pending)**: Hardened invite links and token-based sharing
-
-### 🐛 Bug Fixes & Polish
-
-- Windows Add/Remove Programs icon: `UninstallDisplayIcon` in `setup.iss` now points to `encodeur_rsa_icon.ico`
-- Toast messaging improvements for consistent English in-app strings
+- **Issue #8 (Pending)**: Automatic session key rotation (periodic rekey)
 
 ### 📚 Documentation
 
-- Merged overlapping documentation files for cleaner structure
-- Added comprehensive security roadmap
+- Updated SECURITY.md with Phase 5 completions (Ed25519, replay protection)
+
+---
+
+## [1.7.3] - 2026-01-24
+
+### 🔐 Security Enhancements
+
+- **Issue #5 (Complete)**: Signature scheme hardening - Added Ed25519 support with negotiation
+  - Implemented Ed25519 identity key generation and signing
+  - Added `SignatureScheme` negotiation during handshake
+  - Backward compatible with RSA-2048; new identities default to Ed25519
+  - 12 new crypto tests for Ed25519 functionality
+
+- **Issue #6 (Complete)**: Replay protection and transport-layer validation
+  - Implemented sequence number tracking in transport layer (per-session)
+  - All incoming messages validated against last received sequence
+  - Out-of-order, duplicate, and old messages rejected before emission
+  - 8 new replay detection tests covering all attack vectors
 
 ---
 
