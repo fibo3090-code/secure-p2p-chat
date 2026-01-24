@@ -6,12 +6,32 @@ All notable changes to this project will be documented in this file.
 
 ### 🔐 Security
 
-- **Issue #7 (Pending)**: Hardened invite links and token-based sharing
+- **Issue #7 (Complete)**: Hardened invite links with RSA-PSS signatures
+  - Implemented v2 signed invite format with RSA-PSS-SHA256 signatures
+  - Each v2 invite includes payload (name, address, fingerprint, public_key, timestamp, nonce, version)
+  - Signature verification prevents any tampering with invite data
+  - Fingerprint swap attacks are cryptographically prevented
+  - URL-safe base64 encoding (RFC 4648) for safe URL transmission
+  - Backward compatible: v1 unsigned invites still parse with deprecation warning
+  - 11 new comprehensive tests for v2 invite generation, verification, and tampering detection
+  - Added `rsa_sign_pss()` and `rsa_verify_pss()` cryptographic functions to crypto module
+  - Updated `docs/04_protocol.md` with v2 invite format specification and verification process
+  - Updated `SECURITY.md` with Phase 11 (Hardened Invite Links) details
+
 - **Issue #8 (Pending)**: Automatic session key rotation (periodic rekey)
 
 ### 📚 Documentation
 
-- Updated SECURITY.md with Phase 5 completions (Ed25519, replay protection)
+- Updated `docs/04_protocol.md` with Section 4.6: Invite Links (v1 and v2 formats)
+  - Documented v1 legacy format (deprecated)
+  - Documented v2 signed format with RSA-PSS signature
+  - Added signature verification process (5-step algorithm)
+  - Added implementation notes for URL-safe base64, nonce uniqueness, timestamp handling
+
+- Updated `SECURITY.md` with Phase 11: Hardened Invite Links with RSA-PSS Signatures
+  - Security problem statement and impact analysis
+  - Complete fix description with files and test coverage
+  - Security guarantees: authenticity, integrity, uniqueness, non-repudiation
 
 ---
 

@@ -1381,6 +1381,9 @@ impl ChatManager {
     }
 
     /// Parse an invite link and create a Contact
+    /// Supports both v1 (unsigned) and v2 (signed) formats
+    /// v1: chat-p2p://invite/<base64_json>
+    /// v2: chat-p2p://invite/v2/<url_safe_base64_json>
     pub fn parse_invite_link(&self, link: &str) -> Result<Contact> {
         use serde::{Deserialize, Serialize};
 
@@ -1392,66 +1395,184 @@ impl ChatManager {
             public_key: String,
         }
 
+        #[derive(Serialize, Deserialize)]
+        struct SignedInvitePayload {
+            version: u32,
+            timestamp: u64,
+            nonce: String,
+            name: String,
+            address: Option<String>,
+            fingerprint: String,
+            public_key: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct SignedInvite {
+            payload: SignedInvitePayload,
+            signature: Vec<u8>,
+        }
+
         tracing::debug!("Parsing invite link");
-        // Remove prefix if present
-        let encoded = link.strip_prefix("chat-p2p://invite/").unwrap_or(link);
 
-        // Decode base64
-        use base64::Engine;
-        let json = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| {
-                tracing::warn!(error = %e, "Invalid invite link during base64 decode");
-                anyhow::anyhow!("Invalid invite link: {}", e)
+        // Check if this is a v2 (signed) or v1 (unsigned) invite
+        if link.contains("/v2/") {
+            // V2: Signed invite with RSA-PSS signature
+            let encoded = link
+                .strip_prefix("chat-p2p://invite/v2/")
+                .ok_or_else(|| anyhow::anyhow!("Invalid v2 invite link format"))?;
+
+            // Decode URL-safe base64
+            use base64::Engine;
+            let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Invalid v2 invite link during base64 decode");
+                    anyhow::anyhow!("Invalid v2 invite link: {}", e)
+                })?;
+            let json_str = String::from_utf8(json).map_err(|e| {
+                tracing::warn!(error = %e, "Invalid UTF-8 in v2 invite link");
+                anyhow::anyhow!("Invalid UTF-8 in v2 invite link: {}", e)
             })?;
-        let json_str = String::from_utf8(json).map_err(|e| {
-            tracing::warn!(error = %e, "Invalid UTF-8 in invite link");
-            anyhow::anyhow!("Invalid UTF-8 in invite link: {}", e)
-        })?;
 
-        // Parse JSON
-        let payload: InvitePayload = serde_json::from_str(&json_str).map_err(|e| {
-            tracing::warn!(error = %e, "Invalid invite data JSON");
-            anyhow::anyhow!("Invalid invite data: {}", e)
-        })?;
+            // Parse signed invite structure
+            let signed_invite: SignedInvite = serde_json::from_str(&json_str).map_err(|e| {
+                tracing::warn!(error = %e, "Invalid v2 invite data JSON");
+                anyhow::anyhow!("Invalid v2 invite data: {}", e)
+            })?;
 
-        // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
-        let address = payload.address.and_then(|addr| {
-            let trimmed = addr.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
-                None
-            } else {
-                // Basic validation: should contain a colon and a numeric port
-                if let Some(idx) = trimmed.rfind(':') {
-                    let (host, port_str) = trimmed.split_at(idx);
-                    let port_str = &port_str[1..]; // skip ':'
-                    if host.is_empty() || port_str.parse::<u16>().is_err() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                } else {
-                    // no port provided, treat as invalid for now
+            // Serialize payload back to JSON for signature verification
+            let payload_json = serde_json::to_string(&signed_invite.payload).map_err(|e| {
+                tracing::warn!(error = %e, "Failed to serialize payload for verification");
+                anyhow::anyhow!("Serialization error: {}", e)
+            })?;
+
+            // Verify RSA-PSS signature using the public key from the invite
+            let pubkey_pem = &signed_invite.payload.public_key;
+            let pubkey = crate::core::crypto::pem_decode_public(pubkey_pem).map_err(|e| {
+                tracing::warn!(error = %e, "Failed to decode public key from invite");
+                anyhow::anyhow!("Invalid public key in invite: {}", e)
+            })?;
+
+            crate::core::crypto::rsa_verify_pss(
+                &pubkey,
+                payload_json.as_bytes(),
+                &signed_invite.signature,
+            )
+            .map_err(|e| {
+                tracing::warn!(error = %e, "v2 invite signature verification failed");
+                anyhow::anyhow!("Invite signature verification failed: {}", e)
+            })?;
+
+            tracing::debug!(
+                timestamp = signed_invite.payload.timestamp,
+                "Successfully verified v2 signed invite"
+            );
+
+            let payload = &signed_invite.payload;
+
+            // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
+            let address = payload.address.as_ref().and_then(|addr| {
+                let trimmed = addr.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
                     None
+                } else {
+                    // Basic validation: should contain a colon and a numeric port
+                    if let Some(idx) = trimmed.rfind(':') {
+                        let (host, port_str) = trimmed.split_at(idx);
+                        let port_str = &port_str[1..]; // skip ':'
+                        if host.is_empty() || port_str.parse::<u16>().is_err() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    } else {
+                        // no port provided, treat as invalid for now
+                        None
+                    }
                 }
-            }
-        });
+            });
 
-        // Create contact
-        let contact = Contact {
-            id: Uuid::new_v4(),
-            name: payload.name,
-            address,
-            fingerprint: Some(payload.fingerprint),
-            public_key: Some(payload.public_key),
-            created_at: chrono::Utc::now(),
-            trust_state: TrustState::Unverified,
-            notes: String::new(),
-            tags: Vec::new(),
-            last_seen: None,
-        };
+            // Create contact from v2 invite
+            let contact = Contact {
+                id: Uuid::new_v4(),
+                name: payload.name.clone(),
+                address,
+                fingerprint: Some(payload.fingerprint.clone()),
+                public_key: Some(payload.public_key.clone()),
+                created_at: chrono::Utc::now(),
+                trust_state: TrustState::Unverified,
+                notes: String::new(),
+                tags: Vec::new(),
+                last_seen: None,
+            };
 
-        Ok(contact)
+            Ok(contact)
+        } else {
+            // V1: Legacy unsigned invite
+            tracing::warn!(
+                "Parsing legacy v1 unsigned invite link - prefer v2 signed format for security"
+            );
+
+            // Remove prefix if present
+            let encoded = link.strip_prefix("chat-p2p://invite/").unwrap_or(link);
+
+            // Decode base64
+            use base64::Engine;
+            let json = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Invalid invite link during base64 decode");
+                    anyhow::anyhow!("Invalid invite link: {}", e)
+                })?;
+            let json_str = String::from_utf8(json).map_err(|e| {
+                tracing::warn!(error = %e, "Invalid UTF-8 in invite link");
+                anyhow::anyhow!("Invalid UTF-8 in invite link: {}", e)
+            })?;
+
+            // Parse JSON
+            let payload: InvitePayload = serde_json::from_str(&json_str).map_err(|e| {
+                tracing::warn!(error = %e, "Invalid invite data JSON");
+                anyhow::anyhow!("Invalid invite data: {}", e)
+            })?;
+
+            // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
+            let address = payload.address.as_ref().and_then(|addr| {
+                let trimmed = addr.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
+                    None
+                } else {
+                    // Basic validation: should contain a colon and a numeric port
+                    if let Some(idx) = trimmed.rfind(':') {
+                        let (host, port_str) = trimmed.split_at(idx);
+                        let port_str = &port_str[1..]; // skip ':'
+                        if host.is_empty() || port_str.parse::<u16>().is_err() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    } else {
+                        // no port provided, treat as invalid for now
+                        None
+                    }
+                }
+            });
+
+            // Create contact
+            let contact = Contact {
+                id: Uuid::new_v4(),
+                name: payload.name,
+                address,
+                fingerprint: Some(payload.fingerprint),
+                public_key: Some(payload.public_key),
+                created_at: chrono::Utc::now(),
+                trust_state: TrustState::Unverified,
+                notes: String::new(),
+                tags: Vec::new(),
+                last_seen: None,
+            };
+
+            Ok(contact)
+        }
     }
 
     /// Generate a QR code for an invite link (as PNG bytes)
@@ -1733,6 +1854,189 @@ mod tests {
         assert!(
             !config.enable_mdns,
             "enable_mdns MUST default to false for privacy (LAN fingerprint disclosure risk)"
+        );
+    }
+
+    // ============================================================================
+    // Signed Invite Link (v2) Parsing Tests
+    // ============================================================================
+
+    #[test]
+    fn parse_v2_signed_invite_link_valid() {
+        use crate::identity::Identity;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("Test Signer".to_string()).unwrap();
+
+        // Generate a v2 signed invite
+        let link = identity
+            .generate_signed_invite_link(Some("127.0.0.1:9001".to_string()))
+            .unwrap();
+
+        // Parse it
+        let contact = mgr
+            .parse_invite_link(&link)
+            .expect("should parse v2 signed invite");
+
+        // Verify contact fields
+        assert_eq!(contact.name, "Test Signer");
+        assert_eq!(contact.address, Some("127.0.0.1:9001".to_string()));
+        assert_eq!(contact.fingerprint, Some(identity.fingerprint.clone()));
+        assert_eq!(contact.public_key, Some(identity.public_key_pem.clone()));
+        assert_eq!(contact.trust_state, TrustState::Unverified);
+    }
+
+    #[test]
+    fn parse_v2_signed_invite_rejects_tampered_signature() {
+        use crate::identity::Identity;
+        use base64::Engine;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("Tamper Test".to_string()).unwrap();
+
+        // Generate a v2 signed invite
+        let link = identity.generate_signed_invite_link(None).unwrap();
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+
+        // Decode, tamper with signature, re-encode
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        let json_str = String::from_utf8(decoded).unwrap();
+
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct SignedInvite {
+            payload: serde_json::Value,
+            signature: Vec<u8>,
+        }
+
+        let mut invite: SignedInvite = serde_json::from_str(&json_str).unwrap();
+        // Flip a bit in the signature to tamper with it
+        if !invite.signature.is_empty() {
+            invite.signature[0] ^= 0xFF;
+        }
+
+        let tampered_json = serde_json::to_string(&invite).unwrap();
+        let tampered_encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tampered_json);
+        let tampered_link = format!("chat-p2p://invite/v2/{}", tampered_encoded);
+
+        // Parsing should fail due to signature verification
+        assert!(
+            mgr.parse_invite_link(&tampered_link).is_err(),
+            "should reject tampered signature"
+        );
+    }
+
+    #[test]
+    fn parse_v1_invite_link_still_works_with_warning() {
+        let mgr = ChatManager::default();
+
+        let payload = serde_json::json!({
+            "name": "Legacy User",
+            "address": "192.168.1.50:8001",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
+        });
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+        let link = format!("chat-p2p://invite/{}", encoded);
+
+        // Should still parse v1 unsigned invites (backward compatibility)
+        let contact = mgr
+            .parse_invite_link(&link)
+            .expect("should parse v1 invite");
+        assert_eq!(contact.name, "Legacy User");
+        assert_eq!(contact.address, Some("192.168.1.50:8001".to_string()));
+        assert_eq!(
+            contact.fingerprint,
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_v2_signed_invite_without_address() {
+        use crate::identity::Identity;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("No Address User".to_string()).unwrap();
+
+        // Generate a v2 signed invite without address
+        let link = identity.generate_signed_invite_link(None).unwrap();
+
+        // Parse it
+        let contact = mgr
+            .parse_invite_link(&link)
+            .expect("should parse v2 signed invite without address");
+
+        assert_eq!(contact.name, "No Address User");
+        assert_eq!(contact.address, None);
+        assert_eq!(contact.fingerprint, Some(identity.fingerprint.clone()));
+    }
+
+    #[test]
+    fn parse_v2_signed_invite_preserves_identity_fields() {
+        use crate::identity::Identity;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("Complete Info User".to_string()).unwrap();
+
+        // Generate with full info
+        let link = identity
+            .generate_signed_invite_link(Some("10.20.30.40:6500".to_string()))
+            .unwrap();
+
+        let contact = mgr
+            .parse_invite_link(&link)
+            .expect("should parse v2 signed invite");
+
+        // All fields should match the identity
+        assert_eq!(contact.name, "Complete Info User");
+        assert_eq!(contact.address, Some("10.20.30.40:6500".to_string()));
+        assert_eq!(contact.fingerprint, Some(identity.fingerprint.clone()));
+        assert_eq!(contact.public_key, Some(identity.public_key_pem.clone()));
+    }
+
+    #[test]
+    fn v2_invite_signature_verification_prevents_fingerprint_swap() {
+        use crate::identity::Identity;
+        use base64::Engine;
+
+        let mgr = ChatManager::default();
+        let identity1 = Identity::new_with_plaintext("User One".to_string()).unwrap();
+        let identity2 = Identity::new_with_plaintext("User Two".to_string()).unwrap();
+
+        // Generate invite from identity1
+        let link = identity1.generate_signed_invite_link(None).unwrap();
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+
+        // Decode and try to swap the fingerprint with identity2's
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        let json_str = String::from_utf8(decoded).unwrap();
+
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct SignedInvite {
+            payload: serde_json::Value,
+            signature: Vec<u8>,
+        }
+
+        let mut invite: SignedInvite = serde_json::from_str(&json_str).unwrap();
+
+        // Swap fingerprint (attack attempt)
+        invite.payload["fingerprint"] = serde_json::Value::String(identity2.fingerprint.clone());
+
+        let tampered_json = serde_json::to_string(&invite).unwrap();
+        let tampered_encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tampered_json);
+        let tampered_link = format!("chat-p2p://invite/v2/{}", tampered_encoded);
+
+        // Should reject because signature won't verify with modified payload
+        assert!(
+            mgr.parse_invite_link(&tampered_link).is_err(),
+            "should reject invite with swapped fingerprint"
         );
     }
 }

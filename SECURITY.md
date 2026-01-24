@@ -213,11 +213,43 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
   - Old message rejection
   - Valid sequence accepted
 
+#### 11. Hardened Invite Links with RSA-PSS Signatures (Issue #7, Jan 24, 2026)
+
+- **Problem**: V1 invite links (unsigned base64-encoded JSON) are vulnerable to tampering attacks. An attacker could intercept an invite link and modify the fingerprint, address, or public key without detection.
+- **Fix**: Implemented v2 signed invite format with RSA-PSS-SHA256 signatures.
+  - New function `Identity::generate_signed_invite_link()` creates v2 invites with:
+    - Deterministic JSON serialization of payload (version, timestamp, nonce, identity info)
+    - RSA-PSS-SHA256 signature over the payload
+    - URL-safe base64 encoding (RFC 4648) without padding
+    - Ephemeral nonce (Ed25519 key) for uniqueness per invite
+    - Timestamp field for future expiration support (currently unused, future work)
+  - Updated `ChatManager::parse_invite_link()` to support both v1 and v2:
+    - Automatically detects v2 format by `/v2/` URL prefix
+    - Verifies RSA-PSS signature before accepting v2 invites
+    - Falls back to v1 parsing with deprecation warning for backward compatibility
+    - Rejects any v2 invite with tampered signature or invalid public key
+  - Added `rsa_sign_pss()` and `rsa_verify_pss()` helper functions to crypto module
+- **Impact**: Prevents invite link tampering attacks. Users can safely share invites via untrusted channels without risk of fingerprint substitution or address modification.
+- **Files**: `src/identity/mod.rs`, `src/app/chat_manager.rs`, `src/core/crypto.rs`, `docs/04_protocol.md`
+- **Tests**: 11 new comprehensive tests covering:
+  - V2 signed invite generation
+  - V2 signature verification success
+  - V2 signature tampering detection and rejection
+  - Fingerprint/address swap attack prevention
+  - V1 backward compatibility with warning logs
+  - Timestamp and nonce uniqueness validation
+  - URL-safe base64 encoding verification
+- **Security Guarantees**:
+  - **Authenticity**: Only the identity holder can create valid invites (signature proves origin)
+  - **Integrity**: Any bit-level modification of the invite is detected and rejected
+  - **Uniqueness**: Each invite is unique (ephemeral nonce prevents exact replay)
+  - **Non-repudiation**: The sender cannot deny creating the invite (RSA signature)
+
 ---
 
 ## Remaining Security Work
 
-### 🏃 Phase 6: Periodic Key Rotation (Future)
+### 🏃 Phase 8: Periodic Key Rotation (Future)
 
 1. **Session Key Rotation**:
     - **Task**: Automatically re-negotiate the AES session key every N seconds or after M messages.
@@ -227,6 +259,15 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 2. **Professional Security Audit**:
     - **Task**: Engage a third-party firm to perform a professional cryptographic review of the codebase.
     - **Why**: Provides expert, unbiased validation of the application's security.
+
+### Phase 7 (Future): Invite Link Expiration & Revocation
+
+- **Task**: Add optional expiration timestamps to v2 invites and implement a revocation mechanism
+- **Current State**: Timestamp field is present in v2 invites but not yet validated
+- **Future Work**: 
+  - Reject invites older than 30 days by default
+  - Allow users to customize expiration (1 day, 1 week, 1 month, never)
+  - Add invite revocation list (for stolen invite links)
 
 ---
 

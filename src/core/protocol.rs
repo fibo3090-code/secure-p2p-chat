@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use super::SignatureScheme;
+use serde::{Deserialize, Serialize};
 
 /// Protocol version for forward compatibility
 ///

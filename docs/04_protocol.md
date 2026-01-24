@@ -109,13 +109,66 @@ pub enum ProtocolMessage {
 }
 ## 4.6. Invite Links
 
-Invite links are base64-encoded JSON objects:
+Invite links are used to share contact information securely. Two versions are supported:
+
+### V1 (Legacy, Unsigned)
+
+Format: `chat-p2p://invite/<base64_json>`
+
+V1 invites are unsigned base64-encoded JSON objects:
 
 ```json
 {
   "name": "Alice",
-  "address": "192.168.1.10:12345", // Optional
+  "address": "192.168.1.10:12345",
   "fingerprint": "a1b2c3d4e5f6...",
   "public_key": "-----BEGIN PUBLIC KEY-----\n..."
 }
 ```
+
+**Security Note**: V1 invites lack cryptographic integrity protection. An attacker could intercept and modify the invite link to swap fingerprints or addresses. V1 invites are deprecated and supported only for backward compatibility.
+
+### V2 (Signed with RSA-PSS)
+
+Format: `chat-p2p://invite/v2/<url_safe_base64_json>`
+
+V2 invites are cryptographically signed with RSA-PSS-SHA256 to prevent tampering. The structure is:
+
+```json
+{
+  "payload": {
+    "version": 2,
+    "timestamp": 1704067200,
+    "nonce": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+    "name": "Alice",
+    "address": "192.168.1.10:12345",
+    "fingerprint": "a1b2c3d4e5f6...",
+    "public_key": "-----BEGIN PUBLIC KEY-----\n..."
+  },
+  "signature": "<RSA-PSS signature bytes>"
+}
+```
+
+**Signature Verification Process**:
+
+1. Extract the `payload` and `signature` from the invite
+2. Serialize the payload back to JSON (deterministically) to recreate the signed message
+3. Extract the public key from `payload.public_key`
+4. Verify: `RSA_Verify_PSS(public_key, payload_json, signature)` with SHA-256
+5. If verification succeeds, accept the contact information as authentic
+6. If verification fails, reject the invite link as tampered
+
+**Security Benefits**:
+
+- **Integrity**: RSA-PSS signature prevents any tampering with the invite link
+- **Authenticity**: The signature is created with the identity's private key, proving the invite originated from the claimed sender
+- **Uniqueness**: Each invite includes an ephemeral nonce (one-time random Ed25519 key) for uniqueness
+- **Timestamp**: Invites include a timestamp field for future expiration support
+
+**Implementation Notes**:
+
+- V2 invites use **URL-safe base64** (RFC 4648 without padding) to avoid URL encoding/decoding issues
+- The `nonce` field contains a hex-encoded Ed25519 public key generated ephemeralally per invite
+- The timestamp is always in UTC seconds (UNIX epoch)
+- Invites are transport-layer unique via the nonce, with future versions adding expiration support
+

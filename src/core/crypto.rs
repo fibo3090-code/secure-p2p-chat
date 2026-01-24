@@ -5,16 +5,20 @@ use aes_gcm::{
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use ed25519_dalek::{Signature, SigningKey as Ed25519SigningKey, Signer, VerifyingKey as Ed25519VerifyingKey, Verifier};
+use ed25519_dalek::{
+    Signature, Signer, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey,
+};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use rsa::{
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey},
     pkcs8::{DecodePublicKey, EncodePublicKey},
+    pss::{SigningKey, VerifyingKey},
+    signature::{RandomizedSigner, SignatureEncoding},
     Oaep, RsaPrivateKey, RsaPublicKey,
 };
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
 use crate::AES_KEY_SIZE;
@@ -99,6 +103,67 @@ pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> String {
 }
 
 // ============================================================================
+// RSA-PSS Signing for Invite Links and Other Integrity-Protected Data
+// ============================================================================
+
+/// Sign data using RSA-PSS with SHA-256
+///
+/// Uses randomized signing for each call (security best practice)
+///
+/// # Arguments
+/// * `privkey` - RSA private key
+/// * `data` - Data to sign
+///
+/// # Returns
+/// DER-encoded signature bytes
+pub fn rsa_sign_pss(privkey: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
+    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+    let mut rng = OsRng;
+
+    // Create SHA-256 digest of the data
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+
+    // Sign with randomized signing for enhanced security
+    let signature = signing_key
+        .sign_with_rng(&mut rng, &digest)
+        .to_bytes()
+        .to_vec();
+
+    Ok(signature)
+}
+
+/// Verify RSA-PSS signature with SHA-256
+///
+/// # Arguments
+/// * `pubkey` - RSA public key
+/// * `data` - Original data that was signed
+/// * `signature` - DER-encoded signature bytes
+///
+/// # Returns
+/// Ok(()) if signature is valid, Err if invalid
+pub fn rsa_verify_pss(pubkey: &RsaPublicKey, data: &[u8], signature: &[u8]) -> Result<()> {
+    use rsa::signature::Verifier as RsaVerifier;
+
+    let verifying_key = VerifyingKey::<Sha256>::new(pubkey.clone());
+
+    // Create SHA-256 digest of the data
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+
+    // Convert byte slice to RSA Signature type
+    let rsa_signature = rsa::pss::Signature::try_from(signature)
+        .map_err(|e| anyhow!("Failed to parse RSA signature: {}", e))?;
+
+    // Verify signature
+    verifying_key
+        .verify(&digest, &rsa_signature)
+        .map_err(|e| anyhow!("RSA-PSS signature verification failed: {}", e))
+}
+
+// ============================================================================
 // Ed25519 EDDSA Signatures for Modern Key Exchanges
 // ============================================================================
 
@@ -158,7 +223,12 @@ pub fn sign_ed25519(signing_key: &Ed25519SigningKey, data: &[u8]) -> Signature {
 }
 
 /// Verify Ed25519 signature
-pub fn verify_ed25519(verifying_key: &Ed25519VerifyingKey, data: &[u8], signature: &Signature) -> Result<()> {
+pub fn verify_ed25519(
+    verifying_key: &Ed25519VerifyingKey,
+    data: &[u8],
+    signature: &Signature,
+) -> Result<()> {
+    use ed25519_dalek::Verifier as Ed25519VerifierTrait;
     verifying_key
         .verify(data, signature)
         .map_err(|e| anyhow!("Ed25519 signature verification failed: {}", e))
@@ -173,7 +243,10 @@ pub fn ed25519_public_to_hex(vkey: &Ed25519VerifyingKey) -> String {
 pub fn ed25519_public_from_hex(hex_str: &str) -> Result<Ed25519VerifyingKey> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
     if bytes.len() != 32 {
-        return Err(anyhow!("Ed25519 public key must be 32 bytes, got {}", bytes.len()));
+        return Err(anyhow!(
+            "Ed25519 public key must be 32 bytes, got {}",
+            bytes.len()
+        ));
     }
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&bytes);
@@ -190,7 +263,10 @@ pub fn ed25519_private_to_hex(skey: &Ed25519SigningKey) -> String {
 pub fn ed25519_private_from_hex(hex_str: &str) -> Result<Ed25519SigningKey> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
     if bytes.len() != 32 {
-        return Err(anyhow!("Ed25519 private key must be 32 bytes, got {}", bytes.len()));
+        return Err(anyhow!(
+            "Ed25519 private key must be 32 bytes, got {}",
+            bytes.len()
+        ));
     }
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&bytes);
@@ -198,14 +274,17 @@ pub fn ed25519_private_from_hex(hex_str: &str) -> Result<Ed25519SigningKey> {
 }
 
 /// Negotiate signature scheme from lists of supported schemes
-/// 
+///
 /// Selects the highest priority common scheme:
 /// - Returns Ed25519 (2) if both support it (preferred)
 /// - Returns RsaPss (1) if both support it (fallback)
 /// - Returns None if no common scheme found
-/// 
+///
 /// Both lists should contain u8 values from SignatureScheme enum (1 or 2)
-pub fn negotiate_signature_scheme(our_schemes: &[u8], their_schemes: &[u8]) -> Option<SignatureScheme> {
+pub fn negotiate_signature_scheme(
+    our_schemes: &[u8],
+    their_schemes: &[u8],
+) -> Option<SignatureScheme> {
     // Prefer Ed25519 first, fall back to RsaPss
     for &preferred in &[2u8, 1u8] {
         if our_schemes.contains(&preferred) && their_schemes.contains(&preferred) {
@@ -214,7 +293,6 @@ pub fn negotiate_signature_scheme(our_schemes: &[u8], their_schemes: &[u8]) -> O
     }
     None
 }
-
 
 // X25519 ECDH for Forward Secrecy
 // ============================================================================
@@ -735,30 +813,39 @@ mod tests {
     #[test]
     fn test_signature_scheme_negotiation() {
         // Test that negotiation prefers Ed25519 over RSA-PSS
-        let our_schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
-        let their_schemes = vec![SignatureScheme::Ed25519.to_u8(), SignatureScheme::RsaPss.to_u8()];
-        
+        let our_schemes = vec![
+            SignatureScheme::RsaPss.to_u8(),
+            SignatureScheme::Ed25519.to_u8(),
+        ];
+        let their_schemes = vec![
+            SignatureScheme::Ed25519.to_u8(),
+            SignatureScheme::RsaPss.to_u8(),
+        ];
+
         let negotiated = negotiate_signature_scheme(&our_schemes, &their_schemes);
         assert_eq!(negotiated, Some(SignatureScheme::Ed25519));
-        
+
         // Test fallback to RSA-PSS when Ed25519 not available
         let our_schemes_rsa_only = vec![SignatureScheme::RsaPss.to_u8()];
         let their_schemes_rsa_only = vec![SignatureScheme::RsaPss.to_u8()];
-        
+
         let negotiated = negotiate_signature_scheme(&our_schemes_rsa_only, &their_schemes_rsa_only);
         assert_eq!(negotiated, Some(SignatureScheme::RsaPss));
-        
+
         // Test no common scheme
         let our_schemes_ed = vec![SignatureScheme::Ed25519.to_u8()];
         let their_schemes_rsa = vec![SignatureScheme::RsaPss.to_u8()];
-        
+
         let negotiated = negotiate_signature_scheme(&our_schemes_ed, &their_schemes_rsa);
         assert_eq!(negotiated, None);
-        
+
         // Test reverse order doesn't matter (Ed25519 still preferred)
         let our_schemes_rev = vec![SignatureScheme::Ed25519.to_u8()];
-        let their_schemes_rev = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
-        
+        let their_schemes_rev = vec![
+            SignatureScheme::RsaPss.to_u8(),
+            SignatureScheme::Ed25519.to_u8(),
+        ];
+
         let negotiated = negotiate_signature_scheme(&our_schemes_rev, &their_schemes_rev);
         assert_eq!(negotiated, Some(SignatureScheme::Ed25519));
     }
@@ -766,19 +853,26 @@ mod tests {
     #[test]
     fn test_supported_signature_schemes_message() {
         // Test SupportedSignatureSchemes message encoding/decoding
-        let schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
-        let msg = crate::core::ProtocolMessage::SupportedSignatureSchemes { schemes: schemes.clone() };
-        
+        let schemes = vec![
+            SignatureScheme::RsaPss.to_u8(),
+            SignatureScheme::Ed25519.to_u8(),
+        ];
+        let msg = crate::core::ProtocolMessage::SupportedSignatureSchemes {
+            schemes: schemes.clone(),
+        };
+
         let bytes = msg.to_plain_bytes();
         assert!(!bytes.is_empty());
-        
+
         let decoded = crate::core::ProtocolMessage::from_plain_bytes(&bytes);
         assert!(decoded.is_some());
-        
+
         match decoded {
-            Some(crate::core::ProtocolMessage::SupportedSignatureSchemes { schemes: decoded_schemes }) => {
+            Some(crate::core::ProtocolMessage::SupportedSignatureSchemes {
+                schemes: decoded_schemes,
+            }) => {
                 assert_eq!(decoded_schemes, schemes);
-            },
+            }
             _ => panic!("Expected SupportedSignatureSchemes message"),
         }
     }

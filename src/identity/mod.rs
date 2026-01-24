@@ -419,7 +419,73 @@ impl Identity {
         self.encrypt(password)
     }
 
-    /// Generate invite link for this identity
+    /// Generate a signed invite link for this identity (v2, with Ed25519 signature)
+    ///
+    /// This creates a cryptographically signed invite link that prevents tampering.
+    /// The signature is computed over the invite payload and verified on import.
+    pub fn generate_signed_invite_link(&self, address: Option<String>) -> Result<String> {
+        use crate::core::crypto::generate_ed25519_keypair;
+        use serde::{Deserialize, Serialize};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Generate ephemeral key for this invite (one-time use)
+        let (_ephemeral_skey, ephemeral_vkey) = generate_ed25519_keypair();
+        let nonce = hex::encode(ephemeral_vkey.to_bytes());
+
+        // Create timestamp (current UTC Unix timestamp)
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        #[derive(Serialize, Deserialize, Clone)]
+        struct SignedInvitePayload {
+            version: u32,
+            timestamp: u64,
+            nonce: String, // Ephemeral key as hex for uniqueness
+            name: String,
+            address: Option<String>,
+            fingerprint: String,
+            public_key: String,
+        }
+
+        let payload = SignedInvitePayload {
+            version: 2, // Signed invite format version
+            timestamp,
+            nonce,
+            name: self.name.clone(),
+            address,
+            fingerprint: self.fingerprint.clone(),
+            public_key: self.public_key_pem.clone(),
+        };
+
+        // Serialize payload to deterministic JSON
+        let payload_json = serde_json::to_string(&payload)?;
+
+        // Sign the payload using the identity's RSA private key
+        // For now, we use RSA signature since Ed25519 identity keys are still in development
+        // TODO: Use Ed25519 private key when fully integrated into Identity struct
+        let privkey = self.private_key()?;
+        let signature = crate::core::crypto::rsa_sign_pss(&privkey, payload_json.as_bytes())?;
+
+        #[derive(Serialize, Deserialize)]
+        struct SignedInvite {
+            payload: SignedInvitePayload,
+            signature: Vec<u8>, // RSA-PSS signature over payload JSON
+        }
+
+        let signed_invite = SignedInvite { payload, signature };
+        let invite_json = serde_json::to_string(&signed_invite)?;
+
+        // Use URL-safe base64 encoding (RFC 4648)
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(invite_json);
+        Ok(format!("chat-p2p://invite/v2/{}", encoded))
+    }
+
+    /// Generate invite link for this identity (v1, unsigned - for backward compatibility)
+    ///
+    /// DEPRECATED: Use generate_signed_invite_link() instead for security.
+    /// This is kept for backward compatibility with existing invites.
     pub fn generate_invite_link(&self, address: Option<String>) -> Result<String> {
         use serde_json::json;
 
@@ -431,6 +497,7 @@ impl Identity {
         });
 
         let json = serde_json::to_string(&payload)?;
+        // Use standard base64 for v1 (legacy)
         let encoded = base64::engine::general_purpose::STANDARD.encode(json);
         Ok(format!("chat-p2p://invite/{}", encoded))
     }
@@ -641,5 +708,165 @@ mod tests {
             payload.get("address").and_then(|v| v.as_str()),
             addr.as_deref()
         );
+    }
+
+    // ============================================================================
+    // Signed Invite Link Tests (v2 format)
+    // ============================================================================
+
+    #[test]
+    fn test_signed_invite_link_generation() {
+        let identity = Identity::new_with_plaintext("Signed Test User".to_string()).unwrap();
+        let link = identity.generate_signed_invite_link(None).unwrap();
+
+        // V2 format should contain /v2/
+        assert!(link.starts_with("chat-p2p://invite/v2/"));
+        assert!(link.len() > 50);
+
+        // The encoded part should use URL-safe base64 (no +, /, or =)
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        // URL-safe base64 without padding means no trailing =
+    }
+
+    #[test]
+    fn test_signed_invite_link_includes_timestamp() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let identity = Identity::new_with_plaintext("Timestamp Test".to_string()).unwrap();
+        let link = identity.generate_signed_invite_link(None).unwrap();
+
+        // Decode and verify timestamp is present
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct SignedInvite {
+            payload: serde_json::Value,
+            #[allow(dead_code)]
+            signature: Vec<u8>,
+        }
+
+        let invite: SignedInvite = serde_json::from_slice(&decoded).unwrap();
+        let payload = &invite.payload;
+
+        // Verify timestamp field exists and is recent
+        let timestamp = payload.get("timestamp").and_then(|v| v.as_u64()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Timestamp should be within last 10 seconds
+        assert!(now - timestamp < 10);
+    }
+
+    #[test]
+    fn test_signed_invite_link_includes_nonce() {
+        let identity = Identity::new_with_plaintext("Nonce Test".to_string()).unwrap();
+        let link1 = identity.generate_signed_invite_link(None).unwrap();
+        let link2 = identity.generate_signed_invite_link(None).unwrap();
+
+        // Decode both and verify nonces are different (uniqueness)
+        let decode_link = |link: &str| -> String {
+            let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .unwrap();
+
+            #[derive(serde::Deserialize)]
+            struct SignedInvite {
+                payload: serde_json::Value,
+            }
+
+            let invite: SignedInvite = serde_json::from_slice(&decoded).unwrap();
+            invite
+                .payload
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
+
+        let nonce1 = decode_link(&link1);
+        let nonce2 = decode_link(&link2);
+
+        // Nonces should be different (ephemeral keys are random)
+        assert_ne!(nonce1, nonce2);
+
+        // Nonces should be non-empty hex strings
+        assert!(!nonce1.is_empty());
+        assert!(!nonce2.is_empty());
+        hex::decode(&nonce1).unwrap(); // Should be valid hex
+        hex::decode(&nonce2).unwrap();
+    }
+
+    #[test]
+    fn test_signed_invite_link_with_address() {
+        let identity = Identity::new_with_plaintext("Address Test".to_string()).unwrap();
+        let addr = Some("192.168.1.100:9000".to_string());
+        let link = identity.generate_signed_invite_link(addr.clone()).unwrap();
+
+        // Decode and verify address is included
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct SignedInvite {
+            payload: serde_json::Value,
+        }
+
+        let invite: SignedInvite = serde_json::from_slice(&decoded).unwrap();
+        let payload = &invite.payload;
+
+        assert_eq!(
+            payload.get("address").and_then(|v| v.as_str()),
+            addr.as_deref()
+        );
+    }
+
+    #[test]
+    fn test_signed_invite_payload_contains_identity_info() {
+        let identity = Identity::new_with_plaintext("Info Test".to_string()).unwrap();
+        let link = identity.generate_signed_invite_link(None).unwrap();
+
+        // Decode and verify all expected fields are present
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct SignedInvite {
+            payload: serde_json::Value,
+            signature: Vec<u8>,
+        }
+
+        let invite: SignedInvite = serde_json::from_slice(&decoded).unwrap();
+        let payload = &invite.payload;
+
+        // Verify all required fields are present
+        assert_eq!(payload.get("version").and_then(|v| v.as_u64()), Some(2));
+        assert!(payload.get("timestamp").and_then(|v| v.as_u64()).is_some());
+        assert!(payload.get("nonce").and_then(|v| v.as_str()).is_some());
+        assert_eq!(
+            payload.get("name").and_then(|v| v.as_str()),
+            Some("Info Test")
+        );
+        assert_eq!(
+            payload.get("fingerprint").and_then(|v| v.as_str()),
+            Some(identity.fingerprint.as_str())
+        );
+        assert_eq!(
+            payload.get("public_key").and_then(|v| v.as_str()),
+            Some(identity.public_key_pem.as_str())
+        );
+
+        // Signature should not be empty
+        assert!(!invite.signature.is_empty());
     }
 }

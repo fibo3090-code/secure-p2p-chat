@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::core::{
     derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, negotiate_signature_scheme,
     parse_x25519_public, pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher,
-    IdentityProof, SignatureScheme, ProtocolMessage, PROTOCOL_VERSION,
+    IdentityProof, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -145,11 +145,16 @@ pub async fn run_host_session(
     // 7.5. Negotiate Signature Scheme
     // Host and Client advertise supported signature schemes
     // Default: [RsaPss, Ed25519] = [1, 2]
-    let our_schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
-    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes { schemes: our_schemes.clone() };
+    let our_schemes = vec![
+        SignatureScheme::RsaPss.to_u8(),
+        SignatureScheme::Ed25519.to_u8(),
+    ];
+    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
+        schemes: our_schemes.clone(),
+    };
     let schemes_bytes = schemes_msg.to_plain_bytes();
     send_packet(&mut stream, &schemes_bytes).await?;
-    
+
     // Receive client's supported schemes
     let client_schemes_bytes = recv_packet_with_timeout(&mut stream).await?;
     let client_schemes = match ProtocolMessage::from_plain_bytes(&client_schemes_bytes) {
@@ -159,7 +164,7 @@ pub async fn run_host_session(
             return Err(anyhow!("Client did not send valid signature schemes"));
         }
     };
-    
+
     // Negotiate the best common scheme (Ed25519 preferred, fallback to RSA-PSS)
     let selected_scheme = negotiate_signature_scheme(&our_schemes, &client_schemes)
         .ok_or_else(|| anyhow!("No common signature scheme found"))?;
@@ -194,8 +199,10 @@ pub async fn run_host_session(
             let mut hasher = Sha256::new();
             hasher.update(b"IDENTITY_PROOF");
             hasher.update(host_ephemeral_bytes); // Bind to my ephemeral key
-            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
-        },
+            signing_key
+                .sign_with_rng(&mut rng, &hasher.finalize())
+                .to_vec()
+        }
         SignatureScheme::Ed25519 => {
             // For Ed25519, we would need to have Ed25519 identity key
             // For now, we'll fall back to RSA-PSS if Ed25519 not available
@@ -206,8 +213,10 @@ pub async fn run_host_session(
             let mut hasher = Sha256::new();
             hasher.update(b"IDENTITY_PROOF");
             hasher.update(host_ephemeral_bytes);
-            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
-        },
+            signing_key
+                .sign_with_rng(&mut rng, &hasher.finalize())
+                .to_vec()
+        }
     };
 
     let my_proof = IdentityProof {
@@ -364,8 +373,13 @@ pub async fn run_client_session(
     };
 
     // Send our supported schemes (same as host: [RsaPss, Ed25519])
-    let our_schemes = vec![SignatureScheme::RsaPss.to_u8(), SignatureScheme::Ed25519.to_u8()];
-    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes { schemes: our_schemes.clone() };
+    let our_schemes = vec![
+        SignatureScheme::RsaPss.to_u8(),
+        SignatureScheme::Ed25519.to_u8(),
+    ];
+    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
+        schemes: our_schemes.clone(),
+    };
     let schemes_bytes = schemes_msg.to_plain_bytes();
     send_packet(&mut stream, &schemes_bytes).await?;
 
@@ -431,8 +445,10 @@ pub async fn run_client_session(
             let mut hasher = Sha256::new();
             hasher.update(b"IDENTITY_PROOF");
             hasher.update(client_ephemeral_bytes); // Bind to my ephemeral key
-            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
-        },
+            signing_key
+                .sign_with_rng(&mut rng, &hasher.finalize())
+                .to_vec()
+        }
         SignatureScheme::Ed25519 => {
             // For Ed25519, we would need to have Ed25519 identity key
             // For now, we'll fall back to RSA-PSS if Ed25519 not available
@@ -443,8 +459,10 @@ pub async fn run_client_session(
             let mut hasher = Sha256::new();
             hasher.update(b"IDENTITY_PROOF");
             hasher.update(client_ephemeral_bytes);
-            signing_key.sign_with_rng(&mut rng, &hasher.finalize()).to_vec()
-        },
+            signing_key
+                .sign_with_rng(&mut rng, &hasher.finalize())
+                .to_vec()
+        }
     };
 
     let my_proof = IdentityProof {
@@ -507,7 +525,7 @@ pub async fn run_client_session(
 /// Returns None if the message type doesn't have a sequence number (shouldn't happen in practice)
 fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
     match msg {
-        ProtocolMessage::Version { .. } => None,    // Handshake only
+        ProtocolMessage::Version { .. } => None, // Handshake only
         ProtocolMessage::EphemeralKey { .. } => None, // Handshake only
         ProtocolMessage::SupportedSignatureSchemes { .. } => None, // Handshake only
         ProtocolMessage::Text { seq, .. } => Some(*seq),
@@ -521,7 +539,7 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
 }
 
 /// Validate message sequence number for replay attack protection
-/// 
+///
 /// Transport-layer validation ensures that:
 /// 1. Messages are strictly monotonically increasing (seq > last_valid_seq)
 /// 2. Replayed messages (old seq) are rejected
@@ -537,7 +555,10 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
 /// # Returns
 /// * `Ok(())` if the sequence is valid and last_valid_seq is updated
 /// * `Err(String)` if the sequence is invalid (with descriptive reason)
-fn validate_message_sequence(msg: &ProtocolMessage, last_valid_seq: &mut u64) -> Result<(), String> {
+fn validate_message_sequence(
+    msg: &ProtocolMessage,
+    last_valid_seq: &mut u64,
+) -> Result<(), String> {
     // Handshake messages don't have sequence numbers - always allow
     if extract_sequence(msg).is_none() {
         return Ok(());
@@ -947,7 +968,7 @@ mod tests {
     #[test]
     fn test_issue_6_replay_protection_complete() {
         // Issue #6: Replay Protection & Key Rotation
-        // 
+        //
         // Phase 2 (Transport-Layer Validation) - COMPLETED ✅
         // - Sequence numbers are now validated in transport layer (run_message_loop)
         // - Replayed/out-of-order messages are rejected before app receives them
@@ -957,8 +978,10 @@ mod tests {
         // - Implement periodic session key re-negotiation
         // - Add RekeyRequest protocol message
         // - Both sides independently track rekey schedule
-        
-        assert!(true, "Transport-layer replay protection is now implemented in Issue #6 Phase 2");
+
+        assert!(
+            true,
+            "Transport-layer replay protection is now implemented in Issue #6 Phase 2"
+        );
     }
 }
-
