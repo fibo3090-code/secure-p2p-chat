@@ -359,7 +359,7 @@ impl ChatManager {
         }
         let chat_id = Uuid::new_v4();
         tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
-        let privkey = generate_rsa_keypair_async(2048).await?;
+        let privkey = generate_rsa_keypair_async(crate::RSA_KEY_BITS).await?;
 
         // Create channels
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
@@ -412,7 +412,7 @@ impl ChatManager {
     ) -> Result<Uuid> {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         tracing::info!(chat_id = %chat_id, host = %host, port = %port, "connect_to_host called");
-        let privkey = generate_rsa_keypair_async(2048).await?;
+        let privkey = generate_rsa_keypair_async(crate::RSA_KEY_BITS).await?;
 
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
@@ -640,6 +640,13 @@ impl ChatManager {
         filename: &str,
         size: u64,
     ) -> Result<Uuid> {
+        if size > crate::MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File size {} exceeds maximum allowed ({} bytes)",
+                size,
+                crate::MAX_FILE_SIZE
+            );
+        }
         let transfer_id = Uuid::new_v4();
 
         let state = FileTransferState {
@@ -1221,52 +1228,48 @@ impl ChatManager {
                                 if seq == transfer.seq {
                                     tracing::info!("File transfer completed");
 
-                                    // Finalize all active transfers
-                                    let transfer_ids: Vec<Uuid> =
-                                        self.incoming_files.keys().copied().collect();
-                                    for transfer_id in transfer_ids {
-                                        if let Some(incoming) =
-                                            self.incoming_files.remove(&transfer_id)
-                                        {
-                                            let bytes_received = incoming.bytes_received();
-                                            match incoming.finalize() {
-                                                Ok(final_path) => {
-                                                    if let Some(transfer) =
-                                                        self.active_transfers.get(&transfer_id)
+                                    // Finalize only the matching transfer, not all incoming files
+                                    if let Some(incoming) =
+                                        self.incoming_files.remove(&transfer_id)
+                                    {
+                                        let bytes_received = incoming.bytes_received();
+                                        match incoming.finalize() {
+                                            Ok(final_path) => {
+                                                if let Some(transfer) =
+                                                    self.active_transfers.get(&transfer_id)
+                                                {
+                                                    // Add to chat history
+                                                    if let Some(chat) =
+                                                        self.chats.get_mut(&chat_id)
                                                     {
-                                                        // Add to chat history
-                                                        if let Some(chat) =
-                                                            self.chats.get_mut(&chat_id)
-                                                        {
-                                                            chat.messages.push(Message {
-                                                                id: Uuid::new_v4(),
-                                                                from_me: false,
-                                                                content: MessageContent::File {
-                                                                    filename: transfer
-                                                                        .filename
-                                                                        .clone(),
-                                                                    size: transfer.size,
-                                                                    path: Some(final_path),
-                                                                },
-                                                                timestamp: chrono::Utc::now(),
-                                                            });
-                                                        }
+                                                        chat.messages.push(Message {
+                                                            id: Uuid::new_v4(),
+                                                            from_me: false,
+                                                            content: MessageContent::File {
+                                                                filename: transfer
+                                                                    .filename
+                                                                    .clone(),
+                                                                size: transfer.size,
+                                                                path: Some(final_path),
+                                                            },
+                                                            timestamp: chrono::Utc::now(),
+                                                        });
                                                     }
-                                                    self.update_transfer_progress(
-                                                        transfer_id,
-                                                        bytes_received,
-                                                    );
                                                 }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "Failed to finalize file: {}",
-                                                        e
-                                                    );
-                                                    self.add_toast(
-                                                        ToastLevel::Error,
-                                                        format!("File transfer error: {}", e),
-                                                    );
-                                                }
+                                                self.update_transfer_progress(
+                                                    transfer_id,
+                                                    bytes_received,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Failed to finalize file: {}",
+                                                    e
+                                                );
+                                                self.add_toast(
+                                                    ToastLevel::Error,
+                                                    format!("File transfer error: {}", e),
+                                                );
                                             }
                                         }
                                     }

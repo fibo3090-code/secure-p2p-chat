@@ -2,7 +2,7 @@
 name = "encodeur_rsa_rust"
 version = "1.7.1"
 edition = "2021"
-authors = ["fibo3090 <fibo3090@.com>"]
+authors = ["fibo3090 <fibo3090@example.com>"]
 description = "Encrypted P2P Messenger - A secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
 
 [dependencies]

@@ -441,6 +441,14 @@ impl Identity {
         let identity: Identity = serde_json::from_str(&content)?;
         tracing::info!("Loaded identity: {} ({})", identity.name, identity.id);
 
+        // SECURITY: Warn if loading legacy file with plaintext private key on disk.
+        if identity.private_key_pem_plaintext.is_some() {
+            tracing::warn!(
+                "Loaded identity has plaintext private key in file (legacy format). \
+                 Consider encrypting with a password and saving to improve security."
+            );
+        }
+
         if identity.encrypted_private_key.is_none() && identity.private_key_pem_plaintext.is_none()
         {
             return Err(anyhow!(
@@ -505,14 +513,14 @@ impl Identity {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load identity, creating new one: {}", e);
-                    let identity = Self::new(default_name.to_string())?;
+                    let identity = Self::new_with_plaintext(default_name.to_string())?;
                     Ok((identity, true))
                 }
             }
         } else {
             // Create new identity
             tracing::info!("No existing identity found, creating new one");
-            let identity = Self::new(default_name.to_string())?;
+            let identity = Self::new_with_plaintext(default_name.to_string())?;
             Ok((identity, true))
         }
     }

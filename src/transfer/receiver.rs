@@ -6,6 +6,7 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::util::sanitize_filename;
+use crate::MAX_FILE_SIZE;
 
 /// Incoming file being received
 pub struct IncomingFile {
@@ -19,6 +20,13 @@ pub struct IncomingFile {
 impl IncomingFile {
     /// Start receiving a file (create temporary file)
     pub async fn start_meta(filename: &str, size: u64, tmp_dir: &Path) -> Result<Self> {
+        if size > MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File size {} exceeds maximum allowed ({} bytes)",
+                size,
+                MAX_FILE_SIZE
+            );
+        }
         // Sanitize filename
         let safe_filename = sanitize_filename(filename);
 
@@ -165,6 +173,13 @@ impl Clone for IncomingFileSync {
 impl IncomingFileSync {
     /// Create a new incoming file
     pub fn new(dest_path: &Path, expected_size: u64) -> Result<Self> {
+        if expected_size > crate::MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File size {} exceeds maximum allowed ({} bytes)",
+                expected_size,
+                crate::MAX_FILE_SIZE
+            );
+        }
         let _ = dest_path
             .file_name()
             .and_then(|n| n.to_str())

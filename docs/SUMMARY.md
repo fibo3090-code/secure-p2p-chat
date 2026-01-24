@@ -1,143 +1,50 @@
-# Documentation Summary & Index
+# Documentation Index
 
-This document provides a comprehensive index and summary of all project documentation for the Encrypted P2P Messenger.
-
-## 📖 Documentation Structure
-
-### Root Directory (Quick Reference)
-
-- **[SECURITY.md](../SECURITY.md)** - Comprehensive security policy, audit findings, and applied fixes
-- **[CHANGELOG.md](../CHANGELOG.md)** - Release notes, fixes, and improvements
-- **[CONTRIBUTING.md](../CONTRIBUTING.md)** - How to contribute to the project
-- **[ROADMAP.md](../ROADMAP.md)** - Development roadmap and future plans
-- **[DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md)** - Technical guide for developers
-- **[DESIGN_NOTES.md](../DESIGN_NOTES.md)** - Comprehensive design & UI/UX guide
-- **[README.md](../README.md)** - Project overview and quick start
-
-### Detailed Documentation (docs/ folder)
-
-- **[01_introduction.md](01_introduction.md)** - Project overview and goals
-- **[02_getting_started.md](02_getting_started.md)** - Installation and setup guide
-- **[03_architecture.md](03_architecture.md)** - System architecture and components
-- **[04_protocol.md](04_protocol.md)** - Protocol specification and message formats
+Index of all project documentation for **Encrypted P2P Messenger** (v1.7.1).
 
 ---
 
-## Project Overview
+## Root (Quick Reference)
 
-The project is a **secure, peer-to-peer desktop messaging application** built with Rust and the `egui` library. Its primary goal is to provide a private and secure communication channel without relying on a central server.
-
-## Core Features
-
-- **End-to-End Encryption**: Utilizes a combination of RSA for identity and AES-256-GCM for message encryption.
-- **Forward Secrecy**: Implemented using the X25519 Elliptic Curve Diffie-Hellman (ECDH) key exchange to protect past conversations even if long-term keys are compromised.
-- **Peer-to-Peer (P2P) Architecture**: Direct communication between users on a local network (LAN) or VPN, eliminating the need for a central server.
-- **File Transfer**: Supports sending and receiving files with chunking.
-- **User-Friendly Interface**: A modern GUI with features like typing indicators, emoji support, and desktop notifications.
-- **Local Persistence**: Chat history and user identity are stored locally on the user's device.
-
-## Key Technologies
-
-- **Programming Language**: Rust
-- **GUI Framework**: `egui`
-- **Asynchronous Runtime**: `tokio`
-- **Cryptography Libraries**: `rsa`, `aes-gcm`, `x25519-dalek`, `hkdf`
-- **Serialization**: `serde`, `serde_json`, `bincode`
-
-## Architecture
-
-The application follows a layered architecture:
-
-1. **GUI Layer**: Handles user interaction (built with `egui`).
-2. **Business Logic Layer**: Manages the application's state, including chats and sessions.
-3. **Core Layers**:
-    - **Network**: Manages TCP connections and the communication protocol.
-    - **Crypto**: Implements all cryptographic operations.
-    - **Transfer**: Handles file transfers.
-    - **Identity**: Manages the user's persistent RSA keys.
-
-## Protocol
-
-The application uses a custom TCP-based protocol (version 3) with the following characteristics:
-
-- **Length-Prefixed Framing**: Each message is prefixed with its length.
-- **Secure Handshake (ECDH-First)**:
-  - Exchange of ephemeral X25519 keys (Plaintext).
-  - Encrypted Tunnel Establishment (AES-GCM).
-  - Exchange of RSA identity proofs *inside* the tunnel (Metadata Protection).
-  - Session key derivation using HKDF.
-
-## Contribution and Development
-
-The project has clear guidelines for contributions, including:
-
-- **Conventional Commits** for commit messages.
-- A requirement for `cargo fmt` and `cargo clippy` to be run before submitting pull requests.
-- A well-defined branching strategy and release process.
-
-## Development Roadmap
-
-The project has an ambitious roadmap for future development:
-
-- **v1.6.0** (Current): Protocol v3 privacy upgrade and security hardening
-- **v2.0**: The Professional Release
-  - Automatic peer discovery (mDNS) - *Partially implemented in 1.5.0*
-  - NAT traversal for internet connectivity
-  - Message search and moderation tools
-- **v3.0**: The Next Generation
-  - Post-quantum cryptography
-  - Mobile applications
-  - Voice/video calls
-
-## Security
-
-Security is a primary focus of the project, with:
-
-- A detailed **threat model** that considers eavesdropping, tampering, and key compromise.
-- A strong emphasis on **fingerprint verification** to prevent man-in-the-middle attacks.
-- A responsible **vulnerability disclosure policy**.
-- **Current Security Status**: HIGH risk (improved from MEDIUM)
-  - 13 out of 14 vulnerabilities fixed (92%)
-  - All critical issues resolved (2/2)
-  - All high-priority issues resolved (5/5)
-
-## Recent Updates (January 2026)
-
-### Security Hardening (v1.6.0)
-
-- **Protocol v3 Privacy Upgrade**: Identity exchange is now encrypted, protecting user metadata from eavesdroppers.
-- **Robustness**: Eliminated crashing bugs by removing pervasive `unwrap()` calls in network handling.
-- **DoS Protection**: Implemented streaming packet reads and strict handshake timeouts to prevent denial-of-service attacks.
-- **Memory Safety**: Integrated `zeroize` to wipe sensitive keys from memory when not in use.
-
-### Previous Updates (v1.5.0)
-
-- **Local Peer Discovery**: mDNS implementation for auto-discovering peers on LAN.
-- **App Hardening**: Initial round of stability improvements.
+| Document | Purpose |
+|----------|---------|
+| [README.md](../README.md) | Project overview and quick start |
+| [SECURITY.md](../SECURITY.md) | Security policy, threat model, audit, and fixes |
+| [CHANGELOG.md](../CHANGELOG.md) | Release notes and changes |
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | How to contribute |
+| [ROADMAP.md](../ROADMAP.md) | Roadmap and plans |
+| [DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md) | Architecture, protocol, build, test, and **post-change checklist** |
+| [DESIGN_NOTES.md](../DESIGN_NOTES.md) | UI/UX and design guide |
+| [LICENSE.md](../LICENSE.md) | MIT License |
 
 ---
 
-## Quick Navigation
+## docs/
 
-**For Users:**
+| Document | Purpose |
+|----------|---------|
+| [GETTING_STARTED.md](GETTING_STARTED.md) | **Introduction, features, build, run, and fingerprint verification** (replaces 01_introduction and 02_getting_started) |
+| [03_architecture.md](03_architecture.md) | System architecture and components |
+| [04_protocol.md](04_protocol.md) | Protocol specification and message formats |
 
-- Start here: [README.md](../README.md)
-- Getting started: [02_getting_started.md](02_getting_started.md)
-- Security info: [SECURITY.md](../SECURITY.md)
+---
 
-**For Contributors:**
+## For Users
 
-- Contributing guide: [CONTRIBUTING.md](../CONTRIBUTING.md)
-- Developer guide: [DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md)
-- Architecture: [03_architecture.md](03_architecture.md)
+- Start: [README.md](../README.md) → [GETTING_STARTED.md](GETTING_STARTED.md)
+- Security: [SECURITY.md](../SECURITY.md)
 
-**For Designers:**
+## For Contributors
 
-- Design guide: [DESIGN_NOTES.md](../DESIGN_NOTES.md)
-- Roadmap: [ROADMAP.md](../ROADMAP.md)
+- [CONTRIBUTING.md](../CONTRIBUTING.md)
+- [DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md) (including **checklist: after a bug fix or new feature**)
+- [03_architecture.md](03_architecture.md)
 
-**For Security Researchers:**
+## For Designers
 
-- Security policy: [SECURITY.md](../SECURITY.md)
-- Audit report: [SECURITY.md#security-audit-report-december-18-2025](../SECURITY.md#security-audit-report-december-18-2025)
-- Applied fixes: [SECURITY.md#applied-security-fixes](../SECURITY.md#applied-security-fixes)
+- [DESIGN_NOTES.md](../DESIGN_NOTES.md)
+- [ROADMAP.md](../ROADMAP.md)
+
+## For Security Researchers
+
+- [SECURITY.md](../SECURITY.md)

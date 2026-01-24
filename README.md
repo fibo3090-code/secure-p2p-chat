@@ -60,8 +60,8 @@ cargo build --release
 # Run the application
 cargo run --release
 ```
----
-**Automated update:** Documentation reviewed and annotated on 2026-01-04. Please verify and commit if acceptable.
+
+On first run (or when your identity is password-protected), you must **unlock with your password** or **set a password** for a new identity. The main app (chats, connections) is not available until that step is complete.
 
 ### Windows
 
@@ -95,8 +95,7 @@ Tips:
 
 ### Detailed Documentation (`docs/` folder)
 
-- **[docs/01_introduction.md](docs/01_introduction.md)**: Project overview and goals
-- **[docs/02_getting_started.md](docs/02_getting_started.md)**: Installation and setup guide
+- **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)**: Introduction, features, build, run, and fingerprint verification
 - **[docs/03_architecture.md](docs/03_architecture.md)**: System architecture and components
 - **[docs/04_protocol.md](docs/04_protocol.md)**: Protocol specification and message formats
 

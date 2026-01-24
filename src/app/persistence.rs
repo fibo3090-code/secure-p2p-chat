@@ -5,10 +5,48 @@ use chacha20poly1305::{
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::types::{Chat, Config};
 use uuid::Uuid;
+
+/// Returns true if the path is considered dangerous (traversal or system dir).
+/// Used to prevent malicious history files from redirecting writes to system paths.
+fn is_dangerous_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    if s.contains("..") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let lower: std::string::String = s.chars().flat_map(|c| c.to_lowercase()).collect();
+        if lower.contains("\\windows\\")
+            || lower.contains("\\program files")
+            || lower.contains("\\system32")
+            || lower.contains("\\program files (x86)")
+        {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        if s.starts_with("/etc") || s.starts_with("/usr") || s.starts_with("/bin") || s.starts_with("/sbin") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sanitize loaded config: replace dangerous paths with defaults.
+fn sanitize_loaded_config(mut config: Config) -> Config {
+    if is_dangerous_path(&config.download_dir) {
+        config.download_dir = PathBuf::from("Downloads");
+    }
+    if is_dangerous_path(&config.temp_dir) {
+        config.temp_dir = PathBuf::from("temp");
+    }
+    config
+}
 
 /// History file format for JSON serialization
 #[derive(Serialize, Deserialize)]
@@ -145,8 +183,9 @@ impl ChatManager {
         // Restore persisted contact/chat associations for reconnect
         self.contact_to_chat.extend(history.contact_chat_map);
 
-        // Load persisted config (if present)
-        self.config = history.config;
+        // Load persisted config (if present). Sanitize paths to prevent malicious
+        // history files from redirecting writes to system or sensitive directories.
+        self.config = sanitize_loaded_config(history.config);
 
         Ok(())
     }

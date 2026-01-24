@@ -64,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
         );
         if let Err(e) = run_result {
             tracing::error!(error = %e, "Failed to start GUI application");
-        } else {
-            tracing::info!("GUI application exited");
+            std::process::exit(1);
         }
+        tracing::info!("GUI application exited");
     } else if args.host {
         // CLI host mode
         tracing::info!("Starting host on port {}", args.port);

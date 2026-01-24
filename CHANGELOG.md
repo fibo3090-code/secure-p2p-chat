@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🔐 Security
+
+- **Password gate (unlock/set password)**: The full app UI (chats, connections, menus) is blocked until the user unlocks the identity with their password or sets a password for a new/legacy identity. The unlock/set-password screen cannot be closed or bypassed. Auto-host and auto-connect are not started until after unlock/set-password.
+
+### 🐛 Bug Fixes & Polish
+
+- **Windows Add/Remove Programs icon**: `UninstallDisplayIcon` in `setup.iss` now points to `encodeur_rsa_icon.ico` so the app logo appears correctly in Settings → Apps and in the uninstall list.
+- **Toast and copy**: Rehost success toast text changed from "Host relancé" to "Host restarted" for consistent English in-app strings.
+
+### 📚 Documentation
+
+- **Merged docs**: Replaced `docs/01_introduction.md` and `docs/02_getting_started.md` with a single `docs/GETTING_STARTED.md` (all content preserved). Updated `docs/SUMMARY.md` and `README.md` to match.
+- **Checklist**: Added "Checklist: After a Bug Fix or New Feature" to `CONTRIBUTING.md` and `DEVELOPER_GUIDE.md` (tests, changelog, docs, version, packaging).
+- **Removed**: `DOCS_UPDATE_SUMMARY.md` (superseded by the new structure and checklist).
+
 ## [1.7.1] - 2026-01-22
 
 ### 🔐 Security Fixes

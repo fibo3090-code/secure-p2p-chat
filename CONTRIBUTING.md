@@ -119,6 +119,29 @@ While the prerequisites above must be satisfied prior to having your pull reques
 - Bump version in `Cargo.toml`
 - Create a tagged release with release notes
 
+### Checklist: After a Bug Fix or New Feature
+
+For every non-trivial fix or feature, before opening a PR or releasing:
+
+1. **Code**
+   - Run `cargo test`, `cargo clippy`, and `cargo fmt`.
+   - Ensure no new `unwrap()` or `expect()` in security-sensitive paths.
+
+2. **Changelog**
+   - Add an entry under `[Unreleased]` in `CHANGELOG.md` (and under the release section when cutting a release).
+
+3. **Docs**
+   - Update `README.md`, `DEVELOPER_GUIDE.md`, or `docs/*.md` if behavior, APIs, or setup change.
+   - If the protocol or wire format changes: update `docs/04_protocol.md` and `DEVELOPER_GUIDE.md`.
+   - If UI/UX or design changes: consider `DESIGN_NOTES.md`.
+   - If security-related: update `SECURITY.md` and add a security note in `CHANGELOG.md`.
+
+4. **Version**
+   - When releasing: bump `version` in `Cargo.toml` and move `[Unreleased]` entries into the new version in `CHANGELOG.md`.
+
+5. **Packaging (when relevant)**
+   - If the binary name, icon, or installer behavior changes: update `setup.iss` and `build-and-package.ps1`.
+
 ## Additional Notes
 
 ### Issue and Pull Request Labels

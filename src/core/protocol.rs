@@ -226,6 +226,9 @@ impl ProtocolMessage {
                 let raw_filename = parts[2];
                 let filename = crate::util::sanitize_filename(raw_filename);
                 if let Ok(size) = parts[3].parse::<u64>() {
+                    if size > crate::MAX_FILE_SIZE {
+                        return None;
+                    }
                     return Some(Self::FileMeta {
                         filename,
                         size,
@@ -298,6 +301,10 @@ impl ProtocolMessage {
                     return None;
                 }
                 let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
+                // Cap to 256 to prevent huge allocations (X25519 is 32 bytes)
+                if len > 256 {
+                    return None;
+                }
                 cursor += 4;
                 if cursor + len > b.len() {
                     return None;
@@ -335,6 +342,9 @@ impl ProtocolMessage {
                 let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 cursor += 8;
                 let size = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                if size > crate::MAX_FILE_SIZE {
+                    return None;
+                }
                 cursor += 8;
                 let fn_len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;

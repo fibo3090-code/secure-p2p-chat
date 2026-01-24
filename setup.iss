@@ -32,7 +32,8 @@ SolidCompression=yes
 WizardStyle=modern
 DisableWelcomePage=no
 DisableFinishedPage=no
-UninstallDisplayIcon={app}\{#MyAppExe}
+; Use .ico for Add/Remove Programs / Settings > Apps so the app logo displays correctly
+UninstallDisplayIcon={app}\encodeur_rsa_icon.ico
 ; Use installer icon only if present
 #if defined MyAppIcon
   SetupIconFile={#MyAppIcon}

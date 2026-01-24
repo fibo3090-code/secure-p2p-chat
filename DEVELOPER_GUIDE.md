@@ -30,16 +30,17 @@ chat-p2p/
 │   │   ├── chat_manager.rs (Core state management)
 │   │   └── persistence.rs (JSON save/load)
 │   │
-│   ├── core/ (Cryptography Layer)
+│   ├── core/ (Cryptography & Protocol)
 │   │   ├── crypto.rs (RSA, AES-GCM, X25519)
-│   │   └── protocol.rs (Message types)
+│   │   ├── framing.rs (Length-prefixed send/recv, DoS-safe reads)
+│   │   └── protocol.rs (Message types, binary/legacy parsing)
 │   │
 │   ├── network/ (Network Layer)
 │   │   ├── discovery.rs (mDNS Peer Discovery)
 │   │   └── session.rs (TCP sessions, handshake)
 │   │
 │   ├── transfer/ (File Transfer Layer)
-│   │   └── file_transfer.rs (Chunked files)
+│   │   ├── mod.rs, receiver.rs, sender.rs (Chunked send/receive)
 │   │
 │   └── identity/ (Identity Layer)
 │       └── mod.rs (Persistent RSA keys)
@@ -243,6 +244,21 @@ You can run these tests with `cargo test`.
 6. **Commit changes**: `git commit -m "Brief description of changes"`
 7. **Push changes**: `git push origin feature/new-feature`
 8. **Create a pull request**: Open a pull request on GitHub to merge your feature branch into `main`.
+
+### 4.7. Checklist: After a Bug Fix or New Feature
+
+Before merging or releasing, ensure:
+
+| Step | Action |
+|------|--------|
+| **Tests** | `cargo test`, `cargo clippy`, `cargo fmt` |
+| **CHANGELOG** | Add entry under `[Unreleased]` in `CHANGELOG.md` |
+| **Docs** | Update `README`, `DEVELOPER_GUIDE`, `docs/*`, or `DESIGN_NOTES` if behavior, API, protocol, or UI changes |
+| **SECURITY** | If security-relevant: update `SECURITY.md` and add a security note in `CHANGELOG` |
+| **Version** | On release: bump `Cargo.toml` and move `[Unreleased]` into the new version |
+| **Packaging** | If installer/binary/icon changes: update `setup.iss` and `build-and-package.ps1` |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md#checklist-after-a-bug-fix-or-new-feature) for the full checklist.
 
 ## 5. Recent Changes
 

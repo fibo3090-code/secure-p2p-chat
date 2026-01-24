@@ -123,7 +123,7 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 
 - **Rate Limiting**: Implemented a global rate limiter to reject excessive connections from a single IP.
 - **Handshake Timeouts**: All handshake steps are wrapped in strict timeouts to prevent Slowloris attacks.
-- **Chunked Reads**: Replaced large buffer pre-allocation with chunked steraming reads to prevent memory exhaustion attacks.
+- **Chunked Reads**: Replaced large buffer pre-allocation with chunked streaming reads to prevent memory exhaustion attacks.
 - **Files**: `src/network/session.rs`, `src/core/framing.rs`
 
 #### 2. Memory Hygiene
@@ -163,6 +163,15 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 
 - **Hard-coded Cryptographic Values**: Addressed multiple CodeQL warnings about hard-coded cryptographic values in test functions by generating random keys directly instead of initializing with zeros first.
 - **Files**: `src/core/crypto.rs`, `src/transfer/sender.rs`
+
+### Phase 4: Password Gate (Jan 2026)
+
+#### 8. Blocking Unlock / Set-Password Screen
+
+- **Problem**: The app allowed full use (chats, connections, sending) even when the identity was password-protected and not yet unlocked. Users could dismiss or ignore the password dialog.
+- **Fix**: The entire main UI (menus, sidebar, chats, status) is blocked until the user either unlocks with their password or sets a password for a new/legacy identity. A full-screen auth screen is shown; it cannot be closed or bypassed. Auto-host and auto-connect do not run until after unlock/set-password.
+- **Impact**: Ensures the private key is never used for network operations without the user first proving knowledge of the password.
+- **Files**: `src/gui/app_ui.rs`, `src/gui/dialogs.rs`
 
 ---
 

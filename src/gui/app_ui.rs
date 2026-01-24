@@ -188,36 +188,35 @@ impl App {
         let enable_mdns = chat_manager.config.enable_mdns;
         // Capture listen_port for initializing the UI field before moving manager
         let host_port_ui = auto_host_port.to_string();
-        // Wrap manager in Arc<Mutex<..>> once and reuse
-        let manager_arc = Arc::new(Mutex::new(chat_manager));
-        // Auto-start host on startup if enabled in settings
-        if auto_host_enabled {
-            tracing::info!(port = %auto_host_port, "Auto-host on startup is enabled; starting host");
-            let mgr_clone = manager_arc.clone();
-            tokio::spawn(async move {
-                let mut mgr = mgr_clone.lock().await;
-                if let Err(e) = mgr.start_host(auto_host_port).await {
-                    mgr.add_toast(
-                        crate::types::ToastLevel::Error,
-                        format!("Failed to auto-start host: {}", e),
-                    );
-                }
-            });
-        }
-
-        // Auto-reconnect to known contacts if enabled
-        if auto_connect_enabled {
-            let mgr_clone = manager_arc.clone();
-            tokio::spawn(async move {
-                let mut mgr = mgr_clone.lock().await;
-                mgr.auto_reconnect_contacts().await;
-            });
-        }
-
         let initial_identity_locked = identity.is_locked();
         // Force password setup whenever the identity is not locked (i.e., private key available in plaintext)
-        // This covers: newly created identities and legacy identities loaded with plaintext.
         let force_password_setup = !initial_identity_locked;
+        // Wrap manager in Arc<Mutex<..>> once and reuse
+        let manager_arc = Arc::new(Mutex::new(chat_manager));
+        // Do not start network (auto_host, auto_connect) until identity is unlocked or password set
+        let auth_blocked = initial_identity_locked || is_new_identity || force_password_setup;
+        if !auth_blocked {
+            if auto_host_enabled {
+                tracing::info!(port = %auto_host_port, "Auto-host on startup is enabled; starting host");
+                let mgr_clone = manager_arc.clone();
+                tokio::spawn(async move {
+                    let mut mgr = mgr_clone.lock().await;
+                    if let Err(e) = mgr.start_host(auto_host_port).await {
+                        mgr.add_toast(
+                            crate::types::ToastLevel::Error,
+                            format!("Failed to auto-start host: {}", e),
+                        );
+                    }
+                });
+            }
+            if auto_connect_enabled {
+                let mgr_clone = manager_arc.clone();
+                tokio::spawn(async move {
+                    let mut mgr = mgr_clone.lock().await;
+                    mgr.auto_reconnect_contacts().await;
+                });
+            }
+        }
 
         Self {
             chat_manager: manager_arc,
@@ -359,6 +358,14 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Block entire UI until identity is unlocked or password is set. User cannot bypass.
+        if self.identity.is_locked() || self.is_new_identity || self.force_password_setup {
+            crate::gui::dialogs::render_blocking_auth_screen(self, ctx);
+            crate::gui::dialogs::render_toasts(self, ctx);
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+
         // Always poll session events to keep the app responsive
         if let Ok(mut manager) = self.chat_manager.try_lock() {
             manager.poll_session_events();
@@ -427,7 +434,7 @@ impl eframe::App for App {
                             } else {
                                 mgr.add_toast(
                                     crate::types::ToastLevel::Success,
-                                    "Host relancé".to_string(),
+                                    "Host restarted".to_string(),
                                 );
                             }
                         });

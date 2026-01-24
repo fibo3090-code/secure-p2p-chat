@@ -163,7 +163,13 @@ pub struct AesCipher {
 impl AesCipher {
     /// Create new cipher from 32-byte key with random session ID
     pub fn new(key: &[u8]) -> Result<Self> {
-        assert_eq!(key.len(), AES_KEY_SIZE, "AES key must be 32 bytes");
+        if key.len() != AES_KEY_SIZE {
+            return Err(anyhow!(
+                "AES key must be {} bytes, got {}",
+                AES_KEY_SIZE,
+                key.len()
+            ));
+        }
 
         let mut session_id = [0u8; 4];
         // Use OS RNG explicitly for cryptographic session IDs
