@@ -96,8 +96,9 @@ begin
     begin
         // Manually delete the application data directory.
         // This path MUST match the one used by `directories::ProjectDirs` in the application.
-        // On Windows, this is typically %LOCALAPPDATA%\<organization>.<app>.<author>
-        DelTree(ExpandConstant('{localappdata}\com.chat-p2p.EncryptedMessenger'), True, True, True);
+        // ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger") creates:
+        // %LOCALAPPDATA%\chat-p2p\EncryptedMessenger on Windows
+        DelTree(ExpandConstant('{localappdata}\chat-p2p\EncryptedMessenger'), True, True, True);
     end;
   end;
 end;

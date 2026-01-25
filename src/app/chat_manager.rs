@@ -861,6 +861,32 @@ impl ChatManager {
         tracing::info!("History cleared and saved");
     }
 
+    /// Delete all data including identity file. Used for complete data wipe.
+    pub fn delete_all_data(&mut self) {
+        tracing::warn!("Deleting ALL data including identity");
+
+        // First clear all in-memory state
+        self.clear_history(std::path::Path::new(""));
+
+        // Then try to delete identity file if we can determine the path
+        if let Some(dirs) = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger")
+        {
+            let data_dir = dirs.data_dir();
+            let identity_path = data_dir.join("identity.json");
+
+            if identity_path.exists() {
+                match std::fs::remove_file(&identity_path) {
+                    Ok(_) => {
+                        tracing::info!("Identity file deleted: {}", identity_path.display());
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to delete identity file: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Send the user's accept/reject decision for a fingerprint verification to the session task
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");

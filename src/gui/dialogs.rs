@@ -1771,28 +1771,32 @@ fn render_remove_password_dialog(app: &mut App, ctx: &egui::Context) {
 }
 
 fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
-    egui::Window::new("⚠️ Clear Chat History")
+    egui::Window::new("⚠️ Clear All Data (Including Identity)")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.label("Are you sure you want to clear all chat history?");
+            ui.label(egui::RichText::new("WARNING: Complete Data Wipe").color(crate::gui::styling::ERROR));
+            ui.label("This will delete:");
+            ui.label("  • All chat messages and contacts");
+            ui.label("  • Your cryptographic identity and keys");
+            ui.label("  • Your password protection");
             ui.label(
                 egui::RichText::new(
-                    "This action cannot be undone and will delete all messages and contacts.",
+                    "You will need to create a NEW identity when you restart the app.\nThis action CANNOT be undone!",
                 )
                 .color(crate::gui::styling::ERROR),
             );
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
-                if crate::gui::widgets::primary_button(ui, "❌ Clear All").clicked() {
+                if crate::gui::widgets::primary_button(ui, "❌ Delete Everything").clicked() {
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
-                        manager.clear_history(&app.history_path);
+                        manager.delete_all_data();
                         app.selected_chat = None;
                         manager.add_toast(
                             crate::types::ToastLevel::Success,
-                            "Chat history cleared!".to_string(),
+                            "All data deleted! Please restart the app.".to_string(),
                         );
                     }
                     app.show_clear_history_dialog = false;
