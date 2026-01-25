@@ -179,9 +179,9 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                 ui.separator();
             }
 
-            // Input bar
+            // Input bar with proper alignment
             ui.horizontal(|ui| {
-                // File attach button
+                // File attach button - left side
                 if ui
                     .button(egui::RichText::new("📎").size(20.0))
                     .on_hover_text("Attach file (or drag & drop)")
@@ -192,7 +192,7 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     }
                 }
 
-                // Emoji picker button
+                // Emoji picker button - left side
                 if ui
                     .button(egui::RichText::new("😊").size(20.0))
                     .on_hover_text("Emoji picker")
@@ -201,17 +201,17 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     app.show_emoji_picker = !app.show_emoji_picker;
                 }
 
-                // Multiline text input
-                // let text_width = ui.available_width() - 70.0; // This is no longer needed directly
+                // Multiline text input - grows to fill available space
                 let response = egui::ScrollArea::vertical()
                     .max_height(100.0) // Set max height for the text input before it scrolls
+                    .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut app.input_text)
                                 .hint_text("💬 Type a message... (Ctrl+Enter to send)")
                                 .desired_rows(1) // Start with 1 desired row, let it grow
                                 .lock_focus(false)
-                                .desired_width(ui.available_width()), // Use available width
+                                .desired_width(f32::INFINITY), // Take all available width
                         )
                     })
                     .inner; // Get the response from the inner TextEdit
@@ -258,11 +258,11 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     app.typing_stopped = true;
                 }
 
-                // Send button
+                // Send button - right side, always visible
                 let send_enabled = !app.input_text.trim().is_empty();
                 let mut send_button =
-                    egui::Button::new(egui::RichText::new("📤\nSend").size(14.0).strong())
-                        .min_size(egui::vec2(65.0, 70.0));
+                    egui::Button::new(egui::RichText::new("📤\nSend").size(12.0).strong())
+                        .min_size(egui::vec2(50.0, 60.0));
 
                 if send_enabled {
                     send_button = send_button.fill(ui.visuals().selection.bg_fill);

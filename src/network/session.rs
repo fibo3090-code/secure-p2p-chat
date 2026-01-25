@@ -269,8 +269,8 @@ pub async fn run_host_session(
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // Wait for user confirmation (up to 5 minutes) before proceeding
-    match tokio::time::timeout(tokio::time::Duration::from_secs(300), async {
+    // Wait for user confirmation (up to 30 minutes) before proceeding
+    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
         confirm_rx.recv().await
     })
     .await
@@ -487,8 +487,8 @@ pub async fn run_client_session(
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // Wait up to 5 minutes for user confirmation
-    match tokio::time::timeout(tokio::time::Duration::from_secs(300), async {
+    // Wait up to 30 minutes for user confirmation
+    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
         confirm_rx.recv().await
     })
     .await
@@ -591,7 +591,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
-    
+
     // Key rotation constants
     const REKEY_MESSAGE_COUNT: u64 = 100; // Rekey every 100 messages
     const REKEY_TIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
@@ -599,7 +599,10 @@ where
     // Track last valid sequence number to detect replays and out-of-order messages
     // This is enforced at the transport layer, not just in the app layer
     let mut last_valid_seq: u64 = 0;
-    
+
+    // Dedicated counter for outgoing messages (including Rekey messages)
+    let mut sent_seq: u64 = 0;
+
     // Track messages since last rekey for key rotation
     let mut messages_since_rekey: u64 = 0;
     let mut last_rekey_time = std::time::Instant::now();
@@ -625,11 +628,14 @@ where
                                         // Sequence is valid
                                         // Check if this is a rekey message and handle it
                                         if let ProtocolMessage::Rekey { nonce, .. } = &msg {
-                                            // Import and use the new key
+                                            // Handle rekeying
                                             use crate::core::rekey_session_key;
+
+                                            let received_nonce: [u8; 16] = nonce.as_slice().try_into()
+                                                .map_err(|_| anyhow!("Invalid nonce length"))?;
+
                                             let current_key_bytes = cipher.get_current_key();
-                                            let next_key = rekey_session_key(&current_key_bytes, nonce.as_slice().try_into()
-                                                .map_err(|_| anyhow!("Invalid nonce length"))?);
+                                            let next_key = rekey_session_key(&current_key_bytes, &received_nonce);
                                             cipher = AesCipher::new(&next_key)?;
                                             messages_since_rekey = 0;
                                             last_rekey_time = std::time::Instant::now();
@@ -638,7 +644,7 @@ where
                                         } else {
                                             // Track message count for rekeying
                                             messages_since_rekey += 1;
-                                            
+
                                             // Emit the message
                                             if let Err(e) = to_app_tx.send(SessionEvent::MessageReceived(msg)) {
                                                 tracing::error!("Failed to send MessageReceived event: {}", e);
@@ -682,42 +688,42 @@ where
                 // Check if we need to initiate rekeying
                 let should_rekey = messages_since_rekey >= REKEY_MESSAGE_COUNT ||
                     last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL;
-                
+
                 if should_rekey {
                     // Generate a new rekeying nonce
+                    // Initiate rekey by sending Rekey message
                     use crate::core::{generate_rekey_nonce, rekey_session_key};
-                    
+
                     let nonce = generate_rekey_nonce();
-                    
-                    // Create and send REKEY message with current sequence number
+
+                    // Increment sent sequence and create Rekey message
+                    sent_seq += 1;
                     let rekey_msg = ProtocolMessage::Rekey {
                         nonce: nonce.to_vec(),
-                        seq: last_valid_seq + 1,
+                        seq: sent_seq,
                     };
-                    
+
                     let rekey_plaintext = rekey_msg.to_plain_bytes();
                     let rekey_encrypted = cipher.encrypt(&rekey_plaintext, None);
-                    
+
                     if let Err(e) = send_packet(&mut stream, &rekey_encrypted).await {
                         let err_msg = format!("Network send error (rekey): {}", e);
                         tracing::error!("{}", err_msg);
                         let _ = to_app_tx.send(SessionEvent::Error(err_msg));
                         break;
                     } else {
-                        tracing::debug!("Rekey message sent");
+                        tracing::debug!("Rekey message sent with nonce");
                     }
-                    
-                    // Update our own cipher with the new key
+
+                    // Apply the new key immediately since we sent the Rekey message
                     let current_key_bytes = cipher.get_current_key();
                     let next_key = rekey_session_key(&current_key_bytes, &nonce);
                     cipher = AesCipher::new(&next_key)?;
-                    
-                    // Reset rekey tracking
                     messages_since_rekey = 0;
                     last_rekey_time = std::time::Instant::now();
                     tracing::info!("Session key rotated (initiated rekey)");
                 }
-                
+
                 tracing::debug!("Sending message: {:?}", msg);
 
                 let plaintext = msg.to_plain_bytes();

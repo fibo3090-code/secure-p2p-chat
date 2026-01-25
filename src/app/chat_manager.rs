@@ -36,6 +36,9 @@ pub struct ChatManager {
     session_events: HashMap<Uuid, Arc<Mutex<mpsc::UnboundedReceiver<SessionEvent>>>>,
     /// Channels used to confirm fingerprint verification with the running session task
     fingerprint_confirm_senders: HashMap<Uuid, mpsc::UnboundedSender<bool>>,
+    /// Map incoming_chat_id -> parent_session_chat_id. Used when host accepts a connection with a different chat_id than the placeholder.
+    /// When a message is sent to incoming_chat_id, it's forwarded to the parent_session_chat_id's session.
+    chat_id_mapping: HashMap<Uuid, Uuid>,
     active_transfers: HashMap<Uuid, FileTransferState>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
@@ -73,6 +76,7 @@ impl ChatManager {
             contact_to_chat: HashMap::new(),
             sessions: HashMap::new(),
             session_events: HashMap::new(),
+            chat_id_mapping: HashMap::new(),
             active_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             toasts: Vec::new(),
@@ -574,11 +578,19 @@ impl ChatManager {
             chat_id,
             text.len()
         );
+
+        // Resolve chat_id through mapping (in case this is an incoming connection with a different chat_id)
+        let actual_session_chat_id = self
+            .chat_id_mapping
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(chat_id);
+
         // Determine if this is a true group chat
         let (participants_len, has_session) = if let Some(chat) = self.chats.get(&chat_id) {
             (
                 chat.participants.len(),
-                self.sessions.contains_key(&chat_id),
+                self.sessions.contains_key(&actual_session_chat_id),
             )
         } else {
             (0, false)
@@ -586,10 +598,11 @@ impl ChatManager {
 
         let is_group_chat = participants_len >= 2;
         tracing::debug!(
-            "chat classification: is_group_chat={}, participants_len={}, has_session={}",
+            "chat classification: is_group_chat={}, participants_len={}, has_session={}, actual_session_chat_id={}",
             is_group_chat,
             participants_len,
-            has_session
+            has_session,
+            actual_session_chat_id,
         );
 
         if is_group_chat {
@@ -601,8 +614,9 @@ impl ChatManager {
         // One-to-one chat path
         if !has_session {
             tracing::warn!(
-                "No active session for 1:1 chat {} yet. Likely still connecting.",
-                chat_id
+                "No active session for 1:1 chat {} (mapped to {}) yet. Likely still connecting.",
+                chat_id,
+                actual_session_chat_id,
             );
             self.add_toast(
                 ToastLevel::Info,
@@ -613,7 +627,7 @@ impl ChatManager {
 
         let session = self
             .sessions
-            .get(&chat_id)
+            .get(&actual_session_chat_id)
             .ok_or_else(|| anyhow::anyhow!("Session should exist but was not found"))?;
 
         let chat = self
@@ -1007,14 +1021,31 @@ impl ChatManager {
                 chat_id: incoming_chat_id,
             } => {
                 tracing::info!(
-                    "New incoming connection from {} with chat_id {}",
+                    "New incoming connection from {} with chat_id {}, session_chat_id={}",
                     peer_addr,
-                    incoming_chat_id
+                    incoming_chat_id,
+                    chat_id,
                 );
+
+                // Map incoming_chat_id to the session's chat_id (the placeholder host chat)
+                // This allows messages sent to incoming_chat_id to be routed to the session
+                self.chat_id_mapping.insert(incoming_chat_id, chat_id);
+                tracing::debug!(
+                    "Mapped incoming chat {} to session chat {}",
+                    incoming_chat_id,
+                    chat_id
+                );
+
+                // Format a title using the peer's fingerprint instead of IP address
+                let title = format!(
+                    "Peer {}",
+                    crate::util::format_fingerprint_short(&fingerprint)
+                );
+
                 // Create a chat for this new connection
                 self.chats.entry(incoming_chat_id).or_insert_with(|| Chat {
                     id: incoming_chat_id,
-                    title: peer_addr.clone(),
+                    title,
                     peer_fingerprint: Some(fingerprint.clone()),
                     participants: Vec::new(),
                     messages: Vec::new(),
@@ -1106,9 +1137,21 @@ impl ChatManager {
             SessionEvent::MessageReceived(proto_msg) => {
                 tracing::debug!("Session {} received message: {:?}", chat_id, proto_msg);
 
+                // Find the actual chat to add the message to
+                // If this session is mapped from an incoming connection, use the incoming chat_id
+                // Otherwise use the session's chat_id
+                let actual_chat_id = self
+                    .chat_id_mapping
+                    .iter()
+                    .find(|(_, &session_id)| session_id == chat_id)
+                    .map(|(&incoming_id, _)| incoming_id)
+                    .unwrap_or(chat_id);
+
+                tracing::debug!("Message routed to actual_chat_id={}", actual_chat_id);
+
                 match proto_msg {
                     ProtocolMessage::Text { text, seq, .. } => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
                             if seq > chat.recv_seq {
                                 chat.recv_seq = seq;
                                 chat.messages.push(Message {
@@ -1121,7 +1164,6 @@ impl ChatManager {
                                 // Clear typing indicator
                                 chat.peer_typing = false;
                                 chat.typing_since = None;
-
                                 // Show desktop notification
                                 let preview = if text.len() > 50 {
                                     format!("{}...", &text[..50])
@@ -1130,12 +1172,15 @@ impl ChatManager {
                                 };
                                 self.show_notification("New message", &preview);
 
-                                tracing::info!("Added received message to chat {}", chat_id);
+                                tracing::info!("Added received message to chat {}", actual_chat_id);
                             } else {
-                                tracing::warn!("Received message with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                                tracing::warn!("Received message with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
                             }
                         } else {
-                            tracing::error!("Chat {} not found for received message", chat_id);
+                            tracing::error!(
+                                "Chat {} not found for received message",
+                                actual_chat_id
+                            );
                         }
                     }
 
@@ -1144,7 +1189,7 @@ impl ChatManager {
                         size,
                         seq,
                     } => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
                             if seq > chat.recv_seq {
                                 chat.recv_seq = seq;
                                 tracing::info!(
@@ -1153,7 +1198,7 @@ impl ChatManager {
                                     size
                                 );
 
-                                match self.start_receiving_file(chat_id, &filename, size) {
+                                match self.start_receiving_file(actual_chat_id, &filename, size) {
                                     Ok(transfer_id) => {
                                         // Create new IncomingFileSync for this transfer
                                         let file_path = self.config.download_dir.join(&filename);
@@ -1192,7 +1237,7 @@ impl ChatManager {
                         let transfer_id = self
                             .active_transfers
                             .values()
-                            .find(|t| t.chat_id == chat_id)
+                            .find(|t| t.chat_id == actual_chat_id)
                             .map(|t| t.id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
@@ -1232,7 +1277,7 @@ impl ChatManager {
                         let transfer_id = self
                             .active_transfers
                             .values()
-                            .find(|t| t.chat_id == chat_id)
+                            .find(|t| t.chat_id == actual_chat_id)
                             .map(|t| t.id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
@@ -1296,25 +1341,25 @@ impl ChatManager {
                     }
 
                     ProtocolMessage::TypingStart { seq } => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
                             if seq > chat.recv_seq {
                                 chat.recv_seq = seq;
                                 chat.peer_typing = true;
                                 chat.typing_since = Some(std::time::Instant::now());
                             } else {
-                                tracing::warn!("Received TypingStart with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                                tracing::warn!("Received TypingStart with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
                             }
                         }
                     }
 
                     ProtocolMessage::TypingStop { seq } => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
                             if seq > chat.recv_seq {
                                 chat.recv_seq = seq;
                                 chat.peer_typing = false;
                                 chat.typing_since = None;
                             } else {
-                                tracing::warn!("Received TypingStop with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                                tracing::warn!("Received TypingStop with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
                             }
                         }
                     }

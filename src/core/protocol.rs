@@ -473,8 +473,8 @@ impl ProtocolMessage {
                 cursor += 8;
                 let nonce_len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
-                // Nonce should be 16 bytes, but be defensive and cap at 256
-                if nonce_len > 256 {
+                // Nonce must be at least 16 bytes for sufficient entropy and at most 256 bytes
+                if nonce_len < 16 || nonce_len > 256 {
                     return None;
                 }
                 if cursor + nonce_len > b.len() {

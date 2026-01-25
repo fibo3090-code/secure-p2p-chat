@@ -22,7 +22,7 @@ All notable changes to this project will be documented in this file.
   - Implemented automatic key rotation every 100 messages OR 5 minutes (whichever first)
   - Added `rekey_session_key()` function using HKDF-SHA256 for deterministic key derivation
   - Added `generate_rekey_nonce()` with cryptographically random nonce generation (OsRng)
-  - New `Rekey` protocol message type (v3.1) with sequence validation for replay protection
+  - New `Rekey` protocol message type (v3) with sequence validation and simultaneous-rekey resolution
   - Transparent rekeying: Rekey messages handled at protocol layer, not emitted to application
   - Bidirectional: Both peers independently detect rekey condition and derive identical new key
   - Added 5 comprehensive crypto tests (determinism, nonce independence, encryption flow)

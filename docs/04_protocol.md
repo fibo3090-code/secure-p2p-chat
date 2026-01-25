@@ -102,7 +102,16 @@ Keys are rotated when either condition is met (whichever comes first):
    - Updates cipher to use the new key
    - Does NOT emit the `Rekey` message to the application (it's a protocol-level operation)
 
-3. **Both Peers**:
+3. **Simultaneous Rekey Resolution**:
+   - If both peers initiate a rekey at nearly the same time, each will send their own `Rekey` message before receiving the other's
+   - When a peer receives a `Rekey` while having initiated its own, it must compare nonces deterministically:
+     - Compare nonces using lexicographic byte order (smaller nonce "wins")
+     - Both peers derive: `next_key = HKDF-SHA256(current_key, winning_nonce, "key-rotation")`
+     - The peer whose nonce lost abandons its locally-generated nonce and does NOT send a second rotation
+     - Both peers update cipher using the winning nonce and reset counters
+   - This ensures deterministic, symmetric resolution without race conditions or duplicate rotations
+
+4. **Both Peers** (after rekey, whether single or simultaneous):
    - Reset message counter to 0
    - Reset rekey timer
    - Continue encrypted communication with the new key
