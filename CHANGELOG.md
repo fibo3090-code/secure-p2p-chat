@@ -342,6 +342,11 @@ This release transformed the application from a functional prototype into a poli
 - Message history persistence.
 
 [Unreleased]: #
+[1.7.3]: #
+[1.7.2]: #
+[1.7.1]: #
+[1.7.0]: #
+[1.6.0]: #
 [1.5.0]: #
 [1.4.0]: #
 [1.3.1]: #
