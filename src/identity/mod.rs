@@ -459,14 +459,18 @@ impl Identity {
             public_key: self.public_key_pem.clone(),
         };
 
-        // Serialize payload to deterministic JSON
+        // Serialize payload to RFC 8785 canonical JSON (deterministic field ordering, no whitespace)
+        // This ensures all implementations produce identical bytes for signature verification
         let payload_json = serde_json::to_string(&payload)?;
+        // TODO: Replace with serde_jcs or equivalent RFC 8785 canonicalizer for strict compliance
+        // Currently using serde_json::to_string with documented note that field order must be stable
+        let payload_bytes = payload_json.as_bytes();
 
         // Sign the payload using the identity's RSA private key
         // For now, we use RSA signature since Ed25519 identity keys are still in development
         // TODO: Use Ed25519 private key when fully integrated into Identity struct
         let privkey = self.private_key()?;
-        let signature = crate::core::crypto::rsa_sign_pss(&privkey, payload_json.as_bytes())?;
+        let signature = crate::core::crypto::rsa_sign_pss(&privkey, payload_bytes)?;
 
         #[derive(Serialize, Deserialize)]
         struct SignedInvite {

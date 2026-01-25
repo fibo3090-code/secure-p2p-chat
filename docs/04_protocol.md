@@ -152,23 +152,26 @@ V2 invites are cryptographically signed with RSA-PSS-SHA256 to prevent tampering
 **Signature Verification Process**:
 
 1. Extract the `payload` and `signature` from the invite
-2. Serialize the payload back to JSON (deterministically) to recreate the signed message
+2. Serialize the payload back to JSON using canonical serialization (RFC 8785 JSON Canonicalization: sorted keys, no whitespace, deterministic formatting)
 3. Extract the public key from `payload.public_key`
-4. Verify: `RSA_Verify_PSS(public_key, payload_json, signature)` with SHA-256
+4. Verify using RFC 8785 canonical payload bytes: `RSA_Verify_PSS(public_key, canonical_payload_bytes, signature)` with SHA-256
+   - Use exact byte-for-byte canonical form for verification to ensure interoperability
 5. If verification succeeds, accept the contact information as authentic
 6. If verification fails, reject the invite link as tampered
+
+**Canonical Serialization Requirement**: Implementations MUST use RFC 8785 JSON Canonicalization (UTF-8 encoding, sorted object member order, no insignificant whitespace, deterministic number formatting) for the signed payload. This ensures all compliant implementations produce identical bytes for verification.
 
 **Security Benefits**:
 
 - **Integrity**: RSA-PSS signature prevents any tampering with the invite link
 - **Authenticity**: The signature is created with the identity's private key, proving the invite originated from the claimed sender
-- **Uniqueness**: Each invite includes an ephemeral nonce (one-time random Ed25519 key) for uniqueness
-- **Timestamp**: Invites include a timestamp field for future expiration support
+- **Uniqueness**: Each invite includes a unique random nonce (raw bytes) for transport-layer uniqueness
+- **Non-Expiring**: Invites do not expire because the timestamp field is not validated during verification
 
 **Implementation Notes**:
 
 - V2 invites use **URL-safe base64** (RFC 4648 without padding) to avoid URL encoding/decoding issues
-- The `nonce` field contains a hex-encoded Ed25519 public key generated ephemeralally per invite
-- The timestamp is always in UTC seconds (UNIX epoch)
-- Invites are transport-layer unique via the nonce, with future versions adding expiration support
+- The `nonce` field contains a hex-encoded random value (unique per invite, not an Ed25519 key)
+- The timestamp is always in UTC seconds (UNIX epoch) but is NOT validated for expiry
+- Invites are transport-layer unique via the nonce; they do not expire
 

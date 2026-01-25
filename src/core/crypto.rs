@@ -115,19 +115,15 @@ pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> String {
 /// * `data` - Data to sign
 ///
 /// # Returns
-/// DER-encoded signature bytes
+/// Raw RSA-PSS signature bytes
 pub fn rsa_sign_pss(privkey: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());
     let mut rng = OsRng;
 
-    // Create SHA-256 digest of the data
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-
     // Sign with randomized signing for enhanced security
+    // SigningKey::<Sha256>::sign_with_rng automatically applies SHA-256 hashing
     let signature = signing_key
-        .sign_with_rng(&mut rng, &digest)
+        .sign_with_rng(&mut rng, data)
         .to_bytes()
         .to_vec();
 
@@ -139,7 +135,7 @@ pub fn rsa_sign_pss(privkey: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
 /// # Arguments
 /// * `pubkey` - RSA public key
 /// * `data` - Original data that was signed
-/// * `signature` - DER-encoded signature bytes
+/// * `signature` - Raw RSA-PSS signature bytes
 ///
 /// # Returns
 /// Ok(()) if signature is valid, Err if invalid
@@ -148,18 +144,14 @@ pub fn rsa_verify_pss(pubkey: &RsaPublicKey, data: &[u8], signature: &[u8]) -> R
 
     let verifying_key = VerifyingKey::<Sha256>::new(pubkey.clone());
 
-    // Create SHA-256 digest of the data
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-
     // Convert byte slice to RSA Signature type
     let rsa_signature = rsa::pss::Signature::try_from(signature)
         .map_err(|e| anyhow!("Failed to parse RSA signature: {}", e))?;
 
     // Verify signature
+    // VerifyingKey::<Sha256>::verify automatically applies SHA-256 hashing
     verifying_key
-        .verify(&digest, &rsa_signature)
+        .verify(data, &rsa_signature)
         .map_err(|e| anyhow!("RSA-PSS signature verification failed: {}", e))
 }
 

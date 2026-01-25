@@ -221,8 +221,8 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
     - Deterministic JSON serialization of payload (version, timestamp, nonce, identity info)
     - RSA-PSS-SHA256 signature over the payload
     - URL-safe base64 encoding (RFC 4648) without padding
-    - Ephemeral nonce (Ed25519 key) for uniqueness per invite
-    - Timestamp field for future expiration support (currently unused, future work)
+    - Ephemeral nonce (random bytes) for uniqueness per invite
+    - Timestamp field (not validated; invites do not expire)
   - Updated `ChatManager::parse_invite_link()` to support both v1 and v2:
     - Automatically detects v2 format by `/v2/` URL prefix
     - Verifies RSA-PSS signature before accepting v2 invites
@@ -242,8 +242,9 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 - **Security Guarantees**:
   - **Authenticity**: Only the identity holder can create valid invites (signature proves origin)
   - **Integrity**: Any bit-level modification of the invite is detected and rejected
-  - **Uniqueness**: Each invite is unique (ephemeral nonce prevents exact replay)
-  - **Non-repudiation**: The sender cannot deny creating the invite (RSA signature)
+  - **Uniqueness**: Each invite is unique (random nonce prevents exact replay at transport layer)
+  - **Non-Repudiation**: The sender cannot deny creating the invite (RSA signature)
+  - **Non-Expiring**: Invites do not expire because the timestamp field is not validated during verification
 
 ---
 
