@@ -326,6 +326,40 @@ pub fn derive_session_key(
     session_key
 }
 
+/// Generate a new session key by rekeying the current key with a nonce
+///
+/// Used for periodic key rotation to provide perfect forward secrecy.
+/// Derives next key from current key + random nonce using HKDF-SHA256.
+///
+/// # Arguments
+/// * `current_key` - Current 32-byte session key
+/// * `nonce` - Random 16-byte nonce (should be cryptographically random)
+///
+/// # Returns
+/// New 32-byte session key
+pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> [u8; AES_KEY_SIZE] {
+    // Use HKDF to derive next key from current key and nonce
+    // Current key acts as IKM (Input Keying Material)
+    // Nonce acts as salt for additional entropy
+    let hkdf = Hkdf::<Sha256>::new(Some(nonce), current_key);
+
+    let mut next_key = [0u8; AES_KEY_SIZE];
+    hkdf.expand(b"key-rotation", &mut next_key)
+        .expect("HKDF expand should not fail with valid length");
+
+    next_key
+}
+
+/// Generate a cryptographically random nonce for rekeying
+///
+/// # Returns
+/// 16-byte random nonce suitable for key rotation
+pub fn generate_rekey_nonce() -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
 /// Parse X25519 public key from 32 bytes
 pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
     if bytes.len() != 32 {
@@ -345,6 +379,7 @@ pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
 #[derive(Clone)]
 pub struct AesCipher {
     cipher: Aes256Gcm,
+    key: [u8; AES_KEY_SIZE],
     nonce_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     session_id: [u8; 4],
 }
@@ -364,13 +399,23 @@ impl AesCipher {
         // Use OS RNG explicitly for cryptographic session IDs
         OsRng.fill_bytes(&mut session_id);
 
+        let mut key_array = [0u8; AES_KEY_SIZE];
+        key_array.copy_from_slice(key);
+
         Ok(Self {
             cipher: Aes256Gcm::new_from_slice(key)
                 .map_err(|e| anyhow!("Invalid AES key length: {}", e))?,
+            key: key_array,
             nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             session_id,
         })
     }
+
+    /// Get the current session key (for rekeying purposes)
+    pub fn get_current_key(&self) -> [u8; AES_KEY_SIZE] {
+        self.key
+    }
+
     /// Encrypt plaintext with optional AAD, returns nonce(12) || ciphertext || tag(16)
     /// Uses counter-based nonce: session_id(4) || counter(8) for guaranteed uniqueness
     ///
@@ -682,6 +727,98 @@ mod tests {
         let decrypted = bob_cipher.decrypt(&encrypted, None).unwrap();
 
         assert_eq!(plaintext, &decrypted[..]);
+    }
+
+    // ========== Key Rotation (Rekeying) Tests ==========
+
+    #[test]
+    fn test_rekey_derives_correct_key() {
+        // Current key (32 bytes)
+        let current_key = [42u8; AES_KEY_SIZE];
+
+        // Nonce for rekeying (16 bytes, random)
+        let nonce = [99u8; 16];
+
+        // Derive next key
+        let next_key = rekey_session_key(&current_key, &nonce);
+
+        // Next key should be 32 bytes (same size)
+        assert_eq!(next_key.len(), AES_KEY_SIZE);
+
+        // Next key should be different from current key
+        assert_ne!(next_key, current_key);
+    }
+
+    #[test]
+    fn test_rekey_deterministic() {
+        // Rekeying with the same inputs should produce the same output
+        let current_key = [111u8; AES_KEY_SIZE];
+        let nonce = [222u8; 16];
+
+        let key1 = rekey_session_key(&current_key, &nonce);
+        let key2 = rekey_session_key(&current_key, &nonce);
+
+        // Same inputs should produce identical output (deterministic)
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_rekey_different_nonces() {
+        // Different nonces should produce different keys
+        let current_key = [123u8; AES_KEY_SIZE];
+        let nonce1 = [1u8; 16];
+        let nonce2 = [2u8; 16];
+
+        let key1 = rekey_session_key(&current_key, &nonce1);
+        let key2 = rekey_session_key(&current_key, &nonce2);
+
+        // Different nonces should produce different keys
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_generate_rekey_nonce() {
+        let nonce1 = generate_rekey_nonce();
+        let nonce2 = generate_rekey_nonce();
+
+        // Nonces should be 16 bytes
+        assert_eq!(nonce1.len(), 16);
+        assert_eq!(nonce2.len(), 16);
+
+        // Nonces should be different (with overwhelming probability)
+        assert_ne!(nonce1, nonce2);
+    }
+
+    #[test]
+    fn test_rekey_encryption_flow() {
+        // Test that rekeying doesn't break encryption/decryption
+        let current_key = [77u8; AES_KEY_SIZE];
+        let cipher1 = AesCipher::new(&current_key).unwrap();
+
+        // Encrypt message with first key
+        let plaintext = b"Message before rekeying";
+        let encrypted = cipher1.encrypt(plaintext, None);
+
+        // Decrypt with same cipher should work
+        let decrypted = cipher1.decrypt(&encrypted, None).unwrap();
+        assert_eq!(plaintext, &decrypted[..]);
+
+        // Now rekey
+        let nonce = generate_rekey_nonce();
+        let next_key = rekey_session_key(&current_key, &nonce);
+        let cipher2 = AesCipher::new(&next_key).unwrap();
+
+        // Encrypt with new key
+        let plaintext2 = b"Message after rekeying";
+        let encrypted2 = cipher2.encrypt(plaintext2, None);
+
+        // Decrypt should work with new key
+        let decrypted2 = cipher2.decrypt(&encrypted2, None).unwrap();
+        assert_eq!(plaintext2, &decrypted2[..]);
+
+        // Old cipher can still decrypt its own ciphertexts
+        let old_decrypt = cipher1.decrypt(&encrypted, None).unwrap();
+        assert_eq!(plaintext, &old_decrypt[..]);
     }
 
     // ========== Ed25519 Signature Tests ==========

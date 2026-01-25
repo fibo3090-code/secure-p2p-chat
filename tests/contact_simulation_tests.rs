@@ -22,9 +22,8 @@ async fn simulation_contacts_lifecycle() {
     assert_eq!(manager.contacts.len(), 500);
 
     // 2. Modify Metadata (Simulate marking as Trusted)
-    for i in 0..50 {
-        let id = ids[i];
-        if let Some(contact) = manager.contacts.get_mut(&id) {
+    for id in ids.iter().take(50) {
+        if let Some(contact) = manager.contacts.get_mut(id) {
             contact.trust_state = TrustState::Trusted;
             contact.notes = "Verified in person".to_string();
             contact.tags.push("Work".to_string());
@@ -32,9 +31,8 @@ async fn simulation_contacts_lifecycle() {
     }
 
     // 3. Block malicious users
-    for i in 50..60 {
-        let id = ids[i];
-        if let Some(contact) = manager.contacts.get_mut(&id) {
+    for id in ids.iter().take(60).skip(50) {
+        if let Some(contact) = manager.contacts.get_mut(id) {
             contact.trust_state = TrustState::Blocked;
             contact.notes = "Spammer".to_string();
         }
@@ -56,9 +54,8 @@ async fn simulation_contacts_lifecycle() {
     assert_eq!(blocked_count, 10);
 
     // 5. Deletion
-    for i in 400..405 {
-        let id = ids[i];
-        manager.remove_contact(id);
+    for id in ids.iter().take(405).skip(400) {
+        manager.remove_contact(*id);
     }
 
     assert_eq!(manager.contacts.len(), 495);

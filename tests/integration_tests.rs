@@ -1,5 +1,6 @@
 use encodeur_rsa_rust::app::chat_manager::ChatManager;
 use encodeur_rsa_rust::types::{Config, Theme};
+use rand::RngCore;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -8,6 +9,11 @@ use uuid::Uuid;
 fn test_chat_lifecycle() {
     let mut manager = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
+
+    // Set encryption key for history (required for save/load)
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    manager.set_history_key(key);
 
     // 1. Create (Simulated)
     manager.create_local_chat_for_test(chat_id, "Initial Title".to_string());
@@ -26,7 +32,10 @@ fn test_chat_lifecycle() {
     let history_file = NamedTempFile::new().unwrap();
     manager.save_history(history_file.path()).unwrap();
     let mut reloaded = ChatManager::new(Config::default());
-    reloaded.load_history(history_file.path()).unwrap();
+    reloaded.set_history_key(key);
+    reloaded
+        .load_history_encrypted(history_file.path(), &key)
+        .unwrap();
     assert_eq!(reloaded.chats.get(&chat_id).unwrap().title, "Renamed Title");
 
     // 4. Delete
@@ -64,7 +73,7 @@ fn test_config_and_theme() {
         Theme::Dark,
         "Default theme should be Dark (as per types.rs)"
     );
-    assert_eq!(config.auto_host_on_startup, false);
+    assert!(!config.auto_host_on_startup);
 
     // Change settings
     config.theme = Theme::Midnight;

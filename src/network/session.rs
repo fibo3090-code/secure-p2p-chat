@@ -535,6 +535,7 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
         ProtocolMessage::Ping { seq } => Some(*seq),
         ProtocolMessage::TypingStart { seq } => Some(*seq),
         ProtocolMessage::TypingStop { seq } => Some(*seq),
+        ProtocolMessage::Rekey { seq, .. } => Some(*seq),
     }
 }
 
@@ -582,7 +583,7 @@ fn validate_message_sequence(
 /// Main message loop: send and receive encrypted messages with replay protection
 async fn run_message_loop<S>(
     mut stream: S,
-    cipher: AesCipher,
+    mut cipher: AesCipher,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     mut from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
 ) -> Result<()>
@@ -590,10 +591,18 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+    
+    // Key rotation constants
+    const REKEY_MESSAGE_COUNT: u64 = 100; // Rekey every 100 messages
+    const REKEY_TIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
 
     // Track last valid sequence number to detect replays and out-of-order messages
     // This is enforced at the transport layer, not just in the app layer
     let mut last_valid_seq: u64 = 0;
+    
+    // Track messages since last rekey for key rotation
+    let mut messages_since_rekey: u64 = 0;
+    let mut last_rekey_time = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -613,10 +622,28 @@ where
                                 // Extract sequence number from message and validate it
                                 match validate_message_sequence(&msg, &mut last_valid_seq) {
                                     Ok(_) => {
-                                        // Sequence is valid, emit the message
-                                        if let Err(e) = to_app_tx.send(SessionEvent::MessageReceived(msg)) {
-                                            tracing::error!("Failed to send MessageReceived event: {}", e);
-                                            return Err(anyhow!("Event channel closed: {}", e));
+                                        // Sequence is valid
+                                        // Check if this is a rekey message and handle it
+                                        if let ProtocolMessage::Rekey { nonce, .. } = &msg {
+                                            // Import and use the new key
+                                            use crate::core::rekey_session_key;
+                                            let current_key_bytes = cipher.get_current_key();
+                                            let next_key = rekey_session_key(&current_key_bytes, nonce.as_slice().try_into()
+                                                .map_err(|_| anyhow!("Invalid nonce length"))?);
+                                            cipher = AesCipher::new(&next_key)?;
+                                            messages_since_rekey = 0;
+                                            last_rekey_time = std::time::Instant::now();
+                                            tracing::info!("Session key rotated (received Rekey message)");
+                                            // Don't emit the Rekey message to the app
+                                        } else {
+                                            // Track message count for rekeying
+                                            messages_since_rekey += 1;
+                                            
+                                            // Emit the message
+                                            if let Err(e) = to_app_tx.send(SessionEvent::MessageReceived(msg)) {
+                                                tracing::error!("Failed to send MessageReceived event: {}", e);
+                                                return Err(anyhow!("Event channel closed: {}", e));
+                                            }
                                         }
                                     },
                                     Err(e) => {
@@ -652,6 +679,45 @@ where
 
             // Send to network
             Some(msg) = from_app_rx.recv() => {
+                // Check if we need to initiate rekeying
+                let should_rekey = messages_since_rekey >= REKEY_MESSAGE_COUNT ||
+                    last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL;
+                
+                if should_rekey {
+                    // Generate a new rekeying nonce
+                    use crate::core::{generate_rekey_nonce, rekey_session_key};
+                    
+                    let nonce = generate_rekey_nonce();
+                    
+                    // Create and send REKEY message with current sequence number
+                    let rekey_msg = ProtocolMessage::Rekey {
+                        nonce: nonce.to_vec(),
+                        seq: last_valid_seq + 1,
+                    };
+                    
+                    let rekey_plaintext = rekey_msg.to_plain_bytes();
+                    let rekey_encrypted = cipher.encrypt(&rekey_plaintext, None);
+                    
+                    if let Err(e) = send_packet(&mut stream, &rekey_encrypted).await {
+                        let err_msg = format!("Network send error (rekey): {}", e);
+                        tracing::error!("{}", err_msg);
+                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                        break;
+                    } else {
+                        tracing::debug!("Rekey message sent");
+                    }
+                    
+                    // Update our own cipher with the new key
+                    let current_key_bytes = cipher.get_current_key();
+                    let next_key = rekey_session_key(&current_key_bytes, &nonce);
+                    cipher = AesCipher::new(&next_key)?;
+                    
+                    // Reset rekey tracking
+                    messages_since_rekey = 0;
+                    last_rekey_time = std::time::Instant::now();
+                    tracing::info!("Session key rotated (initiated rekey)");
+                }
+                
                 tracing::debug!("Sending message: {:?}", msg);
 
                 let plaintext = msg.to_plain_bytes();
@@ -668,6 +734,8 @@ where
                     break;
                 } else {
                     tracing::debug!("Message sent successfully");
+                    // Track sent messages for rekeying
+                    messages_since_rekey += 1;
                 }
             }
         }
@@ -978,10 +1046,7 @@ mod tests {
         // - Implement periodic session key re-negotiation
         // - Add RekeyRequest protocol message
         // - Both sides independently track rekey schedule
-
-        assert!(
-            true,
-            "Transport-layer replay protection is now implemented in Issue #6 Phase 2"
-        );
+        //
+        // NOTE: Transport-layer replay protection is now implemented in Issue #6 Phase 2
     }
 }

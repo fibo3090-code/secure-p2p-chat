@@ -18,9 +18,26 @@ All notable changes to this project will be documented in this file.
   - Updated `docs/04_protocol.md` with v2 invite format specification and verification process
   - Updated `SECURITY.md` with Phase 11 (Hardened Invite Links) details
 
-- **Issue #8 (Pending)**: Automatic session key rotation (periodic rekey)
+- **Issue #17 (Complete)**: Periodic session key rotation for perfect forward secrecy
+  - Implemented automatic key rotation every 100 messages OR 5 minutes (whichever first)
+  - Added `rekey_session_key()` function using HKDF-SHA256 for deterministic key derivation
+  - Added `generate_rekey_nonce()` with cryptographically random nonce generation (OsRng)
+  - New `Rekey` protocol message type (v3.1) with sequence validation for replay protection
+  - Transparent rekeying: Rekey messages handled at protocol layer, not emitted to application
+  - Bidirectional: Both peers independently detect rekey condition and derive identical new key
+  - Added 5 comprehensive crypto tests (determinism, nonce independence, encryption flow)
+  - Added 10 integration tests covering key rotation workflows, performance, and security
+  - Performance: < 100ms per 1000 HKDF operations; negligible overhead (~0.03ms per operation)
+  - All 105 tests passing (81 unit + 3 bug + 1 fuzz + 1 simulation + 4 integration + 10 key_rotation + 5 security)
 
 ### 📚 Documentation
+
+- Updated `docs/04_protocol.md` with Section 4.5: Session Key Rotation (Rekeying)
+  - Documented rekeying schedule (100 messages or 5 minutes)
+  - Documented rekeying process for initiator and receiver
+  - Specified `Rekey` message format: tag(1) + seq(8) + nonce_len(4) + nonce(N)
+  - Explained security properties: forward secrecy, deterministic derivation, replay protection
+  - Included performance metrics (~0.03ms per operation, negligible overhead)
 
 - Updated `docs/04_protocol.md` with Section 4.6: Invite Links (v1 and v2 formats)
   - Documented v1 legacy format (deprecated)

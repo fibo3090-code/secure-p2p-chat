@@ -48,6 +48,12 @@ pub enum ProtocolMessage {
 
     /// Typing indicator - user stopped typing
     TypingStop { seq: u64 },
+
+    /// Session key rotation (rekeying) - contains random nonce for next key derivation
+    /// After receiving this message, peers independently derive the next session key using:
+    /// next_key = rekey_session_key(current_key, nonce)
+    /// All subsequent messages use the new key.
+    Rekey { nonce: Vec<u8>, seq: u64 },
 }
 
 impl std::fmt::Debug for ProtocolMessage {
@@ -89,6 +95,11 @@ impl std::fmt::Debug for ProtocolMessage {
             Self::Ping { seq } => f.debug_struct("Ping").field("seq", seq).finish(),
             Self::TypingStart { seq } => f.debug_struct("TypingStart").field("seq", seq).finish(),
             Self::TypingStop { seq } => f.debug_struct("TypingStop").field("seq", seq).finish(),
+            Self::Rekey { nonce, seq } => f
+                .debug_struct("Rekey")
+                .field("seq", seq)
+                .field("nonce_len", &nonce.len())
+                .finish(),
         }
     }
 }
@@ -199,6 +210,14 @@ impl ProtocolMessage {
             Self::TypingStop { seq } => {
                 v.push(8u8);
                 v.extend_from_slice(&seq.to_be_bytes());
+            }
+
+            Self::Rekey { nonce, seq } => {
+                v.push(10u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+                let len = (nonce.len() as u32).to_be_bytes();
+                v.extend_from_slice(&len);
+                v.extend_from_slice(nonce);
             }
         }
         v
@@ -445,6 +464,24 @@ impl ProtocolMessage {
                 }
                 let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 Some(Self::TypingStop { seq })
+            }
+            10 => {
+                if cursor + 8 + 4 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                cursor += 8;
+                let nonce_len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
+                cursor += 4;
+                // Nonce should be 16 bytes, but be defensive and cap at 256
+                if nonce_len > 256 {
+                    return None;
+                }
+                if cursor + nonce_len > b.len() {
+                    return None;
+                }
+                let nonce = b[cursor..cursor + nonce_len].to_vec();
+                Some(Self::Rekey { nonce, seq })
             }
             _ => None,
         }
