@@ -10,6 +10,7 @@ use encodeur_rsa_rust::core::{
     generate_rekey_nonce, rekey_session_key, AesCipher, ProtocolMessage,
 };
 use encodeur_rsa_rust::AES_KEY_SIZE;
+use rand::RngCore;
 use std::time::Instant;
 
 #[test]
@@ -41,7 +42,7 @@ fn test_rekey_different_nonces_different_keys() {
     rand::rngs::OsRng.fill_bytes(&mut original_key);
     rand::rngs::OsRng.fill_bytes(&mut nonce_1);
     rand::rngs::OsRng.fill_bytes(&mut nonce_2);
-    
+
     // Ensure nonces are different
     if nonce_1 == nonce_2 {
         nonce_2[0] = nonce_2[0].wrapping_add(1);
@@ -242,7 +243,7 @@ fn test_rekey_key_independence() {
     rand::rngs::OsRng.fill_bytes(&mut key_a);
     rand::rngs::OsRng.fill_bytes(&mut key_b);
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    
+
     // Ensure keys are different
     if key_a == key_b {
         key_b[0] = key_b[0].wrapping_add(1);

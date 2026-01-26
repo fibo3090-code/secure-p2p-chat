@@ -57,7 +57,10 @@ jobs:
           #   - OpenSSL is a transitive dependency via mdns-sd
           #   - Risk is mitigated by our use of constant-time AEAD operations
           #   - Awaiting upstream mdns-sd dependency update
-          cargo audit --ignore RUSTSEC-2020-0001
+          # RUSTSEC-2023-0071: RSA Marvin Attack (no fix available, using for signatures only)
+          # RUSTSEC-2025-0141: Bincode unmaintained (widely used, stable)
+          # RUSTSEC-2024-0436: Paste unmaintained (transitive via rav1e/image)
+          cargo audit --ignore RUSTSEC-2020-0001 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0436
 
   build-release:
     name: Build (Release)
