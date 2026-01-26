@@ -50,6 +50,17 @@ All notable changes to this project will be documented in this file.
   - Complete fix description with files and test coverage
   - Security guarantees: authenticity, integrity, uniqueness, non-repudiation
 
+### 🔧 Code Quality
+
+- **Hardcoded Cryptographic Values Remediation**: Replaced all hardcoded test keys and nonces
+  - Replaced hardcoded test keys/nonces with cryptographically secure random values (`OsRng`)
+  - Added `AES_GCM_TAG_SIZE` constant (16 bytes) to `src/lib.rs` for consistency
+  - Replaced magic numbers (12, 16) with named constants (`AES_NONCE_SIZE`, `AES_GCM_TAG_SIZE`)
+  - Added key uniqueness validation in key independence tests
+  - Files modified: `src/lib.rs`, `src/core/crypto.rs`, `src/network/session.rs`, `tests/key_rotation_tests.rs`
+  - Impact: Tests now use cryptographically secure random values instead of predictable patterns
+  - All 81 unit tests passing
+
 ---
 
 ## [1.7.3] - 2026-01-24
