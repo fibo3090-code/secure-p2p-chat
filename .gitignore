@@ -120,6 +120,7 @@ codeql-results.sarif
 assets/*
 !assets/README.md
 !assets/.gitkeep
+/assets/
 
 # Gemini / Local AI
 .gemini/
