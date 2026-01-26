@@ -429,9 +429,9 @@ impl AesCipher {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Build nonce: session_id (4 bytes) || counter (8 bytes)
-        let mut nonce_bytes = [0u8; 12];
+        let mut nonce_bytes = [0u8; crate::AES_NONCE_SIZE];
         nonce_bytes[0..4].copy_from_slice(&self.session_id);
-        nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
+        nonce_bytes[4..crate::AES_NONCE_SIZE].copy_from_slice(&counter.to_be_bytes());
 
         let nonce = Nonce::from(nonce_bytes);
 
@@ -454,25 +454,25 @@ impl AesCipher {
             .expect("AES-GCM encryption should not fail");
 
         // Format: nonce || ciphertext (includes tag)
-        let mut output = Vec::with_capacity(12 + ciphertext.len());
+        let mut output = Vec::with_capacity(crate::AES_NONCE_SIZE + ciphertext.len());
         output.extend_from_slice(&nonce_bytes);
         output.extend_from_slice(&ciphertext);
         output
     }
 
-    /// Decrypt payload with optional AAD: nonce(12) || ciphertext || tag(16)
+    /// Decrypt payload with optional AAD: nonce(AES_NONCE_SIZE) || ciphertext || tag(AES_GCM_TAG_SIZE)
     ///
     /// # Arguments
     /// * `payload` - Encrypted data in format nonce || ciphertext
     /// * `aad` - Optional Additional Authenticated Data (must match encryption AAD)
     pub fn decrypt(&self, payload: &[u8], aad: Option<&[u8]>) -> Option<Vec<u8>> {
-        if payload.len() < 12 + 16 {
+        if payload.len() < crate::AES_NONCE_SIZE + crate::AES_GCM_TAG_SIZE {
             return None; // Too small
         }
 
-        let (nonce_bytes, ciphertext) = payload.split_at(12);
+        let (nonce_bytes, ciphertext) = payload.split_at(crate::AES_NONCE_SIZE);
         // Convert nonce slice to array then to Nonce
-        let nonce_arr: [u8; 12] = match <[u8; 12]>::try_from(nonce_bytes) {
+        let nonce_arr: [u8; crate::AES_NONCE_SIZE] = match <[u8; crate::AES_NONCE_SIZE]>::try_from(nonce_bytes) {
             Ok(a) => a,
             Err(_) => return None,
         };

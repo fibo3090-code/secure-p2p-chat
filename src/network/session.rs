@@ -137,7 +137,7 @@ pub async fn run_host_session(
 
     // 7. Receive Ephemeral Public Key (plaintext)
     let client_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
-    if client_ephemeral_bytes.len() != 32 {
+    if client_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
         return Err(anyhow!("Invalid ephemeral key length"));
     }
     let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
@@ -349,7 +349,7 @@ pub async fn run_client_session(
 
     // 4. Receive Host Ephemeral Public Key
     let host_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
-    if host_ephemeral_bytes.len() != 32 {
+    if host_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
         return Err(anyhow!("Invalid ephemeral key length"));
     }
     let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
@@ -631,7 +631,7 @@ where
                                             // Handle rekeying
                                             use crate::core::rekey_session_key;
 
-                                            let received_nonce: [u8; 16] = nonce.as_slice().try_into()
+                                            let received_nonce: [u8; crate::AES_GCM_TAG_SIZE] = nonce.as_slice().try_into()
                                                 .map_err(|_| anyhow!("Invalid nonce length"))?;
 
                                             let current_key_bytes = cipher.get_current_key();
@@ -887,8 +887,8 @@ mod tests {
             Ok(client_aes_key)
         });
 
-        let host_aes_res: Result<[u8; 32]> = host_handle.await.unwrap();
-        let client_aes_res: Result<[u8; 32]> = client_handle.await.unwrap();
+        let host_aes_res: Result<[u8; crate::AES_KEY_SIZE]> = host_handle.await.unwrap();
+        let client_aes_res: Result<[u8; crate::AES_KEY_SIZE]> = client_handle.await.unwrap();
 
         let host_aes = host_aes_res.unwrap();
         let client_aes = client_aes_res.unwrap();

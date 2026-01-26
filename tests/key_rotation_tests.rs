@@ -15,8 +15,11 @@ use std::time::Instant;
 #[test]
 fn test_rekey_basic_key_derivation() {
     // Test that rekeying produces deterministic keys
-    let original_key = [42u8; AES_KEY_SIZE];
-    let nonce = [99u8; 16];
+    // Use cryptographically secure random values instead of hardcoded constants
+    let mut original_key = [0u8; AES_KEY_SIZE];
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut original_key);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     let rotated_key_1 = rekey_session_key(&original_key, &nonce);
     let rotated_key_2 = rekey_session_key(&original_key, &nonce);
@@ -31,9 +34,18 @@ fn test_rekey_basic_key_derivation() {
 #[test]
 fn test_rekey_different_nonces_different_keys() {
     // Different nonces should produce different keys
-    let original_key = [55u8; AES_KEY_SIZE];
-    let nonce_1 = [1u8; 16];
-    let nonce_2 = [2u8; 16];
+    // Use cryptographically secure random values
+    let mut original_key = [0u8; AES_KEY_SIZE];
+    let mut nonce_1 = [0u8; 16];
+    let mut nonce_2 = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut original_key);
+    rand::rngs::OsRng.fill_bytes(&mut nonce_1);
+    rand::rngs::OsRng.fill_bytes(&mut nonce_2);
+    
+    // Ensure nonces are different
+    if nonce_1 == nonce_2 {
+        nonce_2[0] = nonce_2[0].wrapping_add(1);
+    }
 
     let key_1 = rekey_session_key(&original_key, &nonce_1);
     let key_2 = rekey_session_key(&original_key, &nonce_2);
@@ -84,7 +96,9 @@ fn test_rekey_nonce_generation() {
 #[test]
 fn test_rekey_cipher_reset() {
     // Test that new ciphers created with rotated keys work correctly
-    let key_1 = [77u8; AES_KEY_SIZE];
+    // Use cryptographically secure random values
+    let mut key_1 = [0u8; AES_KEY_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut key_1);
     let cipher_1 = AesCipher::new(&key_1).unwrap();
 
     let plaintext = b"Test message before rekey";
@@ -114,12 +128,20 @@ fn test_rekey_cipher_reset() {
 fn test_rekey_sequence_produces_correct_chain() {
     // Test that multiple rekeying operations produce a proper key chain
     // and verify deterministic reproduction of the chain
-    let initial_key = [11u8; AES_KEY_SIZE];
+    // Use cryptographically secure random values
+    let mut initial_key = [0u8; AES_KEY_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut initial_key);
     let mut current_key = initial_key;
     let mut key_chain = vec![current_key];
 
     // Perform multiple rekeying operations and build the key chain
-    let nonces: Vec<[u8; 16]> = (0..5).map(|i| [i as u8; 16]).collect();
+    // Use cryptographically secure random nonces
+    let mut nonces = Vec::new();
+    for _ in 0..5 {
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        nonces.push(nonce);
+    }
 
     for nonce in &nonces {
         let prev_key = current_key;
@@ -154,14 +176,16 @@ fn test_rekey_sequence_produces_correct_chain() {
 #[test]
 fn test_rekey_bidirectional_peers() {
     // Simulate two peers rekeying to the same key
+    // Use cryptographically secure random values
 
     // Alice's side
-    let alice_key_1 = [42u8; AES_KEY_SIZE];
+    let mut alice_key_1 = [0u8; AES_KEY_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut alice_key_1);
     let nonce = generate_rekey_nonce();
     let alice_key_2 = rekey_session_key(&alice_key_1, &nonce);
 
     // Bob's side
-    let bob_key_1 = [42u8; AES_KEY_SIZE]; // Same starting key from ECDH
+    let bob_key_1 = alice_key_1; // Same starting key from ECDH
     let bob_key_2 = rekey_session_key(&bob_key_1, &nonce);
 
     // Both should derive the same next key
@@ -187,8 +211,11 @@ fn test_rekey_bidirectional_peers() {
 #[test]
 fn test_rekey_timing_performance() {
     // Ensure rekeying operations are fast (< 100ms for 1000 operations in debug mode)
-    let key = [88u8; AES_KEY_SIZE];
-    let nonce = [99u8; 16];
+    // Use cryptographically secure random values
+    let mut key = [0u8; AES_KEY_SIZE];
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     let start = Instant::now();
     for _ in 0..1000 {
@@ -208,9 +235,18 @@ fn test_rekey_timing_performance() {
 #[test]
 fn test_rekey_key_independence() {
     // Test that rotating from two different starting keys produces different results
-    let key_a = [111u8; AES_KEY_SIZE];
-    let key_b = [222u8; AES_KEY_SIZE];
-    let nonce = [99u8; 16];
+    // Use cryptographically secure random values
+    let mut key_a = [0u8; AES_KEY_SIZE];
+    let mut key_b = [0u8; AES_KEY_SIZE];
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut key_a);
+    rand::rngs::OsRng.fill_bytes(&mut key_b);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    
+    // Ensure keys are different
+    if key_a == key_b {
+        key_b[0] = key_b[0].wrapping_add(1);
+    }
 
     let rotated_a = rekey_session_key(&key_a, &nonce);
     let rotated_b = rekey_session_key(&key_b, &nonce);
@@ -223,7 +259,9 @@ fn test_rekey_key_independence() {
 fn test_rekey_message_preservation() {
     // Test that messages are correctly preserved through encryption/decryption
     // even with rekeying
-    let key = [77u8; AES_KEY_SIZE];
+    // Use cryptographically secure random values
+    let mut key = [0u8; AES_KEY_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut key);
 
     // Create multiple messages
     let messages = vec![
