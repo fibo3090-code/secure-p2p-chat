@@ -121,3 +121,7 @@ assets/*
 # Gemini / Local AI
 .gemini/
 .claude/
+GEMINI.md
+settings.local.json
+.vscode/extensions.json
+.vscode/settings.json
