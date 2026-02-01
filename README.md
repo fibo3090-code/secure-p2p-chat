@@ -122,7 +122,8 @@ Tips:
 
 ## 📸 Screenshots
 
-Screenshots of the chat list, message view, fingerprint dialog, and file transfer will be added here. If you have design feedback or want to contribute visuals, see [CONTRIBUTING.md](CONTRIBUTING.md).
+_[Coming Soon: Screenshots of the application in action will be added here. We plan to showcase the main chat view, the peer connection process, and the file transfer interface. If you have design suggestions or would like to contribute high-quality screenshots, please see our [CONTRIBUTING.md](CONTRIBUTING.md) guide!]_
+
 
 ---
 

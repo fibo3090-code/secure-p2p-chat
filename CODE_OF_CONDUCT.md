@@ -1,6 +1,4 @@
 # Code of Conduct
----
-**Automated update:** Documentation reviewed and annotated on 2026-01-04. Please verify and commit if acceptable.
 
 ## Our Pledge
 
