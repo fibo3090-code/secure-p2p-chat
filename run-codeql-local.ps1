@@ -46,6 +46,11 @@ function Run-Analysis {
     $outputFile = "codeql-results.sarif"
     $mountPoint = $null
 
+    # Use a temporary target directory to avoid CodeQL indexing build artifacts
+    # This prevents warnings about generated code in dependencies and clean-up issues
+    $env:CARGO_TARGET_DIR = Join-Path $env:TEMP "chat-p2p-codeql-target"
+    Write-Host "Setting CARGO_TARGET_DIR to '$env:CARGO_TARGET_DIR' to exclude artifacts from analysis." -ForegroundColor Cyan
+
     # Workaround for CodeQL on Windows with spaces in path:
     # We mount the current directory to a drive letter (e.g. X:)
     if ($originalLocation.Path.Contains(" ")) {
