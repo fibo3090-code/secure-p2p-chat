@@ -63,6 +63,16 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [1.7.4] - 2026-02-01
+
+### 🛠️ Developer Tooling
+
+- **Fixed CodeQL Local Script**: Fixed `run-codeql-local.ps1` to handle virtual drive mounting correctly.
+  - Removed redundant `Copy-Item` command that caused "Cannot overwrite file with itself" error.
+  - The script now correctly identifies that the virtual drive is mapped to the original workspace.
+
+---
+
 ## [1.7.3] - 2026-01-24
 
 ### 🔐 Security Enhancements

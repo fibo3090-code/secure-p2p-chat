@@ -1,7 +1,7 @@
 # Security Policy & Documentation
 
 **Last Updated:** January 24, 2026
-Application: Encrypted P2P Messenger v1.7.2+
+Application: Encrypted P2P Messenger v1.7.4+
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
 
@@ -265,7 +265,7 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 
 - **Task**: Add optional expiration timestamps to v2 invites and implement a revocation mechanism
 - **Current State**: Timestamp field is present in v2 invites but not yet validated
-- **Future Work**: 
+- **Future Work**:
   - Reject invites older than 30 days by default
   - Allow users to customize expiration (1 day, 1 week, 1 month, never)
   - Add invite revocation list (for stolen invite links)
@@ -300,15 +300,17 @@ Gather information about the vulnerability:
 
 #### Step 2: Submit Responsibly
 
-**Email**: security@fibo3090-code.dev *(replace with actual contact)*
+**Email**: <security@fibo3090-code.dev> *(replace with actual contact)*
 
 **DO NOT**:
+
 - ❌ Post on social media
 - ❌ Create public GitHub issues
 - ❌ Share the vulnerability with others without researcher agreement
 - ❌ Attempt to profit from the vulnerability (use bug bounty programs if available)
 
 **DO**:
+
 - ✅ Email only the security contact
 - ✅ Use PGP encryption if available (public key: see below)
 - ✅ Provide detailed technical information
@@ -377,6 +379,7 @@ Fingerprint: [FINGERPRINT - TO BE ADDED]
 ```
 
 **To Encrypt**:
+
 ```bash
 gpg --import security-key.asc
 echo "Your vulnerability report" | gpg --encrypt --armor --recipient security@fibo3090-code.dev
@@ -429,26 +432,31 @@ We recognize and thank researchers who responsibly disclose vulnerabilities:
 ### Current Focus (January 24, 2026)
 
 **Issue #1-#3**: ✅ COMPLETE
+
 - Added AAD support to AES-256-GCM
 - Verified payload size validation
 - Deployed GitHub Actions CI/CD
 
 **Issue #4**: ✅ COMPLETE
+
 - Created comprehensive [THREAT_MODEL.md](THREAT_MODEL.md) with threat scenarios and mitigations
 - Expanded SECURITY.md with responsible disclosure policy
 - Documented severity levels and response SLAs
 
 **Issue #5**: ✅ COMPLETE
+
 - Implemented Ed25519 support with signature scheme negotiation
 - Added identity key migration paths
 - Full backward compatibility with RSA-2048
 
 **Issue #6**: ✅ COMPLETE
+
 - Implemented replay protection at transport layer
 - Added per-session sequence validation
 - All replay attacks detected and rejected
 
 **Issue #8**: 📋 NEXT
+
 - Automatic session key rotation (periodic rekey)
 - Implement RekeyRequest message type
 - Timeline: 2-3 weeks

@@ -2,7 +2,7 @@
 
 **Version:** 1.0  
 **Last Updated:** January 24, 2026  
-**Application:** Encrypted P2P Messenger v1.7.2+
+**Application:** Encrypted P2P Messenger v1.7.4+
 
 ---
 
@@ -77,6 +77,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 #### 1. Network Layer (TCP)
 
 **Threats:**
+
 - Passive eavesdropping on cleartext protocol negotiation
 - Active MITM attacks during handshake
 - Denial of service (slowloris, connection flooding)
@@ -84,6 +85,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 - Traffic analysis (packet timing, sizes)
 
 **Controls:**
+
 - Protocol version negotiation (fallback prevention)
 - ECDH-first encrypted tunnel (identity privacy)
 - Sequence number-based replay protection
@@ -93,6 +95,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 #### 2. Cryptographic Layer (Encryption/Signing)
 
 **Threats:**
+
 - Weak key derivation function
 - Nonce reuse (catastrophic GCM failure)
 - Lack of authenticated encryption (tampering not detected)
@@ -100,6 +103,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 - Downgrade to weaker crypto (RSA vs. modern alternatives)
 
 **Controls:**
+
 - HKDF-SHA256 for key derivation (industry standard)
 - Atomic counters + session IDs prevent nonce reuse
 - AES-GCM + ChaCha20-Poly1305 provide authenticated encryption
@@ -109,12 +113,14 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 #### 3. Identity & Trust Management
 
 **Threats:**
+
 - Key substitution / MITM without fingerprint verification
 - Compromise of long-term identity keys
 - Fingerprint spoofing or collision (SHA-256 >> 64-bit display)
 - Weak fingerprint display (user confusion)
 
 **Controls:**
+
 - Fingerprint verification enforced (TOFU)
 - 64-bit fingerprint display (risk vs. usability trade-off)
 - RSA public key stored locally (no central CA)
@@ -124,12 +130,14 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 #### 4. Local Filesystem
 
 **Threats:**
+
 - Unencrypted identity key on disk
 - Unencrypted chat history
 - Temporary files with plaintext data
 - Residual memory after application exit
 
 **Controls:**
+
 - Chat history encrypted with ChaCha20-Poly1305
 - Identity keys stored unencrypted (password protection planned)
 - `zeroize` crate used to securely wipe secrets from memory
@@ -139,6 +147,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 #### 5. User Interface & UX
 
 **Threats:**
+
 - Password disclosure on screen during entry
 - Cached passwords in memory
 - Weak password validation
@@ -146,6 +155,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 - Social engineering (user tricks sender)
 
 **Controls:**
+
 - Blocking password gate (cannot use app without unlock)
 - Password-protected identity keys (mandatory)
 - No weak password acceptance
@@ -155,12 +165,14 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 #### 6. Dependency Chain
 
 **Threats:**
+
 - Malicious or vulnerable transitive dependencies
 - Supply chain attacks (compromised package registries)
 - Outdated crates with known CVEs
 - Unmaintained dependencies
 
 **Controls:**
+
 - `cargo-deny` license and CVE scanning in CI
 - GitHub Actions audit checks (RUSTSEC database)
 - Regular dependency updates
@@ -176,11 +188,13 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Capability**: Can observe all network traffic but cannot modify packets
 
 **Threats**:
+
 - Read message content if sent unencrypted
 - Infer communication patterns from packet sizes/timing
 - Correlate IP addresses to identify users
 
 **Our Defenses**:
+
 - ✅ All messages encrypted end-to-end (AES-256-GCM)
 - ✅ Protocol v3 hides identities in plaintext protocol
 - ⚠️ Cannot fully hide traffic patterns without onion routing (out of scope)
@@ -190,6 +204,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Capability**: Can observe AND modify network traffic, perform protocol attacks
 
 **Threats**:
+
 - Inject fake messages
 - Replace peer identity keys
 - Downgrade cryptography
@@ -197,6 +212,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 - Replay old messages
 
 **Our Defenses**:
+
 - ✅ GCM authentication detects tampering
 - ✅ Fingerprint verification prevents key substitution
 - ✅ Protocol v3 signature binding prevents MITM
@@ -208,6 +224,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Capability**: Can read files, access memory, install backdoors
 
 **Threats**:
+
 - Steal identity private keys
 - Read plaintext chat history
 - Hijack active sessions
@@ -215,6 +232,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 - Backdoor the application
 
 **Our Defenses**:
+
 - ⚠️ Identity keys unencrypted on disk (password protection planned)
 - ✅ Chat history encrypted with ChaCha20-Poly1305
 - ✅ Session keys kept in memory only (forward secrecy)
@@ -226,12 +244,14 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Capability**: Can send arbitrary messages, observe your traffic patterns, attempt social engineering
 
 **Threats**:
+
 - Send malicious messages or files
 - Observe conversation patterns
 - Impersonate legitimate contacts (if credentials stolen)
 - Denial of service (flood messages)
 
 **Our Defenses**:
+
 - ✅ GCM authentication prevents message forgery
 - ✅ You can block/remove contacts
 - ✅ Rate limiting prevents flood attacks
@@ -243,12 +263,14 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Capability**: Can perform large-scale cryptanalytic attacks, exploit weaknesses in primitives
 
 **Threats**:
+
 - Brute-force AES-256-GCM keys
 - Collision attacks on SHA-256 fingerprints
 - Weak random number generation
 - Side-channel attacks on X25519
 
 **Our Defenses**:
+
 - ✅ AES-256-GCM: 256-bit key → 2^256 brute-force cost (infeasible)
 - ✅ SHA-256: No known collisions (cryptographically secure)
 - ✅ `getrandom` crate for cryptographic RNG
@@ -260,11 +282,13 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Capability**: Can compromise an upstream dependency or crate registry
 
 **Threats**:
+
 - Inject malicious code into dependencies
 - Create vulnerable versions
 - Perform timing attacks or weak crypto
 
 **Our Defenses**:
+
 - ✅ `cargo-deny` audits all dependencies
 - ✅ CI automatically checks for known CVEs
 - ✅ Regular dependency updates
@@ -280,10 +304,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Read user messages over ISP link
 
 **Attack Flow**:
+
 1. Attacker captures all TCP traffic between two peers
 2. Attempts to decrypt messages
 
 **Outcome**:
+
 - ✅ **MITIGATED**: All messages encrypted with AES-256-GCM
 - Messages remain confidential even if network is compromised
 
@@ -294,11 +320,13 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Intercept communication and impersonate peer
 
 **Attack Flow**:
+
 1. Attacker positions themselves on network path between Alice and Bob
 2. Attacker creates two sessions: Alice↔Attacker, Attacker↔Bob
 3. Attacker forwards messages while reading plaintext
 
 **Outcome**:
+
 - ✅ **MITIGATED** (mostly): Fingerprint verification prevents this
 - When Bob's identity arrives, Alice compares fingerprint
 - If Alice verifies fingerprint with Bob out-of-band (phone, email), attack fails
@@ -312,10 +340,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Decrypt past messages by compromising session key
 
 **Attack Flow**:
+
 1. Attacker steals session key from Alice's memory (malware)
 2. Attacker uses key to decrypt captured past messages
 
 **Outcome**:
+
 - ✅ **MITIGATED**: Forward secrecy via X25519 ECDH
 - Old session keys are NOT recoverable from compromised long-term keys
 - Only future sessions from compromise point are at risk
@@ -327,10 +357,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Repeat a previously sent message to mislead recipient
 
 **Attack Flow**:
+
 1. Attacker captures an old encrypted message
 2. Attacker replays it to the peer at a later date
 
 **Outcome**:
+
 - ✅ **MITIGATED**: Sequence numbers in protocol
 - Replayed message has old sequence number
 - Recipient detects duplicate/out-of-order and rejects
@@ -342,10 +374,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Read historical chat messages from compromised disk
 
 **Attack Flow**:
+
 1. Attacker gains physical or filesystem access to Alice's computer
 2. Attacker copies the chat history database
 
 **Outcome**:
+
 - ✅ **MITIGATED** (partially): Chat history encrypted with ChaCha20-Poly1305
 - Attacker has encrypted blobs without decryption key
 - ⚠️ **RISK**: Key stored on disk in plaintext (planned: password protection)
@@ -358,10 +392,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Impersonate Alice by stealing her long-term RSA key
 
 **Attack Flow**:
+
 1. Attacker gains filesystem access and copies `identity/alice_privkey.pem`
 2. Attacker uses key to sign sessions and impersonate Alice
 
 **Outcome**:
+
 - ✅ **MITIGATED** (planned): Password-protected key storage
 - Currently: Identity key on disk in plaintext (HIGH RISK)
 - Future: Argon2 + AES-256 encryption with password
@@ -374,10 +410,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Crash or disable the application via network overload
 
 **Attack Flow**:
+
 1. Attacker sends thousands of connection requests to target
 2. Application runs out of resources (memory, file descriptors)
 
 **Outcome**:
+
 - ✅ **MITIGATED**: Rate limiting per IP address
 - Excessive connections from single IP rejected
 - Global connection limit prevents resource exhaustion
@@ -389,10 +427,12 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Attacker Goal**: Decrypt messages by breaking AES-256-GCM
 
 **Attack Flow**:
+
 1. Attacker attempts cryptanalytic attack (brute force, key derivation weakness, nonce reuse)
 
 **Outcome**:
-- ✅ **MITIGATED**: 
+
+- ✅ **MITIGATED**:
   - 256-bit key space → 2^256 brute-force (infeasible, ~10^77 operations)
   - HKDF-SHA256 is cryptographically sound
   - Atomic counter + session ID prevent nonce reuse
@@ -507,39 +547,39 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 
 ### Medium Priority
 
-4. **Session Key Rotation**
+1. **Session Key Rotation**
    - Periodically re-negotiate session keys during long sessions
    - Reduce data exposure if a single key is compromised
    - **Impact**: Defense-in-depth against session key compromise
 
-5. **Clipboard Protection**
+2. **Clipboard Protection**
    - Auto-clear clipboard after 30 seconds of paste
    - Prevent accidental message leaks
    - **Impact**: User operational security
 
-6. **Out-of-Band Fingerprint Verification**
+3. **Out-of-Band Fingerprint Verification**
    - Built-in QR code exchange for fingerprints
    - One-click verification via phone
    - **Impact**: Improve user experience of TOFU verification
 
 ### Lower Priority (Future)
 
-7. **Onion Routing Integration (Tor)**
+1. **Onion Routing Integration (Tor)**
    - Route connections through Tor for additional privacy
    - Hide IP addresses from peers
    - **Impact**: Defend against traffic analysis and IP-based tracking
 
-8. **Post-Quantum Cryptography (PQC)**
+2. **Post-Quantum Cryptography (PQC)**
    - Hybrid classical/PQC handshake (CRYSTALS-Kyber, CRYSTALS-Dilithium)
    - Prepare for future quantum threats
    - **Impact**: Long-term cryptographic security
 
-9. **Formal Protocol Verification**
+3. **Formal Protocol Verification**
    - Use ProVerif or similar tool to formally verify Protocol v3
    - Mathematically prove security properties
    - **Impact**: High confidence in protocol design
 
-10. **Hardware Signing Support**
+4. **Hardware Signing Support**
     - Integration with hardware wallets / security keys (FIDO2)
     - Isolate identity key to secure enclave
     - **Impact**: Enterprise-grade security

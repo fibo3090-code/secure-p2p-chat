@@ -76,7 +76,8 @@ function Run-Analysis {
         }
 
         Write-Host "Analyzing database..." -ForegroundColor Cyan
-        codeql database analyze $dbName --format=sarif-latest --output=$outputFile --download
+        # Specify the standard Rust queries pack
+        codeql database analyze $dbName codeql/rust-queries --format=sarif-latest --output=$outputFile --download
 
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Analysis complete. Results saved to '$outputFile'" -ForegroundColor Green
@@ -84,8 +85,9 @@ function Run-Analysis {
             
             # Copy result back to original location if we are mounted
             if ($mountPoint) {
-                Copy-Item $outputFile "$originalLocation\$outputFile" -Force
-                Write-Host "Copied results to original directory."
+                # When using subst, the drive directly maps to the original folder,
+                # so the file is already there. No copy needed.
+                Write-Host "Results are available at: $originalLocation\$outputFile"
             }
         }
         else {
