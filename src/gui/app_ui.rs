@@ -415,6 +415,24 @@ impl App {
             duration: std::time::Duration::from_secs(4),
         });
     }
+
+    /// Returns true if any dialog that should be modal is currently open.
+    pub fn is_any_modal_open(&self) -> bool {
+        self.show_welcome
+            || self.chat_to_delete.is_some()
+            || self.show_host_dialog
+            || self.show_connect_dialog
+            || self.show_add_contact
+            || self.show_create_group
+            || self.show_rename_dialog
+            || self.show_settings
+            || self.show_about
+            || self.show_fingerprint_dialog
+            || self.show_password_dialog
+            || self.show_set_password_dialog
+            || self.show_remove_password_dialog
+            || self.show_clear_history_dialog
+    }
 }
 
 impl eframe::App for App {
@@ -514,32 +532,41 @@ impl eframe::App for App {
             }
         }
 
+        let any_modal_open = self.is_any_modal_open();
+
         // Top panel - Menu bar
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Connection menu
-                ui.menu_button("🔌 Connection", |ui| {
-                    if ui.button("🎤 Start Host").clicked() {
-                        self.show_host_dialog = true;
-                        ui.close_menu();
+            ui.add_enabled_ui(!any_modal_open, |ui| {
+                ui.horizontal(|ui| {
+                    // Connection menu
+                    ui.menu_button("🔌 Connection", |ui| {
+                        if ui.button("🎤 Start Host").clicked() {
+                            if let Ok(manager) = self.chat_manager.try_lock() {
+                                self.host_port = manager.config.listen_port.to_string();
+                            }
+                            self.show_host_dialog = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("🔌 Connect to Host").clicked() {
+                            self.connect_host.clear();
+                            self.connect_port = PORT_DEFAULT.to_string();
+                            self.show_connect_dialog = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    if ui.button("Contacts").clicked() {
+                        self.show_contacts = true;
                     }
-                    if ui.button("🔌 Connect to Host").clicked() {
-                        self.show_connect_dialog = true;
-                        ui.close_menu();
+
+                    if ui.button("Settings").clicked() {
+                        self.show_settings = true;
+                    }
+
+                    if ui.button("Help").clicked() {
+                        self.show_welcome = true;
                     }
                 });
-
-                if ui.button("Contacts").clicked() {
-                    self.show_contacts = true;
-                }
-
-                if ui.button("Settings").clicked() {
-                    self.show_settings = true;
-                }
-
-                if ui.button("Help").clicked() {
-                    self.show_welcome = true;
-                }
             });
         });
 
@@ -547,81 +574,92 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("status_panel")
             .resizable(false)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
-                if let Ok(manager) = self.chat_manager.try_lock() {
-                    let listen_port = manager.config.listen_port;
-                    let host_title = format!("Host on :{}", listen_port);
-                    let is_listening = manager.chats.values().any(|c| c.title == host_title);
-                    let sessions = manager.sessions_len();
-                    let toasts = manager.toasts.len();
+                ui.add_enabled_ui(!any_modal_open, |ui| {
+                    ui.add_space(4.0);
+                    if let Ok(manager) = self.chat_manager.try_lock() {
+                        let listen_port = manager.config.listen_port;
+                        let host_title = format!("Host on :{}", listen_port);
+                        let is_listening = manager.chats.values().any(|c| c.title == host_title);
+                        let sessions = manager.sessions_len();
+                        let toasts = manager.toasts.len();
 
-                    ui.horizontal_wrapped(|ui| {
-                        if is_listening {
-                            ui.colored_label(
-                                crate::gui::styling::SUCCESS,
-                                format!("🟢 Hosting on :{}", listen_port),
-                            );
-                            if ui.button("Copy address").clicked() {
-                                if let Some(ip) = crate::util::primary_local_ipv4() {
-                                    ui.output_mut(|o| {
-                                        o.copied_text = format!("{ip}:{listen_port}")
-                                    });
-                                } else {
-                                    ui.output_mut(|o| {
-                                        o.copied_text = format!("localhost:{listen_port}")
-                                    });
+                        ui.horizontal_wrapped(|ui| {
+                            if is_listening {
+                                ui.colored_label(
+                                    crate::gui::styling::SUCCESS,
+                                    format!("🟢 Hosting on :{}", listen_port),
+                                );
+                                if ui.button("Copy address").clicked() {
+                                    if let Some(ip) = crate::util::primary_local_ipv4() {
+                                        ui.output_mut(|o| {
+                                            o.copied_text = format!("{ip}:{listen_port}")
+                                        });
+                                    } else {
+                                        ui.output_mut(|o| {
+                                            o.copied_text = format!("localhost:{listen_port}")
+                                        });
+                                    }
                                 }
+                            } else {
+                                ui.colored_label(crate::gui::styling::ERROR, "⚠ Not hosting");
                             }
-                        } else {
-                            ui.colored_label(crate::gui::styling::ERROR, "⚠ Not hosting");
-                        }
 
-                        ui.separator();
-                        ui.label(format!("Sessions: {sessions}"));
-                        ui.separator();
-                        ui.label(format!("Toasts: {toasts}"));
-                    });
-                } else {
-                    ui.colored_label(
-                        crate::gui::styling::SUBTLE_TEXT_COLOR,
-                        "Status unavailable (busy)",
-                    );
-                }
+                            ui.separator();
+                            ui.label(format!("Sessions: {sessions}"));
+                            ui.separator();
+                            ui.label(format!("Toasts: {toasts}"));
+                        });
+                    } else {
+                        ui.colored_label(
+                            crate::gui::styling::SUBTLE_TEXT_COLOR,
+                            "Status unavailable (busy)",
+                        );
+                    }
+                });
             });
 
         // Sidebar - Chat list
         egui::SidePanel::left("sidebar")
             .default_width(250.0)
             .show(ctx, |ui| {
-                crate::gui::sidebar::render_sidebar(self, ui);
+                ui.add_enabled_ui(!any_modal_open, |ui| {
+                    crate::gui::sidebar::render_sidebar(self, ui);
+                });
             });
 
         // Main panel - Messages
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(chat_id) = self.selected_chat {
-                crate::gui::chat_view::render_chat(self, ui, chat_id);
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading("No chat selected");
-                        ui.label("Start hosting, connect to a peer, or invite a friend.");
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("🎤 Start Host").clicked() {
-                                self.show_host_dialog = true;
-                            }
-                            if ui.button("🔌 Connect").clicked() {
-                                self.show_connect_dialog = true;
-                            }
-                            if ui.button("📨 Invite").clicked() {
-                                self.show_contacts = true;
-                                self.show_add_contact = true;
-                                self.contact_tab = 1; // invite link tab
-                            }
+            ui.add_enabled_ui(!any_modal_open, |ui| {
+                if let Some(chat_id) = self.selected_chat {
+                    crate::gui::chat_view::render_chat(self, ui, chat_id);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading("No chat selected");
+                            ui.label("Start hosting, connect to a peer, or invite a friend.");
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("🎤 Start Host").clicked() {
+                                    if let Ok(manager) = self.chat_manager.try_lock() {
+                                        self.host_port = manager.config.listen_port.to_string();
+                                    }
+                                    self.show_host_dialog = true;
+                                }
+                                if ui.button("🔌 Connect").clicked() {
+                                    self.connect_host.clear();
+                                    self.connect_port = PORT_DEFAULT.to_string();
+                                    self.show_connect_dialog = true;
+                                }
+                                if ui.button("📨 Invite").clicked() {
+                                    self.show_contacts = true;
+                                    self.show_add_contact = true;
+                                    self.contact_tab = 1; // invite link tab
+                                }
+                            });
                         });
                     });
-                });
-            }
+                }
+            });
         });
 
         // Toasts overlay

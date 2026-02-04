@@ -632,6 +632,14 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("➕ Add Contact").clicked() {
+                    // Reset fields before showing the dialog to ensure a clean state
+                    app.new_contact_name.clear();
+                    app.new_contact_address.clear();
+                    app.new_contact_fingerprint.clear();
+                    app.new_contact_pubkey.clear();
+                    app.invite_link_input.clear();
+                    app.my_invite_link = None;
+                    app.qr_code_texture = None;
                     app.show_add_contact = true;
                 }
 
@@ -694,6 +702,8 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                     .unwrap_or(true);
                                 if should_prompt_connect {
                                     // Pre-open connect dialog; the connect action will now bind to selected_chat
+                                    app.connect_host.clear();
+                                    app.connect_port = crate::PORT_DEFAULT.to_string();
                                     app.show_connect_dialog = true;
                                 }
 
