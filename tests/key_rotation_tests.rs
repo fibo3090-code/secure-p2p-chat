@@ -10,17 +10,15 @@ use encodeur_rsa_rust::core::{
     generate_rekey_nonce, rekey_session_key, AesCipher, ProtocolMessage,
 };
 use encodeur_rsa_rust::AES_KEY_SIZE;
-use rand::RngCore;
+use rand::Rng;
 use std::time::Instant;
 
 #[test]
 fn test_rekey_basic_key_derivation() {
     // Test that rekeying produces deterministic keys
     // Use cryptographically secure random values instead of hardcoded constants
-    let mut original_key = [0u8; AES_KEY_SIZE];
-    let mut nonce = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut original_key);
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let original_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let nonce: [u8; 16] = rand::thread_rng().r#gen();
 
     let rotated_key_1 = rekey_session_key(&original_key, &nonce);
     let rotated_key_2 = rekey_session_key(&original_key, &nonce);
@@ -36,12 +34,9 @@ fn test_rekey_basic_key_derivation() {
 fn test_rekey_different_nonces_different_keys() {
     // Different nonces should produce different keys
     // Use cryptographically secure random values
-    let mut original_key = [0u8; AES_KEY_SIZE];
-    let mut nonce_1 = [0u8; 16];
-    let mut nonce_2 = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut original_key);
-    rand::rngs::OsRng.fill_bytes(&mut nonce_1);
-    rand::rngs::OsRng.fill_bytes(&mut nonce_2);
+    let original_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let mut nonce_1: [u8; 16] = rand::thread_rng().r#gen();
+    let mut nonce_2: [u8; 16] = rand::thread_rng().r#gen();
 
     // Ensure nonces are different
     if nonce_1 == nonce_2 {
@@ -98,8 +93,7 @@ fn test_rekey_nonce_generation() {
 fn test_rekey_cipher_reset() {
     // Test that new ciphers created with rotated keys work correctly
     // Use cryptographically secure random values
-    let mut key_1 = [0u8; AES_KEY_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut key_1);
+    let key_1: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
     let cipher_1 = AesCipher::new(&key_1).unwrap();
 
     let plaintext = b"Test message before rekey";
@@ -130,8 +124,7 @@ fn test_rekey_sequence_produces_correct_chain() {
     // Test that multiple rekeying operations produce a proper key chain
     // and verify deterministic reproduction of the chain
     // Use cryptographically secure random values
-    let mut initial_key = [0u8; AES_KEY_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut initial_key);
+    let initial_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
     let mut current_key = initial_key;
     let mut key_chain = vec![current_key];
 
@@ -139,8 +132,7 @@ fn test_rekey_sequence_produces_correct_chain() {
     // Use cryptographically secure random nonces
     let mut nonces = Vec::new();
     for _ in 0..5 {
-        let mut nonce = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce: [u8; 16] = rand::thread_rng().r#gen();
         nonces.push(nonce);
     }
 
@@ -180,8 +172,7 @@ fn test_rekey_bidirectional_peers() {
     // Use cryptographically secure random values
 
     // Alice's side
-    let mut alice_key_1 = [0u8; AES_KEY_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut alice_key_1);
+    let alice_key_1: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
     let nonce = generate_rekey_nonce();
     let alice_key_2 = rekey_session_key(&alice_key_1, &nonce);
 
@@ -213,10 +204,8 @@ fn test_rekey_bidirectional_peers() {
 fn test_rekey_timing_performance() {
     // Ensure rekeying operations are fast (< 100ms for 1000 operations in debug mode)
     // Use cryptographically secure random values
-    let mut key = [0u8; AES_KEY_SIZE];
-    let mut nonce = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut key);
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let nonce: [u8; 16] = rand::thread_rng().r#gen();
 
     let start = Instant::now();
     for _ in 0..1000 {
@@ -237,12 +226,9 @@ fn test_rekey_timing_performance() {
 fn test_rekey_key_independence() {
     // Test that rotating from two different starting keys produces different results
     // Use cryptographically secure random values
-    let mut key_a = [0u8; AES_KEY_SIZE];
-    let mut key_b = [0u8; AES_KEY_SIZE];
-    let mut nonce = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut key_a);
-    rand::rngs::OsRng.fill_bytes(&mut key_b);
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut key_a: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let mut key_b: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let nonce: [u8; 16] = rand::thread_rng().r#gen();
 
     // Ensure keys are different
     if key_a == key_b {
@@ -261,8 +247,7 @@ fn test_rekey_message_preservation() {
     // Test that messages are correctly preserved through encryption/decryption
     // even with rekeying
     // Use cryptographically secure random values
-    let mut key = [0u8; AES_KEY_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    let key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
 
     // Create multiple messages
     let messages = vec![

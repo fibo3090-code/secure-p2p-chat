@@ -734,11 +734,11 @@ mod tests {
 
     #[test]
     fn test_rekey_derives_correct_key() {
-        // Current key (32 bytes)
-        let current_key = [42u8; AES_KEY_SIZE];
+        // Current key (32 bytes) - randomly generated
+        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
 
         // Nonce for rekeying (16 bytes, random)
-        let nonce = [99u8; 16];
+        let nonce: [u8; 16] = rand::thread_rng().gen();
 
         // Derive next key
         let next_key = rekey_session_key(&current_key, &nonce);
@@ -753,8 +753,8 @@ mod tests {
     #[test]
     fn test_rekey_deterministic() {
         // Rekeying with the same inputs should produce the same output
-        let current_key = [111u8; AES_KEY_SIZE];
-        let nonce = [222u8; 16];
+        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
+        let nonce: [u8; 16] = rand::thread_rng().gen();
 
         let key1 = rekey_session_key(&current_key, &nonce);
         let key2 = rekey_session_key(&current_key, &nonce);
@@ -766,9 +766,13 @@ mod tests {
     #[test]
     fn test_rekey_different_nonces() {
         // Different nonces should produce different keys
-        let current_key = [123u8; AES_KEY_SIZE];
-        let nonce1 = [1u8; 16];
-        let nonce2 = [2u8; 16];
+        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
+        let nonce1: [u8; 16] = rand::thread_rng().gen();
+        let mut nonce2: [u8; 16] = rand::thread_rng().gen();
+        // Ensure nonces are different
+        if nonce1 == nonce2 {
+            nonce2[0] = nonce2[0].wrapping_add(1);
+        }
 
         let key1 = rekey_session_key(&current_key, &nonce1);
         let key2 = rekey_session_key(&current_key, &nonce2);
@@ -793,7 +797,7 @@ mod tests {
     #[test]
     fn test_rekey_encryption_flow() {
         // Test that rekeying doesn't break encryption/decryption
-        let current_key = [77u8; AES_KEY_SIZE];
+        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
         let cipher1 = AesCipher::new(&current_key).unwrap();
 
         // Encrypt message with first key

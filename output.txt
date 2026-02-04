@@ -1,0 +1,14 @@
+
+✅ Completed: Created a detailed tutorial for the TUI and updated the documentation index.
+
+Changes made:
+- Created a new markdown file `docs/tui_tutorial.md` with detailed instructions on TUI usage.
+- Updated `docs/SUMMARY.md` to include `tui_tutorial.md` and added a new "For TUI Users" section.
+
+Files modified:
+- `docs/tui_tutorial.md`
+- `docs/SUMMARY.md`
+
+Testing: Manual review of the generated markdown content and the `SUMMARY.md` file.
+
+Next steps: None - ready for review.
