@@ -9,8 +9,6 @@ use encodeur_rsa_rust::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-mod tui;
-
 #[derive(Debug, Parser)]
 #[command(author, version, about = "P2P Encrypted Messaging Application")]
 struct Args {

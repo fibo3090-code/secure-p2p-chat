@@ -1,5 +1,5 @@
-mod app;
-mod ui;
+pub mod app;
+pub mod ui;
 
 use crate::tui::app::TuiApp;
 use anyhow::Result;

@@ -148,6 +148,11 @@ impl ChatManager {
         self.chats.insert(id, chat);
     }
 
+    /// Helper to inject a mock session for testing
+    pub fn add_session_for_test(&mut self, chat_id: Uuid, handle: SessionHandle) {
+        self.sessions.insert(chat_id, handle);
+    }
+
     /// Add a contact
     pub fn add_contact(
         &mut self,
