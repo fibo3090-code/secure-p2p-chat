@@ -5,6 +5,9 @@ Application: Encrypted P2P Messenger v1.7.4+
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
 
+> [!IMPORTANT]
+> **tl;dr (Security Overview)**: This application implements industry-standard end-to-end encryption (AES-256-GCM) with perfect forward secrecy (X25519 ECDH). It follows a decentralized, serverless architecture where security is enforced through peer-to-peer verification (TOFU). Core identity keys and chat history are encrypted at rest.
+
 ---
 
 ## Table of Contents
@@ -12,32 +15,11 @@ This document provides comprehensive security information including the threat m
 1. [Security Overview](#security-overview)
 2. [Threat Model](#threat-model)
 3. [Cryptographic Specifications](#cryptographic-specifications)
-
-## Security Audit History
-
-### Internal Audit (December 18, 2025)
-
-**Status: PASSED (Excellent)**
-
-A comprehensive security audit was conducted on December 18, 2025.
-
-**Summary of Findings:**
-
-- **Identity Storage**: ✅ Secure (encrypted with Argon2id + ChaCha20Poly1305).
-- **Nonce Management**: ✅ Secure (atomic counters prevent reuse).
-- **Replay Protection**: ✅ Secure (transporter-layer sequence numbers).
-- **DoS Protection**: ✅ Secure (rate limiting and handshake timeouts).
-- **Protocol Security**: ✅ Secure (Protocol v3 implements forward secrecy and prevents MITM).
-
-**Conclusion**: No exploitable vulnerabilities were found in the core cryptographic design or implementation.
-
----
-
-## Applied Security Fixes
-
+4. [Security Audit History](#security-audit-history)
+5. [Applied Security Fixes](#applied-security-fixes)
 6. [Remaining Security Work](#remaining-security-work)
-2. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
-3. [Security Roadmap](#security-roadmap)
+7. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
+8. [Security Roadmap](#security-roadmap)
 
 ---
 
@@ -81,30 +63,6 @@ This document summarizes key protections; the detailed threat model covers:
 - **Known Limitations** (what we cannot protect against)
 - **Future Improvements** (planned security enhancements)
 
-### Protected Against
-
-- **Eavesdropping**: All messages are encrypted end-to-end with AES-256-GCM, making them unreadable to anyone who intercepts the traffic.
-- **Tampering**: GCM authentication tags detect any modification of messages in transit.
-- **Replay Attacks**: Sequence numbers prevent attackers from replaying old messages.
-- **Key Compromise**: Forward secrecy via X25519 ECDH ensures that past sessions remain secure even if long-term identity keys are compromised.
-- **Downgrade Attacks**: Protocol version negotiation prevents forcing use of weaker protocols.
-- **Data at Rest Compromise**: Chat history is encrypted with ChaCha20-Poly1305.
-- **Nonce Reuse**: Counter-based nonces guarantee uniqueness.
-
-### Assumptions
-
-This security model makes the following assumptions:
-
-- Users **verify fingerprints** on the first connection to prevent man-in-the-middle attacks.
-- The operating system is **not compromised**.
-- The application is used on a **trusted network** (e.g., a home LAN or a secure VPN).
-
-### Key Handling & Persistence
-
-- **Identity Keys**: Long-term RSA-2048 identity keys are generated locally and stored on disk, encrypted with a password-derived key using Argon2 and ChaCha20-Poly1305.
-- **Session Keys**: Ephemeral AES-256-GCM session keys are derived via X25519 ECDH + HKDF and are kept in memory only for the session lifetime.
-- **Fingerprints**: The RSA public key fingerprint is SHA-256 over the PEM bytes in lowercase hex.
-
 ---
 
 ## Cryptographic Specifications
@@ -143,6 +101,26 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 5. **Fingerprint Verification**:
    - The received RSA public key's fingerprint is verified against known contacts.
    - If unknown, the user is prompted to verify and trust the new identity (TOFU).
+
+---
+
+## Security Audit History
+
+### Internal Audit (December 18, 2025)
+
+**Status: PASSED (Excellent)**
+
+A comprehensive security audit was conducted on December 18, 2025.
+
+**Summary of Findings:**
+
+- **Identity Storage**: ✅ Secure (encrypted with Argon2id + ChaCha20Poly1305).
+- **Nonce Management**: ✅ Secure (atomic counters prevent reuse).
+- **Replay Protection**: ✅ Secure (transporter-layer sequence numbers).
+- **DoS Protection**: ✅ Secure (rate limiting and handshake timeouts).
+- **Protocol Security**: ✅ Secure (Protocol v3 implements forward secrecy and prevents MITM).
+
+**Conclusion**: No exploitable vulnerabilities were found in the core cryptographic design or implementation.
 
 ---
 
@@ -269,27 +247,9 @@ The handshake process has been upgraded to **Protocol v3** to eliminate metadata
 
 ---
 
-## Remaining Security Work
+## Security Roadmap
 
-### 🏃 Phase 8: Periodic Key Rotation (Future)
-
-1. **Session Key Rotation**:
-    - **Task**: Automatically re-negotiate the AES session key every N seconds or after M messages.
-    - **Why**: Improves long-term security by limiting the amount of data exposed if a single session key is ever compromised (forward secrecy over time).
-    - **Timeline**: 2-3 weeks
-
-2. **Professional Security Audit**:
-    - **Task**: Engage a third-party firm to perform a professional cryptographic review of the codebase.
-    - **Why**: Provides expert, unbiased validation of the application's security.
-
-### Phase 7 (Future): Invite Link Expiration & Revocation
-
-- **Task**: Add optional expiration timestamps to v2 invites and implement a revocation mechanism
-- **Current State**: Timestamp field is present in v2 invites but not yet validated
-- **Future Work**:
-  - Reject invites older than 30 days by default
-  - Allow users to customize expiration (1 day, 1 week, 1 month, never)
-  - Add invite revocation list (for stolen invite links)
+For the detailed security roadmap, including planned features like Key Rotation, Hardware Signing, and Post-Quantum Cryptography, please refer to the main **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)**.
 
 ---
 
@@ -322,165 +282,6 @@ Gather information about the vulnerability:
 #### Step 2: Submit Responsibly
 
 **Email**: <security@fibo3090-code.dev> *(replace with actual contact)*
-
-**DO NOT**:
-
-- ❌ Post on social media
-- ❌ Create public GitHub issues
-- ❌ Share the vulnerability with others without researcher agreement
-- ❌ Attempt to profit from the vulnerability (use bug bounty programs if available)
-
-**DO**:
-
-- ✅ Email only the security contact
-- ✅ Use PGP encryption if available (public key: see below)
-- ✅ Provide detailed technical information
-- ✅ Include your contact information (name, email, GitHub username)
-- ✅ Indicate whether you'd like credit for the discovery
-
-#### Step 3: Our Response
-
-Upon receiving your report, we will:
-
-1. **Initial Acknowledgment** (within 48 hours)
-   - Confirm receipt of your report
-   - Assign a ticket number for reference
-   - Ask any clarifying questions
-
-2. **Investigation & Validation** (3-10 days)
-   - Reproduce the vulnerability in our environment
-   - Assess severity and impact
-   - Identify affected versions
-   - Confirm root cause
-
-3. **Fix Development** (variable timeline)
-   - **Critical Severity** (RCE, loss of encryption): Fix within 1 week
-   - **High Severity** (auth bypass, data disclosure): Fix within 2 weeks
-   - **Medium Severity** (DoS, weak crypto): Fix within 1 month
-   - **Low Severity** (minor logic flaws): Fix in next release
-
-4. **Disclosure Coordination**
-   - We will propose a disclosure timeline (typically 30-90 days)
-   - Researcher must agree to embargo period
-   - Patch is released before public disclosure
-
-5. **Post-Release**
-   - Security advisory published on GitHub (in releases section)
-   - CVE requested (if applicable)
-   - Researcher credited (if desired)
-   - Post-mortem analysis published
-
-### Severity Levels & Response Times
-
-| Severity | Description | Response SLA | Fix SLA | Example |
-|----------|-------------|--------------|---------|---------|
-| **Critical** | Immediate threat to user security; remote code execution; loss of encryption | 2 hours | 1 week | Buffer overflow, key disclosure |
-| **High** | Significant impact; data disclosure or loss; authentication bypass | 4 hours | 2 weeks | Weak random number generation; plaintext key storage |
-| **Medium** | Moderate impact; requires attacker effort; limited exposure | 24 hours | 1 month | DoS attack; logic flaw in protocol |
-| **Low** | Minor impact; low exploitability; documentation improvement | 1 week | Next release | Typo; unused variable; weak log messages |
-
-### Vulnerability Embargo & Coordinated Disclosure Timeline
-
-**Default Embargo Period**: 30-90 days (negotiable based on severity)
-
-- **Day 0**: Vulnerability reported to us privately
-- **Day N (Disclosure Date)**: Patch released on GitHub
-- **Day N**: CVE (if applicable) is published
-- **Day N**: Security advisory published
-- **Day N + 1**: Researcher free to discuss publicly
-- **Day N + 7**: Full post-mortem (what happened, how we fixed it, how to prevent similar issues)
-
-### Encryption & Communication
-
-For extra confidentiality, researchers may encrypt reports using our security team's PGP key:
-
-```
-Public Key: [PGP KEY ID - TO BE ADDED]
-Fingerprint: [FINGERPRINT - TO BE ADDED]
-```
-
-**To Encrypt**:
-
-```bash
-gpg --import security-key.asc
-echo "Your vulnerability report" | gpg --encrypt --armor --recipient security@fibo3090-code.dev
-```
-
-*(PGP key and process to be finalized before public release)*
-
-### Security Hall of Fame
-
-We recognize and thank researchers who responsibly disclose vulnerabilities:
-
-| Researcher | Date | Vulnerability | Severity |
-|-----------|------|-----------------|----------|
-| *First researcher* | TBD | TBD | TBD |
-
-**Want your name here?** Help us improve security through responsible disclosure!
-
----
-
-## Security Roadmap
-
-### Completed Milestones ✅
-
-| Phase | Date | Work | Status |
-|-------|------|------|--------|
-| **Phase 1** | Dec 2025 | Immediate hardening (DoS protection, memory hygiene, logging sanitization) | ✅ Complete |
-| **Phase 2** | Dec 2025 | Protocol v3 (encrypted identity exchange, privacy) | ✅ Complete |
-| **Phase 3** | Jan 2026 | Dependency hardening, GitHub Actions CI, AAD in AES-GCM | ✅ Complete |
-| **Phase 4** | Jan 2026 | Threat model documentation, responsible disclosure policy | ✅ Complete |
-
-### Active Work 🔄
-
-| Phase | Target | Work | Timeline | Owner |
-|-------|--------|------|----------|-------|
-| **Phase 5** | v1.8.0 | Encrypted identity keystore (Argon2 + AES-256) | 2-3 weeks | @fibo3090-code |
-| **Phase 5** | v1.8.0 | Ed25519 migration (replace RSA-2048) | 3-4 weeks | @fibo3090-code |
-| **Phase 5** | v1.8.0 | Professional security audit | 4-6 weeks | TBD (external) |
-
-### Planned Work 📋
-
-| Phase | Target | Work | Timeline | Rationale |
-|-------|--------|------|----------|-----------|
-| **Phase 6** | v1.9.0 | Session key rotation policy | 2 weeks | Long-term key exposure reduction |
-| **Phase 6** | v1.9.0 | Clipboard auto-clear (30s timeout) | 1 week | UX security improvement |
-| **Phase 6** | v1.9.0 | Out-of-band fingerprint verification (QR codes) | 2 weeks | Improve TOFU UX |
-| **Phase 7** | v2.0.0 | Post-quantum cryptography (hybrid PQC) | 8-12 weeks | Future-proof against quantum threats |
-| **Phase 7** | v2.0.0 | Hardware signing support (FIDO2) | 4-6 weeks | Enterprise security |
-| **Phase 7** | v2.0.0 | Formal protocol verification (ProVerif) | 4-8 weeks | Mathematical proof of security |
-
-### Current Focus (January 24, 2026)
-
-**Issue #1-#3**: ✅ COMPLETE
-
-- Added AAD support to AES-256-GCM
-- Verified payload size validation
-- Deployed GitHub Actions CI/CD
-
-**Issue #4**: ✅ COMPLETE
-
-- Created comprehensive [THREAT_MODEL.md](THREAT_MODEL.md) with threat scenarios and mitigations
-- Expanded SECURITY.md with responsible disclosure policy
-- Documented severity levels and response SLAs
-
-**Issue #5**: ✅ COMPLETE
-
-- Implemented Ed25519 support with signature scheme negotiation
-- Added identity key migration paths
-- Full backward compatibility with RSA-2048
-
-**Issue #6**: ✅ COMPLETE
-
-- Implemented replay protection at transport layer
-- Added per-session sequence validation
-- All replay attacks detected and rejected
-
-**Issue #8**: 📋 NEXT
-
-- Automatic session key rotation (periodic rekey)
-- Implement RekeyRequest message type
-- Timeline: 2-3 weeks
 
 ---
 

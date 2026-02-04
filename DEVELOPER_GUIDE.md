@@ -1,8 +1,87 @@
 # Developer Guide
 
-This guide provides all the technical information you need to understand, build, and contribute to the Encrypted P2P Messenger.
+This comprehensive guide provides all the necessary information to understand, build, run, and contribute to the Encrypted P2P Messenger. It's intended for both new contributors and advanced users.
 
-## Code Quality Standards
+---
+
+## 1. What Is This?
+
+Encrypted P2P Messenger is a **desktop application** for secure messaging built with these principles:
+
+- **Privacy First**: No central server, no data collection, no tracking. Your conversations are your own.
+- **End-to-End Encryption**: RSA for identity, AES-256-GCM for messages. Messages are encrypted from send until receive.
+- **Forward Secrecy**: X25519 ECDH ensures past messages stay secure even if long-term keys are compromised.
+- **Peer-to-Peer**: Direct connections on your LAN or VPN—no central server as a single point of failure.
+- **Open Source**: The codebase is open for inspection, audit, and contribution.
+
+---
+
+## 2. Features
+
+- **Secure Messaging**: State-of-the-art encryption for all conversations.
+- **Encrypted Identity Exchange (Protocol v3)**: Identity is exchanged inside an encrypted tunnel so metadata is hidden from observers.
+- **Password-Protected Identity**: Your private key is encrypted on disk (Argon2 + ChaCha20-Poly1305). You must unlock with your password before using the app.
+- **Local Peer Discovery (mDNS)**: Optional automatic discovery of peers on your LAN.
+- **File Transfer**: Chunked, with progress; supports large files up to the configured maximum.
+- **Typing Indicators**, **Desktop Notifications**, **Emoji Picker**, **Drag & Drop** files.
+- **Invite Links & QR Codes**: Add contacts via `chat-p2p://invite/...` or a QR code.
+- **Local Persistence**: Chat history and identity stored locally; you control your data.
+- **Auto-Host & Auto-Rehost**: Optional auto-listen on startup and auto re-listen after a connection.
+
+---
+
+## 3. Prerequisites
+
+- **Rust 1.70+**: [rustup.rs](https://rustup.rs/)
+- **Network**: Same LAN or VPN to reach other users.
+
+---
+
+## 4. Building and Running the Application
+
+This section guides you through setting up your development environment, building the application from source, and running it.
+
+### 4.1. Development Setup
+
+1. **Install Rust**: Make sure you have the latest stable version of Rust installed from [rustup.rs](https://rustup.rs/).
+2. **Clone the repository**: `git clone <repository-url>`
+3. **Navigate to project directory**: `cd chat-p2p`
+4. **Build the project**: `cargo build`
+
+### 4.2. Build & Run Commands
+
+- **Build**: `cargo build`
+- **Build (Release, recommended for use)**: `cargo build --release`
+- **Run (GUI)**: `cargo run --release`
+
+> **Note**: The CLI is for launching the GUI. Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
+>
+> On first run (or when your identity is encrypted), you will see a **blocking unlock/set-password screen**. You must enter your password to unlock, or set a password for a new identity, before the main UI (chats, connections, etc.) is available. This cannot be bypassed.
+
+### 4.3. Platform-Specific Notes
+
+#### Windows
+
+- Use **PowerShell** or **Windows Terminal**.
+- **SmartScreen**: For packaged binaries, you may need “More info” → “Run anyway” if you trust the source.
+- **Packaging**: Use `./build-and-package.ps1` to produce a distributable build and installer. The installer places the app icon in Add/Remove Programs (Settings → Apps) via `encodeur_rsa_icon.ico`.
+- **PATH**: If `cargo` is not found, run `$env:Path += ';$HOME\.cargo\bin'` in PowerShell.
+
+---
+
+## 5. Verifying Fingerprints (Critical for Security)
+
+To protect against **Man-in-the-Middle (MITM)** attacks, you must **verify the fingerprint** of each contact on first connection.
+
+- A **fingerprint** is a 64-character hex string that uniquely identifies a public key.
+- **When**: On first connection and whenever a contact’s device or key may have changed.
+- **How**: Compare the fingerprint in the app with the one your peer provides over a **separate, secure channel** (e.g. phone call, in-person).
+- **Do not** verify over the same unencrypted channel you are about to protect.
+- **If they do not match**: Disconnect and investigate. Do not proceed.
+
+---
+
+## 6. Code Quality Standards
 
 This project adheres to high quality standards.
 
@@ -15,11 +94,13 @@ This project adheres to high quality standards.
   - **UI Tests**: (Planned) Tests for TUI and GUI rendering.
 - **Documentation**: All public APIs must be documented.
 
-## Architecture Overview
+---
 
-This is a secure, peer-to-peer messaging application for desktop, built with Rust and the `egui` graphical user interface library. It provides end-to-end encryption, forward secrecy, and file sharing capabilities, all without relying on a central server.
+## 7. Architecture Overview
 
-**Key Technologies:**
+This is a secure, peer-to-peer messaging application for desktop, built with Rust and the `egui` graphical user interface library. It provides end-to-end encryption, forward secrecy, and file sharing capabilities, all without relying on a central server. For a detailed architectural deep-dive, refer to the [Architecture Document](docs/03_architecture.md).
+
+### Key Technologies:
 
 - **Language:** Rust
 - **GUI:** `egui`
@@ -27,96 +108,33 @@ This is a secure, peer-to-peer messaging application for desktop, built with Rus
 - **Cryptography:** `rsa`, `aes-gcm`, `x25519-dalek`, `hkdf`
 - **Serialization:** `serde`, `serde_json`, `bincode`
 
-## 2. Architecture
+### High-Level Architecture
 
-### 2.1. Directory Structure
-
-```text
-chat-p2p/
-├── src/
-│   ├── main.rs (GUI application entrypoint)
-│   ├── lib.rs (Module exports and constants)
-│   ├── types.rs (Core data structures)
-│   ├── util.rs (Utility functions)
-│   │
-│   ├── app/ (Business Logic Layer)
-│   │   ├── mod.rs
-│   │   ├── chat_manager.rs (Core state management)
-│   │   └── persistence.rs (JSON history save/load)
-│   │
-│   ├── core/ (Cryptography & Protocol)
-│   │   ├── mod.rs
-│   │   ├── crypto.rs (RSA, AES-GCM, X25519)
-│   │   ├── framing.rs (Length-prefixed send/recv)
-│   │   └── protocol.rs (Message types and serialization)
-│   │
-│   ├── gui/ (GUI Layer)
-│   │   ├── mod.rs
-│   │   ├── app_ui.rs (Main application state)
-│   │   ├── chat_view.rs (Message display)
-│   │   ├── dialogs.rs (All pop-up dialogs)
-│   │   ├── help_view.rs (Help and about windows)
-│   │   ├── sidebar.rs (Chat list)
-│   │   ├── styling.rs (Theme and visuals)
-│   │   └── widgets.rs (Custom UI components)
-│   │
-│   ├── network/ (Network Layer)
-│   │   ├── mod.rs
-│   │   ├── discovery.rs (mDNS Peer Discovery)
-│   │   └── session.rs (TCP sessions and handshake)
-│   │
-│   ├── transfer/ (File Transfer Layer)
-│   │   ├── mod.rs
-│   │   ├── receiver.rs (Receiving files)
-│   │   └── sender.rs (Sending files)
-│   │
-│   └── identity/ (Identity Layer)
-│       └── mod.rs (Persistent user identity and RSA keys)
-│
-├── Cargo.toml
-├── README.md
-└── SECURITY.md
-```
-
-### 2.2. Layer Architecture
+The application is designed with a clear separation of concerns, following a layered architecture. This makes the codebase easier to understand, maintain, and test.
 
 ```text
 ┌─────────────────────────────────────┐
-│   GUI Layer (egui/eframe)           │  ← User interaction
+│   GUI Layer (egui/eframe)           │  ← Handles all user interaction and rendering.
 └──────────────┬──────────────────────┘
-               │ Arc<Mutex<ChatManager>>
+               │ Shares state via Arc<Mutex<ChatManager>>
 ┌──────────────▼──────────────────────┐
-│   Business Logic Layer              │  ← State management
+│   Business Logic Layer (app)        │  ← Manages the application's core state and logic.
 └──────────────┬──────────────────────┘
-               │ tokio channels
+               │ Communicates with other layers via tokio channels
     ┌──────────┼──────────┬──────────┐
     │          │          │          │
 ┌───▼───┐  ┌──▼────┐  ┌──▼────┐  ┌──▼──────┐
-│Network│  │Crypto │  │Transfer│ │Identity │
-│Session│  │       │  │        │ │         │
-│(TCP)  │  │RSA/AES│  │Files   │ │RSA Keys │
+│Network│  │Crypto │  │Transfer│ │Identity │  ← Core functionality layers.
+│(TCP)  │  │(RSA/AES)│  │(Files) │ │(RSA Keys) │
 └───────┘  └───────┘  └────────┘ └─────────┘
 ```
+For a detailed breakdown of the directory structure and module responsibilities, refer to the [Architecture Document](docs/03_architecture.md).
 
-### 2.3. Module Responsibilities
+---
 
-- **`src/main.rs` - GUI Application**: User interface and event handling.
-- **`src/app/chat_manager.rs` - Business Logic**: Core state management, session management, and message routing.
-- **`src/identity/mod.rs` - Identity System**: Persistent user identity, RSA key management.
-- **`src/core/crypto.rs` - Cryptography**: All cryptographic operations (RSA, AES-GCM, X25519).
-- **`src/core/protocol.rs` - Wire Protocol**: Message serialization and deserialization.
-- **`src/network/session.rs` - Network Sessions**: TCP connection management and handshake logic.
-- **`src/network/discovery.rs` - Peer Discovery**: Handles mDNS/Bonjour broadcasting and discovery of local peers.
-- **`src/transfer/` - File Transfer**: Chunked file sending and receiving.
-- **`src/types.rs` - Data Structures**: Shared types used throughout the application (`Chat`, `Message`, `Contact`).
+## 8. Protocol Specification
 
-#### Notable runtime events
-
-- `SessionEvent::NewConnection(chat_id, peer_meta)`: emitted on the host when a client connects and presents a chat identifier. Used by `ChatManager` to create/sync chats across peers.
-
-## 3. Protocol Specification
-
-### 3.1. Constants
+### 8.1. Constants
 
 These values are critical for compatibility:
 
@@ -130,7 +148,7 @@ const RSA_KEY_BITS: usize = 2048;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 ```
 
-### 3.2. Cryptography
+### 8.2. Cryptography
 
 - **RSA**: 2048 bits, OAEP with SHA-256 (RSA-OAEP-SHA256)
 - **AES**: AES-256-GCM
@@ -138,7 +156,7 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 - **Fingerprint**: sha256_hex(pem_bytes) in lowercase hex.
 - **Transport Format (Encrypted)**: `nonce(12) || ciphertext || tag(16)`
 
-### 3.3. Network Protocol
+### 8.3. Network Protocol
 
 #### TCP Framing (length-prefixed)
 
@@ -167,7 +185,7 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
    - The received RSA key fingerprint is checked against trusted contacts.
    - If unknown, the user is prompted to verify and trust the new identity (TOFU).
 
-### 3.4. Message Format
+### 8.4. Message Format
 
 ```rust
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -201,7 +219,7 @@ pub enum ProtocolMessage {
 }
 ```
 
-### 3.5. Invite Links
+### 8.5. Invite Links
 
 Invite links are a convenient way to share contact information. They are base64-encoded JSON objects with the following structure:
 
@@ -216,30 +234,16 @@ Invite links are a convenient way to share contact information. They are base64-
 
 The `address` field is optional. If it is not included, the recipient will need to manually enter the host and port when connecting.
 
-## 4. Building and Testing
+---
 
-### 4.1. Development Setup
-
-1. **Install Rust**: Make sure you have the latest stable version of Rust installed from [rustup.rs](https://rustup.rs/).
-2. **Clone the repository**: `git clone <repository-url>`
-3. **Build the project**: `cargo build`
-
-### 4.2. Build and Run Commands
-
-- **Build**: `cargo build`
-- **Build (Release)**: `cargo build --release`
-- **Run (GUI)**: `cargo run --release`
-
-> **Note**: Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
-
-### 4.3. Testing
+## 9. Testing
 
 - **Run all tests**: `cargo test`
 - **Run specific test**: `cargo test test_aes_roundtrip -- --exact`
 - **Code Formatting**: `cargo fmt`
 - **Linter**: `cargo clippy`
 
-#### Invite Link Parsing Tests
+### Invite Link Parsing Tests
 
 The `chat_manager.rs` file contains a test module with several tests for parsing invite links. These tests cover various scenarios, including:
 
@@ -250,18 +254,24 @@ The `chat_manager.rs` file contains a test module with several tests for parsing
 
 You can run these tests with `cargo test`.
 
-### 4.4. Logging & Diagnostics
+---
+
+## 10. Logging & Diagnostics
 
 - Logging uses `tracing` with `tracing-subscriber`.
 - Set `RUST_LOG="info,encodeur_rsa_rust=debug"` to increase verbosity.
 - The GUI integrates logs via `egui_tracing` for in-app viewing.
 
-### 4.5. Build Profiles
+---
+
+## 11. Build Profiles
 
 - `dev`: faster builds, debug assertions on.
 - `release`: optimized with `lto = true` and `codegen-units = 1` (see `Cargo.toml`).
 
-### 4.6. Developer Workflow
+---
+
+## 12. Developer Workflow
 
 1. **Create a feature branch**: `git checkout -b feature/new-feature`
 2. **Make changes**: Implement your feature or bug fix.
@@ -272,7 +282,9 @@ You can run these tests with `cargo test`.
 7. **Push changes**: `git push origin feature/new-feature`
 8. **Create a pull request**: Open a pull request on GitHub to merge your feature branch into `main`.
 
-### 4.7. Checklist: After a Bug Fix or New Feature
+---
+
+## 13. Checklist: After a Bug Fix or New Feature
 
 Before merging or releasing, ensure:
 
@@ -287,6 +299,19 @@ Before merging or releasing, ensure:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#checklist-after-a-bug-fix-or-new-feature) for the full checklist.
 
-## 5. Recent Changes
+---
+
+## 14. Recent Changes
 
 For a detailed history of changes, new features, and bug fixes, please refer to the [CHANGELOG.md](CHANGELOG.md) file.
+
+---
+
+## 15. Where to Go Next
+
+- **Development Plan**: [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)
+- **Architecture**: [docs/03_architecture.md](docs/03_architecture.md)
+- **Protocol**: [docs/04_protocol.md](docs/04_protocol.md)
+- **Security**: [SECURITY.md](SECURITY.md)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Design Notes**: [DESIGN_NOTES.md](DESIGN_NOTES.md)

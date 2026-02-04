@@ -497,7 +497,14 @@ impl eframe::App for App {
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let last = last_rehost.load(Ordering::Relaxed);
-                    let should_rehost = last == 0 || now_millis.saturating_sub(last) > 1500;
+                    let mut should_rehost = false;
+                    let timer_expired = last == 0 || now_millis.saturating_sub(last) > 1500;
+
+                    if timer_expired {
+                        if let Ok(manager) = self.chat_manager.try_lock() {
+                            should_rehost = manager.check_rehost_needed();
+                        }
+                    }
 
                     if should_rehost {
                         last_rehost.store(now_millis, Ordering::Relaxed);
@@ -578,8 +585,7 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     if let Ok(manager) = self.chat_manager.try_lock() {
                         let listen_port = manager.config.listen_port;
-                        let host_title = format!("Host on :{}", listen_port);
-                        let is_listening = manager.chats.values().any(|c| c.title == host_title);
+                        let is_listening = manager.is_hosting;
                         let sessions = manager.sessions_len();
                         let toasts = manager.toasts.len();
 

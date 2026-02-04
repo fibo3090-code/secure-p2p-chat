@@ -46,6 +46,9 @@ pub struct ChatManager {
     pub config: Config,
     pub fingerprint_verification_request: Option<(String, String, Uuid)>,
     pub history_key: Option<[u8; 32]>,
+    /// Tracks if the application intends to be hosting.
+    /// Used for auto-rehosting if the placeholder connection is consumed.
+    pub is_hosting: bool,
 }
 
 impl ChatManager {
@@ -84,6 +87,41 @@ impl ChatManager {
             fingerprint_verification_request: None,
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
+            is_hosting: false,
+        }
+    }
+
+    /// Check if we need to re-host (i.e. we want to be hosting, but no placeholder host exists).
+    /// Returns true if the caller should spawn a task to call `start_host`.
+    pub fn check_rehost_needed(&self) -> bool {
+        if !self.is_hosting {
+            return false;
+        }
+        // If we want to host, but no chat is a placeholder host, we need to restart.
+        !self.chats.values().any(|c| c.is_host_placeholder)
+    }
+
+    /// Stop hosting (user action).
+    pub fn stop_hosting(&mut self) {
+        self.is_hosting = false;
+        // Remove placeholder if exists
+        if let Some(id) = self
+            .chats
+            .values()
+            .find(|c| c.is_host_placeholder)
+            .map(|c| c.id)
+        {
+            self.toasts.push(Toast {
+                id: Uuid::new_v4(),
+                level: ToastLevel::Info,
+                message: "Stopped hosting".to_string(),
+                created_at: std::time::Instant::now(),
+                duration: Duration::from_secs(3),
+            });
+            self.chats.remove(&id);
+            self.sessions.remove(&id);
+            self.session_events.remove(&id);
+            self.fingerprint_confirm_senders.remove(&id);
         }
     }
 
@@ -332,8 +370,6 @@ impl ChatManager {
         }
     }
 
-
-
     /// Start hosting on specified port
     pub async fn start_host(&mut self, port: u16, privkey: RsaPrivateKey) -> Result<Uuid> {
         // Guard: if a placeholder host already exists, avoid spawning another.
@@ -396,6 +432,7 @@ impl ChatManager {
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
+        self.is_hosting = true;
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 

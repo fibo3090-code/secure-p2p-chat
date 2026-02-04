@@ -1,6 +1,6 @@
 # 🔒 Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.7.4-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.7.5-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
 [![Security](https://img.shields.io/badge/security-audited-success)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/)
@@ -17,47 +17,47 @@ A modern desktop application for encrypted messaging over local networks (LAN) o
 
 Encrypted P2P Messenger is a **desktop application** for secure messaging built with these principles:
 
-- **Privacy First**: No central server, no data collection, no tracking.
-- **End-to-End Encryption**: Military-grade cryptography.
-- **Forward Secrecy**: Past messages stay secure even if keys are compromised.
-- **Peer-to-Peer**: Direct connections between devices on your local network.
+- **Privacy First**: No central server, no data collection, no tracking. Your conversations are your own.
+- **End-to-End Encryption**: AES-256-GCM authenticated encryption for all traffic; RSA/Ed25519 for identity.
+- **Forward Secrecy**: X25519 ECDH ensures past messages stay secure even if long-term keys are compromised.
+- **Peer-to-Peer**: Direct connections on your LAN or VPN—no central server as a single point of failure.
 - **Open Source**: Transparent, auditable, and free forever.
 
 ---
 
-## ✨ Features
+## ✨ Key Features
 
-- **Secure messaging** with AES-256-GCM and X25519 forward secrecy
-- **Encrypted Identity Exchange (Protocol v3)**: Metadata protection (identity hidden from observers)
-- **DoS Protection**: Rate limiting and handshake hardening against flooding attacks
-- **Local peer discovery (mDNS)**: Automatically find nearby peers on your LAN
-- **File transfer** with chunking and progress
-- **Typing indicators** and desktop notifications
-- **Emoji picker** and drag & drop files
-- **Invite links & QR codes**: Share your contact info easily with a link or a scannable QR code.
-- **Local persistence** of history and identity (no server)
-- **Auto-host + Auto-rehost**: optional auto-start listening on launch and automatic re-listen after a connection consumes the placeholder host
+- **Security & Privacy**
+  - **Metadata Protection**: Protocol v3 hides identities from passive observers during the handshake.
+  - **Password-Protected Identity**: Private keys are encrypted on disk (Argon2 + ChaCha20-Poly1305).
+  - **Session Key Rotation**: Automatic re-keying every 100 messages or 5 minutes.
+  - **Replay Protection**: Transport-layer sequence numbers prevent message injection.
+  - **DoS Mitigation**: Global rate limiting and strict handshake timeouts.
+
+- **User Experience**
+  - **Local Discovery**: Automatically find peers on your LAN via mDNS (Bonjour/Avahi).
+  - **Rich Messaging**: Typing indicators, emojis, and desktop notifications.
+  - **File Transfer**: Drag-and-drop file sharing with chunked transmission and progress tracking.
+  - **Invite Links & QR Codes**: Share contact info via `chat-p2p://invite/...` or visual QR codes.
+  - **Zero-Config**: No accounts needed; uses a Trust-on-First-Use (TOFU) model.
 
 ---
 
 ## 💻 System Requirements & Compatibility
 
-| Platform | Status | Notes |
-|----------|--------|-------|
+| Platform | Status | Prerequisites |
+|----------|--------|---------------|
 | **Windows** | ✅ Supported | Requires [Bonjour Print Services](https://support.apple.com/kb/DL999) for peer discovery. |
-| **Linux** | ⚠️ Supported | Requires `avahi-daemon` and system libraries (`libgtk-3-dev`, `libxcb-dev`). |
-| **macOS** | ⚠️ Experimental | Should work natively (uses built-in Bonjour), but not actively packaged/tested. |
+| **Linux** | ⚠️ Supported | Requires `avahi-daemon` and libraries (`libgtk-3-dev`, `libxcb-dev`, `libfontconfig-dev`). |
+| **macOS** | ⚠️ Experimental | Works natively with built-in Bonjour; lacks automated packaging. |
 
-> **Note on Peer Discovery**: The application uses mDNS for local discovery. On Windows, you likely need **Bonjour Print Services** installed. On Linux, ensure `avahi-daemon` is running.
+---
 
-## 🚀 Installation
+## 🚀 Quick Start
 
-### Prerequisites
+### 1. Installation
 
-- **Rust 1.70+** (install from [rustup.rs](https://rustup.rs/))
-- **Network access** (same LAN or VPN)
-
-### Build & Run
+To build from source, ensure you have [Rust 1.70+](https://rustup.rs/) installed.
 
 ```bash
 # Clone the repository
@@ -71,68 +71,33 @@ cargo build --release
 cargo run --release
 ```
 
-> **Note**: The CLI is for launching the GUI. Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
+### 2. First Run (Unlock Identity)
 
-On first run (or when your identity is password-protected), you must **unlock with your password** or **set a password** for a new identity. The main app (chats, connections) is not available until that step is complete.
+On the first launch, you will be prompted to set a password for your new identity. This password encrypts your private keys at rest and is required every time you open the app. **This cannot be bypassed.**
 
-### Windows
+### 3. Verify Fingerprints (CRITICAL)
 
-- Recommended shell: PowerShell or Windows Terminal
-- If SmartScreen warns about an unknown app when running packaged binaries, choose “More info” → “Run anyway” (if you trust the source)
-- Packaging script (optional): `./build-and-package.ps1` produces a distributable build
-- If `cargo` is missing from PATH, run `$env:Path += ';$HOME\\.cargo\\bin'` in PowerShell, then retry `cargo build`
+To protect against **Man-in-the-Middle (MITM)** attacks:
 
-### Verify Fingerprints (CRITICAL for Security!)
-
-When you connect to another user, you must verify their fingerprint to prevent man-in-the-middle attacks. Compare the 64-character fingerprint shown in the application with the other user's fingerprint through a separate, secure channel (like a phone call).
-
-Tips:
-
-- Always verify at first contact and when a peer’s device changes.
-- Prefer voice or in-person verification over chat.
-- If fingerprints don’t match, disconnect and investigate.
+1. Connect to a peer.
+2. Compare the 64-character fingerprint (or the colored grid) shown in the app with the one your peer provides over a **separate, secure channel** (e.g., phone call, in-person).
+3. Only click **Trust** if they match exactly.
 
 ---
 
 ## 📚 Documentation
 
-### Quick Reference (Root Directory)
+### Core Guides
 
-- **[SECURITY.md](SECURITY.md)**: Comprehensive security policy, audit findings, and applied fixes
-- **[CHANGELOG.md](CHANGELOG.md)**: Release notes, fixes, and improvements
-- **[CONTRIBUTING.md](CONTRIBUTING.md)**: How to open issues and send PRs
-- **[ROADMAP.md](ROADMAP.md)**: Development roadmap and future plans
-- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: Technical guide covering architecture and protocols
-- **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: Comprehensive design & UI/UX guide
+- **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)**: Unified project roadmap, security initiatives, and backlog.
+- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: Architecture details, protocol specs, and build instructions.
+- **[SECURITY.md](SECURITY.md)**: Security policy, audit history, and vulnerability disclosure.
+- **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: UI/UX principles, design patterns, and visual language.
 
-### Detailed Documentation (`docs/` folder)
+### Technical Specs
 
-- **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)**: Introduction, features, build, run, and fingerprint verification
-- **[docs/03_architecture.md](docs/03_architecture.md)**: System architecture and components
-- **[docs/04_protocol.md](docs/04_protocol.md)**: Protocol specification and message formats
-
----
-
-## 🧭 Usage Notes (Invites, Contacts, Auto-Host/Reconnect)
-
-- **Invite links**: Paste a `chat-p2p://invite/...` link in Contacts → “Invite Link” tab. If the link contains `IP:PORT`, the fields auto-fill; invalid addresses are ignored safely.
-- **Generate my link**: Contacts → “Share my link” tab; we include your best-effort local IP + listen port when available.
-- **Contacts mapping**: Contact-to-chat associations are persisted so reconnects can resume sessions automatically.
-- **Auto-host**: Enable in Settings to start listening on launch; stale placeholder hosts are cleaned before rehosting.
-- **Auto-reconnect**: Enable `auto_connect` in settings to re-associate mapped contacts on startup with backoff-friendly logging.
-
----
-
-## 🛠️ Troubleshooting
-
-- **PATH on Windows**: If commands like `cargo` fail, run `$env:Path += ';$HOME\\.cargo\\bin'` in your shell or set it permanently via `[Environment]::SetEnvironmentVariable("Path", $env:Path + ';$HOME\\.cargo\\bin', 'User')` and restart the terminal.
-- **Accented paths**: If your project path includes accented characters, use PowerShell and `-LiteralPath` to avoid encoding issues.
-
----
-
-## 📸 Screenshots
-
-_[Coming Soon: Screenshots of the application in action will be added here. We plan to showcase the main chat view, the peer connection process, and the file transfer interface. If you have design suggestions or would like to contribute high-quality screenshots, please see our [CONTRIBUTING.md](CONTRIBUTING.md) guide!]_
+- **[docs/03_architecture.md](docs/03_architecture.md)**: Detailed system component mapping.
+- **[docs/04_protocol.md](docs/04_protocol.md)**: Handshake, framing, and message format specifications.
 
 ---
 

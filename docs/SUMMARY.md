@@ -9,11 +9,11 @@ Index of all project documentation for **Encrypted P2P Messenger** (v1.7.1).
 | Document | Purpose |
 |----------|---------|
 | [README.md](../README.md) | Project overview and quick start |
+| [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) | Unified project, security, and UI/UX roadmaps, and key development tasks |
+| [DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md) | Comprehensive guide for building, running, contributing, architecture, and protocol |
 | [SECURITY.md](../SECURITY.md) | Security policy, threat model, audit, and fixes |
 | [CHANGELOG.md](../CHANGELOG.md) | Release notes and changes |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | How to contribute |
-| [ROADMAP.md](../ROADMAP.md) | Roadmap and plans |
-| [DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md) | Architecture, protocol, build, test, and **post-change checklist** |
 | [DESIGN_NOTES.md](../DESIGN_NOTES.md) | UI/UX and design guide |
 | [LICENSE.md](../LICENSE.md) | MIT License |
 
@@ -23,15 +23,14 @@ Index of all project documentation for **Encrypted P2P Messenger** (v1.7.1).
 
 | Document | Purpose |
 |----------|---------|
-| [GETTING_STARTED.md](GETTING_STARTED.md) | **Introduction, features, build, run, and fingerprint verification** (replaces 01_introduction and 02_getting_started) |
-| [03_architecture.md](03_architecture.md) | System architecture and components |
+| [03_architecture.md](03_architecture.md) | Detailed system architecture and components |
 | [04_protocol.md](04_protocol.md) | Protocol specification and message formats |
 
 ---
 
 ## For Users
 
-- Start: [README.md](../README.md) → [GETTING_STARTED.md](GETTING_STARTED.md)
+- Start: [README.md](../README.md) → [DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md)
 - Security: [SECURITY.md](../SECURITY.md)
 
 ## For Contributors
@@ -43,7 +42,7 @@ Index of all project documentation for **Encrypted P2P Messenger** (v1.7.1).
 ## For Designers
 
 - [DESIGN_NOTES.md](../DESIGN_NOTES.md)
-- [ROADMAP.md](../ROADMAP.md)
+- [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md)
 
 ## For Security Researchers
 
