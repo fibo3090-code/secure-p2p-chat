@@ -1691,6 +1691,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.52.0",
  "x25519-dalek",
  "zeroize",
 ]

@@ -76,6 +76,13 @@ chacha20poly1305 = "0.10.1"
 mdns-sd = "0.11"
 hostname = "0.4"
 
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

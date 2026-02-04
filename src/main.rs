@@ -56,6 +56,25 @@ async fn main() -> anyhow::Result<()> {
         args.gui = true;
     }
 
+    // On Windows, if we are in TUI mode or explicitly requested console features,
+    // we need to attach to the parent console or allocate a new one.
+    #[cfg(target_os = "windows")]
+    if args.tui || args.host || args.connect.is_some() {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            // Try to attach to parent console (e.g. if launched from cmd/powershell)
+            if unsafe {
+                windows_sys::Win32::System::Console::AttachConsole(
+                    windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+                )
+            } == 0
+            {
+                // If attaching failed (e.g. launched from Explorer), allocate a new console
+                unsafe { windows_sys::Win32::System::Console::AllocConsole() };
+            }
+        }
+    }
+
     if args.tui {
         // Launch TUI
         tracing::info!("Starting TUI mode");
