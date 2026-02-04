@@ -1,97 +1,117 @@
-# TUI Tutorial for chat-p2p
+# TUI Tutorial for Encrypted P2P Messenger
 
 ## 1. Introduction
-This tutorial provides a comprehensive guide to using the Terminal User Interface (TUI) for the `chat-p2p` application. The TUI allows users to interact with the secure peer-to-peer chat system directly from their terminal, offering a lightweight and efficient way to communicate.
 
-## 2. Installation
-Before you can use the `chat-p2p` TUI, ensure you have the necessary prerequisites and follow the installation steps below.
+This tutorial provides a comprehensive guide to using the Terminal User Interface (TUI) for the `chat-p2p` application. The TUI allows you to interact with the secure peer-to-peer chat system directly from your terminal, offering a lightweight and efficient way to communicate without a graphical window manager.
+
+## 2. Installation & Prerequisites
+
+To use the TUI, you need to build the application with the TUI features.
 
 ### Prerequisites
-- Rust programming language and Cargo package manager (install via rustup: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- A compatible terminal emulator (e.g., Alacritty, GNOME Terminal, iTerm2, Windows Terminal)
 
-### Steps
-1. Clone the `chat-p2p` repository:
+- **Rust Toolchain**: Install via [rustup](https://rustup.rs/)
+- **Terminal Emulator**: Any modern terminal (Alacritty, Windows Terminal, iTerm2, GNOME Terminal)
+
+### Build Instructions
+
+1. Clone the repository:
+
    ```bash
-   git clone https://github.com/your-repo/chat-p2p.git
-   cd chat-p2p
+   git clone https://github.com/fibo3090-code/secure-p2p-chat.git
+   cd secure-p2p-chat
    ```
-2. Build the application with TUI feature enabled:
+
+2. Build the application in release mode:
+
    ```bash
-   cargo build --release --features tui
+   cargo build --release
    ```
-3. The executable will be located in `target/release/chat-p2p`.
 
-## 3. Basic Usage and Navigation
-This section covers the fundamental aspects of interacting with the `chat-p2p` TUI, including navigation and common keybindings.
+3. The executable will be located at:
+   - Linux/macOS: `./target/release/encodeur_rsa_rust`
+   - Windows: `.\target\release\encodeur_rsa_rust.exe`
 
-### Starting the TUI
-To start the TUI, run the compiled executable:
+## 3. Launching the TUI
+
+To start the application in TUI mode, use the `--tui` flag.
+
 ```bash
-./target/release/chat-p2p
+# Basic usage (defaults to TUI if no arguments provided, but explicit is better)
+./target/release/encodeur_rsa_rust --tui
 ```
-(Note: The TUI is the default interface when running the application without specific arguments.)
+
+### Command Line Arguments
+
+- `--tui`: Force launch in Terminal User Interface mode.
+- `--gui`: Force launch in Graphical User Interface mode (default).
+- `--host`: Start in host mode immediately.
+- `--connect <IP:PORT>`: Connect to a specific peer immediately.
+- `--port <PORT>`: Specify listening port (default: 12345).
+
+**Example:**
+
+```bash
+./target/release/encodeur_rsa_rust --tui --port 9000
+```
+
+## 4. Navigation & Controls
+
+The TUI is designed to be fully keyboard-driven.
 
 ### Keybindings
-| Key          | Action                       | Description                               |
-|--------------|------------------------------|-------------------------------------------|
-| `q`          | Quit                         | Exit the application.                     |
-| `Down Arrow` | Select Next Chat             | Move to the next chat in the list.        |
-| `Up Arrow`   | Select Previous Chat         | Move to the previous chat in the list.    |
-| `Page Down`  | Scroll Messages Down         | Scroll the message view downwards.        |
-| `Page Up`    | Scroll Messages Up           | Scroll the message view upwards.          |
-| `Enter`      | Send Message                 | Send the text currently in the input field. |
-| Any Char     | Type                         | Enter characters into the input field.    |
-| `Backspace`  | Delete Character             | Delete the last character in the input field. |
 
-## 4. Core Commands
+| Key | Description |
+| :--- | :--- |
+| **Navigation** | |
+| `↑` (Up Arrow) | Select previous chat in the sidebar |
+| `↓` (Down Arrow) | Select next chat in the sidebar |
+| `Page Up` | Scroll chat history up |
+| `Page Down` | Scroll chat history down |
+| **Messaging** | |
+| `Enter` | Send the message currently in the input field |
+| `Backspace` | Delete the last character |
+| **System** | |
+| `q` | Quit the application immediately |
 
-The `chat-p2p` TUI provides a straightforward set of interactions primarily driven by key presses.
+### Interface Layout
 
-### Sending Messages
-1.  **Select a Chat:** Use the `Up Arrow` and `Down Arrow` keys to navigate and select a chat from the "Chats" panel on the left.
-2.  **Type your Message:** As you type, characters will appear in the "Input" box at the bottom right.
-3.  **Send Message:** Press `Enter` to send the typed message to the selected chat. The input box will clear automatically after sending.
+The screen is divided into three main sections:
 
-### Navigating Chats
--   **Next Chat:** Press `Down Arrow` to move the selection to the next chat in your chat list. The selection will wrap around to the first chat if you are at the end of the list.
--   **Previous Chat:** Press `Up Arrow` to move the selection to the previous chat in your chat list. The selection will wrap around to the last chat if you are at the beginning of the list.
+1. **Sidebar (Left)**: Displays your list of active chats and contacts.
+2. **Chat Area (Right)**: Shows the message history for the selected conversation.
+3. **Input Bar (Bottom)**: Where you type your messages.
 
-### Scrolling Through Messages
--   **Scroll Up:** Use `Page Up` to scroll upwards through the message history of the currently selected chat.
--   **Scroll Down:** Use `Page Down` to scroll downwards through the message history of the currently selected chat.
+## 5. Using the TUI
 
-### Exiting the Application
--   **Quit:** Press `q` to exit the `chat-p2p` TUI application.
+### 1. Managing Chats
 
-## 5. Advanced Features
-The current Terminal User Interface (TUI) for `chat-p2p` primarily focuses on providing a streamlined experience for basic chat functionalities, including sending and receiving messages, and navigating between active chat sessions.
+- Use the **Up/Down arrows** to cycle through your available chats.
+- The currently selected chat will be highlighted in the sidebar.
+- The message view automatically updates to show the history of the selected chat.
 
-Advanced features such as file transfers, group chat management, or detailed identity management are handled by the underlying `ChatManager` but are not directly exposed or controllable through specific TUI commands or keybindings in this version. Future iterations may expand TUI capabilities to include more direct interaction with these advanced features.
+### 2. Sending Messages
 
-For now, please refer to the application's core documentation for details on these features and how they might be configured or utilized outside the immediate TUI interface.
+- Type your message using your keyboard. You will see characters appear in the bottom input bar.
+- Press **Enter** to send.
+- Your message will appear in the chat history immediately.
+
+### 3. Exiting
+
+- Press `q` at any time to close the application cleanly.
 
 ## 6. Troubleshooting
-Encountering issues? This section provides solutions to common problems you might face while using the `chat-p2p` TUI.
 
-### Common Issues
-- **TUI not starting:**
-  - **Solution:** Ensure you built with `--features tui` and the executable path is correct. Check for any error messages in the terminal output.
-- **Keybindings not working:**
-  - **Solution:** Verify your terminal emulator is compatible and not intercepting key presses.
-- **Connection issues:**
-  - **Solution:** Check network connectivity and ensure other peers are discoverable. Refer to the networking documentation for more details.
+### "TUI looks broken or characters are misaligned"
 
-## 7. Usage Examples
-This section provides practical scenarios to demonstrate how to use the `chat-p2p` TUI effectively.
+- Ensure your terminal uses a **Monospace Font** (e.g., Fira Code, JetBrains Mono, Consolas).
+- Provides adequate window size (at least 80x24 characters).
 
-### Example 1: Sending a direct message
-1.  **Start the TUI:** Execute `./target/release/chat-p2p` in your terminal.
-2.  **Select a Chat:** Use the `Up Arrow` or `Down Arrow` keys to highlight the desired chat in the "Chats" panel.
-3.  **Type Your Message:** Begin typing. Your input will appear in the "Input" box at the bottom of the screen.
-4.  **Send Message:** Press the `Enter` key. The message will be sent to the selected chat and appear in the messages view. The input box will then clear, ready for your next message.
+### "Key presses aren't registering"
 
-### Example 2: Navigating Between Chats
-1.  **View Current Chat:** Upon launching, the first available chat will be selected by default, and its messages will be displayed.
-2.  **Move to Next Chat:** Press the `Down Arrow` key. The highlight in the "Chats" panel will move to the next chat, and the messages view will update to show the conversation history of the newly selected chat.
-3.  **Move to Previous Chat:** Press the `Up Arrow` key. The highlight will move to the previous chat, updating the messages view accordingly. This allows you to quickly switch contexts between different conversations.
+- Verify that no other application is capturing global shortcuts.
+- On some systems, `Page Up`/`Page Down` might require holding `Shift` or `Fn` depending on your keyboard layout.
+
+### "I can't see the cursor"
+
+- The TUI hides the system cursor by default for a cleaner look. Your typing position is indicated by the text in the input field.
