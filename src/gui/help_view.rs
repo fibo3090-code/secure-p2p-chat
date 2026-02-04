@@ -2,7 +2,7 @@ use crate::gui::app_ui::App;
 use eframe::egui;
 
 pub fn render_help_window(app: &mut App, ctx: &egui::Context) {
-    let mut open = app.show_about;
+    let mut open = app.active_dialog == crate::gui::app_ui::ActiveDialog::About;
     egui::Window::new("ℹ️ Help & Support")
         .open(&mut open)
         .collapsible(false)
@@ -26,7 +26,9 @@ pub fn render_help_window(app: &mut App, ctx: &egui::Context) {
                 _ => render_about_tab(ui),
             });
         });
-    app.show_about = open;
+    if !open && app.active_dialog == crate::gui::app_ui::ActiveDialog::About {
+        app.active_dialog = crate::gui::app_ui::ActiveDialog::None;
+    }
 }
 
 fn render_about_tab(ui: &mut egui::Ui) {

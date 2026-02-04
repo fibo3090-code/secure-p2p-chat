@@ -10,12 +10,12 @@ pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
                 ui.menu_button("", |ui| {
                     if ui.button("🎤 Host Connection").clicked() {
                         tracing::info!("Host connection dialog opened");
-                        app.show_host_dialog = true;
+                        app.active_dialog = crate::gui::app_ui::ActiveDialog::Host;
                         ui.close_menu();
                     }
                     if ui.button("🔌 Connect to Host").clicked() {
                         tracing::info!("Connect to host dialog opened");
-                        app.show_connect_dialog = true;
+                        app.active_dialog = crate::gui::app_ui::ActiveDialog::Connect;
                         ui.close_menu();
                     }
                 });
@@ -57,12 +57,13 @@ pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
                         tracing::info!("Rename chat context menu clicked for chat_id: {}", chat_id);
                         app.rename_chat_id = Some(chat_id);
                         app.rename_input = chat.title.clone();
-                        app.show_rename_dialog = true;
+                        app.active_dialog = crate::gui::app_ui::ActiveDialog::RenameChat;
                         ui.close_menu();
                     }
                     if ui.button("🗑 Delete chat").clicked() {
                         tracing::info!("Delete chat context menu clicked for chat_id: {}", chat_id);
                         app.chat_to_delete = Some(chat_id);
+                        app.active_dialog = crate::gui::app_ui::ActiveDialog::DeleteChat;
                         ui.close_menu();
                     }
                 });

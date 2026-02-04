@@ -12,14 +12,35 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum ActiveDialog {
+    None,
+    Contacts,
+    AddContact,
+    CreateGroup,
+    RenameChat,
+    Connect,
+    Host,
+    Settings,
+    About,
+    Password,
+    SetPassword,
+    RemovePassword,
+    FingerprintVerification,
+    ClearHistory,
+    Welcome,
+    DeleteChat,
+}
+
 pub struct App {
     pub chat_manager: Arc<Mutex<ChatManager>>,
     pub identity: crate::identity::Identity,
     pub selected_chat: Option<Uuid>,
     pub input_text: String,
+    pub active_dialog: ActiveDialog,
     // Contacts / groups UI state
-    pub show_contacts: bool,
-    pub show_add_contact: bool,
+    // pub show_contacts: bool, REMOVED
+    // pub show_add_contact: bool, REMOVED
     pub contact_tab: usize, // 0=Manual, 1=Invite Link, 2=Generate My Link
     pub new_contact_name: String,
     pub new_contact_address: String,
@@ -29,24 +50,24 @@ pub struct App {
     pub help_tab: usize,
     pub invite_link_input: String,
     pub my_invite_link: Option<String>,
-    pub show_create_group: bool,
+    // pub show_create_group: bool, REMOVED
     pub group_wizard_step: usize, // 0=Name, 1=Members, 2=Confirm
     pub group_selected: Vec<Uuid>,
     pub group_title: String,
     pub group_search: String,
     // Rename conversation dialog
-    pub show_rename_dialog: bool,
+    // pub show_rename_dialog: bool, REMOVED
     pub rename_chat_id: Option<Uuid>,
     pub rename_input: String,
-    pub show_connect_dialog: bool,
+    // pub show_connect_dialog: bool, REMOVED
     pub connect_host: String,
     pub connect_port: String,
-    pub show_host_dialog: bool,
+    // pub show_host_dialog: bool, REMOVED
     pub host_port: String,
-    pub show_settings: bool,
-    pub show_welcome: bool,
+    // pub show_settings: bool, REMOVED
+    // pub show_welcome: bool, REMOVED
     pub file_to_send: Option<PathBuf>,
-    pub show_about: bool,
+    // pub show_about: bool, REMOVED
     pub chat_to_delete: Option<Uuid>,
     pub history_path: PathBuf,
     pub history_loaded: bool,
@@ -54,22 +75,22 @@ pub struct App {
     pub last_typing_time: Option<std::time::Instant>,
     pub typing_stopped: bool,
     // Password dialogs
-    pub show_password_dialog: bool,
-    pub show_set_password_dialog: bool,
+    // pub show_password_dialog: bool, REMOVED
+    // pub show_set_password_dialog: bool, REMOVED
     pub password_input: String,
     pub new_password_input: String,
     pub confirm_password_input: String,
-    pub show_remove_password_dialog: bool,
+    // pub show_remove_password_dialog: bool, REMOVED
     pub remove_password_input: String,
     pub identity_locked: bool,
     pub force_password_setup: bool,
     // Fingerprint verification dialog
-    pub show_fingerprint_dialog: bool,
+    // pub show_fingerprint_dialog: bool, REMOVED
     pub fingerprint_to_verify: Option<String>,
     pub peer_name_to_verify: Option<String>,
     pub chat_id_to_verify: Option<Uuid>,
     pub show_log_terminal: bool,
-    pub show_clear_history_dialog: bool,
+    // pub show_clear_history_dialog: bool, REMOVED
     pub event_collector: EventCollector,
     pub toasts: Vec<Toast>,
     pub is_new_identity: bool,
@@ -167,7 +188,11 @@ impl App {
             &identity.fingerprint[..16]
         );
 
-        let show_welcome = !history_path.exists();
+        let active_dialog = if !history_path.exists() {
+            ActiveDialog::Welcome
+        } else {
+            ActiveDialog::None
+        };
 
         // Derive history key from identity if it's not locked
         if !identity.is_locked() {
@@ -260,18 +285,16 @@ impl App {
             identity,
             selected_chat: None,
             input_text: String::new(),
-            show_connect_dialog: false,
+            active_dialog: if initial_identity_locked {
+                ActiveDialog::Password
+            } else {
+                active_dialog
+            },
             connect_host: String::new(),
             connect_port: PORT_DEFAULT.to_string(),
-            show_host_dialog: false,
             host_port: host_port_ui,
-            show_settings: false,
-            show_welcome, // Show welcome screen on first launch
             file_to_send: None,
-            show_about: false,
             chat_to_delete: None,
-            show_contacts: false,
-            show_add_contact: false,
             contact_tab: 0,
             help_tab: 0,
             new_contact_name: String::new(),
@@ -280,12 +303,10 @@ impl App {
             new_contact_pubkey: String::new(),
             invite_link_input: String::new(),
             my_invite_link: None,
-            show_create_group: false,
             group_wizard_step: 0,
             group_selected: Vec::new(),
             group_title: String::new(),
             group_search: String::new(),
-            show_rename_dialog: false,
             rename_chat_id: None,
             rename_input: String::new(),
             history_path,
@@ -293,22 +314,17 @@ impl App {
             show_emoji_picker: false,
             last_typing_time: None,
             typing_stopped: false,
-            show_password_dialog: initial_identity_locked, // Show password dialog if identity is locked
-            show_set_password_dialog: false,
             password_input: String::new(),
             new_password_input: String::new(),
             confirm_password_input: String::new(),
-            show_remove_password_dialog: false,
             remove_password_input: String::new(),
             identity_locked: initial_identity_locked,
             force_password_setup,
             // Fingerprint verification dialog
-            show_fingerprint_dialog: false,
             fingerprint_to_verify: None,
             peer_name_to_verify: None,
             chat_id_to_verify: None,
             show_log_terminal: initial_show_log_terminal,
-            show_clear_history_dialog: false,
             event_collector,
             toasts: Vec::new(),
             is_new_identity,
@@ -418,20 +434,7 @@ impl App {
 
     /// Returns true if any dialog that should be modal is currently open.
     pub fn is_any_modal_open(&self) -> bool {
-        self.show_welcome
-            || self.chat_to_delete.is_some()
-            || self.show_host_dialog
-            || self.show_connect_dialog
-            || self.show_add_contact
-            || self.show_create_group
-            || self.show_rename_dialog
-            || self.show_settings
-            || self.show_about
-            || self.show_fingerprint_dialog
-            || self.show_password_dialog
-            || self.show_set_password_dialog
-            || self.show_remove_password_dialog
-            || self.show_clear_history_dialog
+        self.active_dialog != ActiveDialog::None
     }
 }
 
@@ -454,7 +457,7 @@ impl eframe::App for App {
                 self.fingerprint_to_verify = Some(fingerprint);
                 self.peer_name_to_verify = Some(peer_name);
                 self.chat_id_to_verify = Some(chat_id);
-                self.show_fingerprint_dialog = true;
+                self.active_dialog = ActiveDialog::FingerprintVerification;
             }
             manager.cleanup_expired_toasts();
 
@@ -541,27 +544,27 @@ impl eframe::App for App {
                             if let Ok(manager) = self.chat_manager.try_lock() {
                                 self.host_port = manager.config.listen_port.to_string();
                             }
-                            self.show_host_dialog = true;
+                            self.active_dialog = ActiveDialog::Host;
                             ui.close_menu();
                         }
                         if ui.button("🔌 Connect to Host").clicked() {
                             self.connect_host.clear();
-                            self.connect_port = PORT_DEFAULT.to_string();
-                            self.show_connect_dialog = true;
+                            self.connect_port = crate::PORT_DEFAULT.to_string();
+                            self.active_dialog = ActiveDialog::Connect;
                             ui.close_menu();
                         }
                     });
 
                     if ui.button("Contacts").clicked() {
-                        self.show_contacts = true;
+                        self.active_dialog = ActiveDialog::Contacts;
                     }
 
                     if ui.button("Settings").clicked() {
-                        self.show_settings = true;
+                        self.active_dialog = ActiveDialog::Settings;
                     }
 
                     if ui.button("Help").clicked() {
-                        self.show_welcome = true;
+                        self.active_dialog = ActiveDialog::Welcome;
                     }
                 });
             });
@@ -640,16 +643,15 @@ impl eframe::App for App {
                                     if let Ok(manager) = self.chat_manager.try_lock() {
                                         self.host_port = manager.config.listen_port.to_string();
                                     }
-                                    self.show_host_dialog = true;
+                                    self.active_dialog = ActiveDialog::Host;
                                 }
                                 if ui.button("🔌 Connect").clicked() {
                                     self.connect_host.clear();
                                     self.connect_port = PORT_DEFAULT.to_string();
-                                    self.show_connect_dialog = true;
+                                    self.active_dialog = ActiveDialog::Connect;
                                 }
                                 if ui.button("📨 Invite").clicked() {
-                                    self.show_contacts = true;
-                                    self.show_add_contact = true;
+                                    self.active_dialog = ActiveDialog::AddContact;
                                     self.contact_tab = 1; // invite link tab
                                 }
                             });
