@@ -101,6 +101,7 @@ downloads/
 logs/
 crash-*.log
 *.dmp
+check_output*.txt
 
 # Core dumps (Exclude 'core' files but ALLOW 'src/core' directory)
 core

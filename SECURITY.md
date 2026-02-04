@@ -12,11 +12,32 @@ This document provides comprehensive security information including the threat m
 1. [Security Overview](#security-overview)
 2. [Threat Model](#threat-model)
 3. [Cryptographic Specifications](#cryptographic-specifications)
-4. [Security Audit Report (December 18, 2025)](#security-audit-report-december-18-2025)
-5. [Applied Security Fixes](#applied-security-fixes)
+
+## Security Audit History
+
+### Internal Audit (December 18, 2025)
+
+**Status: PASSED (Excellent)**
+
+A comprehensive security audit was conducted on December 18, 2025.
+
+**Summary of Findings:**
+
+- **Identity Storage**: ✅ Secure (encrypted with Argon2id + ChaCha20Poly1305).
+- **Nonce Management**: ✅ Secure (atomic counters prevent reuse).
+- **Replay Protection**: ✅ Secure (transporter-layer sequence numbers).
+- **DoS Protection**: ✅ Secure (rate limiting and handshake timeouts).
+- **Protocol Security**: ✅ Secure (Protocol v3 implements forward secrecy and prevents MITM).
+
+**Conclusion**: No exploitable vulnerabilities were found in the core cryptographic design or implementation.
+
+---
+
+## Applied Security Fixes
+
 6. [Remaining Security Work](#remaining-security-work)
-7. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
-8. [Security Roadmap](#security-roadmap)
+2. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
+3. [Security Roadmap](#security-roadmap)
 
 ---
 
@@ -33,7 +54,7 @@ This application implements **military-grade end-to-end encryption** with **forw
 - ✅ Strong cryptographic primitives (RSA-2048, AES-256-GCM, X25519)
 - ✅ Forward secrecy via ephemeral key exchange
 - ✅ Authenticated encryption (AES-GCM)
-- ✅ Encrypted chat history at rest (ChaCha20-Poly1305)
+- ✅ Encrypted identity keystore at rest (Argon2 + ChaCha20-Poly1305)
 - ✅ Counter-based nonces (prevents reuse)
 - ✅ Replay attack protection (sequence numbers)
 - ✅ Thread-safe implementation (no unsafe code)
@@ -80,7 +101,7 @@ This security model makes the following assumptions:
 
 ### Key Handling & Persistence
 
-- **Identity Keys**: Long-term RSA-2048 identity keys are generated locally and stored on disk. Future versions will support an encrypted keystore (Argon2 + AES-256).
+- **Identity Keys**: Long-term RSA-2048 identity keys are generated locally and stored on disk, encrypted with a password-derived key using Argon2 and ChaCha20-Poly1305.
 - **Session Keys**: Ephemeral AES-256-GCM session keys are derived via X25519 ECDH + HKDF and are kept in memory only for the session lifetime.
 - **Fingerprints**: The RSA public key fingerprint is SHA-256 over the PEM bytes in lowercase hex.
 

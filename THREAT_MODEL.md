@@ -61,7 +61,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 5. **User Identity Keys**
    - **Value**: RSA-2048 long-term identity keys used to sign sessions
    - **Threat**: Theft from disk, side-channel extraction, weak entropy
-   - **Protection**: File-based storage (encrypted in future), Argon2-protected (planned), `zeroize` on drop
+   - **Protection**: Encrypted at rest with a password-derived key (Argon2 + ChaCha20-Poly1305), `zeroize` on drop
 
 6. **Metadata (Connection Patterns)**
    - **Value**: Information about *who* talks to *whom* and *when*
@@ -139,7 +139,7 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 **Controls:**
 
 - Chat history encrypted with ChaCha20-Poly1305
-- Identity keys stored unencrypted (password protection planned)
+- Identity keys encrypted at rest with a password-derived key (Argon2 + ChaCha20-Poly1305)
 - `zeroize` crate used to securely wipe secrets from memory
 - No temporary plaintext files created
 - Planned: Argon2 + AES-256 keystore for identity keys
@@ -398,10 +398,9 @@ This threat model documents the security architecture of the Encrypted P2P Messe
 
 **Outcome**:
 
-- ✅ **MITIGATED** (planned): Password-protected key storage
-- Currently: Identity key on disk in plaintext (HIGH RISK)
-- Future: Argon2 + AES-256 encryption with password
-- **Current Workaround**: Store identity file on encrypted partition
+- ✅ **MITIGATED**: Identity key is encrypted at rest with a password-derived key (Argon2 + ChaCha20-Poly1305).
+- Attacker who steals the `identity.json` file cannot use the private key without brute-forcing the user's password.
+- **Residual Risk**: A weak user password would allow an offline brute-force attack on the stolen file.
 
 ---
 
@@ -519,10 +518,6 @@ This threat model documents the security architecture of the Encrypted P2P Messe
    - Timing, power, or cache attacks on cryptographic operations
    - **Mitigation**: Use constant-time libraries (x25519-dalek); avoid unsafe code
 
-8. **Unencrypted Identity Keys (Current)**
-   - Long-term RSA identity keys are stored in plaintext on disk
-   - **Current Impact**: HIGH RISK for compromised systems
-   - **Mitigation (Planned)**: Encrypt with Argon2 + AES-256
 
 ---
 

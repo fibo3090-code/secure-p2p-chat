@@ -63,6 +63,21 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [1.7.5] - 2026-02-04
+
+### 🐛 Bug Fixes
+
+- **Modal Dialogs**: Refactored the dialog system to use an `ActiveDialog` enum, preventing multiple dialogs from opening simultaneously and ensuring proper state reset on closure.
+- **Build Warnings**: Fixed unused variable warnings in `dialogs.rs`.
+
+### 📚 Documentation
+
+- **Compatibility Audit**: Merged findings into `README.md` (System Requirements).
+- **Security Audit**: Merged findings into `SECURITY.md` (Audit History).
+- **Roadmap Update**: Added planned features for Pure Rust mDNS and QR Scanning.
+
+---
+
 ## [1.7.4] - 2026-02-01
 
 ### 🛠️ Developer Tooling

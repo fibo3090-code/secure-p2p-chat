@@ -472,10 +472,11 @@ impl AesCipher {
 
         let (nonce_bytes, ciphertext) = payload.split_at(crate::AES_NONCE_SIZE);
         // Convert nonce slice to array then to Nonce
-        let nonce_arr: [u8; crate::AES_NONCE_SIZE] = match <[u8; crate::AES_NONCE_SIZE]>::try_from(nonce_bytes) {
-            Ok(a) => a,
-            Err(_) => return None,
-        };
+        let nonce_arr: [u8; crate::AES_NONCE_SIZE] =
+            match <[u8; crate::AES_NONCE_SIZE]>::try_from(nonce_bytes) {
+                Ok(a) => a,
+                Err(_) => return None,
+            };
 
         let nonce = Nonce::from(nonce_arr);
 

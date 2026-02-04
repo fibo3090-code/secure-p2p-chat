@@ -96,6 +96,22 @@ The roadmap is organized into prioritized sprints, focusing on delivering the mo
 
 ---
 
+### 🛠️ Infrastructure & UX Backlog
+
+1. **Pure Rust mDNS**:
+    - **Task**: Replace `mdns-sd` with a pure Rust implementation.
+    - **Why**: Removes external dependency on Bonjour/Avahi, significantly improving cross-platform compatibility.
+
+2. **QR Code Scanning**:
+    - **Task**: Implement camera-based scanning for invite codes.
+    - **Why**: Completes the mobile-like onboarding flow.
+
+3. **File Transfer UI**:
+    - **Task**: Add progress bars and cancellation controls.
+    - **Why**: Critical feedback for large file transfers.
+
+---
+
 ## 🔮 Future Considerations
 
 - **Group Admin Features**: Roles, permissions, and invite links.

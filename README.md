@@ -40,7 +40,17 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
 
 ---
 
-## 🚀 Quick Start
+## 💻 System Requirements & Compatibility
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **Windows** | ✅ Supported | Requires [Bonjour Print Services](https://support.apple.com/kb/DL999) for peer discovery. |
+| **Linux** | ⚠️ Supported | Requires `avahi-daemon` and system libraries (`libgtk-3-dev`, `libxcb-dev`). |
+| **macOS** | ⚠️ Experimental | Should work natively (uses built-in Bonjour), but not actively packaged/tested. |
+
+> **Note on Peer Discovery**: The application uses mDNS for local discovery. On Windows, you likely need **Bonjour Print Services** installed. On Linux, ensure `avahi-daemon` is running.
+
+## 🚀 Installation
 
 ### Prerequisites
 
@@ -123,7 +133,6 @@ Tips:
 ## 📸 Screenshots
 
 _[Coming Soon: Screenshots of the application in action will be added here. We plan to showcase the main chat view, the peer connection process, and the file transfer interface. If you have design suggestions or would like to contribute high-quality screenshots, please see our [CONTRIBUTING.md](CONTRIBUTING.md) guide!]_
-
 
 ---
 

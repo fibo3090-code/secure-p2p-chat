@@ -9,6 +9,8 @@ use encodeur_rsa_rust::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod tui;
+
 #[derive(Debug, Parser)]
 #[command(author, version, about = "P2P Encrypted Messaging Application")]
 struct Args {
@@ -24,9 +26,13 @@ struct Args {
     #[arg(short, long, default_value_t = PORT_DEFAULT)]
     port: u16,
 
-    /// Enable GUI mode (default)
-    #[arg(long, default_value_t = true)]
+    /// Enable GUI mode (default unless --tui is used)
+    #[arg(long)]
     gui: bool,
+
+    /// Enable Terminal UI mode
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
@@ -42,10 +48,23 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Application starting");
-    let args = Args::parse();
+    let mut args = Args::parse();
     tracing::debug!(?args, "Parsed CLI arguments");
 
-    if args.gui || (!args.host && args.connect.is_none()) {
+    // Default to GUI if no mode is specified
+    if !args.gui && !args.tui {
+        args.gui = true;
+    }
+
+    if args.tui {
+        // Launch TUI
+        tracing::info!("Starting TUI mode");
+        if let Err(e) = tui::run().await {
+            tracing::error!(error = %e, "TUI application exited with an error");
+            std::process::exit(1);
+        }
+        tracing::info!("TUI application exited");
+    } else if args.gui {
         // Launch GUI
         tracing::info!("Starting GUI mode");
 
@@ -73,19 +92,6 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         tracing::info!("GUI application exited");
-    } else if args.host {
-        // CLI host mode
-        tracing::warn!("CLI host mode is not implemented. Please use the GUI.");
-        println!("CLI host mode is not implemented. Please use the GUI.");
-        std::process::exit(1);
-    } else if let Some(addr) = args.connect {
-        // CLI client mode
-        tracing::warn!(
-            "CLI connect mode is not implemented. Please use the GUI. Got address: {}",
-            addr
-        );
-        println!("CLI connect mode is not implemented. Please use the GUI.");
-        std::process::exit(1);
     }
 
     Ok(())
