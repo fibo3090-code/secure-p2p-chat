@@ -95,5 +95,4 @@ codegen-units = 1
 
 [features]
 default = []
-embed_fonts = []
 

@@ -111,40 +111,8 @@ impl App {
         cc.egui_ctx
             .set_visuals(crate::gui::styling::apply_custom_visuals(&theme));
 
-        // Load fonts. Embedding the TTF files at compile time requires the files to exist.
-        // Make embedding optional so builds don't fail when the `assets/` files are not present.
-        #[cfg(feature = "embed_fonts")]
-        let mut fonts = egui::FontDefinitions::default();
-        #[cfg(not(feature = "embed_fonts"))]
+        // Load fonts.
         let fonts = egui::FontDefinitions::default();
-
-        // If you want to embed the Inter fonts into the binary, enable the
-        // `embed_fonts` feature in Cargo.toml and ensure the files exist at
-        // `assets/Inter-Regular.ttf` and `assets/Inter-Bold.ttf`.
-        #[cfg(feature = "embed_fonts")]
-        {
-            fonts.font_data.insert(
-                "Inter-Regular".to_owned(),
-                egui::FontData::from_static(include_bytes!("../../assets/Inter-Regular.ttf")),
-            );
-            fonts.font_data.insert(
-                "Inter-Bold".to_owned(),
-                egui::FontData::from_static(include_bytes!("../../assets/Inter-Bold.ttf")),
-            );
-
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "Inter-regular".to_owned());
-
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "Inter-Regular".to_owned());
-        }
-
         cc.egui_ctx.set_fonts(fonts);
 
         let mut chat_manager = ChatManager::new(Config::default());

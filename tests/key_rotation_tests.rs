@@ -35,7 +35,7 @@ fn test_rekey_different_nonces_different_keys() {
     // Different nonces should produce different keys
     // Use cryptographically secure random values
     let original_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let mut nonce_1: [u8; 16] = rand::thread_rng().r#gen();
+    let nonce_1: [u8; 16] = rand::thread_rng().r#gen();
     let mut nonce_2: [u8; 16] = rand::thread_rng().r#gen();
 
     // Ensure nonces are different
@@ -226,7 +226,7 @@ fn test_rekey_timing_performance() {
 fn test_rekey_key_independence() {
     // Test that rotating from two different starting keys produces different results
     // Use cryptographically secure random values
-    let mut key_a: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let key_a: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
     let mut key_b: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
     let nonce: [u8; 16] = rand::thread_rng().r#gen();
 
