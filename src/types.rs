@@ -21,6 +21,9 @@ pub struct Chat {
     pub peer_typing: bool,
     #[serde(skip)]
     pub typing_since: Option<std::time::Instant>,
+    /// True if this chat is a placeholder for a listening host, not a real conversation.
+    #[serde(default)]
+    pub is_host_placeholder: bool,
 }
 
 /// A single message in a chat

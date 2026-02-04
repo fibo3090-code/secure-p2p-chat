@@ -105,6 +105,7 @@ impl ChatManager {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: false,
         };
         self.chats.insert(id, chat);
     }
@@ -235,6 +236,7 @@ impl ChatManager {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: false,
         };
 
         self.chats.insert(chat_id, chat);
@@ -330,28 +332,21 @@ impl ChatManager {
         }
     }
 
-    fn has_placeholder_host(&self, port: u16) -> bool {
-        let expected = format!("Host on :{}", port);
-        self.chats.values().any(|c| c.title == expected)
-    }
+
 
     /// Start hosting on specified port
     pub async fn start_host(&mut self, port: u16, privkey: RsaPrivateKey) -> Result<Uuid> {
-        // Guard: if a placeholder host already exists for this port, avoid spawning another.
-        // If the placeholder has no active session, clean it up so we can rehost.
-        if self.has_placeholder_host(port) {
-            let expected = format!("Host on :{}", port);
-            let placeholder_ids: Vec<Uuid> = self
-                .chats
-                .iter()
-                .filter(|(_, c)| c.title == expected)
-                .map(|(id, _)| *id)
-                .collect();
-            let has_active_session = placeholder_ids
-                .iter()
-                .any(|id| self.sessions.contains_key(id));
-
-            if has_active_session {
+        // Guard: if a placeholder host already exists, avoid spawning another.
+        if let Some(existing_host) = self.chats.values().find(|c| c.is_host_placeholder) {
+            // If the placeholder has no active session, clean it up so we can rehost.
+            if !self.sessions.contains_key(&existing_host.id) {
+                let id_to_remove = existing_host.id;
+                self.chats.remove(&id_to_remove);
+                self.sessions.remove(&id_to_remove);
+                self.session_events.remove(&id_to_remove);
+                self.fingerprint_confirm_senders.remove(&id_to_remove);
+                tracing::warn!(port = %port, "Removed stale placeholder host before restarting");
+            } else {
                 self.add_toast(
                     ToastLevel::Info,
                     format!("Already listening on port {}", port),
@@ -359,15 +354,8 @@ impl ChatManager {
                 tracing::info!(port = %port, "start_host skipped: active placeholder host exists");
                 return Err(anyhow::anyhow!("Already listening on port {}", port));
             }
-
-            for id in placeholder_ids {
-                self.chats.remove(&id);
-                self.sessions.remove(&id);
-                self.session_events.remove(&id);
-                self.fingerprint_confirm_senders.remove(&id);
-            }
-            tracing::warn!(port = %port, "Removed stale placeholder host before restarting");
         }
+
         let chat_id = Uuid::new_v4();
         tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
 
@@ -399,6 +387,7 @@ impl ChatManager {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: true,
         };
 
         self.chats.insert(chat_id, chat);
@@ -458,6 +447,7 @@ impl ChatManager {
                 typing_since: None,
                 send_seq: 0,
                 recv_seq: 0,
+                is_host_placeholder: false,
             };
             e.insert(chat);
             tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
@@ -1038,6 +1028,7 @@ impl ChatManager {
 
                 if let Some(chat) = self.chats.get_mut(&chat_id) {
                     chat.title = peer;
+                    chat.is_host_placeholder = false;
                 }
             }
 
@@ -1080,6 +1071,7 @@ impl ChatManager {
                     typing_since: None,
                     send_seq: 0,
                     recv_seq: 0,
+                    is_host_placeholder: false,
                 });
                 self.add_toast(
                     ToastLevel::Info,
@@ -1772,7 +1764,7 @@ mod tests {
     fn placeholder_detection_works() {
         let mut mgr = ChatManager::new(Config::default());
         let port = 5001u16;
-        assert!(!mgr.has_placeholder_host(port));
+        assert!(!mgr.chats.values().any(|c| c.is_host_placeholder));
         let chat = Chat {
             id: Uuid::new_v4(),
             title: format!("Host on :{}", port),
@@ -1784,10 +1776,11 @@ mod tests {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: true,
         };
         let id = chat.id;
         mgr.chats.insert(id, chat);
-        assert!(mgr.has_placeholder_host(port));
+        assert!(mgr.chats.values().any(|c| c.is_host_placeholder));
     }
 
     #[test]
@@ -1810,6 +1803,7 @@ mod tests {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: false,
         };
         // Add a dummy confirmation sender for the test
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1892,6 +1886,7 @@ mod tests {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: false,
         };
 
         let (tx, _rx) = mpsc::unbounded_channel();

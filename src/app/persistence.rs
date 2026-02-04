@@ -289,6 +289,7 @@ mod tests {
             typing_since: None,
             send_seq: 0,
             recv_seq: 0,
+            is_host_placeholder: false,
         };
 
         let history = HistoryFile::new(vec![chat.clone()]);
@@ -329,6 +330,7 @@ mod tests {
                 typing_since: None,
                 send_seq: 0,
                 recv_seq: 0,
+                is_host_placeholder: false,
             },
         );
 
@@ -421,6 +423,7 @@ mod tests {
                 typing_since: None,
                 send_seq: 0,
                 recv_seq: 0,
+                is_host_placeholder: false,
             },
         );
 

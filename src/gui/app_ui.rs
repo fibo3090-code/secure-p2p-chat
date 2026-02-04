@@ -482,10 +482,7 @@ impl eframe::App for App {
             // Auto-rehost: if auto-host is enabled and no placeholder host chat exists,
             // spawn a new host to replace the one that was consumed by a connection.
             if manager.config.auto_host_on_startup {
-                let has_placeholder = manager
-                    .chats
-                    .values()
-                    .any(|c| c.title.starts_with("Host on :"));
+                let has_placeholder = manager.chats.values().any(|c| c.is_host_placeholder);
                 if !has_placeholder {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     use std::sync::OnceLock;

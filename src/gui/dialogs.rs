@@ -734,6 +734,7 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                         typing_since: None,
                                         send_seq: 0,
                                         recv_seq: 0,
+                                        is_host_placeholder: false,
                                     };
                                     mgr.chats.insert(chat_id, chat);
                                     mgr.associate_contact_with_chat(contact_clone.id, chat_id);
