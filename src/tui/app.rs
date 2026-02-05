@@ -2,6 +2,7 @@ use crate::app::chat_manager::ChatManager;
 use crate::identity::Identity;
 use crate::types::Config;
 use anyhow::Result;
+use egui_tracing::tracing::EventCollector;
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -13,10 +14,11 @@ pub struct TuiApp {
     pub input_text: String,
     pub message_scroll: u16,
     pub identity_name: String,
+    pub event_collector: EventCollector,
 }
 
 impl TuiApp {
-    pub fn new() -> Result<Self> {
+    pub fn new(event_collector: EventCollector) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
 
         let proj_dirs = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
@@ -54,7 +56,48 @@ impl TuiApp {
             input_text: String::new(),
             message_scroll: 0,
             identity_name: identity.name,
+            event_collector,
         })
+    }
+
+    pub fn copy_logs(&mut self) {
+        let mut log_text = String::new();
+        for event in self.event_collector.events() {
+            let level = event.level.as_str();
+            let target = event.target.as_str();
+            let msg = event
+                .fields
+                .get("message")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let timestamp = event.time.to_rfc3339();
+            log_text.push_str(&format!("[{}] {} [{}] {}\n", timestamp, level, target, msg));
+        }
+
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => {
+                if let Err(e) = clipboard.set_text(log_text) {
+                    tracing::error!("Failed to copy logs to clipboard: {}", e);
+                    self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Failed to copy logs: {}", e),
+                    );
+                } else {
+                    tracing::info!("Logs copied to clipboard (TUI)");
+                    self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Success,
+                        "Logs copied to clipboard".to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize clipboard: {}", e);
+                self.chat_manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Clipboard error: {}", e),
+                );
+            }
+        }
     }
 
     pub fn next_chat(&mut self) {
@@ -121,6 +164,7 @@ impl TuiApp {
 mod tests {
     use super::TuiApp;
     use crate::app::chat_manager::SessionHandle;
+    use egui_tracing::tracing::EventCollector;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
@@ -148,14 +192,14 @@ mod tests {
 
     #[test]
     fn test_new_app() {
-        let app = TuiApp::new().unwrap();
+        let app = TuiApp::new(EventCollector::new()).unwrap();
         assert_eq!(app.input_text, "");
         assert_eq!(app.message_scroll, 0);
     }
 
     #[test]
     fn test_chat_selection() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         app.chat_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         app.chat_list_state.select(Some(0));
 
@@ -176,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_chat_selection_empty() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         app.chat_ids = vec![];
         app.chat_list_state.select(None);
 
@@ -189,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_scrolling() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         app.message_scroll = 5;
 
         app.scroll_up();
@@ -208,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_send_message_clears_input() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         let (_chat_id, _rx) = setup_chat_with_session(&mut app, "Test Chat");
         app.input_text = "Hello, world!".to_string();
 
@@ -219,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_input_text_append() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         app.input_text = "Hello".to_string();
 
         app.input_text.push('!');
@@ -231,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_input_text_delete() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         app.input_text = "Test".to_string();
 
         app.input_text.pop();
@@ -249,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_send_empty_message_noop() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         let (chat_id, _rx) = setup_chat_with_session(&mut app, "Test");
 
         // 1. Empty string
@@ -269,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_send_message_adds_to_history() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         let (chat_id, _rx) = setup_chat_with_session(&mut app, "Test");
 
         app.input_text = "Message 1".to_string();
@@ -313,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_send_message_increments_seq() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         let (chat_id, _rx) = setup_chat_with_session(&mut app, "Test");
 
         let initial_seq = app.chat_manager.chats.get(&chat_id).unwrap().send_seq;
@@ -327,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_send_to_nonexistent_chat() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         // Force state: empty chat_ids but selected index 0
         app.chat_ids = vec![];
         app.chat_list_state.select(Some(0));
@@ -342,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_scroll_overflow() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         app.message_scroll = u16::MAX;
 
         app.scroll_down();
@@ -355,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_unicode_input() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         let (chat_id, _rx) = setup_chat_with_session(&mut app, "Unicode");
 
         let emoji_msg = "Hello 👋 🌍";
@@ -372,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_very_long_input() {
-        let mut app = TuiApp::new().unwrap();
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
         let (chat_id, _rx) = setup_chat_with_session(&mut app, "Long");
 
         let long_msg = "a".repeat(1000);

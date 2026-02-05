@@ -4,17 +4,18 @@ pub mod ui;
 use crate::tui::app::TuiApp;
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use egui_tracing::tracing::EventCollector;
 use ratatui::prelude::*;
 use std::io;
 use std::time::Duration;
 use ui::ui;
 
 /// Main entry point for the TUI.
-pub async fn run() -> Result<()> {
+pub async fn run(event_collector: EventCollector) -> Result<()> {
     // Setup terminal
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -23,7 +24,7 @@ pub async fn run() -> Result<()> {
     enable_raw_mode()?;
 
     // Create app and run the main loop
-    let app = TuiApp::new()?;
+    let app = TuiApp::new(event_collector)?;
     let res = run_app(&mut terminal, app).await;
 
     // Restore terminal
@@ -77,6 +78,9 @@ async fn run_app(
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.copy_logs();
+                    }
                     KeyCode::Down => app.next_chat(),
                     KeyCode::Up => app.previous_chat(),
                     KeyCode::PageDown => app.scroll_down(),

@@ -1778,19 +1778,50 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-fn render_log_terminal(_app: &mut App, ctx: &egui::Context) {
+fn render_log_terminal(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("Log Terminal")
         .collapsible(true)
         .resizable(true)
         .default_width(600.0)
         .default_height(400.0)
         .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("📋 Copy All Logs").clicked() {
+                    let mut log_text = String::new();
+                    // Lock the events collection and format each event
+                    for event in app.event_collector.events() {
+                        let level = event.level.as_str();
+                        let target = event.target.as_str();
+                        let msg = event
+                            .fields
+                            .get("message")
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let timestamp = event.time.to_rfc3339();
+                        log_text
+                            .push_str(&format!("[{}] {} [{}] {}\n", timestamp, level, target, msg));
+                    }
+                    ui.output_mut(|o| o.copied_text = log_text);
+                    if let Ok(mut manager) = app.chat_manager.try_lock() {
+                        manager.add_toast(
+                            crate::types::ToastLevel::Success,
+                            "Logs copied to clipboard".to_string(),
+                        );
+                    }
+                }
+                if ui.button("🗑 Clear Logs").clicked() {
+                    // Optional: Clear logs if API allows. EventCollector usually doesn't expose a clear() that is easy.
+                    // But let's leave it for now or check if it exists.
+                }
+            });
+            ui.separator();
+
             let avail = ui.available_size();
             egui::ScrollArea::both()
                 .auto_shrink([true, true])
                 .show(ui, |ui| {
                     // Constrain the Logs widget to the current window size to prevent growth
-                    ui.add_sized(avail, Logs::new(_app.event_collector.clone()));
+                    ui.add_sized(avail, Logs::new(app.event_collector.clone()));
                 });
         });
 }
