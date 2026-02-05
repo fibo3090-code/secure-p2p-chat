@@ -931,8 +931,23 @@ impl ChatManager {
             if accept {
                 if let Some((fp, _peer_name, req_chat_id)) = &self.fingerprint_verification_request
                 {
+                    // IMPORTANT: In host mode, req_chat_id is the session ID (the host placeholder ID)
+                    // but the fingerprint should be stored in the actual chat (the client's ID).
+                    // However, confirm_fingerprint is called with the session ID.
                     if *req_chat_id == chat_id {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                        // Resolve the actual chat ID if this is a mapped session
+                        let target_chat_id = self
+                            .chat_id_mapping
+                            .iter()
+                            .find(|(_, &session_id)| session_id == chat_id)
+                            .map(|(&incoming_id, _)| incoming_id)
+                            .unwrap_or(chat_id);
+
+                        if let Some(chat) = self.chats.get_mut(&target_chat_id) {
+                            tracing::debug!(
+                                "Storing verified fingerprint for chat {}",
+                                target_chat_id
+                            );
                             chat.peer_fingerprint = Some(fp.clone());
                         }
                         // Clear the pending request now that we've stored it
@@ -1058,6 +1073,87 @@ impl ChatManager {
         }
     }
 
+    /// Consolidate Trust-On-First-Use (TOFU) verification logic
+    fn handle_tofu_verification(&mut self, session_id: Uuid, fingerprint: &str, peer_name: &str) {
+        // Resolve the actual chat ID (important for host mode where session_id != chat_id)
+        let actual_chat_id = self
+            .chat_id_mapping
+            .iter()
+            .find(|(_, &sid)| sid == session_id)
+            .map(|(&cid, _)| cid)
+            .unwrap_or(session_id);
+
+        let chat = match self.chats.get_mut(&actual_chat_id) {
+            Some(c) => c,
+            None => {
+                tracing::error!("TOFU check failed: Chat {} not found", actual_chat_id);
+                return;
+            }
+        };
+
+        match &chat.peer_fingerprint {
+            // CASE 1: No stored fingerprint. This is the FIRST USE.
+            None => {
+                tracing::info!(
+                    "Trust on First Use for chat {}. Requesting user confirmation.",
+                    actual_chat_id
+                );
+                // If user opted into auto-trust (not recommended), allow it.
+                if self.config.auto_trust_on_first_use {
+                    tracing::info!(
+                        "auto_trust_on_first_use enabled: auto-storing fingerprint for chat {}",
+                        actual_chat_id
+                    );
+                    chat.peer_fingerprint = Some(fingerprint.to_string());
+                    if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
+                        if let Err(e) = tx.send(true) {
+                            tracing::error!("Failed to auto-confirm fingerprint: {}", e);
+                        }
+                    }
+                } else {
+                    // Request explicit user verification via UI
+                    // Note: fingerprint_verification_request uses the SESSION ID
+                    // because confirmation (accept/reject) must be sent to that session's task.
+                    self.fingerprint_verification_request =
+                        Some((fingerprint.to_string(), peer_name.to_string(), session_id));
+                    self.add_toast(
+                        ToastLevel::Warning,
+                        "Fingerprint verification required".to_string(),
+                    );
+                }
+            }
+            // CASE 2: Stored fingerprint matches the new one.
+            Some(stored_fp) if stored_fp == fingerprint => {
+                tracing::debug!(
+                    "Fingerprint matches stored value for chat {}. Proceeding automatically.",
+                    actual_chat_id
+                );
+                // Automatically confirm this connection using the session ID.
+                if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
+                    if let Err(e) = tx.send(true) {
+                        tracing::error!("Failed to auto-confirm fingerprint: {}", e);
+                    }
+                }
+            }
+            // CASE 3: Stored fingerprint MISMATCHES. Security alert!
+            Some(stored_fp) => {
+                tracing::warn!(
+                    "FINGERPRINT MISMATCH for chat {}! Stored: `{}`, New: `{}`",
+                    actual_chat_id,
+                    stored_fp,
+                    fingerprint
+                );
+                // Trigger the UI dialog for manual verification using the session ID.
+                self.fingerprint_verification_request =
+                    Some((fingerprint.to_string(), peer_name.to_string(), session_id));
+                self.add_toast(
+                    ToastLevel::Warning,
+                    "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
+                );
+            }
+        }
+    }
+
     /// Handle a single session event
     fn handle_session_event(&mut self, chat_id: Uuid, event: SessionEvent) {
         tracing::debug!("Handling session event for {}: {:?}", chat_id, event);
@@ -1129,10 +1225,7 @@ impl ChatManager {
                     }
                 }
 
-                self.add_toast(
-                    ToastLevel::Info,
-                    format!("New connection from {}", peer_addr),
-                );
+                self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr);
             }
 
             SessionEvent::ShowFingerprintVerification {
@@ -1140,67 +1233,7 @@ impl ChatManager {
                 peer_name,
                 chat_id,
             } => {
-                let chat = match self.chats.get_mut(&chat_id) {
-                    Some(c) => c,
-                    None => {
-                        tracing::error!("TOFU check failed: Chat {} not found", chat_id);
-                        return;
-                    }
-                };
-
-                match &chat.peer_fingerprint {
-                    // CASE 1: No stored fingerprint. This is the FIRST USE.
-                    None => {
-                        tracing::info!(
-                            "Trust on First Use for chat {}. Requesting user confirmation.",
-                            chat_id
-                        );
-                        // If user opted into auto-trust (not recommended), allow it.
-                        if self.config.auto_trust_on_first_use {
-                            tracing::info!("auto_trust_on_first_use enabled: auto-storing fingerprint for chat {}", chat_id);
-                            chat.peer_fingerprint = Some(fingerprint.clone());
-                            if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
-                                if let Err(e) = tx.send(true) {
-                                    tracing::error!("Failed to auto-confirm fingerprint: {}", e);
-                                }
-                            }
-                        } else {
-                            // Request explicit user verification via UI
-                            self.fingerprint_verification_request =
-                                Some((fingerprint, peer_name, chat_id));
-                            self.add_toast(
-                                ToastLevel::Warning,
-                                "Fingerprint verification required".to_string(),
-                            );
-                        }
-                    }
-                    // CASE 2: Stored fingerprint matches the new one.
-                    Some(stored_fp) if stored_fp == &fingerprint => {
-                        tracing::debug!("Fingerprint matches stored value for chat {}. Proceeding automatically.", chat_id);
-                        // Automatically confirm this connection.
-                        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
-                            if let Err(e) = tx.send(true) {
-                                tracing::error!("Failed to auto-confirm fingerprint: {}", e);
-                            }
-                        }
-                    }
-                    // CASE 3: Stored fingerprint MISMATCHES. Security alert!
-                    Some(stored_fp) => {
-                        tracing::warn!(
-                            "FINGERPRINT MISMATCH for chat {}! Stored: `{}`, New: `{}`",
-                            chat_id,
-                            stored_fp,
-                            fingerprint
-                        );
-                        // Trigger the UI dialog for manual verification.
-                        self.fingerprint_verification_request =
-                            Some((fingerprint, peer_name, chat_id));
-                        self.add_toast(
-                            ToastLevel::Warning,
-                            "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
-                        );
-                    }
-                }
+                self.handle_tofu_verification(chat_id, &fingerprint, &peer_name);
             }
 
             SessionEvent::Ready => {
