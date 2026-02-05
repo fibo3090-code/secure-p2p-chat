@@ -12,6 +12,7 @@ pub struct TuiApp {
     pub chat_ids: Vec<Uuid>,
     pub input_text: String,
     pub message_scroll: u16,
+    pub identity_name: String,
 }
 
 impl TuiApp {
@@ -52,6 +53,7 @@ impl TuiApp {
             chat_ids,
             input_text: String::new(),
             message_scroll: 0,
+            identity_name: identity.name,
         })
     }
 

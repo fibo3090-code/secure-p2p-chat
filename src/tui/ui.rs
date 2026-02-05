@@ -25,7 +25,7 @@ pub fn ui(f: &mut Frame, app: &mut TuiApp) {
         "🔴 Not Hosting".to_string()
     };
 
-    let identity_str = format!("👤 {}", app.chat_manager.config.identity_name);
+    let identity_str = format!("👤 {}", app.identity_name);
 
     let header = Line::from(vec![
         Span::styled(
