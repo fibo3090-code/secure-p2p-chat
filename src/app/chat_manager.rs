@@ -766,9 +766,10 @@ impl ChatManager {
             return Ok(());
         }
 
+        let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
         let session = self
             .sessions
-            .get(&chat_id)
+            .get(actual_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
         let chat = self
@@ -788,9 +789,10 @@ impl ChatManager {
             return Ok(());
         }
 
+        let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
         let session = self
             .sessions
-            .get(&chat_id)
+            .get(actual_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
         let chat = self
@@ -850,7 +852,8 @@ impl ChatManager {
 
     /// Check if a chat has an active session.
     pub fn is_connected(&self, chat_id: &Uuid) -> bool {
-        self.sessions.contains_key(chat_id)
+        let actual_id = self.chat_id_mapping.get(chat_id).unwrap_or(chat_id);
+        self.sessions.contains_key(actual_id)
     }
 
     /// Get all chat IDs
@@ -956,9 +959,10 @@ impl ChatManager {
         use tokio::io::AsyncReadExt;
 
         tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
+        let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
         let session = self
             .sessions
-            .get(&chat_id)
+            .get(actual_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
         let filename = path
@@ -1115,6 +1119,16 @@ impl ChatManager {
                     recv_seq: 0,
                     is_host_placeholder: false,
                 });
+
+                // If this connection consumes a placeholder host chat, remove the placeholder
+                // so the UI shows only the real chat. Auto-rehost will spawn a new listener.
+                if let Some(placeholder) = self.chats.get(&chat_id) {
+                    if placeholder.is_host_placeholder {
+                        tracing::debug!("Removing consumed host placeholder chat {}", chat_id);
+                        self.chats.remove(&chat_id);
+                    }
+                }
+
                 self.add_toast(
                     ToastLevel::Info,
                     format!("New connection from {}", peer_addr),
@@ -1439,6 +1453,7 @@ impl ChatManager {
                 // Clean up session
                 self.sessions.remove(&chat_id);
                 self.session_events.remove(&chat_id);
+                self.chat_id_mapping.retain(|_, v| *v != chat_id);
             }
 
             SessionEvent::Error(err) => {

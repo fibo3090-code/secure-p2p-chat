@@ -265,7 +265,7 @@ pub async fn run_host_session(
         .send(SessionEvent::NewConnection {
             peer_addr: peer_addr.to_string(),
             fingerprint: client_fingerprint,
-            chat_id,
+            chat_id: client_proof.chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 

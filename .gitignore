@@ -132,3 +132,5 @@ settings.local.json
 .vscode/settings.json
 clippy_output.txt
 test_output.txt
+check_errors.txt
+clippy_errors.txt
