@@ -130,3 +130,5 @@ GEMINI.md
 settings.local.json
 .vscode/extensions.json
 .vscode/settings.json
+clippy_output.txt
+test_output.txt
