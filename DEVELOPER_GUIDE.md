@@ -53,8 +53,11 @@ This section guides you through setting up your development environment, buildin
 - **Build**: `cargo build`
 - **Build (Release, recommended for use)**: `cargo build --release`
 - **Run (GUI)**: `cargo run --release`
+- **Run (TUI)**: `cargo run --release -- --tui`
+- **Run (TUI + host on port 9000)**: `cargo run --release -- --tui --host --port 9000`
+- **Run (TUI + connect)**: `cargo run --release -- --tui --connect 127.0.0.1:12345`
 
-> **Note**: The CLI is for launching the GUI. Standalone CLI operation with `--host` and `--connect` is not implemented. Please use the GUI to host or connect.
+> **Note**: GUI remains the default mode. Use `--tui` to launch the terminal interface.
 >
 > On first run (or when your identity is encrypted), you will see a **blocking unlock/set-password screen**. You must enter your password to unlock, or set a password for a new identity, before the main UI (chats, connections, etc.) is available. This cannot be bypassed.
 

@@ -49,6 +49,8 @@ To start the application in TUI mode, use the `--tui` flag.
 - `--connect <IP:PORT>`: Connect to a specific peer immediately.
 - `--port <PORT>`: Specify listening port (default: 12345).
 
+> `--host`, `--connect`, and `--port` are honored in TUI mode.
+
 **Example:**
 
 ```bash

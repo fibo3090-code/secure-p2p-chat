@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### ✨ TUI
+
+- Implemented a command-driven, keyboard-first TUI shell:
+  - Added focus/model state (`normal` + `command` modes) and status line.
+  - Added command palette and commands: `:host`, `:connect`, `:disconnect`, `:rename`, `:help`, `:quit`.
+  - Added multiline input behavior (`Enter` sends, `Ctrl+J` inserts newline).
+  - Added startup wiring so `--tui --host/--connect/--port` work end-to-end.
+  - Improved rendering resilience for stale/empty chat states and small terminal sizes.
+
+### ✅ Tests
+
+- Added strong TUI verification suites:
+  - `tests/tui_command_tests.rs` for command parsing, focus/mode transitions, and state sync.
+  - `tests/tui_loop_integration.rs` for input/send flow, newline behavior, rename, and quit paths.
+  - Extended `src/tui/ui.rs` render regression coverage for stale IDs and narrow terminals.
+
+### 📚 Documentation
+
+- Updated `docs/tui_tutorial.md` with command mode, keybindings, and startup behavior.
+- Updated `DEVELOPER_GUIDE.md` run instructions for TUI and launch examples.
+- Synced repository metadata to `v1.7.7` (`Cargo.toml`, `README.md` badge, `setup.iss` call example, security/threat headers).
+
 ### 🔐 Security
 
 - **Issue #7 (Complete)**: Hardened invite links with RSA-PSS signatures

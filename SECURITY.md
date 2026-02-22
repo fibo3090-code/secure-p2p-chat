@@ -1,7 +1,7 @@
 # Security Policy & Documentation
 
-**Last Updated:** January 24, 2026
-Application: Encrypted P2P Messenger v1.7.4+
+**Last Updated:** February 22, 2026
+Application: Encrypted P2P Messenger v1.7.7+
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
 

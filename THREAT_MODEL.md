@@ -1,8 +1,8 @@
 # Threat Model - Secure P2P Chat Application
 
 **Version:** 1.0
-**Last Updated:** January 24, 2026
-**Application:** Encrypted P2P Messenger v1.7.4+
+**Last Updated:** February 22, 2026
+**Application:** Encrypted P2P Messenger v1.7.7+
 
 ---
 

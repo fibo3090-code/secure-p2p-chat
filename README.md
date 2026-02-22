@@ -1,6 +1,6 @@
 # 🔒 Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.7.5-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.7.7-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
 [![Security](https://img.shields.io/badge/security-audited-success)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/)
@@ -67,8 +67,11 @@ cd chat-p2p
 # Build release version
 cargo build --release
 
-# Run the application
+# Run the GUI
 cargo run --release
+
+# Run the TUI
+cargo run --release -- --tui
 ```
 
 ### 2. First Run (Unlock Identity)
