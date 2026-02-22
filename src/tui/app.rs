@@ -153,7 +153,6 @@ impl TuiApp {
                         tracing::error!("Failed to send message: {}", e);
                     }
                     self.input_text.clear();
-                    self.message_scroll = 0; // Reset scroll to see new message
                 }
             }
         }
