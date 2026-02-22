@@ -91,7 +91,7 @@ This project adheres to high quality standards.
 - **Testing**:
   - **Unit Tests**: Required for all crypto and core logic.
   - **Integration Tests**: Required for network flows.
-  - **UI Tests**: (Planned) Tests for TUI and GUI rendering.
+  - **UI Tests**: TUI rendering and interaction regression tests (with `ratatui::TestBackend` and key-event integration tests).
 - **Documentation**: All public APIs must be documented.
 
 ---

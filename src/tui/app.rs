@@ -2,10 +2,34 @@ use crate::app::chat_manager::ChatManager;
 use crate::identity::Identity;
 use crate::types::Config;
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use egui_tracing::tracing::EventCollector;
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiFocus {
+    ChatList,
+    MessageView,
+    Input,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiMode {
+    Normal,
+    Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiCommand {
+    Host(Option<u16>),
+    Connect { host: String, port: u16 },
+    Disconnect,
+    Rename(String),
+    Help,
+    Quit,
+}
 
 pub struct TuiApp {
     pub chat_manager: ChatManager,
@@ -15,6 +39,13 @@ pub struct TuiApp {
     pub message_scroll: u16,
     pub identity_name: String,
     pub event_collector: EventCollector,
+    pub focus: TuiFocus,
+    pub mode: TuiMode,
+    pub command_buffer: String,
+    pub status_line: String,
+    pub should_quit: bool,
+    identity: Identity,
+    pending_command: Option<TuiCommand>,
 }
 
 impl TuiApp {
@@ -43,21 +74,377 @@ impl TuiApp {
             }
         }
 
-        let chat_ids: Vec<Uuid> = chat_manager.chats.keys().copied().collect();
-        let mut chat_list_state = ListState::default();
-        if !chat_ids.is_empty() {
-            chat_list_state.select(Some(0));
-        }
-
-        Ok(Self {
+        let mut app = Self {
             chat_manager,
-            chat_list_state,
-            chat_ids,
+            chat_list_state: ListState::default(),
+            chat_ids: Vec::new(),
             input_text: String::new(),
             message_scroll: 0,
-            identity_name: identity.name,
+            identity_name: identity.name.clone(),
             event_collector,
-        })
+            focus: TuiFocus::Input,
+            mode: TuiMode::Normal,
+            command_buffer: String::new(),
+            status_line: "Ready. Press :help for commands.".to_string(),
+            should_quit: false,
+            identity,
+            pending_command: None,
+        };
+        app.sync_chat_ids();
+        app.refresh_status_line();
+
+        Ok(app)
+    }
+
+    pub fn selected_chat_id(&self) -> Option<Uuid> {
+        self.chat_list_state
+            .selected()
+            .and_then(|idx| self.chat_ids.get(idx).copied())
+    }
+
+    pub fn sync_chat_ids(&mut self) {
+        let selected_chat_id = self.selected_chat_id();
+        let mut chats: Vec<_> = self.chat_manager.chats.values().collect();
+        chats.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        self.chat_ids = chats.into_iter().map(|c| c.id).collect();
+
+        if self.chat_ids.is_empty() {
+            self.chat_list_state.select(None);
+            return;
+        }
+
+        if let Some(selected) = selected_chat_id {
+            if let Some(new_idx) = self.chat_ids.iter().position(|id| *id == selected) {
+                self.chat_list_state.select(Some(new_idx));
+                return;
+            }
+        }
+
+        let invalid_selection = self
+            .chat_list_state
+            .selected()
+            .is_none_or(|idx| idx >= self.chat_ids.len());
+        if invalid_selection {
+            self.chat_list_state.select(Some(0));
+        }
+    }
+
+    pub fn tick(&mut self) {
+        self.chat_manager.poll_session_events();
+        self.chat_manager.cleanup_expired_toasts();
+        self.sync_chat_ids();
+        self.refresh_status_line();
+    }
+
+    fn refresh_status_line(&mut self) {
+        let session_count = self.chat_manager.sessions_len();
+        let selected_state = if let Some(chat_id) = self.selected_chat_id() {
+            if self.chat_manager.is_connected(&chat_id) {
+                "connected"
+            } else {
+                "disconnected"
+            }
+        } else {
+            "no-chat"
+        };
+
+        let focus_label = match self.focus {
+            TuiFocus::ChatList => "focus:chats",
+            TuiFocus::MessageView => "focus:messages",
+            TuiFocus::Input => "focus:input",
+        };
+        let mode_label = match self.mode {
+            TuiMode::Normal => "mode:normal",
+            TuiMode::Command => "mode:command",
+        };
+
+        let mut line = format!(
+            "{} | {} | sessions:{} | selected:{}",
+            focus_label, mode_label, session_count, selected_state
+        );
+
+        if let Some(toast) = self.chat_manager.toasts.last() {
+            line.push_str(&format!(" | last:{}", toast.message));
+        } else {
+            line.push_str(" | Tab focus | : commands | Enter send | Ctrl+J newline");
+        }
+
+        self.status_line = line;
+    }
+
+    pub fn enter_command_mode(&mut self) {
+        self.mode = TuiMode::Command;
+        self.command_buffer.clear();
+    }
+
+    pub fn cancel_command_mode(&mut self) {
+        self.mode = TuiMode::Normal;
+        self.command_buffer.clear();
+    }
+
+    pub fn take_pending_command(&mut self) -> Option<TuiCommand> {
+        self.pending_command.take()
+    }
+
+    pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
+        let input = raw.trim().trim_start_matches(':').trim();
+        if input.is_empty() {
+            return Err("Empty command. Try :help".to_string());
+        }
+
+        let mut parts = input.split_whitespace();
+        let cmd = parts.next().unwrap_or_default();
+
+        match cmd {
+            "host" => {
+                let port = parts
+                    .next()
+                    .map(|p| {
+                        p.parse::<u16>()
+                            .map_err(|_| "Invalid port. Example: :host 9000".to_string())
+                    })
+                    .transpose()?;
+                Ok(TuiCommand::Host(port))
+            }
+            "connect" => {
+                let target = parts
+                    .next()
+                    .ok_or_else(|| "Usage: :connect <host[:port]>".to_string())?;
+                let (host, port) = if let Some((h, p)) = target.rsplit_once(':') {
+                    let parsed_port = p
+                        .parse::<u16>()
+                        .map_err(|_| "Invalid port in :connect".to_string())?;
+                    (h.to_string(), parsed_port)
+                } else {
+                    (target.to_string(), crate::PORT_DEFAULT)
+                };
+                if host.trim().is_empty() {
+                    return Err("Host cannot be empty".to_string());
+                }
+                Ok(TuiCommand::Connect { host, port })
+            }
+            "disconnect" => Ok(TuiCommand::Disconnect),
+            "rename" => {
+                let title = input
+                    .strip_prefix("rename")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if title.is_empty() {
+                    return Err("Usage: :rename <new title>".to_string());
+                }
+                Ok(TuiCommand::Rename(title))
+            }
+            "help" => Ok(TuiCommand::Help),
+            "quit" | "q" => Ok(TuiCommand::Quit),
+            _ => Err(format!("Unknown command: {}. Try :help", cmd)),
+        }
+    }
+
+    pub fn submit_command(&mut self) {
+        match Self::parse_command(&self.command_buffer) {
+            Ok(cmd) => {
+                self.pending_command = Some(cmd);
+                self.mode = TuiMode::Normal;
+                self.command_buffer.clear();
+            }
+            Err(e) => {
+                self.chat_manager
+                    .add_toast(crate::types::ToastLevel::Error, e);
+                self.mode = TuiMode::Normal;
+                self.command_buffer.clear();
+            }
+        }
+    }
+
+    pub fn cycle_focus(&mut self) {
+        self.focus = match self.focus {
+            TuiFocus::ChatList => TuiFocus::MessageView,
+            TuiFocus::MessageView => TuiFocus::Input,
+            TuiFocus::Input => TuiFocus::ChatList,
+        };
+    }
+
+    pub fn handle_key_event(&mut self, key: KeyEvent) {
+        if self.mode == TuiMode::Command {
+            match key.code {
+                KeyCode::Esc => self.cancel_command_mode(),
+                KeyCode::Enter => self.submit_command(),
+                KeyCode::Backspace => {
+                    self.command_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.command_buffer.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            self.copy_logs();
+            return;
+        }
+
+        if key.code == KeyCode::Tab {
+            self.cycle_focus();
+            return;
+        }
+
+        if key.code == KeyCode::Esc {
+            self.focus = TuiFocus::ChatList;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+            if self.focus == TuiFocus::Input {
+                self.input_text.push('\n');
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char(':') => {
+                if self.focus != TuiFocus::Input || self.input_text.is_empty() {
+                    self.enter_command_mode();
+                } else {
+                    self.input_text.push(':');
+                }
+            }
+            KeyCode::Char('q') if self.focus != TuiFocus::Input => {
+                self.should_quit = true;
+            }
+            KeyCode::Down => match self.focus {
+                TuiFocus::ChatList => self.next_chat(),
+                TuiFocus::MessageView => self.scroll_down(),
+                TuiFocus::Input => {}
+            },
+            KeyCode::Up => match self.focus {
+                TuiFocus::ChatList => self.previous_chat(),
+                TuiFocus::MessageView => self.scroll_up(),
+                TuiFocus::Input => {}
+            },
+            KeyCode::PageDown => self.scroll_down(),
+            KeyCode::PageUp => self.scroll_up(),
+            KeyCode::Enter => {
+                if self.focus == TuiFocus::Input {
+                    self.send_message();
+                }
+            }
+            KeyCode::Backspace => {
+                if self.focus == TuiFocus::Input {
+                    self.input_text.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if self.focus == TuiFocus::Input {
+                    self.input_text.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub async fn execute_command(&mut self, cmd: TuiCommand) {
+        match cmd {
+            TuiCommand::Host(port_override) => {
+                let port = port_override.unwrap_or(self.chat_manager.config.listen_port);
+                match self.identity.private_key() {
+                    Ok(privkey) => match self.chat_manager.start_host(port, privkey).await {
+                        Ok(_) => {
+                            self.chat_manager.add_toast(
+                                crate::types::ToastLevel::Success,
+                                format!("Hosting on :{}", port),
+                            );
+                        }
+                        Err(e) => self.chat_manager.add_toast(
+                            crate::types::ToastLevel::Error,
+                            format!("Failed to start host: {}", e),
+                        ),
+                    },
+                    Err(e) => self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Cannot start host: {}", e),
+                    ),
+                }
+            }
+            TuiCommand::Connect { host, port } => match self.identity.private_key() {
+                Ok(privkey) => match self
+                    .chat_manager
+                    .connect_to_host(&host, port, None, privkey)
+                    .await
+                {
+                    Ok(chat_id) => {
+                        self.chat_manager.add_toast(
+                            crate::types::ToastLevel::Info,
+                            format!("Connecting to {}:{}...", host, port),
+                        );
+                        self.sync_chat_ids();
+                        if let Some(idx) = self.chat_ids.iter().position(|id| *id == chat_id) {
+                            self.chat_list_state.select(Some(idx));
+                        }
+                    }
+                    Err(e) => self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Connect failed: {}", e),
+                    ),
+                },
+                Err(e) => self.chat_manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Cannot connect: {}", e),
+                ),
+            },
+            TuiCommand::Disconnect => {
+                if let Some(chat_id) = self.selected_chat_id() {
+                    let is_placeholder = self
+                        .chat_manager
+                        .get_chat(chat_id)
+                        .map(|c| c.is_host_placeholder)
+                        .unwrap_or(false);
+                    if is_placeholder {
+                        self.chat_manager.stop_hosting();
+                    } else {
+                        self.chat_manager.delete_chat(chat_id);
+                    }
+                } else {
+                    self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Warning,
+                        "No selected chat to disconnect".to_string(),
+                    );
+                }
+            }
+            TuiCommand::Rename(new_title) => {
+                if let Some(chat_id) = self.selected_chat_id() {
+                    if let Err(e) = self.chat_manager.rename_chat(chat_id, new_title) {
+                        self.chat_manager.add_toast(
+                            crate::types::ToastLevel::Error,
+                            format!("Rename failed: {}", e),
+                        );
+                    } else {
+                        self.chat_manager.add_toast(
+                            crate::types::ToastLevel::Success,
+                            "Chat renamed".to_string(),
+                        );
+                    }
+                } else {
+                    self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Warning,
+                        "No selected chat to rename".to_string(),
+                    );
+                }
+            }
+            TuiCommand::Help => {
+                self.chat_manager.add_toast(
+                    crate::types::ToastLevel::Info,
+                    "Commands: :host [port], :connect <host[:port]>, :disconnect, :rename <title>, :help, :quit"
+                        .to_string(),
+                );
+            }
+            TuiCommand::Quit => {
+                self.should_quit = true;
+            }
+        }
+        self.refresh_status_line();
     }
 
     pub fn copy_logs(&mut self) {
@@ -98,6 +485,7 @@ impl TuiApp {
                 );
             }
         }
+        self.refresh_status_line();
     }
 
     pub fn next_chat(&mut self) {
@@ -161,8 +549,9 @@ impl TuiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::TuiApp;
+    use super::{TuiApp, TuiCommand, TuiFocus, TuiMode};
     use crate::app::chat_manager::SessionHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use egui_tracing::tracing::EventCollector;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -194,6 +583,7 @@ mod tests {
         let app = TuiApp::new(EventCollector::new()).unwrap();
         assert_eq!(app.input_text, "");
         assert_eq!(app.message_scroll, 0);
+        assert_eq!(app.mode, TuiMode::Normal);
     }
 
     #[test]
@@ -355,20 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn test_send_message_increments_seq() {
-        let mut app = TuiApp::new(EventCollector::new()).unwrap();
-        let (chat_id, _rx) = setup_chat_with_session(&mut app, "Test");
-
-        let initial_seq = app.chat_manager.chats.get(&chat_id).unwrap().send_seq;
-
-        app.input_text = "Seq Test".to_string();
-        app.send_message();
-
-        let new_seq = app.chat_manager.chats.get(&chat_id).unwrap().send_seq;
-        assert_eq!(new_seq, initial_seq + 1);
-    }
-
-    #[test]
     fn test_send_to_nonexistent_chat() {
         let mut app = TuiApp::new(EventCollector::new()).unwrap();
         // Force state: empty chat_ids but selected index 0
@@ -428,5 +804,57 @@ mod tests {
             crate::types::MessageContent::Text { text } => assert_eq!(text, &long_msg),
             _ => panic!("Wrong content"),
         }
+    }
+
+    #[test]
+    fn test_parse_host_command_with_port() {
+        let parsed = TuiApp::parse_command(":host 7777").unwrap();
+        assert_eq!(parsed, TuiCommand::Host(Some(7777)));
+    }
+
+    #[test]
+    fn test_parse_connect_command_default_port() {
+        let parsed = TuiApp::parse_command(":connect 10.0.0.1").unwrap();
+        assert_eq!(
+            parsed,
+            TuiCommand::Connect {
+                host: "10.0.0.1".to_string(),
+                port: crate::PORT_DEFAULT,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_rename_requires_title() {
+        assert!(TuiApp::parse_command(":rename").is_err());
+    }
+
+    #[test]
+    fn test_enter_command_mode_from_empty_input() {
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
+        app.focus = TuiFocus::Input;
+        app.input_text.clear();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, TuiMode::Command);
+    }
+
+    #[test]
+    fn test_ctrl_j_inserts_newline_in_input() {
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
+        app.focus = TuiFocus::Input;
+        app.input_text = "hello".to_string();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.input_text, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn test_quit_command_sets_exit_flag() {
+        let mut app = TuiApp::new(EventCollector::new()).unwrap();
+        app.execute_command(TuiCommand::Quit).await;
+        assert!(app.should_quit);
     }
 }

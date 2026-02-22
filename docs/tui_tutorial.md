@@ -37,7 +37,7 @@ To use the TUI, you need to build the application with the TUI features.
 To start the application in TUI mode, use the `--tui` flag.
 
 ```bash
-# Basic usage (defaults to TUI if no arguments provided, but explicit is better)
+# Basic usage (GUI is default, so pass --tui explicitly)
 ./target/release/encodeur_rsa_rust --tui
 ```
 
@@ -68,11 +68,18 @@ The TUI is designed to be fully keyboard-driven.
 | `↓` (Down Arrow) | Select next chat in the sidebar |
 | `Page Up` | Scroll chat history up |
 | `Page Down` | Scroll chat history down |
+| `Tab` | Cycle focus: chats -> messages -> input |
 | **Messaging** | |
 | `Enter` | Send the message currently in the input field |
+| `Ctrl+J` | Insert newline in the input field |
 | `Backspace` | Delete the last character |
+| `Esc` | Move focus back to chat list |
+| **Commands** | |
+| `:` | Open command palette |
+| `Enter` (in command mode) | Execute command |
+| **Examples** | `:host 9000`, `:connect 192.168.1.10:12345`, `:rename Team Chat`, `:disconnect`, `:help`, `:quit` |
 | **System** | |
-| `q` | Quit the application immediately |
+| `q` | Quit (when input box is not focused) |
 
 ### Interface Layout
 
@@ -80,7 +87,8 @@ The screen is divided into three main sections:
 
 1. **Sidebar (Left)**: Displays your list of active chats and contacts.
 2. **Chat Area (Right)**: Shows the message history for the selected conversation.
-3. **Input Bar (Bottom)**: Where you type your messages.
+3. **Input/Command Bar (Bottom)**: Message input and command mode (`:`).
+4. **Status Line**: Focus/mode/session summary and quick hints.
 
 ## 5. Using the TUI
 
@@ -94,6 +102,7 @@ The screen is divided into three main sections:
 
 - Type your message using your keyboard. You will see characters appear in the bottom input bar.
 - Press **Enter** to send.
+- Press **Ctrl+J** to insert a newline without sending.
 - Your message will appear in the chat history immediately.
 
 ### 3. Exiting

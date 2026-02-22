@@ -76,7 +76,12 @@ async fn main() -> anyhow::Result<()> {
     if args.tui {
         // Launch TUI
         tracing::info!("Starting TUI mode");
-        if let Err(e) = tui::run(event_collector.clone()).await {
+        let launch = tui::TuiLaunchConfig {
+            host: args.host,
+            connect: args.connect.clone(),
+            port: args.port,
+        };
+        if let Err(e) = tui::run(event_collector.clone(), launch).await {
             tracing::error!(error = %e, "TUI application exited with an error");
             std::process::exit(1);
         }
