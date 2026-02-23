@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-1.7.7-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
 [![Security](https://img.shields.io/badge/security-audited-success)](SECURITY.md)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
 
 > **Secure, private, peer-to-peer messaging with end-to-end encryption and forward secrecy.**
 
@@ -57,7 +57,7 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
 
 ### 1. Installation
 
-To build from source, ensure you have [Rust 1.70+](https://rustup.rs/) installed.
+To build from source, ensure you have [Rust 1.86+](https://rustup.rs/) installed.
 
 ```bash
 # Clone the repository

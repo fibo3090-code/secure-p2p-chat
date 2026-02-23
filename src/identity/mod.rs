@@ -618,6 +618,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_password() -> String {
+        format!("pw-{}", Uuid::new_v4())
+    }
+
     #[test]
     fn test_identity_creation() {
         let identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
@@ -634,16 +638,17 @@ mod tests {
     fn test_encryption_decryption_roundtrip() {
         let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
         let original_pem = identity.private_key_pem_plaintext.clone().unwrap();
+        let password = test_password();
 
         // Encrypt
-        identity.encrypt("password123").unwrap();
+        identity.encrypt(&password).unwrap();
         assert!(identity.private_key_pem_plaintext.is_none());
         assert!(identity.encrypted_private_key.is_some());
         assert!(identity.salt.is_some());
         assert!(identity.nonce.is_some());
 
         // Decrypt
-        identity.decrypt("password123").unwrap();
+        identity.decrypt(&password).unwrap();
         assert!(identity.private_key_pem_plaintext.is_some());
         assert_eq!(identity.private_key_pem_plaintext.unwrap(), original_pem);
     }
@@ -651,8 +656,10 @@ mod tests {
     #[test]
     fn test_decryption_with_wrong_password_fails() {
         let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
-        identity.encrypt("password123").unwrap();
-        let result = identity.decrypt("wrong-password");
+        let password = test_password();
+        identity.encrypt(&password).unwrap();
+        let wrong_password = test_password();
+        let result = identity.decrypt(&wrong_password);
         assert!(result.is_err());
     }
 
@@ -663,15 +670,16 @@ mod tests {
 
         let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
         let original_pem = identity.private_key().unwrap();
+        let password = test_password();
 
         // Encrypt and save
-        identity.encrypt("password123").unwrap();
+        identity.encrypt(&password).unwrap();
         identity.save(&path).unwrap();
 
         // Load and decrypt
         let mut loaded = Identity::load(&path).unwrap();
         assert!(loaded.private_key_pem_plaintext.is_none()); // Should not be available yet
-        loaded.decrypt("password123").unwrap();
+        loaded.decrypt(&password).unwrap();
 
         assert_eq!(loaded.private_key().unwrap(), original_pem);
     }

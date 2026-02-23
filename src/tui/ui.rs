@@ -6,7 +6,7 @@ pub fn ui(f: &mut Frame, app: &mut TuiApp) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
-        .split(f.size());
+        .split(f.area());
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)

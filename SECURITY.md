@@ -1,6 +1,6 @@
 # Security Policy & Documentation
 
-**Last Updated:** February 22, 2026
+**Last Updated:** February 23, 2026
 Application: Encrypted P2P Messenger v1.7.7+
 
 This document provides comprehensive security information including the threat model, cryptographic specifications, security audit findings, applied fixes, and vulnerability reporting guidelines.
@@ -17,9 +17,9 @@ This document provides comprehensive security information including the threat m
 3. [Cryptographic Specifications](#cryptographic-specifications)
 4. [Security Audit History](#security-audit-history)
 5. [Applied Security Fixes](#applied-security-fixes)
-6. [Remaining Security Work](#remaining-security-work)
-7. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
-8. [Security Roadmap](#security-roadmap)
+6. [Known Open Risks (Audit Feb 23, 2026)](#known-open-risks-audit-feb-23-2026)
+7. [Security Roadmap](#security-roadmap)
+8. [Vulnerability Reporting & Responsible Disclosure](#vulnerability-reporting--responsible-disclosure)
 
 ---
 
@@ -29,7 +29,7 @@ This application implements **military-grade end-to-end encryption** with **forw
 
 ### Current Security Posture
 
-**Overall Risk Assessment:** **LOW** (improved from MEDIUM)
+**Overall Risk Assessment:** **MEDIUM**
 
 **Security Achievements:**
 
@@ -39,14 +39,31 @@ This application implements **military-grade end-to-end encryption** with **forw
 - ✅ Encrypted identity keystore at rest (Argon2 + ChaCha20-Poly1305)
 - ✅ Counter-based nonces (prevents reuse)
 - ✅ Replay attack protection (sequence numbers)
-- ✅ Thread-safe implementation (no unsafe code)
+- ✅ Thread-safe architecture with narrowly scoped platform `unsafe` blocks (Windows console attach/alloc)
 - ✅ Fingerprint verification enforcement
 
-**Recent Security Improvements (Jan 2026):**
+**Recent Security Improvements (Jan-Feb 2026):**
 
-- Patched `rsa` crate vulnerability (CVE-2026-21895).
-- Updated all dependencies to latest versions.
-- Remediated multiple CodeQL warnings.
+- Patched Dependabot findings for `bytes`, `time`, and `lru`.
+- Remediated CodeQL findings for hard-coded crypto values and workflow permissions.
+- Added signed v2 invite verification and transport-level replay protection.
+
+---
+
+## Known Open Risks (Audit Feb 23, 2026)
+
+The following findings are tracked publicly and prioritized for remediation:
+
+- [Issue #21](https://github.com/fibo3090-code/secure-p2p-chat/issues/21) (HIGH): File transfer sequence numbers conflict with transport replay protection.
+- [Issue #22](https://github.com/fibo3090-code/secure-p2p-chat/issues/22) (HIGH): GUI share flow still generates unsigned v1 invite links.
+- [Issue #23](https://github.com/fibo3090-code/secure-p2p-chat/issues/23) (MEDIUM): Session chat mapping is inconsistent in event routing.
+- [Issue #24](https://github.com/fibo3090-code/secure-p2p-chat/issues/24) (MEDIUM): CI security policy is inconsistent (`cargo audit` ignores vs `deny.toml` policy).
+- [Issue #25](https://github.com/fibo3090-code/secure-p2p-chat/issues/25) (LOW): SECURITY.md claims and implementation drift.
+
+Dependency risk status:
+
+- `RUSTSEC-2023-0071` (`rsa`) remains open with no upstream fixed release currently available.
+- Unmaintained crate warnings remain for `bincode` and transitive `paste`; both are tracked and require migration planning.
 
 ---
 
@@ -165,6 +182,7 @@ A comprehensive security audit was conducted on December 18, 2025.
 #### 6. Dependency Vulnerability Patching
 
 - **rsa Crate Panic (CVE-2026-21895)**: Upgraded the `rsa` crate to version `0.9.10` to patch a vulnerability where creating a private key from components with a prime equal to 1 could cause a panic.
+- **Current Limitation**: `RUSTSEC-2023-0071` (Marvin timing sidechannel in `rsa`) still has no fixed upstream version; risk is mitigated operationally but not eliminated.
 - **General Dependency Update**: Updated all dependencies to their latest compatible versions to incorporate security fixes and improvements from the ecosystem.
 - **Files**: `Cargo.toml`, `Cargo.lock`
 
@@ -321,4 +339,4 @@ For security-related inquiries:
 - **General Questions**: Open an issue on GitHub (non-sensitive questions only)
 - **Direct Contact**: [TBD - add contact info]
 
-*This security policy is effective as of January 24, 2026 and supersedes all previous versions.*
+*This security policy is effective as of February 23, 2026 and supersedes all previous versions.*

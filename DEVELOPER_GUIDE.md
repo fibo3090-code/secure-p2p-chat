@@ -32,7 +32,7 @@ Encrypted P2P Messenger is a **desktop application** for secure messaging built 
 
 ## 3. Prerequisites
 
-- **Rust 1.70+**: [rustup.rs](https://rustup.rs/)
+- **Rust 1.86+**: [rustup.rs](https://rustup.rs/)
 - **Network**: Same LAN or VPN to reach other users.
 
 ---

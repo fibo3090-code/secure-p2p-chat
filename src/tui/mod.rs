@@ -77,7 +77,7 @@ fn set_cursor_position(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &TuiApp,
 ) -> Result<()> {
-    let size = terminal.size()?;
+    let size: Rect = terminal.size()?.into();
 
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -119,7 +119,7 @@ fn set_cursor_position(
     let max_inner_cols = input_area.width.saturating_sub(2);
     let x = input_area.x + 1 + col.min(max_inner_cols.saturating_sub(1));
 
-    terminal.set_cursor(x, y)?;
+    terminal.set_cursor_position((x, y))?;
 
     Ok(())
 }

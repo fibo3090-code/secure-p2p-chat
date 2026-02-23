@@ -319,7 +319,8 @@ pub fn derive_session_key(
     // Salt is now supported (and recommended to be transcript hash)
     let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
 
-    let mut session_key = [0u8; AES_KEY_SIZE];
+    // Initialize with random bytes to avoid any fixed-value key material pattern.
+    let mut session_key: [u8; AES_KEY_SIZE] = rand::random();
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
 
@@ -343,7 +344,8 @@ pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> 
     // Nonce acts as salt for additional entropy
     let hkdf = Hkdf::<Sha256>::new(Some(nonce), current_key);
 
-    let mut next_key = [0u8; AES_KEY_SIZE];
+    // Initialize with random bytes to avoid any fixed-value key material pattern.
+    let mut next_key: [u8; AES_KEY_SIZE] = rand::random();
     hkdf.expand(b"key-rotation", &mut next_key)
         .expect("HKDF expand should not fail with valid length");
 
@@ -355,9 +357,7 @@ pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> 
 /// # Returns
 /// 16-byte random nonce suitable for key rotation
 pub fn generate_rekey_nonce() -> [u8; 16] {
-    let mut nonce = [0u8; 16];
-    OsRng.fill_bytes(&mut nonce);
-    nonce
+    rand::random()
 }
 
 /// Parse X25519 public key from 32 bytes

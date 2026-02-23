@@ -10,7 +10,7 @@ To use the TUI, you need to build the application with the TUI features.
 
 ### Prerequisites
 
-- **Rust Toolchain**: Install via [rustup](https://rustup.rs/)
+- **Rust Toolchain (1.86+)**: Install via [rustup](https://rustup.rs/)
 - **Terminal Emulator**: Any modern terminal (Alacritty, Windows Terminal, iTerm2, GNOME Terminal)
 
 ### Build Instructions

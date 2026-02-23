@@ -975,9 +975,10 @@ impl ChatManager {
 
         tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
         let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
-        let session = self
+        let sender = self
             .sessions
             .get(actual_id)
+            .map(|s| s.from_app_tx.clone())
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
         let filename = path
@@ -989,25 +990,23 @@ impl ChatManager {
         let file_size = tokio::fs::metadata(&path).await?.len();
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
-        // Send file metadata
-        let meta_msg = {
-            let chat = self
-                .chats
-                .get_mut(&chat_id)
-                .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
-            chat.send_seq += 1;
-            ProtocolMessage::FileMeta {
-                filename: filename.clone(),
-                size: file_size,
-                seq: chat.send_seq,
-            }
-        };
-        session.from_app_tx.send(meta_msg)?;
+        let chat = self
+            .chats
+            .get_mut(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
 
-        // Send file chunks
+        // Send file metadata using the same monotonic sequence space as all other chat messages.
+        chat.send_seq += 1;
+        sender.send(ProtocolMessage::FileMeta {
+            filename: filename.clone(),
+            size: file_size,
+            seq: chat.send_seq,
+        })?;
+
+        // Send file chunks with globally monotonic sequence numbers.
         let mut file = File::open(&path).await?;
         let mut buffer = vec![0u8; crate::FILE_CHUNK_SIZE];
-        let mut seq = 0u64;
+        let mut sent_chunks = 0u64;
 
         loop {
             let n = file.read(&mut buffer).await?;
@@ -1015,34 +1014,33 @@ impl ChatManager {
                 break; // EOF
             }
 
-            let chunk_msg = ProtocolMessage::FileChunk {
+            chat.send_seq += 1;
+            sender.send(ProtocolMessage::FileChunk {
                 chunk: buffer[..n].to_vec(),
-                seq,
-            };
-            session.from_app_tx.send(chunk_msg)?;
-            seq += 1;
-            if seq.is_multiple_of(64) {
-                tracing::trace!(sent_chunks = %seq, "File sending progress");
+                seq: chat.send_seq,
+            })?;
+            sent_chunks += 1;
+            if sent_chunks % 64 == 0 {
+                tracing::trace!(sent_chunks = %sent_chunks, "File sending progress");
             }
         }
 
-        // Send end marker
-        session.from_app_tx.send(ProtocolMessage::FileEnd { seq })?;
+        // Send end marker with the next monotonic sequence value.
+        chat.send_seq += 1;
+        sender.send(ProtocolMessage::FileEnd { seq: chat.send_seq })?;
         tracing::info!(file = %filename, total_bytes = %file_size, "File send complete");
 
-        // Add to local history
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.messages.push(Message {
-                id: Uuid::new_v4(),
-                from_me: true,
-                content: MessageContent::File {
-                    filename: filename.clone(),
-                    size: file_size,
-                    path: Some(path),
-                },
-                timestamp: chrono::Utc::now(),
-            });
-        }
+        // Add to local history.
+        chat.messages.push(Message {
+            id: Uuid::new_v4(),
+            from_me: true,
+            content: MessageContent::File {
+                filename: filename.clone(),
+                size: file_size,
+                path: Some(path),
+            },
+            timestamp: chrono::Utc::now(),
+        });
 
         self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
 
@@ -1341,6 +1339,21 @@ impl ChatManager {
                     }
 
                     ProtocolMessage::FileChunk { chunk, seq } => {
+                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                true
+                            } else {
+                                tracing::warn!("Received file chunk with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !valid_seq {
+                            return;
+                        }
+
                         let transfer_id = self
                             .active_transfers
                             .values()
@@ -1348,101 +1361,103 @@ impl ChatManager {
                             .map(|t| t.id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-                                if seq == transfer.seq {
-                                    transfer.seq += 1;
-                                    tracing::debug!(
-                                        "Received file chunk {} ({} bytes)",
-                                        seq,
-                                        chunk.len()
-                                    );
+                                transfer.seq += 1;
+                                tracing::debug!(
+                                    "Received file chunk {} ({} bytes)",
+                                    seq,
+                                    chunk.len()
+                                );
 
-                                    if let Some(incoming) =
-                                        self.incoming_files.get_mut(&transfer_id)
-                                    {
-                                        if let Err(e) = incoming.write_chunk(&chunk) {
-                                            tracing::error!("Failed to write chunk: {}", e);
-                                            self.add_toast(
-                                                ToastLevel::Error,
-                                                format!("File transfer error: {}", e),
-                                            );
-                                        } else {
-                                            let bytes_received = incoming.bytes_received();
-                                            self.update_transfer_progress(
-                                                transfer_id,
-                                                bytes_received,
-                                            );
-                                        }
+                                if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
+                                    if let Err(e) = incoming.write_chunk(&chunk) {
+                                        tracing::error!("Failed to write chunk: {}", e);
+                                        self.add_toast(
+                                            ToastLevel::Error,
+                                            format!("File transfer error: {}", e),
+                                        );
+                                    } else {
+                                        let bytes_received = incoming.bytes_received();
+                                        self.update_transfer_progress(transfer_id, bytes_received);
                                     }
-                                } else {
-                                    tracing::warn!("Received file chunk with invalid sequence number for transfer {}. Expected {}, got {}. Discarding.", transfer_id, transfer.seq, seq);
                                 }
                             }
                         }
                     }
 
                     ProtocolMessage::FileEnd { seq } => {
+                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                true
+                            } else {
+                                tracing::warn!("Received FileEnd with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !valid_seq {
+                            return;
+                        }
+
                         let transfer_id = self
                             .active_transfers
                             .values()
                             .find(|t| t.chat_id == actual_chat_id)
                             .map(|t| t.id);
                         if let Some(transfer_id) = transfer_id {
-                            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-                                if seq == transfer.seq {
-                                    tracing::info!("File transfer completed");
+                            if let Some(_transfer) = self.active_transfers.get_mut(&transfer_id) {
+                                tracing::info!("File transfer completed");
 
-                                    // Finalize only the matching transfer, not all incoming files
-                                    if let Some(incoming) = self.incoming_files.remove(&transfer_id)
-                                    {
-                                        let bytes_received = incoming.bytes_received();
-                                        match incoming.finalize() {
-                                            Ok(final_path) => {
-                                                if let Some(transfer) =
-                                                    self.active_transfers.get(&transfer_id)
+                                // Finalize only the matching transfer, not all incoming files.
+                                if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+                                    let bytes_received = incoming.bytes_received();
+                                    match incoming.finalize() {
+                                        Ok(final_path) => {
+                                            if let Some(transfer) =
+                                                self.active_transfers.get(&transfer_id)
+                                            {
+                                                // Add to chat history.
+                                                if let Some(chat) =
+                                                    self.chats.get_mut(&actual_chat_id)
                                                 {
-                                                    // Add to chat history
-                                                    if let Some(chat) = self.chats.get_mut(&chat_id)
-                                                    {
-                                                        chat.messages.push(Message {
-                                                            id: Uuid::new_v4(),
-                                                            from_me: false,
-                                                            content: MessageContent::File {
-                                                                filename: transfer.filename.clone(),
-                                                                size: transfer.size,
-                                                                path: Some(final_path),
-                                                            },
-                                                            timestamp: chrono::Utc::now(),
-                                                        });
-                                                    }
+                                                    chat.messages.push(Message {
+                                                        id: Uuid::new_v4(),
+                                                        from_me: false,
+                                                        content: MessageContent::File {
+                                                            filename: transfer.filename.clone(),
+                                                            size: transfer.size,
+                                                            path: Some(final_path),
+                                                        },
+                                                        timestamp: chrono::Utc::now(),
+                                                    });
                                                 }
-                                                self.update_transfer_progress(
-                                                    transfer_id,
-                                                    bytes_received,
-                                                );
                                             }
-                                            Err(e) => {
-                                                tracing::error!("Failed to finalize file: {}", e);
-                                                self.add_toast(
-                                                    ToastLevel::Error,
-                                                    format!("File transfer error: {}", e),
-                                                );
-                                            }
+                                            self.update_transfer_progress(
+                                                transfer_id,
+                                                bytes_received,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to finalize file: {}", e);
+                                            self.add_toast(
+                                                ToastLevel::Error,
+                                                format!("File transfer error: {}", e),
+                                            );
                                         }
                                     }
-                                } else {
-                                    tracing::warn!("Received FileEnd with invalid sequence number for transfer {}. Expected {}, got {}. Discarding.", transfer_id, transfer.seq, seq);
                                 }
                             }
                         }
                     }
 
                     ProtocolMessage::Ping { seq } => {
-                        if let Some(chat) = self.chats.get_mut(&chat_id) {
+                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
                             if seq > chat.recv_seq {
                                 chat.recv_seq = seq;
                                 tracing::trace!("Received ping with seq {}", seq);
                             } else {
-                                tracing::warn!("Received Ping with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
+                                tracing::warn!("Received Ping with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
                             }
                         }
                     }
@@ -2193,6 +2208,84 @@ mod tests {
         assert!(
             mgr.parse_invite_link(&tampered_link).is_err(),
             "should reject invite with swapped fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_file_uses_monotonic_chat_sequence_space() {
+        let mut mgr = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(chat_id, "File Seq Test".to_string());
+
+        let (from_app_tx, mut from_app_rx) = mpsc::unbounded_channel();
+        mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+
+        // Start from a non-zero value to ensure file transfer continues existing sequence space.
+        mgr.chats.get_mut(&chat_id).unwrap().send_seq = 5;
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let content = vec![b'x'; crate::FILE_CHUNK_SIZE * 2 + 13];
+        std::fs::write(temp_file.path(), content).unwrap();
+
+        mgr.send_file(chat_id, temp_file.path().to_path_buf())
+            .await
+            .expect("send_file should succeed");
+
+        let mut seqs = Vec::new();
+        let mut saw_meta = false;
+        let mut saw_end = false;
+        let mut chunk_count = 0usize;
+        while let Ok(msg) = from_app_rx.try_recv() {
+            match msg {
+                ProtocolMessage::FileMeta { seq, .. } => {
+                    saw_meta = true;
+                    seqs.push(seq);
+                }
+                ProtocolMessage::FileChunk { seq, .. } => {
+                    chunk_count += 1;
+                    seqs.push(seq);
+                }
+                ProtocolMessage::FileEnd { seq } => {
+                    saw_end = true;
+                    seqs.push(seq);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_meta, "FileMeta should be emitted");
+        assert!(saw_end, "FileEnd should be emitted");
+        assert!(chunk_count >= 2, "Test file should produce multiple chunks");
+        assert_eq!(
+            seqs.first().copied(),
+            Some(6),
+            "Sequence should continue from chat.send_seq"
+        );
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0] + 1),
+            "File transfer messages must use strictly increasing sequence numbers"
+        );
+    }
+
+    #[test]
+    fn mapped_session_ping_updates_actual_chat() {
+        let mut mgr = ChatManager::new(Config::default());
+        let session_chat_id = Uuid::new_v4();
+        let actual_chat_id = Uuid::new_v4();
+
+        mgr.chat_id_mapping.insert(actual_chat_id, session_chat_id);
+        mgr.create_local_chat_for_test(actual_chat_id, "Mapped Chat".to_string());
+        mgr.chats.get_mut(&actual_chat_id).unwrap().recv_seq = 0;
+
+        mgr.handle_session_event(
+            session_chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::Ping { seq: 1 }),
+        );
+
+        assert_eq!(
+            mgr.chats.get(&actual_chat_id).unwrap().recv_seq,
+            1,
+            "Ping sequence must be applied to mapped actual chat"
         );
     }
 }

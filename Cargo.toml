@@ -2,6 +2,7 @@
 name = "encodeur_rsa_rust"
 version = "1.7.7"
 edition = "2021"
+rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]
 description = "Encrypted P2P Messenger - A secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
 
@@ -42,8 +43,8 @@ egui = "0.29.0"
 egui_commonmark = { version = "0.18", features = ["default"] }
 
 # TUI
-ratatui = { version = "0.26.1", features = ["all-widgets"] }
-crossterm = "0.27.0"
+ratatui = { version = "0.30.0", features = ["all-widgets"] }
+crossterm = "0.29.0"
 
 # Utilities
 anyhow = "1"

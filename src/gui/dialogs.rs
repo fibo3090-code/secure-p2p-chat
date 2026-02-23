@@ -1025,14 +1025,14 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                             let port = manager.config.listen_port;
                             let invite_addr =
                                 primary_local_ipv4().map(|ip| format!("{}:{}", ip, port));
-                            match app.identity.generate_invite_link(invite_addr) {
+                            match app.identity.generate_signed_invite_link(invite_addr) {
                                 Ok(link) => {
                                     app.my_invite_link = Some(link);
                                 }
                                 Err(e) => {
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "❌ Failed to generate link: {}",
+                                            "❌ Failed to generate signed link: {}",
                                             e
                                         ))
                                         .color(crate::gui::styling::ERROR),
