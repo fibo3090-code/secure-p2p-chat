@@ -6,7 +6,7 @@ notice = "warn"
 # Temporary risk acceptances tracked in GitHub issues and SECURITY.md.
 # Keep this list minimal and review regularly.
 ignore = [
-    "RUSTSEC-2020-0001", # OpenSSL via transitive dependency
+    "RUSTSEC-2020-0001", # trust-dns-server stack overflow when resolving additional records from MX/SRV null targets
     "RUSTSEC-2023-0071", # rsa Marvin timing issue (no upstream fix yet)
     "RUSTSEC-2024-0436", # paste unmaintained (transitive)
     "RUSTSEC-2025-0141", # bincode unmaintained (direct, migration pending)

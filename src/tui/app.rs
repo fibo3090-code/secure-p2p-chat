@@ -2,9 +2,9 @@ use crate::app::chat_manager::ChatManager;
 use crate::identity::Identity;
 use crate::types::Config;
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use egui_tracing::tracing::EventCollector;
 use ratatui::widgets::ListState;
+use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -551,8 +551,8 @@ impl TuiApp {
 mod tests {
     use super::{TuiApp, TuiCommand, TuiFocus, TuiMode};
     use crate::app::chat_manager::SessionHandle;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use egui_tracing::tracing::EventCollector;
+    use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
     use uuid::Uuid;
 

@@ -3,13 +3,13 @@ pub mod ui;
 
 use crate::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
 use anyhow::Result;
-use crossterm::{
+use egui_tracing::tracing::EventCollector;
+use ratatui::prelude::*;
+use ratatui_crossterm::crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use egui_tracing::tracing::EventCollector;
-use ratatui::prelude::*;
 use std::io;
 use std::time::Duration;
 use ui::ui;

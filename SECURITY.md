@@ -25,11 +25,11 @@ This document provides comprehensive security information including the threat m
 
 ## Security Overview
 
-This application implements **military-grade end-to-end encryption** with **forward secrecy**, matching the security standards of leading messaging apps like Signal and WhatsApp.
+This application implements **strong end-to-end encryption with known limitations** and forward secrecy; see [Known Open Risks](#known-open-risks-audit-feb-23-2026) for the items that motivated this audit.
 
 ### Current Security Posture
 
-**Overall Risk Assessment:** **MEDIUM**
+**Overall Risk Assessment:** **MEDIUM** (see Known Open Risks below for the highest-priority items and their resolutions)
 
 **Security Achievements:**
 
@@ -52,13 +52,13 @@ This application implements **military-grade end-to-end encryption** with **forw
 
 ## Known Open Risks (Audit Feb 23, 2026)
 
-The following findings are tracked publicly and prioritized for remediation:
+The highest-priority issues identified during this audit were addressed as part of the fixes documented here; we will re-open the corresponding GitHub issues if regressions emerge.
 
-- [Issue #21](https://github.com/fibo3090-code/secure-p2p-chat/issues/21) (HIGH): File transfer sequence numbers conflict with transport replay protection.
-- [Issue #22](https://github.com/fibo3090-code/secure-p2p-chat/issues/22) (HIGH): GUI share flow still generates unsigned v1 invite links.
-- [Issue #23](https://github.com/fibo3090-code/secure-p2p-chat/issues/23) (MEDIUM): Session chat mapping is inconsistent in event routing.
-- [Issue #24](https://github.com/fibo3090-code/secure-p2p-chat/issues/24) (MEDIUM): CI security policy is inconsistent (`cargo audit` ignores vs `deny.toml` policy).
-- [Issue #25](https://github.com/fibo3090-code/secure-p2p-chat/issues/25) (LOW): SECURITY.md claims and implementation drift.
+- [Issue #21](https://github.com/fibo3090-code/secure-p2p-chat/issues/21) (HIGH): File transfer sequence numbers now share the per-chat monotonic namespace that the transport-level replay protection tracks.
+- [Issue #22](https://github.com/fibo3090-code/secure-p2p-chat/issues/22) (HIGH): GUI share flow now emits only signed v2 invite links.
+- [Issue #23](https://github.com/fibo3090-code/secure-p2p-chat/issues/23) (MEDIUM): Session event routing now consistently uses the mapped chat identifier.
+- [Issue #24](https://github.com/fibo3090-code/secure-p2p-chat/issues/24) (MEDIUM): CI now runs `cargo deny check advisories`, matching the dependency policy defined in `deny.toml`.
+- [Issue #25](https://github.com/fibo3090-code/secure-p2p-chat/issues/25) (LOW): Security documentation now matches the implementation and references these items.
 
 Dependency risk status:
 
@@ -222,7 +222,7 @@ A comprehensive security audit was conducted on December 18, 2025.
   - All incoming messages validated before emission to ChatManager
   - Out-of-order messages rejected with detailed error logging
   - Duplicate and old messages dropped (defensive against replay attacks)
-- **Impact**: Eliminates replay attack surface completely at protocol level.
+- **Impact**: Eliminates replay attack surface for standard messages and now extends the same guarantee to file-transfer traffic by keeping those packets in the per-chat monotonic sequence namespace (see Issue #21).
 - **Files**: `src/network/session.rs`, `src/types.rs`
 - **Tests**: 8 new replay detection tests covering:
   - Duplicate message rejection
