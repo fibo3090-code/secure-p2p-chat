@@ -201,20 +201,15 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                     app.show_emoji_picker = !app.show_emoji_picker;
                 }
 
-                // Multiline text input - grows to fill available space
-                let response = egui::ScrollArea::vertical()
-                    .max_height(100.0) // Set max height for the text input before it scrolls
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut app.input_text)
-                                .hint_text("💬 Type a message... (Ctrl+Enter to send)")
-                                .desired_rows(1) // Start with 1 desired row, let it grow
-                                .lock_focus(false)
-                                .desired_width(f32::INFINITY), // Take all available width
-                        )
-                    })
-                    .inner; // Get the response from the inner TextEdit
+                // Multiline text input - grows inherently
+                let response = ui.add_sized(
+                    ui.available_size() - egui::vec2(60.0, 0.0), // Reserve width for send button
+                    egui::TextEdit::multiline(&mut app.input_text)
+                        .hint_text("💬 Type a message... (Ctrl+Enter to send)")
+                        .desired_rows(1)
+                        .lock_focus(false)
+                        .desired_width(f32::INFINITY),
+                );
 
                 // Handle typing indicators
                 if response.changed() && !app.input_text.is_empty() {
@@ -386,15 +381,23 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
             .stroke(egui::Stroke::NONE);
 
         let frame_response = frame.show(ui, |ui| {
-            ui.set_max_width(400.0);
+            // Dynamic width, 68% of available, clamped between 250 and 800
+            let max_w = (ui.available_width() * 0.68).clamp(250.0, 800.0);
+            ui.set_max_width(max_w);
 
             match &message.content {
                 MessageContent::Text { text } => {
-                    // Use egui_commonmark for proper Markdown rendering
-                    // We create a unique ID for cache based on message ID
                     let mut cache = egui_commonmark::CommonMarkCache::default();
-                    ui.visuals_mut().override_text_color = Some(text_color);
-                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, text);
+                    let text_to_render = inject_soft_breaks(text, 28);
+
+                    ui.scope(|ui| {
+                        ui.visuals_mut().override_text_color = Some(text_color);
+                        egui_commonmark::CommonMarkViewer::new().show(
+                            ui,
+                            &mut cache,
+                            &text_to_render,
+                        );
+                    });
 
                     // Copy action (only visible on hover to reduce clutter)
                     if ui.rect_contains_pointer(ui.max_rect()) {
@@ -495,4 +498,93 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
             );
         }
     });
+}
+
+fn inject_soft_breaks(markdown: &str, threshold: usize) -> String {
+    let mut result = String::with_capacity(markdown.len() + markdown.len() / threshold);
+    let mut in_code_block = false;
+    let mut in_inline_code = false;
+
+    for line in markdown.lines() {
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        if in_code_block {
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        let mut consecutive_non_space = 0;
+        let mut chars = line.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '`' {
+                in_inline_code = !in_inline_code;
+                result.push(c);
+                consecutive_non_space = 0;
+                continue;
+            }
+
+            if in_inline_code {
+                result.push(c);
+                consecutive_non_space = 0;
+                continue;
+            }
+
+            if c.is_whitespace() {
+                consecutive_non_space = 0;
+                result.push(c);
+            } else {
+                consecutive_non_space += 1;
+                result.push(c);
+                if consecutive_non_space >= threshold {
+                    result.push('\u{200B}');
+                    consecutive_non_space = 0;
+                }
+            }
+        }
+        result.push('\n');
+    }
+
+    // Remove the last trailing newline if the original string didn't end with one
+    if !markdown.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_soft_break_long_token() {
+        let input = "SuperLongWordThatCannotBeBrokenNormallyInAnyMarkdownEngineWithoutThisHack";
+        let out = inject_soft_breaks(input, 20);
+        assert!(out.contains('\u{200B}'));
+        let chunks: Vec<&str> = out.split('\u{200B}').collect();
+        assert_eq!(chunks[0], "SuperLongWordThatCan");
+    }
+
+    #[test]
+    fn test_soft_break_ignores_code() {
+        let input =
+            "```\nSuperLongWordThatCannotBeBrokenNormallyInAnyMarkdownEngineWithoutThisHack\n```";
+        let out = inject_soft_breaks(input, 20);
+        assert!(!out.contains('\u{200B}'));
+    }
+
+    #[test]
+    fn test_soft_break_ignores_inline() {
+        let input =
+            "some text `SuperLongWordThatCannotBeBrokenNormallyInAnyMarkdownEngine...` is here";
+        let out = inject_soft_breaks(input, 20);
+        assert!(!out.contains('\u{200B}'));
+    }
 }

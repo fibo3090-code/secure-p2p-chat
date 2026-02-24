@@ -23,9 +23,15 @@ pub const WARNING: Color32 = Color32::from_rgb(241, 196, 15);
 pub const ERROR: Color32 = Color32::from_rgb(231, 76, 60);
 
 // Spacing constants
-pub const SPACING_SMALL: f32 = 5.0;
-pub const SPACING_MEDIUM: f32 = 10.0;
-pub const SPACING_LARGE: f32 = 15.0;
+pub const SPACING_SMALL: f32 = 4.0;
+pub const SPACING_MEDIUM: f32 = 8.0;
+pub const SPACING_LARGE: f32 = 16.0;
+pub const SPACING_XLARGE: f32 = 24.0;
+
+// Radius constants
+pub const RADIUS_TIGHT: f32 = 4.0;
+pub const RADIUS_DEFAULT: f32 = 8.0;
+pub const RADIUS_LARGE: f32 = 10.0;
 
 /// Returns a full set of dark visuals.
 fn dark_visuals() -> Visuals {
@@ -41,27 +47,27 @@ fn dark_visuals() -> Visuals {
     visuals.widgets.noninteractive.bg_fill = bg;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, primary);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.noninteractive.rounding = Rounding::same(8.0); // Softer corners
+    visuals.widgets.noninteractive.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.inactive.bg_fill = primary;
     visuals.widgets.inactive.bg_stroke = Stroke::new(0.5, secondary);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.hovered.bg_fill = secondary;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent.gamma_multiply(0.5));
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.hovered.rounding = Rounding::same(6.0);
+    visuals.widgets.hovered.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.active.bg_fill = accent;
     visuals.widgets.active.bg_stroke = Stroke::NONE;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.active.rounding = Rounding::same(6.0);
+    visuals.widgets.active.rounding = Rounding::same(RADIUS_DEFAULT);
 
-    visuals.selection.bg_fill = accent.gamma_multiply(0.3); // Transparent accent for selection
-    visuals.selection.stroke = Stroke::new(1.0, accent);
+    visuals.selection.bg_fill = accent.gamma_multiply(0.2); // Transparent accent for selection, reduced intensity
+    visuals.selection.stroke = Stroke::new(1.0, accent.gamma_multiply(0.5));
 
-    visuals.window_rounding = Rounding::same(12.0);
+    visuals.window_rounding = Rounding::same(RADIUS_LARGE);
     // visuals.window_shadow = eframe::epaint::Shadow::big_dark(); // Removed as it causes build error
     visuals.window_shadow = eframe::epaint::Shadow {
         blur: 32.0,
@@ -77,9 +83,13 @@ fn light_visuals() -> Visuals {
     let mut visuals = Visuals::light();
     visuals.override_text_color = Some(LIGHT_TEXT_PRIMARY);
     // Keep light theme mostly standard but refined
-    visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
-    visuals.widgets.inactive.rounding = Rounding::same(6.0);
-    visuals.menu_rounding = Rounding::same(6.0);
+    visuals.widgets.noninteractive.rounding = Rounding::same(RADIUS_DEFAULT);
+    visuals.widgets.inactive.rounding = Rounding::same(RADIUS_DEFAULT);
+    visuals.widgets.hovered.rounding = Rounding::same(RADIUS_DEFAULT);
+    visuals.widgets.active.rounding = Rounding::same(RADIUS_DEFAULT);
+    visuals.selection.bg_fill = ACCENT_PRIMARY.gamma_multiply(0.15);
+    visuals.window_rounding = Rounding::same(RADIUS_LARGE);
+    visuals.menu_rounding = Rounding::same(RADIUS_DEFAULT);
     visuals
 }
 
@@ -96,18 +106,21 @@ fn midnight_visuals() -> Visuals {
     visuals.widgets.noninteractive.bg_fill = bg;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, secondary);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.noninteractive.rounding = Rounding::same(8.0);
+    visuals.widgets.noninteractive.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.inactive.bg_fill = primary;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = Rounding::same(RADIUS_DEFAULT);
+
+    visuals.widgets.hovered.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.active.bg_fill = accent;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.active.rounding = Rounding::same(6.0);
+    visuals.widgets.active.rounding = Rounding::same(RADIUS_DEFAULT);
 
-    visuals.selection.bg_fill = accent;
+    visuals.selection.bg_fill = accent.gamma_multiply(0.25);
     visuals.selection.stroke = Stroke::NONE;
+    visuals.window_rounding = Rounding::same(RADIUS_LARGE);
 
     // visuals.window_shadow = eframe::epaint::Shadow::big_light(); // Glow effect
     visuals.window_shadow = eframe::epaint::Shadow {
@@ -130,15 +143,20 @@ fn forest_visuals() -> Visuals {
 
     visuals.override_text_color = Some(text);
     visuals.widgets.noninteractive.bg_fill = primary;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, secondary);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.noninteractive.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.inactive.bg_fill = secondary;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.inactive.rounding = Rounding::same(RADIUS_DEFAULT);
+
+    visuals.widgets.hovered.rounding = Rounding::same(RADIUS_DEFAULT);
 
     visuals.widgets.active.bg_fill = accent;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.selection.bg_fill = accent;
+    visuals.widgets.active.rounding = Rounding::same(RADIUS_DEFAULT);
+
+    visuals.selection.bg_fill = accent.gamma_multiply(0.25);
+    visuals.window_rounding = Rounding::same(RADIUS_LARGE);
 
     visuals
 }

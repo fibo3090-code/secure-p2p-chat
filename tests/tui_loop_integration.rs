@@ -1,8 +1,8 @@
-use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use egui_tracing::tracing::EventCollector;
 use encodeur_rsa_rust::app::chat_manager::SessionHandle;
 use encodeur_rsa_rust::core::ProtocolMessage;
 use encodeur_rsa_rust::tui::app::{TuiApp, TuiCommand, TuiFocus};
+use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 

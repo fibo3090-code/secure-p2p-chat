@@ -25,11 +25,11 @@ This document provides comprehensive security information including the threat m
 
 ## Security Overview
 
-This application implements **strong end-to-end encryption with known limitations** and forward secrecy; see [Known Open Risks](#known-open-risks-audit-feb-23-2026) for the items that motivated this audit.
+This application implements **strong end-to-end encryption with known limitations** and forward secrecy; see [Applied Security Fixes](#applied-security-fixes-audit-feb-23-2026) and [Known Open Risks](#known-open-risks-audit-feb-23-2026) for the items that motivated this audit.
 
 ### Current Security Posture
 
-**Overall Risk Assessment:** **MEDIUM** (see Known Open Risks below for the highest-priority items and their resolutions)
+**Overall Risk Assessment:** **MEDIUM** (see [Applied Security Fixes](#applied-security-fixes-audit-feb-23-2026) and [Known Open Risks](#known-open-risks-audit-feb-23-2026) sections below for context)
 
 **Security Achievements:**
 
@@ -50,7 +50,7 @@ This application implements **strong end-to-end encryption with known limitation
 
 ---
 
-## Known Open Risks (Audit Feb 23, 2026)
+## Applied Security Fixes (Audit Feb 23, 2026)
 
 The highest-priority issues identified during this audit were addressed as part of the fixes documented here; we will re-open the corresponding GitHub issues if regressions emerge.
 
@@ -60,7 +60,13 @@ The highest-priority issues identified during this audit were addressed as part 
 - [Issue #24](https://github.com/fibo3090-code/secure-p2p-chat/issues/24) (MEDIUM): CI now runs `cargo deny check advisories`, matching the dependency policy defined in `deny.toml`.
 - [Issue #25](https://github.com/fibo3090-code/secure-p2p-chat/issues/25) (LOW): Security documentation now matches the implementation and references these items.
 
-Dependency risk status:
+---
+
+## Known Open Risks (Audit Feb 23, 2026)
+
+The following items remain unresolved and are prioritized for future remediation:
+
+**Dependency risk status:**
 
 - `RUSTSEC-2023-0071` (`rsa`) remains open with no upstream fixed release currently available.
 - Unmaintained crate warnings remain for `bincode` and transitive `paste`; both are tracked and require migration planning.

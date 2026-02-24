@@ -58,6 +58,17 @@ pub fn get_initials(name: &str) -> String {
         .to_uppercase()
 }
 
+/// Truncate long text strings to fit within sidebar bounds safely
+pub fn truncate_string_with_ellipsis(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        text.to_string()
+    } else {
+        let mut truncated = text.chars().take(max_len).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
 /// Format a timestamp relative (today/time, yesterday, weekday, or date)
 pub fn format_timestamp_relative(dt: &chrono::DateTime<chrono::Utc>) -> String {
     let local: chrono::DateTime<Local> = dt.with_timezone(&Local);
@@ -103,11 +114,12 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
     );
 
     // Title
-    let title_pos = rect.min + Vec2::new(64.0, 6.0);
+    let title_pos = rect.min + Vec2::new(60.0, 10.0);
+    let title_truncated = truncate_string_with_ellipsis(&chat.title, 18);
     ui.painter().text(
         title_pos,
         Align2::LEFT_TOP,
-        &chat.title,
+        title_truncated,
         FontId::proportional(15.0),
         ui.visuals().text_color(),
     );
@@ -119,10 +131,10 @@ pub fn chat_list_item(ui: &mut Ui, chat: &Chat, is_selected: bool) -> Response {
         .map(|m: &Message| format_timestamp_relative(&m.timestamp))
         .unwrap_or_default();
     ui.painter().text(
-        rect.max + Vec2::new(-8.0, -22.0),
+        rect.max + Vec2::new(-8.0, -40.0), // Align properly near top-right edge
         Align2::RIGHT_TOP,
         ts,
-        FontId::proportional(12.0),
+        FontId::proportional(11.0),
         ui.visuals().text_color().gamma_multiply(0.7),
     );
 
@@ -137,4 +149,18 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
 /// A secondary button with a more subtle style for minor actions.
 pub fn secondary_button(ui: &mut Ui, text: &str) -> Response {
     ui.button(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_string() {
+        assert_eq!(truncate_string_with_ellipsis("Short", 10), "Short");
+        assert_eq!(
+            truncate_string_with_ellipsis("This is a very long text indeed", 10),
+            "This is a ..."
+        );
+    }
 }

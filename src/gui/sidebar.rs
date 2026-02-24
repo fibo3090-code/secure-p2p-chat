@@ -2,24 +2,24 @@ use crate::gui::app_ui::App;
 use eframe::egui;
 
 pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
+    ui.add_space(crate::gui::styling::SPACING_MEDIUM);
     ui.horizontal(|ui| {
         ui.heading("💬 Chats");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("➕").on_hover_text("New connection").clicked() {
-                ui.menu_button("", |ui| {
-                    if ui.button("🎤 Host Connection").clicked() {
-                        tracing::info!("Host connection dialog opened");
-                        app.active_dialog = crate::gui::app_ui::ActiveDialog::Host;
-                        ui.close_menu();
-                    }
-                    if ui.button("🔌 Connect to Host").clicked() {
-                        tracing::info!("Connect to host dialog opened");
-                        app.active_dialog = crate::gui::app_ui::ActiveDialog::Connect;
-                        ui.close_menu();
-                    }
-                });
-            }
+            ui.menu_button("➕", |ui| {
+                if ui.button("🎤 Host Connection").clicked() {
+                    tracing::info!("Host connection dialog opened");
+                    app.active_dialog = crate::gui::app_ui::ActiveDialog::Host;
+                    ui.close_menu();
+                }
+                if ui.button("🔌 Connect to Host").clicked() {
+                    tracing::info!("Connect to host dialog opened");
+                    app.active_dialog = crate::gui::app_ui::ActiveDialog::Connect;
+                    ui.close_menu();
+                }
+            })
+            .response
+            .on_hover_text("New connection");
         });
     });
     ui.separator();

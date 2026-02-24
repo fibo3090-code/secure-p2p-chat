@@ -539,7 +539,7 @@ impl eframe::App for App {
                     }
 
                     if ui.button("Help").clicked() {
-                        self.active_dialog = ActiveDialog::Welcome;
+                        self.active_dialog = ActiveDialog::About;
                     }
                 });
             });
@@ -550,7 +550,7 @@ impl eframe::App for App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!any_modal_open, |ui| {
-                    ui.add_space(4.0);
+                    ui.add_space(crate::gui::styling::SPACING_MEDIUM);
                     if let Ok(manager) = self.chat_manager.try_lock() {
                         let listen_port = manager.config.listen_port;
                         let is_listening = manager.is_hosting;
@@ -594,7 +594,7 @@ impl eframe::App for App {
 
         // Sidebar - Chat list
         egui::SidePanel::left("sidebar")
-            .default_width(250.0)
+            .default_width(260.0)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!any_modal_open, |ui| {
                     crate::gui::sidebar::render_sidebar(self, ui);

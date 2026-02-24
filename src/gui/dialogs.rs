@@ -384,7 +384,10 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
     all_toasts.sort_by_key(|t| t.created_at);
 
     egui::Area::new(egui::Id::new("toasts"))
-        .fixed_pos(egui::pos2(ctx.screen_rect().width() - 320.0, 60.0))
+        .fixed_pos(egui::pos2(
+            ctx.screen_rect().width() - 320.0,
+            60.0 + crate::gui::styling::SPACING_LARGE,
+        ))
         .show(ctx, |ui| {
             ui.set_max_width(300.0);
 
@@ -419,9 +422,12 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                     let stroke_color = icon_color;
 
                     let toast_frame = egui::Frame {
-                        inner_margin: egui::Margin::symmetric(12.0, 8.0),
+                        inner_margin: egui::Margin::symmetric(
+                            crate::gui::styling::SPACING_LARGE,
+                            crate::gui::styling::SPACING_MEDIUM,
+                        ),
                         outer_margin: egui::Margin::same(0.0),
-                        rounding: egui::Rounding::same(6.0),
+                        rounding: egui::Rounding::same(crate::gui::styling::RADIUS_DEFAULT),
                         shadow: egui::epaint::Shadow {
                             blur: 8.0,
                             spread: 2.0,

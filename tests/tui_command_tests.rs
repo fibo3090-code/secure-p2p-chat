@@ -1,6 +1,6 @@
-use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use egui_tracing::tracing::EventCollector;
 use encodeur_rsa_rust::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
+use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use uuid::Uuid;
 
 #[test]
