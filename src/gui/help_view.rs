@@ -268,7 +268,9 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
         |ui| {
             ui.label("• Check the connection status indicator in the chat header.");
             ui.label("• Ensure both parties are online and connected.");
-            ui.label("• If status shows 'Reconnecting', wait for the next retry or reconnect manually.");
+            ui.label(
+                "• If status shows 'Reconnecting', wait for the next retry or reconnect manually.",
+            );
             ui.label("• Try manually reconnecting: click contact → Connect button.");
             ui.label("• Check the Log Terminal (Settings → Show Log Terminal) for errors.");
         },

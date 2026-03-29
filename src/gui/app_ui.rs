@@ -451,8 +451,10 @@ impl eframe::App for App {
                         let path = self.history_path.clone();
                         last_save.store(now_millis, Ordering::Relaxed);
                         tokio::spawn(async move {
-                            match tokio::task::spawn_blocking(move || history.save_encrypted(&path, &key))
-                                .await
+                            match tokio::task::spawn_blocking(move || {
+                                history.save_encrypted(&path, &key)
+                            })
+                            .await
                             {
                                 Ok(Err(e)) => tracing::warn!("Background auto-save failed: {}", e),
                                 Err(e) => tracing::warn!("Background auto-save task failed: {}", e),

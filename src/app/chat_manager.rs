@@ -1744,8 +1744,8 @@ impl Default for ChatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use base64::Engine;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_invite_placeholder_is_ignored() {
@@ -2284,7 +2284,9 @@ mod tests {
             .generate_signed_invite_link(Some("2001:db8::1:12345".to_string()))
             .unwrap();
 
-        let contact = mgr.parse_invite_link(&link).expect("invite itself should remain valid");
+        let contact = mgr
+            .parse_invite_link(&link)
+            .expect("invite itself should remain valid");
         assert_eq!(
             contact.address, None,
             "invalid address payloads should be dropped instead of normalized"
@@ -2310,11 +2312,8 @@ mod tests {
         );
         mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
         mgr.contact_to_chat.insert(contact_id, chat_id);
-        mgr.fingerprint_verification_request = Some((
-            "fingerprint".to_string(),
-            "peer".to_string(),
-            chat_id,
-        ));
+        mgr.fingerprint_verification_request =
+            Some(("fingerprint".to_string(), "peer".to_string(), chat_id));
 
         mgr.delete_all_data(&history_path, &identity_path).unwrap();
 

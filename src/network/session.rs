@@ -762,6 +762,13 @@ mod tests {
     use crate::core::{generate_rsa_keypair, IdentityProof};
     use crate::RSA_KEY_BITS;
     use anyhow::Result;
+    use rand::RngCore;
+
+    fn test_cipher() -> AesCipher {
+        let mut key = [0u8; crate::AES_KEY_SIZE];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        AesCipher::new(&key).expect("random test key should be valid")
+    }
 
     #[tokio::test]
     async fn test_full_handshake_with_forward_secrecy() -> Result<()> {
@@ -913,7 +920,7 @@ mod tests {
             signature_scheme: SignatureScheme::RsaPss,
         };
         let proof_bytes = bincode::serialize(&proof).unwrap();
-        let cipher = AesCipher::new(&[7u8; crate::AES_KEY_SIZE]).unwrap();
+        let cipher = test_cipher();
 
         let correct_aad = labeled_aad(b"identity-proof", b"transcript-a");
         let wrong_aad = labeled_aad(b"identity-proof", b"transcript-b");
@@ -931,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_transport_aad_binding_rejects_wrong_context() {
-        let cipher = AesCipher::new(&[9u8; crate::AES_KEY_SIZE]).unwrap();
+        let cipher = test_cipher();
         let msg = ProtocolMessage::Text {
             text: "hello".to_string(),
             timestamp: 42,
