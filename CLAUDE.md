@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides repository-specific guidance for coding agents working in this project.
 
 ## Development Commands
 
@@ -22,7 +22,7 @@ cargo fmt                      # Format code
 cargo clippy                   # Lint and check warnings
 
 # Logging
-RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
+RUST_LOG="info,secure_p2p_chat=debug" cargo run
 
 # Windows packaging
 ./build-and-package.ps1        # PowerShell script for distributable builds
@@ -40,15 +40,15 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
                │ Arc<Mutex<ChatManager>>
 ┌──────────────▼──────────────────────┐
 │   Business Logic (app/)             │  ← ChatManager - central coordinator
-│   └── chat_manager.rs               │     (chats, contacts, sessions, file transfers, toasts)
-│   └── persistence.rs                │     (JSON save/load)
+│   └── chat_manager.rs               │     (chats, contacts, sessions, transfers, toasts)
+│   └── persistence.rs                │     (encrypted history save/load)
 └──────────────┬──────────────────────┘
                │ tokio::sync::mpsc channels
     ┌──────────┼──────────┬──────────┐
     │          │          │          │
 ┌───▼───┐  ┌──▼────┐  ┌──▼────┐  ┌──▼──────┐
 │Network│  │Crypto │  │Transfer│ │Identity │
-│(TCP)  │  │(RSA/AES)│  │(Files) │ │(Keys)   │
+│(TCP)  │  │(RSA/AES)│ │(Files) │ │(Keys)   │
 └───────┘  └───────┘  └────────┘ └─────────┘
 ```
 
@@ -65,8 +65,15 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 2. X25519 ephemeral key exchange (plaintext) - provides forward secrecy
 3. Session key derivation via HKDF-SHA256 from shared secret
 4. Encrypted tunnel established with AES-256-GCM
-5. Identity exchange inside tunnel (`IdentityProof` with signature binding ephemeral key to identity)
+5. Identity exchange inside tunnel (`IdentityProof` with RSA-PSS signature binding ephemeral key to identity)
 6. Fingerprint verification (TOFU - Trust On First Use)
+
+Authoritative docs live in:
+
+- `docs/README.md`
+- `docs/03_architecture.md`
+- `docs/04_protocol.md`
+- `SECURITY.md`
 
 **Message Framing**: Binary-tagged ASCII format `[type: u8][payload...]`. CRITICAL: `to_plain_bytes()` and `from_plain_bytes()` in `src/core/protocol.rs` must remain symmetric—changing one side without the other breaks protocol compatibility.
 
@@ -89,8 +96,8 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 File transfers use chunked transmission (`FILE_CHUNK_SIZE = 64 KiB`). Progress is tracked via `FileTransferState`. Transfer packets share the per-chat monotonic sequence namespace with standard messages, so replay protection covers both message types.
 
 **Key Files**:
-- `src/transfer/sender.rs` - File sending logic
-- `src/transfer/receiver.rs` - File receiving logic
+- `src/app/chat_manager.rs` - transfer orchestration and outgoing chunk dispatch
+- `src/transfer/receiver.rs` - file receiving logic
 - `src/core/protocol.rs` - `FILE_CHUNK` message encoding/decoding
 
 ## TOFU (Trust-On-First-Use) Flow
@@ -128,3 +135,9 @@ Defined in `src/lib.rs`:
 - Async tests use `#[tokio::test]`
 - Handshake tests must verify derived keys match on both sides
 - Protocol changes require new serialization/deserialization tests
+
+## Documentation Discipline
+
+- Update the canonical doc instead of adding a parallel explanation elsewhere.
+- Prefer deleting superseded docs after merging their useful content.
+- Keep this file short; it is an agent hint, not the main project manual.

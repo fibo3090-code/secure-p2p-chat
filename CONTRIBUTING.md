@@ -1,184 +1,74 @@
-# Contributing to Encrypted P2P Messenger
+# Contributing
 
-First off, thank you for considering contributing to the Encrypted P2P Messenger! It's people like you that make this software better for everyone.
+This repository is intentionally documented in layers. Before changing code, read the doc that matches the kind of change you are making instead of guessing from stale comments.
 
-## Code of Conduct
+## Read First
 
-This project and everyone participating in it is governed by our Code of Conduct. By participating, you are expected to uphold this code.
+- `README.md`: project overview, quick start, current feature set.
+- `docs/README.md`: canonical documentation index.
+- `docs/USER_GUIDE.md`: user-facing behavior and troubleshooting.
+- `docs/03_architecture.md`: current module boundaries and state flow.
+- `docs/04_protocol.md`: current wire protocol and handshake behavior.
+- `SECURITY.md`: shipped protections, limits, and disclosure policy.
+- `DEVELOPMENT_PLAN.md`: backlog and planned work.
 
-## How Can I Contribute?
+## Contribution Rules
 
-### Reporting Bugs
+1. Branch from `main` with a focused name such as `fix/ipv6-parse` or `docs/protocol-cleanup`.
+2. Use Conventional Commits where practical: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`.
+3. Keep changes scoped. Avoid mixing protocol work, UI refactors, and unrelated cleanup in one PR.
+4. Add or update tests for any non-trivial behavior change.
+5. Update docs in the same PR when behavior, architecture, or security posture changes.
 
-This section guides you through submitting a bug report. Following these guidelines helps maintainers and the community understand your report, reproduce the behavior, and find related reports.
+## Local Workflow
 
-#### Before Submitting A Bug Report
+Run these before opening a PR:
 
-- Check the documentation for tips on troubleshooting
-- Perform a cursory search to see if the problem has already been reported
+```bash
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
-#### How Do I Submit A (Good) Bug Report?
+If you touch packaging or release files, also validate the relevant scripts manually.
 
-Bugs are tracked as GitHub issues. Create an issue and provide the following information:
+## Bug Reports
 
-- **Use a clear and descriptive title** for the issue to identify the problem.
-- **Describe the exact steps which reproduce the problem** in as many details as possible.
-- **Provide specific examples to demonstrate the steps**.
-- **Describe the behavior you observed after following the steps** and point out what exactly is the problem with that behavior.
-- **Explain which behavior you expected to see instead and why.**
-- **Include screenshots and animated GIFs** if possible.
-- **Include details about your configuration and environment**
+Open an issue with:
 
-### Suggesting Enhancements
+- A clear title.
+- Exact reproduction steps.
+- Expected behavior.
+- Actual behavior.
+- Platform and Rust version if relevant.
+- Screenshots or logs when useful.
 
-This section guides you through submitting an enhancement suggestion, including completely new features and minor improvements to existing functionality.
+Check the docs first so the report is based on current behavior, not an outdated assumption.
 
-#### Before Submitting An Enhancement Suggestion
+## Pull Request Checklist
 
-- Check if the enhancement has already been suggested
-- Determine which repository the enhancement should be suggested in
+- [ ] Scope is focused and reviewable.
+- [ ] Tests added or updated, or rationale provided.
+- [ ] `cargo fmt -- --check` passes.
+- [ ] `cargo clippy --all-targets -- -D warnings` passes.
+- [ ] `cargo test` passes.
+- [ ] Relevant docs updated.
+- [ ] `CHANGELOG.md` updated for user-visible changes.
 
-#### How Do I Submit A (Good) Enhancement Suggestion?
+## Documentation Rules
 
-Enhancement suggestions are tracked as GitHub issues. Create an issue and provide the following information:
+- Do not duplicate large explanations across multiple files.
+- Prefer updating the canonical doc and linking to it.
+- If protocol behavior changes, update `docs/04_protocol.md`.
+- If architecture or module ownership changes, update `docs/03_architecture.md`.
+- If security guarantees or limits change, update `SECURITY.md` and `THREAT_MODEL.md`.
+- If UX changes materially, update `docs/USER_GUIDE.md` or `DESIGN_NOTES.md`.
 
-- **Use a clear and descriptive title** for the issue to identify the suggestion.
-- **Provide a step-by-step description of the suggested enhancement** in as many details as possible.
-- **Provide specific examples to demonstrate the steps**.
-- **Describe the current behavior and explain which behavior you expected to see instead** and why.
-- **Include screenshots and animated GIFs** if possible.
-- **Explain why this enhancement would be useful** to most users.
+## Release Notes
 
-### Pull Requests
+For releases:
 
-The process described here has several goals:
-
-- Maintain the project's quality
-- Fix problems that are important to users
-- Engage the community in working toward the best possible software
-- Enable a sustainable system for the project's maintainers to review contributions
-
-**Please follow these steps to have your contribution considered by the maintainers:**
-
-1. Follow all instructions in the template
-2. Follow the [styleguides](#styleguides)
-3. Create your branch from `main` using a descriptive name (e.g., `feat/emoji-picker`, `fix/handshake-timeout`)
-4. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages (e.g., `feat: add typing indicators`)
-5. Ensure all tests pass locally and format/lints are clean
-6. After you submit your pull request, verify that all status checks are passing
-
-#### PR Checklist
-
-- [ ] Linked issue (if applicable)
-- [ ] Tests added/updated or rationale provided
-- [ ] `cargo fmt` applied
-- [ ] `cargo clippy` has no warnings (or warnings explained)
-- [ ] Updated docs (README/DEVELOPER_GUIDE/SECURITY/CHANGELOG as needed)
-
-While the prerequisites above must be satisfied prior to having your pull request reviewed, the reviewer(s) may ask you to complete additional design work, tests, or other changes before your pull request can be ultimately accepted.
-
-## Styleguides
-
-### Git Commit Messages
-
-- Use the present tense ("Add feature" not "Added feature")
-- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
-- Limit the first line to 72 characters or less
-- Reference issues and pull requests liberally after the first line
-- Prefer Conventional Commits types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
-
-### Rust Styleguide
-
-- All Rust code must be formatted with `cargo fmt`
-- All Rust code must pass `cargo clippy` with no warnings
-- Write documentation for public APIs
-- Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
-
-### Documentation Styleguide
-
-- Use [Markdown](https://daringfireball.net/projects/markdown) for documentation
-- Reference functions and variables with backticks
-- Follow the existing documentation style in the project
-
-## Local Development
-
-### Branching Strategy
-
-- Main development happens on `main`
-- Use feature branches per PR; keep them focused and small
-
-### Build and Test
-
-- Build: `cargo build` or `cargo build --release`
-- Run tests: `cargo test`
-- Lints/format: `cargo clippy && cargo fmt`
-
-### Releases
-
-- Update `CHANGELOG.md`
-- Bump version in `Cargo.toml`
-- Create a tagged release with release notes
-
-### Checklist: After a Bug Fix or New Feature
-
-For every non-trivial fix or feature, before opening a PR or releasing:
-
-1. **Code**
-   - Run `cargo test`, `cargo clippy`, and `cargo fmt`.
-   - Ensure no new `unwrap()` or `expect()` in security-sensitive paths.
-
-2. **Changelog**
-   - Add an entry under `[Unreleased]` in `CHANGELOG.md` (and under the release section when cutting a release).
-
-3. **Docs**
-   - Update `README.md`, `DEVELOPER_GUIDE.md`, or `docs/*.md` if behavior, APIs, or setup change.
-   - If the protocol or wire format changes: update `docs/04_protocol.md` and `DEVELOPER_GUIDE.md`.
-   - If UI/UX or design changes: consider `DESIGN_NOTES.md`.
-   - If security-related: update `SECURITY.md` and add a security note in `CHANGELOG.md`.
-
-4. **Version**
-   - When releasing: bump `version` in `Cargo.toml` and move `[Unreleased]` entries into the new version in `CHANGELOG.md`.
-
-5. **Packaging (when relevant)**
-   - If the binary name, icon, or installer behavior changes: update `setup.iss` and `build-and-package.ps1`.
-
-## Additional Notes
-
-### Issue and Pull Request Labels
-
-This section lists the labels we use to help us track and manage issues and pull requests.
-
-- `bug` - Issues that are bugs
-- `enhancement` - Issues that are feature requests
-- `documentation` - Issues related to documentation
-- `security` - Issues related to security
-- `good first issue` - Good for newcomers
-- `help wanted` - Extra attention is needed
-
-## Getting Started
-
-1. Fork the repository on GitHub
-2. Clone your fork locally
-3. Create a branch for your changes
-4. Make your changes
-5. Add tests if applicable
-6. Run the test suite to ensure everything works
-7. Commit your changes
-8. Push to your fork
-9. Create a pull request
-
-## Development Setup
-
-1. Install Rust (latest stable version)
-2. Clone the repository
-3. Run `cargo build` to build the project
-4. Run `cargo test` to run tests
-
-## Testing
-
-- All code changes should be accompanied by tests
-- Run `cargo test` to run all tests
-- Run `cargo clippy` to check for code quality issues
-- Run `cargo fmt -- --check` to check code formatting
-
-Thank you for reading and contributing!
+1. Move relevant `CHANGELOG.md` entries out of `Unreleased`.
+2. Bump the version in `Cargo.toml`.
+3. Re-run quality checks.
+4. Verify packaging scripts if release artifacts are being produced.

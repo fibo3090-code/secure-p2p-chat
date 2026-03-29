@@ -55,21 +55,10 @@ impl ChatManager {
     /// Parse an address of the form host:port
     /// Returns (host, port) or an error if the format is invalid.
     pub fn parse_address(address: &str) -> Result<(String, u16)> {
-        let parts: Vec<&str> = address.split(':').collect();
-        if parts.len() != 2 {
-            tracing::error!("Invalid address format for contact: {}", address);
-            return Err(anyhow::anyhow!("Invalid address format for contact"));
-        }
-        let host = parts[0].trim();
-        let port: u16 = parts[1]
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid port in contact address"))?;
-        if host.is_empty() {
-            tracing::error!("Host is empty in contact address: {}", address);
-            return Err(anyhow::anyhow!("Host is empty in contact address"));
-        }
-        Ok((host.to_string(), port))
+        crate::util::parse_host_port(address, None).map_err(|e| {
+            tracing::error!("Invalid address format for contact '{}': {}", address, e);
+            anyhow::anyhow!("Invalid contact address: {}", e)
+        })
     }
 
     pub fn new(config: Config) -> Self {
@@ -891,35 +880,36 @@ impl ChatManager {
         self.toasts.clear();
         self.fingerprint_verification_request = None;
 
-        // Save empty history to disk
-        let _ = self.save_history(history_path);
-        tracing::info!("History cleared and saved");
+        if !history_path.as_os_str().is_empty() && self.history_key.is_some() {
+            let _ = self.save_history(history_path);
+            tracing::info!("History cleared and saved");
+        } else {
+            tracing::info!("History cleared in memory");
+        }
     }
 
     /// Delete all data including identity file. Used for complete data wipe.
-    pub fn delete_all_data(&mut self) {
+    pub fn delete_all_data(
+        &mut self,
+        history_path: &std::path::Path,
+        identity_path: &std::path::Path,
+    ) -> Result<()> {
         tracing::warn!("Deleting ALL data including identity");
 
         // First clear all in-memory state
         self.clear_history(std::path::Path::new(""));
 
-        // Then try to delete identity file if we can determine the path
-        if let Some(dirs) = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger")
-        {
-            let data_dir = dirs.data_dir();
-            let identity_path = data_dir.join("identity.json");
-
-            if identity_path.exists() {
-                match std::fs::remove_file(&identity_path) {
-                    Ok(_) => {
-                        tracing::info!("Identity file deleted: {}", identity_path.display());
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to delete identity file: {}", e);
-                    }
-                }
-            }
+        if history_path.exists() {
+            std::fs::remove_file(history_path)?;
+            tracing::info!("History file deleted: {}", history_path.display());
         }
+
+        if identity_path.exists() {
+            std::fs::remove_file(identity_path)?;
+            tracing::info!("Identity file deleted: {}", identity_path.display());
+        }
+
+        Ok(())
     }
 
     /// Send the user's accept/reject decision for a fingerprint verification to the session task
@@ -1644,19 +1634,9 @@ impl ChatManager {
                 if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
                     None
                 } else {
-                    // Basic validation: should contain a colon and a numeric port
-                    if let Some(idx) = trimmed.rfind(':') {
-                        let (host, port_str) = trimmed.split_at(idx);
-                        let port_str = &port_str[1..]; // skip ':'
-                        if host.is_empty() || port_str.parse::<u16>().is_err() {
-                            None
-                        } else {
-                            Some(trimmed.to_string())
-                        }
-                    } else {
-                        // no port provided, treat as invalid for now
-                        None
-                    }
+                    Self::parse_address(trimmed)
+                        .ok()
+                        .map(|(host, port)| crate::util::format_host_port(&host, port))
                 }
             });
 
@@ -1709,19 +1689,9 @@ impl ChatManager {
                 if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
                     None
                 } else {
-                    // Basic validation: should contain a colon and a numeric port
-                    if let Some(idx) = trimmed.rfind(':') {
-                        let (host, port_str) = trimmed.split_at(idx);
-                        let port_str = &port_str[1..]; // skip ':'
-                        if host.is_empty() || port_str.parse::<u16>().is_err() {
-                            None
-                        } else {
-                            Some(trimmed.to_string())
-                        }
-                    } else {
-                        // no port provided, treat as invalid for now
-                        None
-                    }
+                    Self::parse_address(trimmed)
+                        .ok()
+                        .map(|(host, port)| crate::util::format_host_port(&host, port))
                 }
             });
 
@@ -1774,6 +1744,7 @@ impl Default for ChatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use base64::Engine;
 
     #[test]
@@ -2287,5 +2258,71 @@ mod tests {
             1,
             "Ping sequence must be applied to mapped actual chat"
         );
+    }
+
+    #[test]
+    fn parse_v2_signed_invite_normalizes_ipv6_address() {
+        use crate::identity::Identity;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("IPv6 User".to_string()).unwrap();
+        let link = identity
+            .generate_signed_invite_link(Some("[2001:db8::1]:12345".to_string()))
+            .unwrap();
+
+        let contact = mgr.parse_invite_link(&link).expect("should parse invite");
+        assert_eq!(contact.address.as_deref(), Some("[2001:db8::1]:12345"));
+    }
+
+    #[test]
+    fn parse_v2_signed_invite_drops_unbracketed_ipv6_with_port() {
+        use crate::identity::Identity;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("Broken IPv6".to_string()).unwrap();
+        let link = identity
+            .generate_signed_invite_link(Some("2001:db8::1:12345".to_string()))
+            .unwrap();
+
+        let contact = mgr.parse_invite_link(&link).expect("invite itself should remain valid");
+        assert_eq!(
+            contact.address, None,
+            "invalid address payloads should be dropped instead of normalized"
+        );
+    }
+
+    #[test]
+    fn delete_all_data_removes_files_and_clears_state() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json.enc");
+        let identity_path = dir.path().join("identity.json");
+
+        std::fs::write(&history_path, b"encrypted-history").unwrap();
+        std::fs::write(&identity_path, b"encrypted-identity").unwrap();
+
+        let mut mgr = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        let contact_id = mgr.add_contact(
+            "Contact".to_string(),
+            Some("127.0.0.1:12345".to_string()),
+            None,
+            None,
+        );
+        mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
+        mgr.contact_to_chat.insert(contact_id, chat_id);
+        mgr.fingerprint_verification_request = Some((
+            "fingerprint".to_string(),
+            "peer".to_string(),
+            chat_id,
+        ));
+
+        mgr.delete_all_data(&history_path, &identity_path).unwrap();
+
+        assert!(!history_path.exists(), "history file should be deleted");
+        assert!(!identity_path.exists(), "identity file should be deleted");
+        assert!(mgr.chats.is_empty());
+        assert!(mgr.contacts.is_empty());
+        assert!(mgr.contact_to_chat.is_empty());
+        assert!(mgr.fingerprint_verification_request.is_none());
     }
 }

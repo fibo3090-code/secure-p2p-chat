@@ -372,21 +372,13 @@ impl Identity {
         Ok(())
     }
 
-    /// Removes password protection from the identity.
-    /// It decrypts the private key with the given password and then
-    /// clears the encryption-related fields.
-    pub fn remove_password(&mut self, password: &str) -> Result<()> {
-        // First, decrypt the key to make sure the password is correct and
-        // to get the plaintext key.
-        self.decrypt(password)?;
-
-        // Now that `private_key_pem_plaintext` is populated, we can
-        // clear the encryption fields.
-        self.encrypted_private_key = None;
-        self.salt = None;
-        self.nonce = None;
-
-        Ok(())
+    /// Removing password protection is intentionally unsupported.
+    ///
+    /// Identities must remain encrypted when persisted to disk.
+    pub fn remove_password(&mut self, _password: &str) -> Result<()> {
+        Err(anyhow!(
+            "Removing password protection is not supported; identities must remain encrypted on disk"
+        ))
     }
 
     /// Get private key (if available)
@@ -419,18 +411,17 @@ impl Identity {
         self.encrypt(password)
     }
 
-    /// Generate a signed invite link for this identity (v2, with Ed25519 signature)
+    /// Generate a signed invite link for this identity (v2, with RSA-PSS signature)
     ///
     /// This creates a cryptographically signed invite link that prevents tampering.
     /// The signature is computed over the invite payload and verified on import.
     pub fn generate_signed_invite_link(&self, address: Option<String>) -> Result<String> {
-        use crate::core::crypto::generate_ed25519_keypair;
         use serde::{Deserialize, Serialize};
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Generate ephemeral key for this invite (one-time use)
-        let (_ephemeral_skey, ephemeral_vkey) = generate_ed25519_keypair();
-        let nonce = hex::encode(ephemeral_vkey.to_bytes());
+        let mut invite_nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut invite_nonce);
+        let nonce = hex::encode(invite_nonce);
 
         // Create timestamp (current UTC Unix timestamp)
         let timestamp = SystemTime::now()
@@ -442,7 +433,7 @@ impl Identity {
         struct SignedInvitePayload {
             version: u32,
             timestamp: u64,
-            nonce: String, // Ephemeral key as hex for uniqueness
+            nonce: String, // Random per-invite nonce encoded as hex
             name: String,
             address: Option<String>,
             fingerprint: String,
@@ -459,16 +450,13 @@ impl Identity {
             public_key: self.public_key_pem.clone(),
         };
 
-        // Serialize payload to RFC 8785 canonical JSON (deterministic field ordering, no whitespace)
-        // This ensures all implementations produce identical bytes for signature verification
+        // Serialize payload using the crate-local serde_json representation.
+        // Verification uses the same byte representation; this is deterministic for this app,
+        // but it is not a general-purpose RFC 8785 canonicalization scheme.
         let payload_json = serde_json::to_string(&payload)?;
-        // TODO: Replace with serde_jcs or equivalent RFC 8785 canonicalizer for strict compliance
-        // Currently using serde_json::to_string with documented note that field order must be stable
         let payload_bytes = payload_json.as_bytes();
 
         // Sign the payload using the identity's RSA private key
-        // For now, we use RSA signature since Ed25519 identity keys are still in development
-        // TODO: Use Ed25519 private key when fully integrated into Identity struct
         let privkey = self.private_key()?;
         let signature = crate::core::crypto::rsa_sign_pss(&privkey, payload_bytes)?;
 
@@ -880,5 +868,19 @@ mod tests {
 
         // Signature should not be empty
         assert!(!invite.signature.is_empty());
+    }
+
+    #[test]
+    fn test_remove_password_is_rejected() {
+        let mut identity = Identity::new_with_plaintext("Protected User".to_string()).unwrap();
+        identity.encrypt(&test_password()).unwrap();
+
+        let err = identity
+            .remove_password(&test_password())
+            .expect_err("password removal must be rejected");
+        assert!(err.to_string().contains("not supported"));
+        assert!(identity.encrypted_private_key.is_some());
+        assert!(identity.salt.is_some());
+        assert!(identity.nonce.is_some());
     }
 }

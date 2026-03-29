@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🔐 Security Fixes
+
+- Fixed handshake signature negotiation so the runtime now truthfully advertises and accepts only RSA-PSS identity proofs.
+- Bound encrypted identity proofs and transport packets to the handshake transcript with AAD.
+- Disabled password-removal for persisted identities and updated the GUI to reflect the enforced encrypted-at-rest model.
+- Fixed the destructive local-data reset flow so it now deletes the encrypted history and identity files it claims to remove.
+- Centralized endpoint parsing to support hostnames, IPv4, and bracketed IPv6 consistently across the app and invite handling.
+
+### 📚 Documentation
+
+- Synced `README.md`, `SECURITY.md`, `THREAT_MODEL.md`, `DEVELOPER_GUIDE.md`, `docs/04_protocol.md`, and in-app help with the current runtime behavior.
+
+### 🛠️ Engineering
+
+- Added a checked-in GitHub Actions CI workflow for formatting, clippy, tests, dependency auditing, and Windows build validation.
+- Moved periodic GUI autosave off the hot UI path by snapshotting state and persisting it in a background task.
+- Switched encrypted history writes to a temp-file-and-rename flow for safer persistence.
+- Removed the unused duplicate low-level transfer sender module to keep one authoritative file-transfer path.
+- Advanced the history format to `1.1` while keeping `1.0` load compatibility.
+
 ### ✨ TUI
 
 - Implemented a command-driven, keyboard-first TUI shell:
@@ -22,7 +42,7 @@ All notable changes to this project will be documented in this file.
 
 ### 📚 Documentation
 
-- Updated `docs/tui_tutorial.md` with command mode, keybindings, and startup behavior.
+- Merged the former TUI tutorial content into `docs/USER_GUIDE.md` and aligned it with the current command-mode behavior.
 - Updated `DEVELOPER_GUIDE.md` run instructions for TUI and launch examples.
 - Synced repository metadata to `v1.7.7` (`Cargo.toml`, `README.md` badge, `setup.iss` call example, security/threat headers).
 

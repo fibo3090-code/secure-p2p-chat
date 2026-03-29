@@ -1,84 +1,142 @@
-# 3. Architecture
+# Architecture
 
-This document provides a detailed look at the architecture of the Encrypted P2P Messenger, including its directory structure, layered design, and module responsibilities.
+This document describes the current codebase structure and the major runtime responsibilities.
 
-## 3.1. Directory Structure
-
-The project is organized into the following directory structure:
+## High-Level Shape
 
 ```text
-`chat-p2p/
-├── src/
-│   ├── main.rs (GUI application)
-│   ├── lib.rs (Module exports)
-│   ├── types.rs (Data structures)
-│   ├── util.rs (Helpers)
-│   │
-│   ├── app/ (Business Logic Layer)
-│   │   ├── chat_manager.rs (Core state management)
-│   │   └── persistence.rs (JSON save/load)
-│   │
-│   ├── core/ (Cryptography Layer)
-│   │   ├── crypto.rs (RSA, AES-GCM, X25519)
-│   │   └── protocol.rs (Message types)
-│   │
-│   ├── network/ (Network Layer)
-│   │   ├── discovery.rs (mDNS Peer Discovery)
-│   │   └── session.rs (TCP sessions, handshake)
-│   │
-│   ├── transfer/ (File Transfer Layer)
-│   │   ├── receiver.rs (Receiving files)
-│   │   └── sender.rs (Sending files)
-│   │
-│   └── identity/ (Identity Layer)
-│       └── mod.rs (Persistent RSA keys)
-│
-├── Cargo.toml
-├── README.md
-└── SECURITY.md
-`
+GUI (egui) or TUI (ratatui)
+        |
+        v
+   ChatManager
+        |
+  -----------------------------
+  |        |         |        |
+network   core    identity  persistence/transfer
 ```
 
-## 3.2. Layered Architecture
+The project is centered around `ChatManager`, which coordinates chats, contacts, sessions, file-transfer state, toasts, and persistence.
 
-The application is designed with a clear separation of concerns, following a layered architecture. This makes the codebase easier to understand, maintain, and test.
+## Directory Structure
 
 ```text
-┌─────────────────────────────────────┐
-│   GUI Layer (egui/eframe)           │  ← Handles all user interaction and rendering.
-└──────────────┬──────────────────────┘
-               │ Shares state via Arc<Mutex<ChatManager>>
-┌──────────────▼──────────────────────┐
-│   Business Logic Layer (app)        │  ← Manages the application's core state and logic.
-└──────────────┬──────────────────────┘
-               │ Communicates with other layers via tokio channels
-    ┌──────────┼──────────┬──────────┐
-    │          │          │          │
-┌───▼───┐  ┌──▼────┐  ┌──▼────┐  ┌──▼──────┐
-│Network│  │Crypto │  │Transfer│ │Identity │  ← Core functionality layers.
-│(TCP)  │  │(RSA/AES)│  │(Files) │ │(RSA Keys) │
-└───────┘  └───────┘  └────────┘ └─────────┘
+src/
+  main.rs         entry point for GUI/TUI launch
+  lib.rs          exports and shared constants
+  types.rs        shared application data structures
+  util.rs         helpers and parsing utilities
+  app/
+    chat_manager.rs
+    persistence.rs
+  core/
+    crypto.rs
+    framing.rs
+    protocol.rs
+  network/
+    discovery.rs
+    session.rs
+  identity/
+    mod.rs
+  transfer/
+    receiver.rs
+  gui/
+    app_ui.rs
+    chat_view.rs
+    dialogs.rs
+    help_view.rs
+    sidebar.rs
+    styling.rs
+    widgets.rs
+  tui/
+    app.rs
+    ui.rs
 ```
 
-## 3.3. Module Responsibilities
+## Module Responsibilities
 
-- **`src/main.rs` - GUI Application**: The entry point of the application. It initializes the `egui` framework, sets up the main application state, and runs the event loop.
+### `src/main.rs`
 
-- **`src/app/chat_manager.rs` - Business Logic**: This is the "brain" of the application. It manages all application state, including the list of chats, contacts, and active network sessions. It also handles routing messages between the GUI and the network layer.
+- parses CLI mode/launch flags
+- configures tracing
+- starts GUI or TUI
 
-- **`src/identity/mod.rs` - Identity System**: Responsible for managing the user's persistent identity. This includes generating, loading, and saving the user's long-term RSA key pair.
+### `src/app/chat_manager.rs`
 
-- **`src/core/crypto.rs` - Cryptography**: This module contains all the cryptographic logic. It provides functions for RSA encryption/decryption, AES-GCM encryption/decryption, and the X25519 Diffie-Hellman key exchange.
+- central application state
+- contact/chat/session mapping
+- message routing
+- send flows for text, typing, files
+- fingerprint-verification workflow
+- toast notifications
 
-- **`src/core/protocol.rs` - Wire Protocol**: Defines the structure of messages that are sent over the network. It uses `serde` for serialization and deserialization of these messages.
+### `src/app/persistence.rs`
 
-- **`src/network/session.rs` - Network Sessions**: Manages the lifecycle of a TCP connection between two peers. This includes the secure handshake process, sending and receiving messages, and handling connection errors.
-- **`src/network/discovery.rs` - Peer Discovery**: Uses mDNS-SD (Bonjour) to broadcast presence and discover other peers on the local network.
+- encrypted history serialization/deserialization
+- compatibility with history versions `1.0` and `1.1`
+- background-save snapshot support
+- loaded-config sanitization
 
-- **`src/transfer/` - File Transfer**: This module implements the logic for sending and receiving large files by breaking them down into smaller chunks.
+### `src/core/crypto.rs`
 
-- **`src/types.rs` - Data Structures**: Contains the core data structures used throughout the application, such as `Chat`, `Message`, `Contact`, and various event enums.
+- RSA helpers
+- AES-GCM wrapper
+- X25519 and HKDF helpers
+- fingerprints
+- invite-signature helpers
 
-### Notable Runtime Events
+### `src/core/protocol.rs`
 
-- `SessionEvent::NewConnection(chat_id, peer_meta)`: This event is a key part of the chat synchronization logic. It is emitted on the host's side when a client successfully connects and provides a `chat_id`. The `ChatManager` listens for this event to create or update the chat on the host's side, ensuring that both peers have a consistent view of the conversation.
+- protocol message definitions
+- binary/plain encoding and decoding
+
+### `src/core/framing.rs`
+
+- packet framing for the TCP transport
+
+### `src/network/session.rs`
+
+- secure handshake
+- session message loop
+- transport replay protection
+- rekey handling
+
+### `src/network/discovery.rs`
+
+- optional mDNS registration/discovery
+- LAN peer advertisement and lookup
+
+### `src/identity/mod.rs`
+
+- identity creation and load/save
+- password-based encryption
+- history-key derivation
+- invite generation
+
+### `src/transfer/receiver.rs`
+
+- receiving and finalizing inbound file data
+
+### `src/gui/`
+
+- egui interface, dialogs, state presentation, and log/help UI
+
+### `src/tui/`
+
+- ratatui interface, command mode, keyboard workflows
+
+## Important Runtime Rules
+
+- `ChatManager` is the source of truth for app state.
+- Identity files must remain encrypted on disk.
+- Signed invite generation and parsing must stay aligned.
+- Protocol serialization and deserialization must stay symmetric.
+- Sequence validation and transcript-bound AAD are transport invariants.
+
+## Architecture Gaps
+
+These are real limitations, not hidden assumptions:
+
+- no NAT traversal or relay layer
+- discovery subsystem is optional and not privacy-neutral
+- GUI and TUI share backend state but not identical UX depth
+- persistence and migration are practical, but still lightweight rather than enterprise-grade

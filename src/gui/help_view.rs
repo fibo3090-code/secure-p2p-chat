@@ -41,7 +41,8 @@ fn render_about_tab(ui: &mut egui::Ui) {
         );
         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
         ui.label(
-            egui::RichText::new("Security Status: LOW").color(egui::Color32::from_rgb(255, 165, 0)),
+            egui::RichText::new("Security Status: MEDIUM")
+                .color(egui::Color32::from_rgb(255, 196, 0)),
         );
         ui.add_space(10.0);
         ui.label("A secure, private, and decentralized peer-to-peer messaging application.");
@@ -125,7 +126,7 @@ fn render_features_tab(ui: &mut egui::Ui) {
         ),
         (
             "📁 File Transfer",
-            "Securely share files up to 2GB with encryption and integrity checks.",
+            "Securely share files up to 10 GiB with encryption and integrity checks.",
         ),
         (
             "⌨️ Typing Indicators",
@@ -141,7 +142,7 @@ fn render_features_tab(ui: &mut egui::Ui) {
         ),
         (
             "🔄 Auto-Reconnect",
-            "Automatic reconnection with exponential backoff.",
+            "Automatic reconnect to known contacts when enabled in settings.",
         ),
     ];
 
@@ -196,7 +197,7 @@ fn render_faq_tab(ui: &mut egui::Ui) {
         ),
         (
             "Is it really secure?",
-            "Yes. We use military-grade cryptography: RSA-2048-OAEP for identity, AES-256-GCM for messages, X25519 ECDH for forward secrecy, and ChaCha20-Poly1305 for storage. All critical vulnerabilities have been fixed (100% critical, 80% high-priority). Private keys never leave your device and can be password-protected with Argon2.",
+            "The app uses RSA-2048 identity keys, AES-256-GCM for transport, X25519 ECDH for forward secrecy, and ChaCha20-Poly1305 for encrypted local storage. Identity proof and transport encryption are authenticated, but the project still documents a medium overall risk posture rather than claiming a completed audit.",
         ),
         (
             "What is fingerprint verification?",
@@ -220,7 +221,7 @@ fn render_faq_tab(ui: &mut egui::Ui) {
         ),
         (
             "How do I enable auto-host?",
-            "Go to Settings and enable 'Auto-host on startup'. The application will automatically start listening for connections when you launch it. You can also enable 'Auto-reconnect' to automatically reconnect to known contacts.",
+            "Go to Settings and enable 'Auto-host on startup'. The application will automatically start listening for connections when you launch it. You can also enable auto-connect to retry known contact addresses from saved history.",
         ),
         (
             "Can I use this on multiple devices?",
@@ -267,7 +268,7 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
         |ui| {
             ui.label("• Check the connection status indicator in the chat header.");
             ui.label("• Ensure both parties are online and connected.");
-            ui.label("• If status shows 'Reconnecting', wait for automatic reconnection.");
+            ui.label("• If status shows 'Reconnecting', wait for the next retry or reconnect manually.");
             ui.label("• Try manually reconnecting: click contact → Connect button.");
             ui.label("• Check the Log Terminal (Settings → Show Log Terminal) for errors.");
         },
@@ -291,7 +292,7 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
     ui.collapsing(
         egui::RichText::new("📁 File transfer issues").strong(),
         |ui| {
-            ui.label("• Maximum file size is 2GB - larger files will be rejected.");
+            ui.label("• Maximum file size is 10 GiB - larger files will be rejected.");
             ui.label("• Ensure you have enough disk space in your Downloads folder.");
             ui.label("• Check file permissions on the Downloads directory.");
             ui.label("• Large files may take time - check the progress indicator.");
@@ -305,8 +306,9 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
         |ui| {
             ui.label("• If you forgot your password, you cannot recover your identity.");
             ui.label("• You'll need to create a new identity and re-verify with contacts.");
-            ui.label("• To backup your identity: copy identity.json from the app data folder.");
+            ui.label("• To back up your identity: copy identity.json from the app data folder.");
             ui.label("• To restore: replace identity.json and restart the application.");
+            ui.label("• Removing password protection is not supported.");
             ui.label("• Password uses Argon2 - there's no way to bypass or reset it.");
         },
     );

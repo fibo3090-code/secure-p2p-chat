@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 use crate::types::{Chat, Config};
 use uuid::Uuid;
 
+const CURRENT_HISTORY_VERSION: &str = "1.1";
+
+fn history_version_supported(version: &str) -> bool {
+    matches!(version, "1.0" | "1.1")
+}
+
 /// Returns true if the path is considered dangerous (traversal or system dir).
 /// Used to prevent malicious history files from redirecting writes to system paths.
 fn is_dangerous_path(p: &Path) -> bool {
@@ -68,7 +74,7 @@ pub struct HistoryFile {
 impl HistoryFile {
     pub fn new(chats: Vec<Chat>) -> Self {
         Self {
-            version: "1.0".to_string(),
+            version: CURRENT_HISTORY_VERSION.to_string(),
             chats,
             contacts: Vec::new(),
             config: Config::default(),
@@ -81,7 +87,7 @@ impl HistoryFile {
         let content = std::fs::read_to_string(path)?;
         let history: HistoryFile = serde_json::from_str(&content)?;
 
-        if history.version != "1.0" {
+        if !history_version_supported(&history.version) {
             anyhow::bail!("Unsupported history version: {}", history.version);
         }
 
@@ -108,7 +114,7 @@ impl HistoryFile {
 
         let history: HistoryFile = serde_json::from_slice(&plaintext)?;
 
-        if history.version != "1.0" {
+        if !history_version_supported(&history.version) {
             anyhow::bail!("Unsupported history version: {}", history.version);
         }
 
@@ -155,14 +161,17 @@ impl HistoryFile {
         let mut output = nonce.to_vec();
         output.extend_from_slice(&ciphertext);
 
-        std::fs::write(path, output)?;
+        let temp_path = path.with_extension("tmp");
+        std::fs::write(&temp_path, output)?;
 
         // Set restrictive file permissions on Unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
         }
+
+        std::fs::rename(&temp_path, path)?;
 
         tracing::info!("Saved {} chats to encrypted history", self.chats.len());
         Ok(())
@@ -241,10 +250,16 @@ impl ChatManager {
         history.save_encrypted(path, &key)
     }
 
-    /// Auto-save to default location
-    pub fn auto_save(&self) -> Result<()> {
-        let path = self.config.download_dir.join("history.json.enc");
-        self.save_history(&path)
+    /// Build a serializable snapshot for background persistence.
+    pub fn history_snapshot(&self) -> Result<(HistoryFile, [u8; 32])> {
+        let mut history = HistoryFile::new(self.chats.values().cloned().collect());
+        history.contacts = self.contacts.values().cloned().collect();
+        history.config = self.config.clone();
+        history.contact_chat_map = self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
+        let key = self
+            .history_key
+            .ok_or_else(|| anyhow!("History encryption key not available"))?;
+        Ok((history, key))
     }
 
     fn apply_history(&mut self, history: HistoryFile) {
@@ -300,7 +315,7 @@ mod tests {
         // Load
         let loaded = HistoryFile::load(temp_file.path()).unwrap();
 
-        assert_eq!(loaded.version, "1.0");
+        assert_eq!(loaded.version, CURRENT_HISTORY_VERSION);
         assert_eq!(loaded.chats.len(), 1);
         assert_eq!(loaded.chats[0].id, chat.id);
         assert_eq!(loaded.chats[0].title, chat.title);
@@ -386,10 +401,9 @@ mod tests {
         assert!(plaintext_load.is_err());
     }
 
-    /// PHASE 0 REGRESSION TEST: auto_save must always use encrypted storage.
-    /// If this test fails, the audit's HIGH-priority plaintext autosave issue is present.
+    /// PHASE 0 REGRESSION TEST: background persistence snapshots must remain encrypted.
     #[test]
-    fn test_autosave_always_encrypted() {
+    fn test_history_snapshot_always_encrypted() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut manager = ChatManager::new(Config {
             download_dir: temp_dir.path().to_path_buf(),
@@ -427,13 +441,15 @@ mod tests {
             },
         );
 
-        // Auto-save should succeed
-        manager
-            .auto_save()
-            .expect("auto_save should succeed with key");
+        let history_path = temp_dir.path().join("history.json.enc");
+        let (history, snapshot_key) = manager
+            .history_snapshot()
+            .expect("history_snapshot should succeed with key");
+        history
+            .save_encrypted(&history_path, &snapshot_key)
+            .expect("save_encrypted should succeed");
 
         // Verify the saved file is encrypted (not plaintext JSON)
-        let history_path = temp_dir.path().join("history.json.enc");
         assert!(
             history_path.exists(),
             "history.json.enc should exist after auto_save"
@@ -453,23 +469,20 @@ mod tests {
         assert_eq!(decrypted.chats[0].id, chat_id);
     }
 
-    /// PHASE 0 REGRESSION TEST: auto_save without key should fail gracefully.
-    /// This guards against fallback to unencrypted storage.
+    /// PHASE 0 REGRESSION TEST: history snapshots without a key must fail gracefully.
     #[test]
-    fn test_autosave_without_key_fails() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    fn test_history_snapshot_without_key_fails() {
         let manager = ChatManager::new(Config {
-            download_dir: temp_dir.path().to_path_buf(),
             ..Config::default()
         });
 
         // Do NOT set history_key
-        let result = manager.auto_save();
+        let result = manager.history_snapshot();
 
         // Should fail, not silently save as plaintext
         assert!(
             result.is_err(),
-            "auto_save should fail if history_key is not set"
+            "history_snapshot should fail if history_key is not set"
         );
     }
 }

@@ -95,3 +95,10 @@ fn test_address_parsing_logic() {
     assert_eq!(parsed.1, 8080);
     assert!(ChatManager::parse_address(invalid_addr).is_err());
 }
+
+#[test]
+fn test_address_parsing_supports_bracketed_ipv6() {
+    let parsed = ChatManager::parse_address("[2001:db8::1]:7000").unwrap();
+    assert_eq!(parsed.0, "2001:db8::1");
+    assert_eq!(parsed.1, 7000);
+}

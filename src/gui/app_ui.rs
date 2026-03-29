@@ -25,7 +25,6 @@ pub enum ActiveDialog {
     About,
     Password,
     SetPassword,
-    RemovePassword,
     FingerprintVerification,
     ClearHistory,
     Welcome,
@@ -80,8 +79,6 @@ pub struct App {
     pub password_input: String,
     pub new_password_input: String,
     pub confirm_password_input: String,
-    // pub show_remove_password_dialog: bool, REMOVED
-    pub remove_password_input: String,
     pub identity_locked: bool,
     pub force_password_setup: bool,
     // Fingerprint verification dialog
@@ -285,7 +282,6 @@ impl App {
             password_input: String::new(),
             new_password_input: String::new(),
             confirm_password_input: String::new(),
-            remove_password_input: String::new(),
             identity_locked: initial_identity_locked,
             force_password_setup,
             // Fingerprint verification dialog
@@ -351,18 +347,25 @@ impl App {
     }
 
     pub fn connect_clicked(&mut self) {
-        let mut host = self.connect_host.clone();
-        let mut port = self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT);
-        if let Some(colon) = host.find(':') {
-            let (h, p) = host.split_at(colon);
-            // Clone slices to owned Strings to avoid borrowing `host` while reassigning it
-            let h_str = h.to_string();
-            let p_str = p[1..].to_string(); // skip ':'
-            if let Ok(pn) = p_str.parse::<u16>() {
-                port = pn;
+        let combined = if self.connect_host.contains(':') || self.connect_port.trim().is_empty() {
+            self.connect_host.clone()
+        } else {
+            crate::util::format_host_port(
+                self.connect_host.trim(),
+                self.connect_port.parse().unwrap_or(crate::PORT_DEFAULT),
+            )
+        };
+        let (host, port) = match crate::util::parse_host_port(&combined, Some(crate::PORT_DEFAULT))
+        {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Cannot connect: {}", e),
+                );
+                return;
             }
-            host = h_str;
-        }
+        };
         let privkey = match self.identity.private_key() {
             Ok(k) => k,
             Err(e) => {
@@ -443,10 +446,23 @@ impl eframe::App for App {
             let should_save = last == 0 || now_millis.saturating_sub(last) > 30_000;
 
             if should_save && !manager.chats.is_empty() {
-                if let Err(e) = manager.save_history(&self.history_path) {
-                    tracing::warn!("Failed to auto-save history: {}", e);
-                } else {
-                    last_save.store(now_millis, Ordering::Relaxed);
+                match manager.history_snapshot() {
+                    Ok((history, key)) => {
+                        let path = self.history_path.clone();
+                        last_save.store(now_millis, Ordering::Relaxed);
+                        tokio::spawn(async move {
+                            match tokio::task::spawn_blocking(move || history.save_encrypted(&path, &key))
+                                .await
+                            {
+                                Ok(Err(e)) => tracing::warn!("Background auto-save failed: {}", e),
+                                Err(e) => tracing::warn!("Background auto-save task failed: {}", e),
+                                Ok(Ok(())) => {}
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to prepare auto-save history snapshot: {}", e);
+                    }
                 }
             }
 
@@ -566,7 +582,8 @@ impl eframe::App for App {
                                 if ui.button("Copy address").clicked() {
                                     if let Some(ip) = crate::util::primary_local_ipv4() {
                                         ui.output_mut(|o| {
-                                            o.copied_text = format!("{ip}:{listen_port}")
+                                            o.copied_text =
+                                                crate::util::format_host_port(&ip, listen_port)
                                         });
                                     } else {
                                         ui.output_mut(|o| {

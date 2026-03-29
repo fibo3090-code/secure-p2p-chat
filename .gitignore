@@ -82,6 +82,9 @@ secrets.json
 config.json
 identity.json
 .github
+!.github/
+!.github/workflows/
+!.github/workflows/ci.yml
 .obsidian
 .vscode
 

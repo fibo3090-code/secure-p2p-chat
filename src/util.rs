@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use eframe::egui::Color32;
 use rand::RngCore;
 use std::net::{SocketAddr, UdpSocket};
@@ -40,6 +41,74 @@ pub fn sanitize_filename(filename: &str) -> String {
         "file".to_string()
     } else {
         sanitized
+    }
+}
+
+/// Parse a user-facing endpoint string into `(host, port)`.
+///
+/// Supports:
+/// - `hostname:1234`
+/// - `127.0.0.1:1234`
+/// - `[::1]:1234`
+/// - `hostname` / `127.0.0.1` / `::1` when `default_port` is provided
+pub fn parse_host_port(input: &str, default_port: Option<u16>) -> Result<(String, u16)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Host cannot be empty"));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| anyhow!("Invalid IPv6 address format; missing closing ']'"))?;
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        if let Some(port_str) = suffix.strip_prefix(':') {
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_| anyhow!("Invalid port"))?;
+            return Ok((host.to_string(), port));
+        }
+        if suffix.is_empty() {
+            if let Some(port) = default_port {
+                return Ok((host.to_string(), port));
+            }
+            return Err(anyhow!("Missing port"));
+        }
+        return Err(anyhow!("Invalid IPv6 endpoint suffix"));
+    }
+
+    if trimmed.matches(':').count() > 1 {
+        if let Some(port) = default_port {
+            return Ok((trimmed.to_string(), port));
+        }
+        return Err(anyhow!(
+            "IPv6 addresses must be bracketed when a port is required"
+        ));
+    }
+
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if !host.trim().is_empty() {
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_| anyhow!("Invalid port"))?;
+            return Ok((host.trim().to_string(), port));
+        }
+    }
+
+    if let Some(port) = default_port {
+        return Ok((trimmed.to_string(), port));
+    }
+
+    Err(anyhow!("Invalid address format; expected host:port"))
+}
+
+/// Render a normalized address string, adding brackets around IPv6 literals.
+pub fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
     }
 }
 
@@ -156,5 +225,36 @@ mod tests {
         let grid = generate_color_grid(fp);
         assert_eq!(grid.len(), 4);
         assert_eq!(grid[0].len(), 4);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv4_and_hostname() {
+        assert_eq!(
+            parse_host_port("127.0.0.1:12345", None).unwrap(),
+            ("127.0.0.1".to_string(), 12345)
+        );
+        assert_eq!(
+            parse_host_port("example.local", Some(9000)).unwrap(),
+            ("example.local".to_string(), 9000)
+        );
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6() {
+        assert_eq!(
+            parse_host_port("[::1]:12345", None).unwrap(),
+            ("::1".to_string(), 12345)
+        );
+        assert_eq!(
+            parse_host_port("::1", Some(12345)).unwrap(),
+            ("::1".to_string(), 12345)
+        );
+        assert!(parse_host_port("::1", None).is_err());
+    }
+
+    #[test]
+    fn test_format_host_port_brackets_ipv6() {
+        assert_eq!(format_host_port("::1", 12345), "[::1]:12345");
+        assert_eq!(format_host_port("127.0.0.1", 12345), "127.0.0.1:12345");
     }
 }

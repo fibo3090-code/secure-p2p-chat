@@ -520,9 +520,9 @@ fn inject_soft_breaks(markdown: &str, threshold: usize) -> String {
         }
 
         let mut consecutive_non_space = 0;
-        let mut chars = line.chars().peekable();
+        let chars = line.chars();
 
-        while let Some(c) = chars.next() {
+        for c in chars {
             if c == '`' {
                 in_inline_code = !in_inline_code;
                 result.push(c);

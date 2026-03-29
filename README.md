@@ -1,115 +1,86 @@
-# 🔒 Encrypted P2P Messenger
+# Encrypted P2P Messenger
 
 [![Version](https://img.shields.io/badge/version-1.7.7-blue)](CHANGELOG.md)
-[![License](https://img.shields.io/badge/license-MIT-orange)](#-license)
-[![Security](https://img.shields.io/badge/security-audited-success)](SECURITY.md)
+[![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE.md)
+[![Security](https://img.shields.io/badge/security-medium-yellow)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
 
-> **Secure, private, peer-to-peer messaging with end-to-end encryption and forward secrecy.**
+Secure peer-to-peer messaging for desktop, built with Rust. The app provides encrypted messaging, encrypted local storage, forward secrecy, signed invite links, and both GUI and TUI frontends.
 
-A modern desktop application for encrypted messaging over local networks (LAN) or VPN, built with **Rust** and **egui**. It implements industry-standard encryption and has no central server.
+## What It Does
 
-[Quick Start](#-quick-start) • [Documentation](#-documentation) • [Contributing](CONTRIBUTING.md)
+- End-to-end encrypted messaging over direct peer connections
+- X25519 + HKDF session establishment with RSA-PSS identity proofs
+- Encrypted local identity and encrypted chat history at rest
+- File transfer, typing indicators, invite links, QR generation, and optional LAN discovery
+- GUI built with `egui` and terminal interface built with `ratatui`
 
----
+## Current Status
 
-## 🎯 What is this?
+The project is functional and actively maintained, but it is not a “finished product” in every area.
 
-Encrypted P2P Messenger is a **desktop application** for secure messaging built with these principles:
+- Security posture: medium. See [SECURITY.md](SECURITY.md).
+- Internet connectivity: still manual. NAT traversal and relay support are not implemented.
+- LAN discovery: optional and privacy-sensitive. Disabled by default.
+- Packaging: Windows-first. Linux and macOS are supported from source; distribution polish is lighter.
 
-- **Privacy First**: No central server, no data collection, no tracking. Your conversations are your own.
-- **End-to-End Encryption**: AES-256-GCM authenticated encryption for all traffic; RSA/Ed25519 for identity.
-- **Forward Secrecy**: X25519 ECDH ensures past messages stay secure even if long-term keys are compromised.
-- **Peer-to-Peer**: Direct connections on your LAN or VPN—no central server as a single point of failure.
-- **Open Source**: Transparent, auditable, and free forever.
+## Quick Start
 
----
-
-## ✨ Key Features
-
-- **Security & Privacy**
-  - **Metadata Protection**: Protocol v3 hides identities from passive observers during the handshake.
-  - **Password-Protected Identity**: Private keys are encrypted on disk (Argon2 + ChaCha20-Poly1305).
-  - **Session Key Rotation**: Automatic re-keying every 100 messages or 5 minutes.
-  - **Replay Protection**: Transport-layer sequence numbers prevent message injection.
-  - **DoS Mitigation**: Global rate limiting and strict handshake timeouts.
-
-- **User Experience**
-  - **Local Discovery**: Automatically find peers on your LAN via mDNS (Bonjour/Avahi).
-  - **Rich Messaging**: Typing indicators, emojis, and desktop notifications.
-  - **File Transfer**: Drag-and-drop file sharing with chunked transmission and progress tracking.
-  - **Invite Links & QR Codes**: Share contact info via `chat-p2p://invite/...` or visual QR codes.
-  - **Zero-Config**: No accounts needed; uses a Trust-on-First-Use (TOFU) model.
-
----
-
-## 💻 System Requirements & Compatibility
-
-| Platform | Status | Prerequisites |
-|----------|--------|---------------|
-| **Windows** | ✅ Supported | Requires [Bonjour Print Services](https://support.apple.com/kb/DL999) for peer discovery. |
-| **Linux** | ⚠️ Supported | Requires `avahi-daemon` and libraries (`libgtk-3-dev`, `libxcb-dev`, `libfontconfig-dev`). |
-| **macOS** | ⚠️ Experimental | Works natively with built-in Bonjour; lacks automated packaging. |
-
----
-
-## 🚀 Quick Start
-
-### 1. Installation
-
-To build from source, ensure you have [Rust 1.86+](https://rustup.rs/) installed.
+### Build
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd chat-p2p
-
-# Build release version
 cargo build --release
+```
 
-# Run the GUI
+### Run GUI
+
+```bash
 cargo run --release
+```
 
-# Run the TUI
+### Run TUI
+
+```bash
 cargo run --release -- --tui
 ```
 
-### 2. First Run (Unlock Identity)
+### First Launch
 
-On the first launch, you will be prompted to set a password for your new identity. This password encrypts your private keys at rest and is required every time you open the app. **This cannot be bypassed.**
+On first launch, the app creates an identity and requires password protection before normal use. The unlock/set-password screen is blocking by design.
 
-### 3. Verify Fingerprints (CRITICAL)
+### Trust Model
 
-To protect against **Man-in-the-Middle (MITM)** attacks:
+The app uses TOFU: trust on first use.
 
 1. Connect to a peer.
-2. Compare the 64-character fingerprint (or the colored grid) shown in the app with the one your peer provides over a **separate, secure channel** (e.g., phone call, in-person).
-3. Only click **Trust** if they match exactly.
+2. Verify the displayed fingerprint over a separate trusted channel.
+3. Accept only if it matches exactly.
 
----
+## Platform Notes
 
-## 📚 Documentation
+| Platform | Status | Notes |
+|---|---|---|
+| Windows | Supported | Best packaging support. Bonjour may be needed for mDNS discovery. |
+| Linux | Supported from source | `avahi-daemon` and GUI system libraries may be required. |
+| macOS | Supported from source | Native Bonjour works; packaging is less automated. |
 
-### Core Guides
+## Documentation
 
-- **[DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)**: Unified project roadmap, security initiatives, and backlog.
-- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**: Architecture details, protocol specs, and build instructions.
-- **[SECURITY.md](SECURITY.md)**: Security policy, audit history, and vulnerability disclosure.
-- **[DESIGN_NOTES.md](DESIGN_NOTES.md)**: UI/UX principles, design patterns, and visual language.
+Start with [docs/README.md](docs/README.md).
 
-### Technical Specs
+- [docs/USER_GUIDE.md](docs/USER_GUIDE.md): installation, usage, GUI/TUI flows, troubleshooting
+- [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md): contributor workflow, build/test/release process
+- [docs/03_architecture.md](docs/03_architecture.md): codebase architecture and runtime responsibilities
+- [docs/04_protocol.md](docs/04_protocol.md): wire protocol and handshake details
+- [SECURITY.md](SECURITY.md): security posture, controls, open risks, disclosure
+- [THREAT_MODEL.md](THREAT_MODEL.md): assumptions, assets, attack surfaces, limitations
+- [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md): roadmap and backlog
+- [docs/AUDITS.md](docs/AUDITS.md): consolidated audit history and findings
 
-- **[docs/03_architecture.md](docs/03_architecture.md)**: Detailed system component mapping.
-- **[docs/04_protocol.md](docs/04_protocol.md)**: Handshake, framing, and message format specifications.
+## Contributing
 
----
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## 🤝 Contributing
+## License
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to report bugs, suggest features, and submit pull requests.
-
----
-
-## 📜 License
-
-This project is licensed under the **MIT License** - see [LICENSE.md](LICENSE.md) for details.
+MIT. See [LICENSE.md](LICENSE.md).

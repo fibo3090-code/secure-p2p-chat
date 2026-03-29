@@ -70,6 +70,14 @@ where
     }
 }
 
+fn labeled_aad(label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(label.len() + 1 + transcript_hash.len());
+    aad.extend_from_slice(label);
+    aad.push(0);
+    aad.extend_from_slice(transcript_hash);
+    aad
+}
+
 /// Run host session: listen, accept, handshake (v3), message loop
 pub async fn run_host_session(
     port: u16,
@@ -143,12 +151,8 @@ pub async fn run_host_session(
     let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
     // 7.5. Negotiate Signature Scheme
-    // Host and Client advertise supported signature schemes
-    // Default: [RsaPss, Ed25519] = [1, 2]
-    let our_schemes = vec![
-        SignatureScheme::RsaPss.to_u8(),
-        SignatureScheme::Ed25519.to_u8(),
-    ];
+    // Current runtime support is RSA-PSS identity proofs only.
+    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
     let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
         schemes: our_schemes.clone(),
     };
@@ -165,7 +169,7 @@ pub async fn run_host_session(
         }
     };
 
-    // Negotiate the best common scheme (Ed25519 preferred, fallback to RSA-PSS)
+    // Negotiate the best common scheme supported by both peers.
     let selected_scheme = negotiate_signature_scheme(&our_schemes, &client_schemes)
         .ok_or_else(|| anyhow!("No common signature scheme found"))?;
     tracing::debug!("Negotiated signature scheme: {}", selected_scheme.name());
@@ -186,6 +190,9 @@ pub async fn run_host_session(
         HKDF_INFO,
     ));
     let cipher = AesCipher::new(&aes_key[..])?;
+    let transcript_hash = salt.as_slice();
+    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
+    let transport_aad = labeled_aad(b"transport", transcript_hash);
     tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
 
     // --- ENCRYPTED IDENTITY EXCHANGE ---
@@ -204,18 +211,9 @@ pub async fn run_host_session(
                 .to_vec()
         }
         SignatureScheme::Ed25519 => {
-            // For Ed25519, we would need to have Ed25519 identity key
-            // For now, we'll fall back to RSA-PSS if Ed25519 not available
-            // TODO: Support Ed25519 identity key storage and use
-            tracing::debug!("Ed25519 signature scheme requested but not yet fully supported, using RSA-PSS fallback");
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(host_ephemeral_bytes);
-            signing_key
-                .sign_with_rng(&mut rng, &hasher.finalize())
-                .to_vec()
+            return Err(anyhow!(
+                "Ed25519 identity proofs are not supported by this runtime"
+            ));
         }
     };
 
@@ -229,16 +227,22 @@ pub async fn run_host_session(
 
     // Serialize & Encrypt Proof
     let my_proof_bytes = bincode::serialize(&my_proof)?;
-    // TODO: Use transcript hash as AAD to bind handshake to encrypted proof
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
     send_packet(&mut stream, &encrypted_proof).await?;
 
     // 10. Receive Client's Identity Proof (Encrypted)
     let encrypted_client_proof = recv_packet_with_timeout(&mut stream).await?;
     let client_proof_bytes = cipher
-        .decrypt(&encrypted_client_proof, None)
+        .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
     let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    if client_proof.signature_scheme != selected_scheme {
+        return Err(anyhow!(
+            "Client used unexpected signature scheme: expected {}, got {}",
+            selected_scheme,
+            client_proof.signature_scheme
+        ));
+    }
 
     // 11. Verify Client Identity
     let client_pubkey = pem_decode_public(&client_proof.public_key_pem)?;
@@ -300,7 +304,7 @@ pub async fn run_host_session(
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    run_message_loop(stream, cipher, to_app_tx, from_app_rx).await
+    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
 }
 
 /// Run client session: connect, handshake (v3), message loop
@@ -372,11 +376,8 @@ pub async fn run_client_session(
         }
     };
 
-    // Send our supported schemes (same as host: [RsaPss, Ed25519])
-    let our_schemes = vec![
-        SignatureScheme::RsaPss.to_u8(),
-        SignatureScheme::Ed25519.to_u8(),
-    ];
+    // Send our supported schemes (same as host: RSA-PSS only).
+    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
     let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
         schemes: our_schemes.clone(),
     };
@@ -406,6 +407,9 @@ pub async fn run_client_session(
         HKDF_INFO,
     ));
     let cipher = AesCipher::new(&aes_key[..])?;
+    let transcript_hash = salt.as_slice();
+    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
+    let transport_aad = labeled_aad(b"transport", transcript_hash);
     tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
 
     // --- ENCRYPTED IDENTITY EXCHANGE ---
@@ -413,9 +417,16 @@ pub async fn run_client_session(
     // 8. Receive Host Identity Proof (Encrypted)
     let encrypted_host_proof = recv_packet_with_timeout(&mut stream).await?;
     let host_proof_bytes = cipher
-        .decrypt(&encrypted_host_proof, None)
+        .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
     let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    if host_proof.signature_scheme != selected_scheme {
+        return Err(anyhow!(
+            "Host used unexpected signature scheme: expected {}, got {}",
+            selected_scheme,
+            host_proof.signature_scheme
+        ));
+    }
 
     // 9. Verify Host Identity
     let host_pubkey = pem_decode_public(&host_proof.public_key_pem)?;
@@ -450,18 +461,9 @@ pub async fn run_client_session(
                 .to_vec()
         }
         SignatureScheme::Ed25519 => {
-            // For Ed25519, we would need to have Ed25519 identity key
-            // For now, we'll fall back to RSA-PSS if Ed25519 not available
-            // TODO: Support Ed25519 identity key storage and use
-            tracing::debug!("Ed25519 signature scheme requested but not yet fully supported, using RSA-PSS fallback");
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(client_ephemeral_bytes);
-            signing_key
-                .sign_with_rng(&mut rng, &hasher.finalize())
-                .to_vec()
+            return Err(anyhow!(
+                "Ed25519 identity proofs are not supported by this runtime"
+            ));
         }
     };
 
@@ -475,7 +477,7 @@ pub async fn run_client_session(
 
     // Serialize & Encrypt Proof
     let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
     send_packet(&mut stream, &encrypted_proof).await?;
 
     // 11. Display Fingerprint & Wait for Confirmation
@@ -518,7 +520,7 @@ pub async fn run_client_session(
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    run_message_loop(stream, cipher, to_app_tx, from_app_rx).await
+    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
 }
 
 /// Extract sequence number from a ProtocolMessage
@@ -584,6 +586,7 @@ fn validate_message_sequence(
 async fn run_message_loop<S>(
     mut stream: S,
     mut cipher: AesCipher,
+    transport_aad: Vec<u8>,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     mut from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
 ) -> Result<()>
@@ -615,7 +618,7 @@ where
                     Ok(Ok(encrypted)) => {
                         tracing::trace!("Received {} bytes encrypted", encrypted.len());
 
-                        if let Some(plaintext) = cipher.decrypt(&encrypted, None) {
+                        if let Some(plaintext) = cipher.decrypt(&encrypted, Some(&transport_aad)) {
                             tracing::trace!("Decrypted {} bytes", plaintext.len());
 
                             if let Some(msg) = ProtocolMessage::from_plain_bytes(&plaintext) {
@@ -704,7 +707,7 @@ where
                     };
 
                     let rekey_plaintext = rekey_msg.to_plain_bytes();
-                    let rekey_encrypted = cipher.encrypt(&rekey_plaintext, None);
+                    let rekey_encrypted = cipher.encrypt(&rekey_plaintext, Some(&transport_aad));
 
                     if let Err(e) = send_packet(&mut stream, &rekey_encrypted).await {
                         let err_msg = format!("Network send error (rekey): {}", e);
@@ -729,8 +732,7 @@ where
                 let plaintext = msg.to_plain_bytes();
                 tracing::trace!("Plaintext {} bytes", plaintext.len());
 
-                // TODO: Bind AAD to include chat_id or message sequence
-                let encrypted = cipher.encrypt(&plaintext, None);
+                let encrypted = cipher.encrypt(&plaintext, Some(&transport_aad));
                 tracing::trace!("Encrypted to {} bytes", encrypted.len());
 
                 if let Err(e) = send_packet(&mut stream, &encrypted).await {
@@ -813,13 +815,14 @@ mod tests {
                 signature_scheme: SignatureScheme::RsaPss,
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
-            let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
+            let identity_proof_aad = labeled_aad(b"identity-proof", salt.as_slice());
+            let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
             send_packet(&mut host_stream, &encrypted_proof).await?;
 
             // 5. Recv Client Identity Proof (Encrypted)
             let encrypted_client_proof = recv_packet(&mut host_stream).await?;
             let client_proof_bytes = cipher
-                .decrypt(&encrypted_client_proof, None)
+                .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
                 .expect("client proof decrypt should succeed");
             let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
             assert_eq!(client_proof.version, PROTOCOL_VERSION as u32);
@@ -859,8 +862,9 @@ mod tests {
 
             // 4. Recv Host Identity Proof (Encrypted)
             let encrypted_host_proof = recv_packet(&mut client_stream).await?;
+            let identity_proof_aad = labeled_aad(b"identity-proof", salt.as_slice());
             let host_proof_bytes = cipher
-                .decrypt(&encrypted_host_proof, None)
+                .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
                 .expect("host proof decrypt should succeed");
             let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
             assert_eq!(host_proof.version, PROTOCOL_VERSION as u32);
@@ -881,7 +885,7 @@ mod tests {
                 signature_scheme: SignatureScheme::RsaPss,
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
-            let encrypted_proof = cipher.encrypt(&my_proof_bytes, None);
+            let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
             send_packet(&mut client_stream, &encrypted_proof).await?;
 
             Ok(client_aes_key)
@@ -897,6 +901,55 @@ mod tests {
         assert_eq!(host_aes, client_aes);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_identity_proof_aad_binding_rejects_wrong_context() {
+        let proof = IdentityProof {
+            public_key_pem: "test-public-key".to_string(),
+            signature: vec![1, 2, 3, 4],
+            version: PROTOCOL_VERSION as u32,
+            chat_id: uuid::Uuid::new_v4(),
+            signature_scheme: SignatureScheme::RsaPss,
+        };
+        let proof_bytes = bincode::serialize(&proof).unwrap();
+        let cipher = AesCipher::new(&[7u8; crate::AES_KEY_SIZE]).unwrap();
+
+        let correct_aad = labeled_aad(b"identity-proof", b"transcript-a");
+        let wrong_aad = labeled_aad(b"identity-proof", b"transcript-b");
+
+        let encrypted = cipher.encrypt(&proof_bytes, Some(&correct_aad));
+        assert!(
+            cipher.decrypt(&encrypted, Some(&wrong_aad)).is_none(),
+            "identity proof must not decrypt under a different transcript binding"
+        );
+        assert!(
+            cipher.decrypt(&encrypted, None).is_none(),
+            "identity proof must not decrypt when AAD is stripped"
+        );
+    }
+
+    #[test]
+    fn test_transport_aad_binding_rejects_wrong_context() {
+        let cipher = AesCipher::new(&[9u8; crate::AES_KEY_SIZE]).unwrap();
+        let msg = ProtocolMessage::Text {
+            text: "hello".to_string(),
+            timestamp: 42,
+            seq: 1,
+        };
+        let plaintext = msg.to_plain_bytes();
+        let correct_aad = labeled_aad(b"transport", b"session-a");
+        let wrong_aad = labeled_aad(b"transport", b"session-b");
+
+        let encrypted = cipher.encrypt(&plaintext, Some(&correct_aad));
+        assert!(
+            cipher.decrypt(&encrypted, Some(&wrong_aad)).is_none(),
+            "transport ciphertext must not decrypt under a different transcript binding"
+        );
+        assert!(
+            cipher.decrypt(&encrypted, None).is_none(),
+            "transport ciphertext must not decrypt when AAD is stripped"
+        );
     }
 
     /// Test: Replay protection now works at transport layer
@@ -994,6 +1047,12 @@ mod tests {
             public_key: vec![0u8; 32],
         };
         assert!(validate_message_sequence(&ephemeral_msg, &mut last_valid_seq).is_ok());
+        assert_eq!(last_valid_seq, 5); // Unchanged
+
+        let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
+            schemes: vec![SignatureScheme::RsaPss.to_u8()],
+        };
+        assert!(validate_message_sequence(&schemes_msg, &mut last_valid_seq).is_ok());
         assert_eq!(last_valid_seq, 5); // Unchanged
     }
 

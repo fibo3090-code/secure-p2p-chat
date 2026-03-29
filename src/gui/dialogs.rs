@@ -1,6 +1,7 @@
 use crate::gui::app_ui::{ActiveDialog, App};
 use crate::gui::widgets::ColorGrid;
 use crate::util::{generate_color_grid, primary_local_ipv4};
+use anyhow::anyhow;
 use eframe::egui;
 use egui_tracing::ui::Logs;
 
@@ -30,7 +31,6 @@ pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
         ActiveDialog::FingerprintVerification => render_fingerprint_dialog(app, ctx),
         ActiveDialog::Password => render_password_dialog(app, ctx),
         ActiveDialog::SetPassword => render_set_password_dialog(app, ctx),
-        ActiveDialog::RemovePassword => render_remove_password_dialog(app, ctx),
         ActiveDialog::ClearHistory => render_clear_history_dialog(app, ctx),
         ActiveDialog::None => {}
     }
@@ -1632,12 +1632,15 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 if crate::gui::widgets::primary_button(ui, "Set/Change Password").clicked() {
                     app.active_dialog = ActiveDialog::SetPassword;
                 }
-
-                if app.identity.encrypted_private_key.is_some()
-                    && crate::gui::widgets::secondary_button(ui, "Remove Password").clicked() {
-                        app.active_dialog = ActiveDialog::RemovePassword;
-                    }
             });
+
+            ui.label(
+                egui::RichText::new(
+                    "Removing password protection is disabled because identities are required to remain encrypted on disk.",
+                )
+                .small()
+                .weak(),
+            );
 
 
             ui.add_space(20.0);
@@ -1681,70 +1684,6 @@ pub fn render_set_password_dialog(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-fn render_remove_password_dialog(app: &mut App, ctx: &egui::Context) {
-    egui::Window::new("🔑 Remove Password")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label("Enter your current password to remove encryption from your identity file.");
-            ui.add_space(10.0);
-
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut app.remove_password_input)
-                    .password(true)
-                    .hint_text("Current Password"),
-            );
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                if (crate::gui::widgets::primary_button(ui, "Confirm Removal").clicked()
-                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
-                    && !app.remove_password_input.is_empty()
-                {
-                    match app.identity.remove_password(&app.remove_password_input) {
-                        Ok(_) => {
-                            if let Err(e) = app
-                                .identity
-                                .save(&app.history_path.with_file_name("identity.json"))
-                            {
-                                if let Ok(mut manager) = app.chat_manager.try_lock() {
-                                    manager.add_toast(
-                                        crate::types::ToastLevel::Error,
-                                        format!("Failed to save identity: {}", e),
-                                    );
-                                }
-                            } else {
-                                if let Ok(mut manager) = app.chat_manager.try_lock() {
-                                    manager.add_toast(
-                                        crate::types::ToastLevel::Success,
-                                        "Password removed and identity is now unencrypted!"
-                                            .to_string(),
-                                    );
-                                }
-                                app.active_dialog = ActiveDialog::None;
-                                app.remove_password_input.clear();
-                            }
-                        }
-                        Err(e) => {
-                            if let Ok(mut manager) = app.chat_manager.try_lock() {
-                                manager.add_toast(
-                                    crate::types::ToastLevel::Error,
-                                    format!("Failed to remove password: {}", e),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
-                    app.active_dialog = ActiveDialog::None;
-                    app.remove_password_input.clear();
-                }
-            });
-        });
-}
-
 fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("⚠️ Clear All Data (Including Identity)")
         .collapsible(false)
@@ -1766,13 +1705,41 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
 
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "❌ Delete Everything").clicked() {
-                    if let Ok(mut manager) = app.chat_manager.try_lock() {
-                        manager.chats.clear();
-                        manager.contact_to_chat.clear(); // Actually we should keep contacts or not?
-                        // Assuming "Clear History" means messages. But contacts are part of state.
-                        // Implementation details aside, let's just close dialog.
-                        if let Err(e) = manager.save_history(&app.history_path) {
-                           tracing::error!("Failed to clear history on disk: {}", e);
+                    let identity_path = app.history_path.with_file_name("identity.json");
+                    let wipe_result = if let Ok(mut manager) = app.chat_manager.try_lock() {
+                        manager.delete_all_data(&app.history_path, &identity_path)
+                    } else {
+                        Err(anyhow!("Could not lock chat manager"))
+                    };
+
+                    match wipe_result {
+                        Ok(()) => {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.add_toast(
+                                    crate::types::ToastLevel::Success,
+                                    "All local data deleted. A new identity is required before you continue."
+                                        .to_string(),
+                                );
+                            }
+                            if let Ok(new_identity) =
+                                crate::identity::Identity::new_with_plaintext("User".to_string())
+                            {
+                                app.identity = new_identity;
+                                app.identity_locked = false;
+                                app.is_new_identity = true;
+                                app.force_password_setup = true;
+                                app.selected_chat = None;
+                                app.input_text.clear();
+                                app.contact_tab = 0;
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                manager.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to delete all data: {}", e),
+                                );
+                            }
                         }
                     }
                     app.active_dialog = ActiveDialog::None;
