@@ -416,6 +416,15 @@ impl Identity {
     /// This creates a cryptographically signed invite link that prevents tampering.
     /// The signature is computed over the invite payload and verified on import.
     pub fn generate_signed_invite_link(&self, address: Option<String>) -> Result<String> {
+        self.generate_signed_invite_link_with_route(address, None, None)
+    }
+
+    pub fn generate_signed_invite_link_with_route(
+        &self,
+        address: Option<String>,
+        relay_server: Option<String>,
+        relay_token: Option<String>,
+    ) -> Result<String> {
         use serde::{Deserialize, Serialize};
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -436,16 +445,24 @@ impl Identity {
             nonce: String, // Random per-invite nonce encoded as hex
             name: String,
             address: Option<String>,
+            relay_server: Option<String>,
+            relay_token: Option<String>,
             fingerprint: String,
             public_key: String,
         }
 
         let payload = SignedInvitePayload {
-            version: 2, // Signed invite format version
+            version: if relay_server.is_some() || relay_token.is_some() {
+                3
+            } else {
+                2
+            },
             timestamp,
             nonce,
             name: self.name.clone(),
             address,
+            relay_server,
+            relay_token,
             fingerprint: self.fingerprint.clone(),
             public_key: self.public_key_pem.clone(),
         };
@@ -868,6 +885,28 @@ mod tests {
 
         // Signature should not be empty
         assert!(!invite.signature.is_empty());
+    }
+
+    #[test]
+    fn test_signed_relay_invite_link_includes_relay_fields() {
+        let identity = Identity::new_with_plaintext("Relay User".to_string()).unwrap();
+        let link = identity
+            .generate_signed_invite_link_with_route(
+                None,
+                Some("relay.example.com:23456".to_string()),
+                Some("0123456789abcdef0123456789abcdef".to_string()),
+            )
+            .unwrap();
+
+        assert!(link.starts_with("chat-p2p://invite/v2/"));
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        let json = String::from_utf8(decoded).unwrap();
+        assert!(json.contains("relay.example.com:23456"));
+        assert!(json.contains("0123456789abcdef0123456789abcdef"));
+        assert!(json.contains("\"version\":3"));
     }
 
     #[test]

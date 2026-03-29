@@ -24,7 +24,18 @@ pub enum TuiMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiCommand {
     Host(Option<u16>),
-    Connect { host: String, port: u16 },
+    Connect {
+        host: String,
+        port: u16,
+    },
+    HostRelay {
+        relay: String,
+        token: Option<String>,
+    },
+    ConnectRelay {
+        relay: String,
+        token: String,
+    },
     Disconnect,
     Diagnostics,
     Rename(String),
@@ -226,6 +237,28 @@ impl TuiApp {
                 }
                 Ok(TuiCommand::Connect { host, port })
             }
+            "host-relay" => {
+                let relay = parts
+                    .next()
+                    .ok_or_else(|| "Usage: :host-relay <relay[:port]> [token]".to_string())?;
+                let token = parts.next().map(str::to_string);
+                Ok(TuiCommand::HostRelay {
+                    relay: relay.to_string(),
+                    token,
+                })
+            }
+            "connect-relay" => {
+                let relay = parts
+                    .next()
+                    .ok_or_else(|| "Usage: :connect-relay <relay[:port]> <token>".to_string())?;
+                let token = parts
+                    .next()
+                    .ok_or_else(|| "Usage: :connect-relay <relay[:port]> <token>".to_string())?;
+                Ok(TuiCommand::ConnectRelay {
+                    relay: relay.to_string(),
+                    token: token.to_string(),
+                })
+            }
             "disconnect" => Ok(TuiCommand::Disconnect),
             "diagnostics" | "diag" => Ok(TuiCommand::Diagnostics),
             "rename" => {
@@ -398,6 +431,69 @@ impl TuiApp {
                     format!("Cannot connect: {}", e),
                 ),
             },
+            TuiCommand::HostRelay { relay, token } => match self.identity.private_key() {
+                Ok(privkey) => match self
+                    .chat_manager
+                    .start_host_via_relay(&relay, token, privkey)
+                    .await
+                {
+                    Ok((chat_id, relay_token)) => {
+                        if let Ok(invite_link) =
+                            self.identity.generate_signed_invite_link_with_route(
+                                None,
+                                Some(relay.clone()),
+                                Some(relay_token.clone()),
+                            )
+                        {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                let _ = clipboard.set_text(invite_link);
+                            }
+                        }
+                        self.chat_manager.add_toast(
+                            crate::types::ToastLevel::Success,
+                            format!("Relay host ready via {} (token {})", relay, relay_token),
+                        );
+                        self.sync_chat_ids();
+                        if let Some(idx) = self.chat_ids.iter().position(|id| *id == chat_id) {
+                            self.chat_list_state.select(Some(idx));
+                        }
+                    }
+                    Err(e) => self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Failed to start relay host: {}", e),
+                    ),
+                },
+                Err(e) => self.chat_manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Cannot start relay host: {}", e),
+                ),
+            },
+            TuiCommand::ConnectRelay { relay, token } => match self.identity.private_key() {
+                Ok(privkey) => match self
+                    .chat_manager
+                    .connect_via_relay(&relay, &token, None, privkey)
+                    .await
+                {
+                    Ok(chat_id) => {
+                        self.chat_manager.add_toast(
+                            crate::types::ToastLevel::Info,
+                            format!("Connecting via relay {}...", relay),
+                        );
+                        self.sync_chat_ids();
+                        if let Some(idx) = self.chat_ids.iter().position(|id| *id == chat_id) {
+                            self.chat_list_state.select(Some(idx));
+                        }
+                    }
+                    Err(e) => self.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Relay connect failed: {}", e),
+                    ),
+                },
+                Err(e) => self.chat_manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Cannot connect via relay: {}", e),
+                ),
+            },
             TuiCommand::Disconnect => {
                 if let Some(chat_id) = self.selected_chat_id() {
                     let is_placeholder = self
@@ -443,7 +539,7 @@ impl TuiApp {
             TuiCommand::Help => {
                 self.chat_manager.add_toast(
                     crate::types::ToastLevel::Info,
-                    "Commands: :host [port], :connect <host[:port]>, :disconnect, :diagnostics, :rename <title>, :help, :quit"
+                    "Commands: :host [port], :connect <host[:port]>, :host-relay <relay[:port]> [token], :connect-relay <relay[:port]> <token>, :disconnect, :diagnostics, :rename <title>, :help, :quit"
                         .to_string(),
                 );
             }
@@ -857,6 +953,31 @@ mod tests {
             TuiCommand::Connect {
                 host: "10.0.0.1".to_string(),
                 port: crate::PORT_DEFAULT,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_host_relay_command() {
+        let parsed = TuiApp::parse_command(":host-relay relay.example.com:23456 token123").unwrap();
+        assert_eq!(
+            parsed,
+            TuiCommand::HostRelay {
+                relay: "relay.example.com:23456".to_string(),
+                token: Some("token123".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_connect_relay_command() {
+        let parsed =
+            TuiApp::parse_command(":connect-relay relay.example.com:23456 token123").unwrap();
+        assert_eq!(
+            parsed,
+            TuiCommand::ConnectRelay {
+                relay: "relay.example.com:23456".to_string(),
+                token: "token123".to_string(),
             }
         );
     }

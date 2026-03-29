@@ -27,6 +27,16 @@ pub enum ProtocolMessage {
         seq: u64,
     },
 
+    /// Chunk of a large text message, reassembled by the app layer.
+    TextChunk {
+        message_id: uuid::Uuid,
+        chunk_index: u32,
+        total_chunks: u32,
+        text_part: String,
+        timestamp: u64,
+        seq: u64,
+    },
+
     /// File metadata (sent before chunks)
     FileMeta {
         filename: String,
@@ -75,6 +85,22 @@ impl std::fmt::Debug for ProtocolMessage {
                 .field("seq", seq)
                 .field("timestamp", timestamp)
                 .field("text", &"***REDACTED***")
+                .finish(),
+            Self::TextChunk {
+                message_id,
+                chunk_index,
+                total_chunks,
+                timestamp,
+                seq,
+                ..
+            } => f
+                .debug_struct("TextChunk")
+                .field("message_id", message_id)
+                .field("chunk_index", chunk_index)
+                .field("total_chunks", total_chunks)
+                .field("seq", seq)
+                .field("timestamp", timestamp)
+                .field("text_part", &"***REDACTED***")
                 .finish(),
             Self::FileMeta {
                 filename,
@@ -170,6 +196,26 @@ impl ProtocolMessage {
                 v.extend_from_slice(bytes);
             }
 
+            Self::TextChunk {
+                message_id,
+                chunk_index,
+                total_chunks,
+                text_part,
+                timestamp,
+                seq,
+            } => {
+                v.push(11u8);
+                v.extend_from_slice(message_id.as_bytes());
+                v.extend_from_slice(&seq.to_be_bytes());
+                v.extend_from_slice(&timestamp.to_be_bytes());
+                v.extend_from_slice(&chunk_index.to_be_bytes());
+                v.extend_from_slice(&total_chunks.to_be_bytes());
+                let bytes = text_part.as_bytes();
+                let len = (bytes.len() as u32).to_be_bytes();
+                v.extend_from_slice(&len);
+                v.extend_from_slice(bytes);
+            }
+
             Self::FileMeta {
                 filename,
                 size,
@@ -246,7 +292,7 @@ impl ProtocolMessage {
         }
 
         if b.starts_with(b"TEXT:") {
-            if b.len() > 64 * 1024 {
+            if b.len() > crate::MAX_TEXT_MESSAGE_BYTES {
                 return None;
             }
             let s = String::from_utf8_lossy(&b[5..]);
@@ -383,7 +429,7 @@ impl ProtocolMessage {
                 cursor += 8;
                 let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
-                if len > 64 * 1024 {
+                if len > crate::MAX_TEXT_MESSAGE_BYTES {
                     return None;
                 }
                 if cursor + len > b.len() {
@@ -392,6 +438,41 @@ impl ProtocolMessage {
                 let text = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
                 Some(Self::Text {
                     text,
+                    timestamp,
+                    seq,
+                })
+            }
+            11 => {
+                if cursor + 16 + 8 + 8 + 4 + 4 + 4 > b.len() {
+                    return None;
+                }
+                let message_id = uuid::Uuid::from_slice(&b[cursor..cursor + 16]).ok()?;
+                cursor += 16;
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                cursor += 8;
+                let timestamp = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                cursor += 8;
+                let chunk_index = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?);
+                cursor += 4;
+                let total_chunks = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?);
+                cursor += 4;
+                if total_chunks == 0 || chunk_index >= total_chunks {
+                    return None;
+                }
+                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
+                cursor += 4;
+                if len > crate::TEXT_CHUNK_BYTES {
+                    return None;
+                }
+                if cursor + len > b.len() {
+                    return None;
+                }
+                let text_part = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
+                Some(Self::TextChunk {
+                    message_id,
+                    chunk_index,
+                    total_chunks,
+                    text_part,
                     timestamp,
                     seq,
                 })

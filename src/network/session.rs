@@ -523,6 +523,343 @@ pub async fn run_client_session(
     run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
 }
 
+pub async fn run_host_session_over_stream<S>(
+    stream: &mut S,
+    peer_label: String,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
+    send_packet(stream, &version_bytes).await?;
+
+    let client_version_bytes = recv_packet_with_timeout(stream).await?;
+    if client_version_bytes.len() != 4 {
+        return Err(anyhow!("Invalid version packet length"));
+    }
+    let client_version = u32::from_be_bytes(
+        client_version_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid version bytes"))?,
+    );
+    if client_version < 3 {
+        return Err(anyhow!(
+            "Client version {} too old (need v3+)",
+            client_version
+        ));
+    }
+
+    let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
+    let host_ephemeral_bytes = host_ephemeral_public.as_bytes();
+    send_packet(stream, host_ephemeral_bytes).await?;
+
+    let client_ephemeral_bytes = recv_packet_with_timeout(stream).await?;
+    if client_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
+        return Err(anyhow!("Invalid ephemeral key length"));
+    }
+    let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
+
+    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
+    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
+        schemes: our_schemes.clone(),
+    };
+    send_packet(stream, &schemes_msg.to_plain_bytes()).await?;
+
+    let client_schemes_bytes = recv_packet_with_timeout(stream).await?;
+    let client_schemes = match ProtocolMessage::from_plain_bytes(&client_schemes_bytes) {
+        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
+        _ => return Err(anyhow!("Client did not send valid signature schemes")),
+    };
+    let selected_scheme = negotiate_signature_scheme(&our_schemes, &client_schemes)
+        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
+
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(&version_bytes);
+    transcript.extend_from_slice(&client_version_bytes);
+    transcript.extend_from_slice(host_ephemeral_bytes);
+    transcript.extend_from_slice(&client_ephemeral_bytes);
+    let salt = Sha256::digest(&transcript);
+
+    let aes_key = Zeroizing::new(derive_session_key(
+        host_ephemeral_secret,
+        &client_ephemeral_public,
+        Some(&salt),
+        HKDF_INFO,
+    ));
+    let cipher = AesCipher::new(&aes_key[..])?;
+    let transcript_hash = salt.as_slice();
+    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
+    let transport_aad = labeled_aad(b"transport", transcript_hash);
+
+    let signature = match selected_scheme {
+        SignatureScheme::RsaPss => {
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(host_ephemeral_bytes);
+            signing_key
+                .sign_with_rng(&mut rng, &hasher.finalize())
+                .to_vec()
+        }
+        SignatureScheme::Ed25519 => {
+            return Err(anyhow!(
+                "Ed25519 identity proofs are not supported by this runtime"
+            ));
+        }
+    };
+
+    let my_proof = IdentityProof {
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
+        signature,
+        version: PROTOCOL_VERSION as u32,
+        chat_id,
+        signature_scheme: selected_scheme,
+    };
+
+    let my_proof_bytes = bincode::serialize(&my_proof)?;
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
+    send_packet(stream, &encrypted_proof).await?;
+
+    let encrypted_client_proof = recv_packet_with_timeout(stream).await?;
+    let client_proof_bytes = cipher
+        .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
+        .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
+    let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    if client_proof.signature_scheme != selected_scheme {
+        return Err(anyhow!(
+            "Client used unexpected signature scheme: expected {}, got {}",
+            selected_scheme,
+            client_proof.signature_scheme
+        ));
+    }
+
+    let client_pubkey = pem_decode_public(&client_proof.public_key_pem)?;
+    let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey);
+    let mut client_hasher = Sha256::new();
+    client_hasher.update(b"IDENTITY_PROOF");
+    client_hasher.update(&client_ephemeral_bytes);
+    let client_digest = client_hasher.finalize();
+    verifying_key
+        .verify(
+            &client_digest,
+            &rsa::pss::Signature::try_from(client_proof.signature.as_slice())?,
+        )
+        .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
+
+    let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
+    to_app_tx
+        .send(SessionEvent::NewConnection {
+            peer_addr: peer_label,
+            fingerprint: client_fingerprint,
+            chat_id: client_proof.chat_id,
+        })
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
+        confirm_rx.recv().await
+    })
+    .await
+    {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
+            return Err(anyhow!("Fingerprint rejected by user"));
+        }
+        Ok(None) => {
+            let msg = "Confirmation channel closed";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification failed: channel closed"));
+        }
+        Err(_) => {
+            let msg = "Fingerprint verification timed out";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification timed out"));
+        }
+    }
+
+    to_app_tx
+        .send(SessionEvent::Ready)
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+}
+
+pub async fn run_client_session_over_stream<S>(
+    stream: &mut S,
+    peer_label: String,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let peer_name = peer_label.clone();
+    to_app_tx
+        .send(SessionEvent::Connected { peer: peer_label })
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+
+    let host_version_bytes = recv_packet_with_timeout(stream).await?;
+    if host_version_bytes.len() != 4 {
+        return Err(anyhow!("Invalid version packet length"));
+    }
+    let host_version = u32::from_be_bytes(
+        host_version_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid version bytes"))?,
+    );
+    if host_version < 3 {
+        return Err(anyhow!("Host version {} too old (need v3+)", host_version));
+    }
+
+    let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
+    send_packet(stream, &version_bytes).await?;
+
+    let host_ephemeral_bytes = recv_packet_with_timeout(stream).await?;
+    if host_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
+        return Err(anyhow!("Invalid ephemeral key length"));
+    }
+    let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
+
+    let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
+    let client_ephemeral_bytes = client_ephemeral_public.as_bytes();
+    send_packet(stream, client_ephemeral_bytes).await?;
+
+    let host_schemes_bytes = recv_packet_with_timeout(stream).await?;
+    let host_schemes = match ProtocolMessage::from_plain_bytes(&host_schemes_bytes) {
+        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
+        _ => return Err(anyhow!("Host did not send valid signature schemes")),
+    };
+
+    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
+    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
+        schemes: our_schemes.clone(),
+    };
+    send_packet(stream, &schemes_msg.to_plain_bytes()).await?;
+
+    let selected_scheme = negotiate_signature_scheme(&host_schemes, &our_schemes)
+        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
+
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(&host_version_bytes);
+    transcript.extend_from_slice(&version_bytes);
+    transcript.extend_from_slice(&host_ephemeral_bytes);
+    transcript.extend_from_slice(client_ephemeral_bytes);
+    let salt = Sha256::digest(&transcript);
+
+    let aes_key = Zeroizing::new(derive_session_key(
+        client_ephemeral_secret,
+        &host_ephemeral_public,
+        Some(&salt),
+        HKDF_INFO,
+    ));
+    let cipher = AesCipher::new(&aes_key[..])?;
+    let transcript_hash = salt.as_slice();
+    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
+    let transport_aad = labeled_aad(b"transport", transcript_hash);
+
+    let encrypted_host_proof = recv_packet_with_timeout(stream).await?;
+    let host_proof_bytes = cipher
+        .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
+        .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
+    let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    if host_proof.signature_scheme != selected_scheme {
+        return Err(anyhow!(
+            "Host used unexpected signature scheme: expected {}, got {}",
+            selected_scheme,
+            host_proof.signature_scheme
+        ));
+    }
+
+    let host_pubkey = pem_decode_public(&host_proof.public_key_pem)?;
+    let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey);
+    let mut host_hasher = Sha256::new();
+    host_hasher.update(b"IDENTITY_PROOF");
+    host_hasher.update(&host_ephemeral_bytes);
+    let host_digest = host_hasher.finalize();
+    verifying_key
+        .verify(
+            &host_digest,
+            &rsa::pss::Signature::try_from(host_proof.signature.as_slice())?,
+        )
+        .map_err(|e| anyhow!("Host identity signature verification failed: {}", e))?;
+
+    let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
+
+    let signature = match selected_scheme {
+        SignatureScheme::RsaPss => {
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            let mut hasher = Sha256::new();
+            hasher.update(b"IDENTITY_PROOF");
+            hasher.update(client_ephemeral_bytes);
+            signing_key
+                .sign_with_rng(&mut rng, &hasher.finalize())
+                .to_vec()
+        }
+        SignatureScheme::Ed25519 => {
+            return Err(anyhow!(
+                "Ed25519 identity proofs are not supported by this runtime"
+            ));
+        }
+    };
+
+    let my_proof = IdentityProof {
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
+        signature,
+        version: PROTOCOL_VERSION as u32,
+        chat_id,
+        signature_scheme: selected_scheme,
+    };
+    let my_proof_bytes = bincode::serialize(&my_proof)?;
+    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
+    send_packet(stream, &encrypted_proof).await?;
+
+    to_app_tx
+        .send(SessionEvent::ShowFingerprintVerification {
+            fingerprint: host_fingerprint,
+            peer_name,
+            chat_id,
+        })
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
+        confirm_rx.recv().await
+    })
+    .await
+    {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
+            return Err(anyhow!("Fingerprint rejected by user"));
+        }
+        Ok(None) => {
+            let msg = "Confirmation channel closed";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification failed: channel closed"));
+        }
+        Err(_) => {
+            let msg = "Fingerprint verification timed out";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification timed out"));
+        }
+    }
+
+    to_app_tx
+        .send(SessionEvent::Ready)
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+}
+
 /// Extract sequence number from a ProtocolMessage
 /// Returns None if the message type doesn't have a sequence number (shouldn't happen in practice)
 fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
@@ -531,6 +868,7 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
         ProtocolMessage::EphemeralKey { .. } => None, // Handshake only
         ProtocolMessage::SupportedSignatureSchemes { .. } => None, // Handshake only
         ProtocolMessage::Text { seq, .. } => Some(*seq),
+        ProtocolMessage::TextChunk { seq, .. } => Some(*seq),
         ProtocolMessage::FileMeta { seq, .. } => Some(*seq),
         ProtocolMessage::FileChunk { seq, .. } => Some(*seq),
         ProtocolMessage::FileEnd { seq } => Some(*seq),
@@ -591,7 +929,7 @@ async fn run_message_loop<S>(
     mut from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
 

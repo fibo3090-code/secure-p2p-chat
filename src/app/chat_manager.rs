@@ -7,15 +7,19 @@
 //! - File transfer state and toasts/notifications
 //! - Invite link generation and parsing (including QR codes)
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::core::ProtocolMessage;
-use crate::network::{run_client_session, run_host_session};
+use crate::network::{
+    generate_relay_token, run_client_session, run_client_session_via_relay, run_host_session,
+    run_host_session_via_relay,
+};
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
 use rsa::RsaPrivateKey;
@@ -42,6 +46,7 @@ pub struct ChatManager {
     active_transfers: HashMap<Uuid, FileTransferState>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
+    incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
     pub fingerprint_verification_request: Option<(String, String, Uuid)>,
@@ -49,6 +54,12 @@ pub struct ChatManager {
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
+}
+
+struct IncomingTextMessage {
+    timestamp_millis: u64,
+    parts: Vec<Option<String>>,
+    updated_at: std::time::Instant,
 }
 
 impl ChatManager {
@@ -61,6 +72,216 @@ impl ChatManager {
         })
     }
 
+    fn build_text_protocol_messages(
+        send_seq: &mut u64,
+        text: &str,
+        timestamp: u64,
+    ) -> Result<Vec<ProtocolMessage>> {
+        if text.len() <= crate::MAX_TEXT_MESSAGE_BYTES {
+            *send_seq += 1;
+            return Ok(vec![ProtocolMessage::Text {
+                text: text.to_string(),
+                timestamp,
+                seq: *send_seq,
+            }]);
+        }
+
+        let chunks = Self::split_text_chunks(text, crate::TEXT_CHUNK_BYTES);
+        if chunks.is_empty() {
+            bail!("Message is empty");
+        }
+
+        let message_id = Uuid::new_v4();
+        let total_chunks = u32::try_from(chunks.len())
+            .map_err(|_| anyhow!("Message is too large to chunk safely"))?;
+        let mut messages = Vec::with_capacity(chunks.len());
+
+        for (chunk_index, text_part) in chunks.into_iter().enumerate() {
+            *send_seq += 1;
+            messages.push(ProtocolMessage::TextChunk {
+                message_id,
+                chunk_index: chunk_index as u32,
+                total_chunks,
+                text_part,
+                timestamp,
+                seq: *send_seq,
+            });
+        }
+
+        Ok(messages)
+    }
+
+    fn split_text_chunks(text: &str, max_bytes: usize) -> Vec<String> {
+        debug_assert!(max_bytes > 0);
+
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        let mut current_bytes = 0usize;
+
+        for ch in text.chars() {
+            let ch_bytes = ch.len_utf8();
+            if current_bytes > 0 && current_bytes + ch_bytes > max_bytes {
+                chunks.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current.push(ch);
+            current_bytes += ch_bytes;
+        }
+
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+
+        chunks
+    }
+
+    fn cleanup_stale_incoming_text_messages(&mut self) {
+        const INCOMING_TEXT_TIMEOUT: Duration = Duration::from_secs(120);
+
+        let now = std::time::Instant::now();
+        let stale_keys: Vec<(Uuid, Uuid)> = self
+            .incoming_text_messages
+            .iter()
+            .filter_map(|(key, pending)| {
+                if now.duration_since(pending.updated_at) >= INCOMING_TEXT_TIMEOUT {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (chat_id, _message_id) in stale_keys {
+            self.incoming_text_messages.remove(&(chat_id, _message_id));
+            self.add_toast(
+                ToastLevel::Warning,
+                "A large incoming message could not be completed and was discarded.".to_string(),
+            );
+        }
+    }
+
+    fn register_incoming_text_chunk(
+        &mut self,
+        chat_id: Uuid,
+        message_id: Uuid,
+        chunk_index: u32,
+        total_chunks: u32,
+        text_part: String,
+        timestamp_millis: u64,
+    ) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
+        let entry = self
+            .incoming_text_messages
+            .entry((chat_id, message_id))
+            .or_insert_with(|| IncomingTextMessage {
+                timestamp_millis,
+                parts: vec![None; total_chunks as usize],
+                updated_at: std::time::Instant::now(),
+            });
+
+        if entry.parts.len() != total_chunks as usize {
+            bail!("Chunk count mismatch for large text message");
+        }
+
+        let index = chunk_index as usize;
+        if index >= entry.parts.len() {
+            bail!("Chunk index out of bounds for large text message");
+        }
+
+        entry.timestamp_millis = timestamp_millis;
+        entry.updated_at = std::time::Instant::now();
+        entry.parts[index] = Some(text_part);
+
+        if entry.parts.iter().all(Option::is_some) {
+            let parts = self
+                .incoming_text_messages
+                .remove(&(chat_id, message_id))
+                .ok_or_else(|| anyhow!("Large text message disappeared during reassembly"))?
+                .parts;
+            let text = parts
+                .into_iter()
+                .collect::<Option<Vec<String>>>()
+                .ok_or_else(|| anyhow!("Large text message reassembly failed"))?
+                .join("");
+            let timestamp =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_millis as i64)
+                    .unwrap_or_else(chrono::Utc::now);
+            return Ok(Some((text, timestamp)));
+        }
+
+        Ok(None)
+    }
+
+    fn preview_text_for_notification(text: &str) -> String {
+        const MAX_PREVIEW_CHARS: usize = 50;
+        let truncated: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
+        if text.chars().count() > MAX_PREVIEW_CHARS {
+            format!("{}...", truncated)
+        } else {
+            truncated
+        }
+    }
+
+    async fn validate_outgoing_file(path: &Path) -> Result<(String, u64)> {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| Self::map_file_access_error(path, e, "read file metadata"))?;
+
+        if !metadata.is_file() {
+            bail!("Selected path is not a regular file: {}", path.display());
+        }
+
+        let file_size = metadata.len();
+        if file_size > crate::MAX_FILE_SIZE {
+            bail!(
+                "File is too large: {} bytes exceeds the {} byte limit",
+                file_size,
+                crate::MAX_FILE_SIZE
+            );
+        }
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| anyhow!("Selected file has an invalid filename"))?
+            .to_string();
+
+        tokio::fs::File::open(path)
+            .await
+            .map_err(|e| Self::map_file_access_error(path, e, "open file for reading"))?;
+
+        Ok((filename, file_size))
+    }
+
+    fn map_file_access_error(path: &Path, error: std::io::Error, action: &str) -> anyhow::Error {
+        let lower = error.to_string().to_lowercase();
+        let message = match error.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "Cannot {}: file not found or not available locally ({})",
+                action,
+                path.display()
+            ),
+            std::io::ErrorKind::PermissionDenied => format!(
+                "Cannot {}: permission denied for {}",
+                action,
+                path.display()
+            ),
+            _ if lower.contains("cloud")
+                || lower.contains("offline")
+                || lower.contains("not available") =>
+            {
+                format!(
+                    "Cannot {}: {} is not fully available locally. If it is stored in OneDrive, iCloud, or Dropbox, mark it for offline use first.",
+                    action,
+                    path.display()
+                )
+            }
+            _ => format!("Cannot {} {}: {}", action, path.display(), error),
+        };
+
+        anyhow!(message)
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             chats: HashMap::new(),
@@ -71,6 +292,7 @@ impl ChatManager {
             chat_id_mapping: HashMap::new(),
             active_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
+            incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
             fingerprint_verification_request: None,
@@ -156,6 +378,8 @@ impl ChatManager {
             id,
             name,
             address,
+            relay_server: None,
+            relay_token: None,
             fingerprint,
             public_key,
             created_at: chrono::Utc::now(),
@@ -167,6 +391,14 @@ impl ChatManager {
         self.contacts.insert(id, contact);
         // no chat association by default
         tracing::debug!(id = %id, total_contacts = %self.contacts.len(), "Contact added");
+        id
+    }
+
+    pub fn import_contact(&mut self, mut contact: Contact) -> Uuid {
+        let id = Uuid::new_v4();
+        contact.id = id;
+        contact.created_at = chrono::Utc::now();
+        self.contacts.insert(id, contact);
         id
     }
 
@@ -308,13 +540,19 @@ impl ChatManager {
                 if let Some(one_chat_id) = self.contact_to_chat.get(&participant_id).copied() {
                     if let Some(session) = self.sessions.get(&one_chat_id) {
                         if let Some(chat) = self.chats.get_mut(&one_chat_id) {
-                            chat.send_seq += 1;
-                            let msg = ProtocolMessage::Text {
-                                text: text.clone(),
-                                timestamp: crate::util::current_timestamp_millis(),
-                                seq: chat.send_seq,
+                            let timestamp = crate::util::current_timestamp_millis();
+                            let Ok(messages) = Self::build_text_protocol_messages(
+                                &mut chat.send_seq,
+                                &text,
+                                timestamp,
+                            ) else {
+                                continue;
                             };
-                            if session.from_app_tx.send(msg).is_ok() {
+
+                            if messages
+                                .into_iter()
+                                .all(|msg| session.from_app_tx.send(msg).is_ok())
+                            {
                                 sent_count += 1;
                             }
                         }
@@ -433,6 +671,75 @@ impl ChatManager {
         Ok(chat_id)
     }
 
+    pub async fn start_host_via_relay(
+        &mut self,
+        relay_server: &str,
+        token: Option<String>,
+        privkey: RsaPrivateKey,
+    ) -> Result<(Uuid, String)> {
+        if let Some(existing_host) = self.chats.values().find(|c| c.is_host_placeholder) {
+            if self.sessions.contains_key(&existing_host.id) {
+                self.add_toast(
+                    ToastLevel::Info,
+                    "Already hosting a session. Disconnect it before starting relay hosting."
+                        .to_string(),
+                );
+                return Err(anyhow!("Already hosting a session"));
+            }
+        }
+
+        let relay_token = token.unwrap_or_else(generate_relay_token);
+        let chat_id = Uuid::new_v4();
+        let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
+        let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let relay_server_owned = relay_server.to_string();
+        let relay_token_owned = relay_token.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = run_host_session_via_relay(
+                &relay_server_owned,
+                &relay_token_owned,
+                privkey,
+                to_app_tx,
+                from_app_rx,
+                confirm_rx,
+                chat_id,
+            )
+            .await
+            {
+                tracing::error!("Relay host session error: {}", e);
+            }
+        });
+
+        self.chats.insert(
+            chat_id,
+            Chat {
+                id: chat_id,
+                title: format!("Relay host via {}", relay_server),
+                peer_fingerprint: None,
+                participants: Vec::new(),
+                messages: Vec::new(),
+                created_at: chrono::Utc::now(),
+                peer_typing: false,
+                typing_since: None,
+                send_seq: 0,
+                recv_seq: 0,
+                is_host_placeholder: true,
+            },
+        );
+        self.sessions.insert(chat_id, SessionHandle { from_app_tx });
+        self.session_events
+            .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
+        self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
+        self.is_hosting = true;
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Waiting for relay peer via {}", relay_server),
+        );
+        Ok((chat_id, relay_token))
+    }
+
     /// Connect to a host
     pub async fn connect_to_host(
         &mut self,
@@ -495,6 +802,63 @@ impl ChatManager {
         Ok(chat_id)
     }
 
+    pub async fn connect_via_relay(
+        &mut self,
+        relay_server: &str,
+        token: &str,
+        existing_chat_id: Option<Uuid>,
+        privkey: RsaPrivateKey,
+    ) -> Result<Uuid> {
+        let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
+        let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
+        let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let relay_server_owned = relay_server.to_string();
+        let relay_token_owned = token.to_string();
+
+        tokio::spawn(async move {
+            if let Err(e) = run_client_session_via_relay(
+                &relay_server_owned,
+                &relay_token_owned,
+                privkey,
+                to_app_tx,
+                from_app_rx,
+                confirm_rx,
+                chat_id,
+            )
+            .await
+            {
+                tracing::error!("Relay client session error: {}", e);
+            }
+        });
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.chats.entry(chat_id) {
+            e.insert(Chat {
+                id: chat_id,
+                title: format!("Relay via {}", relay_server),
+                peer_fingerprint: None,
+                participants: Vec::new(),
+                messages: Vec::new(),
+                created_at: chrono::Utc::now(),
+                peer_typing: false,
+                typing_since: None,
+                send_seq: 0,
+                recv_seq: 0,
+                is_host_placeholder: false,
+            });
+        }
+
+        self.sessions.insert(chat_id, SessionHandle { from_app_tx });
+        self.session_events
+            .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
+        self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Connecting via relay {}", relay_server),
+        );
+        Ok(chat_id)
+    }
+
     pub async fn connect_to_contact(
         &mut self,
         contact_id: Uuid,
@@ -549,6 +913,15 @@ impl ChatManager {
                     return Ok(chat_id);
                 }
             }
+            if let (Some(relay_server), Some(relay_token)) =
+                (contact.relay_server.clone(), contact.relay_token.clone())
+            {
+                let chat_id = self
+                    .connect_via_relay(&relay_server, &relay_token, Some(mapped), privkey.clone())
+                    .await?;
+                self.associate_contact_with_chat(contact_id, chat_id);
+                return Ok(chat_id);
+            }
             // No way to create a session yet; fall through to fingerprint/address logic below
         }
 
@@ -563,6 +936,24 @@ impl ChatManager {
             tracing::info!("Connecting to contact {} via {}:{}", contact_id, host, port);
             let chat_id = self
                 .connect_to_host(&host, port, existing_chat_id, privkey.clone())
+                .await?;
+            self.associate_contact_with_chat(contact_id, chat_id);
+            Ok(chat_id)
+        } else if let (Some(relay_server), Some(relay_token)) =
+            (contact.relay_server.clone(), contact.relay_token.clone())
+        {
+            tracing::info!(
+                "Connecting to contact {} via relay {}",
+                contact_id,
+                relay_server
+            );
+            let chat_id = self
+                .connect_via_relay(
+                    &relay_server,
+                    &relay_token,
+                    existing_chat_id,
+                    privkey.clone(),
+                )
                 .await?;
             self.associate_contact_with_chat(contact_id, chat_id);
             Ok(chat_id)
@@ -656,16 +1047,14 @@ impl ChatManager {
             .get_mut(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Chat not found for sending message"))?;
 
-        chat.send_seq += 1;
-        let msg = ProtocolMessage::Text {
-            text: text.clone(),
-            timestamp: crate::util::current_timestamp_millis(),
-            seq: chat.send_seq,
-        };
+        let timestamp = crate::util::current_timestamp_millis();
+        let messages = Self::build_text_protocol_messages(&mut chat.send_seq, &text, timestamp)?;
 
-        if let Err(e) = session.from_app_tx.send(msg) {
-            tracing::error!("Failed to send message to chat {}: {}", chat_id, e);
-            return Err(e.into());
+        for msg in messages {
+            if let Err(e) = session.from_app_tx.send(msg) {
+                tracing::error!("Failed to send message to chat {}: {}", chat_id, e);
+                return Err(e.into());
+            }
         }
 
         // Add to local history
@@ -877,6 +1266,7 @@ impl ChatManager {
         self.fingerprint_confirm_senders.clear();
         self.active_transfers.clear();
         self.incoming_files.clear();
+        self.incoming_text_messages.clear();
         self.toasts.clear();
         self.fingerprint_verification_request = None;
 
@@ -969,15 +1359,9 @@ impl ChatManager {
             .sessions
             .get(actual_id)
             .map(|s| s.from_app_tx.clone())
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+            .ok_or_else(|| anyhow!("Session not found"))?;
 
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?
-            .to_string();
-
-        let file_size = tokio::fs::metadata(&path).await?.len();
+        let (filename, file_size) = Self::validate_outgoing_file(&path).await?;
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
         let chat = self
@@ -1039,6 +1423,7 @@ impl ChatManager {
 
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
+        self.cleanup_stale_incoming_text_messages();
         let chat_ids: Vec<Uuid> = self.session_events.keys().copied().collect();
         tracing::trace!(tracked_sessions = %chat_ids.len(), "Polling session events");
 
@@ -1260,11 +1645,7 @@ impl ChatManager {
                                 chat.peer_typing = false;
                                 chat.typing_since = None;
                                 // Show desktop notification
-                                let preview = if text.len() > 50 {
-                                    format!("{}...", &text[..50])
-                                } else {
-                                    text.clone()
-                                };
+                                let preview = Self::preview_text_for_notification(&text);
                                 self.show_notification("New message", &preview);
 
                                 tracing::info!("Added received message to chat {}", actual_chat_id);
@@ -1276,6 +1657,82 @@ impl ChatManager {
                                 "Chat {} not found for received message",
                                 actual_chat_id
                             );
+                        }
+                    }
+                    ProtocolMessage::TextChunk {
+                        message_id,
+                        chunk_index,
+                        total_chunks,
+                        text_part,
+                        timestamp,
+                        seq,
+                    } => {
+                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                true
+                            } else {
+                                tracing::warn!("Received TextChunk with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !valid_seq {
+                            return;
+                        }
+
+                        match self.register_incoming_text_chunk(
+                            actual_chat_id,
+                            message_id,
+                            chunk_index,
+                            total_chunks,
+                            text_part,
+                            timestamp,
+                        ) {
+                            Ok(Some((text, assembled_timestamp))) => {
+                                if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                                    chat.messages.push(Message {
+                                        id: Uuid::new_v4(),
+                                        from_me: false,
+                                        content: MessageContent::Text { text: text.clone() },
+                                        timestamp: assembled_timestamp,
+                                    });
+                                    chat.peer_typing = false;
+                                    chat.typing_since = None;
+                                }
+
+                                let preview = Self::preview_text_for_notification(&text);
+                                self.show_notification("New message", &preview);
+                                tracing::info!(
+                                    "Reassembled large text message {} for chat {}",
+                                    message_id,
+                                    actual_chat_id
+                                );
+                            }
+                            Ok(None) => {
+                                tracing::trace!(
+                                    "Buffered text chunk {}/{} for chat {}",
+                                    chunk_index + 1,
+                                    total_chunks,
+                                    actual_chat_id
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Discarding large text message {} for chat {}: {}",
+                                    message_id,
+                                    actual_chat_id,
+                                    e
+                                );
+                                self.incoming_text_messages
+                                    .remove(&(actual_chat_id, message_id));
+                                self.add_toast(
+                                    ToastLevel::Warning,
+                                    "A large incoming message could not be reconstructed."
+                                        .to_string(),
+                                );
+                            }
                         }
                     }
 
@@ -1560,6 +2017,8 @@ impl ChatManager {
             nonce: String,
             name: String,
             address: Option<String>,
+            relay_server: Option<String>,
+            relay_token: Option<String>,
             fingerprint: String,
             public_key: String,
         }
@@ -1639,12 +2098,28 @@ impl ChatManager {
                         .map(|(host, port)| crate::util::format_host_port(&host, port))
                 }
             });
+            let relay_server = payload.relay_server.as_ref().and_then(|server| {
+                let trimmed = server.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    crate::util::parse_host_port(trimmed, Some(crate::PORT_DEFAULT))
+                        .ok()
+                        .map(|(host, port)| crate::util::format_host_port(&host, port))
+                }
+            });
+            let relay_token = payload
+                .relay_token
+                .clone()
+                .filter(|token| !token.trim().is_empty());
 
             // Create contact from v2 invite
             let contact = Contact {
                 id: Uuid::new_v4(),
                 name: payload.name.clone(),
                 address,
+                relay_server,
+                relay_token,
                 fingerprint: Some(payload.fingerprint.clone()),
                 public_key: Some(payload.public_key.clone()),
                 created_at: chrono::Utc::now(),
@@ -1700,6 +2175,8 @@ impl ChatManager {
                 id: Uuid::new_v4(),
                 name: payload.name,
                 address,
+                relay_server: None,
+                relay_token: None,
                 fingerprint: Some(payload.fingerprint),
                 public_key: Some(payload.public_key),
                 created_at: chrono::Utc::now(),
@@ -2239,6 +2716,59 @@ mod tests {
     }
 
     #[test]
+    fn large_incoming_message_reassembles_into_one_chat_message() {
+        let mut mgr = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(chat_id, "Chunked Incoming".to_string());
+
+        let text = "hello large world ".repeat(8_000);
+        let timestamp = 123_456_789u64;
+        let mut seq = 0u64;
+        let messages = ChatManager::build_text_protocol_messages(&mut seq, &text, timestamp)
+            .expect("large text should chunk successfully");
+        assert!(messages.len() > 1, "test message should be chunked");
+
+        for msg in messages {
+            mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(msg));
+        }
+
+        let chat = mgr.chats.get(&chat_id).unwrap();
+        assert_eq!(chat.messages.len(), 1);
+        match &chat.messages[0].content {
+            MessageContent::Text { text: reassembled } => assert_eq!(reassembled, &text),
+            other => panic!("expected text message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stale_incoming_large_message_is_discarded() {
+        let mut mgr = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+
+        mgr.incoming_text_messages.insert(
+            (chat_id, message_id),
+            IncomingTextMessage {
+                timestamp_millis: 1,
+                parts: vec![Some("partial".to_string()), None],
+                updated_at: std::time::Instant::now() - Duration::from_secs(121),
+            },
+        );
+
+        mgr.cleanup_stale_incoming_text_messages();
+
+        assert!(!mgr
+            .incoming_text_messages
+            .contains_key(&(chat_id, message_id)));
+        assert!(
+            mgr.toasts
+                .iter()
+                .any(|toast| toast.message.contains("large incoming message")),
+            "cleanup should surface a warning toast"
+        );
+    }
+
+    #[test]
     fn mapped_session_ping_updates_actual_chat() {
         let mut mgr = ChatManager::new(Config::default());
         let session_chat_id = Uuid::new_v4();
@@ -2291,6 +2821,32 @@ mod tests {
             contact.address, None,
             "invalid address payloads should be dropped instead of normalized"
         );
+    }
+
+    #[test]
+    fn parse_v3_signed_invite_keeps_relay_route() {
+        use crate::identity::Identity;
+
+        let mgr = ChatManager::default();
+        let identity = Identity::new_with_plaintext("Relay Invite User".to_string()).unwrap();
+        let relay_token = "0123456789abcdef0123456789abcdef".to_string();
+        let link = identity
+            .generate_signed_invite_link_with_route(
+                None,
+                Some("relay.example.com:23456".to_string()),
+                Some(relay_token.clone()),
+            )
+            .unwrap();
+
+        let contact = mgr
+            .parse_invite_link(&link)
+            .expect("should parse relay invite");
+        assert_eq!(
+            contact.relay_server.as_deref(),
+            Some("relay.example.com:23456")
+        );
+        assert_eq!(contact.relay_token.as_deref(), Some(relay_token.as_str()));
+        assert_eq!(contact.address, None);
     }
 
     #[test]

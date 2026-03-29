@@ -41,6 +41,10 @@ pub struct Contact {
     pub id: Uuid,
     pub name: String,
     pub address: Option<String>,
+    #[serde(default)]
+    pub relay_server: Option<String>,
+    #[serde(default)]
+    pub relay_token: Option<String>,
     pub fingerprint: Option<String>,
     pub public_key: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -195,6 +199,8 @@ pub struct Config {
     /// and a fingerprint on the local network.
     #[serde(default)]
     pub enable_mdns: bool,
+    #[serde(default)]
+    pub relay_server: Option<String>,
 }
 
 /// Theme options
@@ -231,6 +237,7 @@ impl Default for Config {
             listen_port: crate::PORT_DEFAULT,
             auto_trust_on_first_use: false,
             enable_mdns: false,
+            relay_server: None,
         }
     }
 }

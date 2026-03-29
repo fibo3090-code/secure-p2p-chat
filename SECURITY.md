@@ -13,7 +13,7 @@ Reasoning:
 - strong modern transport/session primitives are in place
 - identity and history are encrypted at rest
 - protocol correctness and replay protection have been hardened
-- some product-grade gaps remain, especially around discovery privacy, internet connectivity, and dependency posture
+- some product-grade gaps remain, especially around discovery privacy, relay operational hardening, and dependency posture
 
 ## Implemented Protections
 
@@ -40,11 +40,12 @@ Reasoning:
 - rate limiting
 - oversized packet rejection
 - signed v2 invite links
+- self-hosted relay-assisted transport that forwards only already-encrypted session traffic
 - checked-in CI for format, lint, test, advisory audit, and Windows build validation
 
 ## Current Limits and Open Risks
 
-- No NAT traversal or relay system
+- No STUN/TURN or peer-to-peer hole punching; WAN support currently relies on a self-hosted relay
 - LAN discovery exposes metadata tradeoffs when enabled
 - The runtime keeps a signature-scheme field on the wire, but currently only supports RSA-PSS identity proofs
 - Invite timestamps are informational and not enforced for expiry
@@ -62,7 +63,7 @@ Users are responsible for verifying fingerprints on first contact using a separa
 It does not currently claim:
 
 - anonymity against traffic analysis
-- relay-assisted global connectivity
+- managed relay infrastructure or anonymous global connectivity
 - Ed25519 identity-key support in the shipped runtime
 - invite revocation or expiry enforcement
 - full protection against a compromised local machine

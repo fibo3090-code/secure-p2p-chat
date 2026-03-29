@@ -1,6 +1,6 @@
 use encodeur_rsa_rust::core::ProtocolMessage;
 use encodeur_rsa_rust::util::sanitize_filename;
-use encodeur_rsa_rust::{FILE_CHUNK_SIZE, MAX_FILE_SIZE};
+use encodeur_rsa_rust::{FILE_CHUNK_SIZE, MAX_FILE_SIZE, MAX_TEXT_MESSAGE_BYTES, TEXT_CHUNK_BYTES};
 use tempfile::TempDir;
 
 #[test]
@@ -41,7 +41,7 @@ fn test_sanitized_filename_stays_within_directory() {
 fn test_protocol_message_input_limits() {
     // Ensure we don't crash on huge inputs
     let huge_data = vec![0u8; 10 * 1024 * 1024]; // 10MB
-                                                 // ProtocolMessage::from_plain_bytes has a check for TEXT: len > 64KB
+                                                 // ProtocolMessage::from_plain_bytes caps legacy text payloads.
 
     let mut text_msg = b"TEXT:".to_vec();
     text_msg.extend_from_slice(&huge_data);
@@ -56,10 +56,21 @@ fn test_binary_protocol_limits() {
     oversized_text.push(2u8); // Text tag
     oversized_text.extend_from_slice(&0u64.to_be_bytes());
     oversized_text.extend_from_slice(&0u64.to_be_bytes());
-    let text_len = (70 * 1024u32).to_be_bytes();
+    let text_len = ((MAX_TEXT_MESSAGE_BYTES + 1) as u32).to_be_bytes();
     oversized_text.extend_from_slice(&text_len);
-    oversized_text.extend_from_slice(&vec![b'a'; 70 * 1024]);
+    oversized_text.extend_from_slice(&vec![b'a'; MAX_TEXT_MESSAGE_BYTES + 1]);
     assert!(ProtocolMessage::from_plain_bytes(&oversized_text).is_none());
+
+    let mut oversized_text_chunk = Vec::new();
+    oversized_text_chunk.push(11u8); // TextChunk tag
+    oversized_text_chunk.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    oversized_text_chunk.extend_from_slice(&1u64.to_be_bytes());
+    oversized_text_chunk.extend_from_slice(&0u64.to_be_bytes());
+    oversized_text_chunk.extend_from_slice(&0u32.to_be_bytes());
+    oversized_text_chunk.extend_from_slice(&1u32.to_be_bytes());
+    oversized_text_chunk.extend_from_slice(&((TEXT_CHUNK_BYTES + 1) as u32).to_be_bytes());
+    oversized_text_chunk.extend_from_slice(&vec![b'a'; TEXT_CHUNK_BYTES + 1]);
+    assert!(ProtocolMessage::from_plain_bytes(&oversized_text_chunk).is_none());
 
     let mut oversized_meta = Vec::new();
     oversized_meta.push(3u8); // FileMeta tag

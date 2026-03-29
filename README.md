@@ -12,7 +12,7 @@ Secure peer-to-peer messaging for desktop, built with Rust. The app provides enc
 - End-to-end encrypted messaging over direct peer connections
 - X25519 + HKDF session establishment with RSA-PSS identity proofs
 - Encrypted local identity and encrypted chat history at rest
-- File transfer, typing indicators, invite links, QR generation, and optional LAN discovery
+- Large text messages are chunked automatically, plus file transfer, typing indicators, invite links, QR generation, and optional LAN discovery
 - Diagnostics bundle export and on-disk panic/crash logs for support
 - GUI built with `egui` and terminal interface built with `ratatui`
 
@@ -21,7 +21,7 @@ Secure peer-to-peer messaging for desktop, built with Rust. The app provides enc
 The project is functional and actively maintained, but it is not a “finished product” in every area.
 
 - Security posture: medium. See [SECURITY.md](SECURITY.md).
-- Internet connectivity: still manual. NAT traversal and relay support are not implemented.
+- Internet connectivity: relay-assisted WAN connectivity is available for self-hosted deployments. Direct TCP is still the default.
 - LAN discovery: optional and privacy-sensitive. Disabled by default.
 - Packaging: Windows-first. Linux and macOS are supported from source; distribution polish is lighter.
 

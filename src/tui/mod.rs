@@ -18,6 +18,9 @@ use ui::ui;
 pub struct TuiLaunchConfig {
     pub host: bool,
     pub connect: Option<String>,
+    pub host_relay: Option<String>,
+    pub relay_connect: Option<String>,
+    pub relay_token: Option<String>,
     pub port: u16,
 }
 
@@ -68,6 +71,43 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
                     crate::types::ToastLevel::Error,
                     format!("Invalid --connect: {}", e),
                 );
+            }
+        }
+    }
+
+    if let Some(relay) = launch.host_relay.as_deref() {
+        let cmd = match launch.relay_token.as_deref() {
+            Some(token) => format!(":host-relay {} {}", relay, token),
+            None => format!(":host-relay {}", relay),
+        };
+        match TuiApp::parse_command(&cmd) {
+            Ok(host_cmd @ TuiCommand::HostRelay { .. }) => {
+                app.execute_command(host_cmd).await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                app.chat_manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Invalid relay host launch: {}", e),
+                );
+            }
+        }
+    }
+
+    if let Some(relay) = launch.relay_connect.as_deref() {
+        if let Some(token) = launch.relay_token.as_deref() {
+            let cmd = format!(":connect-relay {} {}", relay, token);
+            match TuiApp::parse_command(&cmd) {
+                Ok(connect_cmd @ TuiCommand::ConnectRelay { .. }) => {
+                    app.execute_command(connect_cmd).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    app.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Invalid relay connect launch: {}", e),
+                    );
+                }
             }
         }
     }

@@ -20,6 +20,22 @@ struct Args {
     #[arg(short, long)]
     connect: Option<String>,
 
+    /// Run a self-hosted relay server on --port
+    #[arg(long)]
+    relay_server: bool,
+
+    /// Host a session through a relay endpoint (format: HOST:PORT)
+    #[arg(long)]
+    host_relay: Option<String>,
+
+    /// Connect to a peer through a relay endpoint (format: HOST:PORT)
+    #[arg(long)]
+    connect_relay: Option<String>,
+
+    /// Relay rendezvous token used with --host-relay or --connect-relay
+    #[arg(long)]
+    relay_token: Option<String>,
+
     /// Port to use (default: 12345)
     #[arg(short, long, default_value_t = PORT_DEFAULT)]
     port: u16,
@@ -51,6 +67,12 @@ async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
     tracing::debug!(?args, "Parsed CLI arguments");
 
+    if args.relay_server {
+        tracing::info!("Starting relay server mode");
+        network::run_relay_server(args.port).await?;
+        return Ok(());
+    }
+
     // Default to GUI if no mode is specified
     if !args.gui && !args.tui {
         args.gui = true;
@@ -81,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
         let launch = tui::TuiLaunchConfig {
             host: args.host,
             connect: args.connect.clone(),
+            host_relay: args.host_relay.clone(),
+            relay_connect: args.connect_relay.clone(),
+            relay_token: args.relay_token.clone(),
             port: args.port,
         };
         if let Err(e) = tui::run(event_collector.clone(), launch).await {

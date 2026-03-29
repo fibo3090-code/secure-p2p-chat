@@ -105,6 +105,12 @@ src/
 - optional mDNS registration/discovery
 - LAN peer advertisement and lookup
 
+### `src/network/relay.rs`
+
+- self-hosted rendezvous and packet relay server mode
+- relay transport setup for WAN/NAT-constrained peers
+- forwards already-encrypted session traffic without terminating chat encryption
+
 ### `src/identity/mod.rs`
 
 - identity creation and load/save
@@ -136,7 +142,7 @@ src/
 
 These are real limitations, not hidden assumptions:
 
-- no NAT traversal or relay layer
+- relay-assisted WAN transport exists, but GUI configuration and broader operational polish are still limited
 - discovery subsystem is optional and not privacy-neutral
 - GUI and TUI share backend state but not identical UX depth
 - persistence and migration are practical, but still lightweight rather than enterprise-grade

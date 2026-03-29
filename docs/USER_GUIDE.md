@@ -42,6 +42,8 @@ Examples:
 ```bash
 cargo run --release -- --tui --host --port 9000
 cargo run --release -- --tui --connect 127.0.0.1:12345
+cargo run --release -- --relay-server --port 23456
+cargo run --release -- --tui --host-relay 127.0.0.1:23456
 ```
 
 ## First Run
@@ -82,10 +84,14 @@ Current UI flows emit signed v2 invites.
 
 Legacy unsigned invites may still import, but they should be treated as compatibility-only.
 
+Relay-capable signed invites can also carry a self-hosted relay endpoint and one-time rendezvous token.
+
 ### Send files
 
 - choose a file from the GUI or send through the active session
+- large text messages are chunked automatically and still appear as one message on the peer side
 - files larger than `10 GiB` are rejected
+- outgoing files can come from any folder, but cloud-only placeholders must be downloaded locally first
 - received files go to the configured download directory
 
 ## TUI Basics
@@ -115,11 +121,12 @@ Legacy unsigned invites may still import, but they should be treated as compatib
 - verify the host is actually listening
 - verify the address and port
 - check local firewall rules
-- for internet use, remember there is no built-in NAT traversal or relay support
+- for internet use, you can either use direct TCP or a self-hosted relay server
 
 ### Messages not delivering
 
 - check connection status
+- if you are talking to an older build, very large messages may not be understood by that peer
 - reconnect manually if needed
 - inspect the log terminal for errors
 - export a diagnostics bundle from Settings or with `:diagnostics` in the TUI when reporting a bug

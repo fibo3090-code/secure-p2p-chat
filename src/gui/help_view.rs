@@ -268,6 +268,7 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
         |ui| {
             ui.label("• Check the connection status indicator in the chat header.");
             ui.label("• Ensure both parties are online and connected.");
+            ui.label("• Large messages are chunked automatically, but older peers that do not understand chunked text will drop them.");
             ui.label(
                 "• If status shows 'Reconnecting', wait for the next retry or reconnect manually.",
             );
@@ -296,7 +297,10 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
         |ui| {
             ui.label("• Maximum file size is 10 GiB - larger files will be rejected.");
             ui.label("• Ensure you have enough disk space in your Downloads folder.");
-            ui.label("• Check file permissions on the Downloads directory.");
+            ui.label("• Received files are always saved to your configured Downloads directory.");
+            ui.label("• You can send files from any folder, but the source file must be a real local file.");
+            ui.label("• Cloud-only files from OneDrive/iCloud/Dropbox may need to be marked for offline use first.");
+            ui.label("• Check read permission on the source file and write permission on the Downloads directory.");
             ui.label("• Large files may take time - check the progress indicator.");
             ui.label("• If transfer fails, try again or use a smaller file.");
         },

@@ -7,6 +7,13 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
     // Handle dropped files
     let dropped_files = ui.input(|i| i.raw.dropped_files.clone());
     if !dropped_files.is_empty() {
+        if dropped_files.len() > 1 {
+            app.add_toast(
+                crate::types::ToastLevel::Info,
+                "Only the first dropped file will be queued. Send additional files one at a time."
+                    .to_string(),
+            );
+        }
         if let Some(file) = dropped_files.first() {
             if let Some(path) = &file.path {
                 app.file_to_send = Some(path.clone());

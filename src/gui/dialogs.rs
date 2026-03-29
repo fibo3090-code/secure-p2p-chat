@@ -945,6 +945,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     });
                     ui.text_edit_singleline(&mut app.invite_link_input);
 
+                    let mut parsed_contact = None;
                     if !app.invite_link_input.is_empty() {
                         ui.label(
                             egui::RichText::new("✅ Link detected")
@@ -954,6 +955,7 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                         if let Ok(manager) = app.chat_manager.try_lock() {
                             match manager.parse_invite_link(&app.invite_link_input) {
                                 Ok(contact) => {
+                                    parsed_contact = Some(contact.clone());
                                     let had_address = contact.address.is_some();
                                     app.new_contact_name = contact.name;
                                     app.new_contact_address = contact.address.unwrap_or_default();
@@ -996,31 +998,14 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if crate::gui::widgets::primary_button(ui, "➕ Add from Link").clicked() {
-                            let name = app.new_contact_name.trim().to_string();
-                            let address = if app.new_contact_address.trim().is_empty() {
-                                None
-                            } else {
-                                Some(app.new_contact_address.trim().to_string())
-                            };
-                            let fp = if app.new_contact_fingerprint.trim().is_empty() {
-                                None
-                            } else {
-                                Some(app.new_contact_fingerprint.trim().to_string())
-                            };
-                            let pk = if app.new_contact_pubkey.trim().is_empty() {
-                                None
-                            } else {
-                                Some(app.new_contact_pubkey.trim().to_string())
-                            };
-
-                            if !name.is_empty() {
-                                tracing::info!("Adding contact from link: {}", name);
+                            if let Some(contact) = parsed_contact.clone() {
+                                tracing::info!("Adding contact from link: {}", contact.name);
                                 let manager = app.chat_manager.clone();
                                 let history_path = app.history_path.clone();
 
                                 tokio::spawn(async move {
                                     let mut mgr = manager.lock().await;
-                                    mgr.add_contact(name, address, fp, pk);
+                                    mgr.import_contact(contact);
                                     let _ = mgr.save_history(&history_path);
                                     mgr.add_toast(
                                         crate::types::ToastLevel::Success,

@@ -1,4 +1,5 @@
 use encodeur_rsa_rust::app::chat_manager::{ChatManager, SessionHandle};
+use encodeur_rsa_rust::core::ProtocolMessage;
 use encodeur_rsa_rust::types::Config;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -73,4 +74,48 @@ fn test_message_sequence_ordering() {
     let chat = manager.chats.get(&chat_id).unwrap();
     assert_eq!(chat.send_seq, 2);
     assert_eq!(chat.messages.len(), 2);
+}
+
+#[test]
+fn test_large_message_is_chunked_for_transport() {
+    let mut manager = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    manager.create_local_chat_for_test(chat_id, "Chunk Test".to_string());
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    manager.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+
+    let large_text = "abc123".repeat(20_000);
+    manager.send_message(chat_id, large_text.clone()).unwrap();
+
+    let mut message_count = 0usize;
+    let mut chunk_count = 0usize;
+    while let Ok(msg) = rx.try_recv() {
+        message_count += 1;
+        match msg {
+            ProtocolMessage::TextChunk {
+                chunk_index,
+                total_chunks,
+                text_part,
+                ..
+            } => {
+                assert!((chunk_index as usize) < total_chunks as usize);
+                assert!(text_part.len() < large_text.len());
+                chunk_count += 1;
+            }
+            other => panic!("expected TextChunk, got {:?}", other),
+        }
+    }
+
+    assert!(
+        message_count > 1,
+        "large text should be split into multiple transport messages"
+    );
+    assert_eq!(message_count, chunk_count);
+    let chat = manager.chats.get(&chat_id).unwrap();
+    assert_eq!(
+        chat.messages.len(),
+        1,
+        "large text should stay one local message"
+    );
 }

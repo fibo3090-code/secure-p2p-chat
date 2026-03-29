@@ -23,6 +23,7 @@ pub struct DiagnosticsConfig {
     pub listen_port: u16,
     pub auto_trust_on_first_use: bool,
     pub enable_mdns: bool,
+    pub relay_server: Option<String>,
 }
 
 impl From<&Config> for DiagnosticsConfig {
@@ -42,6 +43,7 @@ impl From<&Config> for DiagnosticsConfig {
             listen_port: config.listen_port,
             auto_trust_on_first_use: config.auto_trust_on_first_use,
             enable_mdns: config.enable_mdns,
+            relay_server: config.relay_server.clone(),
         }
     }
 }
@@ -200,6 +202,7 @@ mod tests {
                 listen_port: crate::PORT_DEFAULT,
                 auto_trust_on_first_use: false,
                 enable_mdns: false,
+                relay_server: None,
             },
         };
 
