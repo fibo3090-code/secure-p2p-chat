@@ -282,6 +282,31 @@ impl ChatManager {
         anyhow!(message)
     }
 
+    fn transfer_ids_for_chat_with_status<F>(&self, chat_id: Uuid, mut predicate: F) -> Vec<Uuid>
+    where
+        F: FnMut(&TransferStatus) -> bool,
+    {
+        self.active_transfers
+            .iter()
+            .filter_map(|(transfer_id, transfer)| {
+                (transfer.chat_id == chat_id && predicate(&transfer.status)).then_some(*transfer_id)
+            })
+            .collect()
+    }
+
+    fn active_transfer_id_for_chat(&self, chat_id: Uuid) -> Option<Uuid> {
+        self.transfer_ids_for_chat_with_status(chat_id, |status| {
+            matches!(status, TransferStatus::Pending | TransferStatus::InProgress)
+        })
+        .into_iter()
+        .next()
+    }
+
+    fn clear_transfer_state(&mut self, transfer_id: Uuid) {
+        self.active_transfers.remove(&transfer_id);
+        self.incoming_files.remove(&transfer_id);
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             chats: HashMap::new(),
@@ -1082,6 +1107,20 @@ impl ChatManager {
                 crate::MAX_FILE_SIZE
             );
         }
+
+        for transfer_id in self.transfer_ids_for_chat_with_status(chat_id, |status| {
+            matches!(
+                status,
+                TransferStatus::Completed | TransferStatus::Failed(_) | TransferStatus::Cancelled
+            )
+        }) {
+            self.clear_transfer_state(transfer_id);
+        }
+
+        if self.active_transfer_id_for_chat(chat_id).is_some() {
+            bail!("Another file transfer is already in progress for this chat");
+        }
+
         let transfer_id = Uuid::new_v4();
 
         let state = FileTransferState {
@@ -1103,20 +1142,11 @@ impl ChatManager {
 
     /// Update file transfer progress
     pub fn update_transfer_progress(&mut self, transfer_id: Uuid, bytes: u64) {
-        let should_notify = if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+        if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
             transfer.received = bytes;
-            if bytes == transfer.size {
-                transfer.status = TransferStatus::Completed;
-                Some(transfer.filename.clone())
-            } else {
-                None
+            if bytes > 0 {
+                transfer.status = TransferStatus::InProgress;
             }
-        } else {
-            None
-        };
-
-        if let Some(filename) = should_notify {
-            self.add_toast(ToastLevel::Success, format!("File received: {}", filename));
         }
     }
 
@@ -1801,11 +1831,7 @@ impl ChatManager {
                             return;
                         }
 
-                        let transfer_id = self
-                            .active_transfers
-                            .values()
-                            .find(|t| t.chat_id == actual_chat_id)
-                            .map(|t| t.id);
+                        let transfer_id = self.active_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                                 transfer.seq += 1;
@@ -1818,6 +1844,22 @@ impl ChatManager {
                                 if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
                                     if let Err(e) = incoming.write_chunk(&chunk) {
                                         tracing::error!("Failed to write chunk: {}", e);
+                                        if let Some(transfer) =
+                                            self.active_transfers.get_mut(&transfer_id)
+                                        {
+                                            transfer.status = TransferStatus::Failed(e.to_string());
+                                        }
+                                        if let Some(incoming) =
+                                            self.incoming_files.remove(&transfer_id)
+                                        {
+                                            if let Err(cleanup_err) = incoming.abort_cleanup() {
+                                                tracing::warn!(
+                                                    "Failed to clean up aborted transfer {}: {}",
+                                                    transfer_id,
+                                                    cleanup_err
+                                                );
+                                            }
+                                        }
                                         self.add_toast(
                                             ToastLevel::Error,
                                             format!("File transfer error: {}", e),
@@ -1847,13 +1889,9 @@ impl ChatManager {
                             return;
                         }
 
-                        let transfer_id = self
-                            .active_transfers
-                            .values()
-                            .find(|t| t.chat_id == actual_chat_id)
-                            .map(|t| t.id);
+                        let transfer_id = self.active_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
-                            if let Some(_transfer) = self.active_transfers.get_mut(&transfer_id) {
+                            if self.active_transfers.contains_key(&transfer_id) {
                                 tracing::info!("File transfer completed");
 
                                 // Finalize only the matching transfer, not all incoming files.
@@ -1861,9 +1899,10 @@ impl ChatManager {
                                     let bytes_received = incoming.bytes_received();
                                     match incoming.finalize() {
                                         Ok(final_path) => {
-                                            if let Some(transfer) =
-                                                self.active_transfers.get(&transfer_id)
+                                            if let Some(mut transfer) =
+                                                self.active_transfers.remove(&transfer_id)
                                             {
+                                                transfer.status = TransferStatus::Completed;
                                                 // Add to chat history.
                                                 if let Some(chat) =
                                                     self.chats.get_mut(&actual_chat_id)
@@ -1879,6 +1918,10 @@ impl ChatManager {
                                                         timestamp: chrono::Utc::now(),
                                                     });
                                                 }
+                                                self.add_toast(
+                                                    ToastLevel::Success,
+                                                    format!("File received: {}", transfer.filename),
+                                                );
                                             }
                                             self.update_transfer_progress(
                                                 transfer_id,
@@ -1886,11 +1929,18 @@ impl ChatManager {
                                             );
                                         }
                                         Err(e) => {
+                                            if let Some(transfer) =
+                                                self.active_transfers.get_mut(&transfer_id)
+                                            {
+                                                transfer.status =
+                                                    TransferStatus::Failed(e.to_string());
+                                            }
                                             tracing::error!("Failed to finalize file: {}", e);
                                             self.add_toast(
                                                 ToastLevel::Error,
                                                 format!("File transfer error: {}", e),
                                             );
+                                            self.active_transfers.remove(&transfer_id);
                                         }
                                     }
                                 }
@@ -2787,6 +2837,97 @@ mod tests {
             mgr.chats.get(&actual_chat_id).unwrap().recv_seq,
             1,
             "Ping sequence must be applied to mapped actual chat"
+        );
+    }
+
+    #[test]
+    fn sequential_incoming_files_do_not_reuse_completed_transfer_state() {
+        let temp_dir = tempdir().unwrap();
+        let download_dir = temp_dir.path().join("downloads");
+        let temp_download_dir = temp_dir.path().join("temp");
+        let config = Config {
+            download_dir: download_dir.clone(),
+            temp_dir: temp_download_dir,
+            ..Config::default()
+        };
+
+        let mut mgr = ChatManager::new(config);
+        let chat_id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(chat_id, "Sequential Files".to_string());
+
+        let first_payload = b"first file payload";
+        let second_payload = b"second payload";
+
+        mgr.handle_session_event(
+            chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+                filename: "first.txt".to_string(),
+                size: first_payload.len() as u64,
+                seq: 1,
+            }),
+        );
+        mgr.handle_session_event(
+            chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+                chunk: first_payload.to_vec(),
+                seq: 2,
+            }),
+        );
+        mgr.handle_session_event(
+            chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+        );
+
+        mgr.handle_session_event(
+            chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+                filename: "second.txt".to_string(),
+                size: second_payload.len() as u64,
+                seq: 4,
+            }),
+        );
+        mgr.handle_session_event(
+            chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+                chunk: second_payload.to_vec(),
+                seq: 5,
+            }),
+        );
+        mgr.handle_session_event(
+            chat_id,
+            SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 6 }),
+        );
+
+        let chat = mgr.chats.get(&chat_id).unwrap();
+        let file_messages: Vec<_> = chat
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::File {
+                    path: Some(path), ..
+                } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(file_messages.len(), 2, "both files should be recorded");
+        assert!(
+            mgr.active_transfers.is_empty(),
+            "completed transfers should not remain active"
+        );
+        assert!(
+            mgr.incoming_files.is_empty(),
+            "no incoming file handles should remain after completion"
+        );
+        assert_eq!(
+            std::fs::read(&file_messages[0]).unwrap(),
+            first_payload,
+            "first file should keep its payload"
+        );
+        assert_eq!(
+            std::fs::read(&file_messages[1]).unwrap(),
+            second_payload,
+            "second file should keep its payload"
         );
     }
 

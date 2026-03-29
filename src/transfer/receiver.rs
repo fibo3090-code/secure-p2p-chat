@@ -266,6 +266,14 @@ impl IncomingFileSync {
 
         Ok(final_path)
     }
+
+    /// Abort the transfer and remove the temporary file.
+    pub fn abort_cleanup(self) -> Result<()> {
+        drop(self.file);
+        std::fs::remove_file(&self.tmp_path).ok();
+        tracing::warn!("File transfer aborted, cleaned up temp file");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
