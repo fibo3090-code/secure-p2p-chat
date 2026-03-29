@@ -99,6 +99,13 @@ pub struct App {
 }
 
 impl App {
+    fn diagnostics_base_dir(&self) -> PathBuf {
+        self.history_path
+            .parent()
+            .map(|dir| dir.join("diagnostics"))
+            .unwrap_or_else(crate::support::default_diagnostics_dir)
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         event_collector: EventCollector,
@@ -401,6 +408,96 @@ impl App {
             created_at: std::time::Instant::now(),
             duration: std::time::Duration::from_secs(4),
         });
+    }
+
+    pub fn export_diagnostics_bundle(&mut self) {
+        let discovered_peers = self
+            .discovered_peers
+            .lock()
+            .ok()
+            .map(|peers| peers.len())
+            .unwrap_or(0);
+        let identity_path = self.history_path.with_file_name("identity.json");
+        let report = {
+            match self.chat_manager.try_lock() {
+                Ok(manager) => Some(crate::support::DiagnosticsReport {
+                    generated_at_utc: chrono::Utc::now().to_rfc3339(),
+                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                    os: std::env::consts::OS.to_string(),
+                    arch: std::env::consts::ARCH.to_string(),
+                    history_path: self.history_path.display().to_string(),
+                    identity_path: identity_path.display().to_string(),
+                    history_exists: self.history_path.exists(),
+                    identity_exists: identity_path.exists(),
+                    identity_locked: self.identity.is_locked(),
+                    identity_name: self.identity.name.clone(),
+                    identity_fingerprint_prefix: self
+                        .identity
+                        .fingerprint
+                        .chars()
+                        .take(16)
+                        .collect(),
+                    chats: manager.chats.len(),
+                    contacts: manager.contacts.len(),
+                    sessions: manager.sessions_len(),
+                    active_toasts: manager.toasts.len() + self.toasts.len(),
+                    discovered_peers,
+                    config: crate::support::DiagnosticsConfig::from(&manager.config),
+                }),
+                Err(_) => None,
+            }
+        };
+        let Some(report) = report else {
+            self.add_toast(
+                crate::types::ToastLevel::Error,
+                "Could not export diagnostics: app state is busy".to_string(),
+            );
+            return;
+        };
+
+        let logs = crate::support::format_event_logs(&self.event_collector);
+        let base_dir = self.diagnostics_base_dir();
+        let manager_arc = self.chat_manager.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::support::export_diagnostics_bundle(&base_dir, &report, &logs)
+            })
+            .await;
+
+            let mut manager = manager_arc.lock().await;
+            match result {
+                Ok(Ok(bundle_dir)) => manager.add_toast(
+                    crate::types::ToastLevel::Success,
+                    format!("Diagnostics exported to {}", bundle_dir.display()),
+                ),
+                Ok(Err(e)) => manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Failed to export diagnostics: {}", e),
+                ),
+                Err(e) => manager.add_toast(
+                    crate::types::ToastLevel::Error,
+                    format!("Diagnostics task failed: {}", e),
+                ),
+            }
+        });
+    }
+
+    pub fn open_data_directory(&mut self) {
+        let data_dir = self
+            .history_path
+            .parent()
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_else(crate::support::default_diagnostics_dir);
+        match open::that(&data_dir) {
+            Ok(_) => self.add_toast(
+                crate::types::ToastLevel::Success,
+                format!("Opened {}", data_dir.display()),
+            ),
+            Err(e) => self.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Failed to open data directory: {}", e),
+            ),
+        }
     }
 
     /// Returns true if any dialog that should be modal is currently open.

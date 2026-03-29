@@ -346,6 +346,7 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
     ui.add_space(10.0);
     ui.label(egui::RichText::new("Still having issues?").strong());
     ui.label("• Check the Log Terminal in Settings for detailed error messages.");
+    ui.label("• Export a diagnostics bundle from Settings before filing a bug.");
     ui.label("• Review the documentation: README.md, SECURITY.md, DEVELOPER_GUIDE.md");
     ui.label("• Report bugs on GitHub with log output and steps to reproduce.");
     ui.label("• Security issues: see SECURITY.md for responsible disclosure.");

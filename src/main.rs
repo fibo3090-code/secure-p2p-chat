@@ -35,6 +35,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    support::install_panic_hook();
+
     // Initialize logging
     let event_collector = EventCollector::new();
     tracing_subscriber::registry()

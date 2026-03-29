@@ -13,6 +13,7 @@ Secure peer-to-peer messaging for desktop, built with Rust. The app provides enc
 - X25519 + HKDF session establishment with RSA-PSS identity proofs
 - Encrypted local identity and encrypted chat history at rest
 - File transfer, typing indicators, invite links, QR generation, and optional LAN discovery
+- Diagnostics bundle export and on-disk panic/crash logs for support
 - GUI built with `egui` and terminal interface built with `ratatui`
 
 ## Current Status

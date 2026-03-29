@@ -19,6 +19,7 @@ pub mod core;
 pub mod gui;
 pub mod identity;
 pub mod network;
+pub mod support;
 pub mod transfer;
 pub mod tui;
 pub mod types;

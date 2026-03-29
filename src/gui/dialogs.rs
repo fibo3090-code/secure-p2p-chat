@@ -5,6 +5,29 @@ use anyhow::anyhow;
 use eframe::egui;
 use egui_tracing::ui::Logs;
 
+fn queue_history_save(history_path: std::path::PathBuf, manager: &mut crate::app::ChatManager) {
+    let snapshot = match manager.history_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Failed to prepare save: {}", e),
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let (history, key) = snapshot;
+        match tokio::task::spawn_blocking(move || history.save_encrypted(&history_path, &key)).await
+        {
+            Ok(Err(e)) => tracing::warn!("Background settings save failed: {}", e),
+            Err(e) => tracing::warn!("Background settings save task failed: {}", e),
+            Ok(Ok(())) => {}
+        }
+    });
+}
+
 pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
     // NOTE: When identity.is_locked() || is_new_identity || force_password_setup,
     // update() shows only render_blocking_auth_screen and returns before calling render_dialogs.
@@ -496,8 +519,7 @@ fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid:
                         if app.selected_chat == Some(chat_id) {
                             app.selected_chat = None;
                         }
-                        // Auto-save after deletion
-                        let _ = manager.save_history(&app.history_path);
+                        queue_history_save(app.history_path.clone(), &mut manager);
                     }
                     app.chat_to_delete = None;
                 }
@@ -1407,7 +1429,7 @@ fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
                                 crate::types::ToastLevel::Success,
                                 "Chat renamed successfully!".to_string(),
                             );
-                            let _ = manager.save_history(&app.history_path);
+                            queue_history_save(app.history_path.clone(), &mut manager);
                             ctx.request_repaint();
                             app.active_dialog = ActiveDialog::None;
                         }
@@ -1444,7 +1466,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     let mut auto_host = manager.config.auto_host_on_startup;
                     if ui.checkbox(&mut auto_host, "Auto-host (listen) on startup").changed() {
                         manager.config.auto_host_on_startup = auto_host;
-                        let _ = manager.save_history(&app.history_path);
+                        queue_history_save(app.history_path.clone(), &mut manager);
                         // If enabled, start hosting immediately using current listen_port
                         if auto_host {
                             match app.identity.private_key() {
@@ -1485,7 +1507,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                         if let Ok(p) = port_str.parse::<u16>() {
                             manager.config.listen_port = p;
                             app.host_port = p.to_string(); // keep Host dialog in sync
-                            let _ = manager.save_history(&app.history_path);
+                            queue_history_save(app.history_path.clone(), &mut manager);
                         }
                     }
                 });
@@ -1493,17 +1515,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 // Show my IP address (best-effort primary local IPv4)
                 ui.add_space(8.0);
                 ui.label("My IP address (primary, best-effort):");
-                let my_ip = {
-                    use std::net::{SocketAddr, UdpSocket};
-                    (|| -> Option<String> {
-                        let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-                        // Use a public resolver to determine the outbound interface without sending data
-                        sock.connect("8.8.8.8:80").ok()?;
-                        let addr: SocketAddr = sock.local_addr().ok()?;
-                        Some(addr.ip().to_string())
-                    })()
-                    .unwrap_or_else(|| "Unavailable".to_string())
-                };
+                let my_ip = primary_local_ipv4().unwrap_or_else(|| "Unavailable".to_string());
                 ui.monospace(my_ip);
 
                 ui.add_space(10.0);
@@ -1514,7 +1526,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     if ui.button("📁 Browse").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             manager.config.download_dir = path;
-                            let _ = manager.save_history(&app.history_path);
+                            queue_history_save(app.history_path.clone(), &mut manager);
                         }
                     }
                 });
@@ -1525,7 +1537,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     &mut manager.config.auto_accept_files,
                     "Auto-accept file transfers",
                 ).changed() {
-                    let _ = manager.save_history(&app.history_path);
+                    queue_history_save(app.history_path.clone(), &mut manager);
                 }
 
                 ui.add_space(10.0);
@@ -1538,7 +1550,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     &mut manager.config.enable_notifications,
                     "Enable desktop notifications",
                 ).changed() {
-                    let _ = manager.save_history(&app.history_path);
+                    queue_history_save(app.history_path.clone(), &mut manager);
                 }
 
                 ui.add_space(10.0);
@@ -1547,7 +1559,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     &mut manager.config.enable_typing_indicators,
                     "Enable typing indicators",
                 ).changed() {
-                    let _ = manager.save_history(&app.history_path);
+                    queue_history_save(app.history_path.clone(), &mut manager);
                 }
 
                 ui.add_space(10.0);
@@ -1563,7 +1575,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                             ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Midnight, "Midnight").changed() ||
                             ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Forest, "Forest").changed()
                         }).inner.unwrap_or(false) {
-                            let _ = manager.save_history(&app.history_path);
+                            queue_history_save(app.history_path.clone(), &mut manager);
                             // Apply theme immediately
                             ctx.set_visuals(crate::gui::styling::apply_custom_visuals(&manager.config.theme));
                         }
@@ -1575,7 +1587,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     ui.label("Font Size:");
                     if ui.add(egui::Slider::new(&mut manager.config.font_size, 10..=20).suffix("px")).changed() {
-                        let _ = manager.save_history(&app.history_path);
+                        queue_history_save(app.history_path.clone(), &mut manager);
                         // Apply font size immediately
                         let mut style = (*ctx.style()).clone();
                         if let Some(s) = style.text_styles.get_mut(&egui::TextStyle::Body) {
@@ -1595,7 +1607,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     &mut manager.config.auto_connect,
                     "Auto-connect to last known peer",
                 ).changed() {
-                    let _ = manager.save_history(&app.history_path);
+                    queue_history_save(app.history_path.clone(), &mut manager);
                 }
 
                 ui.add_space(10.0);
@@ -1609,7 +1621,7 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                             ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::None, "None").changed() ||
                             ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::Default, "Default").changed()
                         }).inner.unwrap_or(false) {
-                            let _ = manager.save_history(&app.history_path);
+                            queue_history_save(app.history_path.clone(), &mut manager);
                         }
                 });
 
@@ -1619,9 +1631,30 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 if ui.checkbox(&mut show_log, "Show Log Terminal").changed() {
                     app.show_log_terminal = show_log;
                     manager.config.show_log_terminal = show_log;
-                    let _ = manager.save_history(&app.history_path);
+                    queue_history_save(app.history_path.clone(), &mut manager);
                 }
             }
+
+            ui.add_space(20.0);
+            ui.heading("Support");
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if crate::gui::widgets::primary_button(ui, "Export Diagnostics Bundle").clicked() {
+                    app.export_diagnostics_bundle();
+                }
+                if crate::gui::widgets::secondary_button(ui, "Open Data Directory").clicked() {
+                    app.open_data_directory();
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Diagnostics bundles include app state metadata and logs, but not private keys.",
+                )
+                .small()
+                .weak(),
+            );
 
             ui.add_space(20.0);
             ui.heading("Security");
@@ -1760,20 +1793,7 @@ fn render_log_terminal(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("📋 Copy All Logs").clicked() {
-                    let mut log_text = String::new();
-                    // Lock the events collection and format each event
-                    for event in app.event_collector.events() {
-                        let level = event.level.as_str();
-                        let target = event.target.as_str();
-                        let msg = event
-                            .fields
-                            .get("message")
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        let timestamp = event.time.to_rfc3339();
-                        log_text
-                            .push_str(&format!("[{}] {} [{}] {}\n", timestamp, level, target, msg));
-                    }
+                    let log_text = crate::support::format_event_logs(&app.event_collector);
                     ui.output_mut(|o| o.copied_text = log_text);
                     if let Ok(mut manager) = app.chat_manager.try_lock() {
                         manager.add_toast(
@@ -1781,6 +1801,9 @@ fn render_log_terminal(app: &mut App, ctx: &egui::Context) {
                             "Logs copied to clipboard".to_string(),
                         );
                     }
+                }
+                if ui.button("🧰 Export Diagnostics").clicked() {
+                    app.export_diagnostics_bundle();
                 }
                 if ui.button("🗑 Clear Logs").clicked() {
                     // Optional: Clear logs if API allows. EventCollector usually doesn't expose a clear() that is easy.

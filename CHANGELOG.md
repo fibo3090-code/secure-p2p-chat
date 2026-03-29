@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
 
 - Added a checked-in GitHub Actions CI workflow for formatting, clippy, tests, dependency auditing, and Windows build validation.
 - Moved periodic GUI autosave off the hot UI path by snapshotting state and persisting it in a background task.
+- Added diagnostics bundle export and on-disk panic logs to make support and crash triage easier.
+- Moved the highest-frequency GUI settings saves off the hot UI path by snapshotting history before writing.
 - Switched encrypted history writes to a temp-file-and-rename flow for safer persistence.
 - Removed the unused duplicate low-level transfer sender module to keep one authoritative file-transfer path.
 - Advanced the history format to `1.1` while keeping `1.0` load compatibility.

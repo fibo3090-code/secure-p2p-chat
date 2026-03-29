@@ -26,6 +26,7 @@ pub enum TuiCommand {
     Host(Option<u16>),
     Connect { host: String, port: u16 },
     Disconnect,
+    Diagnostics,
     Rename(String),
     Help,
     Quit,
@@ -45,6 +46,7 @@ pub struct TuiApp {
     pub status_line: String,
     pub should_quit: bool,
     identity: Identity,
+    history_path: PathBuf,
     pending_command: Option<TuiCommand>,
 }
 
@@ -88,6 +90,7 @@ impl TuiApp {
             status_line: "Ready. Press :help for commands.".to_string(),
             should_quit: false,
             identity,
+            history_path,
             pending_command: None,
         };
         app.sync_chat_ids();
@@ -224,6 +227,7 @@ impl TuiApp {
                 Ok(TuiCommand::Connect { host, port })
             }
             "disconnect" => Ok(TuiCommand::Disconnect),
+            "diagnostics" | "diag" => Ok(TuiCommand::Diagnostics),
             "rename" => {
                 let title = input
                     .strip_prefix("rename")
@@ -413,6 +417,9 @@ impl TuiApp {
                     );
                 }
             }
+            TuiCommand::Diagnostics => {
+                self.export_diagnostics_bundle();
+            }
             TuiCommand::Rename(new_title) => {
                 if let Some(chat_id) = self.selected_chat_id() {
                     if let Err(e) = self.chat_manager.rename_chat(chat_id, new_title) {
@@ -436,7 +443,7 @@ impl TuiApp {
             TuiCommand::Help => {
                 self.chat_manager.add_toast(
                     crate::types::ToastLevel::Info,
-                    "Commands: :host [port], :connect <host[:port]>, :disconnect, :rename <title>, :help, :quit"
+                    "Commands: :host [port], :connect <host[:port]>, :disconnect, :diagnostics, :rename <title>, :help, :quit"
                         .to_string(),
                 );
             }
@@ -448,18 +455,7 @@ impl TuiApp {
     }
 
     pub fn copy_logs(&mut self) {
-        let mut log_text = String::new();
-        for event in self.event_collector.events() {
-            let level = event.level.as_str();
-            let target = event.target.as_str();
-            let msg = event
-                .fields
-                .get("message")
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let timestamp = event.time.to_rfc3339();
-            log_text.push_str(&format!("[{}] {} [{}] {}\n", timestamp, level, target, msg));
-        }
+        let log_text = crate::support::format_event_logs(&self.event_collector);
 
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
@@ -484,6 +480,47 @@ impl TuiApp {
                     format!("Clipboard error: {}", e),
                 );
             }
+        }
+        self.refresh_status_line();
+    }
+
+    pub fn export_diagnostics_bundle(&mut self) {
+        let identity_path = self.history_path.with_file_name("identity.json");
+        let report = crate::support::DiagnosticsReport {
+            generated_at_utc: chrono::Utc::now().to_rfc3339(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            history_path: self.history_path.display().to_string(),
+            identity_path: identity_path.display().to_string(),
+            history_exists: self.history_path.exists(),
+            identity_exists: identity_path.exists(),
+            identity_locked: self.identity.is_locked(),
+            identity_name: self.identity.name.clone(),
+            identity_fingerprint_prefix: self.identity.fingerprint.chars().take(16).collect(),
+            chats: self.chat_manager.chats.len(),
+            contacts: self.chat_manager.contacts.len(),
+            sessions: self.chat_manager.sessions_len(),
+            active_toasts: self.chat_manager.toasts.len(),
+            discovered_peers: 0,
+            config: crate::support::DiagnosticsConfig::from(&self.chat_manager.config),
+        };
+        let logs = crate::support::format_event_logs(&self.event_collector);
+        let base_dir = self
+            .history_path
+            .parent()
+            .map(|dir| dir.join("diagnostics"))
+            .unwrap_or_else(crate::support::default_diagnostics_dir);
+
+        match crate::support::export_diagnostics_bundle(&base_dir, &report, &logs) {
+            Ok(bundle_dir) => self.chat_manager.add_toast(
+                crate::types::ToastLevel::Success,
+                format!("Diagnostics exported to {}", bundle_dir.display()),
+            ),
+            Err(e) => self.chat_manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Failed to export diagnostics: {}", e),
+            ),
         }
         self.refresh_status_line();
     }
@@ -827,6 +864,12 @@ mod tests {
     #[test]
     fn test_parse_rename_requires_title() {
         assert!(TuiApp::parse_command(":rename").is_err());
+    }
+
+    #[test]
+    fn test_parse_diagnostics_command() {
+        let parsed = TuiApp::parse_command(":diagnostics").unwrap();
+        assert_eq!(parsed, TuiCommand::Diagnostics);
     }
 
     #[test]

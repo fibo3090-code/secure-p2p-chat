@@ -103,6 +103,7 @@ Legacy unsigned invites may still import, but they should be treated as compatib
 - `:host 9000`
 - `:connect 192.168.1.10:12345`
 - `:disconnect`
+- `:diagnostics`
 - `:rename Team Chat`
 - `:help`
 - `:quit`
@@ -121,6 +122,7 @@ Legacy unsigned invites may still import, but they should be treated as compatib
 - check connection status
 - reconnect manually if needed
 - inspect the log terminal for errors
+- export a diagnostics bundle from Settings or with `:diagnostics` in the TUI when reporting a bug
 
 ### Fingerprint changed
 
@@ -131,6 +133,7 @@ Legacy unsigned invites may still import, but they should be treated as compatib
 
 - verify you used the correct password
 - confirm the encrypted history file still exists
+- inspect the diagnostics/crash files in the app data directory if the app terminated unexpectedly
 
 ### TUI rendering looks wrong
 
