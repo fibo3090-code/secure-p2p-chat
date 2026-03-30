@@ -35,6 +35,9 @@ dist/
 !.vscode/launch.json
 *.code-workspace
 
+# Visual Studio
+.vs/
+
 # IntelliJ / JetBrains
 .idea/
 *.iml
