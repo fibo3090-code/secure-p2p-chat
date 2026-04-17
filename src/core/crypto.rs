@@ -319,8 +319,10 @@ pub fn derive_session_key(
     // Salt is now supported (and recommended to be transcript hash)
     let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
 
-    // Initialize with random bytes to avoid any fixed-value key material pattern.
-    let mut session_key: [u8; AES_KEY_SIZE] = rand::random();
+    // HKDF.expand fully overwrites the buffer; zero-initialize so a future
+    // refactor that swaps .expect() for ? can't silently use uninitialized
+    // or random material as a session key.
+    let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
 
@@ -344,8 +346,10 @@ pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> 
     // Nonce acts as salt for additional entropy
     let hkdf = Hkdf::<Sha256>::new(Some(nonce), current_key);
 
-    // Initialize with random bytes to avoid any fixed-value key material pattern.
-    let mut next_key: [u8; AES_KEY_SIZE] = rand::random();
+    // HKDF.expand fully overwrites the buffer; zero-initialize so a future
+    // refactor that swaps .expect() for ? can't silently use uninitialized
+    // or random material as a session key.
+    let mut next_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(b"key-rotation", &mut next_key)
         .expect("HKDF expand should not fail with valid length");
 
@@ -427,6 +431,16 @@ impl AesCipher {
         let counter = self
             .nonce_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Guard against counter wrap-around. `fetch_add` wraps on overflow, so
+        // letting `counter == u64::MAX` go through would mean the next call
+        // reuses nonce 0 — catastrophic for AES-GCM. The periodic rekey
+        // (REKEY_MESSAGE_COUNT = 100) makes this practically unreachable, but
+        // we fail loudly here as a defense-in-depth measure.
+        assert!(
+            counter < u64::MAX,
+            "AES-GCM nonce counter exhausted; session must be rekeyed before reuse"
+        );
 
         // Build nonce: session_id (4 bytes) || counter (8 bytes)
         let mut nonce_bytes = [0u8; crate::AES_NONCE_SIZE];

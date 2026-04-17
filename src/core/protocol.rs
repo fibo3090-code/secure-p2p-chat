@@ -287,8 +287,17 @@ impl ProtocolMessage {
         }
 
         if b.starts_with(b"EPHEMERAL_KEY:") {
-            let public_key = b[14..].to_vec();
-            return Some(Self::EphemeralKey { public_key });
+            // Validate length before allocating: X25519 public keys are exactly
+            // 32 bytes. Reject anything else without copying the payload so a
+            // malicious peer can't force a multi-MiB allocation during the
+            // unauthenticated handshake phase.
+            let key_bytes = &b[14..];
+            if key_bytes.len() != 32 {
+                return None;
+            }
+            return Some(Self::EphemeralKey {
+                public_key: key_bytes.to_vec(),
+            });
         }
 
         if b.starts_with(b"TEXT:") {

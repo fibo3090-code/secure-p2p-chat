@@ -89,6 +89,36 @@ fn test_binary_protocol_limits() {
 }
 
 #[test]
+fn test_legacy_ephemeral_key_rejects_oversized_payload() {
+    // Regression: a malicious peer could send an EPHEMERAL_KEY: payload larger
+    // than 32 bytes, causing the legacy parser to allocate the full body before
+    // any length check. Ensure such payloads are now rejected without copying.
+    let mut oversized = b"EPHEMERAL_KEY:".to_vec();
+    oversized.extend_from_slice(&vec![0u8; 8 * 1024 * 1024]);
+    assert!(
+        ProtocolMessage::from_plain_bytes(&oversized).is_none(),
+        "Oversized EPHEMERAL_KEY payload must be rejected"
+    );
+
+    let mut short = b"EPHEMERAL_KEY:".to_vec();
+    short.extend_from_slice(&[0u8; 16]);
+    assert!(
+        ProtocolMessage::from_plain_bytes(&short).is_none(),
+        "Undersized EPHEMERAL_KEY payload must be rejected"
+    );
+
+    let mut valid = b"EPHEMERAL_KEY:".to_vec();
+    valid.extend_from_slice(&[0u8; 32]);
+    assert!(
+        matches!(
+            ProtocolMessage::from_plain_bytes(&valid),
+            Some(ProtocolMessage::EphemeralKey { .. })
+        ),
+        "Exactly 32-byte EPHEMERAL_KEY payload must parse"
+    );
+}
+
+#[test]
 fn test_file_meta_parsing_robustness() {
     // Malformed metadata (size is not a number)
     let bad_meta = b"FILE_META|0|filename|not_a_number";
