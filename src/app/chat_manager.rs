@@ -1311,6 +1311,7 @@ impl ChatManager {
     /// Delete all data including identity file. Used for complete data wipe.
     pub fn delete_all_data(
         &mut self,
+        data_dir: &std::path::Path,
         history_path: &std::path::Path,
         identity_path: &std::path::Path,
     ) -> Result<()> {
@@ -1318,6 +1319,18 @@ impl ChatManager {
 
         // First clear all in-memory state
         self.clear_history(std::path::Path::new(""));
+
+        let history_under_data_dir = history_path.parent() == Some(data_dir);
+        let identity_under_data_dir = identity_path.parent() == Some(data_dir);
+        if !data_dir.as_os_str().is_empty()
+            && history_under_data_dir
+            && identity_under_data_dir
+            && data_dir.exists()
+        {
+            std::fs::remove_dir_all(data_dir)?;
+            tracing::info!("App data directory deleted: {}", data_dir.display());
+            return Ok(());
+        }
 
         if history_path.exists() {
             std::fs::remove_file(history_path)?;
@@ -2993,11 +3006,19 @@ mod tests {
     #[test]
     fn delete_all_data_removes_files_and_clears_state() {
         let dir = tempdir().unwrap();
-        let history_path = dir.path().join("history.json.enc");
-        let identity_path = dir.path().join("identity.json");
+        let data_dir = dir.path().join("data");
+        let history_path = data_dir.join("history.json.enc");
+        let identity_path = data_dir.join("identity.json");
+        let crash_log_path = data_dir
+            .join("diagnostics")
+            .join("crashes")
+            .join("panic.log");
+
+        std::fs::create_dir_all(crash_log_path.parent().unwrap()).unwrap();
 
         std::fs::write(&history_path, b"encrypted-history").unwrap();
         std::fs::write(&identity_path, b"encrypted-identity").unwrap();
+        std::fs::write(&crash_log_path, b"crash").unwrap();
 
         let mut mgr = ChatManager::new(Config::default());
         let chat_id = Uuid::new_v4();
@@ -3012,10 +3033,13 @@ mod tests {
         mgr.fingerprint_verification_request =
             Some(("fingerprint".to_string(), "peer".to_string(), chat_id));
 
-        mgr.delete_all_data(&history_path, &identity_path).unwrap();
+        mgr.delete_all_data(&data_dir, &history_path, &identity_path)
+            .unwrap();
 
+        assert!(!data_dir.exists(), "app data directory should be deleted");
         assert!(!history_path.exists(), "history file should be deleted");
         assert!(!identity_path.exists(), "identity file should be deleted");
+        assert!(!crash_log_path.exists(), "diagnostics should be deleted");
         assert!(mgr.chats.is_empty());
         assert!(mgr.contacts.is_empty());
         assert!(mgr.contact_to_chat.is_empty());

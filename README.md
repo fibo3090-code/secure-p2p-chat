@@ -61,7 +61,7 @@ The app uses TOFU: trust on first use.
 
 | Platform | Status | Notes |
 |---|---|---|
-| Windows | Supported | Installer releases are published. Bonjour may be needed for mDNS discovery. |
+| Windows | Supported | Installer releases are published. Bonjour may be needed for mDNS discovery. The uninstaller can remove local identity/history data for a true reset. |
 | Linux | Supported | Release tarballs are published; `avahi-daemon` and GUI system libraries may be required. |
 | macOS | Supported | Intel and Apple Silicon DMGs are published; Native Bonjour works. |
 

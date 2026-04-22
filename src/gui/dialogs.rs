@@ -1722,9 +1722,14 @@ fn render_clear_history_dialog(app: &mut App, ctx: &egui::Context) {
 
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "❌ Delete Everything").clicked() {
+                    let data_dir = app
+                        .history_path
+                        .parent()
+                        .map(|dir| dir.to_path_buf())
+                        .unwrap_or_default();
                     let identity_path = app.history_path.with_file_name("identity.json");
                     let wipe_result = if let Ok(mut manager) = app.chat_manager.try_lock() {
-                        manager.delete_all_data(&app.history_path, &identity_path)
+                        manager.delete_all_data(&data_dir, &app.history_path, &identity_path)
                     } else {
                         Err(anyhow!("Could not lock chat manager"))
                     };

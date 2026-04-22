@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Hardened HKDF session-key derivation to use explicit zero-initialized output buffers instead of misleading random prefill.
 - Prevented AES-GCM nonce-counter wraparound so the transport now fails closed instead of risking nonce reuse after exhaustion.
 - Rejected malformed legacy `EPHEMERAL_KEY:` payloads before allocation and added regression coverage for oversized handshake inputs.
+- Fixed full data wipe and Windows uninstall cleanup so the saved identity, encrypted history, diagnostics, and password-protected local state are removed instead of surviving a reinstall.
 
 ### GitHub
 

@@ -92,12 +92,11 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     // Prompt the user if they want to delete their data
-    if MsgBox('Do you want to delete your conversation data and local keys (recommended for a complete uninstall)?', mbConfirmation, MB_YESNO) = IDYES then
+    if MsgBox('Do you want to delete your conversation data, diagnostics, local keys, and saved password-protected identity (recommended for a complete uninstall)?', mbConfirmation, MB_YESNO) = IDYES then
     begin
-        // Manually delete the application data directory.
-        // This path MUST match the one used by `directories::ProjectDirs` in the application.
-        // ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger") creates:
-        // %LOCALAPPDATA%\chat-p2p\EncryptedMessenger on Windows
+        // Delete both the roaming app-data root used by current builds and the
+        // legacy local app-data root used by earlier packaging assumptions.
+        DelTree(ExpandConstant('{userappdata}\chat-p2p\EncryptedMessenger'), True, True, True);
         DelTree(ExpandConstant('{localappdata}\chat-p2p\EncryptedMessenger'), True, True, True);
     end;
   end;

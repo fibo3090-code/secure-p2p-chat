@@ -255,6 +255,12 @@ Use the TUI when you want:
 - encrypted chat history
 - contact trust state
 - configuration
+- diagnostics and crash logs under the app data area
+
+### Resetting local state
+
+- `Settings -> Delete Everything` removes the messenger app data directory, including the encrypted identity, history, diagnostics, and password-protected local state.
+- On Windows, the uninstaller also offers the same full-data cleanup so a reinstall starts from a fresh identity.
 
 ### Where diagnostics go
 
