@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+  build-windows:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: cargo build --release --locked
+
+      - name: Prepare Dist
+        run: |
+          mkdir dist
+          cp target/release/encodeur_rsa_rust.exe dist/
+          cp encodeur_rsa_icon.ico dist/
+          cp README.md dist/
+          cp LICENSE.md dist/
+
+      - name: Compile Installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="${{ github.ref_name }}" /O"Output" /F"Messenger-Setup-${{ github.ref_name }}" setup.iss
+
+      - name: Upload Installer
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./Output/Messenger-Setup-${{ github.ref_name }}.exe
+          asset_name: Messenger-Setup-${{ github.ref_name }}.exe
+          asset_content_type: application/vnd.microsoft.portable-executable
+
+  build-macos:
+    needs: create-release
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create App Bundle
+        run: |
+          mkdir -p Messenger.app/Contents/MacOS
+          mkdir -p Messenger.app/Contents/Resources
+          cp target/${{ matrix.target }}/release/encodeur_rsa_rust Messenger.app/Contents/MacOS/Messenger
+          chmod +x Messenger.app/Contents/MacOS/Messenger
+          
+          # Use icon if exists
+          if [ -f "encodeur_rsa_icon.ico" ]; then
+            cp encodeur_rsa_icon.ico Messenger.app/Contents/Resources/icon.ico
+          fi
+
+          cat > Messenger.app/Contents/Info.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>Messenger</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.fibo3090.messenger</string>
+              <key>CFBundleName</key>
+              <string>Messenger</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${{ github.ref_name }}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.15</string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "Messenger" -srcfolder Messenger.app -ov -format UDZO messenger-${{ matrix.target }}.dmg
+
+      - name: Upload DMG
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./messenger-${{ matrix.target }}.dmg
+          asset_name: Messenger-macOS-${{ matrix.target }}-${{ github.ref_name }}.dmg
+          asset_content_type: application/x-apple-diskimage
+
+  build-linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create Tarball
+        run: |
+          mkdir -p messenger-linux
+          cp target/release/encodeur_rsa_rust messenger-linux/messenger
+          cp README.md LICENSE.md messenger-linux/
+          tar -czvf messenger-linux-${{ github.ref_name }}.tar.gz messenger-linux/
+
+      - name: Upload Tarball
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./messenger-linux-${{ github.ref_name }}.tar.gz
+          asset_name: Messenger-Linux-${{ github.ref_name }}.tar.gz
+          asset_content_type: application/gzip

@@ -4,6 +4,14 @@ This guide covers installation, launching, core workflows, and troubleshooting f
 
 ## Installation
 
+### Pre-built Binaries (Recommended)
+
+The easiest way to get the app is to download the latest release for your platform from the [GitHub Releases](https://github.com/fibo3090/secure-p2p-chat/releases) page.
+
+- **Windows**: Download `Messenger-Setup-v*.exe` and run the installer.
+- **macOS**: Download `Messenger-macOS-*.dmg`, open it, and drag the app to your Applications folder.
+- **Linux**: Download the `.tar.gz` bundle, extract it, and run the `messenger` binary.
+
 ### Build from source
 
 ```bash

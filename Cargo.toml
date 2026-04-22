@@ -1,6 +1,6 @@
 [package]
 name = "encodeur_rsa_rust"
-version = "1.7.7"
+version = "1.8.0"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]
@@ -93,6 +93,8 @@ proptest = "1"
 opt-level = 3
 lto = true
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
 
 [features]
 default = []

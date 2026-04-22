@@ -6,7 +6,6 @@ This file is the active roadmap and backlog for the project. It is not a changel
 
 ### 1. Productization
 
-- Improve distribution and packaging outside Windows
 - Reduce UI-thread blocking and other responsiveness issues
 - Tighten persistence, migration, and recovery behavior
 - Improve diagnostics and failure visibility for users
@@ -29,7 +28,6 @@ This file is the active roadmap and backlog for the project. It is not a changel
 ### High priority
 
 - NAT traversal / internet-grade connectivity
-- Better packaging and release automation for Linux and macOS
 - File transfer progress and cancellation improvements in the GUI
 - Better diagnostic export for support and bug reporting
 - Stronger mDNS registration/removal behavior

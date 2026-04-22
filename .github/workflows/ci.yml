@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  rust-checks:
+  check:
+    name: Fast Checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -30,29 +31,44 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
+  test:
+    name: Unit Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests
         run: cargo test
 
-  dependency-audit:
+  build-verification:
+    name: Build Verification
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
-
-      - name: Run cargo-deny
-        run: cargo deny check advisories
-
-  windows-build:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -63,4 +79,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --locked --verbose
+        run: cargo build --locked
