@@ -5,25 +5,30 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   create-release:
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Ensure Release Exists
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ github.ref_name }} already exists."
+          else
+            gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "Release ${{ github.ref_name }}" \
+              --generate-notes
+          fi
 
   build-windows:
     needs: create-release
@@ -56,14 +61,9 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="${{ github.ref_name }}" /O"Output" /F"Messenger-Setup-${{ github.ref_name }}" setup.iss
 
       - name: Upload Installer
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./Output/Messenger-Setup-${{ github.ref_name }}.exe
-          asset_name: Messenger-Setup-${{ github.ref_name }}.exe
-          asset_content_type: application/vnd.microsoft.portable-executable
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "./Output/Messenger-Setup-${{ github.ref_name }}.exe" --repo "${{ github.repository }}" --clobber
 
   build-macos:
     needs: create-release
@@ -85,7 +85,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Create App Bundle
         run: |
@@ -125,14 +125,9 @@ jobs:
           hdiutil create -volname "Messenger" -srcfolder Messenger.app -ov -format UDZO messenger-${{ matrix.target }}.dmg
 
       - name: Upload DMG
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./messenger-${{ matrix.target }}.dmg
-          asset_name: Messenger-macOS-${{ matrix.target }}-${{ github.ref_name }}.dmg
-          asset_content_type: application/x-apple-diskimage
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "./messenger-${{ matrix.target }}.dmg#Messenger-macOS-${{ matrix.target }}-${{ github.ref_name }}.dmg" --repo "${{ github.repository }}" --clobber
 
   build-linux:
     needs: create-release
@@ -165,11 +160,6 @@ jobs:
           tar -czvf messenger-linux-${{ github.ref_name }}.tar.gz messenger-linux/
 
       - name: Upload Tarball
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./messenger-linux-${{ github.ref_name }}.tar.gz
-          asset_name: Messenger-Linux-${{ github.ref_name }}.tar.gz
-          asset_content_type: application/gzip
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "./messenger-linux-${{ github.ref_name }}.tar.gz#Messenger-Linux-${{ github.ref_name }}.tar.gz" --repo "${{ github.repository }}" --clobber

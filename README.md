@@ -1,6 +1,6 @@
 # Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.8.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.8.1-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE.md)
 [![Security](https://img.shields.io/badge/security-medium-yellow)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
@@ -23,7 +23,7 @@ The project is functional and actively maintained, but it is not a “finished p
 - Security posture: medium. See [SECURITY.md](SECURITY.md).
 - Internet connectivity: relay-assisted WAN connectivity is available for self-hosted deployments. Direct TCP is still the default.
 - LAN discovery: optional and privacy-sensitive. Disabled by default.
-- Packaging: Windows-first. Linux and macOS are supported from source; distribution polish is lighter.
+- Packaging: Windows, Linux, and macOS release artifacts are published through GitHub Releases.
 
 ## Quick Start
 
@@ -61,9 +61,9 @@ The app uses TOFU: trust on first use.
 
 | Platform | Status | Notes |
 |---|---|---|
-| Windows | Supported | Best packaging support. Bonjour may be needed for mDNS discovery. |
-| Linux | Supported from source | `avahi-daemon` and GUI system libraries may be required. |
-| macOS | Supported from source | Native Bonjour works; packaging is less automated. |
+| Windows | Supported | Installer releases are published. Bonjour may be needed for mDNS discovery. |
+| Linux | Supported | Release tarballs are published; `avahi-daemon` and GUI system libraries may be required. |
+| macOS | Supported | Intel and Apple Silicon DMGs are published; Native Bonjour works. |
 
 ## Documentation
 

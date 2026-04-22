@@ -119,7 +119,7 @@ impl TuiApp {
     pub fn sync_chat_ids(&mut self) {
         let selected_chat_id = self.selected_chat_id();
         let mut chats: Vec<_> = self.chat_manager.chats.values().collect();
-        chats.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        chats.sort_by_key(|chat| chat.created_at);
         self.chat_ids = chats.into_iter().map(|c| c.id).collect();
 
         if self.chat_ids.is_empty() {
@@ -363,20 +363,12 @@ impl TuiApp {
             },
             KeyCode::PageDown => self.scroll_down(),
             KeyCode::PageUp => self.scroll_up(),
-            KeyCode::Enter => {
-                if self.focus == TuiFocus::Input {
-                    self.send_message();
-                }
+            KeyCode::Enter if self.focus == TuiFocus::Input => self.send_message(),
+            KeyCode::Backspace if self.focus == TuiFocus::Input => {
+                self.input_text.pop();
             }
-            KeyCode::Backspace => {
-                if self.focus == TuiFocus::Input {
-                    self.input_text.pop();
-                }
-            }
-            KeyCode::Char(c) => {
-                if self.focus == TuiFocus::Input {
-                    self.input_text.push(c);
-                }
+            KeyCode::Char(c) if self.focus == TuiFocus::Input => {
+                self.input_text.push(c);
             }
             _ => {}
         }

@@ -189,14 +189,14 @@ impl App {
         // After loading history, override default relative paths with absolute paths if possible
         if let Some(dirs) = proj_dirs {
             // If download_dir is still the default "Downloads", resolve it to an absolute path.
-            if chat_manager.config.download_dir == PathBuf::from("Downloads") {
+            if chat_manager.config.download_dir == std::path::Path::new("Downloads") {
                 let download_path = UserDirs::new()
                     .and_then(|user_dirs| user_dirs.download_dir().map(|dir| dir.to_path_buf()))
                     .unwrap_or_else(|| dirs.data_dir().to_path_buf());
                 chat_manager.config.download_dir = download_path.join("EncryptedP2PMessenger");
             }
             // If temp_dir is still the default "temp", resolve it.
-            if chat_manager.config.temp_dir == PathBuf::from("temp") {
+            if chat_manager.config.temp_dir == std::path::Path::new("temp") {
                 chat_manager.config.temp_dir = dirs.data_dir().join("temp");
             }
         }

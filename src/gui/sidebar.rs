@@ -1,5 +1,6 @@
 use crate::gui::app_ui::App;
 use eframe::egui;
+use std::cmp::Reverse;
 
 pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(crate::gui::styling::SPACING_MEDIUM);
@@ -27,7 +28,7 @@ pub fn render_sidebar(app: &mut App, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         if let Ok(manager) = app.chat_manager.try_lock() {
             let mut chats: Vec<_> = manager.chats.values().collect();
-            chats.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            chats.sort_by_key(|chat| Reverse(chat.created_at));
 
             if chats.is_empty() {
                 ui.vertical_centered(|ui| {

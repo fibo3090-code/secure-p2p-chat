@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.1] - 2026-04-22
+
+### Fixed
+
+- Restored `cargo clippy --all-targets -- -D warnings` by removing the current GUI/TUI lint regressions that were blocking CI.
+- Reworked the GitHub release workflow to use idempotent `gh release create/upload --clobber` steps so rerunning a tag no longer fails on an existing release.
+- Locked the macOS release builds to `Cargo.lock` and kept publishing separate Intel and Apple Silicon DMGs.
+- Updated shipped version metadata and README packaging claims so repository docs match the automated release behavior.
+
 ## [1.8.0] - 2026-04-22
 
 ### ✨ New Features: Automated Packaging & Distribution

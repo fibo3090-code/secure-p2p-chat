@@ -244,7 +244,6 @@ fn render_set_password_form(app: &mut App, ui: &mut egui::Ui, allow_cancel: bool
                             }
                             if app.is_new_identity {
                                 app.is_new_identity = false;
-                                app.active_dialog = ActiveDialog::Welcome;
                             }
                             app.force_password_setup = false;
                             app.active_dialog = ActiveDialog::None;
