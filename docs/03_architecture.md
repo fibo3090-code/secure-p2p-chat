@@ -23,6 +23,7 @@ The project is centered around `ChatManager`, which coordinates chats, contacts,
 src/
   main.rs         entry point for GUI/TUI launch
   lib.rs          exports and shared constants
+  support.rs      diagnostics export and panic/crash support
   types.rs        shared application data structures
   util.rs         helpers and parsing utilities
   app/
@@ -34,6 +35,7 @@ src/
     protocol.rs
   network/
     discovery.rs
+    relay.rs
     session.rs
   identity/
     mod.rs

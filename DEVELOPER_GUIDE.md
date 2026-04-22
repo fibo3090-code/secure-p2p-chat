@@ -5,6 +5,7 @@ This document is the contributor-facing guide for building, testing, changing, a
 ## Documentation Structure
 
 - Product overview: [README.md](README.md)
+- Guided onboarding: [docs/TUTORIAL.md](docs/TUTORIAL.md)
 - User workflows: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - Architecture: [docs/03_architecture.md](docs/03_architecture.md)
 - Protocol: [docs/04_protocol.md](docs/04_protocol.md)
@@ -64,9 +65,15 @@ The repository also includes CI in `.github/workflows/ci.yml` for:
 
 - formatting
 - clippy
-- tests
-- `cargo deny check advisories`
-- Windows build validation
+- tests on Ubuntu, Windows, and macOS
+- locked Linux build verification
+
+The tag-based release workflow in `.github/workflows/release.yml` builds and publishes:
+
+- Windows installer
+- Linux tarball
+- macOS Intel DMG
+- macOS Apple Silicon DMG
 
 ## Code Map
 
@@ -134,9 +141,10 @@ Avoid adding new top-level docs when an existing canonical document already owns
 
 1. Run format, clippy, and tests.
 2. Update docs affected by the change.
-3. Add an `[Unreleased]` entry in [CHANGELOG.md](CHANGELOG.md).
+3. Update [CHANGELOG.md](CHANGELOG.md) with the release notes.
 4. Bump version in `Cargo.toml` when cutting a release.
 5. Update packaging artifacts if installer behavior or branding changed.
+6. Push `main`, then push the release tag so `.github/workflows/release.yml` publishes the assets.
 
 ## Notes for Security and Protocol Work
 

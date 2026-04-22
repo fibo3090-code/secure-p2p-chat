@@ -46,7 +46,6 @@ These are still roadmap items rather than resolved findings:
 
 - internet-grade connectivity
 - stronger discovery privacy model
-- broader packaging and release automation outside Windows
 - richer diagnostics and support tooling
 
 ## How to Use This File

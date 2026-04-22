@@ -145,6 +145,8 @@ Payload fields:
 - `address`
 - `fingerprint`
 - `public_key`
+- `relay_server` (optional)
+- `relay_token` (optional)
 
 Wrapper fields:
 
@@ -157,6 +159,7 @@ Current verification behavior:
 - the RSA-PSS signature is verified against those exact bytes
 - the timestamp is informational only and is not used for expiry enforcement
 - invalid addresses are dropped during import rather than trusted blindly
+- relay route data is preserved when present in a signed invite
 
 ## Compatibility Notes
 

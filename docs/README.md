@@ -2,9 +2,10 @@
 
 This is the canonical index for project documentation.
 
-## Start Here
+## Recommended Reading Order
 
 - Project overview: [../README.md](../README.md)
+- Guided first session: [TUTORIAL.md](TUTORIAL.md)
 - User setup and usage: [USER_GUIDE.md](USER_GUIDE.md)
 - Contributor workflow: [../DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md)
 
@@ -20,6 +21,15 @@ This is the canonical index for project documentation.
 - Roadmap and backlog: [../DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md)
 - Release history: [../CHANGELOG.md](../CHANGELOG.md)
 - Audit history: [AUDITS.md](AUDITS.md)
+
+## What Each Document Owns
+
+- `TUTORIAL.md`: the quickest path from install to a verified chat session
+- `USER_GUIDE.md`: day-to-day usage, commands, storage, troubleshooting
+- `03_architecture.md`: code layout and runtime responsibility boundaries
+- `04_protocol.md`: shipped wire behavior and compatibility notes
+- `SECURITY.md`: current security posture and disclosure guidance
+- `THREAT_MODEL.md`: assumptions, assets, attack surfaces, and limits
 
 ## Project Meta
 

@@ -1,6 +1,6 @@
 # Security
 
-**Last Updated:** March 29, 2026
+**Last Updated:** April 22, 2026
 
 This document describes the current security posture of the project, what protections are implemented today, what risks remain open, and how to report issues responsibly.
 
@@ -41,7 +41,7 @@ Reasoning:
 - oversized packet rejection
 - signed v2 invite links
 - self-hosted relay-assisted transport that forwards only already-encrypted session traffic
-- checked-in CI for format, lint, test, advisory audit, and Windows build validation
+- checked-in CI for format, lint, cross-platform tests, locked build verification, and tagged release packaging
 
 ## Current Limits and Open Risks
 

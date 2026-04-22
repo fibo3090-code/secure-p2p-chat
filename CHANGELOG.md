@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Reworked the GitHub release workflow to use idempotent `gh release create/upload --clobber` steps so rerunning a tag no longer fails on an existing release.
 - Locked the macOS release builds to `Cargo.lock` and kept publishing separate Intel and Apple Silicon DMGs.
 - Updated shipped version metadata and README packaging claims so repository docs match the automated release behavior.
+- Added a proper onboarding tutorial and refreshed the user, developer, security, protocol, and audit docs to match the current app and CI behavior.
 
 ## [1.8.0] - 2026-04-22
 

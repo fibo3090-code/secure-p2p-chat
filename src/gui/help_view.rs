@@ -53,9 +53,7 @@ fn render_about_tab(ui: &mut egui::Ui) {
         ui.heading("Core Philosophy");
         ui.add_space(5.0);
         ui.label("• No Central Server: You own your data. Messages go directly from peer to peer.");
-        ui.label(
-            "• End-to-End Encryption: Every message is encrypted with military-grade cryptography.",
-        );
+        ui.label("• End-to-End Encryption: Messages and file transfers run inside an authenticated encrypted session.");
         ui.label("• Privacy First: No phone numbers, no email. Just cryptographic identities.");
         ui.label(
             "• Forward Secrecy: Past conversations remain secure even if keys are compromised.",
@@ -66,17 +64,15 @@ fn render_about_tab(ui: &mut egui::Ui) {
     ui.group(|ui| {
         ui.heading("Recent Security Improvements");
         ui.add_space(5.0);
-        ui.label("✅ Patched `rsa` crate vulnerability (CVE-2026-21895).");
-        ui.label("✅ Updated all dependencies to latest versions.");
-        ui.label("✅ Remediated multiple CodeQL warnings.");
-        ui.label("✅ Protocol v3 Encrypted Identity (Metadata Protection)");
-        ui.label("✅ DoS Protection (Rate Limiting & Timeouts)");
-        ui.label("✅ Secure Memory Wiping (Zeroize)");
-        ui.label("✅ Encrypted chat history at rest (ChaCha20-Poly1305)");
-        ui.label("✅ Replay attack protection with sequence numbers");
-        ui.label("✅ Counter-based nonces for AES-GCM");
-        ui.label("✅ Fingerprint verification enforcement");
-        ui.label("✅ Thread-safe implementation (no unsafe code)");
+        ui.label(
+            "✅ Transcript-bound authenticated encryption for identity proof and transport packets",
+        );
+        ui.label("✅ Replay protection with sequence validation");
+        ui.label("✅ Encrypted identity and encrypted chat history at rest");
+        ui.label("✅ Signed invite links in current UI flows");
+        ui.label("✅ Diagnostics bundle export and panic/crash support");
+        ui.label("✅ Forward secrecy via X25519 + HKDF session establishment");
+        ui.label("✅ Self-hosted relay-assisted transport for WAN/NAT-constrained peers");
     });
 }
 
@@ -86,8 +82,8 @@ fn render_features_tab(ui: &mut egui::Ui) {
 
     let security_features = [
         (
-            "🔒 Military-Grade Encryption",
-            "RSA-2048-OAEP for identity, AES-256-GCM for messages, ChaCha20-Poly1305 for storage.",
+            "🔒 Transport Encryption",
+            "RSA-2048 identity keys, AES-256-GCM transport encryption, and ChaCha20-Poly1305 for encrypted local storage.",
         ),
         (
             "🔐 Forward Secrecy",
@@ -138,11 +134,15 @@ fn render_features_tab(ui: &mut egui::Ui) {
         ),
         (
             "📋 Invite Links",
-            "Easy connection sharing with chat-p2p:// links.",
+            "Signed invite links simplify connection sharing and can optionally carry relay route data.",
         ),
         (
             "🔄 Auto-Reconnect",
             "Automatic reconnect to known contacts when enabled in settings.",
+        ),
+        (
+            "🌐 Relay-Assisted Connectivity",
+            "Self-hosted relay transport can help when direct TCP is inconvenient across the internet.",
         ),
     ];
 
@@ -213,7 +213,7 @@ fn render_faq_tab(ui: &mut egui::Ui) {
         ),
         (
             "Can I chat over the internet?",
-            "Yes, but it requires port forwarding on the host's router, or using a VPN/overlay network (like Tailscale, Hamachi, ZeroTier, or WireGuard). By default, it works on your local network (LAN).",
+            "Yes. You can use direct TCP with port forwarding or a VPN/overlay network, and the app also supports a self-hosted relay mode for WAN or NAT-constrained peers.",
         ),
         (
             "What does 'Forward Secrecy' mean?",
@@ -252,13 +252,9 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
             ui.label("   • Windows: Allow 'chat-p2p.exe' through Windows Defender Firewall");
             ui.label("   • Linux: sudo ufw allow <port>/tcp");
             ui.label("   • macOS: System Preferences → Security & Privacy → Firewall");
-            ui.label(
-                "4. If connecting over internet, ensure port forwarding is configured on router.",
-            );
+            ui.label("4. For WAN use, prefer a self-hosted relay or a VPN/overlay network if direct TCP is unreliable.");
             ui.label("5. Try pinging the host: ping <IP_ADDRESS>");
-            ui.label(
-                "6. Verify both users are on the same network (or using VPN/port forwarding).",
-            );
+            ui.label("6. Verify both users are on the same network or are using a reachable relay/VPN path.");
         },
     );
     ui.add_space(5.0);
@@ -334,14 +330,11 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
     ui.collapsing(
         egui::RichText::new("🌐 Internet/WAN connectivity").strong(),
         |ui| {
-            ui.label("For internet connectivity, you need:");
-            ui.label(
-                "1. Port forwarding on the host's router (forward external port → internal port).",
-            );
-            ui.label("2. Host's public IP address (check whatismyip.com).");
-            ui.label("3. Or use a VPN solution like Tailscale, ZeroTier, or WireGuard.");
-            ui.label("4. Dynamic DNS if host's IP changes frequently.");
-            ui.label("\nEasiest solution: Use Tailscale (free, no port forwarding needed).");
+            ui.label("Practical options for internet connectivity:");
+            ui.label("1. Direct TCP with router port forwarding.");
+            ui.label("2. A VPN or overlay network such as Tailscale, ZeroTier, or WireGuard.");
+            ui.label("3. A self-hosted relay server started with `--relay-server`.");
+            ui.label("Relay improves reachability, but it is not an anonymity layer.");
         },
     );
 
@@ -351,7 +344,9 @@ fn render_troubleshooting_tab(ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("Still having issues?").strong());
     ui.label("• Check the Log Terminal in Settings for detailed error messages.");
     ui.label("• Export a diagnostics bundle from Settings before filing a bug.");
-    ui.label("• Review the documentation: README.md, SECURITY.md, DEVELOPER_GUIDE.md");
+    ui.label(
+        "• Review the documentation: README.md, docs/TUTORIAL.md, docs/USER_GUIDE.md, SECURITY.md",
+    );
     ui.label("• Report bugs on GitHub with log output and steps to reproduce.");
     ui.label("• Security issues: see SECURITY.md for responsible disclosure.");
 }

@@ -58,15 +58,31 @@ Risks:
 
 - LAN observers learning hostname, address, fingerprint, or presence
 - traffic analysis
+- relay operators learning connection metadata such as timing and endpoint usage
 
 Controls:
 
 - discovery disabled by default
 - encrypted identity exchange after session establishment
+- self-hosted relay forwards already-encrypted session traffic
 
 Residual limitation:
 
 - enabling mDNS still exposes local-network metadata tradeoffs
+- relay use improves reachability, not metadata privacy
+
+### Invite sharing and trust bootstrap
+
+Risks:
+
+- users importing forged or tampered invite data
+- users trusting first contact without fingerprint verification
+
+Controls:
+
+- signed invite links in current UI flows
+- invalid invite addresses are sanitized during import
+- explicit fingerprint verification workflow
 
 ## Threat Actors
 

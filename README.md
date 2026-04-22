@@ -69,6 +69,7 @@ The app uses TOFU: trust on first use.
 
 Start with [docs/README.md](docs/README.md).
 
+- [docs/TUTORIAL.md](docs/TUTORIAL.md): step-by-step first session tutorial for GUI, TUI, and relay-assisted setup
 - [docs/USER_GUIDE.md](docs/USER_GUIDE.md): installation, usage, GUI/TUI flows, troubleshooting
 - [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md): contributor workflow, build/test/release process
 - [docs/03_architecture.md](docs/03_architecture.md): codebase architecture and runtime responsibilities
