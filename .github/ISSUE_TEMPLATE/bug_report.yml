@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible defect in the app, docs, packaging, or workflows.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the current docs first so the report matches shipped behavior.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence describing the problem.
+      placeholder: Messages fail to send after reconnecting through a relay
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: List the exact steps needed to reproduce the problem.
+      placeholder: |
+        1. Start the GUI on Windows
+        2. Connect through a relay-backed invite
+        3. Send a file larger than 100 MiB
+        4. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: v1.8.1
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - macOS (Intel)
+        - macOS (Apple Silicon)
+        - Linux
+        - Other
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or diagnostics
+      description: Paste relevant excerpts or describe what is attached. Do not include private keys or secrets.
+      render: text

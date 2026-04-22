@@ -287,7 +287,11 @@ impl ProtocolMessage {
         }
 
         if b.starts_with(b"EPHEMERAL_KEY:") {
-            let public_key = b[14..].to_vec();
+            let public_key_bytes = &b[14..];
+            if public_key_bytes.len() != 32 {
+                return None;
+            }
+            let public_key = public_key_bytes.to_vec();
             return Some(Self::EphemeralKey { public_key });
         }
 

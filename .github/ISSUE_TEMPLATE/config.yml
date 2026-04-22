@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Responsible security disclosure
+    url: https://github.com/fibo3090-code/secure-p2p-chat/blob/main/SECURITY.md
+    about: Use the private reporting guidance in SECURITY.md for sensitive vulnerabilities.
+  - name: Documentation and onboarding
+    url: https://github.com/fibo3090-code/secure-p2p-chat/blob/main/docs/TUTORIAL.md
+    about: Start here for setup, first-run, and troubleshooting before opening a support issue.

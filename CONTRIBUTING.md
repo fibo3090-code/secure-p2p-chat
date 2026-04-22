@@ -34,14 +34,7 @@ If you touch packaging or release files, also validate the relevant scripts manu
 
 ## Bug Reports
 
-Open an issue with:
-
-- A clear title.
-- Exact reproduction steps.
-- Expected behavior.
-- Actual behavior.
-- Platform and Rust version if relevant.
-- Screenshots or logs when useful.
+Use the GitHub issue forms for bug reports and feature requests so reports include reproduction, impact, and environment details up front.
 
 Check the docs first so the report is based on current behavior, not an outdated assumption.
 

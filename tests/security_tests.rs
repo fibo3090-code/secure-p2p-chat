@@ -51,6 +51,28 @@ fn test_protocol_message_input_limits() {
 }
 
 #[test]
+fn test_legacy_ephemeral_key_requires_exact_length() {
+    let oversized = vec![b'A'; 8 * 1024 * 1024];
+    let mut oversized_msg = b"EPHEMERAL_KEY:".to_vec();
+    oversized_msg.extend_from_slice(&oversized);
+    assert!(ProtocolMessage::from_plain_bytes(&oversized_msg).is_none());
+
+    let mut undersized_msg = b"EPHEMERAL_KEY:".to_vec();
+    undersized_msg.extend_from_slice(&[0u8; 31]);
+    assert!(ProtocolMessage::from_plain_bytes(&undersized_msg).is_none());
+
+    let valid_key = [7u8; 32];
+    let mut valid_msg = b"EPHEMERAL_KEY:".to_vec();
+    valid_msg.extend_from_slice(&valid_key);
+    let parsed = ProtocolMessage::from_plain_bytes(&valid_msg);
+
+    assert!(matches!(
+        parsed,
+        Some(ProtocolMessage::EphemeralKey { public_key }) if public_key == valid_key
+    ));
+}
+
+#[test]
 fn test_binary_protocol_limits() {
     let mut oversized_text = Vec::new();
     oversized_text.push(2u8); // Text tag

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Hardened HKDF session-key derivation to use explicit zero-initialized output buffers instead of misleading random prefill.
+- Prevented AES-GCM nonce-counter wraparound so the transport now fails closed instead of risking nonce reuse after exhaustion.
+- Rejected malformed legacy `EPHEMERAL_KEY:` payloads before allocation and added regression coverage for oversized handshake inputs.
+
+### GitHub
+
+- Added structured GitHub issue forms and a pull request template so bug reports, feature requests, and security triage come in with the context needed for faster review.
+
 ## [1.8.1] - 2026-04-22
 
 ### Fixed

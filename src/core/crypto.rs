@@ -319,8 +319,7 @@ pub fn derive_session_key(
     // Salt is now supported (and recommended to be transcript hash)
     let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
 
-    // Initialize with random bytes to avoid any fixed-value key material pattern.
-    let mut session_key: [u8; AES_KEY_SIZE] = rand::random();
+    let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
 
@@ -344,8 +343,7 @@ pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> 
     // Nonce acts as salt for additional entropy
     let hkdf = Hkdf::<Sha256>::new(Some(nonce), current_key);
 
-    // Initialize with random bytes to avoid any fixed-value key material pattern.
-    let mut next_key: [u8; AES_KEY_SIZE] = rand::random();
+    let mut next_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(b"key-rotation", &mut next_key)
         .expect("HKDF expand should not fail with valid length");
 
@@ -423,10 +421,15 @@ impl AesCipher {
     /// * `plaintext` - Data to encrypt
     /// * `aad` - Optional Additional Authenticated Data (binds authenticity context)
     pub fn encrypt(&self, plaintext: &[u8], aad: Option<&[u8]>) -> Vec<u8> {
-        // Get next counter value atomically
+        // Reserve the next counter value atomically without allowing wraparound.
         let counter = self
             .nonce_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.checked_add(1),
+            )
+            .unwrap_or_else(|_| panic!("AES-GCM nonce counter exhausted; rekey required"));
 
         // Build nonce: session_id (4 bytes) || counter (8 bytes)
         let mut nonce_bytes = [0u8; crate::AES_NONCE_SIZE];
@@ -588,6 +591,19 @@ mod tests {
         }
 
         assert!(cipher.decrypt(&encrypted, None).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "AES-GCM nonce counter exhausted; rekey required")]
+    fn test_aes_nonce_counter_exhaustion_panics() {
+        let key: [u8; 32] = rand::thread_rng().gen();
+        let cipher = AesCipher::new(&key).unwrap();
+
+        cipher
+            .nonce_counter
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+
+        let _ = cipher.encrypt(b"nonce exhaustion", None);
     }
 
     #[test]

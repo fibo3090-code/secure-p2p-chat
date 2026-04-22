@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a focused improvement with clear user impact.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: input
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user or maintainer problem does this address?
+      placeholder: Relay setup is too manual for first-time users
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful change.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include rejected options if you already explored them.
+  - type: textarea
+    id: impact
+    attributes:
+      label: User impact
+      description: Explain who benefits and any tradeoffs.
+    validations:
+      required: true
