@@ -5,7 +5,10 @@ use uuid::Uuid;
 
 #[test]
 fn parse_commands_cover_core_paths() {
-    assert_eq!(TuiApp::parse_command(":help").unwrap(), TuiCommand::Help);
+    assert_eq!(
+        TuiApp::parse_command(":help").unwrap(),
+        TuiCommand::Help(None)
+    );
     assert_eq!(TuiApp::parse_command(":quit").unwrap(), TuiCommand::Quit);
     assert_eq!(
         TuiApp::parse_command(":host 9090").unwrap(),
@@ -43,7 +46,7 @@ fn key_flow_enters_and_submits_command_mode() {
     app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert_eq!(app.mode, TuiMode::Normal);
-    assert_eq!(app.take_pending_command(), Some(TuiCommand::Help));
+    assert_eq!(app.take_pending_command(), Some(TuiCommand::Help(None)));
 }
 
 #[test]

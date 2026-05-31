@@ -606,6 +606,11 @@ impl Identity {
         self.encrypted_private_key.is_some() && self.private_key_pem_plaintext.is_none()
     }
 
+    /// True if the private key has been encrypted with a password (persisted form).
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted_private_key.is_some()
+    }
+
     /// Derive a stable 32-byte history encryption key from the private key.
     /// Requires the identity to be unlocked (private key available).
     pub fn history_key(&self) -> Result<[u8; 32]> {

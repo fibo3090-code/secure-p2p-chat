@@ -50,8 +50,11 @@ src/
     styling.rs
     widgets.rs
   tui/
-    app.rs
-    ui.rs
+    app.rs          state machine, key routing, command execution
+    command.rs      command language (TuiCommand) + parser + registry
+    input.rs        EditableField (cursor-aware UTF-8 text editing)
+    overlays.rs     modal overlays (verify, contacts, settings, etc.)
+    ui.rs           frame composition (chat list, messages, toasts)
 ```
 
 ## Module Responsibilities
@@ -130,7 +133,13 @@ src/
 
 ### `src/tui/`
 
-- ratatui interface, command mode, keyboard workflows
+- ratatui interface: command mode with live autocomplete, modal overlays
+  (fingerprint verification, password unlock, contacts, settings, identity,
+  transfers, help), auto-scrolling message view, toast stack, and a typed
+  command language that exposes every action (so the app is fully usable
+  from the keyboard or driven programmatically)
+- shares the same `ChatManager` backend as the GUI, including fingerprint
+  confirmation, encrypted-history persistence, and auto-rehost
 
 ## Important Runtime Rules
 

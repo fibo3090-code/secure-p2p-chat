@@ -4,8 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **TUI overhaul**: the terminal interface is now fully usable on its own. Added a typed command language that exposes every action (connections, contacts, invites, file send, settings, identity, diagnostics), with a live autocomplete menu in command mode (Tab to complete, ↑/↓ to choose).
+- TUI modal overlays: in-terminal fingerprint verification (`y`/`n` or `:verify`), password unlock / set-password on startup, contacts, settings, identity (with the same safety-color grid as the GUI), file-transfer progress, and a scrollable help/keybinding reference.
+- TUI quality-of-life: auto-scrolling message view with clamping, proper cursor-aware text editing (mid-line edits, word delete, command history), a colored toast stack, unread/typing indicators, a readable status bar, and graceful encrypted-history save on a timer and on exit.
+
 ### Fixed
 
+- TUI could not complete a default handshake because it never surfaced fingerprint verification, and it never persisted chat history; both are fixed.
+- TUI no longer registered each keystroke twice on Windows (now only acts on key-press events, not key-release).
+- `ChatManager::rename_chat` truncated titles by bytes, which could panic on a multi-byte/emoji boundary; it now truncates by characters.
 - Hardened HKDF session-key derivation to use explicit zero-initialized output buffers instead of misleading random prefill.
 - Prevented AES-GCM nonce-counter wraparound so the transport now fails closed instead of risking nonce reuse after exhaustion.
 - Rejected malformed legacy `EPHEMERAL_KEY:` payloads before allocation and added regression coverage for oversized handshake inputs.

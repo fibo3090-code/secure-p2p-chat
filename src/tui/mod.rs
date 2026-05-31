@@ -1,4 +1,7 @@
 pub mod app;
+pub mod command;
+pub mod input;
+pub mod overlays;
 pub mod ui;
 
 use crate::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
@@ -6,7 +9,7 @@ use anyhow::Result;
 use egui_tracing::tracing::EventCollector;
 use ratatui::prelude::*;
 use ratatui_crossterm::crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{self, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -28,22 +31,21 @@ pub struct TuiLaunchConfig {
 pub async fn run(event_collector: EventCollector, launch: TuiLaunchConfig) -> Result<()> {
     enable_raw_mode()?;
 
+    // NOTE: mouse capture is intentionally NOT enabled — we handle no mouse
+    // events and capturing would block the terminal's native text selection/copy.
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = TuiApp::new(event_collector)?;
+    app.prompt_auth_if_needed();
     apply_launch_config(&mut app, &launch).await;
 
     let res = run_app(&mut terminal, app).await;
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
@@ -60,18 +62,13 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
     }
 
     if let Some(target) = launch.connect.as_deref() {
-        let cmd = format!(":connect {}", target);
-        match TuiApp::parse_command(&cmd) {
-            Ok(connect_cmd @ TuiCommand::Connect { .. }) => {
-                app.execute_command(connect_cmd).await;
-            }
+        match TuiApp::parse_command(&format!(":connect {}", target)) {
+            Ok(cmd @ TuiCommand::Connect { .. }) => app.execute_command(cmd).await,
             Ok(_) => {}
-            Err(e) => {
-                app.chat_manager.add_toast(
-                    crate::types::ToastLevel::Error,
-                    format!("Invalid --connect: {}", e),
-                );
-            }
+            Err(e) => app.chat_manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Invalid --connect: {}", e),
+            ),
         }
     }
 
@@ -81,86 +78,60 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
             None => format!(":host-relay {}", relay),
         };
         match TuiApp::parse_command(&cmd) {
-            Ok(host_cmd @ TuiCommand::HostRelay { .. }) => {
-                app.execute_command(host_cmd).await;
-            }
+            Ok(cmd @ TuiCommand::HostRelay { .. }) => app.execute_command(cmd).await,
             Ok(_) => {}
-            Err(e) => {
-                app.chat_manager.add_toast(
-                    crate::types::ToastLevel::Error,
-                    format!("Invalid relay host launch: {}", e),
-                );
-            }
+            Err(e) => app.chat_manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Invalid relay host launch: {}", e),
+            ),
         }
     }
 
-    if let Some(relay) = launch.relay_connect.as_deref() {
-        if let Some(token) = launch.relay_token.as_deref() {
-            let cmd = format!(":connect-relay {} {}", relay, token);
-            match TuiApp::parse_command(&cmd) {
-                Ok(connect_cmd @ TuiCommand::ConnectRelay { .. }) => {
-                    app.execute_command(connect_cmd).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    app.chat_manager.add_toast(
-                        crate::types::ToastLevel::Error,
-                        format!("Invalid relay connect launch: {}", e),
-                    );
-                }
-            }
+    if let (Some(relay), Some(token)) = (
+        launch.relay_connect.as_deref(),
+        launch.relay_token.as_deref(),
+    ) {
+        match TuiApp::parse_command(&format!(":connect-relay {} {}", relay, token)) {
+            Ok(cmd @ TuiCommand::ConnectRelay { .. }) => app.execute_command(cmd).await,
+            Ok(_) => {}
+            Err(e) => app.chat_manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Invalid relay connect launch: {}", e),
+            ),
         }
     }
 }
 
+/// Place the hardware cursor in the input/command box using the editable field's
+/// own cursor position, reusing the shared layout so it never drifts from the UI.
 fn set_cursor_position(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &TuiApp,
 ) -> Result<()> {
     let size: Rect = terminal.size()?.into();
+    let input_area = ui::regions(size).input;
 
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
-        .split(size);
-
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
-        .split(vertical[0]);
-
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(5)].as_ref())
-        .split(columns[1]);
-
-    let input_area = right_chunks[1];
-
-    let show_cursor = app.focus == TuiFocus::Input || app.mode == TuiMode::Command;
+    let show_cursor =
+        !app.overlay.is_open() && (app.mode == TuiMode::Command || app.focus == TuiFocus::Input);
     if !show_cursor {
         terminal.hide_cursor()?;
         return Ok(());
     }
 
-    terminal.show_cursor()?;
-
-    let text = if app.mode == TuiMode::Command {
-        app.command_buffer.as_str()
+    let (field, prefix) = if app.mode == TuiMode::Command {
+        (&app.command_field, 1u16) // account for the leading ':'
     } else {
-        app.input_text.as_str()
+        (&app.input_field, 0u16)
     };
-    let lines: Vec<&str> = text.split('\n').collect();
-    let last_line = lines.last().copied().unwrap_or("");
-    let row = lines.len().saturating_sub(1) as u16;
+    let (row, col) = field.cursor_display();
+
     let max_inner_rows = input_area.height.saturating_sub(2);
-    let y = input_area.y + 1 + row.min(max_inner_rows.saturating_sub(1));
-
-    let col = last_line.chars().count() as u16;
     let max_inner_cols = input_area.width.saturating_sub(2);
-    let x = input_area.x + 1 + col.min(max_inner_cols.saturating_sub(1));
+    let y = input_area.y + 1 + row.min(max_inner_rows.saturating_sub(1));
+    let x = input_area.x + 1 + (col + prefix).min(max_inner_cols.saturating_sub(1));
 
+    terminal.show_cursor()?;
     terminal.set_cursor_position((x, y))?;
-
     Ok(())
 }
 
@@ -176,24 +147,24 @@ async fn run_app(
             app.execute_command(cmd).await;
         }
 
-        terminal.draw(|f| {
-            ui(f, &mut app);
-        })?;
-
+        terminal.draw(|f| ui(f, &mut app))?;
         set_cursor_position(terminal, &app)?;
 
         if app.should_quit {
+            app.shutdown_save();
             return Ok(());
         }
 
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => app.handle_key_event(key),
-                Event::Resize(_, _) => {}
-                _ => {}
+            // On Windows, crossterm reports both key-press and key-release events;
+            // only act on presses so each keystroke registers once.
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key_event(key);
+                }
             }
-
             if app.should_quit {
+                app.shutdown_save();
                 return Ok(());
             }
         }

@@ -45,9 +45,11 @@ cargo run --release
 cargo run --release -- --tui
 ```
 
+The terminal UI is fully featured and keyboard-driven: press `:` and start typing for an autocomplete command menu, or `:help` for the full command and keybinding reference. Every action — connecting, fingerprint verification, contacts, invites, file transfer, settings — is reachable without leaving the terminal. See [docs/USER_GUIDE.md](docs/USER_GUIDE.md#tui-reference) for the command list.
+
 ### First Launch
 
-On first launch, the app creates an identity and requires password protection before normal use. The unlock/set-password screen is blocking by design.
+On first launch, the app creates an identity and requires password protection before normal use. The unlock/set-password screen is blocking by design (a password overlay in the TUI, a blocking screen in the GUI).
 
 ### Trust Model
 

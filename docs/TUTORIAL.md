@@ -122,6 +122,8 @@ Each peer has a fingerprint. Verify that fingerprint over a separate trusted cha
 
 Do not skip this just because the app connected successfully. The app uses TOFU, so first contact only becomes meaningful if you verify the other side out of band.
 
+In the TUI a verification overlay opens automatically on a new connection: compare the safety grid / fingerprint, then press `y` to accept or `n` to reject (equivalently `:verify accept` / `:verify reject`).
+
 If the fingerprint changes unexpectedly later:
 
 - stop
@@ -148,6 +150,7 @@ TUI:
 - `Enter` sends
 - `Ctrl+J` inserts a newline
 - `Tab` cycles focus
+- the view auto-scrolls to the newest message
 
 ## 6. Share a file
 
@@ -165,20 +168,25 @@ If a transfer fails:
 - check read permission on the source path
 - check write permission on the download directory
 
+In the TUI, send a file with `:send <path>` and watch progress with `:transfers`.
+
 ## 7. Learn the TUI command set
 
-If you use the terminal UI regularly, these are the core commands:
+On first launch the TUI prompts you to set or unlock your identity password.
+After that, press `:` and start typing — an autocomplete menu lists matching
+commands (`Tab` completes, `↑`/`↓` choose). Press `:help` any time for the full
+list and key reference. Common commands:
 
 ```text
 :host [port]
 :connect <host[:port]>
 :host-relay <relay[:port]> [token]
 :connect-relay <relay[:port]> <token>
-:disconnect
-:diagnostics
-:rename <title>
-:help
-:quit
+:contacts                 :contact-add <name> <host:port> [fp]
+:invite                   :import <invite-link>
+:send <path>              :transfers
+:identity                 :settings        :set <key> <value>
+:disconnect   :rename <title>   :diagnostics   :help   :quit
 ```
 
 Recommended first TUI session:
@@ -192,6 +200,8 @@ On the second machine:
 ```text
 :connect 192.168.1.40:12345
 ```
+
+Then accept the fingerprint overlay (`y`) on both sides and start chatting.
 
 ## 8. Export diagnostics when something breaks
 

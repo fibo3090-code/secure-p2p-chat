@@ -389,6 +389,16 @@ impl ChatManager {
         self.sessions.insert(chat_id, handle);
     }
 
+    /// Helper to inject a fingerprint-confirmation channel for testing the
+    /// verification flow without a live network session.
+    pub fn add_fingerprint_confirm_sender_for_test(
+        &mut self,
+        chat_id: Uuid,
+        tx: mpsc::UnboundedSender<bool>,
+    ) {
+        self.fingerprint_confirm_senders.insert(chat_id, tx);
+    }
+
     /// Add a contact
     pub fn add_contact(
         &mut self,
@@ -612,11 +622,9 @@ impl ChatManager {
 
     /// Rename a conversation/chat
     pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
-        let title = if new_title.len() > 50 {
-            new_title[..50].to_string()
-        } else {
-            new_title
-        };
+        // Truncate by characters (not bytes) so multi-byte/emoji titles never
+        // panic on a non-char-boundary slice.
+        let title: String = new_title.chars().take(50).collect();
 
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.title = title;
@@ -1267,6 +1275,11 @@ impl ChatManager {
     /// Get all chat IDs
     pub fn chat_ids(&self) -> Vec<Uuid> {
         self.chats.keys().copied().collect()
+    }
+
+    /// Snapshot of all tracked file transfers (for read-only UI display).
+    pub fn active_transfers_snapshot(&self) -> Vec<FileTransferState> {
+        self.active_transfers.values().cloned().collect()
     }
 
     /// Delete a chat and its associated session

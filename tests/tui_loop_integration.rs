@@ -19,17 +19,19 @@ fn input_flow_supports_multiline_and_send() {
     app.sync_chat_ids();
     app.chat_list_state.select(Some(0));
     app.focus = TuiFocus::Input;
+    // Isolate input/send behavior from the typing-indicator traffic.
+    app.chat_manager.config.enable_typing_indicators = false;
 
     app.handle_key_event(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
     app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
     app.handle_key_event(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
 
-    assert_eq!(app.input_text, "Hi\n!");
+    assert_eq!(app.input_field.text(), "Hi\n!");
 
     app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_eq!(app.input_text, "");
+    assert_eq!(app.input_field.text(), "");
     let msg = rx.try_recv().expect("message sent to session");
     match msg {
         ProtocolMessage::Text { text, .. } => assert_eq!(text, "Hi\n!"),
@@ -42,8 +44,10 @@ async fn quit_command_terminates_loop_flag() {
     let mut app = TuiApp::new(EventCollector::new()).unwrap();
     assert!(!app.should_quit);
 
+    // :quit now asks for confirmation; the loop only exits after 'y'.
     app.execute_command(TuiCommand::Quit).await;
-
+    assert!(!app.should_quit);
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(app.should_quit);
 }
 

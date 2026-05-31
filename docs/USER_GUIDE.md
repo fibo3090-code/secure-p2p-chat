@@ -215,28 +215,100 @@ If you see transfer problems:
 
 ## TUI Reference
 
-### Main controls
+The TUI is fully usable without the mouse, and every action also has a typed
+command — so you can drive the whole app from the keyboard (or script it).
 
-- `:` enters command mode
-- `Enter` sends a message
-- `Ctrl+J` inserts a newline
-- `Tab` cycles focus
-- `Esc` returns focus to the chat list
-- `q` quits when the input is not focused
+### Keys
+
+- `:` — enter command mode (when the message box is empty or unfocused)
+- `Enter` — send the message / run the command
+- `Ctrl+J` — newline inside the message
+- `Tab` — cycle focus: chat list → messages → input
+- `↑` / `↓` — select a chat, scroll messages, or recall command history,
+  depending on focus
+- `PgUp` / `PgDn` — scroll the message view
+- `Ctrl+L` — copy the event log to the clipboard
+- `Esc` — close an overlay / leave command mode / focus the chat list
+- `q` — quit (asks to confirm) when the input is not focused
+- `?` — open the help overlay
+- The message view auto-scrolls to the newest message; scroll up to read
+  back, and it re-sticks to the bottom when you return there.
+
+Chat-list markers: `H` hosting · `●` connected · `○` offline · `*` unread.
+
+### Command autocomplete
+
+In command mode, start typing a command name and a popup of matching commands
+appears above the input:
+
+- `↑` / `↓` — move through the matches
+- `Tab` — complete to the highlighted command
+- `Enter` — run it · `Esc` — cancel
+
+On an empty `:` prompt the menu is hidden, so `↑`/`↓` recall previous commands.
+
+### Overlays
+
+Some commands open a focused, keyboard-driven panel:
+
+- **Fingerprint verification** — appears automatically on a new connection.
+  Compare the safety grid / 64-char fingerprint with your peer out of band,
+  then press `y` to accept or `n` to reject (or `:verify accept|reject`).
+- **Password** — on startup, unlock an encrypted identity or set a password on
+  a new one. Reachable later via `:unlock` / `:set-password`.
+- **Contacts** (`:contacts`) — `↑`/`↓` to pick, `Enter` to connect.
+- **Settings** (`:settings`) — `Enter` toggles the selected option.
+- **Identity** (`:identity`), **Transfers** (`:transfers`), **Help** (`:help`),
+  and the invite link panel are read-only; press `Esc` to close.
 
 ### Commands
 
 ```text
-:host [port]
-:connect <host[:port]>
-:host-relay <relay[:port]> [token]
-:connect-relay <relay[:port]> <token>
-:disconnect
-:diagnostics
-:rename <title>
-:help
-:quit
+Connections
+  :host [port]                              listen for an incoming peer
+  :connect <host[:port]>                    connect to a hosting peer
+  :host-relay <relay[:port]> [token]        host via a relay (copies an invite)
+  :connect-relay <relay[:port]> <token>     connect through a relay
+  :disconnect                               remove / disconnect the selected chat
+  :stop-host                                stop listening
+
+Contacts & invites
+  :contacts                                 open the contacts list
+  :contact-add <name> <host:port> [fp]      save a contact
+  :contact-connect <name|#>                 connect to a saved contact
+  :contact-remove <name|#>                  delete a contact
+  :contact-rename <name|#> <new name>       rename a contact
+  :invite [host:port]                       generate a signed invite link
+  :invite-relay <relay[:port]>              host via relay + generate an invite
+  :import <invite-link>                     import an invite as a contact
+
+Messaging & files
+  :send <path>                              send a file to the selected chat
+  :transfers                                show active file transfers
+  :rename <title>                           rename the selected chat
+  :delete                                   delete the selected chat
+  :clear-history                            erase all chats and contacts
+
+Identity & security
+  :identity                                 show your fingerprint + safety grid
+  :verify <accept|reject>                   answer a pending fingerprint check
+  :unlock [password]                        unlock a password-protected identity
+  :set-password <password>                  set or change your password
+
+Settings & app
+  :settings                                 open the settings panel
+  :set <key> <value>                        change a setting (see below)
+  :diagnostics                              export a diagnostics bundle
+  :logs                                     copy the event log to the clipboard
+  :help [command]                           show help
+  :quit                                     save and exit (alias :q, :q! to skip confirm)
 ```
+
+`:set` keys: `download-dir`, `listen-port`, `notifications`, `typing`,
+`auto-accept`, `auto-host`, `mdns`, `theme` (`light|dark|midnight|forest`).
+Booleans accept `on`/`off`. Example: `:set notifications off`.
+
+History is saved automatically (encrypted) on a timer and on exit.
 
 ### When to prefer the TUI
 
