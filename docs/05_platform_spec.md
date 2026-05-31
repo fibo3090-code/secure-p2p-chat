@@ -203,9 +203,9 @@ TUI.
 Each phase = its own spec → plan → build.
 
 ```text
-Phase 0  Workspace refactor        (foundation; no behavior change)
+Phase 0  Workspace refactor        (foundation; no behavior change)   ✅ done
    │
-Phase 1  Party Server MVP          ← unblocks the classmates
+Phase 1  Party Server MVP          ← unblocks the classmates  (next)
    │     (Administered tier)
 Phase 2  Drive / files
    │
@@ -218,9 +218,11 @@ Phase 5  Per-server identities
 Independent:  P2P connection passwords + conversation lock  (slot in anytime)
 ```
 
-- **Phase 0 — Workspace refactor.** Split into `core` / `client` / `server` crates
-  with **no behavior change**; CI, build, and packaging updated (mind the
-  binary-naming caveat above). The foundation that lets the server share `core`.
+- **Phase 0 — Workspace refactor. ✅ Done.** Split into `core` / `client` /
+  `server` crates with no behavior change; CI, build, and packaging updated (the
+  client binary kept the `encodeur_rsa_rust` name, so packaging paths are
+  unchanged). Test coverage was broadened in the same effort — see
+  [Test Coverage](#test-coverage).
 - **Phase 1 — Party Server MVP (Administered).** Server binary with SQLite + blob
   store; join-by-IP (+ optional password) + username; member directory + presence;
   channels; server-routed group + DM messaging; offline buffering; the unified
@@ -240,10 +242,11 @@ Independent:  P2P connection passwords + conversation lock  (slot in anytime)
 
 ## Per-Phase Verification
 
-- **Phase 0**: `cargo build` / `cargo test` / `cargo clippy --all-targets -D
+- **Phase 0** ✅: `cargo build` / `cargo test` / `cargo clippy --all-targets -D
   warnings` / `cargo fmt --all -- --check` green across the `--workspace`; the
-  existing app runs unchanged. (CI in `.github/workflows/ci.yml` must be updated to
-  the workspace; builds must use a target dir outside OneDrive per project memory.)
+  existing app runs unchanged. CI was moved to `--workspace`; the client binary
+  name was preserved so packaging is untouched. **211 tests pass** (see
+  [Test Coverage](#test-coverage)).
 - **Phase 1**: two clients join the owner-hosted server over LAN, appear in the
   directory, and exchange channel + DM messages; a message sent while a peer is
   offline is delivered on reconnect and the server stores it (Administered).
@@ -251,8 +254,41 @@ Independent:  P2P connection passwords + conversation lock  (slot in anytime)
 - **Later phases**: dedup / refcount / quota unit tests; governance consent-flow
   tests; E2EE group-key rotation tests; render-no-panic tests for new UI.
 
+## Test Coverage
+
+The workspace is covered by **211 automated tests** (`cargo test --workspace`),
+spanning unit, integration, and end-to-end suites:
+
+- **Protocol** (`core/src/core/protocol.rs`): round-trip symmetry for every
+  `ProtocolMessage` variant, edge values (empty/unicode/max-size), malformed and
+  oversized-payload rejection, `TextChunk` invariants, legacy ASCII parsing,
+  `IdentityProof` serde, and debug redaction.
+- **Crypto / handshake** (`core/src/core`, `core/src/network/session.rs`): RSA/AEAD/
+  X25519/HKDF, transcript-bound AAD, replay protection, and key rotation.
+- **End-to-end pipeline** (`core/tests/session_e2e.rs`): the full A-to-Z path over
+  the real session functions — version → ECDH → key derivation → encrypted identity
+  proof → TOFU confirm → text, typing, file transfer, ping → disconnect, plus the
+  fingerprint-rejection path.
+- **Relay** (`core/tests/relay_e2e.rs`): two peers pair through a self-hosted relay
+  and exchange an application message over the forwarded encrypted transport.
+- **Types** (`core/src/types.rs`): `Config` defaults (privacy-conservative),
+  serde round-trips, and backward-compatible deserialization of older payloads.
+- **Identity / persistence**: encrypted identity storage, encrypted-history
+  round-trip, wrong-key rejection, corrupt-file handling, and format auto-detection.
+- **ChatManager** (`client/tests/feature_coverage_tests.rs` + in-file): group chats,
+  rename/delete, history clearing, toast lifecycle, file-transfer state, typing
+  indicators, contact import/association, invites (v1/v2/v3 + tamper rejection), and
+  invite-QR generation.
+- **TUI**: command parsing, focus cycling, message round-trip, multi-chat isolation,
+  and typing flow.
+
+The one area not deeply automated is GUI pixel rendering (egui); the logic behind
+it (`ChatManager`) is covered directly.
+
 ## Status
 
-This spec is the approved canonical north star for the platform direction. The
-next action is to write the **Phase 0** (workspace refactor) implementation plan
-before any code lands.
+This spec is the approved canonical north star for the platform direction.
+**Phase 0 (workspace refactor) is complete** and the suite is green. The next
+milestone is **Phase 1 — Party Server MVP (Administered)**, which should get its
+own spec → plan before implementation begins. The Independent item (P2P connection
+passwords + conversation lock) can be slotted in at any time.
