@@ -572,3 +572,239 @@ impl ProtocolMessage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    /// Encode then decode must yield an identical message for every variant.
+    fn assert_roundtrip(msg: ProtocolMessage) {
+        let bytes = msg.to_plain_bytes();
+        let decoded = ProtocolMessage::from_plain_bytes(&bytes)
+            .unwrap_or_else(|| panic!("decode failed for {:?}", msg));
+        assert_eq!(decoded, msg, "round-trip mismatch for {:?}", msg);
+    }
+
+    #[test]
+    fn roundtrip_all_variants_representative() {
+        assert_roundtrip(ProtocolMessage::Version { version: 3 });
+        assert_roundtrip(ProtocolMessage::EphemeralKey {
+            public_key: vec![7u8; 32],
+        });
+        assert_roundtrip(ProtocolMessage::SupportedSignatureSchemes {
+            schemes: vec![
+                SignatureScheme::RsaPss.to_u8(),
+                SignatureScheme::Ed25519.to_u8(),
+            ],
+        });
+        assert_roundtrip(ProtocolMessage::Text {
+            text: "hello world".to_string(),
+            timestamp: 1_700_000_000_000,
+            seq: 42,
+        });
+        assert_roundtrip(ProtocolMessage::TextChunk {
+            message_id: Uuid::new_v4(),
+            chunk_index: 2,
+            total_chunks: 5,
+            text_part: "part".to_string(),
+            timestamp: 123,
+            seq: 9,
+        });
+        assert_roundtrip(ProtocolMessage::FileMeta {
+            filename: "report.pdf".to_string(),
+            size: 1024,
+            seq: 1,
+        });
+        assert_roundtrip(ProtocolMessage::FileChunk {
+            chunk: vec![1, 2, 3, 4, 5],
+            seq: 2,
+        });
+        assert_roundtrip(ProtocolMessage::FileEnd { seq: 3 });
+        assert_roundtrip(ProtocolMessage::Ping { seq: 4 });
+        assert_roundtrip(ProtocolMessage::TypingStart { seq: 5 });
+        assert_roundtrip(ProtocolMessage::TypingStop { seq: 6 });
+        assert_roundtrip(ProtocolMessage::Rekey {
+            nonce: vec![0xAB; 16],
+            seq: 7,
+        });
+    }
+
+    #[test]
+    fn roundtrip_edge_values() {
+        // Empty and unicode text.
+        assert_roundtrip(ProtocolMessage::Text {
+            text: String::new(),
+            timestamp: 0,
+            seq: 0,
+        });
+        assert_roundtrip(ProtocolMessage::Text {
+            text: "héllo 🌍 سلام こんにちは".to_string(),
+            timestamp: u64::MAX,
+            seq: u64::MAX,
+        });
+        // Empty file chunk and a max-size chunk.
+        assert_roundtrip(ProtocolMessage::FileChunk {
+            chunk: Vec::new(),
+            seq: 1,
+        });
+        assert_roundtrip(ProtocolMessage::FileChunk {
+            chunk: vec![0xCD; crate::FILE_CHUNK_SIZE],
+            seq: 2,
+        });
+        // Largest permitted text chunk part.
+        assert_roundtrip(ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: 1,
+            text_part: "x".repeat(crate::TEXT_CHUNK_BYTES),
+            timestamp: 1,
+            seq: 1,
+        });
+        // File at exactly the maximum allowed size.
+        assert_roundtrip(ProtocolMessage::FileMeta {
+            filename: "big.bin".to_string(),
+            size: crate::MAX_FILE_SIZE,
+            seq: 1,
+        });
+    }
+
+    #[test]
+    fn filemeta_sanitizes_path_traversal_on_decode() {
+        let msg = ProtocolMessage::FileMeta {
+            filename: "../../etc/passwd".to_string(),
+            size: 10,
+            seq: 1,
+        };
+        let decoded = ProtocolMessage::from_plain_bytes(&msg.to_plain_bytes()).unwrap();
+        match decoded {
+            ProtocolMessage::FileMeta { filename, .. } => {
+                assert!(!filename.contains(".."));
+                assert!(!filename.contains('/'));
+            }
+            other => panic!("expected FileMeta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn malformed_inputs_return_none() {
+        // Empty buffer.
+        assert!(ProtocolMessage::from_plain_bytes(&[]).is_none());
+        // Truncated Text (tag present, missing length-prefixed payload).
+        assert!(ProtocolMessage::from_plain_bytes(&[2u8, 0, 0]).is_none());
+        // Unknown tag with no legacy prefix.
+        assert!(ProtocolMessage::from_plain_bytes(&[200u8, 1, 2, 3]).is_none());
+        // Truncated FileEnd (needs 8 bytes of seq).
+        assert!(ProtocolMessage::from_plain_bytes(&[5u8, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn oversized_payloads_are_rejected() {
+        // FileMeta with size above MAX_FILE_SIZE must not decode.
+        let bad = ProtocolMessage::FileMeta {
+            filename: "x".to_string(),
+            size: crate::MAX_FILE_SIZE + 1,
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&bad.to_plain_bytes()).is_none());
+
+        // FileChunk larger than FILE_CHUNK_SIZE must not decode.
+        let bad_chunk = ProtocolMessage::FileChunk {
+            chunk: vec![0u8; crate::FILE_CHUNK_SIZE + 1],
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&bad_chunk.to_plain_bytes()).is_none());
+
+        // EphemeralKey longer than the 256-byte cap must not decode.
+        let bad_eph = ProtocolMessage::EphemeralKey {
+            public_key: vec![0u8; 300],
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&bad_eph.to_plain_bytes()).is_none());
+    }
+
+    #[test]
+    fn textchunk_invariants_enforced_on_decode() {
+        // total_chunks == 0 is invalid.
+        let zero_total = ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: 0,
+            text_part: "x".to_string(),
+            timestamp: 1,
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&zero_total.to_plain_bytes()).is_none());
+
+        // chunk_index >= total_chunks is invalid.
+        let oob = ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 3,
+            total_chunks: 3,
+            text_part: "x".to_string(),
+            timestamp: 1,
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&oob.to_plain_bytes()).is_none());
+    }
+
+    #[test]
+    fn legacy_ascii_formats_still_parse() {
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(b"VERSION:3"),
+            Some(ProtocolMessage::Version { version: 3 })
+        );
+        match ProtocolMessage::from_plain_bytes(b"TEXT:5:hi there") {
+            Some(ProtocolMessage::Text { text, seq, .. }) => {
+                assert_eq!(text, "hi there");
+                assert_eq!(seq, 5);
+            }
+            other => panic!("expected legacy Text, got {:?}", other),
+        }
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(b"PING:7"),
+            Some(ProtocolMessage::Ping { seq: 7 })
+        );
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(b"FILE_END:9"),
+            Some(ProtocolMessage::FileEnd { seq: 9 })
+        );
+    }
+
+    #[test]
+    fn identity_proof_serde_roundtrip_and_default_scheme() {
+        let proof = IdentityProof {
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----".to_string(),
+            signature: vec![9, 8, 7, 6],
+            version: PROTOCOL_VERSION as u32,
+            chat_id: Uuid::new_v4(),
+            signature_scheme: SignatureScheme::RsaPss,
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+        let decoded: IdentityProof = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.public_key_pem, proof.public_key_pem);
+        assert_eq!(decoded.signature, proof.signature);
+        assert_eq!(decoded.version, proof.version);
+        assert_eq!(decoded.chat_id, proof.chat_id);
+        assert_eq!(decoded.signature_scheme, proof.signature_scheme);
+
+        // JSON without a signature_scheme field falls back to the RSA-PSS default.
+        let json = format!(
+            r#"{{"public_key_pem":"k","signature":[1,2],"version":3,"chat_id":"{}"}}"#,
+            Uuid::nil()
+        );
+        let decoded: IdentityProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.signature_scheme, SignatureScheme::RsaPss);
+    }
+
+    #[test]
+    fn debug_redacts_message_contents() {
+        let msg = ProtocolMessage::Text {
+            text: "super-secret".to_string(),
+            timestamp: 0,
+            seq: 1,
+        };
+        let rendered = format!("{:?}", msg);
+        assert!(!rendered.contains("super-secret"));
+        assert!(rendered.contains("REDACTED"));
+    }
+}

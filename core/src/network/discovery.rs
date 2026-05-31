@@ -148,3 +148,43 @@ impl Drop for Discovery {
         let _ = self.unregister();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovered_peer_construction_and_clone() {
+        let peer = DiscoveredPeer {
+            name: "Laptop".to_string(),
+            address: "192.168.1.20".to_string(),
+            port: 12345,
+            fingerprint: Some("AB".repeat(32)),
+        };
+        let cloned = peer.clone();
+        assert_eq!(cloned.name, "Laptop");
+        assert_eq!(cloned.address, "192.168.1.20");
+        assert_eq!(cloned.port, 12345);
+        assert_eq!(
+            cloned.fingerprint.as_deref(),
+            Some("AB".repeat(32).as_str())
+        );
+        // Debug must render without panicking.
+        assert!(format!("{:?}", peer).contains("Laptop"));
+    }
+
+    /// Exercises the register → poll → unregister lifecycle when an mDNS daemon is
+    /// available. Sandboxed CI without multicast may be unable to start the
+    /// daemon; in that case the constructor path is still exercised and the test
+    /// does not fail on an environment limitation. `poll` is non-blocking.
+    #[test]
+    fn discovery_lifecycle_is_non_panicking_when_available() {
+        if let Ok(mut discovery) = Discovery::new() {
+            let _ = discovery.register("test-peer", 12345, "AA".repeat(32).as_str());
+            let peers = Arc::new(Mutex::new(Vec::new()));
+            discovery.poll(&peers); // must return immediately
+            let _ = discovery.unregister();
+            // Dropping also unregisters; must not panic.
+        }
+    }
+}

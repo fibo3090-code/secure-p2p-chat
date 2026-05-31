@@ -245,3 +245,121 @@ impl Default for Config {
 fn default_listen_port() -> u16 {
     crate::PORT_DEFAULT
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_default_is_privacy_conservative() {
+        let c = Config::default();
+        // Security/privacy-sensitive defaults must stay off.
+        assert!(
+            !c.auto_accept_files,
+            "files must not auto-accept by default"
+        );
+        assert!(
+            !c.auto_trust_on_first_use,
+            "TOFU auto-trust must be off by default"
+        );
+        assert!(!c.enable_mdns, "mDNS advertising must be off by default");
+        assert!(!c.auto_host_on_startup);
+        assert!(!c.auto_connect);
+        assert_eq!(c.listen_port, crate::PORT_DEFAULT);
+        assert_eq!(c.theme, Theme::Dark);
+        assert!(c.relay_server.is_none());
+    }
+
+    #[test]
+    fn config_serde_roundtrip_preserves_fields() {
+        let c = Config {
+            theme: Theme::Forest,
+            font_size: 18,
+            enable_mdns: true,
+            relay_server: Some("relay.example:9000".to_string()),
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.theme, Theme::Forest);
+        assert_eq!(back.font_size, 18);
+        assert!(back.enable_mdns);
+        assert_eq!(back.relay_server.as_deref(), Some("relay.example:9000"));
+    }
+
+    #[test]
+    fn config_deserializes_with_optional_fields_missing() {
+        // A minimal config that predates the newer #[serde(default)] fields must
+        // still load, filling defaults for auto_host_on_startup, listen_port, etc.
+        let json = r#"{
+            "download_dir": "Downloads",
+            "temp_dir": "temp",
+            "auto_accept_files": false,
+            "enable_notifications": true,
+            "enable_typing_indicators": true,
+            "show_log_terminal": false,
+            "theme": "Light",
+            "font_size": 14,
+            "auto_connect": false,
+            "notification_sound": "Default"
+        }"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.theme, Theme::Light);
+        assert!(!c.auto_host_on_startup);
+        assert_eq!(c.listen_port, crate::PORT_DEFAULT);
+        assert!(!c.auto_trust_on_first_use);
+        assert!(!c.enable_mdns);
+        assert!(c.relay_server.is_none());
+    }
+
+    #[test]
+    fn trust_state_default_is_unverified() {
+        assert_eq!(TrustState::default(), TrustState::Unverified);
+    }
+
+    #[test]
+    fn theme_and_notification_sound_serde_roundtrip() {
+        for theme in [Theme::Light, Theme::Dark, Theme::Midnight, Theme::Forest] {
+            let json = serde_json::to_string(&theme).unwrap();
+            let back: Theme = serde_json::from_str(&json).unwrap();
+            assert_eq!(theme, back);
+        }
+        for sound in [NotificationSound::None, NotificationSound::Default] {
+            let json = serde_json::to_string(&sound).unwrap();
+            let back: NotificationSound = serde_json::from_str(&json).unwrap();
+            assert_eq!(sound, back);
+        }
+    }
+
+    #[test]
+    fn message_content_serde_is_tagged() {
+        let file = MessageContent::File {
+            filename: "a.bin".to_string(),
+            size: 10,
+            path: None,
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        assert!(json.contains("\"type\":\"file\""));
+        let text = MessageContent::Text {
+            text: "hi".to_string(),
+        };
+        let json = serde_json::to_string(&text).unwrap();
+        assert!(json.contains("\"type\":\"text\""));
+    }
+
+    #[test]
+    fn contact_deserializes_without_contacts_2_0_fields() {
+        // Older persisted contacts lack trust_state/notes/tags/relay fields.
+        let json = format!(
+            r#"{{"id":"{}","name":"Bob","address":null,"fingerprint":null,
+                 "public_key":null,"created_at":"2020-01-01T00:00:00Z","last_seen":null}}"#,
+            Uuid::nil()
+        );
+        let c: Contact = serde_json::from_str(&json).unwrap();
+        assert_eq!(c.name, "Bob");
+        assert_eq!(c.trust_state, TrustState::Unverified);
+        assert!(c.notes.is_empty());
+        assert!(c.tags.is_empty());
+        assert!(c.relay_server.is_none());
+    }
+}

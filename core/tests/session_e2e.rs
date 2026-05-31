@@ -1,0 +1,279 @@
+//! End-to-end pipeline tests driving the real Protocol v3 session functions
+//! (`run_host_session_over_stream` / `run_client_session_over_stream`) over an
+//! in-memory duplex stream — the full A-to-Z path: version exchange → X25519
+//! ephemeral key exchange → session-key derivation → encrypted identity proof →
+//! TOFU fingerprint confirmation → encrypted transport (text, typing, file
+//! transfer, ping) → disconnect.
+
+use messenger_core::core::{generate_rsa_keypair, ProtocolMessage};
+use messenger_core::network::{run_client_session_over_stream, run_host_session_over_stream};
+use messenger_core::types::SessionEvent;
+use messenger_core::RSA_KEY_BITS;
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+type Events = mpsc::UnboundedReceiver<SessionEvent>;
+type Outbound = mpsc::UnboundedSender<ProtocolMessage>;
+
+const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Both handshake roles pause for TOFU confirmation, but emit different events:
+/// the host emits `NewConnection`, the client emits `ShowFingerprintVerification`.
+fn awaiting_confirmation(ev: &SessionEvent) -> bool {
+    matches!(
+        ev,
+        SessionEvent::NewConnection { .. } | SessionEvent::ShowFingerprintVerification { .. }
+    )
+}
+
+/// Pump `rx` until an event matching `pred` arrives, returning it. Fails (rather
+/// than hanging) if no matching event arrives within the timeout.
+async fn wait_until<F>(rx: &mut Events, label: &str, mut pred: F) -> SessionEvent
+where
+    F: FnMut(&SessionEvent) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ev)) => {
+                if pred(&ev) {
+                    return ev;
+                }
+                // Otherwise keep draining (e.g. skip intermediate handshake events).
+            }
+            Ok(None) => panic!("[{label}] event channel closed before match"),
+            Err(_) => panic!("[{label}] timed out waiting for event"),
+        }
+    }
+}
+
+/// Wait for the next `MessageReceived` and return the contained ProtocolMessage.
+async fn next_message(rx: &mut Events, label: &str) -> ProtocolMessage {
+    match wait_until(rx, label, |ev| {
+        matches!(ev, SessionEvent::MessageReceived(_))
+    })
+    .await
+    {
+        SessionEvent::MessageReceived(m) => m,
+        _ => unreachable!(),
+    }
+}
+
+struct Peer {
+    events: Events,
+    outbound: Outbound,
+    confirm: mpsc::UnboundedSender<bool>,
+    handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+/// Spin up a connected host+client pair over a duplex stream and run both
+/// sessions through the handshake. Returns both peers ready for the confirm step.
+async fn connect_pair() -> (Peer, Peer) {
+    let host_priv = generate_rsa_keypair(RSA_KEY_BITS).expect("host key");
+    let client_priv = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
+    let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+
+    let (host_ev_tx, host_events) = mpsc::unbounded_channel();
+    let (host_out, host_out_rx) = mpsc::unbounded_channel();
+    let (host_confirm, host_confirm_rx) = mpsc::unbounded_channel();
+    let host_chat = uuid::Uuid::new_v4();
+
+    let (client_ev_tx, client_events) = mpsc::unbounded_channel();
+    let (client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
+    let client_chat = uuid::Uuid::new_v4();
+
+    let host_handle = tokio::spawn(async move {
+        run_host_session_over_stream(
+            &mut host_stream,
+            "client-peer".to_string(),
+            host_priv,
+            host_ev_tx,
+            host_out_rx,
+            host_confirm_rx,
+            host_chat,
+        )
+        .await
+    });
+
+    let client_handle = tokio::spawn(async move {
+        run_client_session_over_stream(
+            &mut client_stream,
+            "host-peer".to_string(),
+            client_priv,
+            client_ev_tx,
+            client_out_rx,
+            client_confirm_rx,
+            client_chat,
+        )
+        .await
+    });
+
+    (
+        Peer {
+            events: host_events,
+            outbound: host_out,
+            confirm: host_confirm,
+            handle: host_handle,
+        },
+        Peer {
+            events: client_events,
+            outbound: client_out,
+            confirm: client_confirm,
+            handle: client_handle,
+        },
+    )
+}
+
+#[tokio::test]
+async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
+    let (mut host, mut client) = connect_pair().await;
+
+    // TOFU: both sides surface the peer's fingerprint and wait for confirmation.
+    wait_until(&mut host.events, "host", awaiting_confirmation).await;
+    wait_until(&mut client.events, "client", awaiting_confirmation).await;
+
+    // Accept on both ends.
+    host.confirm.send(true).unwrap();
+    client.confirm.send(true).unwrap();
+
+    // Both transition to Ready (encrypted tunnel established).
+    wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Ready)
+    })
+    .await;
+    wait_until(&mut client.events, "client", |ev| {
+        matches!(ev, SessionEvent::Ready)
+    })
+    .await;
+
+    // --- Bidirectional text ---
+    host.outbound
+        .send(ProtocolMessage::Text {
+            text: "hello from host".to_string(),
+            timestamp: 1,
+            seq: 1,
+        })
+        .unwrap();
+    match next_message(&mut client.events, "client").await {
+        ProtocolMessage::Text { text, .. } => assert_eq!(text, "hello from host"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+
+    client
+        .outbound
+        .send(ProtocolMessage::Text {
+            text: "hi back from client".to_string(),
+            timestamp: 2,
+            seq: 1,
+        })
+        .unwrap();
+    match next_message(&mut host.events, "host").await {
+        ProtocolMessage::Text { text, .. } => assert_eq!(text, "hi back from client"),
+        other => panic!("expected Text, got {other:?}"),
+    }
+
+    // --- Typing indicators ---
+    host.outbound
+        .send(ProtocolMessage::TypingStart { seq: 2 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::TypingStart { .. }
+    ));
+    host.outbound
+        .send(ProtocolMessage::TypingStop { seq: 3 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::TypingStop { .. }
+    ));
+
+    // --- File transfer (meta → chunk → end), sharing the per-session seq space ---
+    let payload = vec![0xABu8; 4096];
+    host.outbound
+        .send(ProtocolMessage::FileMeta {
+            filename: "photo.png".to_string(),
+            size: payload.len() as u64,
+            seq: 4,
+        })
+        .unwrap();
+    match next_message(&mut client.events, "client").await {
+        ProtocolMessage::FileMeta { filename, size, .. } => {
+            assert_eq!(filename, "photo.png");
+            assert_eq!(size, payload.len() as u64);
+        }
+        other => panic!("expected FileMeta, got {other:?}"),
+    }
+    host.outbound
+        .send(ProtocolMessage::FileChunk {
+            chunk: payload.clone(),
+            seq: 5,
+        })
+        .unwrap();
+    match next_message(&mut client.events, "client").await {
+        ProtocolMessage::FileChunk { chunk, .. } => assert_eq!(chunk, payload),
+        other => panic!("expected FileChunk, got {other:?}"),
+    }
+    host.outbound
+        .send(ProtocolMessage::FileEnd { seq: 6 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::FileEnd { .. }
+    ));
+
+    // --- Keep-alive ping ---
+    host.outbound
+        .send(ProtocolMessage::Ping { seq: 7 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::Ping { .. }
+    ));
+
+    // --- Disconnect: tearing down the client makes the host observe the drop ---
+    client.handle.abort();
+    drop(client.outbound);
+    wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Disconnected | SessionEvent::Error(_))
+    })
+    .await;
+
+    host.handle.abort();
+}
+
+#[tokio::test]
+async fn rejecting_the_fingerprint_aborts_the_session() {
+    let (mut host, mut client) = connect_pair().await;
+
+    wait_until(&mut host.events, "host", awaiting_confirmation).await;
+    wait_until(&mut client.events, "client", awaiting_confirmation).await;
+
+    // Host rejects; client accepts. The host session must error out and never
+    // reach Ready.
+    host.confirm.send(false).unwrap();
+    client.confirm.send(true).unwrap();
+
+    let ev = wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Error(_))
+    })
+    .await;
+    match ev {
+        SessionEvent::Error(msg) => assert!(msg.to_lowercase().contains("reject")),
+        _ => unreachable!(),
+    }
+
+    let result = tokio::time::timeout(STEP_TIMEOUT, host.handle)
+        .await
+        .expect("host task should finish after rejection");
+    assert!(
+        result.unwrap().is_err(),
+        "host session must return an error after a rejected fingerprint"
+    );
+
+    client.handle.abort();
+}
