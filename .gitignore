@@ -109,9 +109,9 @@ crash-*.log
 *.dmp
 check_output*.txt
 
-# Core dumps (Exclude 'core' files but ALLOW 'src/core' directory)
-core
-!src/core/
+# Core dumps named like `core.<pid>`. (The bare `core/` directory is the
+# messenger-core workspace crate and must stay tracked.)
+core.[0-9]*
 
 # ----------------------------------------------------------------------------
 # CodeQL & CI

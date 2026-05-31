@@ -1,0 +1,51 @@
+[package]
+name = "messenger-core"
+description = "Shared core for the Encrypted Messenger: crypto, wire protocol, identity, and transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "messenger_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Runtime async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Cryptography
+rsa = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+chacha20poly1305 = { workspace = true }
+
+# Encoding
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# Utilities
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+# Local peer discovery (mDNS/Bonjour)
+mdns-sd = { workspace = true }
+hostname = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }

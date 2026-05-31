@@ -1,0 +1,20 @@
+[package]
+name = "messenger-server"
+description = "Party server for the Encrypted Messenger (placeholder; implemented in Phase 1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+# Reuses the shared core for the encrypted transport handshake (Phase 1+).
+messenger-core = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

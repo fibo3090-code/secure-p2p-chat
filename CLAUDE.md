@@ -4,25 +4,32 @@ This file provides repository-specific guidance for coding agents working in thi
 
 ## Development Commands
 
+This is a Cargo **workspace**: `core` (messenger-core), `client`
+(encodeur_rsa_rust — the app + binary), and `server` (messenger-server —
+Party server placeholder). Bare commands act on the client (`default-members`);
+add `--workspace` to include core + server.
+
 ```bash
 # Build
-cargo build                    # Debug build
+cargo build                    # Debug build (client)
 cargo build --release          # Release build (LTO enabled, opt-level=3)
+cargo build --workspace        # Build all crates (core + client + server)
 
 # Run
 cargo run --release            # GUI (default)
 cargo run --release -- --tui   # Terminal UI (ratatui)
 cargo run --release -- --host --port 9000        # Host on port 9000
 cargo run --release -- --connect 127.0.0.1:12345 # Connect to peer
+cargo run -p messenger-server  # Party server (Phase 0 placeholder)
 
 # Quality & Testing
-cargo test                     # Run all tests
+cargo test --workspace         # Run all tests (core + client)
 cargo test <test_name> -- --exact  # Run specific test
-cargo fmt                      # Format code
-cargo clippy                   # Lint and check warnings
+cargo fmt --all                # Format code
+cargo clippy --workspace --all-targets  # Lint and check warnings
 
 # Logging
-RUST_LOG="info,secure_p2p_chat=debug" cargo run
+RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 
 # Windows packaging
 ./build-and-package.ps1        # PowerShell script for distributable builds

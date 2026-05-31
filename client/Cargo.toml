@@ -1,0 +1,79 @@
+[package]
+name = "encodeur_rsa_rust"
+description = "Encrypted P2P Messenger - a secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "encodeur_rsa_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "encodeur_rsa_rust"
+path = "src/main.rs"
+
+[dependencies]
+# Shared core (crypto, protocol, identity, transport)
+messenger-core = { workspace = true }
+
+# Runtime async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Encoding
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# Cryptography (used by persistence + identity-facing UI)
+rsa = { workspace = true }
+rand = { workspace = true }
+chacha20poly1305 = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+egui_tracing = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# GUI
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_commonmark = { workspace = true }
+
+# TUI
+ratatui = { workspace = true }
+ratatui-crossterm = { workspace = true }
+
+# Utilities
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+
+# File dialogs / shell integration
+rfd = { workspace = true }
+open = { workspace = true }
+notify-rust = { workspace = true }
+
+# Emoji + QR
+emojis = { workspace = true }
+qrcode = { workspace = true }
+image = { workspace = true }
+arboard = { workspace = true }
+
+unicode-width = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }

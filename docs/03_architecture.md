@@ -2,6 +2,23 @@
 
 This document describes the current codebase structure and the major runtime responsibilities.
 
+## Workspace Layout
+
+The project is a Cargo **workspace** of three crates so the client app and the
+(forthcoming) Party server can share code (see `docs/05_platform_spec.md`):
+
+```text
+core/    messenger-core  — crypto, wire protocol, identity, transport, shared types
+client/  encodeur_rsa_rust — the unified app (egui GUI + ratatui TUI) and its binary
+server/  messenger-server  — Party server (Phase 0 placeholder; built in Phase 1)
+```
+
+`client` depends on `core` and re-exports it (`pub use messenger_core::*;`), so the
+client modules and integration tests reach core types via the usual paths. The
+client binary keeps the name `encodeur_rsa_rust` (packaging is unchanged). Bare
+`cargo build`/`test`/`run` target the client via `default-members`; CI builds the
+whole workspace with `--workspace`.
+
 ## High-Level Shape
 
 ```text
@@ -20,15 +37,10 @@ The project is centered around `ChatManager`, which coordinates chats, contacts,
 ## Directory Structure
 
 ```text
-src/
-  main.rs         entry point for GUI/TUI launch
-  lib.rs          exports and shared constants
-  support.rs      diagnostics export and panic/crash support
+core/src/
+  lib.rs          core exports and shared constants
   types.rs        shared application data structures
   util.rs         helpers and parsing utilities
-  app/
-    chat_manager.rs
-    persistence.rs
   core/
     crypto.rs
     framing.rs
@@ -41,6 +53,15 @@ src/
     mod.rs
   transfer/
     receiver.rs
+
+client/src/
+  main.rs         entry point for GUI/TUI launch
+  lib.rs          client exports; re-exports messenger-core
+  support.rs      diagnostics export and panic/crash support
+  colorgrid.rs    fingerprint color-grid rendering (egui Color32)
+  app/
+    chat_manager.rs
+    persistence.rs
   gui/
     app_ui.rs
     chat_view.rs
@@ -55,17 +76,21 @@ src/
     input.rs        EditableField (cursor-aware UTF-8 text editing)
     overlays.rs     modal overlays (verify, contacts, settings, etc.)
     ui.rs           frame composition (chat list, messages, toasts)
+client/tests/      integration tests (link against the client lib)
+
+server/src/
+  main.rs         Party server placeholder (Phase 1 fills this in)
 ```
 
 ## Module Responsibilities
 
-### `src/main.rs`
+### `client/src/main.rs`
 
 - parses CLI mode/launch flags
 - configures tracing
 - starts GUI or TUI
 
-### `src/app/chat_manager.rs`
+### `client/src/app/chat_manager.rs`
 
 - central application state
 - contact/chat/session mapping
@@ -74,14 +99,14 @@ src/
 - fingerprint-verification workflow
 - toast notifications
 
-### `src/app/persistence.rs`
+### `client/src/app/persistence.rs`
 
 - encrypted history serialization/deserialization
 - compatibility with history versions `1.0` and `1.1`
 - background-save snapshot support
 - loaded-config sanitization
 
-### `src/core/crypto.rs`
+### `core/src/core/crypto.rs`
 
 - RSA helpers
 - AES-GCM wrapper
@@ -89,49 +114,49 @@ src/
 - fingerprints
 - invite-signature helpers
 
-### `src/core/protocol.rs`
+### `core/src/core/protocol.rs`
 
 - protocol message definitions
 - binary/plain encoding and decoding
 
-### `src/core/framing.rs`
+### `core/src/core/framing.rs`
 
 - packet framing for the TCP transport
 
-### `src/network/session.rs`
+### `core/src/network/session.rs`
 
 - secure handshake
 - session message loop
 - transport replay protection
 - rekey handling
 
-### `src/network/discovery.rs`
+### `core/src/network/discovery.rs`
 
 - optional mDNS registration/discovery
 - LAN peer advertisement and lookup
 
-### `src/network/relay.rs`
+### `core/src/network/relay.rs`
 
 - self-hosted rendezvous and packet relay server mode
 - relay transport setup for WAN/NAT-constrained peers
 - forwards already-encrypted session traffic without terminating chat encryption
 
-### `src/identity/mod.rs`
+### `core/src/identity/mod.rs`
 
 - identity creation and load/save
 - password-based encryption
 - history-key derivation
 - invite generation
 
-### `src/transfer/receiver.rs`
+### `core/src/transfer/receiver.rs`
 
 - receiving and finalizing inbound file data
 
-### `src/gui/`
+### `client/src/gui/`
 
 - egui interface, dialogs, state presentation, and log/help UI
 
-### `src/tui/`
+### `client/src/tui/`
 
 - ratatui interface: command mode with live autocomplete, modal overlays
   (fingerprint verification, password unlock, contacts, settings, identity,

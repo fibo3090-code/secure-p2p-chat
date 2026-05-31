@@ -1,6 +1,7 @@
+use crate::colorgrid::generate_color_grid;
 use crate::gui::app_ui::{ActiveDialog, App};
 use crate::gui::widgets::ColorGrid;
-use crate::util::{generate_color_grid, primary_local_ipv4};
+use crate::util::primary_local_ipv4;
 use anyhow::anyhow;
 use eframe::egui;
 use egui_tracing::ui::Logs;

@@ -214,7 +214,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
     );
 
     // Color grid (matches the GUI's generate_color_grid palette exactly).
-    let grid = crate::util::generate_color_grid(fingerprint);
+    let grid = crate::colorgrid::generate_color_grid(fingerprint);
     let grid_lines: Vec<Line> = grid
         .iter()
         .map(|row| {
@@ -370,7 +370,7 @@ fn render_identity(f: &mut Frame, app: &TuiApp, full: Rect) {
             .style(Style::default().add_modifier(Modifier::BOLD)),
         rows[0],
     );
-    let grid = crate::util::generate_color_grid(&app.identity_fingerprint());
+    let grid = crate::colorgrid::generate_color_grid(&app.identity_fingerprint());
     let grid_lines: Vec<Line> = grid
         .iter()
         .map(|row| {

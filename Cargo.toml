@@ -1,12 +1,20 @@
-[package]
-name = "encodeur_rsa_rust"
+[workspace]
+resolver = "2"
+members = ["core", "client", "server"]
+# Bare `cargo build`/`test`/`run` target the client app (the default product);
+# use `--workspace` (CI) or `-p messenger-server` to include the server.
+default-members = ["client"]
+
+[workspace.package]
 version = "1.8.1"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]
-description = "Encrypted P2P Messenger - A secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+messenger-core = { path = "core" }
+
 # Runtime async
 tokio = { version = "1", features = ["full"] }
 
@@ -78,14 +86,10 @@ mdns-sd = "0.11"
 hostname = "0.4"
 unicode-width = "0.2"
 
-# Windows-specific dependencies
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
-    "Win32_System_Console",
-    "Win32_Foundation",
-] }
+# Windows-specific
+windows-sys = { version = "0.52", features = ["Win32_System_Console", "Win32_Foundation"] }
 
-[dev-dependencies]
+# Dev / testing
 tokio-test = "0.4"
 tempfile = "3"
 proptest = "1"
@@ -96,7 +100,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
-
-[features]
-default = []
-

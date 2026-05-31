@@ -46,7 +46,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Release
-        run: cargo build --release --locked
+        run: cargo build --release --locked -p encodeur_rsa_rust
 
       - name: Prepare Dist
         run: |
@@ -85,7 +85,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p encodeur_rsa_rust
 
       - name: Create App Bundle
         run: |
@@ -150,7 +150,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked -p encodeur_rsa_rust
 
       - name: Create Tarball
         run: |
