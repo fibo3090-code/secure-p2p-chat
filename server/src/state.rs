@@ -256,6 +256,36 @@ impl PartyState {
             .collect()
     }
 
+    /// Create a new public channel with a unique, non-empty name. Returns the new
+    /// channel's info. Errors on empty or duplicate (case-insensitive) names.
+    pub fn create_channel(&mut self, name: &str) -> Result<ChannelInfo, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("channel name must not be empty".to_string());
+        }
+        if self
+            .channels
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            return Err("a channel with that name already exists".to_string());
+        }
+        let channel = Channel {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            kind: ChannelKind::Public,
+            messages: Vec::new(),
+        };
+        let info = ChannelInfo {
+            id: channel.id,
+            name: channel.name.clone(),
+            kind: channel.kind,
+        };
+        self.channels.push(channel);
+        self.persist();
+        Ok(info)
+    }
+
     fn channel_mut(&mut self, id: Uuid) -> Option<&mut Channel> {
         self.channels.iter_mut().find(|c| c.id == id)
     }
@@ -519,6 +549,19 @@ mod tests {
         assert_eq!(state.dm_history(thread, 0).len(), 2);
         assert_eq!(state.dm_history(thread, 1).len(), 1);
         assert!(state.dm_history(Uuid::new_v4(), 0).is_empty());
+    }
+
+    #[test]
+    fn create_channel_adds_unique_named_channels() {
+        let mut state = PartyState::new("Open", None);
+        assert_eq!(state.channels().len(), 1); // general
+        let info = state.create_channel("random").unwrap();
+        assert_eq!(info.name, "random");
+        assert_eq!(state.channels().len(), 2);
+        // Duplicate (case-insensitive) and empty names are rejected.
+        assert!(state.create_channel("Random").is_err());
+        assert!(state.create_channel("   ").is_err());
+        assert_eq!(state.channels().len(), 2);
     }
 
     #[test]

@@ -226,6 +226,16 @@ impl PartyManager {
             .unwrap_or_default()
     }
 
+    /// Create a new channel on the server. The server replies with the refreshed
+    /// channel list, applied on the next poll.
+    pub fn create_channel(&self, server_id: Uuid, name: String) -> Result<()> {
+        let conn = self
+            .servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))?;
+        conn.send(PartyRequest::CreateChannel { name })
+    }
+
     /// Request a channel's full history (offline catch-up).
     pub fn fetch_history(&self, server_id: Uuid, channel: Uuid) -> Result<()> {
         let conn = self
@@ -443,6 +453,16 @@ mod tests {
     fn post_before_join_fails() {
         let (mut mgr, id, _tx, _out) = manager_with_server();
         assert!(mgr.post(id, Uuid::new_v4(), "x".to_string()).is_err());
+    }
+
+    #[test]
+    fn create_channel_emits_request() {
+        let (mgr, id, _tx, mut out) = manager_with_server();
+        mgr.create_channel(id, "random".to_string()).unwrap();
+        match out.try_recv().unwrap() {
+            PartyRequest::CreateChannel { name } => assert_eq!(name, "random"),
+            other => panic!("expected CreateChannel, got {other:?}"),
+        }
     }
 
     #[test]

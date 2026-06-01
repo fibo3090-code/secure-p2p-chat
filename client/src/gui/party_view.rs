@@ -133,6 +133,25 @@ fn render_body(app: &mut App, ui: &mut egui::Ui) {
                     app.party_selected_dm = None;
                 }
             }
+            // Create a new channel.
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut app.party_new_channel_input)
+                        .hint_text("new channel")
+                        .desired_width(110.0),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (submit || ui.button("+").clicked())
+                    && !app.party_new_channel_input.trim().is_empty()
+                {
+                    let name = std::mem::take(&mut app.party_new_channel_input);
+                    if let Ok(party) = app.party_manager.try_lock() {
+                        if let Err(e) = party.create_channel(server_id, name) {
+                            tracing::warn!("Create channel failed: {}", e);
+                        }
+                    }
+                }
+            });
 
             ui.add_space(8.0);
             ui.strong(format!("Members ({}) — click to DM", srv.members.len()));

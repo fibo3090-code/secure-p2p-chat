@@ -82,8 +82,8 @@ where
                 for resp in outcome.replies {
                     send_framed(&mut wr, &cipher, &aad, &resp.to_bytes()).await?;
                 }
-                for env in outcome.broadcast {
-                    hub.broadcast_except(conn_id, PartyResponse::Message(env));
+                for resp in outcome.broadcast {
+                    hub.broadcast_except(conn_id, resp);
                 }
                 for (member, resp) in outcome.directed {
                     hub.send_to_member(member, resp);

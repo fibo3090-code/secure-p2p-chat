@@ -77,6 +77,8 @@ pub enum TuiCommand {
         target: String,
         text: String,
     },
+    /// Create a channel on the current Party server.
+    PartyCreateChannel(String),
     PartyStatus,
 
     // --- settings ---
@@ -165,6 +167,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "party-dm",
         ":party-dm <username|#> <message>",
         "Direct-message a member on the current Party server",
+    ),
+    (
+        "party-channel",
+        ":party-channel <name>",
+        "Create a channel on the current Party server",
     ),
     ("party-status", ":party-status", "Show joined Party servers"),
     ("rename", ":rename <title>", "Rename the selected chat"),
@@ -373,6 +380,12 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
                 text,
             })
         }
+        "party-channel" => {
+            if rest.is_empty() {
+                return Err("Usage: :party-channel <name>".to_string());
+            }
+            Ok(TuiCommand::PartyCreateChannel(rest))
+        }
         "party-status" => Ok(TuiCommand::PartyStatus),
 
         "rename" => {
@@ -515,6 +528,11 @@ mod tests {
             }
         );
         assert!(parse_command(":party-dm alice").is_err());
+        assert_eq!(
+            parse_command(":party-channel random").unwrap(),
+            TuiCommand::PartyCreateChannel("random".into())
+        );
+        assert!(parse_command(":party-channel").is_err());
         assert_eq!(
             parse_command(":party-status").unwrap(),
             TuiCommand::PartyStatus

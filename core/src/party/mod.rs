@@ -100,6 +100,8 @@ pub enum PartyRequest {
     SendDm { to: Uuid, text: String },
     /// Fetch direct-message history with another member (offline catch-up).
     FetchDmHistory { with: Uuid, since_seq: u64 },
+    /// Create a new public channel.
+    CreateChannel { name: String },
 }
 
 /// Deterministic, order-independent id for the 1:1 DM thread between two members,
@@ -382,6 +384,9 @@ mod tests {
             PartyRequest::FetchDmHistory {
                 with: Uuid::new_v4(),
                 since_seq: 3,
+            },
+            PartyRequest::CreateChannel {
+                name: "random".to_string(),
             },
         ];
         for req in requests {

@@ -1106,6 +1106,19 @@ impl TuiApp {
                     ),
                 }
             }
+            TuiCommand::PartyCreateChannel(name) => {
+                let Some(server_id) = self.current_party else {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No Party server joined. Use :party-connect".to_string(),
+                    );
+                    return;
+                };
+                match self.party_manager.create_channel(server_id, name.clone()) {
+                    Ok(()) => self.toast(ToastLevel::Info, format!("Creating channel '{name}'…")),
+                    Err(e) => self.toast(ToastLevel::Error, format!("Create channel failed: {e}")),
+                }
+            }
             TuiCommand::PartyStatus => {
                 let ids = self.party_manager.server_ids();
                 if ids.is_empty() {
