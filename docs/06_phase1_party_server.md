@@ -58,9 +58,11 @@ This phase is delivered in safe, independently-testable slices:
    (per-connection `host_handshake` → a `select` loop that serves requests via the
    dispatcher *and* writes pushed broadcasts, binding the handshake-verified
    fingerprint to the member); `server::hub::Hub` cross-connection **broadcast
-   fan-out** (a posted message reaches every other connected member live); a real TCP
-   accept loop in `main`. **Remaining:** a persistent server identity (stable TOFU
-   across restarts) and SQLite + blob persistence under the operator's data dir.
+   fan-out** (a posted message reaches every other connected member live); a
+   **persistent server identity** (`server::identity` stores the RSA key as an
+   owner-only PEM under the data dir, so the fingerprint clients pin is stable
+   across restarts); a real TCP accept loop in `main`. **Remaining:** SQLite + blob
+   persistence of state/history under the operator's data dir (currently in-memory).
 
 4. **Client Party tab.** Connect-to-server flow (address + password + username),
    server-identity TOFU, member list, channel view; GUI + TUI.
@@ -93,6 +95,6 @@ model is the source of truth at runtime.
 Slices 1–2 are complete and slice 3 is well underway: a client can complete the v3
 handshake to the server, join, post to a channel, fetch history, and — with the
 broadcast hub — receive other members' messages live (verified by in-memory
-end-to-end tests in `server::connection`), and `main` runs a real TCP listener.
-Remaining for slice 3: a persistent server identity and SQLite/blob persistence.
-Slice 4 (client Party tab) follows.
+end-to-end tests in `server::connection`). `main` runs a real TCP listener with a
+persistent, owner-only server identity. Remaining for slice 3: SQLite/blob
+persistence (state/history are currently in-memory). Slice 4 (client Party tab) follows.

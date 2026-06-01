@@ -6,18 +6,19 @@
 //! join with a username + the optional server password, post to channels, and the
 //! server stores history so offline members catch up on reconnect.
 //!
-//! Not yet wired (next steps): cross-connection broadcast fan-out, a persistent
-//! server identity, and SQLite/blob persistence. See `docs/06_phase1_party_server.md`.
+//! Not yet wired (next step): SQLite/blob persistence of state and history. See
+//! `docs/06_phase1_party_server.md`.
 
 mod connection;
 mod dispatch;
 mod hub;
+mod identity;
 mod state;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use messenger_core::core::{fingerprint_pubkey, generate_rsa_keypair, pem_encode_public};
-use messenger_core::RSA_KEY_BITS;
+use messenger_core::core::{fingerprint_pubkey, pem_encode_public};
 use rsa::RsaPublicKey;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -39,9 +40,12 @@ async fn main() -> anyhow::Result<()> {
         server_password,
     )));
 
-    // Ephemeral server identity for now (persisted identity + stable TOFU is a
-    // follow-up). Clients verify this fingerprint on first connect.
-    let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS)?);
+    // Persistent server identity: clients pin this fingerprint via TOFU on first
+    // connect, so it must stay stable across restarts.
+    let data_dir = std::env::var_os("PARTY_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("party-data"));
+    let privkey = Arc::new(identity::load_or_create_server_identity(&data_dir)?);
     let fingerprint =
         fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes());
     let hub = Arc::new(Hub::new());
@@ -52,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         server_name = %state.lock().await.name(),
         %fingerprint,
         port,
+        data_dir = %data_dir.display(),
         password_protected = std::env::var("PARTY_PASSWORD").is_ok(),
         "Party server listening"
     );

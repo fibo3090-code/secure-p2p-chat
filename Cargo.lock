@@ -3124,6 +3124,7 @@ dependencies = [
  "anyhow",
  "messenger-core",
  "rsa",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
