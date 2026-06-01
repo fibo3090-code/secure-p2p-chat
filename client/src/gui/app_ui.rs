@@ -96,6 +96,16 @@ pub struct App {
     pub discovered_peers: Arc<StdMutex<Vec<DiscoveredPeer>>>,
     /// mDNS Discovery service instance.
     pub discovery: Option<Discovery>,
+    /// Party-server connections (Phase 1 Party tab).
+    pub party_manager: Arc<Mutex<crate::app::party_manager::PartyManager>>,
+    /// Whether the Party window is open.
+    pub show_party: bool,
+    pub party_address: String,
+    pub party_username: String,
+    pub party_password: String,
+    pub party_post_input: String,
+    pub party_selected_server: Option<Uuid>,
+    pub party_selected_channel: Option<Uuid>,
 }
 
 impl App {
@@ -308,6 +318,14 @@ impl App {
             } else {
                 None
             },
+            party_manager: Arc::new(Mutex::new(crate::app::party_manager::PartyManager::new())),
+            show_party: false,
+            party_address: String::new(),
+            party_username: String::new(),
+            party_password: String::new(),
+            party_post_input: String::new(),
+            party_selected_server: None,
+            party_selected_channel: None,
         })
     }
 
@@ -622,6 +640,11 @@ impl eframe::App for App {
             }
         }
 
+        // Poll Party-server connections (directory/messages/broadcasts).
+        if let Ok(mut party) = self.party_manager.try_lock() {
+            party.poll_events();
+        }
+
         let any_modal_open = self.is_any_modal_open();
 
         // Top panel - Menu bar
@@ -647,6 +670,10 @@ impl eframe::App for App {
 
                     if ui.button("Contacts").clicked() {
                         self.active_dialog = ActiveDialog::Contacts;
+                    }
+
+                    if ui.button("🎉 Party").clicked() {
+                        self.show_party = true;
                     }
 
                     if ui.button("Settings").clicked() {
@@ -756,6 +783,9 @@ impl eframe::App for App {
 
         // Dialogs
         crate::gui::dialogs::render_dialogs(self, ctx);
+
+        // Party server window
+        crate::gui::party_view::render_party_window(self, ctx);
 
         // Request repaint for animations
         ctx.request_repaint_after(std::time::Duration::from_millis(100));

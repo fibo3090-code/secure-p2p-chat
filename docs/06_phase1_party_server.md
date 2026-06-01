@@ -68,8 +68,13 @@ This phase is delivered in safe, independently-testable slices:
    durability mechanism; migrating it to the embedded **SQLite** + blob store the
    spec calls for (the `Snapshot` shape maps cleanly to tables) is a follow-up.
 
-4. **Client Party tab.** Connect-to-server flow (address + password + username),
-   server-identity TOFU, member list, channel view; GUI + TUI.
+4. **Client Party UI (in progress).** Done: `client::app::party_manager::PartyManager`
+   (per-connection read/write task, directory/channel/history tracking, optimistic
+   post); TUI commands (`:party-connect` / `:party-post` / `:party-status`); and a
+   **GUI Party window** (`gui::party_view`) — join form, server selector, channel +
+   member lists, message view, and a post box. **Remaining:** a dedicated TUI Party
+   pane (beyond command output), server-identity TOFU confirmation UI, and
+   surfacing connect/post errors in the GUI.
 
 ## Data model (server, MVP)
 
@@ -101,5 +106,6 @@ handshake to the server, join, post to a channel, fetch history, and — with th
 broadcast hub — receive other members' messages live (verified by in-memory
 end-to-end tests in `server::connection`). `main` runs a real TCP listener with a
 persistent, owner-only server identity, and durable state (a JSON snapshot of
-members/channels/history that survives restarts). Remaining for slice 3: migrate
-that snapshot to the embedded SQLite + blob store. Slice 4 (client Party tab) follows.
+members/channels/history that survives restarts). The client can join and chat via
+TUI commands and a GUI Party window. Remaining: a dedicated TUI Party pane, GUI
+TOFU/error surfacing, and migrating the server snapshot to embedded SQLite + blobs.
