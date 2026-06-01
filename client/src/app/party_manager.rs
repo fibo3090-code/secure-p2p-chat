@@ -64,11 +64,28 @@ impl PartyServerConn {
 #[derive(Default)]
 pub struct PartyManager {
     servers: HashMap<Uuid, PartyServerConn>,
+    /// Last connection error, surfaced in the UI until dismissed or superseded.
+    last_error: Option<String>,
 }
 
 impl PartyManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a connection error (e.g. a failed handshake) for the UI to show.
+    pub fn set_last_error(&mut self, message: String) {
+        self.last_error = Some(message);
+    }
+
+    /// The last connection error, if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Clear the last connection error (e.g. when the user dismisses it).
+    pub fn clear_last_error(&mut self) {
+        self.last_error = None;
     }
 
     /// Connect to a Party server, complete the v3 handshake, and queue a join plus
@@ -84,6 +101,7 @@ impl PartyManager {
     ) -> Result<Uuid> {
         use messenger_core::party::PartyClient;
 
+        self.last_error = None;
         let (host, port) = parse_host_port(address, Some(messenger_core::PORT_DEFAULT))?;
         let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
         let client = PartyClient::connect(stream, privkey, Uuid::new_v4()).await?;
@@ -410,5 +428,15 @@ mod tests {
         tx.send(Incoming::Disconnected).unwrap();
         mgr.poll_events();
         assert_eq!(mgr.server(id).unwrap().status, PartyStatus::Disconnected);
+    }
+
+    #[test]
+    fn last_error_set_and_cleared() {
+        let mut mgr = PartyManager::new();
+        assert!(mgr.last_error().is_none());
+        mgr.set_last_error("connect failed".to_string());
+        assert_eq!(mgr.last_error(), Some("connect failed"));
+        mgr.clear_last_error();
+        assert!(mgr.last_error().is_none());
     }
 }

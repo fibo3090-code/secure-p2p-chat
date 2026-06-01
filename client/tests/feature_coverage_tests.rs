@@ -209,7 +209,10 @@ fn connection_password_setter_ignores_empty() {
     let mut mgr = ChatManager::default();
     assert!(!mgr.has_connection_password());
     mgr.set_connection_password(Some(String::new()));
-    assert!(!mgr.has_connection_password(), "empty password must be treated as none");
+    assert!(
+        !mgr.has_connection_password(),
+        "empty password must be treated as none"
+    );
     mgr.set_connection_password(Some("hunter2".to_string()));
     assert!(mgr.has_connection_password());
     mgr.set_connection_password(None);

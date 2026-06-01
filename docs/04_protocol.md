@@ -48,7 +48,24 @@ Current secure runtime behavior requires protocol version `>= 3`.
 4. Establish encrypted transport with AES-256-GCM.
 5. Exchange encrypted `IdentityProof` messages inside that tunnel.
 6. Verify identity signatures and fingerprints.
-7. Enter the message loop.
+7. Optional connection-password gate (see below).
+8. Enter the message loop.
+
+### Connection password (optional)
+
+When the host is configured with a connection password, an extra step runs inside
+the established, transcript-bound tunnel *after* identity verification and *before*
+the peer is surfaced for fingerprint confirmation:
+
+- The host sends an encrypted one-byte flag indicating whether a password is required.
+- The client replies with the (encrypted) password, or an empty payload when none is
+  required.
+- The host compares the supplied password to the expected one in constant time; a
+  mismatch (or a missing password) aborts the session before any TOFU prompt.
+
+Both frames are encrypted with the session cipher and bound to the transport AAD, so
+the password is never exposed and is replay-protected by the session's nonces. When
+the host has no password configured, the flag is `0` and the exchange is a no-op.
 
 ### Transcript binding
 

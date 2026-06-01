@@ -533,7 +533,7 @@ fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid:
 /// Apply the password typed in the Host/Connect dialog to the chat manager so the
 /// subsequent host/connect uses it (host requires it; client supplies it).
 fn apply_connection_password(app: &mut App) {
-    let pw = app.connection_password_input.clone();
+    let pw = std::mem::take(&mut app.connection_password_input);
     if let Ok(mut m) = app.chat_manager.try_lock() {
         m.set_connection_password(if pw.is_empty() { None } else { Some(pw) });
     }

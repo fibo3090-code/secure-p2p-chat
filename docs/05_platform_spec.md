@@ -215,7 +215,7 @@ Phase 4  E2EE server tier
    │
 Phase 5  Per-server identities
 
-Independent:  P2P connection passwords + conversation lock  (slot in anytime)
+Independent:  P2P connection passwords + conversation lock  ✅ done
 ```
 
 - **Phase 0 — Workspace refactor. ✅ Done.** Split into `core` / `client` /
@@ -237,8 +237,11 @@ Independent:  P2P connection passwords + conversation lock  (slot in anytime)
   for this tier.
 - **Phase 5 — Per-server identities.** Distinct per-server profile/keys bound to
   the global identity.
-- **Independent — P2P connection passwords + conversation lock.** Small; can land
-  anytime.
+- **Independent — P2P connection passwords + conversation lock. ✅ Done.** An
+  optional shared password is verified inside the established v3 tunnel (after the
+  handshake, before TOFU; constant-time compare), and a conversation lock makes the
+  host refuse new connections. Reachable from the GUI (Host/Connect dialogs + a lock
+  toggle) and the TUI (`:connection-password`, `:lock`).
 
 ## Per-Phase Verification
 
@@ -256,7 +259,7 @@ Independent:  P2P connection passwords + conversation lock  (slot in anytime)
 
 ## Test Coverage
 
-The workspace is covered by **211 automated tests** (`cargo test --workspace`),
+The workspace is covered by **250+ automated tests** (`cargo test --workspace`),
 spanning unit, integration, and end-to-end suites:
 
 - **Protocol** (`core/src/core/protocol.rs`): round-trip symmetry for every
@@ -268,7 +271,11 @@ spanning unit, integration, and end-to-end suites:
 - **End-to-end pipeline** (`core/tests/session_e2e.rs`): the full A-to-Z path over
   the real session functions — version → ECDH → key derivation → encrypted identity
   proof → TOFU confirm → text, typing, file transfer, ping → disconnect, plus the
-  fingerprint-rejection path.
+  fingerprint-rejection path and the connection-password gate (correct / wrong /
+  missing).
+- **Party server** (`core::party`, `messenger-server`): protocol round-trips, the
+  in-memory `PartyState` (join/password/channels/history/persistence), the request
+  dispatcher, and connection/broadcast end-to-end over the reused v3 tunnel.
 - **Relay** (`core/tests/relay_e2e.rs`): two peers pair through a self-hosted relay
   and exchange an application message over the forwarded encrypted transport.
 - **Types** (`core/src/types.rs`): `Config` defaults (privacy-conservative),

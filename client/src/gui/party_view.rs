@@ -54,6 +54,23 @@ fn render_body(app: &mut App, ui: &mut egui::Ui) {
         connect_clicked(app);
     }
 
+    // Surface the last connection error (e.g. wrong password / unreachable host).
+    let last_error = app
+        .party_manager
+        .try_lock()
+        .ok()
+        .and_then(|p| p.last_error().map(String::from));
+    if let Some(err) = last_error {
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("⚠ {err}"));
+            if ui.small_button("Dismiss").clicked() {
+                if let Ok(mut p) = app.party_manager.try_lock() {
+                    p.clear_last_error();
+                }
+            }
+        });
+    }
+
     ui.separator();
 
     // --- Snapshot the manager state for this frame ---
@@ -194,6 +211,7 @@ fn connect_clicked(app: &mut App) {
             .await
         {
             tracing::warn!("Party connect to {} failed: {}", address, e);
+            m.set_last_error(format!("Connect to {address} failed: {e}"));
         }
     });
 }
