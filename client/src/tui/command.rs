@@ -59,6 +59,15 @@ pub enum TuiCommand {
     Unlock(Option<String>),
     SetPassword(String),
 
+    // --- party servers ---
+    PartyConnect {
+        address: String,
+        username: String,
+        password: Option<String>,
+    },
+    PartyPost(String),
+    PartyStatus,
+
     // --- settings ---
     Settings,
     Set {
@@ -121,6 +130,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("import", ":import <invite-link>", "Import an invite link as a contact"),
     ("send", ":send <path>", "Send a file to the selected chat"),
     ("transfers", ":transfers", "Show active file transfers"),
+    (
+        "party-connect",
+        ":party-connect <host[:port]> <username> [password]",
+        "Join a Party server",
+    ),
+    (
+        "party-post",
+        ":party-post <message>",
+        "Post a message to the current Party channel",
+    ),
+    ("party-status", ":party-status", "Show joined Party servers"),
     ("rename", ":rename <title>", "Rename the selected chat"),
     ("delete", ":delete", "Delete the selected chat"),
     ("clear-history", ":clear-history", "Erase all chats and contacts"),
@@ -285,6 +305,28 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         }
         "transfers" => Ok(TuiCommand::Transfers),
 
+        "party-connect" => {
+            let address = parts.next().ok_or_else(|| {
+                "Usage: :party-connect <host[:port]> <username> [password]".to_string()
+            })?;
+            let username = parts.next().ok_or_else(|| {
+                "Usage: :party-connect <host[:port]> <username> [password]".to_string()
+            })?;
+            let password = parts.next().map(str::to_string);
+            Ok(TuiCommand::PartyConnect {
+                address: address.to_string(),
+                username: username.to_string(),
+                password,
+            })
+        }
+        "party-post" => {
+            if rest.is_empty() {
+                return Err("Usage: :party-post <message>".to_string());
+            }
+            Ok(TuiCommand::PartyPost(rest))
+        }
+        "party-status" => Ok(TuiCommand::PartyStatus),
+
         "rename" => {
             if rest.is_empty() {
                 return Err("Usage: :rename <new title>".to_string());
@@ -378,6 +420,36 @@ mod tests {
                 token: "tok".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_party_commands() {
+        assert_eq!(
+            parse_command(":party-connect 10.0.0.5:9000 alice s3cret").unwrap(),
+            TuiCommand::PartyConnect {
+                address: "10.0.0.5:9000".into(),
+                username: "alice".into(),
+                password: Some("s3cret".into()),
+            }
+        );
+        assert_eq!(
+            parse_command(":party-connect 10.0.0.5 bob").unwrap(),
+            TuiCommand::PartyConnect {
+                address: "10.0.0.5".into(),
+                username: "bob".into(),
+                password: None,
+            }
+        );
+        assert_eq!(
+            parse_command(":party-post hello everyone").unwrap(),
+            TuiCommand::PartyPost("hello everyone".into())
+        );
+        assert_eq!(
+            parse_command(":party-status").unwrap(),
+            TuiCommand::PartyStatus
+        );
+        assert!(parse_command(":party-connect 10.0.0.5").is_err());
+        assert!(parse_command(":party-post").is_err());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! autosave, auto-rehost, unread/typing bookkeeping).
 
 use crate::app::chat_manager::ChatManager;
+use crate::app::party_manager::PartyManager;
 use crate::identity::Identity;
 use crate::tui::command::{parse_command, parse_setting_bool, settings_keys, COMMANDS};
 use crate::tui::input::EditableField;
@@ -43,6 +44,10 @@ const TYPING_IDLE: Duration = Duration::from_secs(4);
 
 pub struct TuiApp {
     pub chat_manager: ChatManager,
+    /// Connections to Party servers (Phase 1 Party tab, command-driven).
+    pub party_manager: PartyManager,
+    /// The server most recently joined, used as the target for `:party-post`.
+    current_party: Option<Uuid>,
     pub chat_list_state: ListState,
     pub chat_ids: Vec<Uuid>,
     pub input_field: EditableField,
@@ -110,6 +115,8 @@ impl TuiApp {
 
         let mut app = Self {
             chat_manager,
+            party_manager: PartyManager::new(),
+            current_party: None,
             chat_list_state: ListState::default(),
             chat_ids: Vec::new(),
             input_field: EditableField::new(true),
@@ -226,6 +233,7 @@ impl TuiApp {
 
     pub fn tick(&mut self) {
         self.chat_manager.poll_session_events();
+        self.party_manager.poll_events();
         self.chat_manager.cleanup_expired_toasts();
 
         // Surface a pending fingerprint verification as an overlay.
@@ -982,6 +990,88 @@ impl TuiApp {
                 {
                     Ok(()) => {}
                     Err(e) => self.toast(ToastLevel::Error, format!("Send file failed: {}", e)),
+                }
+            }
+            TuiCommand::PartyConnect {
+                address,
+                username,
+                password,
+            } => {
+                if !self.require_unlocked() {
+                    return;
+                }
+                let Some(privkey) = self.private_key() else {
+                    return;
+                };
+                match self
+                    .party_manager
+                    .connect_and_join(&address, &username, password, &privkey)
+                    .await
+                {
+                    Ok(server_id) => {
+                        self.current_party = Some(server_id);
+                        let fp = self
+                            .party_manager
+                            .server(server_id)
+                            .map(|s| s.server_fingerprint.clone())
+                            .unwrap_or_default();
+                        let short = &fp[..fp.len().min(16)];
+                        self.toast(
+                            ToastLevel::Info,
+                            format!("Joining Party {address} as {username} (server fp {short}…)"),
+                        );
+                    }
+                    Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
+                }
+            }
+            TuiCommand::PartyPost(text) => {
+                let Some(server_id) = self.current_party else {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No Party server joined. Use :party-connect".to_string(),
+                    );
+                    return;
+                };
+                let channel = self
+                    .party_manager
+                    .server(server_id)
+                    .and_then(|s| s.channels.first().map(|c| c.id));
+                match channel {
+                    Some(ch) => {
+                        if let Err(e) = self.party_manager.post(server_id, ch, text) {
+                            self.toast(ToastLevel::Error, format!("Party post failed: {e}"));
+                        }
+                    }
+                    None => self.toast(
+                        ToastLevel::Warning,
+                        "No channel available yet; try again in a moment".to_string(),
+                    ),
+                }
+            }
+            TuiCommand::PartyStatus => {
+                let ids = self.party_manager.server_ids();
+                if ids.is_empty() {
+                    self.toast(ToastLevel::Info, "No Party servers joined".to_string());
+                }
+                for id in ids {
+                    if let Some(s) = self.party_manager.server(id) {
+                        let name = if s.server_name.is_empty() {
+                            "…"
+                        } else {
+                            &s.server_name
+                        };
+                        self.toast(
+                            ToastLevel::Info,
+                            format!(
+                                "Party {} [{}] {:?} — {} channels, {} members",
+                                s.address,
+                                name,
+                                s.status,
+                                s.channels.len(),
+                                s.members.len()
+                            ),
+                        );
+                    }
                 }
             }
             TuiCommand::Transfers => self.overlay = TuiOverlay::Transfers,
