@@ -55,11 +55,12 @@ This phase is delivered in safe, independently-testable slices:
 
 3. **Server runtime (in progress).** Done: `core::party::{send_framed, recv_framed}`
    (encrypted Party-message framing over the tunnel); `server::connection::serve_connection`
-   (per-connection `host_handshake` → Party request loop driving the dispatcher,
-   binding the handshake-verified fingerprint to the member); a real TCP accept loop
-   in `main`. **Remaining:** cross-connection broadcast fan-out of newly posted
-   messages, a persistent server identity (stable TOFU across restarts), and SQLite +
-   blob persistence under the operator's data dir.
+   (per-connection `host_handshake` → a `select` loop that serves requests via the
+   dispatcher *and* writes pushed broadcasts, binding the handshake-verified
+   fingerprint to the member); `server::hub::Hub` cross-connection **broadcast
+   fan-out** (a posted message reaches every other connected member live); a real TCP
+   accept loop in `main`. **Remaining:** a persistent server identity (stable TOFU
+   across restarts) and SQLite + blob persistence under the operator's data dir.
 
 4. **Client Party tab.** Connect-to-server flow (address + password + username),
    server-identity TOFU, member list, channel view; GUI + TUI.
@@ -90,7 +91,8 @@ model is the source of truth at runtime.
 ## Status
 
 Slices 1–2 are complete and slice 3 is well underway: a client can complete the v3
-handshake to the server, join, post to a channel, and fetch history — verified by
-an in-memory end-to-end test (`server::connection`), and `main` runs a real TCP
-listener. Remaining for slice 3: broadcast fan-out, persistent server identity, and
-SQLite/blob persistence. Slice 4 (client Party tab) follows.
+handshake to the server, join, post to a channel, fetch history, and — with the
+broadcast hub — receive other members' messages live (verified by in-memory
+end-to-end tests in `server::connection`), and `main` runs a real TCP listener.
+Remaining for slice 3: a persistent server identity and SQLite/blob persistence.
+Slice 4 (client Party tab) follows.

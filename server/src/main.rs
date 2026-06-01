@@ -11,6 +11,7 @@
 
 mod connection;
 mod dispatch;
+mod hub;
 mod state;
 
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use rsa::RsaPublicKey;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+use hub::Hub;
 use state::PartyState;
 
 #[tokio::main]
@@ -42,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS)?);
     let fingerprint =
         fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes());
+    let hub = Arc::new(Hub::new());
 
     let port = messenger_core::PORT_DEFAULT;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -58,8 +61,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(%addr, "client connected");
         let state = state.clone();
         let privkey = privkey.clone();
+        let hub = hub.clone();
         tokio::spawn(async move {
-            if let Err(e) = connection::serve_connection(&mut stream, &privkey, state).await {
+            if let Err(e) = connection::serve_connection(&mut stream, &privkey, state, hub).await {
                 tracing::warn!(%addr, error = %e, "connection ended with error");
             } else {
                 tracing::info!(%addr, "client disconnected");

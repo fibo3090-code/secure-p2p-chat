@@ -8,10 +8,28 @@
 //! a request off the v3 tunnel, calls [`handle_request`], encrypts the replies, and
 //! separately broadcasts newly posted messages to other online members.
 
-use messenger_core::party::{PartyRequest, PartyResponse};
+use messenger_core::party::{Envelope, PartyRequest, PartyResponse};
 use uuid::Uuid;
 
 use crate::state::PartyState;
+
+/// The outcome of handling one request: `replies` go back to the requesting
+/// connection; `broadcast` envelopes are pushed to all *other* connected members
+/// (the runtime fans these out via the connection hub).
+#[derive(Debug, Default)]
+pub struct Dispatch {
+    pub replies: Vec<PartyResponse>,
+    pub broadcast: Vec<Envelope>,
+}
+
+impl Dispatch {
+    fn reply(resp: PartyResponse) -> Self {
+        Self {
+            replies: vec![resp],
+            broadcast: Vec::new(),
+        }
+    }
+}
 
 /// Per-connection session state. A connection must `Join` before any other
 /// request is honoured; once joined it carries the member's id. `peer_fingerprint`
@@ -40,17 +58,13 @@ impl ConnState {
 /// Apply `req` to `state` for the connection `conn`, returning the responses to
 /// send back to that client. Newly posted messages are stored in `state`; the
 /// runtime is responsible for broadcasting them to other connections.
-pub fn handle_request(
-    state: &mut PartyState,
-    conn: &mut ConnState,
-    req: PartyRequest,
-) -> Vec<PartyResponse> {
+pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRequest) -> Dispatch {
     match req {
         PartyRequest::Join { username, password } => {
             if conn.member.is_some() {
-                return vec![PartyResponse::Error(
+                return Dispatch::reply(PartyResponse::Error(
                     "already joined on this connection".to_string(),
-                )];
+                ));
             }
             match state.join(
                 &username,
@@ -59,41 +73,47 @@ pub fn handle_request(
             ) {
                 Ok(id) => {
                     conn.member = Some(id);
-                    vec![PartyResponse::Joined {
+                    Dispatch::reply(PartyResponse::Joined {
                         member_id: id,
                         server_name: state.name().to_string(),
                         tier: state.tier(),
-                    }]
+                    })
                 }
-                Err(e) => vec![PartyResponse::JoinRejected {
+                Err(e) => Dispatch::reply(PartyResponse::JoinRejected {
                     reason: e.reason().to_string(),
-                }],
+                }),
             }
         }
 
         // Everything past this point requires a joined member.
         other => {
             let Some(member) = conn.member else {
-                return vec![PartyResponse::Error("join required".to_string())];
+                return Dispatch::reply(PartyResponse::Error("join required".to_string()));
             };
             match other {
                 PartyRequest::Join { .. } => unreachable!("handled above"),
-                PartyRequest::ListMembers => vec![PartyResponse::Members(state.members())],
-                PartyRequest::ListChannels => vec![PartyResponse::Channels(state.channels())],
+                PartyRequest::ListMembers => {
+                    Dispatch::reply(PartyResponse::Members(state.members()))
+                }
+                PartyRequest::ListChannels => {
+                    Dispatch::reply(PartyResponse::Channels(state.channels()))
+                }
                 PartyRequest::PostMessage { channel, text } => {
                     match state.post_message(member, channel, text) {
-                        Ok(env) => vec![PartyResponse::MessagePosted {
-                            channel: env.channel,
-                            seq: env.seq,
-                        }],
-                        Err(e) => vec![PartyResponse::Error(e)],
+                        // Ack the poster, and broadcast the stored envelope to others.
+                        Ok(env) => Dispatch {
+                            replies: vec![PartyResponse::MessagePosted {
+                                channel: env.channel,
+                                seq: env.seq,
+                            }],
+                            broadcast: vec![env],
+                        },
+                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                     }
                 }
-                PartyRequest::FetchHistory { channel, since_seq } => {
-                    vec![PartyResponse::History(
-                        state.history_since(channel, since_seq),
-                    )]
-                }
+                PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
+                    PartyResponse::History(state.history_since(channel, since_seq)),
+                ),
             }
         }
     }
@@ -118,6 +138,7 @@ mod tests {
                 password: pw.map(str::to_string),
             },
         )
+        .replies
     }
 
     #[test]
@@ -172,7 +193,7 @@ mod tests {
                 since_seq: 0,
             },
         ] {
-            let resp = handle_request(&mut state, &mut conn, req);
+            let resp = handle_request(&mut state, &mut conn, req).replies;
             assert!(
                 matches!(resp[..], [PartyResponse::Error(ref m)] if m == "join required"),
                 "expected join-required error, got {resp:?}"
@@ -195,13 +216,16 @@ mod tests {
                 text: "first message".to_string(),
             },
         );
-        match &posted[..] {
+        match &posted.replies[..] {
             [PartyResponse::MessagePosted { channel: c, seq }] => {
                 assert_eq!(*c, channel);
                 assert_eq!(*seq, 1);
             }
             other => panic!("expected MessagePosted, got {other:?}"),
         }
+        // The post is also queued for broadcast to other members.
+        assert_eq!(posted.broadcast.len(), 1);
+        assert_eq!(posted.broadcast[0].seq, 1);
 
         let history = handle_request(
             &mut state,
@@ -210,7 +234,8 @@ mod tests {
                 channel,
                 since_seq: 0,
             },
-        );
+        )
+        .replies;
         match &history[..] {
             [PartyResponse::History(items)] => {
                 assert_eq!(items.len(), 1);
@@ -229,10 +254,10 @@ mod tests {
         let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", None);
 
-        let members = handle_request(&mut state, &mut conn, PartyRequest::ListMembers);
+        let members = handle_request(&mut state, &mut conn, PartyRequest::ListMembers).replies;
         assert!(matches!(&members[..], [PartyResponse::Members(m)] if m.len() == 1));
 
-        let channels = handle_request(&mut state, &mut conn, PartyRequest::ListChannels);
+        let channels = handle_request(&mut state, &mut conn, PartyRequest::ListChannels).replies;
         assert!(matches!(&channels[..], [PartyResponse::Channels(c)] if c.len() == 1));
     }
 }
