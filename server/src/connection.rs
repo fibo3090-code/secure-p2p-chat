@@ -67,13 +67,16 @@ where
                     None => Dispatch {
                         replies: vec![PartyResponse::Error("malformed request".to_string())],
                         broadcast: Vec::new(),
+                        directed: Vec::new(),
                     },
                 };
 
-                // Start receiving broadcasts once this connection has joined.
-                if !registered && conn.member().is_some() {
-                    hub.register(conn_id, out_tx.clone());
-                    registered = true;
+                // Register for broadcasts/DMs once this connection has joined.
+                if !registered {
+                    if let Some(member) = conn.member() {
+                        hub.register(conn_id, member, out_tx.clone());
+                        registered = true;
+                    }
                 }
 
                 for resp in outcome.replies {
@@ -81,6 +84,9 @@ where
                 }
                 for env in outcome.broadcast {
                     hub.broadcast_except(conn_id, PartyResponse::Message(env));
+                }
+                for (member, resp) in outcome.directed {
+                    hub.send_to_member(member, resp);
                 }
             }
         }
@@ -249,6 +255,78 @@ mod tests {
                 assert_eq!(env.payload, MessagePayload::Text("hi bob".to_string()));
             }
             other => panic!("expected broadcast Message, got {other:?}"),
+        }
+
+        drop(alice);
+        drop(bob);
+        alice_srv.abort();
+        bob_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_message_is_delivered_and_fetchable() {
+        let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let server_priv_b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+
+        let (mut alice, alice_srv) =
+            connect(server_priv_a, &alice_priv, state.clone(), hub.clone()).await;
+        let (mut bob, bob_srv) =
+            connect(server_priv_b, &bob_priv, state.clone(), hub.clone()).await;
+
+        let alice_id = match alice.join("alice", None).await.unwrap() {
+            PartyResponse::Joined { member_id, .. } => member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        };
+        let bob_id = match bob.join("bob", None).await.unwrap() {
+            PartyResponse::Joined { member_id, .. } => member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        };
+
+        // Alice DMs Bob: she gets an ack; Bob receives the message live.
+        let ack = request(
+            &mut alice,
+            PartyRequest::SendDm {
+                to: bob_id,
+                text: "hey bob".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(ack, PartyResponse::MessagePosted { .. }));
+
+        match bob.recv().await.unwrap() {
+            PartyResponse::Message(env) => {
+                assert_eq!(env.sender, alice_id);
+                assert_eq!(
+                    env.channel,
+                    messenger_core::party::dm_thread_id(alice_id, bob_id)
+                );
+                assert_eq!(env.payload, MessagePayload::Text("hey bob".to_string()));
+            }
+            other => panic!("expected DM Message, got {other:?}"),
+        }
+
+        // Bob catches up on DM history with Alice.
+        match request(
+            &mut bob,
+            PartyRequest::FetchDmHistory {
+                with: alice_id,
+                since_seq: 0,
+            },
+        )
+        .await
+        {
+            PartyResponse::History(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0].payload,
+                    MessagePayload::Text("hey bob".to_string())
+                );
+            }
+            other => panic!("expected DM history, got {other:?}"),
         }
 
         drop(alice);

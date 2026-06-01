@@ -17,8 +17,10 @@ server storing history so messages reach people who were offline. This is the
 - The encrypted, authenticated transport reuses the existing Protocol v3 handshake
   (the server has its own identity, TOFU-verified by clients once).
 
-Out of scope for the MVP (later sub-phases / phases): server-routed DMs, roles &
-permissions, governance/audit, files/Drive (Phase 2), E2EE (Phase 4).
+Server-routed 1:1 **direct messages** are implemented (a deterministic per-pair DM
+thread; the server stores and delivers them like channels, with offline history).
+Out of scope for the MVP (later sub-phases / phases): roles & permissions,
+governance/audit, files/Drive (Phase 2), E2EE (Phase 4).
 
 ## Layering
 

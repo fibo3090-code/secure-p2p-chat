@@ -1072,6 +1072,40 @@ impl TuiApp {
                     ),
                 }
             }
+            TuiCommand::PartyDm { target, text } => {
+                let Some(server_id) = self.current_party else {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No Party server joined. Use :party-connect".to_string(),
+                    );
+                    return;
+                };
+                // Resolve the target to a member id: `#N` (1-based) or a username.
+                let member = self.party_manager.server(server_id).and_then(|s| {
+                    if let Some(idx) = target
+                        .strip_prefix('#')
+                        .and_then(|n| n.parse::<usize>().ok())
+                    {
+                        s.members.get(idx.wrapping_sub(1)).map(|m| m.id)
+                    } else {
+                        s.members
+                            .iter()
+                            .find(|m| m.username.eq_ignore_ascii_case(&target))
+                            .map(|m| m.id)
+                    }
+                });
+                match member {
+                    Some(mid) => {
+                        if let Err(e) = self.party_manager.send_dm(server_id, mid, text) {
+                            self.toast(ToastLevel::Error, format!("DM failed: {e}"));
+                        }
+                    }
+                    None => self.toast(
+                        ToastLevel::Error,
+                        format!("No member '{target}' on this server (try :party-status)"),
+                    ),
+                }
+            }
             TuiCommand::PartyStatus => {
                 let ids = self.party_manager.server_ids();
                 if ids.is_empty() {

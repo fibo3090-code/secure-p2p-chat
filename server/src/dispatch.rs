@@ -13,13 +13,17 @@ use uuid::Uuid;
 
 use crate::state::PartyState;
 
-/// The outcome of handling one request: `replies` go back to the requesting
-/// connection; `broadcast` envelopes are pushed to all *other* connected members
-/// (the runtime fans these out via the connection hub).
+/// The outcome of handling one request:
+/// - `replies` go back to the requesting connection;
+/// - `broadcast` envelopes are pushed to all *other* connected members (channels);
+/// - `directed` responses are delivered to a specific member's connections (DMs).
+///
+/// The runtime fans `broadcast`/`directed` out via the connection hub.
 #[derive(Debug, Default)]
 pub struct Dispatch {
     pub replies: Vec<PartyResponse>,
     pub broadcast: Vec<Envelope>,
+    pub directed: Vec<(Uuid, PartyResponse)>,
 }
 
 impl Dispatch {
@@ -27,6 +31,7 @@ impl Dispatch {
         Self {
             replies: vec![resp],
             broadcast: Vec::new(),
+            directed: Vec::new(),
         }
     }
 }
@@ -107,6 +112,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                                 seq: env.seq,
                             }],
                             broadcast: vec![env],
+                            directed: Vec::new(),
                         },
                         Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                     }
@@ -114,6 +120,22 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
                     PartyResponse::History(state.history_since(channel, since_seq)),
                 ),
+                PartyRequest::SendDm { to, text } => match state.post_dm(member, to, text) {
+                    // Ack the sender (who appends locally); deliver to the recipient.
+                    Ok(env) => Dispatch {
+                        replies: vec![PartyResponse::MessagePosted {
+                            channel: env.channel,
+                            seq: env.seq,
+                        }],
+                        broadcast: Vec::new(),
+                        directed: vec![(to, PartyResponse::Message(env))],
+                    },
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::FetchDmHistory { with, since_seq } => {
+                    let thread = messenger_core::party::dm_thread_id(member, with);
+                    Dispatch::reply(PartyResponse::History(state.dm_history(thread, since_seq)))
+                }
             }
         }
     }
