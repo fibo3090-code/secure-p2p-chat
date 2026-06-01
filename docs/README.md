@@ -15,6 +15,7 @@ This is the canonical index for project documentation.
 - Protocol: [04_protocol.md](04_protocol.md)
 - Platform spec: [05_platform_spec.md](05_platform_spec.md)
 - Phase 1 plan (Party server): [06_phase1_party_server.md](06_phase1_party_server.md)
+- UI refront plan (Tauri + SolidJS): [07_ui_refront_tauri.md](07_ui_refront_tauri.md)
 - Security posture: [../SECURITY.md](../SECURITY.md)
 - Threat model: [../THREAT_MODEL.md](../THREAT_MODEL.md)
 
@@ -36,6 +37,7 @@ long-range platform direction. Keep the two from drifting.
 - `04_protocol.md`: shipped wire behavior and compatibility notes
 - `05_platform_spec.md`: the forward-looking Hybrid Messenger platform vision, architecture, trust tiers, and phased roadmap
 - `06_phase1_party_server.md`: the Phase 1 Party server design, build slices, and verification plan
+- `07_ui_refront_tauri.md`: the total UI rewrite plan — Tauri shell + SolidJS frontend, 3-pane shell, packaging rebuild, phased execution
 - `SECURITY.md`: current security posture and disclosure guidance
 - `THREAT_MODEL.md`: assumptions, assets, attack surfaces, and limits
 
