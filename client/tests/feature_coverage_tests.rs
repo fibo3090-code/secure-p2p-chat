@@ -203,3 +203,31 @@ fn generate_invite_qr_produces_png() {
         &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']
     );
 }
+
+#[test]
+fn connection_password_setter_ignores_empty() {
+    let mut mgr = ChatManager::default();
+    assert!(!mgr.has_connection_password());
+    mgr.set_connection_password(Some(String::new()));
+    assert!(!mgr.has_connection_password(), "empty password must be treated as none");
+    mgr.set_connection_password(Some("hunter2".to_string()));
+    assert!(mgr.has_connection_password());
+    mgr.set_connection_password(None);
+    assert!(!mgr.has_connection_password());
+}
+
+#[test]
+fn conversation_lock_pauses_rehost() {
+    let mut mgr = ChatManager::default();
+    mgr.is_hosting = true;
+    // Hosting with no live placeholder => a rehost would normally be needed.
+    assert!(mgr.check_rehost_needed());
+    mgr.set_conversation_locked(true);
+    assert!(mgr.is_conversation_locked());
+    assert!(
+        !mgr.check_rehost_needed(),
+        "a locked conversation must not auto-rehost"
+    );
+    mgr.set_conversation_locked(false);
+    assert!(mgr.check_rehost_needed());
+}

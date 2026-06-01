@@ -72,6 +72,15 @@ struct Peer {
 /// Spin up a connected host+client pair over a duplex stream and run both
 /// sessions through the handshake. Returns both peers ready for the confirm step.
 async fn connect_pair() -> (Peer, Peer) {
+    connect_pair_with_passwords(None, None).await
+}
+
+/// As [`connect_pair`], but with optional host-required / client-supplied
+/// connection passwords to exercise the password gate.
+async fn connect_pair_with_passwords(
+    host_password: Option<String>,
+    client_password: Option<String>,
+) -> (Peer, Peer) {
     let host_priv = generate_rsa_keypair(RSA_KEY_BITS).expect("host key");
     let client_priv = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
     let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
@@ -95,6 +104,7 @@ async fn connect_pair() -> (Peer, Peer) {
             host_out_rx,
             host_confirm_rx,
             host_chat,
+            host_password,
         )
         .await
     });
@@ -108,6 +118,7 @@ async fn connect_pair() -> (Peer, Peer) {
             client_out_rx,
             client_confirm_rx,
             client_chat,
+            client_password,
         )
         .await
     });
@@ -276,4 +287,72 @@ async fn rejecting_the_fingerprint_aborts_the_session() {
     );
 
     client.handle.abort();
+}
+
+#[tokio::test]
+async fn correct_connection_password_is_accepted() {
+    let (mut host, mut client) =
+        connect_pair_with_passwords(Some("hunter2".to_string()), Some("hunter2".to_string())).await;
+
+    // The password gate runs before TOFU; with the right password both sides
+    // proceed to the confirmation step and then to Ready.
+    wait_until(&mut host.events, "host", awaiting_confirmation).await;
+    wait_until(&mut client.events, "client", awaiting_confirmation).await;
+    host.confirm.send(true).unwrap();
+    client.confirm.send(true).unwrap();
+    wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Ready)
+    })
+    .await;
+    wait_until(&mut client.events, "client", |ev| {
+        matches!(ev, SessionEvent::Ready)
+    })
+    .await;
+
+    host.handle.abort();
+    client.handle.abort();
+}
+
+#[tokio::test]
+async fn wrong_connection_password_is_rejected_before_tofu() {
+    let (mut host, client) =
+        connect_pair_with_passwords(Some("hunter2".to_string()), Some("wrong".to_string())).await;
+
+    // The host rejects at the password gate and never surfaces the peer for TOFU.
+    let ev = wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Error(_))
+    })
+    .await;
+    match ev {
+        SessionEvent::Error(msg) => {
+            assert!(msg.to_lowercase().contains("password"), "got: {msg}")
+        }
+        _ => unreachable!(),
+    }
+    let result = tokio::time::timeout(STEP_TIMEOUT, host.handle)
+        .await
+        .expect("host task should finish after a bad password");
+    assert!(result.unwrap().is_err());
+
+    client.handle.abort();
+}
+
+#[tokio::test]
+async fn missing_connection_password_is_rejected() {
+    let (mut host, client) = connect_pair_with_passwords(Some("hunter2".to_string()), None).await;
+
+    wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Error(_))
+    })
+    .await;
+    let result = tokio::time::timeout(STEP_TIMEOUT, host.handle)
+        .await
+        .expect("host task should finish");
+    assert!(result.unwrap().is_err());
+
+    // The client also errors out (it learned a password was required but had none).
+    let client_result = tokio::time::timeout(STEP_TIMEOUT, client.handle)
+        .await
+        .expect("client task should finish");
+    assert!(client_result.unwrap().is_err());
 }

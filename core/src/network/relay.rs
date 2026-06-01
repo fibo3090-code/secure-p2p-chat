@@ -74,6 +74,7 @@ pub async fn run_host_session_via_relay(
         from_app_rx,
         confirm_rx,
         chat_id,
+        None,
     )
     .await
 }
@@ -96,6 +97,7 @@ pub async fn run_client_session_via_relay(
         from_app_rx,
         confirm_rx,
         chat_id,
+        None,
     )
     .await
 }

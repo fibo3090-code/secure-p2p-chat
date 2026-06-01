@@ -86,6 +86,7 @@ pub async fn run_host_session(
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
+    connection_password: Option<String>,
 ) -> Result<()> {
     // 1. Bind listener (bind to all interfaces for now, could be configurable)
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -264,6 +265,20 @@ pub async fn run_host_session(
     let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
     tracing::debug!("Verified client identity: {}...", &client_fingerprint[..8]);
 
+    // Optional connection-password gate (inside the encrypted, authenticated
+    // tunnel, before the peer is surfaced for verification).
+    if let Err(e) = host_password_gate(
+        &mut stream,
+        &cipher,
+        &transport_aad,
+        connection_password.as_deref(),
+    )
+    .await
+    {
+        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+        return Err(e);
+    }
+
     // 12. Display Fingerprint & Wait for Confirmation
     to_app_tx
         .send(SessionEvent::NewConnection {
@@ -308,6 +323,7 @@ pub async fn run_host_session(
 }
 
 /// Run client session: connect, handshake (v3), message loop
+#[allow(clippy::too_many_arguments)]
 pub async fn run_client_session(
     host: &str,
     port: u16,
@@ -316,6 +332,7 @@ pub async fn run_client_session(
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
+    connection_password: Option<String>,
 ) -> Result<()> {
     // 1. Connect to host
     let mut stream = TcpStream::connect((host, port)).await?;
@@ -479,6 +496,19 @@ pub async fn run_client_session(
     let my_proof_bytes = bincode::serialize(&my_proof)?;
     let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
     send_packet(&mut stream, &encrypted_proof).await?;
+
+    // Answer the host's optional connection-password gate before proceeding.
+    if let Err(e) = client_password_gate(
+        &mut stream,
+        &cipher,
+        &transport_aad,
+        connection_password.as_deref(),
+    )
+    .await
+    {
+        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+        return Err(e);
+    }
 
     // 11. Display Fingerprint & Wait for Confirmation
     to_app_tx
@@ -811,6 +841,77 @@ where
     })
 }
 
+/// Constant-time comparison so a wrong connection password cannot be recovered
+/// byte-by-byte via response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Host side of the optional connection-password gate, run over the established
+/// tunnel right after the handshake (so it is confidential and transcript-bound)
+/// and before the peer is surfaced for TOFU. The host announces whether a password
+/// is required; the client replies with its (encrypted) password. A wrong password
+/// returns an error and the caller drops the connection.
+async fn host_password_gate<S>(
+    stream: &mut S,
+    cipher: &AesCipher,
+    aad: &[u8],
+    expected: Option<&str>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let flag = [u8::from(expected.is_some())];
+    send_packet(stream, &cipher.encrypt(&flag, Some(aad))).await?;
+    let resp_ct = recv_packet_with_timeout(stream).await?;
+    let resp = cipher
+        .decrypt(&resp_ct, Some(aad))
+        .ok_or_else(|| anyhow!("Failed to decrypt password response"))?;
+    if let Some(pw) = expected {
+        if !constant_time_eq(&resp, pw.as_bytes()) {
+            return Err(anyhow!("Incorrect connection password"));
+        }
+    }
+    Ok(())
+}
+
+/// Client side of the connection-password gate (mirror of [`host_password_gate`]).
+async fn client_password_gate<S>(
+    stream: &mut S,
+    cipher: &AesCipher,
+    aad: &[u8],
+    password: Option<&str>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let flag_ct = recv_packet_with_timeout(stream).await?;
+    let flag = cipher
+        .decrypt(&flag_ct, Some(aad))
+        .ok_or_else(|| anyhow!("Failed to decrypt password challenge"))?;
+    let required = flag.first().copied() == Some(1);
+    // Always reply (even empty) so the host's receive completes and both sides
+    // converge on the same outcome.
+    let payload: Vec<u8> = if required {
+        password.map(|p| p.as_bytes().to_vec()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    send_packet(stream, &cipher.encrypt(&payload, Some(aad))).await?;
+    if required && password.is_none() {
+        return Err(anyhow!("This host requires a connection password"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_host_session_over_stream<S>(
     stream: &mut S,
     peer_label: String,
@@ -819,6 +920,7 @@ pub async fn run_host_session_over_stream<S>(
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
+    connection_password: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -829,6 +931,19 @@ where
         cipher,
         transport_aad,
     } = host_handshake(stream, &privkey, chat_id).await?;
+
+    // Optional connection-password gate (inside the encrypted, authenticated tunnel).
+    if let Err(e) = host_password_gate(
+        stream,
+        &cipher,
+        &transport_aad,
+        connection_password.as_deref(),
+    )
+    .await
+    {
+        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+        return Err(e);
+    }
 
     to_app_tx
         .send(SessionEvent::NewConnection {
@@ -866,6 +981,7 @@ where
     run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_client_session_over_stream<S>(
     stream: &mut S,
     peer_label: String,
@@ -874,6 +990,7 @@ pub async fn run_client_session_over_stream<S>(
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
+    connection_password: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -889,6 +1006,19 @@ where
         cipher,
         transport_aad,
     } = client_handshake(stream, &privkey, chat_id).await?;
+
+    // Answer the host's optional connection-password gate before proceeding.
+    if let Err(e) = client_password_gate(
+        stream,
+        &cipher,
+        &transport_aad,
+        connection_password.as_deref(),
+    )
+    .await
+    {
+        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+        return Err(e);
+    }
 
     to_app_tx
         .send(SessionEvent::ShowFingerprintVerification {

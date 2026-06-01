@@ -106,6 +106,8 @@ pub struct App {
     pub party_post_input: String,
     pub party_selected_server: Option<Uuid>,
     pub party_selected_channel: Option<Uuid>,
+    /// Optional P2P connection password entered in the Host/Connect dialogs.
+    pub connection_password_input: String,
 }
 
 impl App {
@@ -326,6 +328,7 @@ impl App {
             party_post_input: String::new(),
             party_selected_server: None,
             party_selected_channel: None,
+            connection_password_input: String::new(),
         })
     }
 
@@ -682,6 +685,28 @@ impl eframe::App for App {
 
                     if ui.button("Help").clicked() {
                         self.active_dialog = ActiveDialog::About;
+                    }
+
+                    // Conversation lock toggle (refuse new connections when locked).
+                    if let Ok(mut manager) = self.chat_manager.try_lock() {
+                        let locked = manager.is_conversation_locked();
+                        let label = if locked {
+                            "🔒 Locked"
+                        } else {
+                            "🔓 Unlocked"
+                        };
+                        if ui
+                            .button(label)
+                            .on_hover_text(
+                                "When locked, no new peer can connect (and auto-rehost is paused)",
+                            )
+                            .clicked()
+                        {
+                            manager.set_conversation_locked(!locked);
+                            if !locked {
+                                manager.stop_hosting();
+                            }
+                        }
                     }
                 });
             });

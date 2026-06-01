@@ -54,6 +54,11 @@ pub struct ChatManager {
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
+    /// Optional P2P connection password: required from peers when hosting, and
+    /// supplied to the host when connecting. Verified inside the encrypted tunnel.
+    pub connection_password: Option<String>,
+    /// When true, the conversation is locked: no auto-rehost, so no new peer joins.
+    pub conversation_locked: bool,
 }
 
 struct IncomingTextMessage {
@@ -324,13 +329,37 @@ impl ChatManager {
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
             is_hosting: false,
+            connection_password: None,
+            conversation_locked: false,
         }
+    }
+
+    /// Set the optional P2P connection password. When hosting, peers must present
+    /// it; when connecting, it is the password supplied to the host. Set this
+    /// before calling `start_host` / `connect_to_host`.
+    pub fn set_connection_password(&mut self, password: Option<String>) {
+        self.connection_password = password.filter(|p| !p.is_empty());
+    }
+
+    /// Whether a connection password is currently configured.
+    pub fn has_connection_password(&self) -> bool {
+        self.connection_password.is_some()
+    }
+
+    /// Lock or unlock the conversation. While locked, the host does not auto-rehost,
+    /// so no new peer can connect (the caller typically also stops hosting).
+    pub fn set_conversation_locked(&mut self, locked: bool) {
+        self.conversation_locked = locked;
+    }
+
+    pub fn is_conversation_locked(&self) -> bool {
+        self.conversation_locked
     }
 
     /// Check if we need to re-host (i.e. we want to be hosting, but no placeholder host exists).
     /// Returns true if the caller should spawn a task to call `start_host`.
     pub fn check_rehost_needed(&self) -> bool {
-        if !self.is_hosting {
+        if !self.is_hosting || self.conversation_locked {
             return false;
         }
         // If we want to host, but no chat is a placeholder host, we need to restart.
@@ -666,11 +695,20 @@ impl ChatManager {
 
         // Create confirmation channel so UI can accept/reject the fingerprint
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let connection_password = self.connection_password.clone();
 
         // Spawn session task
         tokio::spawn(async move {
-            if let Err(e) =
-                run_host_session(port, privkey, to_app_tx, from_app_rx, confirm_rx, chat_id).await
+            if let Err(e) = run_host_session(
+                port,
+                privkey,
+                to_app_tx,
+                from_app_rx,
+                confirm_rx,
+                chat_id,
+                connection_password,
+            )
+            .await
             {
                 tracing::error!("Host session error: {}", e);
             }
@@ -789,6 +827,7 @@ impl ChatManager {
 
         let host_copy = host.to_string();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let connection_password = self.connection_password.clone();
 
         tokio::spawn(async move {
             if let Err(e) = run_client_session(
@@ -799,6 +838,7 @@ impl ChatManager {
                 from_app_rx,
                 confirm_rx,
                 chat_id,
+                connection_password,
             )
             .await
             {

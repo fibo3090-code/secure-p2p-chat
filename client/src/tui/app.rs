@@ -879,6 +879,30 @@ impl TuiApp {
                     Err(e) => self.toast(ToastLevel::Error, format!("Relay connect failed: {}", e)),
                 }
             }
+            TuiCommand::ConnectionPassword(pw) => {
+                let set = pw.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+                self.chat_manager.set_connection_password(pw);
+                if set {
+                    self.toast(
+                        ToastLevel::Success,
+                        "Connection password set (applies to next host/connect)".to_string(),
+                    );
+                } else {
+                    self.toast(ToastLevel::Info, "Connection password cleared".to_string());
+                }
+            }
+            TuiCommand::Lock(on) => {
+                self.chat_manager.set_conversation_locked(on);
+                if on {
+                    self.chat_manager.stop_hosting();
+                    self.toast(
+                        ToastLevel::Warning,
+                        "Conversation locked — no new connections accepted".to_string(),
+                    );
+                } else {
+                    self.toast(ToastLevel::Info, "Conversation unlocked".to_string());
+                }
+            }
             TuiCommand::Disconnect => self.disconnect_selected(),
             TuiCommand::StopHost => {
                 self.chat_manager.stop_hosting();

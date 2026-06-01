@@ -530,6 +530,15 @@ fn render_delete_confirmation(app: &mut App, ctx: &egui::Context, chat_id: uuid:
         });
 }
 
+/// Apply the password typed in the Host/Connect dialog to the chat manager so the
+/// subsequent host/connect uses it (host requires it; client supplies it).
+fn apply_connection_password(app: &mut App) {
+    let pw = app.connection_password_input.clone();
+    if let Ok(mut m) = app.chat_manager.try_lock() {
+        m.set_connection_password(if pw.is_empty() { None } else { Some(pw) });
+    }
+}
+
 fn render_host_dialog(app: &mut App, ctx: &egui::Context) {
     egui::Window::new("Start Host")
         .collapsible(false)
@@ -538,9 +547,19 @@ fn render_host_dialog(app: &mut App, ctx: &egui::Context) {
             ui.label("Port:");
             ui.text_edit_singleline(&mut app.host_port);
 
+            ui.add_space(6.0);
+            ui.label("Connection password (optional):");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.connection_password_input)
+                    .password(true)
+                    .hint_text("leave blank for no password"),
+            );
+            ui.small("Peers must enter this exact password to connect.");
+
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "Start").clicked() {
                     tracing::info!("Start host button clicked");
+                    apply_connection_password(app);
                     app.start_host_clicked();
                     app.active_dialog = ActiveDialog::None;
                 }
@@ -603,9 +622,18 @@ fn render_connect_dialog(app: &mut App, ctx: &egui::Context) {
             ui.label("Port:");
             ui.text_edit_singleline(&mut app.connect_port);
 
+            ui.add_space(6.0);
+            ui.label("Connection password (if required):");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.connection_password_input)
+                    .password(true)
+                    .hint_text("leave blank if the host has none"),
+            );
+
             ui.horizontal(|ui| {
                 if crate::gui::widgets::primary_button(ui, "Connect").clicked() {
                     tracing::info!("Connect to host button clicked");
+                    apply_connection_password(app);
                     app.connect_clicked();
                     app.active_dialog = ActiveDialog::None;
                 }

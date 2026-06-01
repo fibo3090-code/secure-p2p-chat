@@ -24,6 +24,11 @@ pub enum TuiCommand {
     },
     Disconnect,
     StopHost,
+    /// Set (or clear, when `None`) the P2P connection password used for hosting and
+    /// connecting.
+    ConnectionPassword(Option<String>),
+    /// Lock (`true`) or unlock (`false`) the conversation against new connections.
+    Lock(bool),
 
     // --- contacts ---
     Contacts,
@@ -100,6 +105,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("disconnect", ":disconnect", "Disconnect / remove the selected chat"),
     ("stop-host", ":stop-host", "Stop listening (tear down the host)"),
+    (
+        "connection-password",
+        ":connection-password [password]",
+        "Set/clear the P2P connection password (host requires it; client supplies it)",
+    ),
+    (
+        "lock",
+        ":lock <on|off>",
+        "Lock the conversation against new connections (on) or unlock (off)",
+    ),
     ("contacts", ":contacts", "Open the contacts list"),
     (
         "contact-add",
@@ -238,6 +253,15 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         }
         "disconnect" => Ok(TuiCommand::Disconnect),
         "stop-host" => Ok(TuiCommand::StopHost),
+        "connection-password" => Ok(TuiCommand::ConnectionPassword(
+            parts.next().map(str::to_string),
+        )),
+        "lock" => {
+            let arg = parts
+                .next()
+                .ok_or_else(|| "Usage: :lock <on|off>".to_string())?;
+            Ok(TuiCommand::Lock(parse_bool(arg)?))
+        }
 
         "contacts" => Ok(TuiCommand::Contacts),
         "contact-add" => {
@@ -420,6 +444,21 @@ mod tests {
                 token: "tok".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_connection_password_and_lock() {
+        assert_eq!(
+            parse_command(":connection-password hunter2").unwrap(),
+            TuiCommand::ConnectionPassword(Some("hunter2".into()))
+        );
+        assert_eq!(
+            parse_command(":connection-password").unwrap(),
+            TuiCommand::ConnectionPassword(None)
+        );
+        assert_eq!(parse_command(":lock on").unwrap(), TuiCommand::Lock(true));
+        assert_eq!(parse_command(":lock off").unwrap(), TuiCommand::Lock(false));
+        assert!(parse_command(":lock").is_err());
     }
 
     #[test]
