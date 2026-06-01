@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "encodeur_rsa_rust"
-version = "1.8.1"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-core"
-version = "1.8.1"
+version = "1.9.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-server"
-version = "1.8.1"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "messenger-core",

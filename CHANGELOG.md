@@ -4,11 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-06-01
+
 ### Added
 
+- **Party server (new `messenger-server` binary).** A self-hosted, multi-user server (the "Administered" trust tier) so non-technical users can join with an address + optional password + a username — no port-forwarding required. Members appear in a directory with presence, chat in channels with live broadcast, and the server stores history so people who were offline catch up on reconnect. The encrypted, authenticated transport reuses the existing Protocol v3 handshake (the server has its own TOFU-verified identity), with durable state (members/channels/history) and a stable server identity persisted across restarts. Run with `cargo run -p messenger-server`.
+- **Party client UI.** Connect to and use a Party server from the GUI (a Party window with a join form, server/channel/member lists, message view, and a post box) and from the TUI (`:party-connect`, `:party-post`, `:party-status`).
+- **P2P connection password + conversation lock.** Hosts can require an optional shared password (verified inside the encrypted v3 tunnel, after identity verification and before fingerprint confirmation, with a constant-time comparison) and can lock a conversation to refuse new connections. Reachable from the GUI (Host/Connect dialogs + a menu-bar lock toggle) and the TUI (`:connection-password`, `:lock`).
 - **TUI overhaul**: the terminal interface is now fully usable on its own. Added a typed command language that exposes every action (connections, contacts, invites, file send, settings, identity, diagnostics), with a live autocomplete menu in command mode (Tab to complete, ↑/↓ to choose).
 - TUI modal overlays: in-terminal fingerprint verification (`y`/`n` or `:verify`), password unlock / set-password on startup, contacts, settings, identity (with the same safety-color grid as the GUI), file-transfer progress, and a scrollable help/keybinding reference.
 - TUI quality-of-life: auto-scrolling message view with clamping, proper cursor-aware text editing (mid-line edits, word delete, command history), a colored toast stack, unread/typing indicators, a readable status bar, and graceful encrypted-history save on a timer and on exit.
+
+### Changed
+
+- **Workspace restructure.** The single crate is now a Cargo workspace of three crates — `core` (`messenger-core`: crypto, protocol, identity, transport, shared types), `client` (`encodeur_rsa_rust`: the GUI/TUI app and its binary), and `server` (`messenger-server`) — so the client and server share `core`. No behavior change for the app: the client binary name and all packaging paths are unchanged. The v3 handshake was extracted into a reusable form so both the P2P sessions and the Party server use the exact same audited code.
+- Test coverage expanded substantially (now 250+ workspace tests), including an end-to-end pipeline test over the real session functions, relay and Party server end-to-end tests, full protocol round-trip/symmetry coverage, and the connection-password gate.
 
 ### Fixed
 
@@ -446,6 +456,7 @@ This release transformed the application from a functional prototype into a poli
 - Message history persistence.
 
 [Unreleased]: #
+[1.9.0]: #
 [1.7.3]: #
 [1.7.2]: #
 [1.7.1]: #

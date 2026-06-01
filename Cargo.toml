@@ -6,7 +6,7 @@ members = ["core", "client", "server"]
 default-members = ["client"]
 
 [workspace.package]
-version = "1.8.1"
+version = "1.9.0"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]

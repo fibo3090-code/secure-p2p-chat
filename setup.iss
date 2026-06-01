@@ -1,5 +1,5 @@
 ; setup.iss - Inno Setup script for Encrypted P2P Messenger
-; Call: ISCC.exe /DMyAppVersion="1.8.1" setup.iss
+; Call: ISCC.exe /DMyAppVersion="1.9.0" setup.iss
 
 #define MyAppName "Encrypted P2P Messenger"
 #define MyAppPublisher "fibo3090"
