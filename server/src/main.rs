@@ -1,10 +1,13 @@
 //! Party server for the Encrypted Messenger.
 //!
-//! Placeholder binary established in Phase 0 (workspace refactor) to prove that the
-//! shared [`messenger_core`] crate is reusable from a server context. The actual
-//! Party server — accounts, channels, server-routed messaging, offline buffering,
-//! and the encrypted transport handshake reusing `messenger_core` — is built in
-//! Phase 1. See `docs/05_platform_spec.md`.
+//! Phase 1 (slice 1) establishes the in-memory [`state::PartyState`] model and the
+//! shared [`messenger_core::party`] protocol. The network runtime — per-connection
+//! v3 handshake reuse plus a Party message loop, and SQLite/blob persistence — is
+//! the next slice. See `docs/06_phase1_party_server.md`.
+
+mod state;
+
+use state::PartyState;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -13,16 +16,23 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Touch the shared core so the dependency is exercised and the contract that
-    // "the server reuses core" is enforced by the build from day one.
+    // Initialise the runtime model so the protocol/state foundation is exercised.
+    // (Accepting connections over the v3 tunnel arrives in the next slice.)
+    let server_password = std::env::var("PARTY_PASSWORD").ok();
+    let state = PartyState::new("Encrypted Messenger Party", server_password);
+
     tracing::info!(
-        core_default_port = messenger_core::PORT_DEFAULT,
-        "Party server is not yet implemented (Phase 1). See docs/05_platform_spec.md."
+        server_name = state.name(),
+        tier = ?state.tier(),
+        default_channel = %state.default_channel(),
+        listen_port = messenger_core::PORT_DEFAULT,
+        "Party server state initialised"
     );
 
     eprintln!(
-        "messenger-server is a Phase 0 placeholder and does not serve yet. \
-         The Party server is implemented in Phase 1 (see docs/05_platform_spec.md)."
+        "messenger-server (Phase 1, slice 1): protocol + state foundation is in \
+         place and tested. The network runtime is the next slice \
+         (see docs/06_phase1_party_server.md)."
     );
 
     Ok(())

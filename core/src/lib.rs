@@ -9,6 +9,7 @@
 //! Modules:
 //! - `core`: Cryptography and wire protocol structures.
 //! - `network`: TCP sessions, relay rendezvous, and local discovery.
+//! - `party`: Party server application protocol (Phase 1), riding on the v3 tunnel.
 //! - `transfer`: Chunked file transfer utilities.
 //! - `identity`: Persistent identity (RSA keys, fingerprints).
 //! - `types`: Shared domain types used across layers.
@@ -16,6 +17,7 @@
 pub mod core;
 pub mod identity;
 pub mod network;
+pub mod party;
 pub mod transfer;
 pub mod types;
 pub mod util;
