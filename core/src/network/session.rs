@@ -523,15 +523,27 @@ pub async fn run_client_session(
     run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
 }
 
-pub async fn run_host_session_over_stream<S>(
+/// A completed Protocol v3 cryptographic handshake: the peer's verified identity
+/// fingerprint and chat id, plus the established AEAD tunnel (cipher + transport
+/// AAD). Callers apply their own trust policy (interactive TOFU for P2P, server
+/// policy for the Party server) and then run whatever message loop rides on top.
+pub struct EstablishedTunnel {
+    pub peer_fingerprint: String,
+    pub peer_chat_id: uuid::Uuid,
+    pub cipher: AesCipher,
+    pub transport_aad: Vec<u8>,
+}
+
+/// Run the host side of the Protocol v3 handshake over `stream`: version exchange,
+/// X25519 ephemeral key exchange, session-key derivation, and the encrypted,
+/// transcript-bound identity-proof exchange. Returns the established tunnel and the
+/// peer's verified identity. The caller is responsible for trust policy (TOFU /
+/// server policy) and the message loop.
+pub async fn host_handshake<S>(
     stream: &mut S,
-    peer_label: String,
-    privkey: RsaPrivateKey,
-    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
-    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    privkey: &RsaPrivateKey,
     chat_id: uuid::Uuid,
-) -> Result<()>
+) -> Result<EstablishedTunnel>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -616,7 +628,7 @@ where
     };
 
     let my_proof = IdentityProof {
-        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
         signature,
         version: PROTOCOL_VERSION as u32,
         chat_id,
@@ -654,59 +666,26 @@ where
         .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
 
     let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
-    to_app_tx
-        .send(SessionEvent::NewConnection {
-            peer_addr: peer_label,
-            fingerprint: client_fingerprint,
-            chat_id: client_proof.chat_id,
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
-        confirm_rx.recv().await
+    Ok(EstablishedTunnel {
+        peer_fingerprint: client_fingerprint,
+        peer_chat_id: client_proof.chat_id,
+        cipher,
+        transport_aad,
     })
-    .await
-    {
-        Ok(Some(true)) => {}
-        Ok(Some(false)) => {
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
-            return Err(anyhow!("Fingerprint rejected by user"));
-        }
-        Ok(None) => {
-            let msg = "Confirmation channel closed";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification failed: channel closed"));
-        }
-        Err(_) => {
-            let msg = "Fingerprint verification timed out";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification timed out"));
-        }
-    }
-
-    to_app_tx
-        .send(SessionEvent::Ready)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
 }
 
-pub async fn run_client_session_over_stream<S>(
+/// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
+/// [`host_handshake`]; returns the established tunnel and the host's verified
+/// identity (`peer_chat_id` is the host's advertised chat id).
+pub async fn client_handshake<S>(
     stream: &mut S,
-    peer_label: String,
-    privkey: RsaPrivateKey,
-    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
-    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    privkey: &RsaPrivateKey,
     chat_id: uuid::Uuid,
-) -> Result<()>
+) -> Result<EstablishedTunnel>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let peer_name = peer_label.clone();
-    to_app_tx
-        .send(SessionEvent::Connected { peer: peer_label })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
     let host_version_bytes = recv_packet_with_timeout(stream).await?;
     if host_version_bytes.len() != 4 {
         return Err(anyhow!("Invalid version packet length"));
@@ -814,7 +793,7 @@ where
     };
 
     let my_proof = IdentityProof {
-        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
         signature,
         version: PROTOCOL_VERSION as u32,
         chat_id,
@@ -823,6 +802,93 @@ where
     let my_proof_bytes = bincode::serialize(&my_proof)?;
     let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
     send_packet(stream, &encrypted_proof).await?;
+
+    Ok(EstablishedTunnel {
+        peer_fingerprint: host_fingerprint,
+        peer_chat_id: host_proof.chat_id,
+        cipher,
+        transport_aad,
+    })
+}
+
+pub async fn run_host_session_over_stream<S>(
+    stream: &mut S,
+    peer_label: String,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let EstablishedTunnel {
+        peer_fingerprint,
+        peer_chat_id,
+        cipher,
+        transport_aad,
+    } = host_handshake(stream, &privkey, chat_id).await?;
+
+    to_app_tx
+        .send(SessionEvent::NewConnection {
+            peer_addr: peer_label,
+            fingerprint: peer_fingerprint,
+            chat_id: peer_chat_id,
+        })
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
+        confirm_rx.recv().await
+    })
+    .await
+    {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
+            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
+            return Err(anyhow!("Fingerprint rejected by user"));
+        }
+        Ok(None) => {
+            let msg = "Confirmation channel closed";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification failed: channel closed"));
+        }
+        Err(_) => {
+            let msg = "Fingerprint verification timed out";
+            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
+            return Err(anyhow!("Fingerprint verification timed out"));
+        }
+    }
+
+    to_app_tx
+        .send(SessionEvent::Ready)
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+}
+
+pub async fn run_client_session_over_stream<S>(
+    stream: &mut S,
+    peer_label: String,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let peer_name = peer_label.clone();
+    to_app_tx
+        .send(SessionEvent::Connected { peer: peer_label })
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+
+    let EstablishedTunnel {
+        peer_fingerprint: host_fingerprint,
+        peer_chat_id: _,
+        cipher,
+        transport_aad,
+    } = client_handshake(stream, &privkey, chat_id).await?;
 
     to_app_tx
         .send(SessionEvent::ShowFingerprintVerification {
