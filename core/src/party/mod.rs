@@ -14,7 +14,7 @@
 
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use uuid::Uuid;
 
 use crate::core::{recv_packet, send_packet, AesCipher};
@@ -192,8 +192,51 @@ where
 /// it against the real `serve_connection`.
 pub struct PartyClient<S> {
     stream: S,
+    server_fingerprint: String,
     cipher: AesCipher,
     transport_aad: Vec<u8>,
+}
+
+/// Read half of a split [`PartyClient`].
+pub struct PartyReader<R> {
+    rd: R,
+    cipher: AesCipher,
+    transport_aad: Vec<u8>,
+}
+
+/// Write half of a split [`PartyClient`].
+pub struct PartyWriter<W> {
+    wr: W,
+    cipher: AesCipher,
+    transport_aad: Vec<u8>,
+}
+
+impl<R> PartyReader<R>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    /// Receive the next message from the server (reply or pushed broadcast).
+    pub async fn recv(&mut self) -> anyhow::Result<PartyResponse> {
+        let bytes = recv_framed(&mut self.rd, &self.cipher, &self.transport_aad).await?;
+        PartyResponse::from_bytes(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("malformed server response"))
+    }
+}
+
+impl<W> PartyWriter<W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    /// Send a request to the server.
+    pub async fn send(&mut self, req: &PartyRequest) -> anyhow::Result<()> {
+        send_framed(
+            &mut self.wr,
+            &self.cipher,
+            &self.transport_aad,
+            &req.to_bytes(),
+        )
+        .await
+    }
 }
 
 impl<S> PartyClient<S>
@@ -210,9 +253,33 @@ where
         let tunnel = client_handshake(&mut stream, privkey, chat_id).await?;
         Ok(Self {
             stream,
+            server_fingerprint: tunnel.peer_fingerprint,
             cipher: tunnel.cipher,
             transport_aad: tunnel.transport_aad,
         })
+    }
+
+    /// The server's handshake-verified identity fingerprint, for TOFU pinning.
+    pub fn server_fingerprint(&self) -> &str {
+        &self.server_fingerprint
+    }
+
+    /// Split into independent read and write halves so an application can run a
+    /// receive loop concurrently with sending requests.
+    pub fn split(self) -> (PartyReader<ReadHalf<S>>, PartyWriter<WriteHalf<S>>) {
+        let (rd, wr) = tokio::io::split(self.stream);
+        (
+            PartyReader {
+                rd,
+                cipher: self.cipher.clone(),
+                transport_aad: self.transport_aad.clone(),
+            },
+            PartyWriter {
+                wr,
+                cipher: self.cipher,
+                transport_aad: self.transport_aad,
+            },
+        )
     }
 
     /// Send a request to the server.
@@ -362,5 +429,51 @@ mod tests {
             .await
             .unwrap();
         assert!(recv_framed(&mut b, &cipher, b"wrong-aad").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn party_client_connect_split_send_and_recv() {
+        use crate::core::generate_rsa_keypair;
+        use crate::network::host_handshake;
+        use crate::RSA_KEY_BITS;
+
+        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut server_stream, client_stream) = tokio::io::duplex(1 << 16);
+
+        // Minimal server: handshake, then answer one ListMembers with an empty list.
+        let server = tokio::spawn(async move {
+            let tunnel = host_handshake(&mut server_stream, &server_priv, Uuid::new_v4())
+                .await
+                .unwrap();
+            let bytes = recv_framed(&mut server_stream, &tunnel.cipher, &tunnel.transport_aad)
+                .await
+                .unwrap();
+            assert_eq!(
+                PartyRequest::from_bytes(&bytes),
+                Some(PartyRequest::ListMembers)
+            );
+            send_framed(
+                &mut server_stream,
+                &tunnel.cipher,
+                &tunnel.transport_aad,
+                &PartyResponse::Members(Vec::new()).to_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = PartyClient::connect(client_stream, &client_priv, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(!client.server_fingerprint().is_empty());
+
+        let (mut reader, mut writer) = client.split();
+        writer.send(&PartyRequest::ListMembers).await.unwrap();
+        assert!(matches!(
+            reader.recv().await.unwrap(),
+            PartyResponse::Members(ref m) if m.is_empty()
+        ));
+        server.await.unwrap();
     }
 }
