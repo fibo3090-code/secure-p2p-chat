@@ -12,11 +12,13 @@
 //!
 //! The MVP implements the Administered tier.
 
+use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 use crate::core::{recv_packet, send_packet, AesCipher};
+use crate::network::client_handshake;
 
 /// Trust tier of a server / stored message. A property of the server, surfaced
 /// prominently in the UI.
@@ -179,6 +181,74 @@ where
     cipher
         .decrypt(&ciphertext, Some(transport_aad))
         .ok_or_else(|| anyhow::anyhow!("failed to decrypt Party frame"))
+}
+
+/// Client-side handle to a Party server over an established Protocol v3 tunnel.
+///
+/// It completes the client handshake, then exposes `send`/`recv` over the encrypted
+/// channel. Responses are a single stream of [`PartyResponse`] — direct replies and
+/// pushed broadcasts interleaved — that the application correlates by variant. The
+/// future client UI (slice 4) drives this; the server's integration tests exercise
+/// it against the real `serve_connection`.
+pub struct PartyClient<S> {
+    stream: S,
+    cipher: AesCipher,
+    transport_aad: Vec<u8>,
+}
+
+impl<S> PartyClient<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    /// Complete the client side of the v3 handshake against a Party server and
+    /// return a ready client. `chat_id` is this client's advertised session id.
+    pub async fn connect(
+        mut stream: S,
+        privkey: &RsaPrivateKey,
+        chat_id: Uuid,
+    ) -> anyhow::Result<Self> {
+        let tunnel = client_handshake(&mut stream, privkey, chat_id).await?;
+        Ok(Self {
+            stream,
+            cipher: tunnel.cipher,
+            transport_aad: tunnel.transport_aad,
+        })
+    }
+
+    /// Send a request to the server.
+    pub async fn send(&mut self, req: &PartyRequest) -> anyhow::Result<()> {
+        send_framed(
+            &mut self.stream,
+            &self.cipher,
+            &self.transport_aad,
+            &req.to_bytes(),
+        )
+        .await
+    }
+
+    /// Receive the next message from the server (a reply or a pushed broadcast).
+    pub async fn recv(&mut self) -> anyhow::Result<PartyResponse> {
+        let bytes = recv_framed(&mut self.stream, &self.cipher, &self.transport_aad).await?;
+        PartyResponse::from_bytes(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("malformed server response"))
+    }
+
+    /// Join the server with a username and the optional server password. The
+    /// `Joined`/`JoinRejected` reply arrives before any broadcast can reach this
+    /// connection (the server registers a connection for broadcasts only once it
+    /// has joined), so the next message is the join result.
+    pub async fn join(
+        &mut self,
+        username: &str,
+        password: Option<String>,
+    ) -> anyhow::Result<PartyResponse> {
+        self.send(&PartyRequest::Join {
+            username: username.to_string(),
+            password,
+        })
+        .await?;
+        self.recv().await
+    }
 }
 
 #[cfg(test)]

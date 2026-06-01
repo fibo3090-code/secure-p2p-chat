@@ -96,61 +96,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use messenger_core::core::{generate_rsa_keypair, AesCipher};
-    use messenger_core::network::client_handshake;
-    use messenger_core::party::MessagePayload;
+    use messenger_core::core::generate_rsa_keypair;
+    use messenger_core::party::{MessagePayload, PartyClient};
     use messenger_core::RSA_KEY_BITS;
     use rsa::RsaPrivateKey;
     use tokio::io::DuplexStream;
 
-    /// Drive a connected client end: a duplex stream plus its negotiated tunnel.
-    struct Client {
-        stream: DuplexStream,
-        cipher: AesCipher,
-        aad: Vec<u8>,
+    type TestClient = PartyClient<DuplexStream>;
+
+    /// Send a request and read the next response. Valid in these tests because no
+    /// broadcast interleaves during a single-stepped exchange.
+    async fn request(client: &mut TestClient, req: PartyRequest) -> PartyResponse {
+        client.send(&req).await.unwrap();
+        client.recv().await.unwrap()
     }
 
-    impl Client {
-        async fn send(&mut self, req: PartyRequest) {
-            send_framed(&mut self.stream, &self.cipher, &self.aad, &req.to_bytes())
-                .await
-                .unwrap();
-        }
-        async fn recv(&mut self) -> PartyResponse {
-            let bytes = recv_framed(&mut self.stream, &self.cipher, &self.aad)
-                .await
-                .unwrap();
-            PartyResponse::from_bytes(&bytes).unwrap()
-        }
-        async fn request(&mut self, req: PartyRequest) -> PartyResponse {
-            self.send(req).await;
-            self.recv().await
-        }
-    }
-
-    /// Spawn a `serve_connection` task and complete the client handshake against it,
-    /// returning the driveable client end.
+    /// Spawn a `serve_connection` task and connect a real `PartyClient` to it.
     async fn connect(
         server_priv: RsaPrivateKey,
         client_priv: &RsaPrivateKey,
         state: Arc<Mutex<PartyState>>,
         hub: Arc<Hub>,
-    ) -> (Client, tokio::task::JoinHandle<()>) {
-        let (mut server_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+    ) -> (TestClient, tokio::task::JoinHandle<()>) {
+        let (mut server_stream, client_stream) = tokio::io::duplex(1 << 16);
         let handle = tokio::spawn(async move {
             let _ = serve_connection(&mut server_stream, &server_priv, state, hub).await;
         });
-        let tunnel = client_handshake(&mut client_stream, client_priv, Uuid::new_v4())
+        let client = PartyClient::connect(client_stream, client_priv, Uuid::new_v4())
             .await
             .expect("client handshake");
-        (
-            Client {
-                stream: client_stream,
-                cipher: tunnel.cipher,
-                aad: tunnel.transport_aad,
-            },
-            handle,
-        )
+        (client, handle)
     }
 
     #[tokio::test]
@@ -164,23 +139,20 @@ mod tests {
         let (mut client, server) =
             connect(server_priv, &client_priv, state.clone(), hub.clone()).await;
 
-        let joined = client
-            .request(PartyRequest::Join {
-                username: "alice".to_string(),
-                password: None,
-            })
-            .await;
+        let joined = client.join("alice", None).await.unwrap();
         assert!(
             matches!(joined, PartyResponse::Joined { .. }),
             "got {joined:?}"
         );
 
-        let posted = client
-            .request(PartyRequest::PostMessage {
+        let posted = request(
+            &mut client,
+            PartyRequest::PostMessage {
                 channel,
                 text: "hello server".to_string(),
-            })
-            .await;
+            },
+        )
+        .await;
         match posted {
             PartyResponse::MessagePosted { channel: c, seq } => {
                 assert_eq!(c, channel);
@@ -189,12 +161,14 @@ mod tests {
             other => panic!("expected MessagePosted, got {other:?}"),
         }
 
-        let history = client
-            .request(PartyRequest::FetchHistory {
+        let history = request(
+            &mut client,
+            PartyRequest::FetchHistory {
                 channel,
                 since_seq: 0,
-            })
-            .await;
+            },
+        )
+        .await;
         match history {
             PartyResponse::History(items) => {
                 assert_eq!(items.len(), 1);
@@ -221,7 +195,7 @@ mod tests {
         let (mut client, server) =
             connect(server_priv, &client_priv, state.clone(), hub.clone()).await;
 
-        match client.request(PartyRequest::ListMembers).await {
+        match request(&mut client, PartyRequest::ListMembers).await {
             PartyResponse::Error(msg) => assert_eq!(msg, "join required"),
             other => panic!("expected join-required error, got {other:?}"),
         }
@@ -248,35 +222,28 @@ mod tests {
 
         // Both join (so both are registered for broadcasts).
         assert!(matches!(
-            alice
-                .request(PartyRequest::Join {
-                    username: "alice".to_string(),
-                    password: None,
-                })
-                .await,
+            alice.join("alice", None).await.unwrap(),
             PartyResponse::Joined { .. }
         ));
         assert!(matches!(
-            bob.request(PartyRequest::Join {
-                username: "bob".to_string(),
-                password: None,
-            })
-            .await,
+            bob.join("bob", None).await.unwrap(),
             PartyResponse::Joined { .. }
         ));
         // Bob is registered once his join is acknowledged.
         assert_eq!(hub.len(), 2);
 
         // Alice posts; she gets the ack, Bob receives the broadcast live.
-        let ack = alice
-            .request(PartyRequest::PostMessage {
+        let ack = request(
+            &mut alice,
+            PartyRequest::PostMessage {
                 channel,
                 text: "hi bob".to_string(),
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(matches!(ack, PartyResponse::MessagePosted { .. }));
 
-        match bob.recv().await {
+        match bob.recv().await.unwrap() {
             PartyResponse::Message(env) => {
                 assert_eq!(env.channel, channel);
                 assert_eq!(env.payload, MessagePayload::Text("hi bob".to_string()));
