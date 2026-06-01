@@ -34,17 +34,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let server_password = std::env::var("PARTY_PASSWORD").ok();
-    let state = Arc::new(Mutex::new(PartyState::new(
-        "Encrypted Messenger Party",
-        server_password,
-    )));
-
-    // Persistent server identity: clients pin this fingerprint via TOFU on first
-    // connect, so it must stay stable across restarts.
     let data_dir = std::env::var_os("PARTY_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("party-data"));
+    let server_password = std::env::var("PARTY_PASSWORD").ok();
+
+    // Durable state: members, channels, and history survive restarts (loaded from
+    // and auto-saved to the data dir).
+    let state = Arc::new(Mutex::new(PartyState::load(
+        "Encrypted Messenger Party",
+        server_password,
+        &data_dir,
+    )?));
+
+    // Persistent server identity: clients pin this fingerprint via TOFU on first
+    // connect, so it must stay stable across restarts.
     let privkey = Arc::new(identity::load_or_create_server_identity(&data_dir)?);
     let fingerprint =
         fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes());

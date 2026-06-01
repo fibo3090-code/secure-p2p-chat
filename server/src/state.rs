@@ -13,12 +13,17 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use messenger_core::party::{
     ChannelInfo, ChannelKind, Envelope, MemberInfo, MessagePayload, TrustTier,
 };
 use messenger_core::util::current_timestamp_millis;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Filename of the durable state snapshot under the operator's data dir.
+const SNAPSHOT_FILE: &str = "party_state.json";
 
 /// Why a join was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,19 +43,38 @@ impl JoinError {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct Member {
     id: Uuid,
     username: String,
     fingerprint: Option<String>,
+    /// Presence is runtime-only and not persisted; members start offline on load.
+    #[serde(skip)]
     online: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct Channel {
     id: Uuid,
     name: String,
     kind: ChannelKind,
     /// Durable history; index order is delivery order. `seq` is `index + 1`.
     messages: Vec<Envelope>,
+}
+
+/// Owned on-disk snapshot used when loading. Server name/password/tier come from
+/// configuration, not the snapshot.
+#[derive(Deserialize, Default)]
+struct Snapshot {
+    members: Vec<Member>,
+    channels: Vec<Channel>,
+}
+
+/// Borrowing view used when saving, to avoid cloning channel history.
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    members: Vec<&'a Member>,
+    channels: &'a [Channel],
 }
 
 /// The full server state.
@@ -60,6 +84,8 @@ pub struct PartyState {
     tier: TrustTier,
     members: HashMap<Uuid, Member>,
     channels: Vec<Channel>,
+    /// When set, mutations are persisted to this snapshot file.
+    persist_path: Option<PathBuf>,
 }
 
 impl PartyState {
@@ -77,6 +103,54 @@ impl PartyState {
             tier: TrustTier::Administered,
             members: HashMap::new(),
             channels: vec![general],
+            persist_path: None,
+        }
+    }
+
+    /// Load durable state from `<data_dir>/party_state.json`, or start fresh (with
+    /// a default `general` channel) if absent. Subsequent mutations auto-persist to
+    /// that file.
+    pub fn load(
+        name: impl Into<String>,
+        password: Option<String>,
+        data_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let path = data_dir.join(SNAPSHOT_FILE);
+        let mut state = Self::new(name, password);
+
+        if path.exists() {
+            let json = std::fs::read_to_string(&path)?;
+            let snapshot: Snapshot = serde_json::from_str(&json)?;
+            state.members = snapshot.members.into_iter().map(|m| (m.id, m)).collect();
+            // Keep the default `general` channel if the snapshot has none.
+            if !snapshot.channels.is_empty() {
+                state.channels = snapshot.channels;
+            }
+        }
+
+        state.persist_path = Some(path);
+        Ok(state)
+    }
+
+    /// Best-effort write of the durable state to the snapshot file (no-op when no
+    /// persist path is configured, e.g. in pure unit tests). Failures are logged
+    /// rather than propagated so a transient disk error doesn't drop a live request.
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let snapshot = SnapshotRef {
+            members: self.members.values().collect(),
+            channels: &self.channels,
+        };
+        match serde_json::to_string(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    tracing::error!(error = %e, path = %path.display(), "failed to persist party state");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "failed to serialize party state"),
         }
     }
 
@@ -126,6 +200,7 @@ impl PartyState {
                 online: true,
             },
         );
+        self.persist();
         Ok(id)
     }
 
@@ -202,6 +277,7 @@ impl PartyState {
             payload: MessagePayload::Text(text),
         };
         chan.messages.push(envelope.clone());
+        self.persist();
         Ok(envelope)
     }
 
@@ -322,5 +398,44 @@ mod tests {
         assert!(!state.members()[0].online);
         state.set_online(alice, true);
         assert!(state.members()[0].online);
+    }
+
+    #[test]
+    fn durable_state_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel;
+        {
+            let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+            channel = state.default_channel();
+            let alice = state
+                .join("alice", None, Some("FINGERPRINT".to_string()))
+                .unwrap();
+            state
+                .post_message(alice, channel, "persisted msg".to_string())
+                .unwrap();
+        } // dropped; everything was written through to disk on each mutation
+
+        let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
+        // Member directory survived; presence resets to offline after reload.
+        let members = reloaded.members();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].username, "alice");
+        assert!(!members[0].online, "presence must reset to offline on load");
+        // Channel identity + history survived.
+        assert_eq!(reloaded.default_channel(), channel);
+        let history = reloaded.history_since(channel, 0);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].payload,
+            MessagePayload::Text("persisted msg".to_string())
+        );
+    }
+
+    #[test]
+    fn load_without_existing_snapshot_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert!(state.members().is_empty());
+        assert_eq!(state.channels().len(), 1); // default `general`
     }
 }

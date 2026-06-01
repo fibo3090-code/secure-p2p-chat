@@ -61,8 +61,12 @@ This phase is delivered in safe, independently-testable slices:
    fan-out** (a posted message reaches every other connected member live); a
    **persistent server identity** (`server::identity` stores the RSA key as an
    owner-only PEM under the data dir, so the fingerprint clients pin is stable
-   across restarts); a real TCP accept loop in `main`. **Remaining:** SQLite + blob
-   persistence of state/history under the operator's data dir (currently in-memory).
+   across restarts); a real TCP accept loop in `main`; and **durable state** —
+   `PartyState::load`/`persist` auto-saves members + channels + history to a JSON
+   snapshot under the data dir and restores it on startup (presence resets to
+   offline), so the server survives restarts. **Note:** the snapshot is the interim
+   durability mechanism; migrating it to the embedded **SQLite** + blob store the
+   spec calls for (the `Snapshot` shape maps cleanly to tables) is a follow-up.
 
 4. **Client Party tab.** Connect-to-server flow (address + password + username),
    server-identity TOFU, member list, channel view; GUI + TUI.
@@ -96,5 +100,6 @@ Slices 1–2 are complete and slice 3 is well underway: a client can complete th
 handshake to the server, join, post to a channel, fetch history, and — with the
 broadcast hub — receive other members' messages live (verified by in-memory
 end-to-end tests in `server::connection`). `main` runs a real TCP listener with a
-persistent, owner-only server identity. Remaining for slice 3: SQLite/blob
-persistence (state/history are currently in-memory). Slice 4 (client Party tab) follows.
+persistent, owner-only server identity, and durable state (a JSON snapshot of
+members/channels/history that survives restarts). Remaining for slice 3: migrate
+that snapshot to the embedded SQLite + blob store. Slice 4 (client Party tab) follows.
