@@ -13,7 +13,10 @@
 //! The MVP implements the Administered tier.
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
+
+use crate::core::{recv_packet, send_packet, AesCipher};
 
 /// Trust tier of a server / stored message. A property of the server, surfaced
 /// prominently in the UI.
@@ -145,6 +148,39 @@ impl PartyResponse {
     }
 }
 
+/// Send a serialized Party message over an established v3 tunnel: encrypt it with
+/// the session `cipher` (bound to `transport_aad`) and length-prefix the result.
+/// Used by both the client and the server for every Party request/response.
+pub async fn send_framed<S>(
+    stream: &mut S,
+    cipher: &AesCipher,
+    transport_aad: &[u8],
+    payload: &[u8],
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let ciphertext = cipher.encrypt(payload, Some(transport_aad));
+    send_packet(stream, &ciphertext).await?;
+    Ok(())
+}
+
+/// Receive and decrypt the next Party message from an established v3 tunnel.
+/// Returns an error if the frame fails to authenticate/decrypt.
+pub async fn recv_framed<S>(
+    stream: &mut S,
+    cipher: &AesCipher,
+    transport_aad: &[u8],
+) -> anyhow::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let ciphertext = recv_packet(stream).await?;
+    cipher
+        .decrypt(&ciphertext, Some(transport_aad))
+        .ok_or_else(|| anyhow::anyhow!("failed to decrypt Party frame"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +269,28 @@ mod tests {
     fn tier_and_channel_kind_default() {
         assert_eq!(TrustTier::default(), TrustTier::Administered);
         assert_eq!(ChannelKind::default(), ChannelKind::Public);
+    }
+
+    #[tokio::test]
+    async fn framed_message_roundtrips_over_a_tunnel() {
+        let cipher = AesCipher::new(&[3u8; 32]).unwrap();
+        let aad = b"transport|party-test";
+        let (mut a, mut b) = tokio::io::duplex(4096);
+
+        let req = PartyRequest::PostMessage {
+            channel: Uuid::new_v4(),
+            text: "hi".to_string(),
+        };
+        send_framed(&mut a, &cipher, aad, &req.to_bytes())
+            .await
+            .unwrap();
+        let bytes = recv_framed(&mut b, &cipher, aad).await.unwrap();
+        assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
+
+        // A frame decrypted under the wrong AAD must fail to authenticate.
+        send_framed(&mut a, &cipher, aad, &PartyRequest::ListMembers.to_bytes())
+            .await
+            .unwrap();
+        assert!(recv_framed(&mut b, &cipher, b"wrong-aad").await.is_err());
     }
 }

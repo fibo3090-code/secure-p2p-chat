@@ -45,16 +45,21 @@ This phase is delivered in safe, independently-testable slices:
      `join`, `members`, `channels`, `post_message`, and `history_since` (offline
      catch-up). Fully unit-tested. No network yet — deterministic and fast.
 
-2. **Handshake reuse (next slice).** Extract the v3 handshake from
-   `run_host_session_over_stream` into a reusable `establish_*` step in `core` that
-   returns `(cipher, transport_aad, peer_fingerprint, stream)`, guarded by the
-   existing handshake tests, so the server can run the handshake and then a *Party*
-   message loop (instead of the P2P `ProtocolMessage` loop). Security-sensitive —
-   done carefully with the handshake tests as a safety net.
+2. **Handshake reuse (done).** The v3 handshake was extracted from
+   `run_host_session_over_stream` / `run_client_session_over_stream` into
+   `host_handshake` / `client_handshake` in `core::network`, returning an
+   `EstablishedTunnel { peer_fingerprint, peer_chat_id, cipher, transport_aad }`.
+   The session functions now apply trust policy + the P2P loop on top; the server
+   reuses the same handshake. No behavior change — the handshake unit tests, the
+   A-Z session E2E, and the relay E2E all pass unchanged.
 
-3. **Server runtime.** TCP accept loop → per-connection handshake → Party message
-   loop driving `PartyState`; persistence via embedded SQLite + filesystem blob
-   store under the operator's data dir.
+3. **Server runtime (in progress).** Done: `core::party::{send_framed, recv_framed}`
+   (encrypted Party-message framing over the tunnel); `server::connection::serve_connection`
+   (per-connection `host_handshake` → Party request loop driving the dispatcher,
+   binding the handshake-verified fingerprint to the member); a real TCP accept loop
+   in `main`. **Remaining:** cross-connection broadcast fan-out of newly posted
+   messages, a persistent server identity (stable TOFU across restarts), and SQLite +
+   blob persistence under the operator's data dir.
 
 4. **Client Party tab.** Connect-to-server flow (address + password + username),
    server-identity TOFU, member list, channel view; GUI + TUI.
@@ -84,4 +89,8 @@ model is the source of truth at runtime.
 
 ## Status
 
-Slice 1 (protocol + state foundation) is implemented and tested. Slices 2–4 follow.
+Slices 1–2 are complete and slice 3 is well underway: a client can complete the v3
+handshake to the server, join, post to a channel, and fetch history — verified by
+an in-memory end-to-end test (`server::connection`), and `main` runs a real TCP
+listener. Remaining for slice 3: broadcast fan-out, persistent server identity, and
+SQLite/blob persistence. Slice 4 (client Party tab) follows.

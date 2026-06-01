@@ -3123,6 +3123,7 @@ version = "1.8.1"
 dependencies = [
  "anyhow",
  "messenger-core",
+ "rsa",
  "tokio",
  "tracing",
  "tracing-subscriber",

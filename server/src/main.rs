@@ -1,19 +1,30 @@
 //! Party server for the Encrypted Messenger.
 //!
-//! Phase 1 (slice 1) establishes the in-memory [`state::PartyState`] model, the
-//! shared [`messenger_core::party`] protocol, and the [`dispatch`] layer that maps
-//! requests to state mutations and responses. The network runtime — per-connection
-//! v3 handshake reuse plus a Party message loop, and SQLite/blob persistence — is
-//! the next slice. See `docs/06_phase1_party_server.md`.
+//! Phase 1: the server binds a TCP listener and serves each client over a reused
+//! Protocol v3 encrypted tunnel ([`messenger_core::network::host_handshake`]),
+//! driving the shared [`state::PartyState`] via the [`dispatch`] layer. Members
+//! join with a username + the optional server password, post to channels, and the
+//! server stores history so offline members catch up on reconnect.
+//!
+//! Not yet wired (next steps): cross-connection broadcast fan-out, a persistent
+//! server identity, and SQLite/blob persistence. See `docs/06_phase1_party_server.md`.
 
+mod connection;
 mod dispatch;
 mod state;
 
-use dispatch::{handle_request, ConnState};
-use messenger_core::party::PartyRequest;
+use std::sync::Arc;
+
+use messenger_core::core::{fingerprint_pubkey, generate_rsa_keypair, pem_encode_public};
+use messenger_core::RSA_KEY_BITS;
+use rsa::RsaPublicKey;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+
 use state::PartyState;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -21,48 +32,38 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let server_password = std::env::var("PARTY_PASSWORD").ok();
-    let mut state = PartyState::new("Encrypted Messenger Party", server_password);
-    let channel = state.default_channel();
+    let state = Arc::new(Mutex::new(PartyState::new(
+        "Encrypted Messenger Party",
+        server_password,
+    )));
 
+    // Ephemeral server identity for now (persisted identity + stable TOFU is a
+    // follow-up). Clients verify this fingerprint on first connect.
+    let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS)?);
+    let fingerprint =
+        fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes());
+
+    let port = messenger_core::PORT_DEFAULT;
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(
-        server_name = state.name(),
-        tier = ?state.tier(),
-        default_channel = %channel,
-        listen_port = messenger_core::PORT_DEFAULT,
-        "Party server state initialised"
+        server_name = %state.lock().await.name(),
+        %fingerprint,
+        port,
+        password_protected = std::env::var("PARTY_PASSWORD").is_ok(),
+        "Party server listening"
     );
 
-    // In-process self-check of the protocol → dispatch → state path, so the binary
-    // demonstrably exercises the slice. (Real connections over the v3 tunnel are
-    // wired in the next slice.)
-    let mut conn = ConnState::new();
-    let _ = handle_request(
-        &mut state,
-        &mut conn,
-        PartyRequest::Join {
-            username: "operator".to_string(),
-            password: std::env::var("PARTY_PASSWORD").ok(),
-        },
-    );
-    let _ = handle_request(
-        &mut state,
-        &mut conn,
-        PartyRequest::PostMessage {
-            channel,
-            text: "server is up".to_string(),
-        },
-    );
-    tracing::info!(
-        member = ?conn.member(),
-        history = state.history_since(channel, 0).len(),
-        "self-check: join + post succeeded"
-    );
-
-    eprintln!(
-        "messenger-server (Phase 1, slice 1): protocol, state, and dispatch are in \
-         place and tested. The network runtime is the next slice \
-         (see docs/06_phase1_party_server.md)."
-    );
-
-    Ok(())
+    loop {
+        let (mut stream, addr) = listener.accept().await?;
+        tracing::info!(%addr, "client connected");
+        let state = state.clone();
+        let privkey = privkey.clone();
+        tokio::spawn(async move {
+            if let Err(e) = connection::serve_connection(&mut stream, &privkey, state).await {
+                tracing::warn!(%addr, error = %e, "connection ended with error");
+            } else {
+                tracing::info!(%addr, "client disconnected");
+            }
+        });
+    }
 }

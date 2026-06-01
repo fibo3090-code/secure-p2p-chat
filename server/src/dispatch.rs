@@ -14,15 +14,21 @@ use uuid::Uuid;
 use crate::state::PartyState;
 
 /// Per-connection session state. A connection must `Join` before any other
-/// request is honoured; once joined it carries the member's id.
+/// request is honoured; once joined it carries the member's id. `peer_fingerprint`
+/// is the identity verified during the v3 handshake, bound to the member on join.
 #[derive(Debug, Default)]
 pub struct ConnState {
     member: Option<Uuid>,
+    peer_fingerprint: Option<String>,
 }
 
 impl ConnState {
-    pub fn new() -> Self {
-        Self::default()
+    /// Create connection state carrying the handshake-verified peer fingerprint.
+    pub fn with_fingerprint(fingerprint: String) -> Self {
+        Self {
+            member: None,
+            peer_fingerprint: Some(fingerprint),
+        }
     }
 
     /// The joined member's id, if this connection has completed `Join`.
@@ -46,7 +52,11 @@ pub fn handle_request(
                     "already joined on this connection".to_string(),
                 )];
             }
-            match state.join(&username, password.as_deref(), None) {
+            match state.join(
+                &username,
+                password.as_deref(),
+                conn.peer_fingerprint.clone(),
+            ) {
                 Ok(id) => {
                     conn.member = Some(id);
                     vec![PartyResponse::Joined {
@@ -113,7 +123,7 @@ mod tests {
     #[test]
     fn join_succeeds_and_sets_member() {
         let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::new();
+        let mut conn = ConnState::default();
         let resp = join(&mut state, &mut conn, "alice", None);
         match &resp[..] {
             [PartyResponse::Joined {
@@ -131,7 +141,7 @@ mod tests {
     #[test]
     fn wrong_password_is_rejected_and_leaves_connection_unjoined() {
         let mut state = PartyState::new("Srv", Some("pw".to_string()));
-        let mut conn = ConnState::new();
+        let mut conn = ConnState::default();
         let resp = join(&mut state, &mut conn, "alice", Some("nope"));
         assert!(matches!(resp[..], [PartyResponse::JoinRejected { .. }]));
         assert_eq!(conn.member(), None);
@@ -140,7 +150,7 @@ mod tests {
     #[test]
     fn double_join_on_one_connection_errors() {
         let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::new();
+        let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", None);
         let resp = join(&mut state, &mut conn, "alice2", None);
         assert!(matches!(resp[..], [PartyResponse::Error(_)]));
@@ -149,7 +159,7 @@ mod tests {
     #[test]
     fn actions_before_join_require_join() {
         let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::new();
+        let mut conn = ConnState::default();
         for req in [
             PartyRequest::ListMembers,
             PartyRequest::ListChannels,
@@ -174,7 +184,7 @@ mod tests {
     fn post_then_fetch_history_round_trips_through_dispatch() {
         let mut state = PartyState::new("Srv", None);
         let channel = state.default_channel();
-        let mut conn = ConnState::new();
+        let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", None);
 
         let posted = handle_request(
@@ -216,7 +226,7 @@ mod tests {
     #[test]
     fn list_members_and_channels_after_join() {
         let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::new();
+        let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", None);
 
         let members = handle_request(&mut state, &mut conn, PartyRequest::ListMembers);
