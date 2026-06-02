@@ -47,9 +47,10 @@ Current secure runtime behavior requires protocol version `>= 3`.
 3. Derive a shared session key using HKDF-SHA256.
 4. Establish encrypted transport with AES-256-GCM.
 5. Exchange encrypted `IdentityProof` messages inside that tunnel.
-6. Verify identity signatures and fingerprints.
+6. Verify the peer's identity signature.
 7. Optional connection-password gate (see below).
-8. Enter the message loop.
+8. Confirm the peer fingerprint (TOFU) before surfacing the session.
+9. Enter the message loop.
 
 ### Connection password (optional)
 
@@ -99,6 +100,7 @@ Runtime messages include:
 - `EphemeralKey`
 - `SupportedSignatureSchemes`
 - `Text`
+- `TextChunk`
 - `FileMeta`
 - `FileChunk`
 - `FileEnd`

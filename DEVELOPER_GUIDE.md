@@ -11,7 +11,7 @@ This document is the contributor-facing guide for building, testing, changing, a
 - Protocol: [docs/04_protocol.md](docs/04_protocol.md)
 - Security posture: [SECURITY.md](SECURITY.md)
 - Threat assumptions: [THREAT_MODEL.md](THREAT_MODEL.md)
-- Roadmap and backlog: [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)
+- Plan, roadmap & backlog: [docs/05_platform_spec.md](docs/05_platform_spec.md)
 - Audit history: [docs/AUDITS.md](docs/AUDITS.md)
 
 ## Toolchain

@@ -1,60 +1,107 @@
-# Platform Spec: Hybrid Messenger
+# Hybrid Messenger — Platform Plan & Roadmap
 
-This is the canonical, forward-looking design spec for evolving the app from a
-1:1 P2P messenger into a hybrid platform. Unlike [04_protocol.md](04_protocol.md)
-(which describes only shipped wire behavior), this document owns the long-range
-vision, architecture, trust model, and phased roadmap. Each phase gets its own
-detailed spec → plan → build before any code lands.
+This is the **single canonical forward-looking document** for the project. It owns
+the product vision, architecture, trust model, the planned UI rewrite, the phased
+roadmap, and the backlog. It supersedes and absorbs the former separate plan docs
+(platform spec, Phase 1 plan, UI refront plan, design system, development plan).
 
-## Context & Goals
+Scope boundaries:
 
-Non-technical users (the motivating case: classmates) can't port-forward, so they
-can't use today's pure-P2P app. The owner wants a **self-hosted central server**
-that friends join with a simple flow — IP + optional password + pick a username —
-then see a member directory, chat in channels and DMs, make groups, and share
-files, including delivery to people who are currently offline.
+- [03_architecture.md](03_architecture.md) describes the code as it is **today**.
+- [04_protocol.md](04_protocol.md) describes the **shipped wire behavior** only.
+- **This document** owns everything *forward-looking*: where the product is going
+  and how. When a planned item ships, move its description into 03/04 and trim it
+  here.
 
-Reframing: the classmate use-case is a **Party Server**, not the existing relay.
-The relay only pairs two peers; it cannot host a multi-user room.
+---
 
-Owner decisions that shape this spec:
+## 1. Context & Goals
 
-- **Spec-first.** Write the complete platform spec before building.
+The original app is a 1:1 peer-to-peer encrypted messenger. Its blocker for
+non-technical users (the motivating case: classmates) is that pure P2P needs port
+forwarding, which they can't do. The goal is to evolve it into a **hybrid
+platform**: keep the strong direct-P2P story, and add a **self-hosted central
+"Party" server** that friends join with a simple flow — address + optional
+password + pick a username — then see a member directory, chat in channels and
+DMs, and (later) share files, with messages delivered even to people who were
+offline.
+
+The relay is *not* the answer to this: it only pairs two peers and cannot host a
+multi-user room. The Party server is the answer.
+
+Guiding decisions:
+
+- **Spec-first.** Design before building; this doc is the design of record.
 - **Two trust tiers.** An **Administered** (server-trusted) tier as the default,
-  and an optional **E2EE** tier.
-- **One cohesive product**, not glued-together pieces.
-- **Single Discord-like tabbed UI** under one identity.
+  and an optional **E2EE** tier later.
+- **One cohesive product**, one identity, one tabbed UI — not glued-together
+  pieces.
 
-## Current State (audit)
+---
 
-- **P2P**: mature. v3 handshake (X25519 → HKDF → AES-256-GCM), TOFU fingerprint
-  verification, forward secrecy, replay protection, rekey, 1:1 text + up to 10 GiB
-  file transfer, typing indicators, encrypted local history, signed invites.
-  "Group chat" today is only client-side fan-out over multiple 1:1 sessions — there
-  is no real server-backed group. No connection passwords or conversation locks.
-- **Relay**: stateless 1:1 rendezvous (`src/network/relay.rs`). Pairs one host and
-  one joiner by token and forwards ciphertext via `copy_bidirectional`. No auth,
-  rooms, or storage. The `--relay-server` mode already ships (see `src/main.rs`,
-  `Args.relay_server` → `network::run_relay_server`). **It cannot host a
-  multi-user room.**
-- **Party / Server**: does not exist yet. This is the new backend.
-- **Crate**: the single crate is named `encodeur_rsa_rust` (see `Cargo.toml`).
-  Today's modules (`src/lib.rs`): `app`, `core`, `gui`, `identity`, `network`,
-  `support`, `transfer`, `tui`, `types`, `util`.
+## 2. Current State
 
-## Product Shape
+An accurate audit of what exists today (verified against the codebase).
 
-One app, one identity, a left tab rail (Discord-like):
+### P2P — mature
 
-- **P2P** tab — direct encrypted DMs/calls between peers (today's strength).
-- **Relay** tab — NAT-traversal helper for 1:1 P2P when neither side can
-  port-forward.
-- **Party** tab — the servers you've joined; each has channels, server-DMs,
-  members, and files (the classmate experience).
+Protocol v3 handshake (X25519 ECDH → HKDF-SHA256 → AES-256-GCM), TOFU fingerprint
+verification, forward secrecy, replay protection, rekeying, 1:1 text + file
+transfer up to 10 GiB, typing indicators, encrypted local history, and signed
+invite links. "Group chat" today is only client-side fan-out over multiple 1:1
+sessions — there is no server-backed group.
 
-The **Local** hub (identity, keys, local vault) folds into settings for the MVP
-rather than being a headline tab. The UI is simplified by default; P2P/advanced
-surfaces sit behind an "advanced" affordance.
+### Independent P2P hardening — done
+
+An optional **connection password** (verified inside the established v3 tunnel,
+after identity verification and before TOFU, with a constant-time compare) and a
+**conversation lock** (the host refuses new connections) ship today. Both are
+reachable from the GUI (Host/Connect dialogs + a lock toggle) and the TUI
+(`:connection-password`, `:lock`).
+
+### Relay — stateless 1:1 rendezvous
+
+`core/src/network/relay.rs`. Pairs one host and one joiner by token and forwards
+ciphertext via `copy_bidirectional`; it never terminates chat encryption. No auth,
+rooms, or storage. The `--relay-server` mode ships (`client/src/main.rs`,
+`Args.relay_server` → `network::run_relay_server`). It cannot host a multi-user
+room.
+
+### Party server — built (Administered MVP)
+
+The Party server exists and works for the Administered tier. See §7 for detail.
+In short: `core::party` defines the application protocol; `messenger-server` runs a
+real TCP listener with a persistent owner-only identity, applies requests to an
+in-memory `PartyState`, fans out live broadcasts across connections, serves
+channels and server-routed DMs with offline history catch-up, and persists state
+to a durable JSON snapshot. A client can join, chat in channels, DM, and create
+channels via TUI commands and a GUI Party window.
+
+### Current UI — egui + ratatui (to be replaced)
+
+The app ships an **egui/eframe** desktop GUI and a **ratatui** TUI, both driving
+the same `ChatManager` (and `PartyManager`). The GUI today is a top menu bar +
+status bar + a left "Chats" sidebar + a central panel + a stack of modeless
+dialogs, with the Party experience in a separate floating window. §10 describes
+the planned rewrite that replaces this.
+
+### Crate layout — Cargo workspace (done)
+
+Three crates: `core` (`messenger-core`), `client` (`encodeur_rsa_rust`, the
+unified app + binary), and `server` (`messenger-server`). The client re-exports
+core via `pub use messenger_core::*`. The client binary kept the
+`encodeur_rsa_rust` name so packaging paths are unchanged.
+
+---
+
+## 3. Product Shape
+
+One app, one identity, a left **tab rail** (Discord-like):
+
+- **P2P** — direct encrypted DMs between peers (today's strength).
+- **Relay** — NAT-traversal helper for 1:1 P2P when neither side can port-forward.
+- **Party** — the servers you've joined; each has channels, server-DMs, members,
+  and (later) files.
 
 ```text
 ┌──────┬─────────────────────────────────────────┐
@@ -66,47 +113,49 @@ surfaces sit behind an "advanced" affordance.
 └──────┴─────────────────────────────────────────┘
 ```
 
-## Architecture
+Identity/keys/local vault fold into **settings** rather than being a headline tab.
+Advanced surfaces sit behind an "advanced" affordance.
 
-Evolve the single `encodeur_rsa_rust` crate into a Cargo **workspace** so the
-client and server share code yet ship as one cohesive product:
+---
+
+## 4. Architecture
+
+The workspace (already in place) lets the client and server share code yet ship as
+one product:
 
 ```text
-workspace/
-├── core/     crypto, protocol/wire types, identity, framing, shared domain types,
-│             diagnostics/support. From today's src/core, src/identity, src/types,
-│             src/util, src/support. Reused by both client and server.
-├── client/   the one unified app: egui GUI + ratatui TUI, ChatManager,
-│             persistence. From today's src/gui, src/tui, src/app.
-└── server/   the Party server (new). Hosts accounts, channels, storage; run by the
-              owner. Reuses `core` for the encrypted transport handshake.
+core/     crypto, protocol/wire types, framing, identity, transport, shared types,
+          and the Party application protocol (core::party). Reused by both sides.
+client/   the unified app: GUI + TUI, ChatManager, PartyManager, persistence.
+server/   the Party server: TCP listener, PartyState, dispatcher, broadcast hub,
+          persistent identity, durable snapshot.
 ```
 
-Relay stays a thin mode (today's `--relay-server`), unchanged in spirit, living
-alongside `core`/`server`.
+Relay stays a thin mode (`--relay-server`) alongside `core`.
 
-**Binaries** ship from one repo/release so it never feels like separate projects:
-a default `client` binary and a `server` binary (`--party-server`).
+**Binaries** ship from one repo/release: a default `client` binary (named
+`encodeur_rsa_rust` for packaging continuity) and the `messenger-server` binary.
 
-> **Phase 0 caveat — binary naming.** Today the binary is `encodeur_rsa_rust`, and
-> that name is hardcoded in the packaging pipeline:
-> `.github/workflows/release.yml` (Windows `.exe`, macOS bundle, Linux tarball),
-> `setup.iss`, and `build-and-package.ps1`. Decide during Phase 0 whether to keep
-> `encodeur_rsa_rust` or rename to `client`/`server`. If renaming, those three
-> packaging files must be updated in the same change or releases break.
+### Transport matrix
 
-**Transport matrix**
+- **P2P / Relay** — the existing v3 E2EE session, unchanged.
+- **Client ↔ Party server** — the **same v3 handshake** establishes an
+  authenticated, encrypted channel to the *server* (which has its own
+  identity/fingerprint, TOFU-verified once). The **Party application protocol**
+  (join, directory, channel ops, messages, DMs) rides on top of that channel.
 
-- **P2P / Relay**: the existing v3 E2EE session, unchanged.
-- **Client ↔ Party server**: the same v3 handshake establishes an authenticated,
-  encrypted channel to the *server* (the server has its own identity/fingerprint,
-  TOFU-verified once). A **Party application protocol** (login, directory, channel
-  ops, messages, files) rides on top of that channel.
+```text
+client ──v3 handshake (core)──▶ encrypted+authenticated tunnel ──▶ core::party
+                                                                     │
+                                                  messenger-server applies it to PartyState
+```
 
-## Identity Model
+---
 
-- **Global private identity** (one per user): the existing RSA key material +
-  fingerprint, password-encrypted at rest (`src/identity`). Never exposed
+## 5. Identity Model
+
+- **Global private identity** (one per user): the existing RSA-2048 key material +
+  fingerprint, password-encrypted at rest (`core/src/identity`). Never exposed
   wholesale.
 - **Per-server identity** (Phase 5): a server-scoped profile (display name,
   visibility, and for E2EE servers a server-scoped keypair) bound to the global
@@ -114,7 +163,9 @@ a default `client` binary and a `server` binary (`--party-server`).
   The MVP uses the global identity with a per-server **display name**; the data
   model reserves room for distinct per-server keys from the start.
 
-## Security & Trust Tiers
+---
+
+## 6. Security & Trust Tiers
 
 Designed in from day one. Every stored/transported message and file carries an
 **envelope**:
@@ -130,36 +181,75 @@ tiers:
   **plaintext**. This enables offline buffering, admin-read (clearly labeled),
   search, and simple groups. The server wears an honest "this operator can read
   messages" badge.
-- **Private / E2EE (optional)** — a per-channel **group key**; the server stores
+- **Private / E2EE (Phase 4)** — a per-channel **group key**; the server stores
   only ciphertext and never sees plaintext; admins cannot read. Offline buffering
   stores encrypted blobs. Group-key distribution and rotation on membership change
-  is the hard part (Phase 4).
+  is the hard part.
 
 Trust tier is a **server property**, shown prominently. Raising exposure (e.g.
 enabling admin-read) triggers a **consent-or-leave** flow.
 
-## Party Server Design
+---
 
-- **Accounts & membership** — a user joins a server (open / password / invite /
-  request); the server stores membership + per-server profile.
-- **Directory & presence** — list of members (subject to visibility policy),
-  online/offline state.
-- **Channels (rooms)** — public / private / locked / password / invite / request;
-  plus admin-only (announce) channels.
-- **Server DMs** — routed and buffered by the server (NOT P2P); per-user policies:
-  open / request / password / closed.
-- **Offline buffering** — the server holds messages/files until the recipient
-  reconnects (plaintext for Administered, ciphertext for E2EE).
-- **Roles & permissions** (Phase 3) — a role hierarchy plus per-channel /
-  per-action grants.
-- **Conversation lock / passwords** — lock = nobody can join; password = a gate to
-  join a channel or open a DM.
-- **Governance** (Phase 3) — server-wide policy is public to members; a
-  transparency panel shows current policy + history; sensitive changes notify users
-  and require accept-or-leave (with data export/delete on leave); an audit log
-  records channel/role/permission/visibility/security changes, bans, and invites.
+## 7. Party Server (Phase 1 — Administered)
 
-## Files / "Drive" (Phase 2)
+The Party protocol is a shared wire contract in `core::party`, reused by client
+and server, riding on top of the v3 encrypted tunnel.
+
+### What is built
+
+- **`core::party`** — the application protocol: `TrustTier`, `Envelope`,
+  `MessagePayload`, `MemberInfo`, `ChannelInfo`, `ChannelKind`; the
+  `PartyRequest` / `PartyResponse` enums (Join, ListMembers, ListChannels,
+  PostMessage, FetchHistory, SendDm, FetchDmHistory, CreateChannel); a
+  deterministic `dm_thread_id(a, b)` (SHA-256 of the sorted member ids); framed
+  send/recv over the tunnel (`send_framed`/`recv_framed`); and a `PartyClient`
+  with a split reader/writer. All bincode-serialized with round-trip tests.
+- **Handshake reuse** — the v3 handshake was extracted into
+  `host_handshake`/`client_handshake` returning an `EstablishedTunnel
+  { peer_fingerprint, peer_chat_id, cipher, transport_aad }`. The P2P session
+  loop, the relay path, and the server all build on the same handshake; existing
+  handshake/E2E tests pass unchanged.
+- **`messenger-server`** — a real TCP accept loop; `serve_connection`
+  (per-connection handshake → a `select` loop that serves requests via the
+  dispatcher and writes pushed broadcasts, binding the verified fingerprint to the
+  member); a cross-connection **broadcast hub** (a posted message reaches every
+  other connected member live); a **persistent owner-only server identity**
+  (`server::identity`, RSA PEM under the data dir, so the pinned fingerprint is
+  stable across restarts); and **durable state** — `PartyState::load`/`persist`
+  auto-saves members + channels + DM threads + history to a JSON snapshot and
+  restores it on startup (presence resets to offline).
+- **Server-routed DMs** — a deterministic per-pair DM thread; the server stores
+  and delivers DMs like channels, with offline history.
+- **Channel creation** — members can create channels at runtime.
+- **Client integration** — `client::app::party_manager::PartyManager`
+  (per-connection read/write task, directory/channel/history tracking, optimistic
+  post, DM send/fetch, channel creation, error surfacing); TUI commands
+  (`:party-connect`, `:party-post`, `:party-dm`, `:party-create-channel`,
+  `:party-status`); and a GUI Party window (`gui::party_view`) with join form,
+  server selector, channel + member lists, DM/channel views, and a post box.
+
+### Server data model (MVP)
+
+```text
+PartyState { name, password: Option<String>, tier, members, channels, dm_threads,
+             persist_path }
+Member  { id, username, fingerprint: Option<String>, joined_at, online }
+Channel { id, name, kind, messages: Vec<Envelope> }   # messages = durable history
+```
+
+### What remains
+
+- Migrate the JSON snapshot to the **embedded SQLite** + filesystem blob store the
+  data model calls for (the snapshot shape maps cleanly to tables) — see §9.
+- A dedicated **TUI Party pane** (beyond command output) and **server-identity
+  TOFU** confirmation UI in the GUI.
+- Roles/permissions, governance/audit, lock/password gating per channel (Phase 3);
+  files (Phase 2); the E2EE tier (Phase 4).
+
+---
+
+## 8. Files / "Drive" (Phase 2)
 
 Content-addressable, deduplicated storage:
 
@@ -172,130 +262,299 @@ Content-addressable, deduplicated storage:
   whom / with which permissions. Blobs are **reference-counted** and deleted only
   when no reference or retention rule holds them.
 - **Quotas** — physical (bytes stored, dedup-aware) and logical (per-user /
-  per-role references); recommended: dedup physical storage + a logical quota per
-  reference, freed on delete.
+  per-role references), freed on delete.
 - **Provenance / audit** — who uploaded, where it was shared, what permissions
   traveled with it.
-- **UI** — a Google-Drive-like panel: list, size, date, location, quota used/left,
-  and download / delete / move / permissions actions.
+- **UI** — a Drive-like panel: list, size, date, location, quota used/left, and
+  download / delete / move / permissions actions.
 
-## Data Model (objects, concise)
+---
+
+## 9. Data Model (objects)
 
 `Identity(global)`, `ServerProfile(per-server)`, `Server`, `Membership`,
 `Channel`, `Message(envelope)`, `DMThread`, `Blob`, `FileEntry`,
 `PermissionMatrix`, `FileReference`, `Quota`, `Role`, `Policy`, `AuditLog`.
 
-**Server persistence**: embedded **SQLite** for metadata + a filesystem blob store
-(both under the operator's data dir). Chosen for zero-ops single-host hosting, with
-room to swap later.
+**Server persistence:** today an auto-saved **JSON snapshot** under the operator's
+data dir (interim). The target is embedded **SQLite** for metadata + a filesystem
+blob store, chosen for zero-ops single-host hosting with room to swap later.
 
-## UI (unified, tabbed)
+---
 
-Left rail tabs: **P2P · Relay · Party**. The Party tab mirrors Discord: server list
-→ channels + server-DMs + member list + files + (admin) governance/audit. The
-fingerprint-verification, password, and transparency/consent flows are overlays
-(GUI dialogs / TUI overlays — reusing the overlay patterns just built for the TUI,
-see `src/tui/overlays.rs`). Every Party action is also reachable by command in the
-TUI.
+## 10. UI Rewrite (Tauri + SolidJS)
 
-## Phased Roadmap
+The current egui GUI is an accumulation, not a design: a top menu bar, a status
+bar, a left "Chats" sidebar, a central panel, a pile of modeless dialogs (the
+dialog file alone is ~84 KB), and — the clearest symptom — the **Party experience
+in a separate floating window**, disconnected from everything else. Users juggle
+two mental models. This rewrite realizes §3's tab-rail vision with a designed,
+animated UI.
 
-Each phase = its own spec → plan → build.
+### Target shape — a 3-pane shell
 
 ```text
-Phase 0  Workspace refactor        (foundation; no behavior change)   ✅ done
-   │
-Phase 1  Party Server MVP          ← unblocks the classmates  (next)
-   │     (Administered tier)
-Phase 2  Drive / files
-   │
-Phase 3  Governance & roles
-   │
-Phase 4  E2EE server tier
-   │
-Phase 5  Per-server identities
-
-Independent:  P2P connection passwords + conversation lock  ✅ done
+┌──┬───────────────┬─────────────────────────────┐
+│ R│   List pane   │      Content pane           │
+│ a│ (chats /      │  (messages + composer, OR   │
+│ i│  channels +   │   directory, OR a settings  │
+│ l│  members /    │   page — no floating modals)│
+│  │  relay sess.) │                             │
+└──┴───────────────┴─────────────────────────────┘
+ icon rail (top→bottom): P2P · Relay · Party · … · identity/lock/settings
 ```
 
-- **Phase 0 — Workspace refactor. ✅ Done.** Split into `core` / `client` /
-  `server` crates with no behavior change; CI, build, and packaging updated (the
-  client binary kept the `encodeur_rsa_rust` name, so packaging paths are
-  unchanged). Test coverage was broadened in the same effort — see
-  [Test Coverage](#test-coverage).
-- **Phase 1 — Party Server MVP (Administered).** Server binary with SQLite + blob
-  store; join-by-IP (+ optional password) + username; member directory + presence;
-  channels; server-routed group + DM messaging; offline buffering; the unified
-  Party tab (GUI + TUI); server-identity TOFU. *This unblocks the classmates.*
-- **Phase 2 — Drive / files.** Upload / list / download / delete in channels &
-  DMs; hash dedup + reference counting; logical + physical quotas; the Drive panel.
+- The **icon rail** replaces the menu bar and switches mode (P2P / Relay / Party);
+  identity, lock, and settings dock at the bottom.
+- The **list pane** is contextual to the mode.
+- The **content pane** holds the conversation *or* a full-pane page for directory
+  and settings — eliminating most modal dialogs.
+- **Overlays only for genuinely interruptive flows**: fingerprint verification,
+  password/unlock, consent-or-leave. Settings, Contacts, Connect, Host become
+  inline pages.
+- **Party stops being a floating window** and becomes the Party tab, sharing the
+  same list+content layout as P2P. One mental model.
+
+### Stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Shell | **Tauri 2** | Native window + system webview; the Rust core stays behind an IPC boundary; capability/CSP security model (tighter than Electron); no bundled Node runtime. |
+| Frontend | **SolidJS + TypeScript** | Fine-grained reactivity, no virtual-DOM diffing → best render perf for a high-frequency message stream; smallest runtime → fast webview cold-start. |
+| Styling | **Tailwind CSS** + design tokens | A real token system (see "Visual language" below); replaces ad-hoc styling. |
+| Components | **Kobalte** (a11y headless) + **Motion One** (animation) + **TanStack Virtual** (message-list virtualization) | Discord-grade polish without hand-rolling primitives. |
+| Build | **Vite** | Standard Solid toolchain; `tauri dev`/`tauri build` orchestrate it. |
+
+**Accepted costs (owned deliberately):** a JS/TS toolchain joins a previously
+pure-Rust repo; the ratatui TUI stays Rust and is redesigned in parallel to the
+same 3-pane model (two frontends maintained); **packaging is rebuilt from
+scratch** (below); the security surface grows by a system webview + IPC (crypto
+stays in Rust, documented in `SECURITY.md`); and a full rewrite means a window
+where the GUI is rebuilding while the TUI remains the working frontend.
+
+### The Rust↔web bridge
+
+The business logic is already view-agnostic — the existing TUI proves it by
+driving the same managers as the GUI. The rewrite keeps the managers in Rust and
+exposes them to the web UI:
+
+- **Commands** (`#[tauri::command]`): each manager method the UI calls becomes a
+  command (`connect`, `host`, `send_message`, `set_connection_password`,
+  `confirm_fingerprint`, `party_join`, `party_post`, `party_send_dm`,
+  `party_create_channel`, `party_fetch_history`, …).
+- **Events** (`app_handle.emit`): the existing `SessionEvent` / party-event mpsc
+  streams map almost 1:1 onto Tauri's event channel. A background task drains
+  them and emits typed events the Solid frontend subscribes to — replacing
+  per-frame `try_lock()` polling with push, a better fit for the domain.
+- **Shared types:** define DTOs once in Rust (`serde`) and generate matching TS
+  types (e.g. `ts-rs` / `tauri-specta`) so the IPC contract can't silently drift.
+  Wire framing stays in `core`; the `to_plain_bytes`/`from_plain_bytes` symmetry
+  discipline is unaffected.
+
+```text
+core/ (unchanged)
+client/
+├── src-tauri/   Rust: managers + #[tauri::command] + event pump + main.rs (deletes src/gui/)
+└── ui/          SolidJS app: rail / list / content + overlays + design tokens
+```
+
+`client --tui` keeps opening the ratatui UI; launching `client` opens the Tauri
+window.
+
+### Visual language (target design tokens)
+
+A dark, layered aesthetic — information illuminated on a deep charcoal base, depth
+from tonal layering rather than borders or heavy shadows.
+
+- **Surfaces (no 1px section borders):** structure comes from background shifts,
+  negative space, and tonal transitions. Base `#0e0e0e` → `surface_container_low`
+  `#131313` (content) → `surface_container` `#1a1a1a` (interactive) →
+  `surface_container_high` `#20201f` (pop-overs / focus). Avoid pure black except
+  the lowest surface.
+- **Accents:** `primary` warm amber (`#ffd16c`→`#fdc003` gradient on key CTAs);
+  `secondary` neon green reserved as a sparse "signal" color for success / active
+  states.
+- **Typography:** `Space Grotesk` for display/headlines, `Inter` for body/labels
+  and dense data; muted gray for metadata, near-white for active content.
+- **Elevation:** tonal layering over drop shadows; floating modals use a soft
+  ambient "ghost" shadow and optional translucent blur. Any border that
+  accessibility requires is a faint `outline_variant`, felt not seen.
+- **Components:** primary buttons are solid `primary`, no border, modest radius
+  (no full pills); inputs use the highest surface with a focus underline/glow
+  rather than a heavy outline; lists separate items with spacing / alternating
+  surfaces, not divider lines.
+
+These tokens carry the existing theme names (Light / Dark / Midnight / Forest) as
+Tailwind token sets.
+
+### Packaging rebuild
+
+The current pipeline assumes one eframe binary named `encodeur_rsa_rust`:
+`release.yml` builds `-p encodeur_rsa_rust` then hand-rolls Inno Setup
+(`setup.iss`), a macOS `.app`+`.dmg`, and a Linux tarball; `build-and-package.ps1`
+and `setup.iss` hardcode that name. Tauri replaces all of this with its **own
+bundler** (`tauri build` → `.msi`/`.nsis`, `.app`/`.dmg`, `.deb`/`.AppImage`) and
+the **`tauri-action`** GitHub Action. Tasks: add `tauri.conf.json` (identifier
+`com.fibo3090.messenger`, window 1200×800 / min 800×600, icon from
+`encodeur_rsa_icon.ico`); rewrite `release.yml` to install Node + Rust and run
+`tauri-action` per-OS, keeping the `on: push: tags: 'v*'` trigger; retire
+`setup.iss` and `build-and-package.ps1`; add a frontend job to `ci.yml`
+(`pnpm install` + typecheck + lint + build) alongside the Rust checks.
+
+### Phased execution
+
+A full rewrite (no compatibility flag), sequenced so each phase is reviewable and
+the binary keeps building (the TUI stays functional throughout):
+
+- **A — Scaffold & bridge.** Add Tauri 2 + Solid/Vite to `client/`; restructure
+  into `src-tauri/` + `ui/`; empty window; wire one command + one event
+  round-trip; generate TS types; CI builds both toolchains.
+- **B — P2P tab end-to-end.** Rail → chat list → virtualized message view →
+  composer → fingerprint-verify overlay → connect/host as inline pages; lock /
+  password flows. The go/no-go on the whole approach.
+- **C — Party tab.** Server join, channels + members, channel messages, DMs,
+  channel creation, presence — reusing the list+content layout.
+- **D — Relay tab + Settings/Contacts/Help pages.** Move the remaining dialogs
+  into inline pages; themes via Tailwind tokens.
+- **E — Delete egui.** Remove `client/src/gui/` and the egui deps; switch the GUI
+  launch in `main.rs` to Tauri.
+- **F — Packaging + docs.** Rewrite `release.yml` to `tauri-action`, retire the
+  old packaging scripts, add a webview/CSP section to `SECURITY.md`, refresh user
+  docs, and update this document (egui → Tauri/Solid in §2).
+- **G — TUI 3-pane redesign.** Apply the rail/list/content model to ratatui,
+  preserving the existing typed command language.
+
+---
+
+## 11. Roadmap
+
+Each phase gets its own detailed plan before code lands.
+
+```text
+Phase 0  Workspace refactor                         ✅ done
+Phase 1  Party Server MVP (Administered)            ✅ core done · SQLite + UI polish remain
+UI       Tauri + SolidJS rewrite (§10)              ▶ next major effort
+Phase 2  Drive / files
+Phase 3  Governance & roles
+Phase 4  E2EE server tier
+Phase 5  Per-server identities
+
+Independent:  P2P connection passwords + conversation lock   ✅ done
+```
+
+- **Phase 0 — Workspace refactor. ✅** Split into `core`/`client`/`server` with no
+  behavior change; CI moved to `--workspace`; packaging untouched (binary name
+  preserved). Test coverage broadened (see §13).
+- **Phase 1 — Party Server MVP (Administered). ✅ core complete.** Server binary,
+  join-by-address (+ optional password) + username, member directory + presence,
+  channels, server-routed group + DM messaging, offline buffering via history
+  catch-up, channel creation, the GUI Party window + TUI commands, server-identity
+  TOFU on the wire. **Remaining:** migrate the JSON snapshot to SQLite + blob
+  store; TUI Party pane; GUI server-TOFU/error polish (see §7).
+- **UI rewrite — Tauri + SolidJS.** The next major effort; full plan in §10. Plan
+  a `2.0.0` release when Phase F lands (owner authorizes the tag).
+- **Phase 2 — Drive / files.** Upload/list/download/delete in channels & DMs; hash
+  dedup + reference counting; logical + physical quotas; the Drive panel.
 - **Phase 3 — Governance & roles.** Trust-tier labeling, transparency panel,
   consent-or-leave, audit log, roles/permissions, visibility & contact policies,
   channel lock/password.
 - **Phase 4 — E2EE server tier.** Per-channel group keys, ciphertext-only storage,
-  key rotation on membership change, encrypted offline blobs; admin-read disabled
-  for this tier.
+  key rotation on membership change, encrypted offline blobs; admin-read disabled.
 - **Phase 5 — Per-server identities.** Distinct per-server profile/keys bound to
   the global identity.
-- **Independent — P2P connection passwords + conversation lock. ✅ Done.** An
-  optional shared password is verified inside the established v3 tunnel (after the
-  handshake, before TOFU; constant-time compare), and a conversation lock makes the
-  host refuse new connections. Reachable from the GUI (Host/Connect dialogs + a lock
-  toggle) and the TUI (`:connection-password`, `:lock`).
+- **Independent — P2P connection passwords + conversation lock. ✅** Shipped; see
+  §2.
 
-## Per-Phase Verification
+---
 
-- **Phase 0** ✅: `cargo build` / `cargo test` / `cargo clippy --all-targets -D
-  warnings` / `cargo fmt --all -- --check` green across the `--workspace`; the
-  existing app runs unchanged. CI was moved to `--workspace`; the client binary
-  name was preserved so packaging is untouched. **211 tests pass** (see
-  [Test Coverage](#test-coverage)).
-- **Phase 1**: two clients join the owner-hosted server over LAN, appear in the
-  directory, and exchange channel + DM messages; a message sent while a peer is
-  offline is delivered on reconnect and the server stores it (Administered).
-  Automated server-protocol tests + client integration tests.
-- **Later phases**: dedup / refcount / quota unit tests; governance consent-flow
-  tests; E2EE group-key rotation tests; render-no-panic tests for new UI.
+## 12. Backlog
 
-## Test Coverage
+Near-term items not tied to a numbered phase. (When one becomes real behavior,
+update the canonical doc — 03/04 — in the same change.)
 
-The workspace is covered by **250+ automated tests** (`cargo test --workspace`),
-spanning unit, integration, and end-to-end suites:
+**Productization**
+
+- Reduce UI-thread blocking and responsiveness issues (largely addressed by the
+  §10 rewrite's push-based event model).
+- Tighten persistence, migration, and recovery behavior.
+- Improve diagnostics and failure visibility for users; better diagnostic export
+  for support/bug reporting.
+
+**Security & privacy**
+
+- Keep security docs accurate as implementation changes; keep dependency risk
+  under review.
+- Harden mDNS registration/removal behavior and discovery privacy.
+- Stronger invite lifecycle controls: **invite expiration and revocation**.
+
+**Connectivity**
+
+- A practical internet-connectivity story: **NAT traversal** / relay- or
+  overlay-assisted connection modes.
+
+**UX**
+
+- Accessibility pass over interactions and color usage.
+- Settings IA cleanup / tabbed organization (folds into the §10 settings page).
+- Better contact management UX and trust-state workflows.
+- File-transfer progress and cancellation improvements.
+
+**Tracked long-horizon gaps** (intentionally not described as "done" anywhere):
+onion routing / anonymity layer, post-quantum migration, hardware-backed identity.
+
+---
+
+## 13. Verification & Test Coverage
+
+The workspace passes **264 automated tests** (`cargo test --workspace`) spanning
+unit, integration, and end-to-end suites:
 
 - **Protocol** (`core/src/core/protocol.rs`): round-trip symmetry for every
   `ProtocolMessage` variant, edge values (empty/unicode/max-size), malformed and
   oversized-payload rejection, `TextChunk` invariants, legacy ASCII parsing,
   `IdentityProof` serde, and debug redaction.
-- **Crypto / handshake** (`core/src/core`, `core/src/network/session.rs`): RSA/AEAD/
-  X25519/HKDF, transcript-bound AAD, replay protection, and key rotation.
+- **Crypto / handshake** (`core/src/core`, `core/src/network/session.rs`):
+  RSA/AEAD/X25519/HKDF, transcript-bound AAD, replay protection, key rotation.
 - **End-to-end pipeline** (`core/tests/session_e2e.rs`): the full A-to-Z path over
-  the real session functions — version → ECDH → key derivation → encrypted identity
-  proof → TOFU confirm → text, typing, file transfer, ping → disconnect, plus the
-  fingerprint-rejection path and the connection-password gate (correct / wrong /
-  missing).
+  the real session functions — version → ECDH → key derivation → encrypted
+  identity proof → TOFU confirm → text, typing, file transfer, ping → disconnect,
+  plus the fingerprint-rejection path and the connection-password gate
+  (correct / wrong / missing).
 - **Party server** (`core::party`, `messenger-server`): protocol round-trips, the
-  in-memory `PartyState` (join/password/channels/history/persistence), the request
-  dispatcher, and connection/broadcast end-to-end over the reused v3 tunnel.
+  in-memory `PartyState` (join/password/channels/history/DMs/persistence), the
+  request dispatcher, and connection/broadcast end-to-end over the reused v3
+  tunnel.
 - **Relay** (`core/tests/relay_e2e.rs`): two peers pair through a self-hosted relay
   and exchange an application message over the forwarded encrypted transport.
-- **Types** (`core/src/types.rs`): `Config` defaults (privacy-conservative),
-  serde round-trips, and backward-compatible deserialization of older payloads.
+- **Types** (`core/src/types.rs`): `Config` defaults (privacy-conservative), serde
+  round-trips, backward-compatible deserialization.
 - **Identity / persistence**: encrypted identity storage, encrypted-history
-  round-trip, wrong-key rejection, corrupt-file handling, and format auto-detection.
-- **ChatManager** (`client/tests/feature_coverage_tests.rs` + in-file): group chats,
-  rename/delete, history clearing, toast lifecycle, file-transfer state, typing
-  indicators, contact import/association, invites (v1/v2/v3 + tamper rejection), and
-  invite-QR generation.
-- **TUI**: command parsing, focus cycling, message round-trip, multi-chat isolation,
-  and typing flow.
+  round-trip, wrong-key rejection, corrupt-file handling, format auto-detection.
+- **ChatManager** (`client/tests/feature_coverage_tests.rs` + in-file): group
+  chats, rename/delete, history clearing, toast lifecycle, file-transfer state,
+  typing indicators, contact import/association, invites (v1/v2/v3 + tamper
+  rejection), invite-QR generation.
+- **TUI**: command parsing, focus cycling, message round-trip, multi-chat
+  isolation, typing flow.
 
-The one area not deeply automated is GUI pixel rendering (egui); the logic behind
-it (`ChatManager`) is covered directly.
+The one area not deeply automated is GUI pixel rendering; the logic behind it
+(`ChatManager`) is covered directly. Per-phase verification targets:
 
-## Status
+- **Phase 1**: two clients join over LAN, appear in the directory, exchange channel
+  + DM messages; a message sent while a peer is offline is delivered on reconnect.
+  (Met by the in-memory E2E tests in `server::connection` + client integration.)
+- **UI rewrite**: per-phase gates in §10 — both toolchains build in CI; P2P then
+  Party flows work end-to-end through the new UI; no `egui`/`eframe` symbols remain
+  after Phase E; `tauri build` produces installers on all three OSes.
+- **Later phases**: dedup/refcount/quota tests; governance consent-flow tests;
+  E2EE group-key rotation tests; render-no-panic tests for new UI.
 
-This spec is the approved canonical north star for the platform direction.
-**Phase 0 (workspace refactor) is complete** and the suite is green. The next
-milestone is **Phase 1 — Party Server MVP (Administered)**, which should get its
-own spec → plan before implementation begins. The Independent item (P2P connection
-passwords + conversation lock) can be slotted in at any time.
+---
+
+## 14. Status
+
+Phase 0 (workspace) and the Phase 1 Party server core are complete; the suite is
+green at 264 tests. The next major effort is the **Tauri + SolidJS UI rewrite**
+(§10), which also closes the remaining Phase 1 UI-polish items. The Independent P2P
+hardening (connection passwords + conversation lock) shipped. This document is the
+approved north star; each phase gets its own detailed plan before implementation.

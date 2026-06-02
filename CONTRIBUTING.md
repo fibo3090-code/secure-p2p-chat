@@ -10,7 +10,7 @@ This repository is intentionally documented in layers. Before changing code, rea
 - `docs/03_architecture.md`: current module boundaries and state flow.
 - `docs/04_protocol.md`: current wire protocol and handshake behavior.
 - `SECURITY.md`: shipped protections, limits, and disclosure policy.
-- `DEVELOPMENT_PLAN.md`: backlog and planned work.
+- `docs/05_platform_spec.md`: platform plan, roadmap, and backlog.
 
 ## Contribution Rules
 
