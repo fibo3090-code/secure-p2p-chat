@@ -141,3 +141,4 @@ test_output.txt
 check_errors.txt
 clippy_errors.txt
 AGENTS.md
+.superpowers/
