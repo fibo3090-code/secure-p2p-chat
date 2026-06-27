@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "client", "server"]
+members = ["core", "client", "server", "desktop/src-tauri"]
 # Bare `cargo build`/`test`/`run` target the client app (the default product);
 # use `--workspace` (CI) or `-p messenger-server` to include the server.
 default-members = ["client"]
