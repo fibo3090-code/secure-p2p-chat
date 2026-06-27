@@ -296,6 +296,8 @@ mod tests {
         let chat = Chat {
             id: Uuid::new_v4(),
             title: "Test Chat".to_string(),
+            kind: crate::types::ChatKind::Dm,
+            transport: crate::types::Transport::Direct,
             peer_fingerprint: Some("abc123".to_string()),
             participants: Vec::new(),
             messages: Vec::new(),
@@ -337,6 +339,8 @@ mod tests {
             Chat {
                 id: chat_id,
                 title: "Chat".into(),
+                kind: crate::types::ChatKind::Dm,
+                transport: crate::types::Transport::Direct,
                 peer_fingerprint: None,
                 participants: Vec::new(),
                 messages: Vec::new(),
@@ -424,6 +428,8 @@ mod tests {
             Chat {
                 id: chat_id,
                 title: "Test Chat".into(),
+                kind: crate::types::ChatKind::Dm,
+                transport: crate::types::Transport::Direct,
                 peer_fingerprint: None,
                 participants: Vec::new(),
                 messages: vec![Message {

@@ -400,6 +400,8 @@ impl ChatManager {
         let chat = Chat {
             id,
             title,
+            kind: ChatKind::Dm,
+            transport: Transport::Direct,
             peer_fingerprint: None,
             participants: Vec::new(),
             messages: Vec::new(),
@@ -556,6 +558,8 @@ impl ChatManager {
         let chat = Chat {
             id: chat_id,
             title: default_title,
+            kind: ChatKind::Group,
+            transport: Transport::Direct,
             peer_fingerprint: None,
             participants,
             messages: Vec::new(),
@@ -718,6 +722,8 @@ impl ChatManager {
         let chat = Chat {
             id: chat_id,
             title: format!("Host on :{}", port),
+            kind: ChatKind::Dm,
+            transport: Transport::Direct,
             peer_fingerprint: None,
             participants: Vec::new(),
             messages: Vec::new(),
@@ -788,6 +794,8 @@ impl ChatManager {
             Chat {
                 id: chat_id,
                 title: format!("Relay host via {}", relay_server),
+                kind: ChatKind::Dm,
+                transport: Transport::Relay,
                 peer_fingerprint: None,
                 participants: Vec::new(),
                 messages: Vec::new(),
@@ -850,6 +858,8 @@ impl ChatManager {
             let chat = Chat {
                 id: chat_id,
                 title: format!("{}:{}", host, port),
+                kind: ChatKind::Dm,
+                transport: Transport::Direct,
                 peer_fingerprint: None,
                 participants: Vec::new(),
                 messages: Vec::new(),
@@ -909,6 +919,8 @@ impl ChatManager {
             e.insert(Chat {
                 id: chat_id,
                 title: format!("Relay via {}", relay_server),
+                kind: ChatKind::Dm,
+                transport: Transport::Relay,
                 peer_fingerprint: None,
                 participants: Vec::new(),
                 messages: Vec::new(),
@@ -1674,6 +1686,8 @@ impl ChatManager {
                 self.chats.entry(incoming_chat_id).or_insert_with(|| Chat {
                     id: incoming_chat_id,
                     title,
+                    kind: ChatKind::Dm,
+                    transport: Transport::Direct,
                     peer_fingerprint: Some(fingerprint.clone()),
                     participants: Vec::new(),
                     messages: Vec::new(),
@@ -2437,6 +2451,8 @@ mod tests {
         let chat = Chat {
             id: Uuid::new_v4(),
             title: format!("Host on :{}", port),
+            kind: ChatKind::Dm,
+            transport: Transport::Direct,
             peer_fingerprint: None,
             participants: Vec::new(),
             messages: Vec::new(),
@@ -2464,6 +2480,8 @@ mod tests {
         let chat = Chat {
             id: chat_id,
             title: "Test Chat".to_string(),
+            kind: ChatKind::Dm,
+            transport: Transport::Direct,
             peer_fingerprint: None,
             participants: Vec::new(),
             messages: Vec::new(),
@@ -2547,6 +2565,8 @@ mod tests {
         let chat = Chat {
             id: chat_id,
             title: "Test Chat".to_string(),
+            kind: ChatKind::Dm,
+            transport: Transport::Direct,
             peer_fingerprint: None,
             participants: Vec::new(),
             messages: Vec::new(),

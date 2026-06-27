@@ -24,6 +24,37 @@ pub struct Chat {
     /// True if this chat is a placeholder for a listening host, not a real conversation.
     #[serde(default)]
     pub is_host_placeholder: bool,
+    /// What kind of conversation this is (DM / flat group / community channel).
+    #[serde(default)]
+    pub kind: ChatKind,
+    /// How bytes reach the peer(s) for this conversation (orthogonal to `kind`).
+    #[serde(default)]
+    pub transport: Transport,
+}
+
+/// The kind of conversation, independent of how it is transported.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatKind {
+    /// One-to-one direct message.
+    #[default]
+    Dm,
+    /// A flat group of 3+ peers (no channels).
+    Group,
+    /// A channel inside a community / server.
+    Channel,
+}
+
+/// How a conversation's bytes reach the other participant(s). Orthogonal to
+/// [`ChatKind`]: a DM or a group can each be carried over any transport.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// Direct peer-to-peer TCP (one peer exposes a port).
+    #[default]
+    Direct,
+    /// Brokered through a relay (no port-forwarding, blind pipe).
+    Relay,
+    /// Terminated by a server that holds the conversation.
+    Server,
 }
 
 /// A single message in a chat
@@ -315,6 +346,30 @@ mod tests {
     #[test]
     fn trust_state_default_is_unverified() {
         assert_eq!(TrustState::default(), TrustState::Unverified);
+    }
+
+    #[test]
+    fn chat_kind_transport_defaults_and_back_compat() {
+        assert_eq!(ChatKind::default(), ChatKind::Dm);
+        assert_eq!(Transport::default(), Transport::Direct);
+        // A Chat persisted before these fields existed must still load, filling
+        // kind=Dm / transport=Direct via #[serde(default)].
+        let json = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "title":"old","peer_fingerprint":null,"participants":[],
+            "messages":[],"created_at":"2020-01-01T00:00:00Z"
+        }"#;
+        let c: Chat = serde_json::from_str(json).unwrap();
+        assert_eq!(c.kind, ChatKind::Dm);
+        assert_eq!(c.transport, Transport::Direct);
+        assert!(!c.is_host_placeholder);
+        // Round-trip preserves explicit values.
+        let mut c2 = c.clone();
+        c2.kind = ChatKind::Group;
+        c2.transport = Transport::Relay;
+        let back: Chat = serde_json::from_str(&serde_json::to_string(&c2).unwrap()).unwrap();
+        assert_eq!(back.kind, ChatKind::Group);
+        assert_eq!(back.transport, Transport::Relay);
     }
 
     #[test]
