@@ -1,20 +1,60 @@
+// Relays surface — a relay is a blind byte-broker that lets two peers pair when
+// neither can dial the other (no port-forwarding). It retains no data; a relayed
+// conversation is still an end-to-end-encrypted, fingerprint-verified DM.
+//
+// Honest by design: this pane only exposes actions the backend actually backs
+// (connect/host via relay through the bridge, run a local relay). Saved-relay
+// and live-route tracking don't exist yet, so they're shown as explicit empty
+// states rather than fabricated data.
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { Button, Input, cx } from "./ui.jsx";
+import { Button, Input } from "./ui.jsx";
+import { api } from "../lib/bridge.js";
+import { toast } from "../lib/toast.js";
 
-const RELAYS = [
-  { host: "relay.home:12345", status: "online", latency: "18 ms", active: 2 },
-  { host: "192.168.1.42:12346", status: "offline", latency: "-", active: 0 },
-];
+const LOCAL_RELAY_CMD = "cargo run -p encodeur_rsa_rust -- --relay-server --port 9000";
 
-const ROUTES = [
-  { peer: "Alice", direction: "out", via: "relay.home:12345", since: "12 min", state: "active" },
-  { peer: "Bob", direction: "in", via: "relay.home:12345", since: "idle", state: "idle" },
-];
+function Copyable({ value }) {
+  const [done, setDone] = useState(false);
+  return (
+    <div className="rl-cmd">
+      <code>{value}</code>
+      <button className="copy-btn" title="Copy" onClick={() => {
+        try { navigator.clipboard.writeText(value); setDone(true); setTimeout(() => setDone(false), 1200); } catch { /* */ }
+      }}><Icon name={done ? "check" : "copy"} size={15} /></button>
+    </div>
+  );
+}
 
-export function Relays() {
-  const [host, setHost] = useState("relay.home:12345");
-  const [token, setToken] = useState("classroom");
+export function Relays({ onConnected }) {
+  const [host, setHost] = useState("");
+  const [token, setToken] = useState("");
+  const [hostToken, setHostToken] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function pair() {
+    if (!host.trim()) return toast("Enter the relay address.", "error");
+    if (!token.trim()) return toast("Enter the connection token your peer shared.", "error");
+    setBusy(true);
+    try {
+      await api.connectViaRelay(host.trim(), token.trim());
+      toast(`Connecting via relay ${host.trim()}…`, "success");
+      onConnected && onConnected();
+    } catch (e) { toast(String(e), "error"); }
+    finally { setBusy(false); }
+  }
+
+  async function openHost() {
+    if (!host.trim()) return toast("Enter the relay address to broker through.", "error");
+    setBusy(true);
+    setHostToken("");
+    try {
+      const t = await api.hostViaRelay(host.trim());
+      setHostToken(t);
+      toast("Relay session open — share the token with your peer", "success");
+    } catch (e) { toast(String(e), "error"); }
+    finally { setBusy(false); }
+  }
 
   return (
     <div className="relay-pane">
@@ -22,100 +62,48 @@ export function Relays() {
         <header className="rl-head">
           <div>
             <h2>Relays</h2>
-            <p>Self-hosted rendezvous for peers that cannot dial each other directly.</p>
+            <p>A relay is a blind broker for peers that can't dial each other directly — no port-forwarding. It forwards bytes only; your chat stays end-to-end encrypted and fingerprint-verified.</p>
           </div>
-          <Button icon="refresh">Refresh</Button>
         </header>
-
-        <section className="rl-hero">
-          <div className="rl-hero-l">
-            <span className="rl-hero-ic"><Icon name="globe" size={24} /></span>
-            <div>
-              <div className="rl-hero-host">{host}</div>
-              <div className="rl-hero-tags">
-                <span className="rl-status is-online"><span className="rl-status-dot" />online</span>
-                <span className="rl-sep">•</span>
-                <span className="rl-selfhost"><Icon name="server" size={13} />self-hosted</span>
-              </div>
-            </div>
-          </div>
-          <div className="rl-hero-stats">
-            <div className="rl-stat">
-              <div className="rl-stat-v">2</div>
-              <div className="rl-stat-l">routes</div>
-            </div>
-            <div className="rl-stat">
-              <div className="rl-stat-v">18 ms</div>
-              <div className="rl-stat-l">latency</div>
-            </div>
-          </div>
-        </section>
 
         <section className="rl-connect">
           <div className="rl-block-head">
-            <h3>Pair through relay</h3>
+            <h3>Pair through a relay</h3>
           </div>
-          <div className="rl-connect-row">
-            <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="relay host" />
-            <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="token" />
-            <Button icon="swap">Pair</Button>
+          <p className="creator-lead" style={{ marginBottom: 10 }}>Both peers use the same relay address. The host opens a session to get a token; the other peer connects with that token.</p>
+          <div className="creator-row" style={{ marginBottom: 8 }}>
+            <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="relay.example.com:9000" />
+            <Button variant="ghost" icon="satellite" onClick={openHost} disabled={busy}>Host</Button>
           </div>
-        </section>
-
-        <section className="rl-block">
-          <div className="rl-block-head">
-            <h3>Known relays</h3>
-            <span className="pd-block-note">{RELAYS.length} configured</span>
+          <div className="creator-row">
+            <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="connection token"
+              onKeyDown={(e) => e.key === "Enter" && pair()} />
+            <Button icon="swap" onClick={pair} disabled={busy}>Connect</Button>
           </div>
-          <div className="rl-servers">
-            {RELAYS.map((relay) => (
-              <div key={relay.host} className={cx("rl-server", relay.status !== "online" && "is-off")}>
-                <span className={cx("rl-server-dot", relay.status === "online" ? "is-online" : "is-offline")} />
-                <div className="rl-server-main">
-                  <div className="rl-server-host">{relay.host}</div>
-                  <div className="rl-server-tags">
-                    <span>{relay.status}</span>
-                    <span>{relay.active} active</span>
-                  </div>
-                </div>
-                <span className="rl-server-lat">{relay.latency}</span>
-                <div className="rl-server-actions">
-                  <button className="cc-act" title="Use relay"><Icon name="check" size={15} /></button>
-                  <button className="cc-act danger" title="Remove"><Icon name="trash" size={15} /></button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="rl-block">
-          <div className="rl-block-head">
-            <h3>Active routes</h3>
-          </div>
-          <div className="rl-routes">
-            <div className="rl-route rl-route-head">
-              <span>Peer</span><span>Direction</span><span>Relay</span><span>Since</span><span></span>
+          {hostToken && (
+            <div style={{ marginTop: 12 }}>
+              <p className="creator-lead" style={{ marginBottom: 6 }}><strong>Share this token</strong> alongside <code>{host.trim()}</code>:</p>
+              <Copyable value={hostToken} />
             </div>
-            {ROUTES.map((route) => (
-              <div className="rl-route" key={route.peer}>
-                <span className="rl-r-peer"><span className={cx("rl-r-state", `is-${route.state}`)} />{route.peer}</span>
-                <span className={cx("rl-r-dir", `dir-${route.direction}`)}>{route.direction}</span>
-                <span className="rl-r-via">{route.via}</span>
-                <span className="rl-r-since">{route.since}</span>
-                <span className="rl-r-right"><button className="cc-act" title="Reconnect"><Icon name="refresh" size={15} /></button></span>
-              </div>
-            ))}
+          )}
+        </section>
+
+        <section className="rl-block">
+          <div className="rl-block-head">
+            <h3>Saved relays</h3>
+          </div>
+          <div className="rl-empty">
+            <Icon name="globe" size={18} />
+            <span>Saved relays and live routes aren't tracked yet — pair above to start a relayed session.</span>
           </div>
         </section>
 
         <section className="rl-block">
           <div className="rl-block-head">
-            <h3>Run locally</h3>
+            <h3>Run your own relay</h3>
           </div>
-          <div className="rl-cmd">
-            <code>cargo run -p encodeur_rsa_rust -- --relay-server</code>
-            <button className="copy-btn" title="Copy"><Icon name="copy" size={15} /></button>
-          </div>
+          <p className="creator-lead" style={{ marginBottom: 8 }}>Host a relay on a machine both peers can reach (a VPS, or a LAN box). It stores nothing.</p>
+          <Copyable value={LOCAL_RELAY_CMD} />
         </section>
       </div>
     </div>
