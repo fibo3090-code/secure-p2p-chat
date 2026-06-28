@@ -96,6 +96,29 @@ pub enum PartyRequest {
     /// Fetch channel history strictly after `since_seq` (offline catch-up).
     /// `since_seq = 0` returns the whole channel.
     FetchHistory { channel: Uuid, since_seq: u64 },
+    /// Send a direct (1:1) message to another member.
+    SendDm { to: Uuid, text: String },
+    /// Fetch direct-message history with another member (offline catch-up).
+    FetchDmHistory { with: Uuid, since_seq: u64 },
+    /// Create a new public channel.
+    CreateChannel { name: String },
+}
+
+/// Deterministic, order-independent id for the 1:1 DM thread between two members,
+/// so both participants and the server agree on the same `Envelope.channel` for
+/// their direct messages. A DM `Envelope` is just a [`Message`]/[`History`] item
+/// whose `channel` is this thread id rather than a real channel id.
+pub fn dm_thread_id(a: Uuid, b: Uuid) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut hasher = Sha256::new();
+    hasher.update(b"party-dm-thread");
+    hasher.update(lo.as_bytes());
+    hasher.update(hi.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 /// Server → client messages.
@@ -354,11 +377,39 @@ mod tests {
                 channel: Uuid::new_v4(),
                 since_seq: 42,
             },
+            PartyRequest::SendDm {
+                to: Uuid::new_v4(),
+                text: "psst".to_string(),
+            },
+            PartyRequest::FetchDmHistory {
+                with: Uuid::new_v4(),
+                since_seq: 3,
+            },
+            PartyRequest::CreateChannel {
+                name: "random".to_string(),
+            },
         ];
         for req in requests {
             let bytes = req.to_bytes();
             assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
         }
+    }
+
+    #[test]
+    fn dm_thread_id_is_order_independent_and_distinct() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        assert_eq!(
+            dm_thread_id(a, b),
+            dm_thread_id(b, a),
+            "thread id must be symmetric"
+        );
+        assert_ne!(
+            dm_thread_id(a, b),
+            dm_thread_id(a, c),
+            "different pairs differ"
+        );
     }
 
     #[test]

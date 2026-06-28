@@ -78,7 +78,7 @@ Start with [docs/README.md](docs/README.md).
 - [docs/04_protocol.md](docs/04_protocol.md): wire protocol and handshake details
 - [SECURITY.md](SECURITY.md): security posture, controls, open risks, disclosure
 - [THREAT_MODEL.md](THREAT_MODEL.md): assumptions, assets, attack surfaces, limitations
-- [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md): roadmap and backlog
+- [docs/05_platform_spec.md](docs/05_platform_spec.md): platform plan, roadmap, and backlog
 - [docs/AUDITS.md](docs/AUDITS.md): consolidated audit history and findings
 
 ## Contributing

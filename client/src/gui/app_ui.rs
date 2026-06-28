@@ -106,6 +106,11 @@ pub struct App {
     pub party_post_input: String,
     pub party_selected_server: Option<Uuid>,
     pub party_selected_channel: Option<Uuid>,
+    /// When set, the Party view shows the DM thread with this member instead of a
+    /// channel.
+    pub party_selected_dm: Option<Uuid>,
+    /// Draft name for creating a new Party channel.
+    pub party_new_channel_input: String,
     /// Optional P2P connection password entered in the Host/Connect dialogs.
     pub connection_password_input: String,
 }
@@ -328,6 +333,8 @@ impl App {
             party_post_input: String::new(),
             party_selected_server: None,
             party_selected_channel: None,
+            party_selected_dm: None,
+            party_new_channel_input: String::new(),
             connection_password_input: String::new(),
         })
     }
