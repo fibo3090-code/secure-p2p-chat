@@ -1,0 +1,37 @@
+[package]
+name = "p2pem-desktop"
+description = "P2PEM desktop (Tauri + webview) frontend — Phase 1 bridge over the shared core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+# The shared library the binary and (future) mobile entry points call into.
+name = "p2pem_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.4", features = [] }
+
+[dependencies]
+tauri = { version = "2.10.0", features = [] }
+tauri-plugin-log = "2"
+log = "0.4"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# App orchestration lives in the client lib (ChatManager, persistence); the
+# bridge reuses it directly. NOTE (tech debt, see Phase 1 spec): this pulls in
+# egui/ratatui transitively. A later phase should extract ChatManager into a
+# UI-agnostic crate so the webview build doesn't compile the legacy GUIs.
+encodeur_rsa_rust = { path = "../../client" }
+messenger-core = { workspace = true }
+
+tokio = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }

@@ -3,7 +3,7 @@
 
 use encodeur_rsa_rust::app::chat_manager::ChatManager;
 use encodeur_rsa_rust::app::persistence::HistoryFile;
-use encodeur_rsa_rust::types::{Chat, Config, Message, MessageContent};
+use encodeur_rsa_rust::types::{Chat, ChatKind, Config, Message, MessageContent, Transport};
 use std::io::Write;
 use uuid::Uuid;
 
@@ -11,6 +11,8 @@ fn sample_chat(title: &str) -> Chat {
     Chat {
         id: Uuid::new_v4(),
         title: title.to_string(),
+        kind: ChatKind::Dm,
+        transport: Transport::Direct,
         peer_fingerprint: Some("FE".repeat(32)),
         participants: Vec::new(),
         messages: vec![Message {
