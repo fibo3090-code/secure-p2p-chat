@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-06-28
+
 ### Changed
 
 - **Party server durability moved to embedded SQLite.** The server now mirrors its
@@ -485,6 +487,7 @@ This release transformed the application from a functional prototype into a poli
 - Message history persistence.
 
 [Unreleased]: #
+[1.10.1]: #
 [1.10.0]: #
 [1.9.0]: #
 [1.7.3]: #
