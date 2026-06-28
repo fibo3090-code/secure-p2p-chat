@@ -6,7 +6,7 @@ members = ["core", "client", "server", "desktop/src-tauri"]
 default-members = ["client"]
 
 [workspace.package]
-version = "1.10.0"
+version = "1.10.1"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]
@@ -53,6 +53,9 @@ egui_commonmark = { version = "0.18", features = ["default"] }
 # TUI
 ratatui = { version = "0.30.0", features = ["crossterm_0_29", "underline-color", "all-widgets", "macros", "layout-cache"] }
 ratatui-crossterm = { version = "0.1.0", features = ["crossterm_0_29"] }
+
+# Embedded SQLite (bundled: compiles SQLite from source, no system dependency)
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Utilities
 anyhow = "1"

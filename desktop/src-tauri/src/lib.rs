@@ -104,7 +104,8 @@ fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
 async fn unlock(password: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     let key = {
         let mut id = state.identity.lock().unwrap();
-        id.decrypt(&password).map_err(|_| "Wrong password".to_string())?;
+        id.decrypt(&password)
+            .map_err(|_| "Wrong password".to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
         *state.is_new.lock().unwrap() = false;
         *state.force_setup.lock().unwrap() = false;
@@ -143,9 +144,7 @@ fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
 }
 
 #[tauri::command]
-async fn list_conversations(
-    state: tauri::State<'_, Bridge>,
-) -> Result<Vec<ConvSummary>, String> {
+async fn list_conversations(state: tauri::State<'_, Bridge>) -> Result<Vec<ConvSummary>, String> {
     let mgr = state.manager.lock().await;
     let mut out = Vec::new();
     for id in mgr.chat_ids() {
@@ -380,12 +379,16 @@ async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<String, Strin
             .map(|ip| messenger_core::util::format_host_port(&ip, port))
     };
     let id = state.identity.lock().unwrap();
-    id.generate_signed_invite_link(address).map_err(|e| e.to_string())
+    id.generate_signed_invite_link(address)
+        .map_err(|e| e.to_string())
 }
 
 /// Parse an invite link and store it as a contact.
 #[tauri::command]
-async fn import_invite(link: String, state: tauri::State<'_, Bridge>) -> Result<ContactDto, String> {
+async fn import_invite(
+    link: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<ContactDto, String> {
     let contact = {
         let mgr = state.manager.lock().await;
         mgr.parse_invite_link(&link).map_err(|e| e.to_string())?
@@ -404,8 +407,9 @@ async fn connect_contact(id: String, state: tauri::State<'_, Bridge>) -> Result<
         mgr.get_contact(uuid).and_then(|c| c.address.clone())
     };
     let address = address.ok_or_else(|| "Contact has no saved address".to_string())?;
-    let (host, port) = messenger_core::util::parse_host_port(&address, Some(messenger_core::PORT_DEFAULT))
-        .map_err(|e| e.to_string())?;
+    let (host, port) =
+        messenger_core::util::parse_host_port(&address, Some(messenger_core::PORT_DEFAULT))
+            .map_err(|e| e.to_string())?;
     let pk = {
         let id = state.identity.lock().unwrap();
         id.private_key().map_err(|e| e.to_string())?
@@ -476,7 +480,11 @@ pub fn run() {
         ])
         .setup(|app| {
             let b = app.state::<Bridge>();
-            spawn_poll_loop(app.handle().clone(), b.manager.clone(), b.pending_fp.clone());
+            spawn_poll_loop(
+                app.handle().clone(),
+                b.manager.clone(),
+                b.pending_fp.clone(),
+            );
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -554,7 +562,10 @@ fn spawn_poll_loop(
                 (req, toasts)
             };
             for (level, message) in toasts {
-                let _ = app.emit("toast", serde_json::json!({ "level": level, "message": message }));
+                let _ = app.emit(
+                    "toast",
+                    serde_json::json!({ "level": level, "message": message }),
+                );
             }
             if let Some((fingerprint, peer_name, chat_id)) = req {
                 let id = chat_id.to_string();

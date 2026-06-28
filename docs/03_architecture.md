@@ -170,7 +170,7 @@ server/src/
 ### `server/src/`
 
 - the Party server: TCP accept loop, `PartyState` (members/channels/DM
-  threads/history + JSON-snapshot persistence), request dispatcher, cross-connection
+  threads/history + embedded-SQLite persistence), request dispatcher, cross-connection
   broadcast hub, per-connection serve loop, and a persistent owner-only identity
 
 ### `client/src/app/party_manager.rs`

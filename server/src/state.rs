@@ -1,29 +1,42 @@
-//! In-memory Party server state and the pure logic that drives it (Phase 1,
-//! slice 1).
+//! In-memory Party server state plus its durable backing store (Phase 1).
 //!
 //! This is the authoritative runtime model: members, channels, and durable
 //! per-channel message history (which is what makes offline buffering work in the
 //! Administered tier — a reconnecting member simply fetches history after the last
-//! sequence it saw). It is deliberately network-free so it can be unit-tested
-//! deterministically; the TCP/handshake runtime (slice 3) drives these methods.
+//! sequence it saw). The pure logic is deliberately network-free so it can be
+//! unit-tested deterministically; the TCP/handshake runtime drives these methods.
+//!
+//! ## Durability
+//!
+//! Runtime state is kept in memory for fast reads and is mirrored to an embedded
+//! **SQLite** database (`party.db`) under the operator's data dir. Each mutation
+//! writes its delta (a single row) rather than rewriting a whole snapshot, so cost
+//! scales with the change, not the history size. A server created with
+//! [`PartyState::new`] has no database and is purely in-memory (used by tests and
+//! by callers that manage their own persistence); [`PartyState::load`] opens the
+//! database, performs a one-time import of any legacy `party_state.json` snapshot,
+//! and reconstructs the in-memory model from the tables.
 
 // Several accessors and fields here (directory/channel listing, presence toggling,
 // the member fingerprint binding) are exercised by the tests now and consumed by
-// the network runtime in the next slice; allow them ahead of that wiring.
+// the network runtime; allow them ahead of that wiring.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use messenger_core::party::{
     ChannelInfo, ChannelKind, Envelope, MemberInfo, MessagePayload, TrustTier,
 };
 use messenger_core::util::current_timestamp_millis;
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection};
+use serde::Deserialize;
 use uuid::Uuid;
 
-/// Filename of the durable state snapshot under the operator's data dir.
-const SNAPSHOT_FILE: &str = "party_state.json";
+/// Filename of the embedded SQLite database under the operator's data dir.
+const DB_FILE: &str = "party.db";
+/// Filename of the legacy JSON snapshot, imported once into SQLite if present.
+const LEGACY_SNAPSHOT_FILE: &str = "party_state.json";
 
 /// Why a join was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,17 +56,14 @@ impl JoinError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct Member {
     id: Uuid,
     username: String,
     fingerprint: Option<String>,
     /// Presence is runtime-only and not persisted; members start offline on load.
-    #[serde(skip)]
     online: bool,
 }
 
-#[derive(Serialize, Deserialize)]
 struct Channel {
     id: Uuid,
     name: String,
@@ -63,31 +73,44 @@ struct Channel {
 }
 
 /// A 1:1 direct-message thread, keyed by `messenger_core::party::dm_thread_id`.
-#[derive(Serialize, Deserialize)]
 struct DmThread {
     id: Uuid,
     messages: Vec<Envelope>,
 }
 
-/// Owned on-disk snapshot used when loading. Server name/password/tier come from
-/// configuration, not the snapshot.
+// --- Legacy JSON snapshot shapes (read-only, for one-time import) ---------------
+
+#[derive(Deserialize)]
+struct LegacyMember {
+    id: Uuid,
+    username: String,
+    fingerprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyChannel {
+    id: Uuid,
+    name: String,
+    kind: ChannelKind,
+    messages: Vec<Envelope>,
+}
+
+#[derive(Deserialize)]
+struct LegacyDmThread {
+    id: Uuid,
+    messages: Vec<Envelope>,
+}
+
 #[derive(Deserialize, Default)]
-struct Snapshot {
-    members: Vec<Member>,
-    channels: Vec<Channel>,
+struct LegacySnapshot {
+    members: Vec<LegacyMember>,
+    channels: Vec<LegacyChannel>,
     #[serde(default)]
-    dm_threads: Vec<DmThread>,
+    dm_threads: Vec<LegacyDmThread>,
 }
 
-/// Borrowing view used when saving, to avoid cloning channel/DM history.
-#[derive(Serialize)]
-struct SnapshotRef<'a> {
-    members: Vec<&'a Member>,
-    channels: &'a [Channel],
-    dm_threads: Vec<&'a DmThread>,
-}
-
-/// The full server state.
+/// The full server state. Server name/password/tier come from configuration, not
+/// the store.
 pub struct PartyState {
     name: String,
     password: Option<String>,
@@ -96,12 +119,13 @@ pub struct PartyState {
     channels: Vec<Channel>,
     /// Direct-message threads, keyed by their deterministic thread id.
     dm_threads: HashMap<Uuid, DmThread>,
-    /// When set, mutations are persisted to this snapshot file.
-    persist_path: Option<PathBuf>,
+    /// When present, mutations are mirrored to this database.
+    db: Option<Connection>,
 }
 
 impl PartyState {
-    /// Create a new Administered server with a default `general` channel.
+    /// Create a new in-memory Administered server with a default `general` channel
+    /// and no durable backing store. Mutations are not persisted.
     pub fn new(name: impl Into<String>, password: Option<String>) -> Self {
         let general = Channel {
             id: Uuid::new_v4(),
@@ -116,57 +140,53 @@ impl PartyState {
             members: HashMap::new(),
             channels: vec![general],
             dm_threads: HashMap::new(),
-            persist_path: None,
+            db: None,
         }
     }
 
-    /// Load durable state from `<data_dir>/party_state.json`, or start fresh (with
-    /// a default `general` channel) if absent. Subsequent mutations auto-persist to
-    /// that file.
+    /// Open (creating if needed) the durable state in `<data_dir>/party.db`,
+    /// reconstructing the in-memory model from it. A fresh database is seeded with
+    /// the default `general` channel. If a legacy `party_state.json` snapshot is
+    /// present and the database is empty, it is imported once and then renamed to
+    /// `party_state.json.imported` so the import is not repeated. Subsequent
+    /// mutations auto-persist their delta.
     pub fn load(
         name: impl Into<String>,
         password: Option<String>,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        let path = data_dir.join(SNAPSHOT_FILE);
+        let conn = Connection::open(data_dir.join(DB_FILE))?;
+        init_schema(&conn)?;
+
+        // One-time migration from the interim JSON snapshot into SQLite.
+        let legacy = data_dir.join(LEGACY_SNAPSHOT_FILE);
+        if legacy.exists() && db_is_empty(&conn)? {
+            import_legacy_snapshot(&conn, &legacy)?;
+            if let Err(e) = std::fs::rename(&legacy, data_dir.join("party_state.json.imported")) {
+                tracing::warn!(error = %e, "imported legacy snapshot but could not rename it; it will be ignored because the database is now non-empty");
+            }
+            tracing::info!("migrated legacy party_state.json snapshot into party.db");
+        }
+
         let mut state = Self::new(name, password);
+        state.db = Some(conn);
 
-        if path.exists() {
-            let json = std::fs::read_to_string(&path)?;
-            let snapshot: Snapshot = serde_json::from_str(&json)?;
-            state.members = snapshot.members.into_iter().map(|m| (m.id, m)).collect();
-            // Keep the default `general` channel if the snapshot has none.
-            if !snapshot.channels.is_empty() {
-                state.channels = snapshot.channels;
-            }
-            state.dm_threads = snapshot.dm_threads.into_iter().map(|t| (t.id, t)).collect();
+        if state.count_channels()? > 0 {
+            // The database is authoritative; rebuild the in-memory model from it.
+            state.reload_from_db()?;
+        } else {
+            // Fresh database: persist the seeded default `general` channel.
+            let general = &state.channels[0];
+            insert_channel_row(
+                state.db.as_ref().unwrap(),
+                general.id,
+                &general.name,
+                general.kind,
+                0,
+            )?;
         }
-
-        state.persist_path = Some(path);
         Ok(state)
-    }
-
-    /// Best-effort write of the durable state to the snapshot file (no-op when no
-    /// persist path is configured, e.g. in pure unit tests). Failures are logged
-    /// rather than propagated so a transient disk error doesn't drop a live request.
-    fn persist(&self) {
-        let Some(path) = &self.persist_path else {
-            return;
-        };
-        let snapshot = SnapshotRef {
-            members: self.members.values().collect(),
-            channels: &self.channels,
-            dm_threads: self.dm_threads.values().collect(),
-        };
-        match serde_json::to_string(&snapshot) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::error!(error = %e, path = %path.display(), "failed to persist party state");
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "failed to serialize party state"),
-        }
     }
 
     pub fn name(&self) -> &str {
@@ -206,20 +226,19 @@ impl PartyState {
         }
 
         let id = Uuid::new_v4();
-        self.members.insert(
+        let member = Member {
             id,
-            Member {
-                id,
-                username: username.to_string(),
-                fingerprint,
-                online: true,
-            },
-        );
-        self.persist();
+            username: username.to_string(),
+            fingerprint,
+            online: true,
+        };
+        self.persist_member(&member);
+        self.members.insert(id, member);
         Ok(id)
     }
 
     /// Mark a member's presence. Used when a connection drops or reconnects.
+    /// Presence is runtime-only and intentionally not persisted.
     pub fn set_online(&mut self, member: Uuid, online: bool) {
         if let Some(m) = self.members.get_mut(&member) {
             m.online = online;
@@ -270,6 +289,7 @@ impl PartyState {
         {
             return Err("a channel with that name already exists".to_string());
         }
+        let position = self.channels.len();
         let channel = Channel {
             id: Uuid::new_v4(),
             name: name.to_string(),
@@ -281,8 +301,8 @@ impl PartyState {
             name: channel.name.clone(),
             kind: channel.kind,
         };
+        self.persist_channel(&channel, position);
         self.channels.push(channel);
-        self.persist();
         Ok(info)
     }
 
@@ -322,7 +342,7 @@ impl PartyState {
             payload: MessagePayload::Text(text),
         };
         chan.messages.push(envelope.clone());
-        self.persist();
+        self.persist_message(&envelope);
         Ok(envelope)
     }
 
@@ -370,7 +390,7 @@ impl PartyState {
             payload: MessagePayload::Text(text),
         };
         thread.messages.push(envelope.clone());
-        self.persist();
+        self.persist_dm(thread_id, &envelope);
         Ok(envelope)
     }
 
@@ -386,6 +406,264 @@ impl PartyState {
             None => Vec::new(),
         }
     }
+
+    // --- Durable mirroring (best-effort: failures are logged, not propagated, so a
+    // transient disk error never drops a live request) --------------------------
+
+    fn persist_member(&self, m: &Member) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = insert_member_row(conn, m.id, &m.username, m.fingerprint.as_deref()) {
+            tracing::error!(error = %e, "failed to persist party member");
+        }
+    }
+
+    fn persist_channel(&self, c: &Channel, position: usize) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = insert_channel_row(conn, c.id, &c.name, c.kind, position) {
+            tracing::error!(error = %e, "failed to persist party channel");
+        }
+    }
+
+    fn persist_message(&self, e: &Envelope) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = insert_message_row(conn, e) {
+            tracing::error!(error = %e, "failed to persist party message");
+        }
+    }
+
+    fn persist_dm(&self, thread_id: Uuid, e: &Envelope) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = insert_dm_message_row(conn, thread_id, e) {
+            tracing::error!(error = %e, "failed to persist party direct message");
+        }
+    }
+
+    /// Rebuild the in-memory model from the database. Presence resets to offline.
+    fn reload_from_db(&mut self) -> anyhow::Result<()> {
+        let conn = self
+            .db
+            .as_ref()
+            .expect("reload_from_db requires an open database");
+
+        let mut members = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT id, username, fingerprint FROM members")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, username, fingerprint) = row?;
+                let id = Uuid::parse_str(&id)?;
+                members.insert(
+                    id,
+                    Member {
+                        id,
+                        username,
+                        fingerprint,
+                        online: false,
+                    },
+                );
+            }
+        }
+
+        let mut channels = Vec::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT id, name, kind FROM channels ORDER BY position ASC")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            let raw: Vec<(String, String, String)> = rows.collect::<Result<_, _>>()?;
+            for (id, name, kind) in raw {
+                let id = Uuid::parse_str(&id)?;
+                let kind: ChannelKind = serde_json::from_str(&kind)?;
+                let messages = load_messages(conn, "messages", "channel_id", id)?;
+                channels.push(Channel {
+                    id,
+                    name,
+                    kind,
+                    messages,
+                });
+            }
+        }
+
+        let mut dm_threads = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT id FROM dm_threads")?;
+            let ids: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            for id in ids {
+                let id = Uuid::parse_str(&id)?;
+                let messages = load_messages(conn, "dm_messages", "thread_id", id)?;
+                dm_threads.insert(id, DmThread { id, messages });
+            }
+        }
+
+        self.members = members;
+        self.channels = channels;
+        self.dm_threads = dm_threads;
+        Ok(())
+    }
+}
+
+// --- Free-standing SQLite helpers ----------------------------------------------
+
+/// Create the schema if it does not yet exist.
+fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS members (
+             id          TEXT PRIMARY KEY,
+             username    TEXT NOT NULL,
+             fingerprint TEXT
+         );
+         CREATE TABLE IF NOT EXISTS channels (
+             id       TEXT PRIMARY KEY,
+             name     TEXT NOT NULL,
+             kind     TEXT NOT NULL,
+             position INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS messages (
+             channel_id TEXT NOT NULL,
+             seq        INTEGER NOT NULL,
+             envelope   TEXT NOT NULL,
+             PRIMARY KEY (channel_id, seq)
+         );
+         CREATE TABLE IF NOT EXISTS dm_threads (
+             id TEXT PRIMARY KEY
+         );
+         CREATE TABLE IF NOT EXISTS dm_messages (
+             thread_id TEXT NOT NULL,
+             seq       INTEGER NOT NULL,
+             envelope  TEXT NOT NULL,
+             PRIMARY KEY (thread_id, seq)
+         );",
+    )
+}
+
+/// True when no members, channels, or DM threads exist yet (a pristine database).
+fn db_is_empty(conn: &Connection) -> rusqlite::Result<bool> {
+    Ok(table_count(conn, "members")? == 0
+        && table_count(conn, "channels")? == 0
+        && table_count(conn, "dm_threads")? == 0)
+}
+
+fn table_count(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    // `table` is a compile-time constant from this module, never user input.
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+}
+
+impl PartyState {
+    fn count_channels(&self) -> rusqlite::Result<i64> {
+        match &self.db {
+            Some(conn) => table_count(conn, "channels"),
+            None => Ok(0),
+        }
+    }
+}
+
+fn insert_member_row(
+    conn: &Connection,
+    id: Uuid,
+    username: &str,
+    fingerprint: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO members (id, username, fingerprint) VALUES (?1, ?2, ?3)",
+        params![id.to_string(), username, fingerprint],
+    )?;
+    Ok(())
+}
+
+fn insert_channel_row(
+    conn: &Connection,
+    id: Uuid,
+    name: &str,
+    kind: ChannelKind,
+    position: usize,
+) -> rusqlite::Result<()> {
+    let kind = serde_json::to_string(&kind).expect("ChannelKind serializes");
+    conn.execute(
+        "INSERT OR REPLACE INTO channels (id, name, kind, position) VALUES (?1, ?2, ?3, ?4)",
+        params![id.to_string(), name, kind, position as i64],
+    )?;
+    Ok(())
+}
+
+fn insert_message_row(conn: &Connection, e: &Envelope) -> rusqlite::Result<()> {
+    let json = serde_json::to_string(e).expect("Envelope serializes");
+    conn.execute(
+        "INSERT OR REPLACE INTO messages (channel_id, seq, envelope) VALUES (?1, ?2, ?3)",
+        params![e.channel.to_string(), e.seq as i64, json],
+    )?;
+    Ok(())
+}
+
+fn insert_dm_message_row(conn: &Connection, thread_id: Uuid, e: &Envelope) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO dm_threads (id) VALUES (?1)",
+        params![thread_id.to_string()],
+    )?;
+    let json = serde_json::to_string(e).expect("Envelope serializes");
+    conn.execute(
+        "INSERT OR REPLACE INTO dm_messages (thread_id, seq, envelope) VALUES (?1, ?2, ?3)",
+        params![thread_id.to_string(), e.seq as i64, json],
+    )?;
+    Ok(())
+}
+
+/// Load and deserialize an ordered envelope history from `table` where the keying
+/// column `key_col` equals `key`. Both `table` and `key_col` are module constants.
+fn load_messages(
+    conn: &Connection,
+    table: &str,
+    key_col: &str,
+    key: Uuid,
+) -> anyhow::Result<Vec<Envelope>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT envelope FROM {table} WHERE {key_col} = ?1 ORDER BY seq ASC"
+    ))?;
+    let rows: Vec<String> = stmt
+        .query_map(params![key.to_string()], |r| r.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for json in rows {
+        out.push(serde_json::from_str(&json)?);
+    }
+    Ok(out)
+}
+
+/// One-time import of a legacy JSON snapshot into the (empty) database, in a single
+/// transaction so it is all-or-nothing.
+fn import_legacy_snapshot(conn: &Connection, path: &Path) -> anyhow::Result<()> {
+    let json = std::fs::read_to_string(path)?;
+    let snap: LegacySnapshot = serde_json::from_str(&json)?;
+
+    let tx = conn.unchecked_transaction()?;
+    for m in &snap.members {
+        insert_member_row(&tx, m.id, &m.username, m.fingerprint.as_deref())?;
+    }
+    for (position, c) in snap.channels.iter().enumerate() {
+        insert_channel_row(&tx, c.id, &c.name, c.kind, position)?;
+        for e in &c.messages {
+            insert_message_row(&tx, e)?;
+        }
+    }
+    for t in &snap.dm_threads {
+        for e in &t.messages {
+            insert_dm_message_row(&tx, t.id, e)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -505,7 +783,7 @@ mod tests {
             state
                 .post_message(alice, channel, "persisted msg".to_string())
                 .unwrap();
-        } // dropped; everything was written through to disk on each mutation
+        } // dropped; everything was written through to the database on each mutation
 
         let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
         // Member directory survived; presence resets to offline after reload.
@@ -586,5 +864,93 @@ mod tests {
         }
         let s = PartyState::load("Srv", None, dir.path()).unwrap();
         assert_eq!(s.dm_history(thread, 0).len(), 1);
+    }
+
+    #[test]
+    fn created_channels_and_their_order_persist_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (general, random_id);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            general = s.default_channel();
+            let alice = s.join("alice", None, None).unwrap();
+            random_id = s.create_channel("random").unwrap().id;
+            s.post_message(alice, random_id, "in random".to_string())
+                .unwrap();
+        }
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        let channels = s.channels();
+        assert_eq!(channels.len(), 2);
+        // Order is preserved: general first, then the created channel.
+        assert_eq!(s.default_channel(), general);
+        assert_eq!(channels[0].id, general);
+        assert_eq!(channels[1].id, random_id);
+        // History of the created channel survived.
+        let history = s.history_since(random_id, 0);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].payload,
+            MessagePayload::Text("in random".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_json_snapshot_is_imported_once() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Hand-write a legacy snapshot in the old on-disk shape.
+        let member_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let snapshot = serde_json::json!({
+            "members": [
+                { "id": member_id, "username": "legacy_user", "fingerprint": "FP" }
+            ],
+            "channels": [
+                {
+                    "id": channel_id,
+                    "name": "general",
+                    "kind": "Public",
+                    "messages": [
+                        {
+                            "tier": "Administered",
+                            "sender": member_id,
+                            "channel": channel_id,
+                            "seq": 1,
+                            "timestamp": 1700000000000u64,
+                            "payload": { "Text": "hello from the past" }
+                        }
+                    ]
+                }
+            ],
+            "dm_threads": []
+        });
+        std::fs::write(
+            dir.path().join("party_state.json"),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        // First load imports the snapshot into SQLite and renames the file.
+        let state = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(state.members().len(), 1);
+        assert_eq!(state.members()[0].username, "legacy_user");
+        assert_eq!(state.default_channel(), channel_id);
+        let history = state.history_since(channel_id, 0);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].payload,
+            MessagePayload::Text("hello from the past".to_string())
+        );
+        assert!(
+            !dir.path().join("party_state.json").exists(),
+            "legacy snapshot should be renamed after import"
+        );
+        assert!(dir.path().join("party_state.json.imported").exists());
+
+        // A second load must not re-import (the database is now authoritative).
+        drop(state);
+        let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(reloaded.members().len(), 1);
+        assert_eq!(reloaded.history_since(channel_id, 0).len(), 1);
     }
 }

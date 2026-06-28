@@ -74,7 +74,7 @@ In short: `core::party` defines the application protocol; `messenger-server` run
 real TCP listener with a persistent owner-only identity, applies requests to an
 in-memory `PartyState`, fans out live broadcasts across connections, serves
 channels and server-routed DMs with offline history catch-up, and persists state
-to a durable JSON snapshot. A client can join, chat in channels, DM, and create
+to an embedded SQLite database. A client can join, chat in channels, DM, and create
 channels via TUI commands and a GUI Party window.
 
 ### Current UI — egui + ratatui (to be replaced)
@@ -128,7 +128,7 @@ core/     crypto, protocol/wire types, framing, identity, transport, shared type
           and the Party application protocol (core::party). Reused by both sides.
 client/   the unified app: GUI + TUI, ChatManager, PartyManager, persistence.
 server/   the Party server: TCP listener, PartyState, dispatcher, broadcast hub,
-          persistent identity, durable snapshot.
+          persistent identity, SQLite store.
 ```
 
 Relay stays a thin mode (`--relay-server`) alongside `core`.
@@ -216,9 +216,11 @@ and server, riding on top of the v3 encrypted tunnel.
   member); a cross-connection **broadcast hub** (a posted message reaches every
   other connected member live); a **persistent owner-only server identity**
   (`server::identity`, RSA PEM under the data dir, so the pinned fingerprint is
-  stable across restarts); and **durable state** — `PartyState::load`/`persist`
-  auto-saves members + channels + DM threads + history to a JSON snapshot and
-  restores it on startup (presence resets to offline).
+  stable across restarts); and **durable state** — `PartyState::load` mirrors
+  members + channels + DM threads + history to an embedded **SQLite** database
+  (`party.db`), writing each mutation's delta and reconstructing the in-memory
+  model on startup (presence resets to offline); a legacy `party_state.json`
+  snapshot is imported once on first load.
 - **Server-routed DMs** — a deterministic per-pair DM thread; the server stores
   and delivers DMs like channels, with offline history.
 - **Channel creation** — members can create channels at runtime.
@@ -231,17 +233,22 @@ and server, riding on top of the v3 encrypted tunnel.
 
 ### Server data model (MVP)
 
+In memory (authoritative at runtime), mirrored row-by-row to SQLite:
+
 ```text
 PartyState { name, password: Option<String>, tier, members, channels, dm_threads,
-             persist_path }
-Member  { id, username, fingerprint: Option<String>, joined_at, online }
+             db: Option<Connection> }
+Member  { id, username, fingerprint: Option<String>, online }
 Channel { id, name, kind, messages: Vec<Envelope> }   # messages = durable history
 ```
 
+SQLite tables: `members`, `channels` (with a `position` column for stable
+ordering), `messages`, `dm_threads`, `dm_messages` (envelopes stored as JSON).
+
 ### What remains
 
-- Migrate the JSON snapshot to the **embedded SQLite** + filesystem blob store the
-  data model calls for (the snapshot shape maps cleanly to tables) — see §9.
+- The filesystem **blob store** for files (Phase 2) — the SQLite metadata store is
+  now in place (see §9).
 - A dedicated **TUI Party pane** (beyond command output) and **server-identity
   TOFU** confirmation UI in the GUI.
 - Roles/permissions, governance/audit, lock/password gating per channel (Phase 3);
@@ -276,9 +283,10 @@ Content-addressable, deduplicated storage:
 `Channel`, `Message(envelope)`, `DMThread`, `Blob`, `FileEntry`,
 `PermissionMatrix`, `FileReference`, `Quota`, `Role`, `Policy`, `AuditLog`.
 
-**Server persistence:** today an auto-saved **JSON snapshot** under the operator's
-data dir (interim). The target is embedded **SQLite** for metadata + a filesystem
-blob store, chosen for zero-ops single-host hosting with room to swap later.
+**Server persistence:** embedded **SQLite** (`party.db`) for metadata under the
+operator's data dir, with a filesystem blob store still to come for files
+(Phase 2), chosen for zero-ops single-host hosting with room to swap later. The
+former interim JSON snapshot is imported once on first load, then superseded.
 
 ---
 
@@ -432,7 +440,7 @@ Each phase gets its own detailed plan before code lands.
 
 ```text
 Phase 0  Workspace refactor                         ✅ done
-Phase 1  Party Server MVP (Administered)            ✅ core done · SQLite + UI polish remain
+Phase 1  Party Server MVP (Administered)            ✅ core + SQLite done · UI polish remains
 UI       Tauri + SolidJS rewrite (§10)              ▶ next major effort
 Phase 2  Drive / files
 Phase 3  Governance & roles
@@ -449,8 +457,9 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   join-by-address (+ optional password) + username, member directory + presence,
   channels, server-routed group + DM messaging, offline buffering via history
   catch-up, channel creation, the GUI Party window + TUI commands, server-identity
-  TOFU on the wire. **Remaining:** migrate the JSON snapshot to SQLite + blob
-  store; TUI Party pane; GUI server-TOFU/error polish (see §7).
+  TOFU on the wire, and SQLite-backed durable state (`party.db`). **Remaining:**
+  the filesystem blob store for files (Phase 2); TUI Party pane; GUI
+  server-TOFU/error polish (see §7).
 - **UI rewrite — Tauri + SolidJS.** The next major effort; full plan in §10. Plan
   a `2.0.0` release when Phase F lands (owner authorizes the tag).
 - **Phase 2 — Drive / files.** Upload/list/download/delete in channels & DMs; hash
