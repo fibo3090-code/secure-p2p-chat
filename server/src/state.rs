@@ -23,10 +23,11 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use messenger_core::party::{
-    ChannelInfo, ChannelKind, Envelope, MemberInfo, MessagePayload, TrustTier,
+    blob_hash, ChannelInfo, ChannelKind, Envelope, FileMeta, MemberInfo, MessagePayload, TrustTier,
+    MAX_INLINE_FILE_BYTES,
 };
 use messenger_core::util::current_timestamp_millis;
 use rusqlite::{params, Connection};
@@ -35,6 +36,8 @@ use uuid::Uuid;
 
 /// Filename of the embedded SQLite database under the operator's data dir.
 const DB_FILE: &str = "party.db";
+/// Subdirectory under the data dir holding content-addressed file blobs.
+const BLOB_DIR: &str = "blobs";
 /// Filename of the legacy JSON snapshot, imported once into SQLite if present.
 const LEGACY_SNAPSHOT_FILE: &str = "party_state.json";
 
@@ -78,6 +81,16 @@ struct DmThread {
     messages: Vec<Envelope>,
 }
 
+/// A content-addressed file blob. The bytes are deduplicated by content hash and
+/// reference-counted (each message that references the blob holds one count); the
+/// bytes also live on disk under `<data_dir>/blobs/<hash>`.
+struct BlobRecord {
+    size: u64,
+    mime: String,
+    data: Vec<u8>,
+    refcount: u32,
+}
+
 // --- Legacy JSON snapshot shapes (read-only, for one-time import) ---------------
 
 #[derive(Deserialize)]
@@ -119,8 +132,12 @@ pub struct PartyState {
     channels: Vec<Channel>,
     /// Direct-message threads, keyed by their deterministic thread id.
     dm_threads: HashMap<Uuid, DmThread>,
+    /// Content-addressed file blobs, keyed by hex SHA-256 of their bytes.
+    blobs: HashMap<String, BlobRecord>,
     /// When present, mutations are mirrored to this database.
     db: Option<Connection>,
+    /// When present, blob bytes are mirrored to files under this directory.
+    blob_dir: Option<PathBuf>,
 }
 
 impl PartyState {
@@ -140,7 +157,9 @@ impl PartyState {
             members: HashMap::new(),
             channels: vec![general],
             dm_threads: HashMap::new(),
+            blobs: HashMap::new(),
             db: None,
+            blob_dir: None,
         }
     }
 
@@ -156,6 +175,8 @@ impl PartyState {
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        let blob_dir = data_dir.join(BLOB_DIR);
+        std::fs::create_dir_all(&blob_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;
         init_schema(&conn)?;
 
@@ -171,6 +192,7 @@ impl PartyState {
 
         let mut state = Self::new(name, password);
         state.db = Some(conn);
+        state.blob_dir = Some(blob_dir);
 
         if state.count_channels()? > 0 {
             // The database is authoritative; rebuild the in-memory model from it.
@@ -407,6 +429,136 @@ impl PartyState {
         }
     }
 
+    // --- File sharing (Phase 2, slice 1) ----------------------------------------
+
+    /// Store `data` as a content-addressed blob (deduplicated by hash, with the
+    /// bytes mirrored to disk) and return its [`FileMeta`]. A repeated upload of the
+    /// same content reuses the existing blob and bumps its reference count.
+    fn store_blob(&mut self, name: &str, mime: &str, data: Vec<u8>) -> FileMeta {
+        let hash = blob_hash(&data);
+        let size = data.len() as u64;
+        if let Some(rec) = self.blobs.get_mut(&hash) {
+            rec.refcount += 1;
+            let refcount = rec.refcount;
+            self.persist_blob_refcount(&hash, refcount);
+        } else {
+            self.write_blob_file(&hash, &data);
+            self.persist_blob_row(&hash, size, mime, 1);
+            self.blobs.insert(
+                hash.clone(),
+                BlobRecord {
+                    size,
+                    mime: mime.to_string(),
+                    data,
+                    refcount: 1,
+                },
+            );
+        }
+        FileMeta {
+            hash,
+            name: name.to_string(),
+            size,
+            mime: mime.to_string(),
+        }
+    }
+
+    /// Validate an inline upload's size, returning the data on success.
+    fn check_inline_size(data: Vec<u8>) -> Result<Vec<u8>, String> {
+        if data.is_empty() {
+            return Err("file is empty".to_string());
+        }
+        if data.len() > MAX_INLINE_FILE_BYTES {
+            return Err(format!(
+                "file exceeds the {} MiB inline limit",
+                MAX_INLINE_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Store a file and post it as a message to `channel`. Returns the assigned
+    /// envelope (its payload is `File`) for broadcast, like [`Self::post_message`].
+    pub fn post_file(
+        &mut self,
+        sender: Uuid,
+        channel: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Envelope, String> {
+        if !self.is_member(sender) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if self.channel(channel).is_none() {
+            return Err("unknown channel".to_string());
+        }
+        let data = Self::check_inline_size(data)?;
+        let tier = self.tier;
+        let meta = self.store_blob(&name, &mime, data);
+        // Re-borrow the channel after the blob store to append the message.
+        let chan = self
+            .channel_mut(channel)
+            .expect("channel existence checked");
+        let seq = chan.messages.len() as u64 + 1;
+        let envelope = Envelope {
+            tier,
+            sender,
+            channel,
+            seq,
+            timestamp: current_timestamp_millis(),
+            payload: MessagePayload::File(meta),
+        };
+        chan.messages.push(envelope.clone());
+        self.persist_message(&envelope);
+        Ok(envelope)
+    }
+
+    /// Store a file and send it as a direct message to `to`. Returns the assigned
+    /// envelope (payload `File`) for delivery, like [`Self::post_dm`].
+    pub fn post_file_dm(
+        &mut self,
+        from: Uuid,
+        to: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Envelope, String> {
+        if !self.is_member(from) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if !self.is_member(to) {
+            return Err("recipient is not a member of this server".to_string());
+        }
+        let data = Self::check_inline_size(data)?;
+        let thread_id = messenger_core::party::dm_thread_id(from, to);
+        let tier = self.tier;
+        let meta = self.store_blob(&name, &mime, data);
+        let thread = self
+            .dm_threads
+            .entry(thread_id)
+            .or_insert_with(|| DmThread {
+                id: thread_id,
+                messages: Vec::new(),
+            });
+        let seq = thread.messages.len() as u64 + 1;
+        let envelope = Envelope {
+            tier,
+            sender: from,
+            channel: thread_id,
+            seq,
+            timestamp: current_timestamp_millis(),
+            payload: MessagePayload::File(meta),
+        };
+        thread.messages.push(envelope.clone());
+        self.persist_dm(thread_id, &envelope);
+        Ok(envelope)
+    }
+
+    /// The bytes of a stored blob by content hash, or `None` if unknown.
+    pub fn blob_bytes(&self, hash: &str) -> Option<Vec<u8>> {
+        self.blobs.get(hash).map(|r| r.data.clone())
+    }
+
     // --- Durable mirroring (best-effort: failures are logged, not propagated, so a
     // transient disk error never drops a live request) --------------------------
 
@@ -435,6 +587,31 @@ impl PartyState {
         let Some(conn) = &self.db else { return };
         if let Err(e) = insert_dm_message_row(conn, thread_id, e) {
             tracing::error!(error = %e, "failed to persist party direct message");
+        }
+    }
+
+    fn write_blob_file(&self, hash: &str, data: &[u8]) {
+        let Some(dir) = &self.blob_dir else { return };
+        let path = dir.join(hash);
+        if let Err(e) = std::fs::write(&path, data) {
+            tracing::error!(error = %e, path = %path.display(), "failed to write file blob");
+        }
+    }
+
+    fn persist_blob_row(&self, hash: &str, size: u64, mime: &str, refcount: u32) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = insert_blob_row(conn, hash, size, mime, refcount) {
+            tracing::error!(error = %e, "failed to persist file blob row");
+        }
+    }
+
+    fn persist_blob_refcount(&self, hash: &str, refcount: u32) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = conn.execute(
+            "UPDATE blobs SET refcount = ?1 WHERE hash = ?2",
+            params![refcount, hash],
+        ) {
+            tracing::error!(error = %e, "failed to update file blob refcount");
         }
     }
 
@@ -508,9 +685,46 @@ impl PartyState {
             }
         }
 
+        let mut blobs = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT hash, size, mime, refcount FROM blobs")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let raw: Vec<(String, i64, String, i64)> = rows.collect::<Result<_, _>>()?;
+            let blob_dir = self
+                .blob_dir
+                .as_ref()
+                .expect("reload_from_db requires a blob directory");
+            for (hash, size, mime, refcount) in raw {
+                match std::fs::read(blob_dir.join(&hash)) {
+                    Ok(data) => {
+                        blobs.insert(
+                            hash,
+                            BlobRecord {
+                                size: size as u64,
+                                mime,
+                                data,
+                                refcount: refcount as u32,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, hash = %hash, "blob bytes missing on disk; skipping")
+                    }
+                }
+            }
+        }
+
         self.members = members;
         self.channels = channels;
         self.dm_threads = dm_threads;
+        self.blobs = blobs;
         Ok(())
     }
 }
@@ -545,8 +759,28 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              seq       INTEGER NOT NULL,
              envelope  TEXT NOT NULL,
              PRIMARY KEY (thread_id, seq)
+         );
+         CREATE TABLE IF NOT EXISTS blobs (
+             hash     TEXT PRIMARY KEY,
+             size     INTEGER NOT NULL,
+             mime     TEXT NOT NULL,
+             refcount INTEGER NOT NULL
          );",
     )
+}
+
+fn insert_blob_row(
+    conn: &Connection,
+    hash: &str,
+    size: u64,
+    mime: &str,
+    refcount: u32,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO blobs (hash, size, mime, refcount) VALUES (?1, ?2, ?3, ?4)",
+        params![hash, size as i64, mime, refcount],
+    )?;
+    Ok(())
 }
 
 /// True when no members, channels, or DM threads exist yet (a pristine database).
@@ -952,5 +1186,174 @@ mod tests {
         let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
         assert_eq!(reloaded.members().len(), 1);
         assert_eq!(reloaded.history_since(channel_id, 0).len(), 1);
+    }
+
+    fn file_payload(env: &Envelope) -> &FileMeta {
+        match &env.payload {
+            MessagePayload::File(f) => f,
+            other => panic!("expected a File payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_file_stores_blob_and_posts_a_file_message() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+
+        let env = state
+            .post_file(
+                alice,
+                chan,
+                "hi.txt".into(),
+                "text/plain".into(),
+                b"hello".to_vec(),
+            )
+            .expect("post_file");
+        assert_eq!(env.seq, 1);
+        let meta = file_payload(&env);
+        assert_eq!(meta.name, "hi.txt");
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.hash, blob_hash(b"hello"));
+
+        // The bytes are retrievable by hash, and the message is in channel history.
+        assert_eq!(state.blob_bytes(&meta.hash), Some(b"hello".to_vec()));
+        assert_eq!(state.history_since(chan, 0).len(), 1);
+    }
+
+    #[test]
+    fn identical_uploads_are_deduplicated_by_content() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+
+        let a = state
+            .post_file(
+                alice,
+                chan,
+                "a.bin".into(),
+                "application/octet-stream".into(),
+                b"same".to_vec(),
+            )
+            .unwrap();
+        let b = state
+            .post_file(
+                alice,
+                chan,
+                "b.bin".into(),
+                "application/octet-stream".into(),
+                b"same".to_vec(),
+            )
+            .unwrap();
+
+        // Two messages, two names, but one shared content-addressed blob.
+        assert_eq!(file_payload(&a).hash, file_payload(&b).hash);
+        assert_eq!(state.blobs.len(), 1);
+        assert_eq!(state.blobs[&file_payload(&a).hash].refcount, 2);
+        assert_eq!(state.history_since(chan, 0).len(), 2);
+    }
+
+    #[test]
+    fn oversized_and_empty_uploads_are_rejected() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+
+        assert!(state
+            .post_file(alice, chan, "empty".into(), "text/plain".into(), Vec::new())
+            .is_err());
+        let too_big = vec![0u8; MAX_INLINE_FILE_BYTES + 1];
+        assert!(state
+            .post_file(
+                alice,
+                chan,
+                "big".into(),
+                "application/octet-stream".into(),
+                too_big
+            )
+            .is_err());
+        // Nothing was stored.
+        assert!(state.blobs.is_empty());
+        assert!(state.history_since(chan, 0).is_empty());
+    }
+
+    #[test]
+    fn post_file_rejects_non_members_and_unknown_channels() {
+        let mut state = PartyState::new("Open", None);
+        let stranger = Uuid::new_v4();
+        let chan = state.default_channel();
+        assert!(state
+            .post_file(
+                stranger,
+                chan,
+                "x".into(),
+                "text/plain".into(),
+                b"x".to_vec()
+            )
+            .is_err());
+
+        let alice = state.join("alice", None, None).unwrap();
+        assert!(state
+            .post_file(
+                alice,
+                Uuid::new_v4(),
+                "x".into(),
+                "text/plain".into(),
+                b"x".to_vec()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn file_dm_is_stored_in_the_thread() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let thread = messenger_core::party::dm_thread_id(alice, bob);
+
+        let env = state
+            .post_file_dm(
+                alice,
+                bob,
+                "secret.txt".into(),
+                "text/plain".into(),
+                b"psst".to_vec(),
+            )
+            .expect("post_file_dm");
+        assert_eq!(env.channel, thread);
+        assert_eq!(file_payload(&env).name, "secret.txt");
+        assert_eq!(state.dm_history(thread, 0).len(), 1);
+        assert_eq!(
+            state.blob_bytes(&file_payload(&env).hash),
+            Some(b"psst".to_vec())
+        );
+    }
+
+    #[test]
+    fn blobs_and_file_messages_persist_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (chan, hash);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            chan = s.default_channel();
+            let alice = s.join("alice", None, None).unwrap();
+            let env = s
+                .post_file(
+                    alice,
+                    chan,
+                    "doc.txt".into(),
+                    "text/plain".into(),
+                    b"durable".to_vec(),
+                )
+                .unwrap();
+            hash = file_payload(&env).hash.clone();
+        }
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        // The blob bytes and the file message both survived.
+        assert_eq!(s.blob_bytes(&hash), Some(b"durable".to_vec()));
+        let history = s.history_since(chan, 0);
+        assert_eq!(history.len(), 1);
+        assert_eq!(file_payload(&history[0]).name, "doc.txt");
+        assert_eq!(s.blobs[&hash].refcount, 1);
     }
 }

@@ -258,7 +258,18 @@ ordering), `messages`, `dm_threads`, `dm_messages` (envelopes stored as JSON).
 
 ## 8. Files / "Drive" (Phase 2)
 
-Content-addressable, deduplicated storage:
+**Shipped (slice 1):** content-addressed inline file sharing in the Party server.
+A `MessagePayload::File(FileMeta)` carries a file reference in channel and DM
+history; `PartyRequest::PostFile` / `SendFileDm` upload bytes inline (bounded by
+`MAX_INLINE_FILE_BYTES = 4 MiB`) and post a file message that broadcasts like a
+text message; `DownloadFile { hash }` returns the bytes. The server stores each
+blob once, keyed by SHA-256, reference-counted, with the bytes on disk under
+`<data_dir>/blobs/<hash>` and metadata (`hash, size, mime, refcount`) in the
+`blobs` SQLite table. **Remaining:** chunked transfer for large files; the
+permission matrix, quotas, provenance, and the Drive UI panel below; client-side
+download/save wiring.
+
+Target data model — content-addressable, deduplicated storage:
 
 - **Blob** — raw content stored once: `hash, size, mime, (ciphertext?)`.
 - **FileEntry** — a logical file in the UI: `name, owner, server, location, date,
@@ -442,7 +453,7 @@ Each phase gets its own detailed plan before code lands.
 Phase 0  Workspace refactor                         ✅ done
 Phase 1  Party Server MVP (Administered)            ✅ core + SQLite done · UI polish remains
 UI       Tauri + SolidJS rewrite (§10)              ▶ next major effort
-Phase 2  Drive / files
+Phase 2  Drive / files                              ◐ slice 1 (inline file sharing) done
 Phase 3  Governance & roles
 Phase 4  E2EE server tier
 Phase 5  Per-server identities
@@ -462,8 +473,10 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   server-TOFU/error polish (see §7).
 - **UI rewrite — Tauri + SolidJS.** The next major effort; full plan in §10. Plan
   a `2.0.0` release when Phase F lands (owner authorizes the tag).
-- **Phase 2 — Drive / files.** Upload/list/download/delete in channels & DMs; hash
-  dedup + reference counting; logical + physical quotas; the Drive panel.
+- **Phase 2 — Drive / files. ◐ slice 1 done.** Inline (≤4 MiB) content-addressed
+  file sharing in channels & DMs with hash dedup + reference counting and on-disk
+  blobs landed (see §8). Remaining: chunked transfer for large files,
+  list/download/delete UX, logical + physical quotas, and the Drive panel.
 - **Phase 3 — Governance & roles.** Trust-tier labeling, transparency panel,
   consent-or-leave, audit log, roles/permissions, visibility & contact policies,
   channel lock/password.

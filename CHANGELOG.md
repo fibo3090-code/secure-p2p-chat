@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **File sharing in Party servers (Phase 2, slice 1).** Members can share files
+  (up to 4 MiB inline) in channels and direct messages. The server stores each
+  file once, content-addressed by SHA-256 and reference-counted, with the bytes on
+  disk and metadata in the SQLite store; a file appears in history like a message
+  and can be fetched by hash. Larger-file chunking and the Drive UI are still to
+  come.
+
 ## [1.10.1] - 2026-06-28
 
 ### Changed
