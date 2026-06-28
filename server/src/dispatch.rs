@@ -146,6 +146,44 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     let thread = messenger_core::party::dm_thread_id(member, with);
                     Dispatch::reply(PartyResponse::History(state.dm_history(thread, since_seq)))
                 }
+                PartyRequest::PostFile {
+                    channel,
+                    name,
+                    mime,
+                    data,
+                } => match state.post_file(member, channel, name, mime, data) {
+                    // Like PostMessage: ack the poster, broadcast the file message.
+                    Ok(env) => Dispatch {
+                        replies: vec![PartyResponse::MessagePosted {
+                            channel: env.channel,
+                            seq: env.seq,
+                        }],
+                        broadcast: vec![PartyResponse::Message(env)],
+                        directed: Vec::new(),
+                    },
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::SendFileDm {
+                    to,
+                    name,
+                    mime,
+                    data,
+                } => match state.post_file_dm(member, to, name, mime, data) {
+                    // Like SendDm: ack the sender, deliver to the recipient.
+                    Ok(env) => Dispatch {
+                        replies: vec![PartyResponse::MessagePosted {
+                            channel: env.channel,
+                            seq: env.seq,
+                        }],
+                        broadcast: Vec::new(),
+                        directed: vec![(to, PartyResponse::Message(env))],
+                    },
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::DownloadFile { hash } => match state.blob_bytes(&hash) {
+                    Some(data) => Dispatch::reply(PartyResponse::FileData { hash, data }),
+                    None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
+                },
             }
         }
     }
@@ -326,5 +364,74 @@ mod tests {
             },
         );
         assert!(matches!(&out.replies[..], [PartyResponse::Error(m)] if m == "join required"));
+    }
+
+    #[test]
+    fn post_file_acks_the_poster_and_broadcasts_a_file_message() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        join(&mut state, &mut conn, "alice", None);
+        let channel = state.default_channel();
+
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::PostFile {
+                channel,
+                name: "pic.png".to_string(),
+                mime: "image/png".to_string(),
+                data: b"\x89PNG data".to_vec(),
+            },
+        );
+        assert!(matches!(
+            &out.replies[..],
+            [PartyResponse::MessagePosted { .. }]
+        ));
+        match &out.broadcast[..] {
+            [PartyResponse::Message(env)] => {
+                assert!(matches!(&env.payload, MessagePayload::File(f) if f.name == "pic.png"));
+            }
+            other => panic!("expected a broadcast File message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_returns_bytes_for_known_and_errors_for_unknown() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        join(&mut state, &mut conn, "alice", None);
+        let channel = state.default_channel();
+
+        let post = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::PostFile {
+                channel,
+                name: "f.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                data: b"payload".to_vec(),
+            },
+        );
+        let hash = match &post.broadcast[..] {
+            [PartyResponse::Message(env)] => match &env.payload {
+                MessagePayload::File(f) => f.hash.clone(),
+                other => panic!("expected File payload, got {other:?}"),
+            },
+            other => panic!("expected broadcast, got {other:?}"),
+        };
+
+        let ok = handle_request(&mut state, &mut conn, PartyRequest::DownloadFile { hash });
+        assert!(
+            matches!(&ok.replies[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
+        );
+
+        let missing = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::DownloadFile {
+                hash: "deadbeef".to_string(),
+            },
+        );
+        assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
     }
 }

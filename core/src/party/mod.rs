@@ -31,11 +31,40 @@ pub enum TrustTier {
     E2EE,
 }
 
+/// Maximum size of a file uploaded inline in a single Party request (Phase 2,
+/// slice 1). Larger files will use chunked transfer in a later slice. Kept well
+/// under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
+pub const MAX_INLINE_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Metadata describing a file shared in a channel or DM. The file's bytes are
+/// stored content-addressed by `hash` (lowercase hex SHA-256); `name` is the
+/// per-message display name, so two messages may reference one blob under
+/// different names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMeta {
+    pub hash: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+}
+
 /// The application payload carried by an [`Envelope`]. For the Administered tier
 /// this is plaintext; the E2EE tier (Phase 4) will add a ciphertext variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessagePayload {
     Text(String),
+    /// A reference to a file stored on the server (Phase 2). The bytes are fetched
+    /// separately via [`PartyRequest::DownloadFile`] using `FileMeta::hash`.
+    File(FileMeta),
+}
+
+/// Content address (lowercase hex SHA-256) of a blob's bytes. Both sides compute
+/// this identically so uploads can be deduplicated by content.
+pub fn blob_hash(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
 }
 
 /// A single stored/transported message. One data model across both tiers.
@@ -102,6 +131,23 @@ pub enum PartyRequest {
     FetchDmHistory { with: Uuid, since_seq: u64 },
     /// Create a new public channel.
     CreateChannel { name: String },
+    /// Upload a file inline and post it as a message to a channel. The bytes must
+    /// not exceed [`MAX_INLINE_FILE_BYTES`].
+    PostFile {
+        channel: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    },
+    /// Upload a file inline and send it as a direct message to another member.
+    SendFileDm {
+        to: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    },
+    /// Fetch a stored file's bytes by its content hash.
+    DownloadFile { hash: String },
 }
 
 /// Deterministic, order-independent id for the 1:1 DM thread between two members,
@@ -145,6 +191,11 @@ pub enum PartyResponse {
     Message(Envelope),
     /// A batch of history items (response to `FetchHistory`).
     History(Vec<Envelope>),
+    /// A stored file's bytes (response to `DownloadFile`).
+    FileData {
+        hash: String,
+        data: Vec<u8>,
+    },
     /// A non-fatal application error.
     Error(String),
 }
@@ -388,11 +439,56 @@ mod tests {
             PartyRequest::CreateChannel {
                 name: "random".to_string(),
             },
+            PartyRequest::PostFile {
+                channel: Uuid::new_v4(),
+                name: "report.pdf".to_string(),
+                mime: "application/pdf".to_string(),
+                data: vec![1, 2, 3, 4],
+            },
+            PartyRequest::SendFileDm {
+                to: Uuid::new_v4(),
+                name: "note.txt".to_string(),
+                mime: "text/plain".to_string(),
+                data: b"hi".to_vec(),
+            },
+            PartyRequest::DownloadFile {
+                hash: "abc123".to_string(),
+            },
         ];
         for req in requests {
             let bytes = req.to_bytes();
             assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
         }
+    }
+
+    #[test]
+    fn blob_hash_is_deterministic_and_content_addressed() {
+        assert_eq!(blob_hash(b"hello"), blob_hash(b"hello"));
+        assert_ne!(blob_hash(b"hello"), blob_hash(b"world"));
+        // Known SHA-256 of "hello" (lowercase hex).
+        assert_eq!(
+            blob_hash(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn file_payload_envelope_roundtrips() {
+        let env = Envelope {
+            tier: TrustTier::Administered,
+            sender: Uuid::new_v4(),
+            channel: Uuid::new_v4(),
+            seq: 7,
+            timestamp: 1234,
+            payload: MessagePayload::File(FileMeta {
+                hash: blob_hash(b"data"),
+                name: "f.bin".to_string(),
+                size: 4,
+                mime: "application/octet-stream".to_string(),
+            }),
+        };
+        let bytes = bincode::serialize(&env).unwrap();
+        assert_eq!(bincode::deserialize::<Envelope>(&bytes).unwrap(), env);
     }
 
     #[test]
@@ -439,6 +535,10 @@ mod tests {
             },
             PartyResponse::Message(sample_envelope()),
             PartyResponse::History(vec![sample_envelope(), sample_envelope()]),
+            PartyResponse::FileData {
+                hash: blob_hash(b"bytes"),
+                data: b"bytes".to_vec(),
+            },
             PartyResponse::Error("boom".to_string()),
         ];
         for resp in responses {

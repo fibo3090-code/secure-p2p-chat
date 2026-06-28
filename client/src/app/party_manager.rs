@@ -316,6 +316,8 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
         }
         // Ack carries no content; the optimistic local append already happened.
         PartyResponse::MessagePosted { .. } => {}
+        // Downloaded file bytes; surfacing/saving them in the UI is a follow-up slice.
+        PartyResponse::FileData { .. } => {}
         PartyResponse::Error(_) => {}
     }
 }

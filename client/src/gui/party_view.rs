@@ -352,8 +352,13 @@ fn snapshot(app: &App) -> Option<Snapshot> {
                     let rendered = msgs
                         .iter()
                         .map(|env| {
-                            let MessagePayload::Text(t) = &env.payload;
-                            (env.sender, t.clone())
+                            let text = match &env.payload {
+                                MessagePayload::Text(t) => t.clone(),
+                                MessagePayload::File(f) => {
+                                    format!("📎 {} ({} bytes)", f.name, f.size)
+                                }
+                            };
+                            (env.sender, text)
                         })
                         .collect::<Vec<_>>();
                     (*ch, rendered)
