@@ -747,6 +747,8 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                     let chat = crate::types::Chat {
                                         id: chat_id,
                                         title: contact_clone.name.clone(),
+                                        kind: crate::types::ChatKind::Dm,
+                                        transport: crate::types::Transport::Direct,
                                         peer_fingerprint: contact_clone.fingerprint.clone(),
                                         participants: vec![contact_clone.id],
                                         messages: Vec::new(),

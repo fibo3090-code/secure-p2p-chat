@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::app::party_manager::PartyStatus;
 use crate::gui::app_ui::App;
-use messenger_core::party::{ChannelInfo, MemberInfo, MessagePayload};
+use messenger_core::party::{dm_thread_id, ChannelInfo, MemberInfo, MessagePayload};
 
 /// Render the Party window if open.
 pub fn render_party_window(app: &mut App, ctx: &egui::Context) {
@@ -119,17 +119,62 @@ fn render_body(app: &mut App, ui: &mut egui::Ui) {
 
     egui::SidePanel::left("party_channels")
         .resizable(false)
-        .default_width(150.0)
+        .default_width(170.0)
         .show_inside(ui, |ui| {
             ui.strong("Channels");
             for ch in &srv.channels {
-                ui.selectable_value(&mut app.party_selected_channel, Some(ch.id), &ch.name);
+                let selected =
+                    app.party_selected_dm.is_none() && app.party_selected_channel == Some(ch.id);
+                if ui
+                    .selectable_label(selected, format!("# {}", ch.name))
+                    .clicked()
+                {
+                    app.party_selected_channel = Some(ch.id);
+                    app.party_selected_dm = None;
+                }
             }
+            // Create a new channel.
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut app.party_new_channel_input)
+                        .hint_text("new channel")
+                        .desired_width(110.0),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (submit || ui.button("+").clicked())
+                    && !app.party_new_channel_input.trim().is_empty()
+                {
+                    let name = std::mem::take(&mut app.party_new_channel_input);
+                    if let Ok(party) = app.party_manager.try_lock() {
+                        if let Err(e) = party.create_channel(server_id, name) {
+                            tracing::warn!("Create channel failed: {}", e);
+                        }
+                    }
+                }
+            });
+
             ui.add_space(8.0);
-            ui.strong(format!("Members ({})", srv.members.len()));
+            ui.strong(format!("Members ({}) — click to DM", srv.members.len()));
             for m in &srv.members {
                 let dot = if m.online { "🟢" } else { "⚪" };
-                ui.label(format!("{dot} {}", m.username));
+                if srv.my_member == Some(m.id) {
+                    ui.label(format!("{dot} {} (you)", m.username));
+                    continue;
+                }
+                let selected = app.party_selected_dm == Some(m.id);
+                if ui
+                    .selectable_label(selected, format!("{dot} ✉ {}", m.username))
+                    .clicked()
+                {
+                    let newly_selected = app.party_selected_dm != Some(m.id);
+                    app.party_selected_dm = Some(m.id);
+                    if newly_selected {
+                        // Seed the DM thread from durable history on first open.
+                        if let Ok(party) = app.party_manager.try_lock() {
+                            let _ = party.fetch_dm_history(server_id, m.id);
+                        }
+                    }
+                }
             }
         });
 
@@ -143,37 +188,28 @@ fn render_body(app: &mut App, ui: &mut egui::Ui) {
     }
 
     egui::CentralPanel::default().show_inside(ui, |ui| {
+        // DM view takes precedence over the channel view when a member is selected.
+        if let Some(peer) = app.party_selected_dm {
+            ui.strong(format!("✉ Direct messages with {}", srv.username(peer)));
+            let thread = srv.my_member.map(|me| dm_thread_id(me, peer));
+            render_message_list(ui, srv, thread.as_ref());
+            ui.separator();
+            ui.horizontal(|ui| {
+                let resp = ui.text_edit_singleline(&mut app.party_post_input);
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let clicked = ui.button("Send").clicked();
+                if (submit || clicked) && !app.party_post_input.trim().is_empty() {
+                    dm_send_clicked(app, server_id, peer);
+                }
+            });
+            return;
+        }
+
         let Some(channel) = app.party_selected_channel else {
             ui.label("No channel selected.");
             return;
         };
-
-        // Message list.
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .max_height(ui.available_height() - 40.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                let empty = Vec::new();
-                let msgs = srv.messages.get(&channel).unwrap_or(&empty);
-                if msgs.is_empty() {
-                    ui.weak("No messages yet.");
-                }
-                for (sender, text) in msgs {
-                    let name = srv
-                        .members
-                        .iter()
-                        .find(|m| &m.id == sender)
-                        .map(|m| m.username.clone())
-                        .unwrap_or_else(|| short_id(sender));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(format!("{name}:"));
-                        ui.label(text);
-                    });
-                }
-            });
-
-        // Post box.
+        render_message_list(ui, srv, Some(&channel));
         ui.separator();
         ui.horizontal(|ui| {
             let resp = ui.text_edit_singleline(&mut app.party_post_input);
@@ -184,6 +220,37 @@ fn render_body(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     });
+}
+
+/// Render the scrollable message list for a channel or DM thread.
+fn render_message_list(ui: &mut egui::Ui, srv: &ServerSnapshot, thread: Option<&Uuid>) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(ui.available_height() - 40.0)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            let empty = Vec::new();
+            let msgs = thread.and_then(|t| srv.messages.get(t)).unwrap_or(&empty);
+            if msgs.is_empty() {
+                ui.weak("No messages yet.");
+            }
+            for (sender, text) in msgs {
+                let name = srv.username(*sender);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!("{name}:"));
+                    ui.label(text);
+                });
+            }
+        });
+}
+
+fn dm_send_clicked(app: &mut App, server_id: Uuid, peer: Uuid) {
+    let text = std::mem::take(&mut app.party_post_input);
+    if let Ok(mut party) = app.party_manager.try_lock() {
+        if let Err(e) = party.send_dm(server_id, peer, text) {
+            tracing::warn!("Party DM failed: {}", e);
+        }
+    }
 }
 
 /// Spawn the async connect+join, mirroring the chat-manager connect pattern.
@@ -232,10 +299,23 @@ struct ServerSnapshot {
     name: String,
     fingerprint: String,
     status: PartyStatus,
+    /// This client's member id on the server (once joined); needed to resolve DM
+    /// thread ids.
+    my_member: Option<Uuid>,
     channels: Vec<ChannelInfo>,
     members: Vec<MemberInfo>,
-    /// Per channel: (sender id, text) pairs in display order.
+    /// Per channel/DM-thread: (sender id, text) pairs in display order.
     messages: std::collections::HashMap<Uuid, Vec<(Uuid, String)>>,
+}
+
+impl ServerSnapshot {
+    fn username(&self, id: Uuid) -> String {
+        self.members
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.username.clone())
+            .unwrap_or_else(|| short_id(&id))
+    }
 }
 
 impl ServerSnapshot {
@@ -284,6 +364,7 @@ fn snapshot(app: &App) -> Option<Snapshot> {
                 name: conn.server_name.clone(),
                 fingerprint: conn.server_fingerprint.clone(),
                 status: conn.status.clone(),
+                my_member: conn.member_id,
                 channels: conn.channels.clone(),
                 members: conn.members.clone(),
                 messages,

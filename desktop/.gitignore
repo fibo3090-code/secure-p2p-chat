@@ -1,0 +1,10 @@
+node_modules/
+
+# Dev artifacts (not source)
+screenshots/
+*.log
+
+# The root .gitignore ignores `dist/` globally, but Tauri embeds `frontendDist`
+# (../dist) into the binary at compile time via generate_context!, so the Vite
+# build output MUST be committed for `cargo build -p p2pem-desktop` to work.
+!dist/

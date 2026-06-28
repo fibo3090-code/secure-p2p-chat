@@ -1,0 +1,169 @@
+// Unified Messages surface — conversation list + chat pane. Clean port of the
+// mockup's chat.jsx, driven by live data adapted in lib/bridge.js.
+import { useRef, useEffect, useState } from "react";
+import { Icon } from "../lib/Icon.jsx";
+import { cx, Avatar, IconButton, Button, TrustBadge, TransportBadge } from "./ui.jsx";
+
+function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [open]);
+  const item = (fn) => () => { setOpen(false); fn && fn(contact); };
+  return (
+    <div className="chat-head-actions">
+      <IconButton name="fingerprint" label="Verify fingerprint" onClick={() => onVerify && onVerify(contact)} />
+      <div className="pop-wrap" ref={ref}>
+        <IconButton name="more" label="More" active={open} onClick={() => setOpen((o) => !o)} />
+        {open && (
+          <div className="pop-menu">
+            <button onClick={item(onInfo)}><Icon name="info" size={15} /> Conversation info</button>
+            <button onClick={item(onRename)}><Icon name="edit" size={15} /> Rename</button>
+            <button className="is-danger" onClick={item(onDelete)}><Icon name="trash" size={15} /> Delete</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const STATE_LABEL = { connected: "Connected", hosting: "Hosting", offline: "Offline", connecting: "Connecting" };
+
+export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery }) {
+  const filtered = contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
+  return (
+    <div className="conv-list">
+      <div className="conv-search">
+        <Icon name="search" size={15} />
+        <input placeholder="Search conversations" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <button className="conv-add" onClick={onAdd} title="New connection"><Icon name="plus" size={17} /></button>
+      </div>
+      <div className="conv-scroll">
+        {filtered.map((c) => (
+          <button key={c.id} className={cx("conv-row", activeId === c.id && "is-active")} onClick={() => onSelect(c.id)}>
+            <Avatar name={c.name} size={42} state={c.state} party={c.trust === "party"} />
+            <div className="conv-main">
+              <div className="conv-line1">
+                <span className="conv-name">{c.name}</span>
+                <span className="conv-time">{c.lastT}</span>
+              </div>
+              <div className="conv-line2">
+                <span className="conv-preview">
+                  {c.typing ? <em className="conv-typing">typing…</em> : c.last}
+                </span>
+                <span className="conv-markers">
+                  {c.kind === "group" && <Icon name="users" size={12} />}
+                  {c.kind === "channel" && <Icon name="hash" size={12} />}
+                  {c.transport === "relay" && <Icon name="satellite" size={12} />}
+                  {c.transport === "server" && <Icon name="server" size={12} />}
+                  {c.state === "hosting" && <span className="marker-h">H</span>}
+                  {c.trust === "unverified" && <span className="marker-warn"><Icon name="alert" size={12} /></span>}
+                  {c.unread > 0 && <span className="conv-unread">{c.unread}</span>}
+                </span>
+              </div>
+            </div>
+          </button>
+        ))}
+        {filtered.length === 0 && <div className="conv-empty">No conversations yet.</div>}
+      </div>
+    </div>
+  );
+}
+
+function MessageItem({ m }) {
+  if (m.kind === "system") {
+    return (
+      <div className={cx("sys-msg", m.warn && "is-warn", m.ok && "is-ok")}>
+        <Icon name={m.warn ? "alert" : m.ok ? "shieldCheck" : "lock"} size={13} />
+        <span>{m.text}</span>
+        <span className="sys-t">{m.t}</span>
+      </div>
+    );
+  }
+  if (m.kind === "file") {
+    const mine = m.from === "me";
+    return (
+      <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
+        <div className={cx("file-card", mine && "is-mine")}>
+          <span className="file-ic"><Icon name="file" size={20} /></span>
+          <div className="file-meta">
+            <div className="file-name">{m.name}</div>
+            <div className="file-sub">{m.size} · {m.progress >= 100 ? "transfer complete" : m.progress + "%"}</div>
+          </div>
+          <button className="file-dl"><Icon name={m.progress >= 100 ? "download" : "x"} size={16} /></button>
+        </div>
+      </div>
+    );
+  }
+  const mine = m.from === "me";
+  return (
+    <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
+      <div className="msg-bubble">
+        {m.author && !mine && <span className="msg-author">{m.author}</span>}
+        <span className="msg-text">{m.text}</span>
+        <span className="msg-time">{m.t}{mine && <Icon name="check" size={12} />}</span>
+      </div>
+    </div>
+  );
+}
+
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, draft, setDraft, onSend }) {
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [contact && contact.id, contact && contact.messages.length]);
+
+  if (!contact) {
+    return (
+      <div className="chat-pane chat-empty">
+        <div className="chat-empty-inner">
+          <span className="chat-empty-ic"><Icon name="message" size={28} /></span>
+          <div className="chat-empty-h">Select a conversation</div>
+          <div className="chat-empty-p">Encrypted peer-to-peer messaging. Pick a conversation, or start a new connection.</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chat-pane">
+      <header className="chat-head">
+        <div className="chat-head-l">
+          <Avatar name={contact.name} size={40} state={contact.state} party={contact.trust === "party"} />
+          <div className="chat-head-info">
+            <div className="chat-head-name">
+              {contact.name}
+              <TrustBadge trust={contact.trust} mini />
+              <TransportBadge transport={contact.transport} kind={contact.kind} mini />
+            </div>
+            <div className="chat-head-sub mono">
+              <span className={"chat-state state-txt-" + contact.state}>{STATE_LABEL[contact.state]}</span>
+              {contact.address && <><span className="chat-dot">·</span>{contact.address}</>}
+            </div>
+          </div>
+        </div>
+        <ChatMenu contact={contact} onVerify={onVerify} onRename={onRename} onDelete={onDelete} onInfo={onInfo} />
+      </header>
+
+      <div className="chat-scroll" ref={scrollRef}>
+        <div className="chat-thread">
+          {contact.messages.map((m, i) => <MessageItem key={i} m={m} />)}
+        </div>
+      </div>
+
+      <div className="composer">
+        <button className="composer-clip" title="Send file"><Icon name="paperclip" size={19} /></button>
+        <textarea className="composer-input" rows={1} placeholder={`Message ${contact.name.split(" ")[0]}…`}
+          value={draft} onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }} />
+        <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={onSend} title="Send">
+          <Icon name="send" size={18} />
+        </button>
+      </div>
+    </div>
+  );
+}

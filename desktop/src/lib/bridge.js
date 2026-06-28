@@ -1,0 +1,150 @@
+// Thin typed wrappers over the Tauri command bridge + adapters that map the
+// Rust `ChatManager` shapes (Chat/ConvSummary/Message) into the presentational
+// `contact` shape the ported components expect.
+//
+// When NOT running inside Tauri (e.g. opened in a plain browser for UI work),
+// `api`/`onBridge` fall back to an in-memory mock so the whole UI is navigable
+// without the Rust backend. Append `?mock=unlock` / `?mock=set_password` to the
+// URL to preview the auth screens.
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+const inTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
+
+const realApi = {
+  authStatus: () => invoke("auth_status"),
+  unlock: (password) => invoke("unlock", { password }),
+  setPassword: (password) => invoke("set_password", { password }),
+  listConversations: () => invoke("list_conversations"),
+  getConversation: (id) => invoke("get_conversation", { id }),
+  sendMessage: (id, text) => invoke("send_message", { id, text }),
+  startHost: (port) => invoke("start_host", { port }),
+  connectPeer: (host, port) => invoke("connect_peer", { host, port }),
+  hostViaRelay: (relay) => invoke("host_via_relay", { relay }),
+  connectViaRelay: (relay, token) => invoke("connect_via_relay", { relay, token }),
+  confirmFingerprint: (chatId, accept) => invoke("confirm_fingerprint", { id: chatId, accept }),
+  pendingFingerprint: () => invoke("pending_fingerprint"),
+  renameChat: (id, title) => invoke("rename_chat", { id, title }),
+  deleteChat: (id) => invoke("delete_chat", { id }),
+  listContacts: () => invoke("list_contacts"),
+  myInviteLink: () => invoke("my_invite_link"),
+  importInvite: (link) => invoke("import_invite", { link }),
+  connectContact: (id) => invoke("connect_contact", { id }),
+};
+
+// ── Dev mock ────────────────────────────────────────────────────────────────
+function makeMock() {
+  const now = new Date().toISOString();
+  let authState = new URLSearchParams(location.search).get("mock") || "ready";
+  const chats = {
+    "11111111-1111-1111-1111-111111111111": {
+      id: "11111111-1111-1111-1111-111111111111", title: "Alice", peer_fingerprint: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
+      participants: [], created_at: now, is_host_placeholder: false,
+      messages: [
+        { id: "m1", from_me: false, content: { type: "text", text: "hey! is this thing encrypted end to end?" }, timestamp: now },
+        { id: "m2", from_me: true, content: { type: "text", text: "yep — X25519 + AES-GCM. fingerprint verified ✔" }, timestamp: now },
+        { id: "m3", from_me: false, content: { type: "text", text: "slick. sending you the file now" }, timestamp: now },
+      ],
+    },
+    "22222222-2222-2222-2222-222222222222": {
+      id: "22222222-2222-2222-2222-222222222222", title: "Bob", peer_fingerprint: "ffeeddccbbaa00998877665544332211f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      participants: [], created_at: now, is_host_placeholder: false, messages: [
+        { id: "m4", from_me: false, content: { type: "text", text: "let's verify fingerprints" }, timestamp: now },
+      ],
+    },
+    "33333333-3333-3333-3333-333333333333": {
+      id: "33333333-3333-3333-3333-333333333333", title: "Listening :12345", peer_fingerprint: null,
+      participants: [], created_at: now, is_host_placeholder: true, messages: [],
+    },
+  };
+  const connected = { "11111111-1111-1111-1111-111111111111": true };
+  const contacts = [
+    { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f6", address: "192.168.1.21:12345", trust: "verified" },
+    { id: "c2", name: "Carol", fingerprint: "deadbeef0102", address: "10.0.0.5:12345", trust: "unverified" },
+  ];
+  const summaries = () => Object.values(chats).map((c) => ({
+    id: c.id, title: c.title,
+    last: c.messages.length ? (c.messages.at(-1).content.text || "") : null,
+    connected: !!connected[c.id], placeholder: c.is_host_placeholder,
+  }));
+  const ok = async () => {};
+  return {
+    authStatus: async () => ({ state: authState, name: "Maya", fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
+    unlock: async () => { authState = "ready"; },
+    setPassword: async () => { authState = "ready"; },
+    listConversations: async () => summaries(),
+    getConversation: async (id) => chats[id],
+    sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
+    startHost: ok, connectPeer: ok, confirmFingerprint: ok,
+    hostViaRelay: async () => "rly_" + Math.random().toString(36).slice(2, 10),
+    connectViaRelay: ok,
+    pendingFingerprint: async () => null,
+    renameChat: async (id, title) => { if (chats[id]) chats[id].title = title; },
+    deleteChat: async (id) => { delete chats[id]; },
+    listContacts: async () => contacts,
+    myInviteLink: async () => "chat-p2p://invite/eyJuYW1lIjoiTWF5YSIsImFkZHJlc3MiOiIxOTIuMTY4LjEuOToxMjM0NSJ9",
+    importInvite: async () => ({ id: "c3", name: "Imported", fingerprint: "abc", address: "1.2.3.4:12345", trust: "unverified" }),
+    connectContact: ok,
+  };
+}
+
+export const api = inTauri ? realApi : makeMock();
+export const onBridge = inTauri ? (event, cb) => listen(event, cb) : async () => () => {};
+
+// ── Adapters + formatting ────────────────────────────────────────────────────
+export function fmtTime(ts) {
+  try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  catch { return ""; }
+}
+
+function msgText(c) {
+  if (!c) return "";
+  if (c.type === "text") return c.text;
+  if (c.type === "file") return c.filename;
+  if (c.type === "Edited") return c.new_text;
+  return c.text || "";
+}
+
+function human(n) {
+  if (n == null) return "";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + " " + u[i];
+}
+
+export function summaryToConv(s) {
+  return {
+    id: s.id, name: s.title,
+    last: s.last || (s.connected ? "Connected" : s.placeholder ? "Waiting for a peer…" : ""),
+    lastT: "", typing: false,
+    kind: s.kind || "dm",
+    transport: s.transport || "direct",
+    relay: s.transport === "relay" || s.transport === "server",
+    state: s.connected ? "connected" : s.placeholder ? "hosting" : "offline",
+    trust: "verified", unread: 0, placeholder: s.placeholder,
+  };
+}
+
+export function chatToContact(chat, connected) {
+  if (!chat) return null;
+  return {
+    id: chat.id, name: chat.title,
+    state: connected ? "connected" : chat.is_host_placeholder ? "hosting" : "offline",
+    trust: "verified",
+    fingerprint: chat.peer_fingerprint || "",
+    address: chat.peer_fingerprint ? chat.peer_fingerprint.slice(0, 16) + "…" : "",
+    placeholder: chat.is_host_placeholder,
+    kind: (chat.kind || "Dm").toLowerCase(),
+    transport: (chat.transport || "Direct").toLowerCase(),
+    relay: chat.transport === "Relay" || chat.transport === "Server",
+    members: 0, typing: false,
+    messages: (chat.messages || []).map((m) => {
+      const c = m.content || {};
+      if (c.type === "file") {
+        return { kind: "file", from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp) };
+      }
+      return { from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp) };
+    }),
+  };
+}

@@ -5,12 +5,13 @@ This document describes the current codebase structure and the major runtime res
 ## Workspace Layout
 
 The project is a Cargo **workspace** of three crates so the client app and the
-(forthcoming) Party server can share code (see `docs/05_platform_spec.md`):
+Party server can share code (see `docs/05_platform_spec.md`):
 
 ```text
-core/    messenger-core  — crypto, wire protocol, identity, transport, shared types
+core/    messenger-core  — crypto, wire protocol, identity, transport, shared types,
+                           and the Party application protocol (core::party)
 client/  encodeur_rsa_rust — the unified app (egui GUI + ratatui TUI) and its binary
-server/  messenger-server  — Party server (Phase 0 placeholder; built in Phase 1)
+server/  messenger-server  — the Party server (TCP listener, state, dispatcher, hub)
 ```
 
 `client` depends on `core` and re-exports it (`pub use messenger_core::*;`), so the
@@ -51,6 +52,8 @@ core/src/
     session.rs
   identity/
     mod.rs
+  party/
+    mod.rs          Party application protocol (shared by client + server)
   transfer/
     receiver.rs
 
@@ -61,12 +64,14 @@ client/src/
   colorgrid.rs    fingerprint color-grid rendering (egui Color32)
   app/
     chat_manager.rs
+    party_manager.rs  Party server client-side state and operations
     persistence.rs
   gui/
     app_ui.rs
     chat_view.rs
     dialogs.rs
     help_view.rs
+    party_view.rs   Party server window (join, channels, members, DMs)
     sidebar.rs
     styling.rs
     widgets.rs
@@ -79,7 +84,12 @@ client/src/
 client/tests/      integration tests (link against the client lib)
 
 server/src/
-  main.rs         Party server placeholder (Phase 1 fills this in)
+  main.rs         TCP accept loop + server bootstrap
+  state.rs        PartyState: members, channels, DM threads, history, persistence
+  dispatch.rs     request → response/broadcast routing
+  hub.rs          cross-connection broadcast fan-out
+  connection.rs   per-connection handshake + serve loop
+  identity.rs     persistent owner-only server identity
 ```
 
 ## Module Responsibilities
@@ -151,6 +161,22 @@ server/src/
 ### `core/src/transfer/receiver.rs`
 
 - receiving and finalizing inbound file data
+
+### `core/src/party/mod.rs`
+
+- the Party application protocol (requests/responses, envelopes, member/channel
+  types) shared by the client and server, framed over the v3 tunnel
+
+### `server/src/`
+
+- the Party server: TCP accept loop, `PartyState` (members/channels/DM
+  threads/history + JSON-snapshot persistence), request dispatcher, cross-connection
+  broadcast hub, per-connection serve loop, and a persistent owner-only identity
+
+### `client/src/app/party_manager.rs`
+
+- client-side Party state: connect/join, post, DMs, channel creation, history
+  fetch, and event polling for the GUI/TUI Party surfaces
 
 ### `client/src/gui/`
 

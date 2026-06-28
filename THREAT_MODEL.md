@@ -150,5 +150,5 @@ Limitation:
 ## Planning References
 
 - Current posture and disclosure: [SECURITY.md](SECURITY.md)
-- Future roadmap: [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)
+- Future roadmap: [docs/05_platform_spec.md](docs/05_platform_spec.md)
 - Audit history: [docs/AUDITS.md](docs/AUDITS.md)

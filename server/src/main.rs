@@ -7,7 +7,7 @@
 //! server stores history so offline members catch up on reconnect.
 //!
 //! Not yet wired (next step): SQLite/blob persistence of state and history. See
-//! `docs/06_phase1_party_server.md`.
+//! `docs/05_platform_spec.md`.
 
 mod connection;
 mod dispatch;

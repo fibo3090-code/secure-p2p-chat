@@ -54,4 +54,4 @@ Add new audit summaries here only after they have been checked against the curre
 
 - [SECURITY.md](../SECURITY.md)
 - [THREAT_MODEL.md](../THREAT_MODEL.md)
-- [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md)
+- [docs/05_platform_spec.md](05_platform_spec.md)

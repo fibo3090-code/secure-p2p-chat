@@ -62,19 +62,29 @@ struct Channel {
     messages: Vec<Envelope>,
 }
 
+/// A 1:1 direct-message thread, keyed by `messenger_core::party::dm_thread_id`.
+#[derive(Serialize, Deserialize)]
+struct DmThread {
+    id: Uuid,
+    messages: Vec<Envelope>,
+}
+
 /// Owned on-disk snapshot used when loading. Server name/password/tier come from
 /// configuration, not the snapshot.
 #[derive(Deserialize, Default)]
 struct Snapshot {
     members: Vec<Member>,
     channels: Vec<Channel>,
+    #[serde(default)]
+    dm_threads: Vec<DmThread>,
 }
 
-/// Borrowing view used when saving, to avoid cloning channel history.
+/// Borrowing view used when saving, to avoid cloning channel/DM history.
 #[derive(Serialize)]
 struct SnapshotRef<'a> {
     members: Vec<&'a Member>,
     channels: &'a [Channel],
+    dm_threads: Vec<&'a DmThread>,
 }
 
 /// The full server state.
@@ -84,6 +94,8 @@ pub struct PartyState {
     tier: TrustTier,
     members: HashMap<Uuid, Member>,
     channels: Vec<Channel>,
+    /// Direct-message threads, keyed by their deterministic thread id.
+    dm_threads: HashMap<Uuid, DmThread>,
     /// When set, mutations are persisted to this snapshot file.
     persist_path: Option<PathBuf>,
 }
@@ -103,6 +115,7 @@ impl PartyState {
             tier: TrustTier::Administered,
             members: HashMap::new(),
             channels: vec![general],
+            dm_threads: HashMap::new(),
             persist_path: None,
         }
     }
@@ -127,6 +140,7 @@ impl PartyState {
             if !snapshot.channels.is_empty() {
                 state.channels = snapshot.channels;
             }
+            state.dm_threads = snapshot.dm_threads.into_iter().map(|t| (t.id, t)).collect();
         }
 
         state.persist_path = Some(path);
@@ -143,6 +157,7 @@ impl PartyState {
         let snapshot = SnapshotRef {
             members: self.members.values().collect(),
             channels: &self.channels,
+            dm_threads: self.dm_threads.values().collect(),
         };
         match serde_json::to_string(&snapshot) {
             Ok(json) => {
@@ -241,6 +256,36 @@ impl PartyState {
             .collect()
     }
 
+    /// Create a new public channel with a unique, non-empty name. Returns the new
+    /// channel's info. Errors on empty or duplicate (case-insensitive) names.
+    pub fn create_channel(&mut self, name: &str) -> Result<ChannelInfo, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("channel name must not be empty".to_string());
+        }
+        if self
+            .channels
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            return Err("a channel with that name already exists".to_string());
+        }
+        let channel = Channel {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            kind: ChannelKind::Public,
+            messages: Vec::new(),
+        };
+        let info = ChannelInfo {
+            id: channel.id,
+            name: channel.name.clone(),
+            kind: channel.kind,
+        };
+        self.channels.push(channel);
+        self.persist();
+        Ok(info)
+    }
+
     fn channel_mut(&mut self, id: Uuid) -> Option<&mut Channel> {
         self.channels.iter_mut().find(|c| c.id == id)
     }
@@ -286,6 +331,53 @@ impl PartyState {
     pub fn history_since(&self, channel: Uuid, since_seq: u64) -> Vec<Envelope> {
         match self.channel(channel) {
             Some(c) => c
+                .messages
+                .iter()
+                .filter(|m| m.seq > since_seq)
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Send a direct message from `from` to `to`. Both must be members. The message
+    /// is stored durably in their (deterministic) 1:1 thread and the assigned
+    /// envelope is returned (its `channel` is the DM thread id) for delivery to both
+    /// participants. Errors if either party is not a member.
+    pub fn post_dm(&mut self, from: Uuid, to: Uuid, text: String) -> Result<Envelope, String> {
+        if !self.is_member(from) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if !self.is_member(to) {
+            return Err("recipient is not a member of this server".to_string());
+        }
+        let thread_id = messenger_core::party::dm_thread_id(from, to);
+        let tier = self.tier;
+        let thread = self
+            .dm_threads
+            .entry(thread_id)
+            .or_insert_with(|| DmThread {
+                id: thread_id,
+                messages: Vec::new(),
+            });
+        let seq = thread.messages.len() as u64 + 1;
+        let envelope = Envelope {
+            tier,
+            sender: from,
+            channel: thread_id,
+            seq,
+            timestamp: current_timestamp_millis(),
+            payload: MessagePayload::Text(text),
+        };
+        thread.messages.push(envelope.clone());
+        self.persist();
+        Ok(envelope)
+    }
+
+    /// Direct-message history for a thread strictly after `since_seq`.
+    pub fn dm_history(&self, thread_id: Uuid, since_seq: u64) -> Vec<Envelope> {
+        match self.dm_threads.get(&thread_id) {
+            Some(t) => t
                 .messages
                 .iter()
                 .filter(|m| m.seq > since_seq)
@@ -437,5 +529,62 @@ mod tests {
         let state = PartyState::load("Srv", None, dir.path()).unwrap();
         assert!(state.members().is_empty());
         assert_eq!(state.channels().len(), 1); // default `general`
+    }
+
+    #[test]
+    fn direct_messages_share_one_order_independent_thread() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let thread = messenger_core::party::dm_thread_id(alice, bob);
+
+        let m1 = state.post_dm(alice, bob, "hi bob".to_string()).unwrap();
+        assert_eq!(m1.channel, thread);
+        assert_eq!(m1.sender, alice);
+        assert_eq!(m1.seq, 1);
+        let m2 = state.post_dm(bob, alice, "hey alice".to_string()).unwrap();
+        assert_eq!(m2.channel, thread);
+        assert_eq!(m2.seq, 2);
+
+        assert_eq!(state.dm_history(thread, 0).len(), 2);
+        assert_eq!(state.dm_history(thread, 1).len(), 1);
+        assert!(state.dm_history(Uuid::new_v4(), 0).is_empty());
+    }
+
+    #[test]
+    fn create_channel_adds_unique_named_channels() {
+        let mut state = PartyState::new("Open", None);
+        assert_eq!(state.channels().len(), 1); // general
+        let info = state.create_channel("random").unwrap();
+        assert_eq!(info.name, "random");
+        assert_eq!(state.channels().len(), 2);
+        // Duplicate (case-insensitive) and empty names are rejected.
+        assert!(state.create_channel("Random").is_err());
+        assert!(state.create_channel("   ").is_err());
+        assert_eq!(state.channels().len(), 2);
+    }
+
+    #[test]
+    fn dm_rejects_non_members() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let stranger = Uuid::new_v4();
+        assert!(state.post_dm(alice, stranger, "x".to_string()).is_err());
+        assert!(state.post_dm(stranger, alice, "x".to_string()).is_err());
+    }
+
+    #[test]
+    fn dm_history_persists_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread;
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            let alice = s.join("alice", None, None).unwrap();
+            let bob = s.join("bob", None, None).unwrap();
+            thread = messenger_core::party::dm_thread_id(alice, bob);
+            s.post_dm(alice, bob, "secret".to_string()).unwrap();
+        }
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(s.dm_history(thread, 0).len(), 1);
     }
 }

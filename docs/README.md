@@ -13,29 +13,27 @@ This is the canonical index for project documentation.
 
 - Architecture: [03_architecture.md](03_architecture.md)
 - Protocol: [04_protocol.md](04_protocol.md)
-- Platform spec: [05_platform_spec.md](05_platform_spec.md)
-- Phase 1 plan (Party server): [06_phase1_party_server.md](06_phase1_party_server.md)
+- Platform plan & roadmap: [05_platform_spec.md](05_platform_spec.md)
 - Security posture: [../SECURITY.md](../SECURITY.md)
 - Threat model: [../THREAT_MODEL.md](../THREAT_MODEL.md)
 
 ## Planning and History
 
-- Roadmap and backlog: [../DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md)
-- Long-range platform direction: [05_platform_spec.md](05_platform_spec.md)
+- Platform plan, roadmap & backlog: [05_platform_spec.md](05_platform_spec.md)
 - Release history: [../CHANGELOG.md](../CHANGELOG.md)
 - Audit history: [AUDITS.md](AUDITS.md)
 
-`DEVELOPMENT_PLAN.md` tracks the near-term backlog; `05_platform_spec.md` owns the
-long-range platform direction. Keep the two from drifting.
+`05_platform_spec.md` is the single canonical forward-looking document — vision,
+architecture, trust tiers, the UI rewrite, the roadmap, and the backlog. Docs 03
+and 04 describe only what ships today.
 
 ## What Each Document Owns
 
 - `TUTORIAL.md`: the quickest path from install to a verified chat session
 - `USER_GUIDE.md`: day-to-day usage, commands, storage, troubleshooting
-- `03_architecture.md`: code layout and runtime responsibility boundaries
+- `03_architecture.md`: code layout and runtime responsibility boundaries (today)
 - `04_protocol.md`: shipped wire behavior and compatibility notes
-- `05_platform_spec.md`: the forward-looking Hybrid Messenger platform vision, architecture, trust tiers, and phased roadmap
-- `06_phase1_party_server.md`: the Phase 1 Party server design, build slices, and verification plan
+- `05_platform_spec.md`: the single canonical plan — vision, architecture, trust tiers, Party server, the Tauri/SolidJS UI rewrite, the phased roadmap, and the backlog
 - `SECURITY.md`: current security posture and disclosure guidance
 - `THREAT_MODEL.md`: assumptions, assets, attack surfaces, and limits
 

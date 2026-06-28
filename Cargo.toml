@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["core", "client", "server"]
+members = ["core", "client", "server", "desktop/src-tauri"]
 # Bare `cargo build`/`test`/`run` target the client app (the default product);
 # use `--workspace` (CI) or `-p messenger-server` to include the server.
 default-members = ["client"]
 
 [workspace.package]
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]

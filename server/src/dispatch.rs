@@ -8,18 +8,23 @@
 //! a request off the v3 tunnel, calls [`handle_request`], encrypts the replies, and
 //! separately broadcasts newly posted messages to other online members.
 
-use messenger_core::party::{Envelope, PartyRequest, PartyResponse};
+use messenger_core::party::{PartyRequest, PartyResponse};
 use uuid::Uuid;
 
 use crate::state::PartyState;
 
-/// The outcome of handling one request: `replies` go back to the requesting
-/// connection; `broadcast` envelopes are pushed to all *other* connected members
-/// (the runtime fans these out via the connection hub).
+/// The outcome of handling one request:
+/// - `replies` go back to the requesting connection;
+/// - `broadcast` responses are pushed to all *other* connected members (a posted
+///   channel message, or a refreshed channel list);
+/// - `directed` responses are delivered to a specific member's connections (DMs).
+///
+/// The runtime fans `broadcast`/`directed` out via the connection hub.
 #[derive(Debug, Default)]
 pub struct Dispatch {
     pub replies: Vec<PartyResponse>,
-    pub broadcast: Vec<Envelope>,
+    pub broadcast: Vec<PartyResponse>,
+    pub directed: Vec<(Uuid, PartyResponse)>,
 }
 
 impl Dispatch {
@@ -27,6 +32,7 @@ impl Dispatch {
         Self {
             replies: vec![resp],
             broadcast: Vec::new(),
+            directed: Vec::new(),
         }
     }
 }
@@ -100,13 +106,14 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 }
                 PartyRequest::PostMessage { channel, text } => {
                     match state.post_message(member, channel, text) {
-                        // Ack the poster, and broadcast the stored envelope to others.
+                        // Ack the poster, and broadcast the stored message to others.
                         Ok(env) => Dispatch {
                             replies: vec![PartyResponse::MessagePosted {
                                 channel: env.channel,
                                 seq: env.seq,
                             }],
-                            broadcast: vec![env],
+                            broadcast: vec![PartyResponse::Message(env)],
+                            directed: Vec::new(),
                         },
                         Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                     }
@@ -114,6 +121,31 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
                     PartyResponse::History(state.history_since(channel, since_seq)),
                 ),
+                PartyRequest::CreateChannel { name } => match state.create_channel(&name) {
+                    // Refresh everyone's channel list (reply to creator + broadcast).
+                    Ok(_) => Dispatch {
+                        replies: vec![PartyResponse::Channels(state.channels())],
+                        broadcast: vec![PartyResponse::Channels(state.channels())],
+                        directed: Vec::new(),
+                    },
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::SendDm { to, text } => match state.post_dm(member, to, text) {
+                    // Ack the sender (who appends locally); deliver to the recipient.
+                    Ok(env) => Dispatch {
+                        replies: vec![PartyResponse::MessagePosted {
+                            channel: env.channel,
+                            seq: env.seq,
+                        }],
+                        broadcast: Vec::new(),
+                        directed: vec![(to, PartyResponse::Message(env))],
+                    },
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::FetchDmHistory { with, since_seq } => {
+                    let thread = messenger_core::party::dm_thread_id(member, with);
+                    Dispatch::reply(PartyResponse::History(state.dm_history(thread, since_seq)))
+                }
             }
         }
     }
@@ -224,8 +256,11 @@ mod tests {
             other => panic!("expected MessagePosted, got {other:?}"),
         }
         // The post is also queued for broadcast to other members.
-        assert_eq!(posted.broadcast.len(), 1);
-        assert_eq!(posted.broadcast[0].seq, 1);
+        assert!(
+            matches!(&posted.broadcast[..], [PartyResponse::Message(env)] if env.seq == 1),
+            "expected one broadcast Message with seq 1, got {:?}",
+            posted.broadcast
+        );
 
         let history = handle_request(
             &mut state,
@@ -259,5 +294,37 @@ mod tests {
 
         let channels = handle_request(&mut state, &mut conn, PartyRequest::ListChannels).replies;
         assert!(matches!(&channels[..], [PartyResponse::Channels(c)] if c.len() == 1));
+    }
+
+    #[test]
+    fn create_channel_replies_and_broadcasts_the_new_list() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        join(&mut state, &mut conn, "alice", None);
+
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::CreateChannel {
+                name: "random".to_string(),
+            },
+        );
+        // Creator gets the refreshed list, and others get it broadcast.
+        assert!(matches!(&out.replies[..], [PartyResponse::Channels(c)] if c.len() == 2));
+        assert!(matches!(&out.broadcast[..], [PartyResponse::Channels(c)] if c.len() == 2));
+    }
+
+    #[test]
+    fn create_channel_before_join_requires_join() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::CreateChannel {
+                name: "x".to_string(),
+            },
+        );
+        assert!(matches!(&out.replies[..], [PartyResponse::Error(m)] if m == "join required"));
     }
 }

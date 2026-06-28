@@ -1,0 +1,7 @@
+/* Fonts the design system references (degrade to system-ui offline). */
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap");
+/* Ported P2PEM design system (tokens, theming, components). */
+@import "./app-system.css";
+/* Extra themes (midnight / forest / rose) + local polish. */
+@import "./themes.css";
+@import "./polish.css";

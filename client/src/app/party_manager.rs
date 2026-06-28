@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use messenger_core::party::{
-    ChannelInfo, Envelope, MemberInfo, MessagePayload, PartyRequest, PartyResponse, TrustTier,
+    dm_thread_id, ChannelInfo, Envelope, MemberInfo, MessagePayload, PartyRequest, PartyResponse,
+    TrustTier,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
 use rsa::RsaPrivateKey;
@@ -179,6 +180,60 @@ impl PartyManager {
             payload: MessagePayload::Text(text.clone()),
         });
         conn.send(PartyRequest::PostMessage { channel, text })
+    }
+
+    /// Send a direct message to another member. Stored locally under the (shared)
+    /// DM thread id immediately; the server delivers it to the recipient.
+    pub fn send_dm(&mut self, server_id: Uuid, to: Uuid, text: String) -> Result<()> {
+        let conn = self
+            .servers
+            .get_mut(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))?;
+        let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
+        let thread = dm_thread_id(me, to);
+        conn.messages.entry(thread).or_default().push(Envelope {
+            tier: TrustTier::Administered,
+            sender: me,
+            channel: thread,
+            seq: 0,
+            timestamp: current_timestamp_millis(),
+            payload: MessagePayload::Text(text.clone()),
+        });
+        conn.send(PartyRequest::SendDm { to, text })
+    }
+
+    /// Request DM history with another member (offline catch-up).
+    pub fn fetch_dm_history(&self, server_id: Uuid, with: Uuid) -> Result<()> {
+        let conn = self
+            .servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))?;
+        conn.send(PartyRequest::FetchDmHistory { with, since_seq: 0 })
+    }
+
+    /// Messages in the DM thread with `peer` on a given server (empty if none).
+    pub fn dm_messages(&self, server_id: Uuid, peer: Uuid) -> Vec<Envelope> {
+        self.servers
+            .get(&server_id)
+            .and_then(|conn| {
+                conn.member_id.map(|me| {
+                    conn.messages
+                        .get(&dm_thread_id(me, peer))
+                        .cloned()
+                        .unwrap_or_default()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Create a new channel on the server. The server replies with the refreshed
+    /// channel list, applied on the next poll.
+    pub fn create_channel(&self, server_id: Uuid, name: String) -> Result<()> {
+        let conn = self
+            .servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))?;
+        conn.send(PartyRequest::CreateChannel { name })
     }
 
     /// Request a channel's full history (offline catch-up).
@@ -398,6 +453,38 @@ mod tests {
     fn post_before_join_fails() {
         let (mut mgr, id, _tx, _out) = manager_with_server();
         assert!(mgr.post(id, Uuid::new_v4(), "x".to_string()).is_err());
+    }
+
+    #[test]
+    fn create_channel_emits_request() {
+        let (mgr, id, _tx, mut out) = manager_with_server();
+        mgr.create_channel(id, "random".to_string()).unwrap();
+        match out.try_recv().unwrap() {
+            PartyRequest::CreateChannel { name } => assert_eq!(name, "random"),
+            other => panic!("expected CreateChannel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_dm_appends_locally_and_emits_request() {
+        let (mut mgr, id, _tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let peer = Uuid::new_v4();
+
+        mgr.send_dm(id, peer, "hi".to_string()).unwrap();
+
+        let dm = mgr.dm_messages(id, peer);
+        assert_eq!(dm.len(), 1);
+        assert_eq!(dm[0].payload, MessagePayload::Text("hi".to_string()));
+
+        match out.try_recv().unwrap() {
+            PartyRequest::SendDm { to, text } => {
+                assert_eq!(to, peer);
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected SendDm, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,0 +1,36 @@
+/* Extra themes layered on top of the design system's dark/light blocks.
+   Each overrides the surface ramp + accent; --mine/--shadow/--scrim reuse the
+   same formulas as the base dark theme so bubbles/scrims stay consistent. */
+
+:root[data-theme="midnight"] {
+  --bg: #0b0a18; --s1: #12102a; --s2: #181634; --s3: #221f47; --s4: #2c2858;
+  --border: rgba(150,140,210,.12); --border-2: rgba(150,140,210,.20);
+  --text: #ece9fb; --dim: #9a93c8; --faint: #685f97;
+  --accent: #8b7bff; --accent-ink: #0a0820;
+  --mine: color-mix(in oklab, var(--accent) 18%, var(--s2));
+  --mine-bd: color-mix(in oklab, var(--accent) 34%, transparent);
+  --shadow: 0 22px 48px -12px rgba(0,0,0,.65);
+  --scrim: rgba(6,5,16,.64);
+}
+
+:root[data-theme="forest"] {
+  --bg: #0a140f; --s1: #0f1c16; --s2: #13241b; --s3: #1c3327; --s4: #264333;
+  --border: rgba(120,190,150,.12); --border-2: rgba(120,190,150,.20);
+  --text: #e7f2ea; --dim: #8fb3a1; --faint: #5b7d6a;
+  --accent: #34d399; --accent-ink: #04140d;
+  --mine: color-mix(in oklab, var(--accent) 16%, var(--s2));
+  --mine-bd: color-mix(in oklab, var(--accent) 30%, transparent);
+  --shadow: 0 22px 48px -12px rgba(0,0,0,.6);
+  --scrim: rgba(5,12,9,.62);
+}
+
+:root[data-theme="rose"] {
+  --bg: #150a0f; --s1: #1e1016; --s2: #27151e; --s3: #3a1f2c; --s4: #4d2a3a;
+  --border: rgba(220,150,175,.12); --border-2: rgba(220,150,175,.20);
+  --text: #f6e8ef; --dim: #c89aad; --faint: #8e6477;
+  --accent: #fb6f92; --accent-ink: #1c0710;
+  --mine: color-mix(in oklab, var(--accent) 16%, var(--s2));
+  --mine-bd: color-mix(in oklab, var(--accent) 30%, transparent);
+  --shadow: 0 22px 48px -12px rgba(0,0,0,.6);
+  --scrim: rgba(14,6,9,.62);
+}

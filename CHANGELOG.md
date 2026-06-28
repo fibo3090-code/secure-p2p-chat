@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-06-28
+
+### Added
+
+- **Tauri 2 desktop app (new `p2pem-desktop` crate).** A native desktop shell wrapping a React/Vite web UI (`desktop/src/`), driving the same `ChatManager` core as the egui/TUI front-ends through a `#[tauri::command]` bridge (`desktop/src-tauri/src/lib.rs`). Includes onboarding, conversations with message view, contacts, invite import/export, fingerprint verification with the safety-color grid, relays pane, settings, and a toast system. Run with `cd desktop && npx tauri dev`.
+- **Conversation model.** Every `Chat` now carries `kind: ChatKind` (`Dm` / `Group` / `Channel`) and `transport: Transport` (`Direct` / `Relay` / `Server`), both `#[serde(default)]` for back-compat with existing history files. Front-ends use these for conversation badges.
+- **Party server-routed direct messages (DMs).** Members can exchange DMs through a Party server in addition to channels, with the hub routing and persisting them; surfaced in the GUI Party window and the TUI.
+- **Party channel creation and management** from the client.
+
+### Changed
+
+- **Workspace now has four members** — `core`, `client`, `server`, and `desktop/src-tauri`. Bare `cargo` commands still target the client.
+- Consolidated the planning/spec docs into a single canonical platform spec and refreshed the architecture, protocol, README, and contributor guides to match the Phase 1 Party server and the new desktop UI direction.
+
 ## [1.9.0] - 2026-06-01
 
 ### Added
@@ -456,6 +470,7 @@ This release transformed the application from a functional prototype into a poli
 - Message history persistence.
 
 [Unreleased]: #
+[1.10.0]: #
 [1.9.0]: #
 [1.7.3]: #
 [1.7.2]: #
