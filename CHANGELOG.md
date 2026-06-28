@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Party server durability moved to embedded SQLite.** The server now mirrors its
+  state (members, channels, message + DM history) to a `party.db` SQLite database
+  under the operator's data dir, writing each change incrementally instead of
+  rewriting a whole JSON snapshot on every message. An existing `party_state.json`
+  snapshot is imported once on first start and then superseded. No configuration
+  change for operators; the runtime model and behavior are unchanged.
+
+### Fixed
+
+- CI now builds the whole workspace: installs the WebKitGTK system dependencies the
+  Tauri desktop crate needs, and applies `rustfmt` to that crate (both were missing
+  after it was merged into the workspace).
+
 ## [1.10.0] - 2026-06-28
 
 ### Added
