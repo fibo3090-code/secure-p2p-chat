@@ -54,6 +54,9 @@ egui_commonmark = { version = "0.18", features = ["default"] }
 ratatui = { version = "0.30.0", features = ["crossterm_0_29", "underline-color", "all-widgets", "macros", "layout-cache"] }
 ratatui-crossterm = { version = "0.1.0", features = ["crossterm_0_29"] }
 
+# Embedded SQLite (bundled: compiles SQLite from source, no system dependency)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Utilities
 anyhow = "1"
 thiserror = "1"
