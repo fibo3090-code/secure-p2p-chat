@@ -76,7 +76,7 @@ open = "5"
 notify-rust = "4"
 
 # Emoji support
-emojis = "0.6"
+emojis = "0.9"
 
 # QR code generation and scanning
 qrcode = "0.14.0"
