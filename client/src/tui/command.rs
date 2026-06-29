@@ -218,8 +218,8 @@ pub fn command_help(name: &str) -> Option<(&'static str, &'static str, &'static 
 
 pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" | "yes" | "1" | "enable" | "enabled" => Ok(true),
-        "off" | "false" | "no" | "0" | "disable" | "disabled" => Ok(false),
+        "on" | "true" | "1" | "enable" | "enabled" => Ok(true),
+        "off" | "false" | "0" | "disable" | "disabled" => Ok(false),
         other => Err(format!("Expected on/off, got '{}'", other)),
     }
 }
@@ -438,8 +438,8 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
                 .next()
                 .ok_or_else(|| "Usage: :verify <accept|reject>".to_string())?;
             match arg.to_ascii_lowercase().as_str() {
-                "accept" | "yes" | "y" | "ok" => Ok(TuiCommand::Verify(true)),
-                "reject" | "no" | "n" | "deny" => Ok(TuiCommand::Verify(false)),
+                "accept" | "y" | "ok" => Ok(TuiCommand::Verify(true)),
+                "reject" | "n" | "deny" => Ok(TuiCommand::Verify(false)),
                 other => Err(format!("Expected accept or reject, got '{}'", other)),
             }
         }
@@ -520,9 +520,10 @@ mod tests {
 
     #[test]
     fn parses_connection_password_and_lock() {
+        let pw = format!("pw-{}", uuid::Uuid::new_v4());
         assert_eq!(
-            parse_command(":connection-password hunter2").unwrap(),
-            TuiCommand::ConnectionPassword(Some("hunter2".into()))
+            parse_command(&format!(":connection-password {pw}")).unwrap(),
+            TuiCommand::ConnectionPassword(Some(pw))
         );
         assert_eq!(
             parse_command(":connection-password").unwrap(),
@@ -535,12 +536,13 @@ mod tests {
 
     #[test]
     fn parses_party_commands() {
+        let party_pw = format!("pw-{}", uuid::Uuid::new_v4());
         assert_eq!(
-            parse_command(":party-connect 10.0.0.5:9000 alice s3cret").unwrap(),
+            parse_command(&format!(":party-connect 10.0.0.5:9000 alice {party_pw}")).unwrap(),
             TuiCommand::PartyConnect {
                 address: "10.0.0.5:9000".into(),
                 username: "alice".into(),
-                password: Some("s3cret".into()),
+                password: Some(party_pw),
             }
         );
         assert_eq!(

@@ -12,10 +12,10 @@ name = "p2pem_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.5.4", features = [] }
+tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2.10.0", features = [] }
+tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 log = "0.4"
 

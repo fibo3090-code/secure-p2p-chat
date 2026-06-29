@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /desktop
+    schedule:
+      interval: weekly
+
+# glib <0.20 is pinned transitively by Tauri 2.x (gtk 0.18). Revisit when Tauri
+# upgrades its GTK stack; see https://github.com/advisories/GHSA-wrw7-89jp-8q8g
