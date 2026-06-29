@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-06-29
+
+### Fixed
+
+- **Release pipeline produces binaries again.** The `v1.11.0` tag shipped with a
+  stale `Cargo.lock`, so every platform job in the Release workflow failed at
+  `cargo build --locked` and no installers/archives were attached to the release.
+  The lockfile is now kept in sync with the workspace version, restoring the
+  Windows installer, macOS DMGs, and Linux tarball as release assets.
+
+### Dependencies
+
+- Rolled up the outstanding Dependabot updates: the grouped `rust-minor` updates,
+  `rfd` 0.14 → 0.17, `rusqlite` 0.32 → 0.40, `mdns-sd` 0.11 → 0.20, `emojis`
+  0.6 → 0.9, and the desktop frontend's `react`/`react-dom` 18 → 19, `vite`
+  6 → 8, `@vitejs/plugin-react` 4 → 6, and `lucide-react`.
+
 ## [1.11.0] - 2026-06-29
 
 ### Added
@@ -506,6 +523,7 @@ This release transformed the application from a functional prototype into a poli
 - Message history persistence.
 
 [Unreleased]: #
+[1.11.1]: #
 [1.11.0]: #
 [1.10.1]: #
 [1.10.0]: #
