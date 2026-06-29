@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-06-29
+
 ### Added
 
 - **File sharing in Party servers (Phase 2, slice 1).** Members can share files
@@ -504,6 +506,7 @@ This release transformed the application from a functional prototype into a poli
 - Message history persistence.
 
 [Unreleased]: #
+[1.11.0]: #
 [1.10.1]: #
 [1.10.0]: #
 [1.9.0]: #

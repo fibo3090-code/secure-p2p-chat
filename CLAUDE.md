@@ -13,6 +13,8 @@ Cargo **workspace** with four members (root `src/` and `tests/` are vestigial â€
 | `messenger-server` | `server/` | Party/Community server (hub, dispatch, connection, state) |
 | `p2pem-desktop` | `desktop/src-tauri/` | **New** Tauri 2 shell wrapping the React/Vite web UI in `desktop/src/` |
 
+**Agent CLI** lives in a **sibling repo** (`../secure-p2p-chat-agent`), not in this workspace â€” see that repo's README.
+
 `default-members = ["client"]`, so bare `cargo` commands act on the client. Add `--workspace` (CI) or `-p <crate>` to target others.
 
 ## Development Commands
