@@ -186,6 +186,7 @@ list and key reference. Common commands:
 :invite                   :import <invite-link>
 :send <path>              :transfers
 :identity                 :settings        :set <key> <value>
+:party-connect <host[:port]> <username>    :party-create-channel <name>
 :disconnect   :rename <title>   :diagnostics   :help   :quit
 ```
 

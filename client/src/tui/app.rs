@@ -10,7 +10,9 @@
 use crate::app::chat_manager::ChatManager;
 use crate::app::party_manager::PartyManager;
 use crate::identity::Identity;
-use crate::tui::command::{parse_command, parse_setting_bool, settings_keys, COMMANDS};
+use crate::tui::command::{
+    command_help, parse_command, parse_setting_bool, settings_keys, COMMANDS,
+};
 use crate::tui::input::EditableField;
 use crate::tui::overlays::{PasswordMode, TuiOverlay};
 use crate::types::{Config, Theme, ToastLevel};
@@ -84,6 +86,8 @@ pub struct TuiApp {
     pub command_suggestions: Vec<usize>,
     /// Highlighted entry within `command_suggestions`.
     pub suggestion_index: usize,
+    /// Optional command name to show in the help overlay.
+    pub help_topic: Option<String>,
 }
 
 impl TuiApp {
@@ -149,6 +153,7 @@ impl TuiApp {
             last_typing_activity: None,
             command_suggestions: Vec::new(),
             suggestion_index: 0,
+            help_topic: None,
         };
         app.sync_chat_ids();
         app.refresh_status_line();
@@ -538,10 +543,7 @@ impl TuiApp {
         match key.code {
             KeyCode::Char(':') => self.enter_command_mode(),
             KeyCode::Char('q') => self.overlay = TuiOverlay::ConfirmQuit,
-            KeyCode::Char('?') => {
-                self.overlay = TuiOverlay::Help;
-                self.overlay_scroll = 0;
-            }
+            KeyCode::Char('?') => self.show_help(None),
             KeyCode::Esc => self.focus = TuiFocus::ChatList,
             KeyCode::Down => match self.focus {
                 TuiFocus::ChatList => self.next_chat(),
@@ -1184,10 +1186,7 @@ impl TuiApp {
 
             TuiCommand::Diagnostics => self.export_diagnostics_bundle(),
             TuiCommand::Logs => self.copy_logs(),
-            TuiCommand::Help(_) => {
-                self.overlay = TuiOverlay::Help;
-                self.overlay_scroll = 0;
-            }
+            TuiCommand::Help(topic) => self.show_help(topic),
             TuiCommand::Quit => self.overlay = TuiOverlay::ConfirmQuit,
             TuiCommand::ForceQuit => self.should_quit = true,
         }
@@ -1211,6 +1210,22 @@ impl TuiApp {
             }
             None => self.toast(ToastLevel::Warning, "No chat selected".to_string()),
         }
+    }
+
+    fn show_help(&mut self, topic: Option<String>) {
+        let topic = topic.map(|t| t.trim().trim_start_matches(':').to_ascii_lowercase());
+        if let Some(ref name) = topic {
+            if command_help(name).is_none() {
+                self.toast(
+                    ToastLevel::Error,
+                    format!("No help for '{}'. Try :help", name),
+                );
+                return;
+            }
+        }
+        self.help_topic = topic;
+        self.overlay = TuiOverlay::Help;
+        self.overlay_scroll = 0;
     }
 
     // ---------------------------------------------------------------- fingerprint

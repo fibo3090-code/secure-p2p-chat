@@ -87,16 +87,21 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
         }
     }
 
-    if let (Some(relay), Some(token)) = (
-        launch.relay_connect.as_deref(),
-        launch.relay_token.as_deref(),
-    ) {
-        match TuiApp::parse_command(&format!(":connect-relay {} {}", relay, token)) {
-            Ok(cmd @ TuiCommand::ConnectRelay { .. }) => app.execute_command(cmd).await,
-            Ok(_) => {}
-            Err(e) => app.chat_manager.add_toast(
+    if let Some(relay) = launch.relay_connect.as_deref() {
+        match launch.relay_token.as_deref() {
+            Some(token) => {
+                match TuiApp::parse_command(&format!(":connect-relay {} {}", relay, token)) {
+                    Ok(cmd @ TuiCommand::ConnectRelay { .. }) => app.execute_command(cmd).await,
+                    Ok(_) => {}
+                    Err(e) => app.chat_manager.add_toast(
+                        crate::types::ToastLevel::Error,
+                        format!("Invalid relay connect launch: {}", e),
+                    ),
+                }
+            }
+            None => app.chat_manager.add_toast(
                 crate::types::ToastLevel::Error,
-                format!("Invalid relay connect launch: {}", e),
+                "--connect-relay requires --relay-token <token>".to_string(),
             ),
         }
     }

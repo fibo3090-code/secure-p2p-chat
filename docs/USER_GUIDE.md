@@ -289,6 +289,14 @@ Messaging & files
   :delete                                   delete the selected chat
   :clear-history                            erase all chats and contacts
 
+Party servers
+  :party-connect <host[:port]> <username> [password]
+                                             join a Party server
+  :party-post <message>                     post to the current Party channel
+  :party-dm <username|#> <message>          direct-message a Party member
+  :party-create-channel <name>              create a Party channel
+  :party-status                             show joined Party servers
+
 Identity & security
   :identity                                 show your fingerprint + safety grid
   :verify <accept|reject>                   answer a pending fingerprint check

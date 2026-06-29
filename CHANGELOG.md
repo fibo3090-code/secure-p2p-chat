@@ -13,6 +13,14 @@ All notable changes to this project will be documented in this file.
   and can be fetched by hash. Larger-file chunking and the Drive UI are still to
   come.
 
+### Changed
+
+- **TUI command polish.** `:help <command>` now opens focused command help, the
+  Party channel command is canonicalized as `:party-create-channel` with the old
+  `:party-channel` spelling kept as an alias, bare IPv6 connect targets no longer
+  get misparsed as `host:port`, and `--tui --connect-relay` now reports a missing
+  `--relay-token` instead of silently doing nothing.
+
 ## [1.10.1] - 2026-06-28
 
 ### Changed

@@ -9,6 +9,10 @@ fn parse_commands_cover_core_paths() {
         TuiApp::parse_command(":help").unwrap(),
         TuiCommand::Help(None)
     );
+    assert_eq!(
+        TuiApp::parse_command(":help connect").unwrap(),
+        TuiCommand::Help(Some("connect".to_string()))
+    );
     assert_eq!(TuiApp::parse_command(":quit").unwrap(), TuiCommand::Quit);
     assert_eq!(
         TuiApp::parse_command(":host 9090").unwrap(),
@@ -19,6 +23,25 @@ fn parse_commands_cover_core_paths() {
         TuiCommand::Connect {
             host: "127.0.0.1".to_string(),
             port: 9001,
+        }
+    );
+}
+
+#[test]
+fn parse_commands_cover_party_channel_aliases_and_ipv6() {
+    assert_eq!(
+        TuiApp::parse_command(":party-create-channel ops").unwrap(),
+        TuiCommand::PartyCreateChannel("ops".to_string())
+    );
+    assert_eq!(
+        TuiApp::parse_command(":party-channel ops").unwrap(),
+        TuiCommand::PartyCreateChannel("ops".to_string())
+    );
+    assert_eq!(
+        TuiApp::parse_command(":connect ::1").unwrap(),
+        TuiCommand::Connect {
+            host: "::1".to_string(),
+            port: encodeur_rsa_rust::PORT_DEFAULT,
         }
     );
 }

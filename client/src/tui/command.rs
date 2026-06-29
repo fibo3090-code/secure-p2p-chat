@@ -169,8 +169,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Direct-message a member on the current Party server",
     ),
     (
-        "party-channel",
-        ":party-channel <name>",
+        "party-create-channel",
+        ":party-create-channel <name>",
         "Create a channel on the current Party server",
     ),
     ("party-status", ":party-status", "Show joined Party servers"),
@@ -193,6 +193,29 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("quit", ":quit", "Save and exit (alias :q)"),
 ];
 
+/// Non-canonical command names accepted by the parser.
+/// Tuple: (alias, canonical command name).
+pub const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("party-channel", "party-create-channel"),
+    ("diag", "diagnostics"),
+    ("?", "help"),
+    ("q", "quit"),
+    ("quit!", "quit"),
+    ("q!", "quit"),
+];
+
+pub fn command_help(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let wanted = name.trim().trim_start_matches(':').to_ascii_lowercase();
+    let canonical = COMMAND_ALIASES
+        .iter()
+        .find_map(|(alias, target)| (*alias == wanted).then_some(*target))
+        .unwrap_or(wanted.as_str());
+    COMMANDS
+        .iter()
+        .copied()
+        .find(|(name, _, _)| *name == canonical)
+}
+
 pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" | "1" | "enable" | "enabled" => Ok(true),
@@ -203,8 +226,20 @@ pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
 
 /// Split a `host[:port]` token, defaulting the port when omitted.
 fn split_host_port(target: &str) -> std::result::Result<(String, u16), String> {
+    if target.starts_with('[') {
+        if let Some((host, port_part)) = target.rsplit_once("]:") {
+            let port = port_part
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port in '{}'", target))?;
+            return Ok((format!("{}]", host), port));
+        }
+    }
+
+    if target.matches(':').count() > 1 {
+        return Ok((target.to_string(), crate::PORT_DEFAULT));
+    }
+
     if let Some((h, p)) = target.rsplit_once(':') {
-        // Guard against bare IPv6 without brackets being mis-split.
         let port = p
             .parse::<u16>()
             .map_err(|_| format!("Invalid port in '{}'", target))?;
@@ -380,9 +415,9 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
                 text,
             })
         }
-        "party-channel" => {
+        "party-create-channel" | "party-channel" => {
             if rest.is_empty() {
-                return Err("Usage: :party-channel <name>".to_string());
+                return Err("Usage: :party-create-channel <name>".to_string());
             }
             Ok(TuiCommand::PartyCreateChannel(rest))
         }
@@ -529,10 +564,14 @@ mod tests {
         );
         assert!(parse_command(":party-dm alice").is_err());
         assert_eq!(
+            parse_command(":party-create-channel random").unwrap(),
+            TuiCommand::PartyCreateChannel("random".into())
+        );
+        assert_eq!(
             parse_command(":party-channel random").unwrap(),
             TuiCommand::PartyCreateChannel("random".into())
         );
-        assert!(parse_command(":party-channel").is_err());
+        assert!(parse_command(":party-create-channel").is_err());
         assert_eq!(
             parse_command(":party-status").unwrap(),
             TuiCommand::PartyStatus
@@ -603,6 +642,38 @@ mod tests {
     fn parses_quit_aliases() {
         assert_eq!(parse_command(":q").unwrap(), TuiCommand::Quit);
         assert_eq!(parse_command(":quit!").unwrap(), TuiCommand::ForceQuit);
+    }
+
+    #[test]
+    fn parses_help_topics_and_command_aliases() {
+        assert_eq!(
+            parse_command(":help connect").unwrap(),
+            TuiCommand::Help(Some("connect".into()))
+        );
+        assert_eq!(
+            command_help("party-channel").unwrap().0,
+            "party-create-channel"
+        );
+        assert_eq!(command_help(":q").unwrap().0, "quit");
+        assert!(command_help("missing").is_none());
+    }
+
+    #[test]
+    fn parses_ipv6_targets_without_losing_host_bits() {
+        assert_eq!(
+            parse_command(":connect ::1").unwrap(),
+            TuiCommand::Connect {
+                host: "::1".into(),
+                port: crate::PORT_DEFAULT,
+            }
+        );
+        assert_eq!(
+            parse_command(":connect [::1]:9000").unwrap(),
+            TuiCommand::Connect {
+                host: "[::1]".into(),
+                port: 9000,
+            }
+        );
     }
 
     #[test]

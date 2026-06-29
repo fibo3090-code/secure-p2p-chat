@@ -5,7 +5,7 @@
 //! equivalent `:`-command so the app stays fully keyboard/command driven.
 
 use crate::tui::app::TuiApp;
-use crate::tui::command::{settings_keys, COMMANDS};
+use crate::tui::command::{command_help, settings_keys, COMMANDS};
 use crate::types::{ToastLevel, TransferStatus};
 use ratatui::{prelude::*, widgets::*};
 use uuid::Uuid;
@@ -121,62 +121,87 @@ fn clear_and_block(f: &mut Frame, area: Rect, title: &str) -> Rect {
 
 fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
     let area = centered_rect(80, 80, full);
-    let inner = clear_and_block(f, area, "Help — commands & keys");
+    let title = if app.help_topic.is_some() {
+        "Help — command"
+    } else {
+        "Help — commands & keys"
+    };
+    let inner = clear_and_block(f, area, title);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Keys",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for (k, v) in [
-        ("Tab", "cycle focus (chats / messages / input)"),
-        (":", "enter command mode"),
-        ("Enter", "send message (input) / submit command"),
-        ("Ctrl+J", "newline in the message input"),
-        ("↑/↓", "select chat / scroll messages / command history"),
-        ("PgUp/PgDn", "scroll messages"),
-        ("Ctrl+L", "copy logs to clipboard"),
-        ("y / n", "accept / reject in confirm & verify overlays"),
-        ("Esc", "close overlay / leave command mode"),
-    ] {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:<10}", k), Style::default().fg(Color::Cyan)),
-            Span::raw(v),
-        ]));
+    if let Some(topic) = app.help_topic.as_deref() {
+        if let Some((name, usage, desc)) = command_help(topic) {
+            lines.push(Line::from(Span::styled(
+                usage,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(desc));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Command name: {}", name)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Use :help for the full command list · Esc to close",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Keys",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (k, v) in [
+            ("Tab", "cycle focus (chats / messages / input)"),
+            (":", "enter command mode"),
+            ("Enter", "send message (input) / submit command"),
+            ("Ctrl+J", "newline in the message input"),
+            ("↑/↓", "select chat / scroll messages / command history"),
+            ("PgUp/PgDn", "scroll messages"),
+            ("Ctrl+L", "copy logs to clipboard"),
+            ("y / n", "accept / reject in confirm & verify overlays"),
+            ("Esc", "close overlay / leave command mode"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<10}", k), Style::default().fg(Color::Cyan)),
+                Span::raw(v),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Chat markers",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(
+            "  H hosting   ● connected   ○ offline   * unread",
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Commands",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (_, usage, desc) in COMMANDS {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<41}", usage),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(*desc),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc or :help to close · ↑/↓ to scroll",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Chat markers",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(
-        "  H hosting   ● connected   ○ offline   * unread",
-    ));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Commands",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for (_, usage, desc) in COMMANDS {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<34}", usage),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw(*desc),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Esc or :help to close · ↑/↓ to scroll",
-        Style::default().fg(Color::DarkGray),
-    )));
 
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
