@@ -131,6 +131,27 @@ Handled in `ChatManager::handle_session_event`: unknown fingerprint → `ShowFin
 - Unit tests live in source files (e.g. `core/src/network/session.rs` has handshake tests); integration tests in each crate's `tests/`.
 - Async tests use `#[tokio::test]`. Handshake tests must verify derived keys match on both sides. Protocol changes require new (de)serialization tests. Adding `serde(default)` fields requires a back-compat test that loads old JSON.
 
+## Preferred Tools (opencode)
+
+These tools are installed globally — always use them instead of slower alternatives:
+
+| Tool | Purpose | Instead of |
+|------|---------|------------|
+| `rg` (ripgrep) | Fast code search | `grep -r`, slow searches |
+| `fd` | Fast file finding | `find`, `ls -R` |
+| `cargo-nextest` | Test runner (~2x faster) | `cargo test` |
+| `cargo-deny` | License/advisory checks | — |
+| `cargo-audit` | CVE scanning | — |
+| `cargo-watch` | Auto-run on file changes | — |
+| `cargo-tauri` | Tauri CLI | manual tauri builds |
+| `npm` | Node.js package manager | — |
+
+Rules:
+- Use `rg` for all content searching (`rg "pattern" --include "*.rs"`)
+- Use `fd` for all file finding (`fd "*.rs"`)
+- Use `cargo nextest run` instead of `cargo test` (faster)
+- Run `cargo-deny check` before committing new deps
+
 ## Documentation Discipline
 
 - Update the canonical doc instead of adding a parallel explanation elsewhere.
