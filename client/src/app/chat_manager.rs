@@ -1699,22 +1699,27 @@ impl ChatManager {
                     .map(|c| c.transport)
                     .unwrap_or(Transport::Direct);
 
-                // Create a chat for this new connection
-                self.chats.entry(incoming_chat_id).or_insert_with(|| Chat {
-                    id: incoming_chat_id,
-                    title,
-                    kind: ChatKind::Dm,
-                    transport: inherited_transport,
-                    peer_fingerprint: Some(fingerprint.clone()),
-                    participants: Vec::new(),
-                    messages: Vec::new(),
-                    created_at: chrono::Utc::now(),
-                    peer_typing: false,
-                    typing_since: None,
-                    send_seq: 0,
-                    recv_seq: 0,
-                    is_host_placeholder: false,
-                });
+                // Create a chat for this new connection, or (on reconnect, where
+                // the entry already exists) normalize its transport so it isn't
+                // left as a stale Direct — the same fix applied in connect_via_relay.
+                self.chats
+                    .entry(incoming_chat_id)
+                    .and_modify(|c| c.transport = inherited_transport)
+                    .or_insert_with(|| Chat {
+                        id: incoming_chat_id,
+                        title,
+                        kind: ChatKind::Dm,
+                        transport: inherited_transport,
+                        peer_fingerprint: Some(fingerprint.clone()),
+                        participants: Vec::new(),
+                        messages: Vec::new(),
+                        created_at: chrono::Utc::now(),
+                        peer_typing: false,
+                        typing_since: None,
+                        send_seq: 0,
+                        recv_seq: 0,
+                        is_host_placeholder: false,
+                    });
 
                 // If this connection consumes a placeholder host chat, remove the placeholder
                 // so the UI shows only the real chat. Auto-rehost will spawn a new listener.

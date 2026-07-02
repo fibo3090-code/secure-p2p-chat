@@ -213,7 +213,16 @@ export default function App() {
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
-                onVerify={(c) => setInfoTarget(c)}
+                onVerify={async (c) => {
+                  // Open the accept/reject dialog only when a real TOFU request
+                  // is pending for this chat; an established chat has nothing to
+                  // confirm, so show the read-only fingerprint instead.
+                  try {
+                    const p = await api.pendingFingerprint();
+                    if (p && p.chat_id === c.id) { setFpReq(p); return; }
+                  } catch { /* ignore */ }
+                  setInfoTarget(c);
+                }}
                 onRename={(c) => setRenameTarget(c)}
                 onDelete={(c) => setDeleteTarget(c)}
                 onInfo={(c) => setInfoTarget(c)} />

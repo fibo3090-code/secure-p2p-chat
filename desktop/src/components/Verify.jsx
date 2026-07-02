@@ -1,6 +1,6 @@
 // Fingerprint (TOFU) verification — colored safety grid + the hex code, with
 // accept/reject. Driven by the bridge's `fingerprint-request` event.
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Modal, Button } from "./ui.jsx";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
@@ -13,6 +13,10 @@ function group(fp) {
 export function Verify({ req, onClose }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // The component stays mounted (returns null when req is falsy), so clear any
+  // stale error when a new request arrives — a security-sensitive dialog must
+  // not show a previous request's failure before the user acts.
+  useEffect(() => { setErr(""); }, [req?.chat_id]);
   if (!req) return null;
   async function decide(accept) {
     if (busy) return;
