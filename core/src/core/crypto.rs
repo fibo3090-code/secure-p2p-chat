@@ -372,19 +372,53 @@ pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
     Ok(X25519PublicKey::from(key_bytes))
 }
 
+/// Which side of a session a cipher belongs to. Both peers derive the *same*
+/// AES-GCM key, so to guarantee their nonce spaces can never collide the high bit
+/// of the nonce encodes the role: the two sides therefore live in disjoint halves
+/// of the nonce space even if their random session ids coincide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonceRole {
+    /// The connection initiator's listener side (`new` defaults to this).
+    Host,
+    /// The connecting side.
+    Client,
+}
+
+impl NonceRole {
+    /// The high bit of the first nonce byte reserved for this role.
+    fn nonce_bit(self) -> u8 {
+        match self {
+            NonceRole::Host => 0x00,
+            NonceRole::Client => 0x80,
+        }
+    }
+}
+
 /// AES-GCM cipher wrapper for encrypting/decrypting messages
 /// Uses counter-based nonces for guaranteed uniqueness
 #[derive(Clone)]
 pub struct AesCipher {
     cipher: Aes256Gcm,
-    key: [u8; AES_KEY_SIZE],
+    /// Retained for rekeying. Wrapped in `Zeroizing` so the key material is wiped
+    /// from memory when the cipher is dropped (defense in depth).
+    key: zeroize::Zeroizing<[u8; AES_KEY_SIZE]>,
     nonce_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     session_id: [u8; 4],
+    role: NonceRole,
 }
 
 impl AesCipher {
-    /// Create new cipher from 32-byte key with random session ID
+    /// Create a new cipher from a 32-byte key with a random session id, in the
+    /// default [`NonceRole::Host`] role. Use [`AesCipher::new_with_role`] to pin
+    /// the role so the two peers of a session get disjoint nonce spaces.
     pub fn new(key: &[u8]) -> Result<Self> {
+        Self::new_with_role(key, NonceRole::Host)
+    }
+
+    /// Create a new cipher from a 32-byte key for a specific session role. The
+    /// role is encoded into the high bit of the nonce so the host and client
+    /// sides — which share one derived key — can never produce the same nonce.
+    pub fn new_with_role(key: &[u8], role: NonceRole) -> Result<Self> {
         if key.len() != AES_KEY_SIZE {
             return Err(anyhow!(
                 "AES key must be {} bytes, got {}",
@@ -396,6 +430,11 @@ impl AesCipher {
         let mut session_id = [0u8; 4];
         // Use OS RNG explicitly for cryptographic session IDs
         OsRng.fill_bytes(&mut session_id);
+        // Reserve the high bit of the first nonce byte for the session role so the
+        // host and client (which share one derived key) occupy disjoint nonce
+        // spaces. Without this, the two directions could pick the same random
+        // session id (~2^-32) and reuse a key+nonce pair — catastrophic for GCM.
+        session_id[0] = (session_id[0] & 0x7f) | role.nonce_bit();
 
         let mut key_array = [0u8; AES_KEY_SIZE];
         key_array.copy_from_slice(key);
@@ -403,15 +442,21 @@ impl AesCipher {
         Ok(Self {
             cipher: Aes256Gcm::new_from_slice(key)
                 .map_err(|e| anyhow!("Invalid AES key length: {}", e))?,
-            key: key_array,
+            key: zeroize::Zeroizing::new(key_array),
             nonce_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             session_id,
+            role,
         })
+    }
+
+    /// The session role this cipher encrypts under (preserved across rekeys).
+    pub fn role(&self) -> NonceRole {
+        self.role
     }
 
     /// Get the current session key (for rekeying purposes)
     pub fn get_current_key(&self) -> [u8; AES_KEY_SIZE] {
-        self.key
+        *self.key
     }
 
     /// Encrypt plaintext with optional AAD, returns nonce(12) || ciphertext || tag(16)
@@ -504,6 +549,27 @@ impl AesCipher {
 mod tests {
     use super::*;
     use rand::Rng;
+
+    #[test]
+    fn host_and_client_nonces_live_in_disjoint_spaces() {
+        // Both peers derive the SAME key; nonce uniqueness across the two
+        // directions must not rely on the 4-byte random session id differing.
+        // The role is encoded in the nonce's high bit, so host and client nonces
+        // can never collide even if their random session ids coincide.
+        let key = [9u8; AES_KEY_SIZE];
+        for _ in 0..64 {
+            let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+            let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+            let host_nonce = host.encrypt(b"x", None);
+            let client_nonce = client.encrypt(b"x", None);
+            assert_eq!(host_nonce[0] & 0x80, 0x00, "host nonce high bit must be 0");
+            assert_eq!(
+                client_nonce[0] & 0x80,
+                0x80,
+                "client nonce high bit must be 1"
+            );
+        }
+    }
 
     #[test]
     fn test_aes_roundtrip() {

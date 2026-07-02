@@ -38,6 +38,10 @@ use uuid::Uuid;
 const DB_FILE: &str = "party.db";
 /// Subdirectory under the data dir holding content-addressed file blobs.
 const BLOB_DIR: &str = "blobs";
+/// Default ceiling on the total bytes of distinct file blobs the server stores,
+/// bounding memory/disk growth from uploads. A safety cap until the Phase 3 quota
+/// system lands; operators can adjust it via [`PartyState::set_max_blob_bytes`].
+const MAX_TOTAL_BLOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Filename of the legacy JSON snapshot, imported once into SQLite if present.
 const LEGACY_SNAPSHOT_FILE: &str = "party_state.json";
 
@@ -134,6 +138,8 @@ pub struct PartyState {
     dm_threads: HashMap<Uuid, DmThread>,
     /// Content-addressed file blobs, keyed by hex SHA-256 of their bytes.
     blobs: HashMap<String, BlobRecord>,
+    /// Ceiling on the total bytes of distinct blobs the store will hold.
+    max_blob_bytes: u64,
     /// When present, mutations are mirrored to this database.
     db: Option<Connection>,
     /// When present, blob bytes are mirrored to files under this directory.
@@ -158,9 +164,16 @@ impl PartyState {
             channels: vec![general],
             dm_threads: HashMap::new(),
             blobs: HashMap::new(),
+            max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             db: None,
             blob_dir: None,
         }
+    }
+
+    /// Override the total-blob-storage ceiling (bytes of distinct content). Used
+    /// to configure the quota; defaults to [`MAX_TOTAL_BLOB_BYTES`].
+    pub fn set_max_blob_bytes(&mut self, bytes: u64) {
+        self.max_blob_bytes = bytes;
     }
 
     /// Open (creating if needed) the durable state in `<data_dir>/party.db`,
@@ -224,8 +237,10 @@ impl PartyState {
         self.channels[0].id
     }
 
-    /// Join the server: validates the password and a unique, non-empty username,
-    /// then registers the member as online and returns its id.
+    /// Join the server: validates the password, then either reactivates the
+    /// returning identity (matched by its handshake-verified fingerprint) or
+    /// registers a new member with a unique, non-empty username. Returns the
+    /// member id, marked online.
     pub fn join(
         &mut self,
         username: &str,
@@ -239,6 +254,23 @@ impl PartyState {
         if self.password.as_deref() != password {
             return Err(JoinError::WrongPassword);
         }
+
+        // Returning identity: a member is never removed on disconnect (only marked
+        // offline), so a reconnecting peer is recognised by its verified fingerprint
+        // and reuses its existing membership — keeping its id and history — instead
+        // of being locked out by its own offline entry as "username taken".
+        if let Some(fp) = fingerprint.as_deref() {
+            if let Some(existing) = self
+                .members
+                .values_mut()
+                .find(|m| m.fingerprint.as_deref() == Some(fp))
+            {
+                existing.online = true;
+                return Ok(existing.id);
+            }
+        }
+
+        // New identity: the username must be free (case-insensitive).
         if self
             .members
             .values()
@@ -433,8 +465,10 @@ impl PartyState {
 
     /// Store `data` as a content-addressed blob (deduplicated by hash, with the
     /// bytes mirrored to disk) and return its [`FileMeta`]. A repeated upload of the
-    /// same content reuses the existing blob and bumps its reference count.
-    fn store_blob(&mut self, name: &str, mime: &str, data: Vec<u8>) -> FileMeta {
+    /// same content reuses the existing blob and bumps its reference count. A new,
+    /// distinct blob is rejected if it would push total stored bytes past the
+    /// configured ceiling.
+    fn store_blob(&mut self, name: &str, mime: &str, data: Vec<u8>) -> Result<FileMeta, String> {
         let hash = blob_hash(&data);
         let size = data.len() as u64;
         if let Some(rec) = self.blobs.get_mut(&hash) {
@@ -442,6 +476,12 @@ impl PartyState {
             let refcount = rec.refcount;
             self.persist_blob_refcount(&hash, refcount);
         } else {
+            // Deduplicated re-uploads above never grow storage; only a distinct
+            // new blob counts against the ceiling.
+            let stored: u64 = self.blobs.values().map(|r| r.size).sum();
+            if stored.saturating_add(size) > self.max_blob_bytes {
+                return Err("server file storage is full".to_string());
+            }
             self.write_blob_file(&hash, &data);
             self.persist_blob_row(&hash, size, mime, 1);
             self.blobs.insert(
@@ -454,12 +494,12 @@ impl PartyState {
                 },
             );
         }
-        FileMeta {
+        Ok(FileMeta {
             hash,
             name: name.to_string(),
             size,
             mime: mime.to_string(),
-        }
+        })
     }
 
     /// Validate an inline upload's size, returning the data on success.
@@ -494,7 +534,7 @@ impl PartyState {
         }
         let data = Self::check_inline_size(data)?;
         let tier = self.tier;
-        let meta = self.store_blob(&name, &mime, data);
+        let meta = self.store_blob(&name, &mime, data)?;
         // Re-borrow the channel after the blob store to append the message.
         let chan = self
             .channel_mut(channel)
@@ -532,7 +572,7 @@ impl PartyState {
         let data = Self::check_inline_size(data)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);
         let tier = self.tier;
-        let meta = self.store_blob(&name, &mime, data);
+        let meta = self.store_blob(&name, &mime, data)?;
         let thread = self
             .dm_threads
             .entry(thread_id)
@@ -942,6 +982,44 @@ mod tests {
     }
 
     #[test]
+    fn reconnecting_with_same_fingerprint_reuses_the_member() {
+        let mut state = PartyState::new("Open", None);
+        let id1 = state
+            .join("alice", None, Some("FP-alice".to_string()))
+            .unwrap();
+
+        // Simulate a dropped connection.
+        state.set_online(id1, false);
+
+        // The same identity reconnects under the same username: it must reuse the
+        // existing membership (same id, back online), not be locked out by its own
+        // offline ghost entry as "username taken".
+        let id2 = state
+            .join("alice", None, Some("FP-alice".to_string()))
+            .expect("returning member must be allowed to rejoin");
+        assert_eq!(id1, id2, "a returning identity keeps its member id");
+        assert_eq!(state.members().len(), 1, "no duplicate member is created");
+        assert!(
+            state.members().iter().find(|m| m.id == id1).unwrap().online,
+            "the reused member is marked online again"
+        );
+    }
+
+    #[test]
+    fn a_different_identity_cannot_take_an_existing_username() {
+        let mut state = PartyState::new("Open", None);
+        state
+            .join("alice", None, Some("FP-alice".to_string()))
+            .unwrap();
+        // A different fingerprint claiming the same username is still rejected
+        // (prevents impersonation of an established member).
+        assert_eq!(
+            state.join("alice", None, Some("FP-mallory".to_string())),
+            Err(JoinError::UsernameTaken)
+        );
+    }
+
+    #[test]
     fn posting_assigns_monotonic_per_channel_seq() {
         let mut state = PartyState::new("Open", None);
         let alice = state.join("alice", None, None).unwrap();
@@ -1327,6 +1405,56 @@ mod tests {
             state.blob_bytes(&file_payload(&env).hash),
             Some(b"psst".to_vec())
         );
+    }
+
+    #[test]
+    fn a_new_blob_past_the_storage_ceiling_is_rejected() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+        state.set_max_blob_bytes(8);
+
+        // First upload fits under the 8-byte ceiling.
+        state
+            .post_file(
+                alice,
+                chan,
+                "a.bin".into(),
+                "application/octet-stream".into(),
+                vec![1u8; 6],
+            )
+            .expect("a blob under the ceiling is accepted");
+
+        // A distinct second blob would push the total to 12 bytes: rejected,
+        // stored nowhere, and no message is posted for it.
+        let err = state
+            .post_file(
+                alice,
+                chan,
+                "b.bin".into(),
+                "application/octet-stream".into(),
+                vec![2u8; 6],
+            )
+            .expect_err("a blob past the ceiling must be rejected");
+        assert!(err.contains("storage"), "error should say why: {err}");
+        assert_eq!(state.blobs.len(), 1, "the rejected blob must not be stored");
+        assert_eq!(
+            state.history_since(chan, 0).len(),
+            1,
+            "no message is posted for a rejected upload"
+        );
+
+        // Re-uploading already-stored content adds no bytes, so deduplicated
+        // uploads still succeed at the ceiling.
+        state
+            .post_file(
+                alice,
+                chan,
+                "a-again.bin".into(),
+                "application/octet-stream".into(),
+                vec![1u8; 6],
+            )
+            .expect("re-upload of stored content adds no bytes and stays allowed");
     }
 
     #[test]

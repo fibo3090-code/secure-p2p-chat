@@ -157,6 +157,29 @@ fn default_signature_scheme() -> SignatureScheme {
 }
 
 impl ProtocolMessage {
+    /// Overwrite the transport sequence number on variants that carry one.
+    ///
+    /// The session message loop owns a single monotonic outgoing counter and
+    /// stamps it onto every frame it sends (application messages *and* `Rekey`),
+    /// so the receiver's replay check sees one strictly-increasing stream.
+    /// Handshake-only variants have no sequence number and are left unchanged.
+    pub fn set_seq(&mut self, new_seq: u64) {
+        match self {
+            Self::Text { seq, .. }
+            | Self::TextChunk { seq, .. }
+            | Self::FileMeta { seq, .. }
+            | Self::FileChunk { seq, .. }
+            | Self::FileEnd { seq }
+            | Self::Ping { seq }
+            | Self::TypingStart { seq }
+            | Self::TypingStop { seq }
+            | Self::Rekey { seq, .. } => *seq = new_seq,
+            Self::Version { .. }
+            | Self::EphemeralKey { .. }
+            | Self::SupportedSignatureSchemes { .. } => {}
+        }
+    }
+
     /// Convert message to plain bytes (binary tagged format)
     pub fn to_plain_bytes(&self) -> Vec<u8> {
         // Binary tagged format:

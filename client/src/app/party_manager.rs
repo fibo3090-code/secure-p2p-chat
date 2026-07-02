@@ -49,6 +49,10 @@ pub struct PartyServerConn {
     pub members: Vec<MemberInfo>,
     /// Per-channel message history (delivery order).
     pub messages: HashMap<Uuid, Vec<Envelope>>,
+    /// The most recent error this server replied with (e.g. a rejected post),
+    /// surfaced in the UI until superseded. Without this, server errors were
+    /// silently dropped and a failed action looked like it simply did nothing.
+    pub last_error: Option<String>,
     outgoing_tx: mpsc::UnboundedSender<PartyRequest>,
     incoming_rx: mpsc::UnboundedReceiver<Incoming>,
 }
@@ -146,6 +150,7 @@ impl PartyManager {
             channels: Vec::new(),
             members: Vec::new(),
             messages: HashMap::new(),
+            last_error: None,
             outgoing_tx,
             incoming_rx,
         };
@@ -318,7 +323,9 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
         PartyResponse::MessagePosted { .. } => {}
         // Downloaded file bytes; surfacing/saving them in the UI is a follow-up slice.
         PartyResponse::FileData { .. } => {}
-        PartyResponse::Error(_) => {}
+        // Surface server-side failures (rejected post, unknown channel, …) so a
+        // failed action is visible instead of silently doing nothing.
+        PartyResponse::Error(message) => conn.last_error = Some(message),
     }
 }
 
@@ -347,6 +354,7 @@ mod tests {
             channels: Vec::new(),
             members: Vec::new(),
             messages: HashMap::new(),
+            last_error: None,
             outgoing_tx,
             incoming_rx,
         };
@@ -517,6 +525,21 @@ mod tests {
         tx.send(Incoming::Disconnected).unwrap();
         mgr.poll_events();
         assert_eq!(mgr.server(id).unwrap().status, PartyStatus::Disconnected);
+    }
+
+    #[test]
+    fn server_error_response_is_surfaced_not_dropped() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        tx.send(Incoming::Response(PartyResponse::Error(
+            "channel is locked".to_string(),
+        )))
+        .unwrap();
+        mgr.poll_events();
+        assert_eq!(
+            mgr.server(id).unwrap().last_error.as_deref(),
+            Some("channel is locked"),
+            "a server Error reply must surface, not be silently dropped"
+        );
     }
 
     #[test]

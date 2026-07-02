@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::core::{
     derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, negotiate_signature_scheme,
     parse_x25519_public, pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher,
-    IdentityProof, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
+    IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -190,7 +190,7 @@ pub async fn run_host_session(
         Some(&salt),
         HKDF_INFO,
     ));
-    let cipher = AesCipher::new(&aes_key[..])?;
+    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
     let transport_aad = labeled_aad(b"transport", transcript_hash);
@@ -423,7 +423,7 @@ pub async fn run_client_session(
         Some(&salt),
         HKDF_INFO,
     ));
-    let cipher = AesCipher::new(&aes_key[..])?;
+    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
     let transport_aad = labeled_aad(b"transport", transcript_hash);
@@ -634,7 +634,7 @@ where
         Some(&salt),
         HKDF_INFO,
     ));
-    let cipher = AesCipher::new(&aes_key[..])?;
+    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
     let transport_aad = labeled_aad(b"transport", transcript_hash);
@@ -771,7 +771,7 @@ where
         Some(&salt),
         HKDF_INFO,
     ));
-    let cipher = AesCipher::new(&aes_key[..])?;
+    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
     let transport_aad = labeled_aad(b"transport", transcript_hash);
@@ -1168,12 +1168,12 @@ where
                                             // Handle rekeying
                                             use crate::core::rekey_session_key;
 
-                                            let received_nonce: [u8; crate::AES_GCM_TAG_SIZE] = nonce.as_slice().try_into()
+                                            let received_nonce: [u8; crate::REKEY_NONCE_SIZE] = nonce.as_slice().try_into()
                                                 .map_err(|_| anyhow!("Invalid nonce length"))?;
 
                                             let current_key_bytes = cipher.get_current_key();
                                             let next_key = rekey_session_key(&current_key_bytes, &received_nonce);
-                                            cipher = AesCipher::new(&next_key)?;
+                                            cipher = AesCipher::new_with_role(&next_key, cipher.role())?;
                                             messages_since_rekey = 0;
                                             last_rekey_time = std::time::Instant::now();
                                             tracing::info!("Session key rotated (received Rekey message)");
@@ -1200,8 +1200,13 @@ where
                                 tracing::debug!("Raw plaintext (truncated): {:.64}", String::from_utf8_lossy(&plaintext));
                             }
                         } else {
+                            // An AEAD failure over a reliable, ordered stream means
+                            // the channel is desynced or tampered with — it cannot
+                            // recover, so fail closed instead of spinning on every
+                            // subsequent (also-undecryptable) packet until idle timeout.
                             tracing::error!("Decryption failed - possible tampering or key mismatch!");
                             let _ = to_app_tx.send(SessionEvent::Error("Decryption failed!".to_string()));
+                            break;
                         }
                     }
                     Ok(Err(e)) => {
@@ -1221,7 +1226,7 @@ where
             }
 
             // Send to network
-            Some(msg) = from_app_rx.recv() => {
+            Some(mut msg) = from_app_rx.recv() => {
                 // Check if we need to initiate rekeying
                 let should_rekey = messages_since_rekey >= REKEY_MESSAGE_COUNT ||
                     last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL;
@@ -1255,11 +1260,20 @@ where
                     // Apply the new key immediately since we sent the Rekey message
                     let current_key_bytes = cipher.get_current_key();
                     let next_key = rekey_session_key(&current_key_bytes, &nonce);
-                    cipher = AesCipher::new(&next_key)?;
+                    cipher = AesCipher::new_with_role(&next_key, cipher.role())?;
                     messages_since_rekey = 0;
                     last_rekey_time = std::time::Instant::now();
                     tracing::info!("Session key rotated (initiated rekey)");
                 }
+
+                // Stamp the next monotonic transport sequence onto every outgoing
+                // frame. The loop owns the outbound sequence space so that
+                // application messages and interleaved Rekey messages form one
+                // strictly-increasing stream the peer's replay check accepts.
+                // (Without this, Rekey used an independent counter whose seq was
+                // rejected as a replay, desyncing the keys and killing the session.)
+                sent_seq += 1;
+                msg.set_seq(sent_seq);
 
                 tracing::debug!("Sending message: {:?}", msg);
 
@@ -1302,6 +1316,48 @@ mod tests {
         let mut key = [0u8; crate::AES_KEY_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut key);
         AesCipher::new(&key).expect("random test key should be valid")
+    }
+
+    /// A frame that decrypts cleanly (tampering aside) must end the session rather
+    /// than leaving the loop spinning on every subsequent packet: an AEAD failure
+    /// over a reliable stream means the channel is desynced or tampered with.
+    #[tokio::test]
+    async fn decryption_failure_ends_the_session() {
+        let cipher = test_cipher();
+        let aad = b"transport".to_vec();
+        let (loop_stream, mut peer_stream) = tokio::io::duplex(4096);
+
+        let (to_app_tx, mut to_app_rx) = mpsc::unbounded_channel();
+        // Keep the app->loop sender alive so the loop only exits via the network side.
+        let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+
+        let handle = tokio::spawn(async move {
+            run_message_loop(loop_stream, cipher, aad, to_app_tx, from_app_rx).await
+        });
+
+        // A well-formed packet whose contents cannot be authenticated under the key.
+        send_packet(&mut peer_stream, &[0u8; 64]).await.unwrap();
+
+        // The loop must surface the failure and terminate (not idle for minutes).
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop must terminate promptly after a decryption failure");
+        assert!(result.unwrap().is_ok());
+
+        // It reported the failure before shutting down.
+        let mut saw_error = false;
+        while let Ok(ev) = to_app_rx.try_recv() {
+            if matches!(ev, SessionEvent::Error(_) | SessionEvent::Disconnected) {
+                saw_error = true;
+            }
+        }
+        assert!(
+            saw_error,
+            "a decryption failure must be surfaced to the app"
+        );
+
+        // Keep the peer end alive until the assertions run.
+        drop(peer_stream);
     }
 
     #[tokio::test]

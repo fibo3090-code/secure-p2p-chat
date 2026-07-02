@@ -35,6 +35,7 @@ pub const TEXT_CHUNK_BYTES: usize = 48 * 1024; // 48 KiB to leave headroom for m
 pub const AES_KEY_SIZE: usize = 32; // 256 bits
 pub const AES_NONCE_SIZE: usize = 12; // 96 bits (GCM standard)
 pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits (GCM authentication tag)
+pub const REKEY_NONCE_SIZE: usize = 16; // 128-bit salt for HKDF key rotation
 pub const RSA_KEY_BITS: usize = 2048;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 /// Maximum file size for transfers: 10 GiB

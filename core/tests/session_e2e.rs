@@ -356,3 +356,51 @@ async fn missing_connection_password_is_rejected() {
         .expect("client task should finish");
     assert!(client_result.unwrap().is_err());
 }
+
+/// Drive a freshly connected pair through TOFU confirmation to the Ready state.
+async fn reach_ready(host: &mut Peer, client: &mut Peer) {
+    wait_until(&mut host.events, "host", awaiting_confirmation).await;
+    wait_until(&mut client.events, "client", awaiting_confirmation).await;
+    host.confirm.send(true).unwrap();
+    client.confirm.send(true).unwrap();
+    wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::Ready)
+    })
+    .await;
+    wait_until(&mut client.events, "client", |ev| {
+        matches!(ev, SessionEvent::Ready)
+    })
+    .await;
+}
+
+/// Regression test for the rekey/replay desync: the transport rekeys after
+/// `REKEY_MESSAGE_COUNT` (100) messages, and the rekey must not break the session.
+/// Sending more than that many messages one way must still deliver every one.
+#[tokio::test]
+async fn messages_keep_flowing_across_a_rekey() {
+    let (mut host, mut client) = connect_pair().await;
+    reach_ready(&mut host, &mut client).await;
+
+    // Cross the 100-message rekey threshold so a rekey fires mid-stream.
+    const COUNT: usize = 130;
+    for i in 0..COUNT {
+        host.outbound
+            .send(ProtocolMessage::Text {
+                text: format!("msg-{i}"),
+                timestamp: i as u64,
+                seq: (i + 1) as u64,
+            })
+            .unwrap();
+    }
+
+    // Every message must arrive, in order, despite the mid-stream rekey.
+    for i in 0..COUNT {
+        match next_message(&mut client.events, "client").await {
+            ProtocolMessage::Text { text, .. } => assert_eq!(text, format!("msg-{i}")),
+            other => panic!("expected Text msg-{i}, got {other:?}"),
+        }
+    }
+
+    host.handle.abort();
+    client.handle.abort();
+}
