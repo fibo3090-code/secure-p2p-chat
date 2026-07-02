@@ -167,7 +167,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
           onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
         <textarea className="composer-input" rows={1} placeholder={`Message ${contact.name.split(" ")[0]}…`}
           value={draft} onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }} />
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); onSend(); } }} />
         <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={onSend} title="Send">
           <Icon name="send" size={18} />
         </button>

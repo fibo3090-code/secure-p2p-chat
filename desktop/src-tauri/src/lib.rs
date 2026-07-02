@@ -17,11 +17,15 @@ use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use encodeur_rsa_rust::app::party_manager::{PartyManager, PartyStatus};
 use encodeur_rsa_rust::app::ChatManager;
 
 /// Shared application state managed by Tauri.
 struct Bridge {
     manager: Arc<Mutex<ChatManager>>,
+    /// Client-side Party/Community server connections (channels, members, DMs).
+    /// State is ephemeral and re-fetched on join — the server holds durable history.
+    party: Arc<Mutex<PartyManager>>,
     identity: StdMutex<Identity>,
     history_path: PathBuf,
     /// Identity file (sibling of the history file).
@@ -101,6 +105,9 @@ struct ConvSummary {
     placeholder: bool,
     kind: &'static str,
     transport: &'static str,
+    /// True once the peer's fingerprint has been confirmed (TOFU-verified). The
+    /// UI must not claim "verified" for conversations that are still pending.
+    verified: bool,
 }
 
 fn kind_str(k: messenger_core::types::ChatKind) -> &'static str {
@@ -119,6 +126,20 @@ fn transport_str(t: messenger_core::types::Transport) -> &'static str {
         Relay => "relay",
         Server => "server",
     }
+}
+
+/// Reject any post-auth command while the identity is still locked or a password
+/// setup is pending. The React shell already hides the UI in those states, but
+/// the bridge must enforce the barrier itself so no command can mutate state or
+/// start a session before unlock/set-password completes.
+fn ensure_ready(state: &Bridge) -> Result<(), String> {
+    if state.identity.lock().unwrap().is_locked() {
+        return Err("Unlock required".to_string());
+    }
+    if *state.is_new.lock().unwrap() || *state.force_setup.lock().unwrap() {
+        return Err("Password setup required".to_string());
+    }
+    Ok(())
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -175,7 +196,14 @@ async fn set_password(password: String, state: tauri::State<'_, Bridge>) -> Resu
         *state.force_setup.lock().unwrap() = false;
         key
     };
-    state.manager.lock().await.set_history_key(key);
+    // Load any existing history the same way `unlock` does. Without this, the
+    // first post-setup session starts from an empty manager and the next save
+    // could overwrite an existing `history.json.enc` with empty state.
+    let mut mgr = state.manager.lock().await;
+    mgr.set_history_key(key);
+    if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
+        tracing::warn!("Failed to load history after password setup: {}", e);
+    }
     Ok(())
 }
 
@@ -186,6 +214,7 @@ fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
 
 #[tauri::command]
 async fn list_conversations(state: tauri::State<'_, Bridge>) -> Result<Vec<ConvSummary>, String> {
+    ensure_ready(&state)?;
     let mgr = state.manager.lock().await;
     let mut out = Vec::new();
     for id in mgr.chat_ids() {
@@ -203,6 +232,7 @@ async fn list_conversations(state: tauri::State<'_, Bridge>) -> Result<Vec<ConvS
                 placeholder: chat.is_host_placeholder,
                 kind: kind_str(chat.kind),
                 transport: transport_str(chat.transport),
+                verified: chat.peer_fingerprint.is_some(),
             });
         }
     }
@@ -215,6 +245,7 @@ async fn get_conversation(
     id: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<serde_json::Value, String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let mgr = state.manager.lock().await;
     match mgr.get_chat(uuid) {
@@ -229,6 +260,7 @@ async fn send_message(
     text: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     state
         .manager
@@ -245,6 +277,7 @@ async fn send_message(
 /// a cancelled dialog is a successful no-op.
 #[tauri::command]
 async fn send_file(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_file())
         .await
@@ -265,6 +298,7 @@ async fn send_file(id: String, state: tauri::State<'_, Bridge>) -> Result<(), St
 
 #[tauri::command]
 async fn start_host(port: u16, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
     let pk = {
         let id = state.identity.lock().unwrap();
         id.private_key().map_err(|e| e.to_string())?
@@ -285,6 +319,7 @@ async fn connect_peer(
     port: u16,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_ready(&state)?;
     let pk = {
         let id = state.identity.lock().unwrap();
         id.private_key().map_err(|e| e.to_string())?
@@ -304,6 +339,7 @@ async fn connect_peer(
 /// the conversation is still a verified DM.
 #[tauri::command]
 async fn host_via_relay(relay: String, state: tauri::State<'_, Bridge>) -> Result<String, String> {
+    ensure_ready(&state)?;
     let pk = {
         let id = state.identity.lock().unwrap();
         id.private_key().map_err(|e| e.to_string())?
@@ -325,6 +361,7 @@ async fn connect_via_relay(
     token: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_ready(&state)?;
     let pk = {
         let id = state.identity.lock().unwrap();
         id.private_key().map_err(|e| e.to_string())?
@@ -345,6 +382,7 @@ async fn confirm_fingerprint(
     accept: bool,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let result = state
         .manager
@@ -352,10 +390,13 @@ async fn confirm_fingerprint(
         .await
         .confirm_fingerprint(uuid, accept)
         .map_err(|e| e.to_string());
-    // Resolved either way — clear the pending prompt so the UI doesn't re-show it.
-    *state.pending_fp.lock().unwrap() = None;
-    // An accepted fingerprint is persisted onto the chat; save so trust survives a restart.
-    persist_history(&state.manager, &state.history_path).await;
+    // Only clear the pending prompt on success. If confirmation failed, keep it so
+    // `pending_fingerprint()` can still surface it and the user can retry.
+    if result.is_ok() {
+        *state.pending_fp.lock().unwrap() = None;
+        // An accepted fingerprint is persisted onto the chat; save so trust survives a restart.
+        persist_history(&state.manager, &state.history_path).await;
+    }
     result
 }
 
@@ -363,6 +404,9 @@ async fn confirm_fingerprint(
 /// dropped `fingerprint-request` event never leaves a session stuck unverified.
 #[tauri::command]
 fn pending_fingerprint(state: tauri::State<'_, Bridge>) -> Option<serde_json::Value> {
+    if ensure_ready(&state).is_err() {
+        return None;
+    }
     state
         .pending_fp
         .lock()
@@ -383,6 +427,7 @@ async fn rename_chat(
     title: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     state
         .manager
@@ -396,6 +441,7 @@ async fn rename_chat(
 
 #[tauri::command]
 async fn delete_chat(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     state.manager.lock().await.delete_chat(uuid);
     persist_history(&state.manager, &state.history_path).await;
@@ -435,6 +481,7 @@ fn contact_dto(c: &messenger_core::types::Contact) -> ContactDto {
 
 #[tauri::command]
 async fn list_contacts(state: tauri::State<'_, Bridge>) -> Result<Vec<ContactDto>, String> {
+    ensure_ready(&state)?;
     let mgr = state.manager.lock().await;
     Ok(mgr.contacts.values().map(contact_dto).collect())
 }
@@ -443,6 +490,7 @@ async fn list_contacts(state: tauri::State<'_, Bridge>) -> Result<Vec<ContactDto
 /// the configured listen port, when resolvable).
 #[tauri::command]
 async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<String, String> {
+    ensure_ready(&state)?;
     let address = {
         let mgr = state.manager.lock().await;
         let port = mgr.config.listen_port;
@@ -460,6 +508,7 @@ async fn import_invite(
     link: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<ContactDto, String> {
+    ensure_ready(&state)?;
     let contact = {
         let mgr = state.manager.lock().await;
         mgr.parse_invite_link(&link).map_err(|e| e.to_string())?
@@ -472,6 +521,7 @@ async fn import_invite(
 /// Dial a stored contact by its saved address.
 #[tauri::command]
 async fn connect_contact(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let address = {
         let mgr = state.manager.lock().await;
@@ -493,6 +543,275 @@ async fn connect_contact(id: String, state: tauri::State<'_, Bridge>) -> Result<
         .await
         .map(|_chat_id| ())
         .map_err(|e| e.to_string())
+}
+
+// ── Communities (Party servers) ─────────────────────────────────────────────
+//
+// A thin bridge over `PartyManager`, mirroring the egui Party tab. Command
+// params are single words (`server`, `channel`, …) to avoid the Tauri 2
+// arg-naming footgun where a snake_case param silently no-ops.
+
+#[derive(Serialize)]
+struct PartyMemberDto {
+    id: String,
+    username: String,
+    online: bool,
+    is_me: bool,
+}
+
+#[derive(Serialize)]
+struct PartyChannelDto {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct PartyServerDto {
+    id: String,
+    name: String,
+    address: String,
+    fingerprint: String,
+    status: &'static str,
+    status_detail: Option<String>,
+    member_id: Option<String>,
+    channels: Vec<PartyChannelDto>,
+    members: Vec<PartyMemberDto>,
+    last_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PartyMessageDto {
+    sender_name: String,
+    from_me: bool,
+    kind: &'static str,
+    text: String,
+    size: Option<u64>,
+    timestamp: u64,
+}
+
+fn party_status_parts(status: &PartyStatus) -> (&'static str, Option<String>) {
+    match status {
+        PartyStatus::Connecting => ("connecting", None),
+        PartyStatus::Joined => ("joined", None),
+        PartyStatus::Rejected(reason) => ("rejected", Some(reason.clone())),
+        PartyStatus::Disconnected => ("disconnected", None),
+    }
+}
+
+/// Serialize one connection's directory (channels + members), resolving "you".
+fn server_dto(
+    id: Uuid,
+    conn: &encodeur_rsa_rust::app::party_manager::PartyServerConn,
+) -> PartyServerDto {
+    let (status, status_detail) = party_status_parts(&conn.status);
+    let members = conn
+        .members
+        .iter()
+        .map(|m| PartyMemberDto {
+            id: m.id.to_string(),
+            username: m.username.clone(),
+            online: m.online,
+            is_me: conn.member_id == Some(m.id),
+        })
+        .collect();
+    let channels = conn
+        .channels
+        .iter()
+        .map(|c| PartyChannelDto {
+            id: c.id.to_string(),
+            name: c.name.clone(),
+        })
+        .collect();
+    PartyServerDto {
+        id: id.to_string(),
+        name: conn.server_name.clone(),
+        address: conn.address.clone(),
+        fingerprint: conn.server_fingerprint.clone(),
+        status,
+        status_detail,
+        member_id: conn.member_id.map(|m| m.to_string()),
+        channels,
+        members,
+        last_error: conn.last_error.clone(),
+    }
+}
+
+/// Turn a stored envelope into a display DTO, resolving the sender's username
+/// from the member directory and flagging the local user's own messages.
+fn message_dto(
+    env: &messenger_core::party::Envelope,
+    conn: &encodeur_rsa_rust::app::party_manager::PartyServerConn,
+) -> PartyMessageDto {
+    use messenger_core::party::MessagePayload;
+    let sender_name = conn
+        .members
+        .iter()
+        .find(|m| m.id == env.sender)
+        .map(|m| m.username.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let (kind, text, size) = match &env.payload {
+        MessagePayload::Text(t) => ("text", t.clone(), None),
+        MessagePayload::File(f) => ("file", f.name.clone(), Some(f.size)),
+    };
+    PartyMessageDto {
+        sender_name,
+        from_me: conn.member_id == Some(env.sender),
+        kind,
+        text,
+        size,
+        timestamp: env.timestamp,
+    }
+}
+
+/// Connect to a community server, verify (TOFU) its fingerprint out of band, and
+/// join with a username. Returns the local server id.
+#[tauri::command]
+async fn party_join(
+    address: String,
+    username: String,
+    password: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<String, String> {
+    ensure_ready(&state)?;
+    let pk = {
+        let id = state.identity.lock().unwrap();
+        id.private_key().map_err(|e| e.to_string())?
+    };
+    let password = Some(password).filter(|p| !p.trim().is_empty());
+    state
+        .party
+        .lock()
+        .await
+        .connect_and_join(&address, &username, password, &pk)
+        .await
+        .map(|id| id.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// The joined community servers with their channels and member directories.
+#[tauri::command]
+async fn party_list(state: tauri::State<'_, Bridge>) -> Result<Vec<PartyServerDto>, String> {
+    ensure_ready(&state)?;
+    let party = state.party.lock().await;
+    let mut out: Vec<PartyServerDto> = party
+        .server_ids()
+        .into_iter()
+        .filter_map(|id| party.server(id).map(|conn| server_dto(id, conn)))
+        .collect();
+    // Stable order so the UI's server list doesn't reshuffle each poll.
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    Ok(out)
+}
+
+/// Messages in a channel (already seeded from durable history on join; live
+/// posts arrive via the poll loop).
+#[tauri::command]
+async fn party_history(
+    server: String,
+    channel: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<Vec<PartyMessageDto>, String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let party = state.party.lock().await;
+    let conn = party
+        .server(sid)
+        .ok_or_else(|| "unknown server".to_string())?;
+    let msgs = conn
+        .messages
+        .get(&cid)
+        .map(|v| v.iter().map(|e| message_dto(e, conn)).collect())
+        .unwrap_or_default();
+    Ok(msgs)
+}
+
+/// Post a text message to a channel.
+#[tauri::command]
+async fn party_post(
+    server: String,
+    channel: String,
+    text: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .post(sid, cid, text)
+        .map_err(|e| e.to_string())
+}
+
+/// Create a new channel on a community server.
+#[tauri::command]
+async fn party_create_channel(
+    server: String,
+    name: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .create_channel(sid, name)
+        .map_err(|e| e.to_string())
+}
+
+/// Send a direct message to another member of a community server.
+#[tauri::command]
+async fn party_send_dm(
+    server: String,
+    to: String,
+    text: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let to = Uuid::parse_str(&to).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .send_dm(sid, to, text)
+        .map_err(|e| e.to_string())
+}
+
+/// The DM thread with a member. Requests a fresh fetch (offline catch-up); the
+/// authoritative history lands on a later poll.
+#[tauri::command]
+async fn party_dm_history(
+    server: String,
+    peer: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<Vec<PartyMessageDto>, String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let peer = Uuid::parse_str(&peer).map_err(|e| e.to_string())?;
+    let party = state.party.lock().await;
+    let _ = party.fetch_dm_history(sid, peer);
+    let conn = party
+        .server(sid)
+        .ok_or_else(|| "unknown server".to_string())?;
+    Ok(party
+        .dm_messages(sid, peer)
+        .iter()
+        .map(|e| message_dto(e, conn))
+        .collect())
+}
+
+/// Clear a server's last surfaced error (e.g. a rejected post) after the UI has
+/// shown it.
+#[tauri::command]
+async fn party_clear_error(server: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    state.party.lock().await.clear_server_error(sid);
+    Ok(())
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -549,12 +868,21 @@ pub fn run() {
             import_invite,
             connect_contact,
             pending_fingerprint,
+            party_join,
+            party_list,
+            party_history,
+            party_post,
+            party_create_channel,
+            party_send_dm,
+            party_dm_history,
+            party_clear_error,
         ])
         .setup(|app| {
             let b = app.state::<Bridge>();
             spawn_poll_loop(
                 app.handle().clone(),
                 b.manager.clone(),
+                b.party.clone(),
                 b.history_path.clone(),
                 b.pending_fp.clone(),
             );
@@ -605,6 +933,7 @@ fn init_bridge() -> Bridge {
 
     Bridge {
         manager,
+        party: Arc::new(Mutex::new(PartyManager::new())),
         identity: StdMutex::new(identity),
         history_path,
         identity_path,
@@ -626,6 +955,7 @@ fn toast_level_str(l: ToastLevel) -> &'static str {
 fn spawn_poll_loop(
     app: tauri::AppHandle,
     manager: Arc<Mutex<ChatManager>>,
+    party: Arc<Mutex<PartyManager>>,
     history_path: PathBuf,
     pending_fp: Arc<StdMutex<Option<(String, String, String)>>>,
 ) {
@@ -637,6 +967,9 @@ fn spawn_poll_loop(
         let mut last_saved_sig: Option<u64> = None;
         loop {
             interval.tick().await;
+            // Drain Party/Community server events (joins, channel/member updates,
+            // incoming messages) so the webview's Communities pane stays live.
+            party.lock().await.poll_events();
             let (req, toasts, sig) = {
                 let mut m = manager.lock().await;
                 m.poll_session_events();
@@ -678,6 +1011,8 @@ fn spawn_poll_loop(
                 );
             }
             let _ = app.emit("state-updated", ());
+            // Nudge the Communities pane to re-read the party directory + messages.
+            let _ = app.emit("party-updated", ());
         }
     });
 }

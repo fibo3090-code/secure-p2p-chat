@@ -23,11 +23,15 @@ export function LockScreen({ onUnlock }) {
 
   async function submit(e) {
     e.preventDefault();
+    if (busy) return;
     if (!pw) { setErr("Enter your password"); return; }
     setBusy(true);
-    const error = await onUnlock(pw);
-    setBusy(false);
-    if (error) { setErr(error); setPw(""); }
+    try {
+      const error = await onUnlock(pw);
+      if (error) { setErr(error); setPw(""); }
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -37,7 +41,7 @@ export function LockScreen({ onUnlock }) {
         <Brand />
         <div className="onb-p-min">Enter your password to unlock your identity and history.</div>
         <div className="onb-field">
-          <PasswordInput value={pw} autoFocus placeholder="Password"
+          <PasswordInput value={pw} autoFocus placeholder="Password" disabled={busy}
             onChange={(e) => { setPw(e.target.value); setErr(""); }} />
           {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}
         </div>
@@ -67,11 +71,15 @@ export function SetPasswordScreen({ fingerprint, onSet }) {
 
   async function submit(e) {
     e.preventDefault();
+    if (busy) return;
     if (pw.length < 4 || pw !== pw2) return;
     setBusy(true);
-    const error = await onSet(pw);
-    setBusy(false);
-    if (error) setErr(error);
+    try {
+      const error = await onSet(pw);
+      if (error) setErr(error);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -82,7 +90,7 @@ export function SetPasswordScreen({ fingerprint, onSet }) {
         <div className="onb-p-min">Set a password to encrypt your identity &amp; history at rest. It can't be reset.</div>
         {fingerprint && <code className="onb-fp-code">{fingerprint.slice(0, 32)}…</code>}
         <div className="onb-field">
-          <PasswordInput value={pw} autoFocus placeholder="New password"
+          <PasswordInput value={pw} autoFocus placeholder="New password" disabled={busy}
             onChange={(e) => { setPw(e.target.value); setErr(""); }} />
           <div className="onb-strength">
             <span className={"onb-strength-bar s" + strength.score} />
@@ -90,7 +98,7 @@ export function SetPasswordScreen({ fingerprint, onSet }) {
           </div>
         </div>
         <div className="onb-field">
-          <PasswordInput value={pw2} placeholder="Confirm password" onChange={(e) => setPw2(e.target.value)} />
+          <PasswordInput value={pw2} placeholder="Confirm password" disabled={busy} onChange={(e) => setPw2(e.target.value)} />
           {pw2 && pw !== pw2 && <span className="onb-err"><Icon name="alert" size={13} /> Passwords don't match</span>}
           {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}
         </div>

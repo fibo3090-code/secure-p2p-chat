@@ -915,22 +915,30 @@ impl ChatManager {
             }
         });
 
-        if let std::collections::hash_map::Entry::Vacant(e) = self.chats.entry(chat_id) {
-            e.insert(Chat {
-                id: chat_id,
-                title: format!("Relay via {}", relay_server),
-                kind: ChatKind::Dm,
-                transport: Transport::Relay,
-                peer_fingerprint: None,
-                participants: Vec::new(),
-                messages: Vec::new(),
-                created_at: chrono::Utc::now(),
-                peer_typing: false,
-                typing_since: None,
-                send_seq: 0,
-                recv_seq: 0,
-                is_host_placeholder: false,
-            });
+        match self.chats.entry(chat_id) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Chat {
+                    id: chat_id,
+                    title: format!("Relay via {}", relay_server),
+                    kind: ChatKind::Dm,
+                    transport: Transport::Relay,
+                    peer_fingerprint: None,
+                    participants: Vec::new(),
+                    messages: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    peer_typing: false,
+                    typing_since: None,
+                    send_seq: 0,
+                    recv_seq: 0,
+                    is_host_placeholder: false,
+                });
+            }
+            // Reconnecting or a chat pre-created elsewhere (e.g. the contacts
+            // dialog defaults to Direct): normalize its route metadata to Relay so
+            // it isn't persisted or rendered as a direct chat.
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().transport = Transport::Relay;
+            }
         }
 
         self.sessions.insert(chat_id, SessionHandle { from_app_tx });
@@ -1682,12 +1690,21 @@ impl ChatManager {
                     crate::util::format_fingerprint_short(&fingerprint)
                 );
 
+                // Inherit the transport of the host session that accepted this peer:
+                // a relay-hosted listener (`start_host_via_relay`) must produce a
+                // Relay chat, not a hardcoded Direct one.
+                let inherited_transport = self
+                    .chats
+                    .get(&chat_id)
+                    .map(|c| c.transport)
+                    .unwrap_or(Transport::Direct);
+
                 // Create a chat for this new connection
                 self.chats.entry(incoming_chat_id).or_insert_with(|| Chat {
                     id: incoming_chat_id,
                     title,
                     kind: ChatKind::Dm,
-                    transport: Transport::Direct,
+                    transport: inherited_transport,
                     peer_fingerprint: Some(fingerprint.clone()),
                     participants: Vec::new(),
                     messages: Vec::new(),

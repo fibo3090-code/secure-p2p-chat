@@ -31,6 +31,15 @@ const realApi = {
   myInviteLink: () => invoke("my_invite_link"),
   importInvite: (link) => invoke("import_invite", { link }),
   connectContact: (id) => invoke("connect_contact", { id }),
+  // Communities (Party servers). Single-word command params by convention.
+  partyJoin: (address, username, password) => invoke("party_join", { address, username, password }),
+  partyList: () => invoke("party_list"),
+  partyHistory: (server, channel) => invoke("party_history", { server, channel }),
+  partyPost: (server, channel, text) => invoke("party_post", { server, channel, text }),
+  partyCreateChannel: (server, name) => invoke("party_create_channel", { server, name }),
+  partySendDm: (server, to, text) => invoke("party_send_dm", { server, to, text }),
+  partyDmHistory: (server, peer) => invoke("party_dm_history", { server, peer }),
+  partyClearError: (server) => invoke("party_clear_error", { server }),
 };
 
 // ── Dev mock ────────────────────────────────────────────────────────────────
@@ -67,8 +76,31 @@ function makeMock() {
     id: c.id, title: c.title,
     last: c.messages.length ? (c.messages.at(-1).content.text || "") : null,
     connected: !!connected[c.id], placeholder: c.is_host_placeholder,
+    verified: !!c.peer_fingerprint,
   }));
   const ok = async () => {};
+  // ── Party (Communities) mock — a single joinable server with two channels ──
+  const partyState = { servers: [], msgs: {} }; // msgs keyed by `${server}|${thread}`
+  function seedParty(address, username) {
+    const sid = "srv-" + Math.random().toString(36).slice(2, 8);
+    const me = "mem-me";
+    const gen = "ch-general", rnd = "ch-random";
+    partyState.servers = [{
+      id: sid, name: address.split(":")[0] || "Community", address,
+      fingerprint: "5f3a9c2e7b1d4068aa22cc55ee88ff00112233445566778899aabbccddeeff11",
+      status: "joined", status_detail: null, member_id: me, last_error: null,
+      channels: [{ id: gen, name: "general" }, { id: rnd, name: "random" }],
+      members: [
+        { id: me, username: username || "you", online: true, is_me: true },
+        { id: "mem-nova", username: "nova", online: true, is_me: false },
+        { id: "mem-kite", username: "kite", online: false, is_me: false },
+      ],
+    }];
+    partyState.msgs[`${sid}|${gen}`] = [
+      { sender_name: "nova", from_me: false, kind: "text", text: "welcome to the community 👋", size: null, timestamp: Date.now() - 60000 },
+    ];
+    partyState.msgs[`${sid}|${rnd}`] = [];
+  }
   return {
     authStatus: async () => ({ state: authState, name: "Maya", fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
     unlock: async () => { authState = "ready"; },
@@ -87,6 +119,22 @@ function makeMock() {
     myInviteLink: async () => "chat-p2p://invite/eyJuYW1lIjoiTWF5YSIsImFkZHJlc3MiOiIxOTIuMTY4LjEuOToxMjM0NSJ9",
     importInvite: async () => ({ id: "c3", name: "Imported", fingerprint: "abc", address: "1.2.3.4:12345", trust: "unverified" }),
     connectContact: ok,
+    partyJoin: async (address, username) => { seedParty(address, username); return partyState.servers[0].id; },
+    partyList: async () => partyState.servers,
+    partyHistory: async (server, channel) => partyState.msgs[`${server}|${channel}`] || [],
+    partyPost: async (server, channel, text) => {
+      (partyState.msgs[`${server}|${channel}`] ||= []).push({ sender_name: "you", from_me: true, kind: "text", text, size: null, timestamp: Date.now() });
+    },
+    partyCreateChannel: async (server, name) => {
+      const s = partyState.servers.find((x) => x.id === server);
+      if (s) { const id = "ch-" + Math.random().toString(36).slice(2, 7); s.channels.push({ id, name }); partyState.msgs[`${server}|${id}`] = []; }
+    },
+    partySendDm: async (server, to, text) => {
+      const key = `${server}|dm-${to}`;
+      (partyState.msgs[key] ||= []).push({ sender_name: "you", from_me: true, kind: "text", text, size: null, timestamp: Date.now() });
+    },
+    partyDmHistory: async (server, peer) => partyState.msgs[`${server}|dm-${peer}`] || [],
+    partyClearError: async (server) => { const s = partyState.servers.find((x) => x.id === server); if (s) s.last_error = null; },
   };
 }
 
@@ -115,31 +163,41 @@ function human(n) {
   return n.toFixed(i ? 1 : 0) + " " + u[i];
 }
 
+// Both adapters normalize kind/transport identically (backends emit either
+// casing across summary vs detail payloads) so a conversation keeps the same
+// shape whichever payload arrived last.
+function normalizeKind(value) { return String(value || "dm").toLowerCase(); }
+function normalizeTransport(value) { return String(value || "direct").toLowerCase(); }
+
 export function summaryToConv(s) {
+  const transport = normalizeTransport(s.transport);
   return {
     id: s.id, name: s.title,
     last: s.last || (s.connected ? "Connected" : s.placeholder ? "Waiting for a peer…" : ""),
     lastT: "", typing: false,
-    kind: s.kind || "dm",
-    transport: s.transport || "direct",
-    relay: s.transport === "relay" || s.transport === "server",
+    kind: normalizeKind(s.kind),
+    transport,
+    relay: transport === "relay" || transport === "server",
     state: s.connected ? "connected" : s.placeholder ? "hosting" : "offline",
-    trust: "verified", unread: 0, placeholder: s.placeholder,
+    // Only claim "verified" once the fingerprint was actually confirmed.
+    trust: s.verified ? "verified" : "unverified", unread: 0, placeholder: s.placeholder,
   };
 }
 
 export function chatToContact(chat, connected) {
   if (!chat) return null;
+  const transport = normalizeTransport(chat.transport);
   return {
     id: chat.id, name: chat.title,
     state: connected ? "connected" : chat.is_host_placeholder ? "hosting" : "offline",
-    trust: "verified",
+    // A stored peer fingerprint means TOFU verification has completed.
+    trust: chat.peer_fingerprint ? "verified" : "unverified",
     fingerprint: chat.peer_fingerprint || "",
     address: chat.peer_fingerprint ? chat.peer_fingerprint.slice(0, 16) + "…" : "",
     placeholder: chat.is_host_placeholder,
-    kind: (chat.kind || "Dm").toLowerCase(),
-    transport: (chat.transport || "Direct").toLowerCase(),
-    relay: chat.transport === "Relay" || chat.transport === "Server",
+    kind: normalizeKind(chat.kind),
+    transport,
+    relay: transport === "relay" || transport === "server",
     members: 0, typing: false,
     messages: (chat.messages || []).map((m) => {
       const c = m.content || {};

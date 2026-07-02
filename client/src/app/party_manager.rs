@@ -275,6 +275,14 @@ impl PartyManager {
         self.servers.get(&server_id)
     }
 
+    /// Clear a server's last surfaced error (e.g. after the UI shows and the user
+    /// dismisses a rejected-post banner). No-op for an unknown server.
+    pub fn clear_server_error(&mut self, server_id: Uuid) {
+        if let Some(conn) = self.servers.get_mut(&server_id) {
+            conn.last_error = None;
+        }
+    }
+
     pub fn server_ids(&self) -> Vec<Uuid> {
         self.servers.keys().copied().collect()
     }
@@ -540,6 +548,15 @@ mod tests {
             Some("channel is locked"),
             "a server Error reply must surface, not be silently dropped"
         );
+
+        // The UI can dismiss it once shown.
+        mgr.clear_server_error(id);
+        assert!(
+            mgr.server(id).unwrap().last_error.is_none(),
+            "a dismissed server error must be cleared"
+        );
+        // Clearing an unknown server is a harmless no-op.
+        mgr.clear_server_error(Uuid::new_v4());
     }
 
     #[test]

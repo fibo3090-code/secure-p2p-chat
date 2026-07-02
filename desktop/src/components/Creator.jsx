@@ -41,6 +41,7 @@ export function Creator({ open, onClose }) {
   const [importLink, setImportLink] = useState("");
   const [err, setErr] = useState("");
   const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (open && mode === "invite" && !myLink) {
@@ -51,6 +52,15 @@ export function Creator({ open, onClose }) {
   function reset() { setErr(""); setNote(""); setHostToken(""); }
   function done(msg) { if (msg) { setNote(msg); } else onClose(); }
 
+  // Single in-flight guard: each connect/host call creates a session in
+  // ChatManager, so a double-submit (repeat click or Enter) would spawn
+  // duplicate conversations / overlapping host attempts.
+  async function run(fn) {
+    if (busy) return;
+    setBusy(true);
+    try { await fn(); } finally { setBusy(false); }
+  }
+
   async function connect() {
     reset();
     const raw = addr.trim();
@@ -58,38 +68,48 @@ export function Creator({ open, onClose }) {
     const i = raw.lastIndexOf(":");
     const h = i > -1 ? raw.slice(0, i) : raw;
     const p = i > -1 ? parseInt(raw.slice(i + 1), 10) || 12345 : 12345;
-    try { await api.connectPeer(h, p); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(String(e)); }
+    await run(async () => {
+      try { await api.connectPeer(h, p); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(String(e)); }
+    });
   }
   async function host() {
     reset();
     const p = parseInt(port, 10) || 12345;
-    try { await api.startHost(p); toast(`Hosting on :${p} — waiting for a peer`, "success"); onClose(); } catch (e) { setErr(String(e)); }
+    await run(async () => {
+      try { await api.startHost(p); toast(`Hosting on :${p} — waiting for a peer`, "success"); onClose(); } catch (e) { setErr(String(e)); }
+    });
   }
   async function relayConnect() {
     reset();
     if (!relay.trim()) return setErr("Enter the relay address.");
     if (!relayToken.trim()) return setErr("Enter the connection token your peer shared.");
-    try { await api.connectViaRelay(relay.trim(), relayToken.trim()); toast(`Connecting via relay ${relay.trim()}…`); onClose(); }
-    catch (e) { setErr(String(e)); }
+    await run(async () => {
+      try { await api.connectViaRelay(relay.trim(), relayToken.trim()); toast(`Connecting via relay ${relay.trim()}…`); onClose(); }
+      catch (e) { setErr(String(e)); }
+    });
   }
   async function relayHost() {
     reset();
     if (!relay.trim()) return setErr("Enter the relay address to broker through.");
-    try {
-      const token = await api.hostViaRelay(relay.trim());
-      setHostToken(token);
-      toast("Relay session open — share the relay + token", "success");
-    } catch (e) { setErr(String(e)); }
+    await run(async () => {
+      try {
+        const token = await api.hostViaRelay(relay.trim());
+        setHostToken(token);
+        toast("Relay session open — share the relay + token", "success");
+      } catch (e) { setErr(String(e)); }
+    });
   }
   async function doImport() {
     reset();
     if (!importLink.trim()) return setErr("Paste an invite link.");
-    try {
-      const c = await api.importInvite(importLink.trim());
-      setImportLink("");
-      try { await api.connectContact(c.id); onClose(); }
-      catch { done(`Saved ${c.name} to contacts.`); }
-    } catch (e) { setErr(String(e)); }
+    await run(async () => {
+      try {
+        const c = await api.importInvite(importLink.trim());
+        setImportLink("");
+        try { await api.connectContact(c.id); onClose(); }
+        catch { done(`Saved ${c.name} to contacts.`); }
+      } catch (e) { setErr(String(e)); }
+    });
   }
 
   return (
@@ -122,7 +142,7 @@ export function Creator({ open, onClose }) {
             <Input value={addr} autoFocus placeholder="192.168.1.20:12345"
               onChange={(e) => setAddr(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && connect()} />
-            <Button icon="send" onClick={connect}>Connect</Button>
+            <Button icon="send" onClick={connect} disabled={busy}>Connect</Button>
           </div>
         </div>
       )}
@@ -138,7 +158,7 @@ export function Creator({ open, onClose }) {
             <Input value={relayToken} placeholder="Connection token from your peer"
               onChange={(e) => setRelayToken(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && relayConnect()} />
-            <Button icon="satellite" onClick={relayConnect}>Connect</Button>
+            <Button icon="satellite" onClick={relayConnect} disabled={busy}>Connect</Button>
           </div>
         </div>
       )}
@@ -148,7 +168,7 @@ export function Creator({ open, onClose }) {
           <p className="creator-lead"><strong>Wait for a peer</strong> to dial you. Share your address (or an invite link) and keep the app open.</p>
           <div className="creator-row">
             <Input value={port} onChange={(e) => setPort(e.target.value)} style={{ maxWidth: 130 }} />
-            <Button variant="ghost" icon="server" onClick={host}>Start hosting</Button>
+            <Button variant="ghost" icon="server" onClick={host} disabled={busy}>Start hosting</Button>
           </div>
         </div>
       )}
@@ -160,7 +180,7 @@ export function Creator({ open, onClose }) {
             <Input value={relay} autoFocus placeholder="relay.example.com:9000"
               onChange={(e) => setRelay(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && relayHost()} />
-            <Button variant="ghost" icon="satellite" onClick={relayHost}>Open relay</Button>
+            <Button variant="ghost" icon="satellite" onClick={relayHost} disabled={busy}>Open relay</Button>
           </div>
           {hostToken && (
             <>
@@ -180,7 +200,7 @@ export function Creator({ open, onClose }) {
             <Input value={importLink} placeholder="chat-p2p://invite/…"
               onChange={(e) => setImportLink(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && doImport()} />
-            <Button icon="plus" onClick={doImport}>Add</Button>
+            <Button icon="plus" onClick={doImport} disabled={busy}>Add</Button>
           </div>
         </div>
       )}

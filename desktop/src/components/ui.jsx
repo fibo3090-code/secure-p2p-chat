@@ -99,14 +99,24 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub }
   if (!open) return null;
   return (
     <div className="modal-scrim" onMouseDown={onClose}>
-      <div className="modal" style={{ width }} onMouseDown={(e) => e.stopPropagation()}>
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? "modal-title" : undefined}
+        aria-describedby={sub ? "modal-sub" : undefined}
+        tabIndex={-1}
+        style={{ width }}
+        onKeyDown={(e) => { if (e.key === "Escape") onClose?.(); }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         {title && (
           <div className="modal-head">
             <div className="modal-head-l">
               {icon && <span className="modal-icon"><Icon name={icon} size={18} /></span>}
               <div>
-                <div className="modal-title">{title}</div>
-                {sub && <div className="modal-sub">{sub}</div>}
+                <div id="modal-title" className="modal-title">{title}</div>
+                {sub && <div id="modal-sub" className="modal-sub">{sub}</div>}
               </div>
             </div>
             <button className="icon-btn" onClick={onClose} aria-label="Close"><Icon name="x" size={18} /></button>

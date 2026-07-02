@@ -130,6 +130,9 @@ export default function App() {
   async function openConv(id) {
     setActiveId(id);
     setNav("chats");
+    // Drafts are per-conversation: clear on switch so unsent text can't follow
+    // the user into another thread and be sent to the wrong recipient.
+    setDraft("");
     try {
       const chat = await api.getConversation(id);
       setActive(chatToContact(chat, convs.find((c) => c.id === id)?.connected));
@@ -210,7 +213,7 @@ export default function App() {
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
-                onVerify={(c) => setFpReq({ chat_id: c.id, peer_name: c.name, fingerprint: c.fingerprint || "" })}
+                onVerify={(c) => setInfoTarget(c)}
                 onRename={(c) => setRenameTarget(c)}
                 onDelete={(c) => setDeleteTarget(c)}
                 onInfo={(c) => setInfoTarget(c)} />
