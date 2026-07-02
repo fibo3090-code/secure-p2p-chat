@@ -770,8 +770,17 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                         );
                                     }
 
-                                    // 3. Asynchronously connect to the peer — only if an address is present
-                                    if contact_clone.address.is_some() {
+                                    // 3. Asynchronously connect — for any contact we
+                                    // can route (a direct address OR a relay
+                                    // server+token). ChatManager::connect_to_contact
+                                    // is the single source of truth and picks the
+                                    // transport from the contact's data, so a
+                                    // relay-only contact reaches the relay path
+                                    // instead of opening a dead direct chat.
+                                    let can_connect = contact_clone.address.is_some()
+                                        || (contact_clone.relay_server.is_some()
+                                            && contact_clone.relay_token.is_some());
+                                    if can_connect {
                                         if let Some(ref pk) = privkey {
                                             if let Err(e) = mgr
                                                 .connect_to_contact(contact_clone.id, Some(chat_id), pk)
@@ -791,7 +800,7 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                         mgr.add_toast(
                                             crate::types::ToastLevel::Info,
                                             format!(
-                                                "No address for {}. Open 'Connect to Host' to connect this chat.",
+                                                "No address or relay for {}. Open 'Connect to Host' to connect this chat.",
                                                 contact_clone.name
                                             ),
                                         );

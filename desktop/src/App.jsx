@@ -130,6 +130,9 @@ export default function App() {
   async function openConv(id) {
     setActiveId(id);
     setNav("chats");
+    // Drafts are per-conversation: clear on switch so unsent text can't follow
+    // the user into another thread and be sent to the wrong recipient.
+    setDraft("");
     try {
       const chat = await api.getConversation(id);
       setActive(chatToContact(chat, convs.find((c) => c.id === id)?.connected));
@@ -210,7 +213,16 @@ export default function App() {
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
-                onVerify={(c) => setFpReq({ chat_id: c.id, peer_name: c.name, fingerprint: c.fingerprint || "" })}
+                onVerify={async (c) => {
+                  // Open the accept/reject dialog only when a real TOFU request
+                  // is pending for this chat; an established chat has nothing to
+                  // confirm, so show the read-only fingerprint instead.
+                  try {
+                    const p = await api.pendingFingerprint();
+                    if (p && p.chat_id === c.id) { setFpReq(p); return; }
+                  } catch { /* ignore */ }
+                  setInfoTarget(c);
+                }}
                 onRename={(c) => setRenameTarget(c)}
                 onDelete={(c) => setDeleteTarget(c)}
                 onInfo={(c) => setInfoTarget(c)} />

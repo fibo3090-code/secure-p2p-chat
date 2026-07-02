@@ -173,7 +173,7 @@
 .party-msg-text { color: var(--text); font-size: 13.5px; line-height: 1.45; }
 .party-composer { flex: none; display: flex; align-items: center; gap: 9px; padding-top: 14px; }
 .party-inspector { min-width: 0; padding: 22px 20px; border-left: 1px solid var(--border); background: color-mix(in oklab, var(--s1) 52%, transparent); overflow-y: auto; }
-.pd-token code { display: block; color: var(--text); font-family: var(--mono); font-size: 12px; line-height: 1.7; word-break: break-word; }
+.pd-token code { display: block; color: var(--text); font-family: var(--mono); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .rl-connect { margin: 18px 0 24px; }
 .rl-connect-row { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(120px, .7fr) auto; gap: 9px; align-items: center; }
 .rl-r-right .cc-act { margin-left: auto; }

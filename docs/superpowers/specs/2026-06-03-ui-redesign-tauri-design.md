@@ -65,7 +65,7 @@ theme toggle · lock.
 
 ## Architecture
 
-```
+```text
 React (Vite) ──Tauri commands──▶ Rust bridge ──▶ ChatManager (unchanged)
    webview   ◀──event stream───   (src-tauri)        │
                                                 core / network / crypto / identity

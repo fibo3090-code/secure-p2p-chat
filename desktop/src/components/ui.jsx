@@ -1,6 +1,6 @@
 // Shared presentational primitives — clean ES-module port of the mockup's
 // ui.jsx, reusing the same class names so the design-system CSS applies.
-import { useState } from "react";
+import { useState, useId, useRef, useEffect } from "react";
 import { Icon } from "../lib/Icon.jsx";
 
 export const cx = (...a) => a.filter(Boolean).join(" ");
@@ -96,17 +96,36 @@ export function PasswordInput(props) {
 }
 
 export function Modal({ open, onClose, children, width = 460, title, icon, sub }) {
+  // Per-instance ids: several Modals can be mounted at once (rename + verify,
+  // etc.), so static ids would collide and break aria-labelledby/describedby.
+  const titleId = useId();
+  const subId = useId();
+  // Move focus into the dialog on open so the Escape handler is reachable for
+  // keyboard users and screen readers announce it.
+  const ref = useRef(null);
+  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
   if (!open) return null;
   return (
     <div className="modal-scrim" onMouseDown={onClose}>
-      <div className="modal" style={{ width }} onMouseDown={(e) => e.stopPropagation()}>
+      <div
+        ref={ref}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? titleId : undefined}
+        aria-describedby={sub ? subId : undefined}
+        tabIndex={-1}
+        style={{ width }}
+        onKeyDown={(e) => { if (e.key === "Escape") onClose?.(); }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         {title && (
           <div className="modal-head">
             <div className="modal-head-l">
               {icon && <span className="modal-icon"><Icon name={icon} size={18} /></span>}
               <div>
-                <div className="modal-title">{title}</div>
-                {sub && <div className="modal-sub">{sub}</div>}
+                <div id={titleId} className="modal-title">{title}</div>
+                {sub && <div id={subId} className="modal-sub">{sub}</div>}
               </div>
             </div>
             <button className="icon-btn" onClick={onClose} aria-label="Close"><Icon name="x" size={18} /></button>

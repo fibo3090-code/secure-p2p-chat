@@ -1,5 +1,6 @@
-/* Fonts the design system references (degrade to system-ui offline). */
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap");
+/* Fonts intentionally not fetched from any third party: a desktop secure-chat
+   app must stay offline and leak no client metadata on startup. The design
+   system's font-family stacks fall back to system-ui / monospace locally. */
 /* Ported P2PEM design system (tokens, theming, components). */
 @import "./app-system.css";
 /* Extra themes (midnight / forest / rose) + local polish. */

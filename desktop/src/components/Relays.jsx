@@ -33,6 +33,7 @@ export function Relays({ onConnected }) {
   const [busy, setBusy] = useState(false);
 
   async function pair() {
+    if (busy) return;
     if (!host.trim()) return toast("Enter the relay address.", "error");
     if (!token.trim()) return toast("Enter the connection token your peer shared.", "error");
     setBusy(true);
@@ -45,6 +46,7 @@ export function Relays({ onConnected }) {
   }
 
   async function openHost() {
+    if (busy) return;
     if (!host.trim()) return toast("Enter the relay address to broker through.", "error");
     setBusy(true);
     setHostToken("");

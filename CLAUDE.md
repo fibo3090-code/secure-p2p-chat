@@ -54,7 +54,7 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 
 `ChatManager` (`client/src/app/chat_manager.rs`) is the single source of truth for all app state — chats, contacts, sessions, transfers, toasts. It has **zero UI dependencies**, so three front-ends drive the same core:
 
-```
+```text
 ┌── egui GUI ──┐  ┌── ratatui TUI ──┐  ┌── Tauri webview (React) ──┐
 │ client/gui/  │  │ client/tui/     │  │ desktop/src/ (frontend)   │
 └──────┬───────┘  └────────┬────────┘  └─────────────┬─────────────┘
