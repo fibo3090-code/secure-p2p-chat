@@ -36,16 +36,23 @@ export function ConfirmDelete({ target, onClose, onConfirm }) {
   );
 }
 
+const TRANSPORT_LABEL = {
+  direct: "direct (peer-to-peer)",
+  relay: "relayed (blind broker, still end-to-end encrypted)",
+  server: "server (community)",
+};
+
 export function InfoDialog({ target, onClose }) {
   if (!target) return null;
   const fp = target.fingerprint || "";
+  const transport = TRANSPORT_LABEL[target.transport] || TRANSPORT_LABEL.direct;
   return (
     <Modal open onClose={onClose} width={420} title={target.name} icon="info" sub="Conversation details">
       <div className="verify-body">
         {fp ? <SafetyGrid fingerprint={fp} n={8} cell={26} /> : <div className="verify-hint">No fingerprint yet.</div>}
         {fp && <div className="verify-code">{fp.replace(/(.{4})/g, "$1 ").trim()}</div>}
         <div className="verify-hint">
-          Transport: direct (peer-to-peer). End-to-end encrypted with X25519 + AES-256-GCM.
+          Transport: {transport}. End-to-end encrypted with X25519 + AES-256-GCM.
         </div>
         <Button full variant="ghost" icon="x" onClick={onClose}>Close</Button>
       </div>

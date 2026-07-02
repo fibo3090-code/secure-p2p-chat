@@ -6,7 +6,7 @@
 //! runs a background poll loop that drains `SessionEvent`s and notifies the
 //! webview. The frontend (static `dist/`) talks to it over the commands below.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -40,6 +40,47 @@ impl Bridge {
     fn identity_save_path(&self) -> PathBuf {
         self.identity_path.clone()
     }
+}
+
+/// Best-effort encrypted history save, mirroring what the egui app does on a
+/// timer. A no-op while the identity is still locked (no history key) or when
+/// there is nothing to persist. Errors are logged, never propagated — a
+/// transient disk failure must not break a live command.
+///
+/// Without this the desktop app never wrote history back: `unlock` loaded it,
+/// but every message sent or received in a session was lost on restart.
+async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path) {
+    // `history_snapshot()` fails only when the identity is still locked (no
+    // history key); in that state there is nothing to persist. An unlocked but
+    // empty history IS saved on purpose, so deleting the last chat sticks.
+    let snapshot = manager.lock().await.history_snapshot();
+    let Ok((history, key)) = snapshot else {
+        return;
+    };
+    let path = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || history.save_encrypted(&path, &key)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("desktop history save failed: {e}"),
+        Err(e) => tracing::warn!("desktop history save task join failed: {e}"),
+    }
+}
+
+/// A cheap signature of the persisted-state surface (chat count + per-chat
+/// message count and title length). Used by the poll loop to save only when
+/// something actually changed, so received messages are persisted without
+/// rewriting the encrypted history to disk on every idle tick.
+fn state_signature(mgr: &ChatManager) -> u64 {
+    let ids = mgr.chat_ids();
+    let mut sig = ids.len() as u64;
+    for id in &ids {
+        if let Some(c) = mgr.get_chat(*id) {
+            sig = sig
+                .wrapping_mul(1_000_003)
+                .wrapping_add(c.messages.len() as u64)
+                .wrapping_add(c.title.len() as u64);
+        }
+    }
+    sig
 }
 
 // ── DTOs sent to the webview ────────────────────────────────────────────────
@@ -194,7 +235,32 @@ async fn send_message(
         .lock()
         .await
         .send_message(uuid, text)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Pick a file with the native dialog and send it over the given conversation.
+/// The picker runs on a blocking thread so it never stalls the async runtime;
+/// a cancelled dialog is a successful no-op.
+#[tauri::command]
+async fn send_file(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_file())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = picked else {
+        return Ok(()); // user cancelled
+    };
+    state
+        .manager
+        .lock()
+        .await
+        .send_file(uuid, path)
+        .await
+        .map_err(|e| e.to_string())?;
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -288,6 +354,8 @@ async fn confirm_fingerprint(
         .map_err(|e| e.to_string());
     // Resolved either way — clear the pending prompt so the UI doesn't re-show it.
     *state.pending_fp.lock().unwrap() = None;
+    // An accepted fingerprint is persisted onto the chat; save so trust survives a restart.
+    persist_history(&state.manager, &state.history_path).await;
     result
 }
 
@@ -321,13 +389,16 @@ async fn rename_chat(
         .lock()
         .await
         .rename_chat(uuid, title)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
 }
 
 #[tauri::command]
 async fn delete_chat(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     state.manager.lock().await.delete_chat(uuid);
+    persist_history(&state.manager, &state.history_path).await;
     Ok(())
 }
 
@@ -465,6 +536,7 @@ pub fn run() {
             list_conversations,
             get_conversation,
             send_message,
+            send_file,
             start_host,
             connect_peer,
             host_via_relay,
@@ -483,9 +555,20 @@ pub fn run() {
             spawn_poll_loop(
                 app.handle().clone(),
                 b.manager.clone(),
+                b.history_path.clone(),
                 b.pending_fp.clone(),
             );
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Flush history synchronously on close so the final session state
+            // (last messages, deletions) is never lost between poll-loop ticks.
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let bridge = window.state::<Bridge>();
+                let manager = bridge.manager.clone();
+                let path = bridge.history_path.clone();
+                tauri::async_runtime::block_on(persist_history(&manager, &path));
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running P2PEM");
@@ -543,13 +626,18 @@ fn toast_level_str(l: ToastLevel) -> &'static str {
 fn spawn_poll_loop(
     app: tauri::AppHandle,
     manager: Arc<Mutex<ChatManager>>,
+    history_path: PathBuf,
     pending_fp: Arc<StdMutex<Option<(String, String, String)>>>,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
+        // Seeded from the first observed state so an unchanged session never
+        // triggers a spurious write; only real changes (notably peer messages
+        // arriving via poll_session_events) are persisted.
+        let mut last_saved_sig: Option<u64> = None;
         loop {
             interval.tick().await;
-            let (req, toasts) = {
+            let (req, toasts, sig) = {
                 let mut m = manager.lock().await;
                 m.poll_session_events();
                 // Drain ChatManager's internal toasts (Connected, errors,
@@ -559,8 +647,15 @@ fn spawn_poll_loop(
                     .map(|t| (toast_level_str(t.level), t.message))
                     .collect();
                 let req = m.fingerprint_verification_request.take();
-                (req, toasts)
+                let sig = state_signature(&m);
+                (req, toasts, sig)
             };
+            // Persist when the conversation surface changed (e.g. a received
+            // message). User-initiated commands save themselves immediately.
+            if last_saved_sig != Some(sig) {
+                persist_history(&manager, &history_path).await;
+                last_saved_sig = Some(sig);
+            }
             for (level, message) in toasts {
                 let _ = app.emit(
                     "toast",

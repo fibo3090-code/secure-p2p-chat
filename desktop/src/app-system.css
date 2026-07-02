@@ -285,11 +285,15 @@ input,textarea{font-family:inherit;color:inherit}
 .file-dl{flex:none;display:grid;place-items:center;width:34px;height:34px;border-radius:var(--r-sm);
   color:var(--dim);background:var(--s3)}
 .file-dl:hover{color:var(--text);background:var(--s4)}
+.file-status{flex:none;display:grid;place-items:center;width:34px;height:34px;border-radius:var(--r-sm);
+  color:var(--dim);background:var(--s3)}
+.file-status.is-done{color:var(--success)}
 /* composer */
 .composer{flex:none;display:flex;align-items:flex-end;gap:9px;padding:13px 18px;background:var(--s1);
   border-top:1px solid var(--border)}
 .composer-clip{flex:none;display:grid;place-items:center;width:40px;height:40px;border-radius:var(--r-sm);color:var(--dim)}
-.composer-clip:hover{background:var(--s3);color:var(--text)}
+.composer-clip:hover:not(:disabled){background:var(--s3);color:var(--text)}
+.composer-clip:disabled{opacity:.4;cursor:not-allowed}
 .composer-input{flex:1;resize:none;background:var(--s2);border:1px solid var(--border);border-radius:var(--radius);
   padding:11px 14px;font-size:var(--fs);max-height:140px;outline:none;line-height:1.45}
 .composer-input:focus{border-color:transparent;box-shadow:0 0 0 1.5px var(--accent)}

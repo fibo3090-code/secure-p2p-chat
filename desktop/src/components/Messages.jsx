@@ -86,15 +86,21 @@ function MessageItem({ m }) {
   }
   if (m.kind === "file") {
     const mine = m.from === "me";
+    const done = m.progress >= 100;
+    // Received files are auto-saved to the configured download directory, so a
+    // completed card shows a "saved" state rather than a dead download button.
+    const sub = done ? (mine ? "sent" : "saved to Downloads") : m.progress + "%";
     return (
       <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
         <div className={cx("file-card", mine && "is-mine")}>
           <span className="file-ic"><Icon name="file" size={20} /></span>
           <div className="file-meta">
             <div className="file-name">{m.name}</div>
-            <div className="file-sub">{m.size} · {m.progress >= 100 ? "transfer complete" : m.progress + "%"}</div>
+            <div className="file-sub">{m.size} · {sub}</div>
           </div>
-          <button className="file-dl"><Icon name={m.progress >= 100 ? "download" : "x"} size={16} /></button>
+          <span className={cx("file-status", done && "is-done")} title={sub}>
+            <Icon name={done ? "check" : "clock"} size={16} />
+          </span>
         </div>
       </div>
     );
@@ -111,7 +117,7 @@ function MessageItem({ m }) {
   );
 }
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, draft, setDraft, onSend }) {
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend }) {
   const scrollRef = useRef(null);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -156,7 +162,9 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, draft,
       </div>
 
       <div className="composer">
-        <button className="composer-clip" title="Send file"><Icon name="paperclip" size={19} /></button>
+        <button className="composer-clip" title="Send file"
+          disabled={contact.state !== "connected"}
+          onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
         <textarea className="composer-input" rows={1} placeholder={`Message ${contact.name.split(" ")[0]}…`}
           value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }} />

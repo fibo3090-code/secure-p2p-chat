@@ -140,8 +140,16 @@ export default function App() {
     const text = draft.trim();
     if (!text || !activeId) return;
     setDraft("");
-    try { await api.sendMessage(activeId, text); } catch (e) { toast(String(e), "error"); }
+    // Restore the draft if the send fails, so a transient error doesn't lose
+    // what the user typed — they can just press Enter again.
+    try { await api.sendMessage(activeId, text); }
+    catch (e) { setDraft(text); toast(String(e), "error"); return; }
     refresh();
+  }
+
+  async function sendFile(c) {
+    try { await api.sendFile(c.id); refresh(); }
+    catch (e) { toast(String(e), "error"); }
   }
 
   async function doRename(id, title) {
@@ -201,6 +209,7 @@ export default function App() {
             </aside>
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
+                onSendFile={sendFile}
                 onVerify={(c) => setFpReq({ chat_id: c.id, peer_name: c.name, fingerprint: c.fingerprint || "" })}
                 onRename={(c) => setRenameTarget(c)}
                 onDelete={(c) => setDeleteTarget(c)}

@@ -5062,6 +5062,7 @@ dependencies = [
  "encodeur_rsa_rust",
  "log",
  "messenger-core",
+ "rfd",
  "serde",
  "serde_json",
  "tauri",
