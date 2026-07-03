@@ -1572,6 +1572,16 @@ impl ChatManager {
             .map(|(&cid, _)| cid)
             .unwrap_or(session_id);
 
+        // Have we already confirmed this fingerprint elsewhere (another chat with
+        // this peer, or a saved contact)? Then it's a returning peer under TOFU and
+        // we accept without another prompt. Computed before the mutable borrow below.
+        let known_trusted = self.chats.iter().any(|(id, c)| {
+            *id != actual_chat_id && c.peer_fingerprint.as_deref() == Some(fingerprint)
+        }) || self
+            .contacts
+            .values()
+            .any(|c| c.fingerprint.as_deref() == Some(fingerprint));
+
         let chat = match self.chats.get_mut(&actual_chat_id) {
             Some(c) => c,
             None => {
@@ -1587,8 +1597,9 @@ impl ChatManager {
                     "Trust on First Use for chat {}. Requesting user confirmation.",
                     actual_chat_id
                 );
-                // If user opted into auto-trust (not recommended), allow it.
-                if self.config.auto_trust_on_first_use {
+                // Auto-trust only if the user opted in, or this fingerprint is one
+                // we've already verified (a returning peer) — otherwise prompt.
+                if self.config.auto_trust_on_first_use || known_trusted {
                     tracing::info!(
                         "auto_trust_on_first_use enabled: auto-storing fingerprint for chat {}",
                         actual_chat_id
@@ -1710,7 +1721,10 @@ impl ChatManager {
                         title,
                         kind: ChatKind::Dm,
                         transport: inherited_transport,
-                        peer_fingerprint: Some(fingerprint.clone()),
+                        // Leave unset so TOFU actually runs for this incoming peer:
+                        // pre-filling the peer's own fingerprint made the check below
+                        // trivially "match" and silently auto-trust every caller.
+                        peer_fingerprint: None,
                         participants: Vec::new(),
                         messages: Vec::new(),
                         created_at: chrono::Utc::now(),
@@ -2396,6 +2410,60 @@ mod tests {
         assert!(
             contact.address.is_none(),
             "placeholder address must be ignored"
+        );
+    }
+
+    #[test]
+    fn host_prompts_for_an_unknown_incoming_fingerprint() {
+        // Simulate an incoming connection: a fresh chat (no stored fingerprint)
+        // mapped from the peer's chat id to the session id, plus a confirm channel.
+        let mut mgr = ChatManager::new(Config::default());
+        let session_id = Uuid::new_v4();
+        let incoming = Uuid::new_v4();
+        mgr.create_local_chat_for_test(incoming, "Peer".into());
+        mgr.chat_id_mapping.insert(incoming, session_id);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+        mgr.handle_tofu_verification(session_id, "UNKNOWN-FP", "Peer");
+
+        // The host must PROMPT for verification, not silently auto-trust.
+        assert!(
+            mgr.fingerprint_verification_request.is_some(),
+            "host must prompt to verify an unknown incoming peer"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "host must not auto-confirm an unknown incoming peer"
+        );
+    }
+
+    #[test]
+    fn host_auto_accepts_a_returning_known_fingerprint() {
+        // A prior chat already has this fingerprint verified (a returning peer).
+        let mut mgr = ChatManager::new(Config::default());
+        let prior = Uuid::new_v4();
+        mgr.create_local_chat_for_test(prior, "Known".into());
+        mgr.get_chat_mut(prior).unwrap().peer_fingerprint = Some("KNOWN-FP".into());
+
+        let session_id = Uuid::new_v4();
+        let incoming = Uuid::new_v4();
+        mgr.create_local_chat_for_test(incoming, "Peer".into());
+        mgr.chat_id_mapping.insert(incoming, session_id);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+        mgr.handle_tofu_verification(session_id, "KNOWN-FP", "Peer");
+
+        // Returning peer: auto-confirmed without re-prompting.
+        assert!(
+            mgr.fingerprint_verification_request.is_none(),
+            "a known fingerprint must not trigger another prompt"
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(true),
+            "a known fingerprint must be auto-confirmed"
         );
     }
 
