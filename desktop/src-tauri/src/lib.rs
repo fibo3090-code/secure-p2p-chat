@@ -904,11 +904,27 @@ pub fn run() {
 
 /// Build the identity + manager, mirroring `gui::App::new`'s data-dir setup.
 fn init_bridge() -> Bridge {
-    let proj = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
-    let (history_path, identity, is_new) = if let Some(dirs) = proj {
-        let data = dirs.data_dir();
-        std::fs::create_dir_all(data).ok();
-        let (id, isnew) = Identity::get_or_create(data, "User").unwrap_or_else(|e| {
+    // The data dir holds `identity.json` (this peer's key/fingerprint) and the
+    // encrypted history. It uses the desktop app's OWN identifier ("P2PEM"), NOT
+    // the egui app's ("EncryptedMessenger"): sharing one dir made both apps load
+    // the same identity, so they were the same P2P peer and could not connect to
+    // each other (a connection between them was a self-connection). With distinct
+    // dirs the two apps are distinct peers and connect normally.
+    //
+    // `P2PEM_DATA_DIR` overrides it, so extra instances can each run with their
+    // own identity/history — handy for testing several peers on one machine:
+    //   P2PEM_DATA_DIR=%LOCALAPPDATA%\p2pem-test cargo tauri dev
+    let data_dir: Option<PathBuf> = std::env::var_os("P2PEM_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            directories::ProjectDirs::from("com", "chat-p2p", "P2PEM")
+                .map(|dirs| dirs.data_dir().to_path_buf())
+        });
+
+    let (history_path, identity, is_new) = if let Some(data) = data_dir {
+        std::fs::create_dir_all(&data).ok();
+        tracing::info!(data_dir = %data.display(), "using data directory");
+        let (id, isnew) = Identity::get_or_create(&data, "User").unwrap_or_else(|e| {
             tracing::error!("identity load/create failed: {e}; falling back to plaintext");
             (
                 Identity::new_with_plaintext("User".to_string()).expect("identity"),
