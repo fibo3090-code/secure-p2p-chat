@@ -25,12 +25,15 @@ This repository is intentionally documented in layers. Before changing code, rea
 Run these before opening a PR:
 
 ```bash
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace          # or: cargo test --workspace
 ```
 
-If you touch packaging or release files, also validate the relevant scripts manually.
+If you changed the Tauri desktop crate (`desktop/`), also run
+`cargo check -p p2pem-desktop` and `cd desktop && npm run build` (it has no
+automated tests). If you touch packaging or release files, validate the relevant
+scripts manually.
 
 ## Bug Reports
 
@@ -42,9 +45,10 @@ Check the docs first so the report is based on current behavior, not an outdated
 
 - [ ] Scope is focused and reviewable.
 - [ ] Tests added or updated, or rationale provided.
-- [ ] `cargo fmt -- --check` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` passes.
-- [ ] `cargo test` passes.
+- [ ] `cargo fmt --all -- --check` passes.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.
+- [ ] `cargo nextest run --workspace` (or `cargo test --workspace`) passes.
+- [ ] If `desktop/` changed: `cargo check -p p2pem-desktop` and `npm run build` pass.
 - [ ] Relevant docs updated.
 - [ ] `CHANGELOG.md` updated for user-visible changes.
 

@@ -74,8 +74,11 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 - **ChatManager**: all state changes (persisting, session mapping, chat ops) go through its methods. egui/TUI hold `Arc<Mutex<ChatManager>>` directly; the Tauri bridge wraps the same `Arc<Mutex<ChatManager>>` and exposes it via `#[tauri::command]`s.
 - **Async**: `tokio` throughout; `tokio::spawn` background tasks; `tokio::sync::mpsc` (often `unbounded_channel()`) for low-latency messaging. Bridge and egui share one runtime.
 - **Session Events**: the network layer emits `SessionEvent` (`Listening`, `Connected`, `NewConnection`, `ShowFingerprintVerification`, `MessageReceived`, `Disconnected`, `Error`, `Warning`); UIs poll `ChatManager::poll_session_events()`.
+- **LAN peer discovery**: `core/src/network/discovery.rs` advertises `_p2p-messenger._tcp.local.` (mDNS/Bonjour) when hosting and browses for peers, yielding `DiscoveredPeer { name, address, port, fingerprint }`. All three UIs surface it (egui dialogs, TUI overlays, desktop bridge) so nearby peers can be connected without typing an address. TOFU still applies — discovery only supplies the address, never trust.
 - **Conversation model (Phase 3)**: every `Chat` (`core/src/types.rs`) carries `kind: ChatKind` (`Dm` / `Group` / `Channel`) and `transport: Transport` (`Direct` / `Relay` / `Server`). Both are `#[serde(default)]` for back-compat with old history files. The UI uses these for badges; all 14 `Chat` construction sites set them explicitly.
 - **Protocol v3 handshake (ECDH-first)**: (1) version exchange (plaintext u32), (2) X25519 ephemeral exchange (forward secrecy), (3) HKDF-SHA256 session-key derivation, (4) AES-256-GCM tunnel, (5) identity exchange inside the tunnel (`IdentityProof`, RSA-PSS signature binding ephemeral key → identity), (6) TOFU fingerprint verification.
+- **Automatic key rotation (rekey)**: post-handshake, the message loop in `session.rs` rotates the session key every `REKEY_MESSAGE_COUNT` (100) messages by sending a `ProtocolMessage::Rekey` carrying a 16-byte `REKEY_NONCE_SIZE` HKDF salt; both sides re-derive and the `Rekey` frame is *not* surfaced to the app. It shares the per-session `seq` namespace (replay protection covers it). Covered by `client/tests/key_rotation_tests.rs`.
+- **Text is chunked like files**: messages over `TEXT_CHUNK_BYTES` (48 KiB) are split into `ProtocolMessage::TextChunk` frames and reassembled; a single message is hard-capped at `MAX_TEXT_MESSAGE_BYTES` (64 KiB) and rejected past it (`protocol.rs`).
 
 Authoritative docs: `docs/README.md`, `docs/03_architecture.md`, `docs/04_protocol.md`, `SECURITY.md`. UI-redesign roadmap: `docs/superpowers/specs/2026-06-03-ui-redesign-tauri-design.md`.
 
@@ -127,7 +130,7 @@ Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`).
 
 ## Important Constants (`core/src/lib.rs`)
 
-`PORT_DEFAULT = 12345`, `MAX_PACKET_SIZE = 8 MiB`, `FILE_CHUNK_SIZE = 64 KiB`, `AES_KEY_SIZE = 32`, `AES_NONCE_SIZE = 12`, `HANDSHAKE_TIMEOUT_SECS = 15`, `MAX_FILE_SIZE = 10 GiB`.
+`PORT_DEFAULT = 12345`, `MAX_PACKET_SIZE = 8 MiB`, `FILE_CHUNK_SIZE = 64 KiB`, `MAX_TEXT_MESSAGE_BYTES = 64 KiB`, `TEXT_CHUNK_BYTES = 48 KiB` (leaves metadata headroom), `AES_KEY_SIZE = 32`, `AES_NONCE_SIZE = 12`, `AES_GCM_TAG_SIZE = 16`, `REKEY_NONCE_SIZE = 16`, `RSA_KEY_BITS = 2048`, `HANDSHAKE_TIMEOUT_SECS = 15`, `MAX_FILE_SIZE = 10 GiB`.
 
 ## Testing
 
@@ -142,7 +145,7 @@ Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`).
 - **`p2pem-desktop` has NO automated tests** and is not exercised by `cargo nextest run --workspace` (that's core/client/server only). Verify bridge changes with `cargo check -p p2pem-desktop`; verify the React frontend with `npm run build` in `desktop/`. The Tauri GUI can't be driven headlessly here, so GUI behaviour stays build-verified only.
 - **`desktop/dist/` is tracked in git** (committed build artifacts). Rebuild (`npm run build`) and commit `dist/` alongside frontend source changes, or it goes stale.
 - **Party file downloads must go through `PartyState::blob_bytes_for(member, hash)`** (access-checked), never the raw `blob_bytes`. Content-addressed blobs are stored globally (dedup), so the *download endpoint* is what enforces who may see a file (public-channel members, or DM participants).
-- **`recv_packet` (`core/src/core/framing.rs`) is DoS-hardened**: rejects oversized length prefixes and reads in 64 KiB chunks. `MAX_PACKET_SIZE` (8 MiB) bounds every frame, so text/username/channel-name are only bounded by that — there are no finer per-field length caps yet.
+- **`recv_packet` (`core/src/core/framing.rs`) is DoS-hardened**: rejects oversized length prefixes and reads in 64 KiB chunks. `MAX_PACKET_SIZE` (8 MiB) bounds every frame. Message **text** now has its own cap (`MAX_TEXT_MESSAGE_BYTES` 64 KiB, chunked at 48 KiB — see protocol notes above), but **username and channel-name still have no per-field length cap** — they are only bounded by `MAX_PACKET_SIZE`. UI truncation (ellipsis) is display-only, not a wire limit.
 
 ## Preferred Tools (opencode)
 

@@ -1,6 +1,6 @@
 # Security
 
-**Last Updated:** April 22, 2026
+**Last Updated:** July 3, 2026
 
 This document describes the current security posture of the project, what protections are implemented today, what risks remain open, and how to report issues responsibly.
 
@@ -38,10 +38,21 @@ Reasoning:
 
 - handshake timeouts
 - rate limiting
-- oversized packet rejection
+- oversized packet rejection (DoS-hardened framing: bounded length prefix, chunked reads)
+- automatic session-key rotation (rekey every 100 messages)
 - signed v2 invite links
 - self-hosted relay-assisted transport that forwards only already-encrypted session traffic
+- Party file downloads are access-checked server-side (`blob_bytes_for(member, hash)`): content-addressed blobs are deduplicated globally, so the download endpoint enforces that only channel members or DM participants can fetch a given file
 - checked-in CI for format, lint, cross-platform tests, locked build verification, and tagged release packaging
+
+### Desktop app (Tauri) attack surface
+
+The new Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
+
+- all cryptography stays in Rust; the React webview only calls `#[tauri::command]`s and never handles key material
+- `tauri.conf.json` sets a restrictive **CSP** (`default-src 'self'`; no external hosts, scripts, or fonts) and disables the global Tauri injection (`withGlobalTauri: false`)
+- the desktop app uses its **own** data directory (`ProjectDirs "P2PEM"`), separate from the egui app, so the two are distinct identities rather than sharing one keystore
+- the desktop crate has no automated tests; it is verified by `cargo check` + `npm run build`, so treat its UI logic as build-verified rather than test-covered
 
 ## Current Limits and Open Risks
 

@@ -8,8 +8,12 @@ This document describes the current wire behavior of the application. It should 
 PORT_DEFAULT: 12345
 MAX_PACKET_SIZE: 8 MiB
 FILE_CHUNK_SIZE: 64 KiB
+MAX_TEXT_MESSAGE_BYTES: 64 KiB   // hard cap on a single text message
+TEXT_CHUNK_BYTES: 48 KiB         // split threshold (headroom for metadata)
 AES_KEY_SIZE: 32
 AES_NONCE_SIZE: 12
+AES_GCM_TAG_SIZE: 16
+REKEY_NONCE_SIZE: 16             // HKDF salt carried by a Rekey message
 RSA_KEY_BITS: 2048
 HANDSHAKE_TIMEOUT_SECS: 15
 MAX_FILE_SIZE: 10 GiB
@@ -121,15 +125,28 @@ The transport rejects messages that are:
 
 Handshake-only messages without sequence numbers bypass that validation.
 
+## Large text messages
+
+Text larger than `TEXT_CHUNK_BYTES` (48 KiB) is split by the app layer into
+`TextChunk` messages (`message_id`, `chunk_index`, `total_chunks`, `text_part`) and
+reassembled by the receiver into one logical message. A single message is
+hard-capped at `MAX_TEXT_MESSAGE_BYTES` (64 KiB); encoding or decoding a larger one
+is rejected. Each chunk carries its own `seq`, so replay protection covers chunks
+exactly like file chunks.
+
 ## Rekeying
 
-The transport supports rekeying.
+The transport rotates the session key automatically during the message loop
+(`core/src/network/session.rs`):
 
-Current runtime behavior:
-
-- rekeying is handled at the transport layer
-- the first valid rekey event observed on the active session is processed
-- the runtime does not implement a separate multi-message nonce tie-break exchange
+- after every `REKEY_MESSAGE_COUNT` (100) messages, a side sends a
+  `Rekey { nonce, seq }` message carrying a fresh `REKEY_NONCE_SIZE` (16-byte) salt
+- both peers independently derive the next key as
+  `rekey_session_key(current_key, nonce)` (HKDF), and all subsequent frames use it
+- the `Rekey` frame shares the session `seq` namespace (so it is replay-protected)
+  and is consumed by the transport — it is never surfaced to the application
+- the sender applies the new key immediately after sending; the receiver switches
+  on receipt
 
 ## Invite Links
 

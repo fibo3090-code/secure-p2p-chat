@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- Brought the docs back in sync with the code: the four-crate workspace (adding
+  `p2pem-desktop`), the shipped **Tauri + React** desktop app (the plan docs still
+  described an unshipped SolidJS rewrite), automatic session-key rotation and text
+  chunking in the protocol reference and constants, mDNS LAN discovery, Party file
+  download access control, the corrected pre-workspace `src/` paths in the developer
+  and agent guides, and the current test count (290). Added a webview/IPC/CSP
+  section to `SECURITY.md`, Party-operator and desktop surfaces to `THREAT_MODEL.md`,
+  and a 2026 findings entry to `docs/AUDITS.md`.
+
 ## [1.11.1] - 2026-06-29
 
 ### Fixed

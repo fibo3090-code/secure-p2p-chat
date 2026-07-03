@@ -1,6 +1,13 @@
 # UI Redesign → Tauri + React Web Frontend — Design
 
-**Status:** approved-pending-review · **Date:** 2026-06-03
+**Status:** shipped (phases A–D) · **Date:** 2026-06-03 · **Updated:** 2026-07-03
+
+> This design shipped as the `p2pem-desktop` crate (`desktop/`): React 19 + Vite,
+> plain CSS, `lucide-react` icons, driving the same `ChatManager`/`PartyManager` over
+> a `#[tauri::command]` bridge. P2P, Party, Relay, Contacts, and Settings reached
+> parity; retiring egui and rebuilding the release packaging remain. The canonical,
+> maintained view is `docs/05_platform_spec.md` §10 — treat this file as the
+> original design record.
 
 ## Summary
 

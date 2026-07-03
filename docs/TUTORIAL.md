@@ -228,3 +228,7 @@ Once the first session works, move on to:
 - [USER_GUIDE.md](USER_GUIDE.md) for the full reference
 - [../SECURITY.md](../SECURITY.md) for the app’s actual security posture
 - [../THREAT_MODEL.md](../THREAT_MODEL.md) for assumptions and limits
+
+If you build from source, you can also try the in-development Tauri + React desktop
+app (the future replacement for the egui GUI) with `cd desktop && npx tauri dev` —
+see [USER_GUIDE.md](USER_GUIDE.md#tauri-desktop-app-preview).

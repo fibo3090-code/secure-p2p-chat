@@ -84,6 +84,36 @@ Controls:
 - invalid invite addresses are sanitized during import
 - explicit fingerprint verification workflow
 
+### Party server (Administered tier)
+
+Risks:
+
+- the server operator can read message/file contents (the Administered tier stores **plaintext** by design, to enable offline buffering, search, and simple groups)
+- a member fetching files they should not see
+- a malicious server impersonating a known server
+
+Controls:
+
+- the trust tier is a **server property**, shown to users; the operator wears an explicit "this operator can read messages" badge
+- the client↔server channel uses the same v3 handshake, and the server has its own **TOFU-verified** identity/fingerprint (stable across restarts)
+- file downloads are access-checked server-side (`blob_bytes_for(member, hash)`): only channel members or DM participants can fetch a blob, despite global content-addressed dedup
+
+Residual limitation:
+
+- the Administered tier is not end-to-end encrypted against the operator; the planned E2EE tier (per-channel group keys, ciphertext-only storage) is future work
+
+### Desktop app webview / IPC
+
+Risks:
+
+- a system-webview + IPC boundary is a larger surface than a pure-Rust GUI
+- webview content-injection or an over-permissive command surface
+
+Controls:
+
+- crypto and key material stay in Rust; the React UI only invokes commands
+- a restrictive CSP (`default-src 'self'`, no external hosts) and `withGlobalTauri: false` in `tauri.conf.json`
+
 ## Threat Actors
 
 ### Passive observer
@@ -138,6 +168,21 @@ Mitigation:
 Limitation:
 
 - the app cannot prevent social engineering
+
+### Party server operator
+
+Goal:
+
+- read or retain message/file contents on a server they run
+
+Mitigation:
+
+- honest trust-tier labeling (Administered = operator-readable) so users consent knowingly
+- server-identity TOFU; per-download access checks
+
+Limitation:
+
+- in the Administered tier the operator can read stored plaintext; only the future E2EE tier removes this
 
 ## Known Security Limits
 

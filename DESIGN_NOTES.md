@@ -24,12 +24,21 @@ This document records the current UI/UX principles for the app and the main desi
 - Password setup/unlock remains blocking by design.
 - LAN discovery must not be presented as harmless or always-on.
 
+## Frontends
+
+There are three: the **egui** desktop GUI, the **ratatui** TUI, and the newer
+**Tauri + React desktop app** (`desktop/`), which realizes the designed tab-rail /
+list / content shell described in `docs/05_platform_spec.md` §10 and is meant to
+replace egui. All three drive the same `ChatManager`, so behavior stays consistent;
+the design intent (one mental model, Party as a tab rather than a floating window,
+overlays only for interruptive flows) is expressed most fully in the desktop app.
+
 ## Current Gaps
 
 - Settings layout is still dense.
 - File transfer progress/cancellation UX is still limited.
-- Accessibility work is incomplete.
-- GUI/TUI parity is functional, but not identical in polish.
+- Accessibility work is incomplete (the desktop app hand-rolls components; no headless a11y library yet).
+- Parity across the three frontends is functional, but not identical in polish; egui and the Tauri app coexist during the migration.
 
 ## Design Change Rule
 

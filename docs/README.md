@@ -33,7 +33,7 @@ and 04 describe only what ships today.
 - `USER_GUIDE.md`: day-to-day usage, commands, storage, troubleshooting
 - `03_architecture.md`: code layout and runtime responsibility boundaries (today)
 - `04_protocol.md`: shipped wire behavior and compatibility notes
-- `05_platform_spec.md`: the single canonical plan — vision, architecture, trust tiers, Party server, the Tauri/SolidJS UI rewrite, the phased roadmap, and the backlog
+- `05_platform_spec.md`: the single canonical plan — vision, architecture, trust tiers, Party server, the Tauri/React desktop UI (shipped in `desktop/`, replacing egui), the phased roadmap, and the backlog
 - `SECURITY.md`: current security posture and disclosure guidance
 - `THREAT_MODEL.md`: assumptions, assets, attack surfaces, and limits
 

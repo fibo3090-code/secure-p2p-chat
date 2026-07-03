@@ -5,7 +5,7 @@
 [![Security](https://img.shields.io/badge/security-medium-yellow)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
 
-Secure peer-to-peer messaging for desktop, built with Rust. The app provides encrypted messaging, encrypted local storage, forward secrecy, signed invite links, and both GUI and TUI frontends.
+Secure peer-to-peer messaging for desktop, built with Rust. The app provides encrypted messaging, encrypted local storage, forward secrecy, signed invite links, and three frontends: an egui desktop GUI, a ratatui terminal UI, and a newer Tauri + React desktop app.
 
 ## What It Does
 
@@ -14,7 +14,7 @@ Secure peer-to-peer messaging for desktop, built with Rust. The app provides enc
 - Encrypted local identity and encrypted chat history at rest
 - Large text messages are chunked automatically, plus file transfer, typing indicators, invite links, QR generation, and optional LAN discovery
 - Diagnostics bundle export and on-disk panic/crash logs for support
-- GUI built with `egui` and terminal interface built with `ratatui`
+- GUI built with `egui`, terminal interface built with `ratatui`, and a Tauri 2 + React desktop app (in `desktop/`) that drives the same core — meant to replace the egui GUI (run from source today; the release still ships the egui binary)
 
 ## Current Status
 
@@ -44,6 +44,14 @@ cargo run --release
 ```bash
 cargo run --release -- --tui
 ```
+
+### Run the Tauri desktop app (preview)
+
+```bash
+cd desktop && npx tauri dev     # native window + React UI (needs Node + the Tauri prereqs)
+```
+
+This is the in-development replacement for the egui GUI. It is not yet in the release pipeline, so build it from source for now.
 
 The terminal UI is fully featured and keyboard-driven: press `:` and start typing for an autocomplete command menu, or `:help` for the full command and keybinding reference. Every action — connecting, fingerprint verification, contacts, invites, file transfer, settings — is reachable without leaving the terminal. See [docs/USER_GUIDE.md](docs/USER_GUIDE.md#tui-reference) for the command list.
 

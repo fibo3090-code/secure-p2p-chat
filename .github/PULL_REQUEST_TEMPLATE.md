@@ -11,8 +11,9 @@
 ## Verification
 
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] `cargo test`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo nextest run --workspace` (or `cargo test --workspace`)
+- [ ] If `desktop/` changed: `cargo check -p p2pem-desktop` and `npm run build`
 - [ ] Manual smoke test performed when relevant
 
 ## Docs And Release Notes

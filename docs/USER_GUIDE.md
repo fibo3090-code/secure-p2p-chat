@@ -50,6 +50,19 @@ cargo run --release
 cargo run --release -- --tui
 ```
 
+### Tauri desktop app (preview)
+
+A newer desktop app (Tauri 2 + React) is in development and will replace the egui
+GUI. It is not yet published in releases, so run it from source:
+
+```bash
+cd desktop && npx tauri dev
+```
+
+It drives the same core as the GUI/TUI (same identity, history, and P2P/Party
+behavior) but uses its own data directory, so it appears as a distinct peer/identity
+from the egui app on the same machine.
+
 ### Relay server
 
 ```bash
