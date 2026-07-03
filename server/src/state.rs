@@ -599,6 +599,43 @@ impl PartyState {
         self.blobs.get(hash).map(|r| r.data.clone())
     }
 
+    /// Whether `member` may download the blob `hash`. A file is accessible only if
+    /// it is referenced by a message in a public channel (every member can read
+    /// those) or in a DM thread the member is a party to. Without this, any joined
+    /// member who learned a content hash could fetch a file shared privately in a
+    /// DM between two *other* members — content-addressed storage is shared, but
+    /// the download endpoint must still enforce who can see what.
+    fn member_can_access_blob(&self, member: Uuid, hash: &str) -> bool {
+        let references =
+            |env: &Envelope| matches!(&env.payload, MessagePayload::File(f) if f.hash == hash);
+        // Public channels are readable by every member.
+        if self
+            .channels
+            .iter()
+            .any(|c| c.messages.iter().any(references))
+        {
+            return true;
+        }
+        // Otherwise only DM threads this member participates in (the thread id is
+        // derived from the two members' ids).
+        self.members.keys().any(|other| {
+            let tid = messenger_core::party::dm_thread_id(member, *other);
+            self.dm_threads
+                .get(&tid)
+                .is_some_and(|t| t.messages.iter().any(references))
+        })
+    }
+
+    /// The bytes of a stored blob, but only when `member` is permitted to see it.
+    /// Returns `None` both when the blob is unknown and when access is denied, so
+    /// the endpoint never reveals the existence of a file the member can't access.
+    pub fn blob_bytes_for(&self, member: Uuid, hash: &str) -> Option<Vec<u8>> {
+        if !self.member_can_access_blob(member, hash) {
+            return None;
+        }
+        self.blob_bytes(hash)
+    }
+
     // --- Durable mirroring (best-effort: failures are logged, not propagated, so a
     // transient disk error never drops a live request) --------------------------
 
@@ -1455,6 +1492,66 @@ mod tests {
                 vec![1u8; 6],
             )
             .expect("re-upload of stored content adds no bytes and stays allowed");
+    }
+
+    #[test]
+    fn download_is_denied_for_a_dm_file_a_member_cannot_see() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let mallory = state.join("mallory", None, None).unwrap();
+
+        // Alice sends Bob a private file over a DM.
+        let env = state
+            .post_file_dm(
+                alice,
+                bob,
+                "secret.pdf".into(),
+                "application/pdf".into(),
+                b"top secret".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        // Both participants can download it...
+        assert_eq!(
+            state.blob_bytes_for(alice, &hash),
+            Some(b"top secret".to_vec())
+        );
+        assert_eq!(
+            state.blob_bytes_for(bob, &hash),
+            Some(b"top secret".to_vec())
+        );
+        // ...but a third member cannot, even if they somehow learn the hash.
+        assert_eq!(
+            state.blob_bytes_for(mallory, &hash),
+            None,
+            "a non-participant must not be able to download a private DM file"
+        );
+    }
+
+    #[test]
+    fn download_of_a_channel_file_is_allowed_for_any_member() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let chan = state.default_channel();
+
+        let env = state
+            .post_file(
+                alice,
+                chan,
+                "pic.png".into(),
+                "image/png".into(),
+                b"pixels".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        // A public-channel file is downloadable by any member, not just the poster.
+        assert_eq!(state.blob_bytes_for(bob, &hash), Some(b"pixels".to_vec()));
+        // An unknown hash is denied.
+        assert_eq!(state.blob_bytes_for(bob, "deadbeef"), None);
     }
 
     #[test]

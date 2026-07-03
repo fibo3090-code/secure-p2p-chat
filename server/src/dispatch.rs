@@ -180,8 +180,10 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     },
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                 },
-                PartyRequest::DownloadFile { hash } => match state.blob_bytes(&hash) {
+                PartyRequest::DownloadFile { hash } => match state.blob_bytes_for(member, &hash) {
                     Some(data) => Dispatch::reply(PartyResponse::FileData { hash, data }),
+                    // Same reply for unknown and access-denied, so the endpoint
+                    // never reveals a file the member isn't allowed to see.
                     None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
                 },
             }
