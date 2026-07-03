@@ -81,9 +81,10 @@ Authoritative docs: `docs/README.md`, `docs/03_architecture.md`, `docs/04_protoc
 
 ## Tauri Bridge (`desktop/src-tauri/src/lib.rs`)
 
-- `Bridge` holds `Arc<Mutex<ChatManager>>` + identity + history/identity paths + `pending_fp`. A background poll loop drains ChatManager toasts → emits `toast` events and forwards fingerprint requests → `fingerprint-request` event. The frontend listens via `onBridge(...)` in `desktop/src/lib/bridge.js`.
-- Commands: `auth_status`, `unlock`, `set_password`, `my_identity`, `list_conversations`, `get_conversation`, `send_message`, `start_host`, `connect_peer`, `confirm_fingerprint`, `pending_fingerprint`, `rename_chat`, `delete_chat`, `list_contacts`, `my_invite_link`, `import_invite`, `connect_contact`.
-- ⚠️ **Arg-naming footgun**: Tauri 2 binds JS invoke keys by exact name. Use **single-word** Rust params (e.g. `id`, not `chat_id`) or camelCase JS keys — a mismatch makes `invoke` *silently no-op* (this was the root cause of the "messages send but don't arrive" / "fingerprint verify does nothing" bugs). When `inTauri` is false, `bridge.js` falls back to an in-memory mock so the UI is navigable in a plain browser.
+- `Bridge` holds `Arc<Mutex<ChatManager>>` + `Arc<Mutex<PartyManager>>` (Communities) + identity + history/identity paths + `pending_fp`. A background poll loop drains ChatManager toasts → `toast` events, forwards fingerprint requests → `fingerprint-request`, drains party events → `party-updated`, **and persists history** (on state change, after mutations, and on window close). The frontend listens via `onBridge(...)` in `desktop/src/lib/bridge.js`.
+- Commands: auth (`auth_status`/`unlock`/`set_password`/`my_identity`), chats (`list_conversations`/`get_conversation`/`send_message`/`send_file`/`rename_chat`/`delete_chat`), connect (`start_host`/`connect_peer`/`host_via_relay`/`connect_via_relay`/`connect_contact`), TOFU (`confirm_fingerprint`/`pending_fingerprint`), contacts (`list_contacts`/`my_invite_link`/`import_invite`), Communities (`party_join`/`party_list`/`party_history`/`party_post`/`party_create_channel`/`party_send_dm`/`party_dm_history`/`party_clear_error`). Every non-auth command is gated by `ensure_ready()`.
+- ⚠️ **Arg-naming footgun**: Tauri 2 binds JS invoke keys by exact name. Use **single-word** Rust params (e.g. `id`, not `chat_id`) or camelCase JS keys — a mismatch makes `invoke` *silently no-op* (was the root cause of "messages send but don't arrive" / "fingerprint verify does nothing"). When `inTauri` is false, `bridge.js` falls back to an in-memory mock so the UI is navigable in a plain browser.
+- **Own data dir**: the desktop app resolves its data dir from *its own* `ProjectDirs("com","chat-p2p","P2PEM")`, **not** egui's `"EncryptedMessenger"` — otherwise both apps load the same `identity.json` and become the same peer (a self-connection). `P2PEM_DATA_DIR` overrides it to run extra test peers on one machine.
 
 ## Security-Sensitive Areas
 
@@ -108,7 +109,9 @@ Chunked (`FILE_CHUNK_SIZE = 64 KiB`), tracked via `FileTransferState`, sharing t
 
 ## TOFU Flow
 
-Handled in `ChatManager::handle_session_event`: unknown fingerprint → `ShowFingerprintVerification` → UI shows the 64-char fingerprint / colored safety grid → user verifies out-of-band → `ChatManager::confirm_fingerprint()` persists trust on accept.
+Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`). **Both roles verify**: the client emits `ShowFingerprintVerification`, the host emits `NewConnection`. An unknown fingerprint → UI shows the 64-char fingerprint / colored safety grid → user verifies out-of-band → `confirm_fingerprint()` persists trust on accept. A fingerprint already verified in *another* chat/contact is treated as a returning peer and auto-accepted (no re-prompt).
+
+⚠️ Do **not** pre-fill an incoming chat's `peer_fingerprint` with the peer's own fingerprint — that makes the TOFU check trivially "match" and silently auto-trust every caller (a bug that existed and was fixed). Incoming chats must start with `peer_fingerprint: None`.
 
 ## Common Entry Points
 
@@ -130,6 +133,16 @@ Handled in `ChatManager::handle_session_event`: unknown fingerprint → `ShowFin
 
 - Unit tests live in source files (e.g. `core/src/network/session.rs` has handshake tests); integration tests in each crate's `tests/`.
 - Async tests use `#[tokio::test]`. Handshake tests must verify derived keys match on both sides. Protocol changes require new (de)serialization tests. Adding `serde(default)` fields requires a back-compat test that loads old JSON.
+
+## Non-obvious gotchas (learned the hard way)
+
+- **The three UIs are one app sharing one `ChatManager`.** The P2P protocol is UI-independent, so a connection bug is almost never in `session.rs` — it's config/wiring in the front-end. Distinct binaries (egui vs Tauri) **must** use distinct `ProjectDirs`; sharing one makes them the same identity/peer, so connecting them on one machine is a self-connection (the core completes it, but it's semantically broken and both apps race on one `history.json.enc`).
+- **`connection_password` is a field on `ChatManager`, not a per-call arg.** It's session-only (not persisted) and read inside `start_host`/`connect_to_host`. The `None` in `connect_to_host(host, port, None, pk)` is `existing_chat_id`, **not** the password — a common misread.
+- **The host creates a NEW chat per incoming connection**, keyed by the *client's* random `chat_id` (`chat_id_mapping` maps incoming→session). There is no persistent per-peer host chat, so returning peers are recognised by **fingerprint** across chats/contacts, not by chat id.
+- **`p2pem-desktop` has NO automated tests** and is not exercised by `cargo nextest run --workspace` (that's core/client/server only). Verify bridge changes with `cargo check -p p2pem-desktop`; verify the React frontend with `npm run build` in `desktop/`. The Tauri GUI can't be driven headlessly here, so GUI behaviour stays build-verified only.
+- **`desktop/dist/` is tracked in git** (committed build artifacts). Rebuild (`npm run build`) and commit `dist/` alongside frontend source changes, or it goes stale.
+- **Party file downloads must go through `PartyState::blob_bytes_for(member, hash)`** (access-checked), never the raw `blob_bytes`. Content-addressed blobs are stored globally (dedup), so the *download endpoint* is what enforces who may see a file (public-channel members, or DM participants).
+- **`recv_packet` (`core/src/core/framing.rs`) is DoS-hardened**: rejects oversized length prefixes and reads in 64 KiB chunks. `MAX_PACKET_SIZE` (8 MiB) bounds every frame, so text/username/channel-name are only bounded by that — there are no finer per-field length caps yet.
 
 ## Preferred Tools (opencode)
 
