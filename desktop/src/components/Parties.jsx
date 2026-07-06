@@ -20,27 +20,34 @@ const STATUS_LABEL = {
 const MAX_USERNAME_CHARS = 32;
 const MAX_CHANNEL_NAME_CHARS = 64;
 
-function JoinForm({ onJoined }) {
-  const [address, setAddress] = useState("");
-  const [username, setUsername] = useState("");
+function JoinForm({ onJoined, onCancel, initial }) {
+  const [address, setAddress] = useState(initial?.address || "");
+  const [username, setUsername] = useState(initial?.username || "");
   const [password, setPassword] = useState("");
+  const [saved, setSaved] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  async function join() {
+  useEffect(() => {
+    api.partySaved().then((s) => setSaved(s || [])).catch(() => {});
+  }, []);
+
+  async function joinWith(addr, user, pass) {
     setErr("");
-    if (!address.trim()) return setErr("Enter the server address.");
-    if (!username.trim()) return setErr("Choose a username.");
-    if ([...username.trim()].length > MAX_USERNAME_CHARS)
+    if (!addr.trim()) return setErr("Enter the server address.");
+    if (!user.trim()) return setErr("Choose a username.");
+    if ([...user.trim()].length > MAX_USERNAME_CHARS)
       return setErr(`Username must be ${MAX_USERNAME_CHARS} characters or fewer.`);
     setBusy(true);
     try {
-      await api.partyJoin(address.trim(), username.trim(), password);
-      toast(`Joining ${address.trim()}…`, "success");
+      await api.partyJoin(addr.trim(), user.trim(), pass);
+      toast(`Joining ${addr.trim()}…`, "success");
       onJoined && onJoined();
     } catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
+
+  const join = () => joinWith(address, username, password);
 
   return (
     <div className="chat-pane chat-empty">
@@ -51,6 +58,26 @@ function JoinForm({ onJoined }) {
           Communities are administered, multi-channel rooms that keep history, served by the
           <code> messenger-server</code> crate. Verify the server's fingerprint out of band after joining.
         </div>
+        {saved.length > 0 && (
+          <div className="party-saved">
+            <div className="party-saved-h">Your communities</div>
+            {saved.map((p) => (
+              <button key={p.address} className="party-saved-card" disabled={busy}
+                title={`Rejoin as ${p.username}`}
+                onClick={() => { setAddress(p.address); setUsername(p.username); joinWith(p.address, p.username, password); }}>
+                <Avatar name={p.name || p.address} size={28} party />
+                <span className="party-saved-txt">
+                  <span className="party-saved-name">{p.name || p.address}</span>
+                  <span className="party-saved-sub mono">{p.username} · {p.address}</span>
+                </span>
+                <Icon name="chevronRight" size={14} />
+              </button>
+            ))}
+            <div className="party-saved-hint">
+              Joining a password-protected community? Type the password below first, then click it.
+            </div>
+          </div>
+        )}
         <div className="party-join">
           <Input value={address} autoFocus placeholder="server address · 192.168.1.20:12345"
             onChange={(e) => setAddress(e.target.value)} />
@@ -60,6 +87,7 @@ function JoinForm({ onJoined }) {
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && join()} />
           <Button icon="users" onClick={join} disabled={busy} full>Connect &amp; join</Button>
+          {onCancel && <Button variant="ghost" onClick={onCancel} full>Cancel</Button>}
           {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
         </div>
       </div>
@@ -106,6 +134,9 @@ export function Parties() {
   const [msgs, setMsgs] = useState([]);
   const [draft, setDraft] = useState("");
   const [newChannel, setNewChannel] = useState("");
+  const [adding, setAdding] = useState(false);       // show the join form to add another community
+  const [prefill, setPrefill] = useState(null);      // prefill for the join form (rejoin flows)
+  const [confirmLeave, setConfirmLeave] = useState(false); // two-click leave confirmation
   const scrollRef = useRef(null);
 
   const server = useMemo(() => servers.find((s) => s.id === sid) || null, [servers, sid]);
@@ -147,8 +178,12 @@ export function Parties() {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [msgs.length, cid, dm]);
 
-  if (!servers.length) {
-    return <JoinForm onJoined={loadServers} />;
+  if (!servers.length || adding) {
+    return (
+      <JoinForm initial={prefill}
+        onJoined={() => { setAdding(false); setPrefill(null); loadServers(); }}
+        onCancel={servers.length ? () => { setAdding(false); setPrefill(null); } : null} />
+    );
   }
 
   const peer = dm ? server?.members.find((m) => m.id === dm) : null;
@@ -202,18 +237,53 @@ export function Parties() {
     try { await api.partyClearError(server.id); loadServers(); } catch { /* ignore */ }
   }
 
+  // Leave (two-click confirm): drops the connection and forgets the community
+  // locally. The server keeps the membership, so rejoining later resumes it.
+  async function leave() {
+    if (!server) return;
+    if (!confirmLeave) { setConfirmLeave(true); return; }
+    setConfirmLeave(false);
+    try {
+      await api.partyLeave(server.id);
+      toast(`Left ${server.name || server.address}.`, "success");
+      setDm(null); setCid(null);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  // Rejoin a dropped/rejected community: open the join form prefilled with the
+  // stored address + username (a password can be typed there if needed). A
+  // successful rejoin replaces this entry (deduped by address in the bridge).
+  function rejoin() {
+    if (!server) return;
+    setPrefill({ address: server.address, username: server.username || "" });
+    setAdding(true);
+  }
+
+  // Remove a dead entry without rejoining.
+  async function removeServer() {
+    if (!server) return;
+    try {
+      await api.partyLeave(server.id);
+      setDm(null); setCid(null);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
   return (
     <div className="party-layout">
-      {servers.length > 1 && (
-        <div className="party-servers">
-          {servers.map((s) => (
-            <button key={s.id} className={cx("party-srv-tab", s.id === sid && "is-active")}
-              onClick={() => { setSid(s.id); setDm(null); }}>
-              <Icon name="users" size={14} /> {s.name || s.address}
-            </button>
-          ))}
-        </div>
-      )}
+      <div className="party-servers">
+        {servers.map((s) => (
+          <button key={s.id} className={cx("party-srv-tab", s.id === sid && "is-active")}
+            onClick={() => { setSid(s.id); setDm(null); setConfirmLeave(false); }}>
+            <Icon name="users" size={14} /> {s.name || s.address}
+          </button>
+        ))}
+        <button className="party-srv-tab party-srv-add" title="Join another community"
+          onClick={() => { setPrefill(null); setAdding(true); }}>
+          <Icon name="plus" size={14} />
+        </button>
+      </div>
 
       <aside className="party-side">
         <div className="party-side-h">Channels</div>
@@ -262,11 +332,31 @@ export function Parties() {
               </div>
             </div>
           </div>
-          <div className="party-fp" title="Verify this out of band">
-            <Icon name="fingerprint" size={13} />
-            <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
+          <div className="party-head-r">
+            <div className="party-fp" title="Verify this out of band">
+              <Icon name="fingerprint" size={13} />
+              <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
+            </div>
+            <button className={cx("party-leave", confirmLeave && "is-confirm")}
+              title={confirmLeave ? "Click again to confirm leaving" : "Leave this community"}
+              onClick={leave} onBlur={() => setConfirmLeave(false)}>
+              <Icon name="x" size={14} /> {confirmLeave ? "Leave?" : "Leave"}
+            </button>
           </div>
         </header>
+
+        {(server?.status === "disconnected" || server?.status === "rejected") && (
+          <div className="party-banner">
+            <Icon name="alert" size={14} />
+            <span>
+              {server.status === "rejected"
+                ? `Join rejected${server.status_detail ? `: ${server.status_detail}` : ""}.`
+                : "Connection to this community was lost."}
+            </span>
+            <Button size="sm" icon="users" onClick={rejoin}>Rejoin</Button>
+            <Button size="sm" variant="ghost" onClick={removeServer}>Remove</Button>
+          </div>
+        )}
 
         {server?.last_error && (
           <div className="party-error">

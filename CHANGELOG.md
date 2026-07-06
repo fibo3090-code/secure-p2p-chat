@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Community lifecycle in the desktop app.** Joined communities are now
+  remembered across restarts (saved to `parties.json` — address, username, and
+  server name; never the password) and offered as one-click rejoin cards on the
+  join screen. You can finally **leave** a community (header button with a
+  confirm step), **join more than one** (a `+` tab in the community switcher),
+  and recover from a lost connection or rejected join via a **Rejoin / Remove**
+  banner instead of being stuck with a dead entry. Rejoining replaces the old
+  entry (deduplicated by address).
+- **Desktop installers in releases.** Tagged releases now also build and attach
+  the Tauri desktop app's native installers (Windows MSI + NSIS, macOS DMGs for
+  Intel and Apple Silicon, Linux deb/AppImage) alongside the classic egui
+  binaries — previously the new desktop app could only be run from source. The
+  Tauri CLI is now a devDependency (`npx tauri dev` works on a fresh clone), and
+  the bundle version now tracks the workspace version instead of a stale `0.1.0`.
+- **Unread badges in the desktop app.** The conversation list and the Chats rail
+  now show real unread counts (messages that arrived while another view was
+  open), clearing when the conversation is opened. Previously the unread badge
+  was rendered but never fed. The Communities rail label is now "Communities"
+  everywhere (was mixed "Parties"/"Party").
+- **Community server identity pinning (TOFU).** The first join pins the server's
+  fingerprint; a later join to the same address presenting a different identity
+  is refused with a clear security warning instead of silently trusting the new
+  key. Leaving a community clears its pin (the documented way to accept a
+  legitimately redeployed server).
+
 - **Community file sharing in the desktop app.** You can now share a file into a
   Community channel or direct message (a paperclip button in the composer) and
   download files others have shared (click a file message to save it via a native

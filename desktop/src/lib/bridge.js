@@ -43,6 +43,8 @@ const realApi = {
   partySendFile: (server, channel) => invoke("party_send_file", { server, channel }),
   partySendFileDm: (server, to) => invoke("party_send_file_dm", { server, to }),
   partyDownloadFile: (server, hash, name) => invoke("party_download_file", { server, hash, name }),
+  partySaved: () => invoke("party_saved"),
+  partyLeave: (server) => invoke("party_leave", { server }),
 };
 
 // ── Dev mock ────────────────────────────────────────────────────────────────
@@ -90,6 +92,7 @@ function makeMock() {
     const gen = "ch-general", rnd = "ch-random";
     partyState.servers = [{
       id: sid, name: address.split(":")[0] || "Community", address,
+      username: username || "you",
       fingerprint: "5f3a9c2e7b1d4068aa22cc55ee88ff00112233445566778899aabbccddeeff11",
       status: "joined", status_detail: null, member_id: me, last_error: null,
       channels: [{ id: gen, name: "general" }, { id: rnd, name: "random" }],
@@ -145,6 +148,8 @@ function makeMock() {
       (partyState.msgs[`${server}|dm-${to}`] ||= []).push({ sender_name: "you", from_me: true, kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash", timestamp: Date.now() });
     },
     partyDownloadFile: async () => { console.log("[mock] party download only works in the desktop app"); },
+    partySaved: async () => [{ address: "192.168.1.20:12345", username: "you", name: "Mock Community", fingerprint: "abc123" }],
+    partyLeave: async (server) => { partyState.servers = partyState.servers.filter((s) => s.id !== server); },
   };
 }
 
@@ -190,7 +195,7 @@ export function summaryToConv(s) {
     relay: transport === "relay" || transport === "server",
     state: s.connected ? "connected" : s.placeholder ? "hosting" : "offline",
     // Only claim "verified" once the fingerprint was actually confirmed.
-    trust: s.verified ? "verified" : "unverified", unread: 0, placeholder: s.placeholder,
+    trust: s.verified ? "verified" : "unverified", unread: s.unread ?? 0, placeholder: s.placeholder,
   };
 }
 

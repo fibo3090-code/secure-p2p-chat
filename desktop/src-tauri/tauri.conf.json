@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "P2PEM",
-  "version": "0.1.0",
   "identifier": "com.chat-p2p.p2pem",
   "build": {
     "frontendDist": "../dist",
