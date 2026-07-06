@@ -74,6 +74,7 @@ export default function App() {
   // event-driven refresh never reads a stale closure.
   const seenRef = useRef(null);
   const activeIdRef = useRef(null);
+  const [transfers, setTransfers] = useState([]);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
 
@@ -106,6 +107,8 @@ export default function App() {
         if (act) seen[cur] = act.messages ?? 0;
       }
       setConvs(list.map((c) => ({ ...c, unread: Math.max(0, (c.messages ?? 0) - (seen[c.id] ?? 0)) })));
+      // Live file-transfer progress, shown in the chat pane.
+      api.listTransfers().then(setTransfers).catch(() => {});
       // Surface any pending TOFU prompt even if its one-shot event was missed.
       api.pendingFingerprint().then((p) => { if (p) setFpReq((cur) => cur || p); }).catch(() => {});
       setActiveId((cur) => {
@@ -239,6 +242,11 @@ export default function App() {
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
+                transfers={transfers.filter((t) =>
+                  // done/cancelled rows can linger in the snapshot until the next
+                  // transfer; the completed file already shows as a message, so
+                  // only surface in-flight work and failures (with their reason).
+                  t.chat_id === activeId && t.status !== "done" && t.status !== "cancelled")}
                 onVerify={async (c) => {
                   // Open the accept/reject dialog only when a real TOFU request
                   // is pending for this chat; an established chat has nothing to

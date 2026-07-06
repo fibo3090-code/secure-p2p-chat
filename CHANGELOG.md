@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Live file-transfer progress in the desktop app.** In-flight sends and
+  receives now show a progress bar (filename, live percentage) above the
+  composer, and failures surface their reason inline. Previously the desktop
+  app showed nothing between picking a file and its eventual completion, even
+  for multi-gigabyte transfers — the progress state existed in `ChatManager`
+  but was never exposed over the bridge (new `list_transfers` command).
+
 - **Community lifecycle in the desktop app.** Joined communities are now
   remembered across restarts (saved to `parties.json` — address, username, and
   server name; never the password) and offered as one-click rejoin cards on the

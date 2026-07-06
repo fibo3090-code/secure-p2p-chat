@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
-use messenger_core::types::{Config, MessageContent, ToastLevel};
+use messenger_core::types::{Config, MessageContent, ToastLevel, TransferStatus};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -245,6 +245,54 @@ async fn list_conversations(state: tauri::State<'_, Bridge>) -> Result<Vec<ConvS
         }
     }
     Ok(out)
+}
+
+/// A live file transfer, for progress display in the chat pane.
+#[derive(Serialize)]
+struct TransferDto {
+    id: String,
+    chat_id: String,
+    filename: String,
+    size: u64,
+    received: u64,
+    status: &'static str,
+    /// Failure reason when `status == "failed"`.
+    error: Option<String>,
+}
+
+fn transfer_status_parts(s: &TransferStatus) -> (&'static str, Option<String>) {
+    match s {
+        TransferStatus::Pending => ("pending", None),
+        TransferStatus::InProgress => ("active", None),
+        TransferStatus::Completed => ("done", None),
+        TransferStatus::Failed(e) => ("failed", Some(e.clone())),
+        TransferStatus::Cancelled => ("cancelled", None),
+    }
+}
+
+/// The active file transfers (both directions), polled by the frontend on the
+/// same `state-updated` cadence as the conversation list, so large sends and
+/// receives show live progress instead of nothing.
+#[tauri::command]
+async fn list_transfers(state: tauri::State<'_, Bridge>) -> Result<Vec<TransferDto>, String> {
+    ensure_ready(&state)?;
+    let mgr = state.manager.lock().await;
+    Ok(mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .map(|t| {
+            let (status, error) = transfer_status_parts(&t.status);
+            TransferDto {
+                id: t.id.to_string(),
+                chat_id: t.chat_id.to_string(),
+                filename: t.filename,
+                size: t.size,
+                received: t.received,
+                status,
+                error,
+            }
+        })
+        .collect())
 }
 
 /// Return the full conversation (with messages) as JSON for the chat pane.
@@ -1129,6 +1177,7 @@ pub fn run() {
             my_identity,
             list_conversations,
             get_conversation,
+            list_transfers,
             send_message,
             send_file,
             start_host,
