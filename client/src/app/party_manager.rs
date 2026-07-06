@@ -41,6 +41,9 @@ enum Incoming {
 /// Per-server connection state shown in the Party tab.
 pub struct PartyServerConn {
     pub address: String,
+    /// The username this client joined (or is joining) with; kept so the UI can
+    /// offer one-click rejoin after a disconnect or restart.
+    pub username: String,
     pub server_name: String,
     pub server_fingerprint: String,
     pub member_id: Option<Uuid>,
@@ -150,6 +153,7 @@ impl PartyManager {
 
         let conn = PartyServerConn {
             address: address.to_string(),
+            username: username.to_string(),
             server_name: String::new(),
             server_fingerprint: fingerprint,
             member_id: None,
@@ -381,6 +385,15 @@ impl PartyManager {
         }
     }
 
+    /// Leave a community: drop the connection and forget its local state. Dropping
+    /// the connection's channels makes its background task exit (and any in-flight
+    /// download receivers error) — the server keeps the membership server-side, so
+    /// rejoining later with the same identity resumes it. Returns whether a server
+    /// was actually removed.
+    pub fn remove_server(&mut self, server_id: Uuid) -> bool {
+        self.servers.remove(&server_id).is_some()
+    }
+
     pub fn server_ids(&self) -> Vec<Uuid> {
         self.servers.keys().copied().collect()
     }
@@ -490,6 +503,7 @@ mod tests {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let conn = PartyServerConn {
             address: "127.0.0.1:12345".to_string(),
+            username: "alice".to_string(),
             server_name: String::new(),
             server_fingerprint: "FP".to_string(),
             member_id: None,
@@ -692,6 +706,26 @@ mod tests {
 
         // The caller gets an error instead of hanging forever.
         assert_eq!(rx.try_recv().unwrap(), Err("unknown file".to_string()));
+    }
+
+    #[test]
+    fn remove_server_forgets_it_and_fails_inflight_downloads() {
+        let (mut mgr, id, _tx, _out) = manager_with_server();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
+
+        // An in-flight download's receiver must error (sender dropped), not hang.
+        let mut rx = mgr.request_download(id, "abc123".to_string()).unwrap();
+
+        assert!(mgr.remove_server(id), "the server is removed");
+        assert!(mgr.server(id).is_none());
+        assert!(mgr.server_ids().is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "pending download receivers error out on leave"
+        );
+
+        // Removing again is a no-op.
+        assert!(!mgr.remove_server(id));
     }
 
     #[test]

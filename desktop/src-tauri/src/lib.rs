@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use messenger_core::identity::Identity;
 use messenger_core::types::{Config, MessageContent, ToastLevel};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -30,6 +30,10 @@ struct Bridge {
     history_path: PathBuf,
     /// Identity file (sibling of the history file).
     identity_path: PathBuf,
+    /// Saved communities (`parties.json`, sibling of the history file): address,
+    /// username, and the pinned server fingerprint, so joined communities survive
+    /// a restart (one-click rejoin) and a changed server identity is detected.
+    parties_path: PathBuf,
     /// A brand-new identity with no password yet.
     is_new: StdMutex<bool>,
     /// Plaintext key present (no password set) — force a set-password step.
@@ -570,6 +574,8 @@ struct PartyServerDto {
     id: String,
     name: String,
     address: String,
+    /// The username this client joined with (for rejoin flows).
+    username: String,
     fingerprint: String,
     status: &'static str,
     status_detail: Option<String>,
@@ -628,6 +634,7 @@ fn server_dto(
         id: id.to_string(),
         name: conn.server_name.clone(),
         address: conn.address.clone(),
+        username: conn.username.clone(),
         fingerprint: conn.server_fingerprint.clone(),
         status,
         status_detail,
@@ -676,19 +683,70 @@ async fn party_join(
     state: tauri::State<'_, Bridge>,
 ) -> Result<String, String> {
     ensure_ready(&state)?;
+    let address = address.trim().to_string();
+    let username = username.trim().to_string();
     let pk = {
         let id = state.identity.lock().unwrap();
         id.private_key().map_err(|e| e.to_string())?
     };
     let password = Some(password).filter(|p| !p.trim().is_empty());
-    state
-        .party
-        .lock()
-        .await
+    let mut party = state.party.lock().await;
+    let sid = party
         .connect_and_join(&address, &username, password, &pk)
         .await
-        .map(|id| id.to_string())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // TOFU pinning: if we've joined this address before, its identity must not
+    // have changed. A mismatch is either a redeployed server or an active MITM —
+    // refuse and tell the user, never silently trust the new key.
+    let fingerprint = party
+        .server(sid)
+        .map(|c| c.server_fingerprint.clone())
+        .unwrap_or_default();
+    let saved = load_saved_parties(&state.parties_path);
+    if let Some(pinned) = saved
+        .iter()
+        .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
+    {
+        if pinned.fingerprint != fingerprint {
+            party.remove_server(sid);
+            return Err(format!(
+                "SECURITY: this server's identity changed since you last joined \
+                 (expected {}…, got {}…). If the operator redeployed the server this \
+                 may be expected — leave the saved community and rejoin to trust the \
+                 new identity. Otherwise, do not proceed.",
+                &pinned.fingerprint[..16.min(pinned.fingerprint.len())],
+                &fingerprint[..16.min(fingerprint.len())]
+            ));
+        }
+    }
+    // Rejoin replaces: drop any older entry for the same address (e.g. a
+    // disconnected or join-rejected zombie) so the list never shows duplicates.
+    let stale: Vec<Uuid> = party
+        .server_ids()
+        .into_iter()
+        .filter(|id| {
+            *id != sid
+                && party
+                    .server(*id)
+                    .is_some_and(|c| c.address.eq_ignore_ascii_case(&address))
+        })
+        .collect();
+    for id in stale {
+        party.remove_server(id);
+    }
+    drop(party);
+
+    upsert_saved_party(
+        &state.parties_path,
+        SavedParty {
+            address,
+            username,
+            name: String::new(),
+            fingerprint,
+        },
+    );
+    Ok(sid.to_string())
 }
 
 /// The joined community servers with their channels and member directories.
@@ -814,6 +872,90 @@ async fn party_clear_error(server: String, state: tauri::State<'_, Bridge>) -> R
     ensure_ready(&state)?;
     let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
     state.party.lock().await.clear_server_error(sid);
+    Ok(())
+}
+
+/// A community this client has joined, persisted (plaintext, no secrets — the
+/// password is never stored) so it survives restarts: the UI offers one-click
+/// rejoin, and the pinned server fingerprint turns the first join's TOFU into a
+/// real trust anchor — a different identity at the same address is refused.
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedParty {
+    address: String,
+    username: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    fingerprint: String,
+}
+
+/// Load the saved-communities list; missing or unreadable files are an empty list
+/// (never an error — this is convenience state, not critical data).
+fn load_saved_parties(path: &Path) -> Vec<SavedParty> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Best-effort save of the saved-communities list; errors are logged, not fatal.
+fn save_saved_parties(path: &Path, list: &[SavedParty]) {
+    match serde_json::to_string_pretty(list) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                tracing::warn!("saving communities list failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("serializing communities list failed: {e}"),
+    }
+}
+
+/// Insert or update the entry for `address` (matched case-insensitively).
+fn upsert_saved_party(path: &Path, entry: SavedParty) {
+    let mut list = load_saved_parties(path);
+    match list
+        .iter_mut()
+        .find(|p| p.address.eq_ignore_ascii_case(&entry.address))
+    {
+        Some(existing) => {
+            existing.username = entry.username;
+            if !entry.name.is_empty() {
+                existing.name = entry.name;
+            }
+            if !entry.fingerprint.is_empty() {
+                existing.fingerprint = entry.fingerprint;
+            }
+        }
+        None => list.push(entry),
+    }
+    save_saved_parties(path, &list);
+}
+
+/// The saved communities, for the join screen's one-click rejoin list.
+#[tauri::command]
+async fn party_saved(state: tauri::State<'_, Bridge>) -> Result<Vec<SavedParty>, String> {
+    ensure_ready(&state)?;
+    Ok(load_saved_parties(&state.parties_path))
+}
+
+/// Leave a community: drop the connection, forget its local state, and remove it
+/// from the saved list. The server keeps the membership, so rejoining with the
+/// same identity later resumes it.
+#[tauri::command]
+async fn party_leave(server: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let mut party = state.party.lock().await;
+    let address = party.server(sid).map(|c| c.address.clone());
+    if !party.remove_server(sid) {
+        return Err("unknown server".to_string());
+    }
+    drop(party);
+    if let Some(addr) = address {
+        let mut list = load_saved_parties(&state.parties_path);
+        list.retain(|p| !p.address.eq_ignore_ascii_case(&addr));
+        save_saved_parties(&state.parties_path, &list);
+    }
     Ok(())
 }
 
@@ -1008,6 +1150,8 @@ pub fn run() {
             party_send_file,
             party_send_file_dm,
             party_download_file,
+            party_saved,
+            party_leave,
         ])
         .setup(|app| {
             let b = app.state::<Bridge>();
@@ -1016,6 +1160,7 @@ pub fn run() {
                 b.manager.clone(),
                 b.party.clone(),
                 b.history_path.clone(),
+                b.parties_path.clone(),
                 b.pending_fp.clone(),
             );
             Ok(())
@@ -1074,6 +1219,7 @@ fn init_bridge() -> Bridge {
     };
 
     let identity_path = history_path.with_file_name("identity.json");
+    let parties_path = history_path.with_file_name("parties.json");
     // Plaintext key in hand (no password) ⇒ force a set-password step, like egui.
     let force_setup = !identity.is_locked();
 
@@ -1085,6 +1231,7 @@ fn init_bridge() -> Bridge {
         identity: StdMutex::new(identity),
         history_path,
         identity_path,
+        parties_path,
         is_new: StdMutex::new(is_new),
         force_setup: StdMutex::new(force_setup),
         pending_fp: Arc::new(StdMutex::new(None)),
@@ -1105,6 +1252,7 @@ fn spawn_poll_loop(
     manager: Arc<Mutex<ChatManager>>,
     party: Arc<Mutex<PartyManager>>,
     history_path: PathBuf,
+    parties_path: PathBuf,
     pending_fp: Arc<StdMutex<Option<(String, String, String)>>>,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -1113,11 +1261,38 @@ fn spawn_poll_loop(
         // triggers a spurious write; only real changes (notably peer messages
         // arriving via poll_session_events) are persisted.
         let mut last_saved_sig: Option<u64> = None;
+        // Servers already recorded as Joined, so the saved-communities file is
+        // touched once per join (to fill in the server's display name), not every tick.
+        let mut joined_recorded: std::collections::HashSet<Uuid> = Default::default();
         loop {
             interval.tick().await;
             // Drain Party/Community server events (joins, channel/member updates,
             // incoming messages) so the webview's Communities pane stays live.
-            party.lock().await.poll_events();
+            {
+                let mut p = party.lock().await;
+                p.poll_events();
+                // Once a server completes its join, copy its (now known) display
+                // name into the saved-communities entry for a nicer rejoin card.
+                for sid in p.server_ids() {
+                    if joined_recorded.contains(&sid) {
+                        continue;
+                    }
+                    if let Some(conn) = p.server(sid) {
+                        if conn.status == PartyStatus::Joined && !conn.server_name.is_empty() {
+                            joined_recorded.insert(sid);
+                            upsert_saved_party(
+                                &parties_path,
+                                SavedParty {
+                                    address: conn.address.clone(),
+                                    username: conn.username.clone(),
+                                    name: conn.server_name.clone(),
+                                    fingerprint: conn.server_fingerprint.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             let (req, toasts, sig) = {
                 let mut m = manager.lock().await;
                 m.poll_session_events();
