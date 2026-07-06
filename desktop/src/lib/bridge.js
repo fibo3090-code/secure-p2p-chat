@@ -195,7 +195,7 @@ export function summaryToConv(s) {
     relay: transport === "relay" || transport === "server",
     state: s.connected ? "connected" : s.placeholder ? "hosting" : "offline",
     // Only claim "verified" once the fingerprint was actually confirmed.
-    trust: s.verified ? "verified" : "unverified", unread: 0, placeholder: s.placeholder,
+    trust: s.verified ? "verified" : "unverified", unread: s.unread ?? 0, placeholder: s.placeholder,
   };
 }
 

@@ -112,6 +112,9 @@ struct ConvSummary {
     /// True once the peer's fingerprint has been confirmed (TOFU-verified). The
     /// UI must not claim "verified" for conversations that are still pending.
     verified: bool,
+    /// Total message count; the frontend derives unread badges from it (count
+    /// beyond what was on screen when the conversation was last open).
+    messages: usize,
 }
 
 fn kind_str(k: messenger_core::types::ChatKind) -> &'static str {
@@ -237,6 +240,7 @@ async fn list_conversations(state: tauri::State<'_, Bridge>) -> Result<Vec<ConvS
                 kind: kind_str(chat.kind),
                 transport: transport_str(chat.transport),
                 verified: chat.peer_fingerprint.is_some(),
+                messages: chat.messages.len(),
             });
         }
     }

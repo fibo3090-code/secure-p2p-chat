@@ -69,6 +69,11 @@ export default function App() {
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [infoTarget, setInfoTarget] = useState(null);
+  // Unread bookkeeping: per-conversation message counts already seen (null until
+  // seeded from the first list load), plus a ref mirror of the active id so the
+  // event-driven refresh never reads a stale closure.
+  const seenRef = useRef(null);
+  const activeIdRef = useRef(null);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
 
@@ -88,7 +93,19 @@ export default function App() {
     if (!ready) return;
     try {
       const list = await api.listConversations();
-      setConvs(list);
+      // Unread bookkeeping (mirrors the TUI): seed the per-conversation "seen"
+      // counts on first load so old history never shows as unread, keep the open
+      // conversation always read, and badge anything beyond the seen count.
+      if (seenRef.current === null) {
+        seenRef.current = Object.fromEntries(list.map((c) => [c.id, c.messages ?? 0]));
+      }
+      const seen = seenRef.current;
+      const cur = activeIdRef.current;
+      if (cur) {
+        const act = list.find((c) => c.id === cur);
+        if (act) seen[cur] = act.messages ?? 0;
+      }
+      setConvs(list.map((c) => ({ ...c, unread: Math.max(0, (c.messages ?? 0) - (seen[c.id] ?? 0)) })));
       // Surface any pending TOFU prompt even if its one-shot event was missed.
       api.pendingFingerprint().then((p) => { if (p) setFpReq((cur) => cur || p); }).catch(() => {});
       setActiveId((cur) => {
@@ -129,6 +146,14 @@ export default function App() {
 
   async function openConv(id) {
     setActiveId(id);
+    activeIdRef.current = id;
+    // Opening a conversation reads it: sync the seen count and clear its badge
+    // immediately (the next poll would do it anyway, this avoids a flicker).
+    if (seenRef.current) {
+      const c = convs.find((x) => x.id === id);
+      if (c) seenRef.current[id] = c.messages ?? 0;
+    }
+    setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, unread: 0 } : c)));
     setNav("chats");
     // Drafts are per-conversation: clear on switch so unsent text can't follow
     // the user into another thread and be sent to the wrong recipient.
@@ -165,7 +190,7 @@ export default function App() {
     setDeleteTarget(null);
     try {
       await api.deleteChat(id);
-      if (activeId === id) { setActiveId(null); setActive(null); }
+      if (activeId === id) { setActiveId(null); activeIdRef.current = null; setActive(null); }
       toast("Conversation deleted", "success");
       refresh();
     } catch (e) { toast(String(e), "error"); }
@@ -193,8 +218,9 @@ export default function App() {
       <div className="app-body">
         <nav className="rail">
           <div className="rail-nav">
-            <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")} />
-            <RailBtn icon="users" label="Parties" active={nav === "parties"} onClick={() => setNav("parties")} />
+            <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}
+              badge={convs.reduce((n, c) => n + (c.unread || 0), 0)} />
+            <RailBtn icon="users" label="Communities" active={nav === "parties"} onClick={() => setNav("parties")} />
             <RailBtn icon="server" label="Relays" active={nav === "relays"} onClick={() => setNav("relays")} />
             <RailBtn icon="user" label="Contacts" active={nav === "contacts"} onClick={() => setNav("contacts")} />
             <RailBtn icon="settings" label="Settings" active={nav === "settings"} onClick={() => setNav("settings")} />

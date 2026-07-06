@@ -44,7 +44,7 @@ export function Avatar({ name, size = 38, state, party }) {
 const TRUST = {
   verified: { icon: "shieldCheck", label: "Verified", cls: "trust-ok" },
   unverified: { icon: "alert", label: "Unverified", cls: "trust-warn" },
-  party: { icon: "users", label: "Party", cls: "trust-party" },
+  party: { icon: "users", label: "Community", cls: "trust-party" },
 };
 export function TrustBadge({ trust, mini }) {
   const t = TRUST[trust] || TRUST.unverified;
