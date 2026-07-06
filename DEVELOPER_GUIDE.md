@@ -73,7 +73,7 @@ cargo check -p p2pem-desktop               # the desktop crate has no tests
 cd desktop && npm run build                # verify the React frontend builds
 ```
 
-The workspace test suite is currently **290 tests**. The `p2pem-desktop` crate is
+The workspace test suite is currently **297 tests**. The `p2pem-desktop` crate is
 not exercised by the test suite and cannot be driven headlessly here, so it is
 verified by `cargo check` + `npm run build` only.
 

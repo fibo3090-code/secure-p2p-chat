@@ -40,6 +40,9 @@ const realApi = {
   partySendDm: (server, to, text) => invoke("party_send_dm", { server, to, text }),
   partyDmHistory: (server, peer) => invoke("party_dm_history", { server, peer }),
   partyClearError: (server) => invoke("party_clear_error", { server }),
+  partySendFile: (server, channel) => invoke("party_send_file", { server, channel }),
+  partySendFileDm: (server, to) => invoke("party_send_file_dm", { server, to }),
+  partyDownloadFile: (server, hash, name) => invoke("party_download_file", { server, hash, name }),
 };
 
 // ── Dev mock ────────────────────────────────────────────────────────────────
@@ -135,6 +138,13 @@ function makeMock() {
     },
     partyDmHistory: async (server, peer) => partyState.msgs[`${server}|dm-${peer}`] || [],
     partyClearError: async (server) => { const s = partyState.servers.find((x) => x.id === server); if (s) s.last_error = null; },
+    partySendFile: async (server, channel) => {
+      (partyState.msgs[`${server}|${channel}`] ||= []).push({ sender_name: "you", from_me: true, kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash", timestamp: Date.now() });
+    },
+    partySendFileDm: async (server, to) => {
+      (partyState.msgs[`${server}|dm-${to}`] ||= []).push({ sender_name: "you", from_me: true, kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash", timestamp: Date.now() });
+    },
+    partyDownloadFile: async () => { console.log("[mock] party download only works in the desktop app"); },
   };
 }
 

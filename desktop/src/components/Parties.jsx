@@ -14,6 +14,12 @@ const STATUS_LABEL = {
   disconnected: "Disconnected",
 };
 
+// Mirror the server-side caps (`messenger-server` state.rs: MAX_USERNAME_CHARS /
+// MAX_CHANNEL_NAME_CHARS) so the UI gives immediate feedback instead of relying on
+// a server rejection. The server remains authoritative.
+const MAX_USERNAME_CHARS = 32;
+const MAX_CHANNEL_NAME_CHARS = 64;
+
 function JoinForm({ onJoined }) {
   const [address, setAddress] = useState("");
   const [username, setUsername] = useState("");
@@ -25,6 +31,8 @@ function JoinForm({ onJoined }) {
     setErr("");
     if (!address.trim()) return setErr("Enter the server address.");
     if (!username.trim()) return setErr("Choose a username.");
+    if ([...username.trim()].length > MAX_USERNAME_CHARS)
+      return setErr(`Username must be ${MAX_USERNAME_CHARS} characters or fewer.`);
     setBusy(true);
     try {
       await api.partyJoin(address.trim(), username.trim(), password);
@@ -46,7 +54,7 @@ function JoinForm({ onJoined }) {
         <div className="party-join">
           <Input value={address} autoFocus placeholder="server address · 192.168.1.20:12345"
             onChange={(e) => setAddress(e.target.value)} />
-          <Input value={username} placeholder="username"
+          <Input value={username} placeholder="username" maxLength={MAX_USERNAME_CHARS}
             onChange={(e) => setUsername(e.target.value)} />
           <PasswordInput value={password} placeholder="server password (optional)"
             onChange={(e) => setPassword(e.target.value)}
@@ -59,15 +67,31 @@ function JoinForm({ onJoined }) {
   );
 }
 
-function MessageRow({ m }) {
+function fmtBytes(n) {
+  if (n == null) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function MessageRow({ m, onDownload }) {
   const mine = m.from_me;
+  const isFile = m.kind === "file";
   return (
     <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
       <div className="msg-bubble">
         {!mine && <span className="msg-author">{m.sender_name}</span>}
-        <span className="msg-text">
-          {m.kind === "file" ? <><Icon name="file" size={13} /> {m.text}</> : m.text}
-        </span>
+        {isFile ? (
+          <button className="msg-file" title={`Download ${m.text}`}
+            onClick={() => onDownload(m)} disabled={!m.hash}>
+            <Icon name="file" size={14} />
+            <span className="msg-file-name">{m.text}</span>
+            {m.size != null && <span className="msg-file-size">{fmtBytes(m.size)}</span>}
+            <Icon name="download" size={14} />
+          </button>
+        ) : (
+          <span className="msg-text">{m.text}</span>
+        )}
         <span className="msg-time">{fmtTime(m.timestamp)}</span>
       </div>
     </div>
@@ -142,9 +166,32 @@ export function Parties() {
     } catch (e) { setDraft(text); toast(String(e), "error"); }
   }
 
+  // Share a file into the active channel or DM. The native picker opens in the
+  // bridge; a cancelled dialog is a no-op.
+  async function sendFile() {
+    if (!server || !connected) return;
+    try {
+      if (dm) await api.partySendFileDm(server.id, dm);
+      else if (cid) await api.partySendFile(server.id, cid);
+      else return;
+      loadMsgs();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  // Download a file message's bytes and save them via the native dialog.
+  async function downloadFile(m) {
+    if (!server || !m.hash) return;
+    try { await api.partyDownloadFile(server.id, m.hash, m.text); }
+    catch (e) { toast(String(e), "error"); }
+  }
+
   async function createChannel() {
     const name = newChannel.trim();
     if (!name || !server) return;
+    if ([...name].length > MAX_CHANNEL_NAME_CHARS) {
+      toast(`Channel name must be ${MAX_CHANNEL_NAME_CHARS} characters or fewer.`, "error");
+      return;
+    }
     setNewChannel("");
     try { await api.partyCreateChannel(server.id, name); loadServers(); }
     catch (e) { toast(String(e), "error"); }
@@ -179,7 +226,7 @@ export function Parties() {
           ))}
         </div>
         <div className="party-newch">
-          <input placeholder="new channel" value={newChannel}
+          <input placeholder="new channel" value={newChannel} maxLength={MAX_CHANNEL_NAME_CHARS}
             onChange={(e) => setNewChannel(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && createChannel()} />
           <button title="Create channel" onClick={createChannel}><Icon name="plus" size={15} /></button>
@@ -231,11 +278,14 @@ export function Parties() {
         <div className="chat-scroll" ref={scrollRef}>
           <div className="chat-thread">
             {msgs.length === 0 && <div className="conv-empty">No messages yet.</div>}
-            {msgs.map((m, i) => <MessageRow key={i} m={m} />)}
+            {msgs.map((m, i) => <MessageRow key={i} m={m} onDownload={downloadFile} />)}
           </div>
         </div>
 
         <div className="composer">
+          <button className="composer-clip" onClick={sendFile} title="Share a file" disabled={!connected}>
+            <Icon name="paperclip" size={18} />
+          </button>
           <textarea className="composer-input" rows={1}
             placeholder={connected ? `Message ${threadName}` : "Not connected"}
             disabled={!connected}

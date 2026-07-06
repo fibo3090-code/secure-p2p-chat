@@ -586,6 +586,8 @@ struct PartyMessageDto {
     kind: &'static str,
     text: String,
     size: Option<u64>,
+    /// Content hash of a file message, used to request its download. `None` for text.
+    hash: Option<String>,
     timestamp: u64,
 }
 
@@ -649,9 +651,9 @@ fn message_dto(
         .find(|m| m.id == env.sender)
         .map(|m| m.username.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    let (kind, text, size) = match &env.payload {
-        MessagePayload::Text(t) => ("text", t.clone(), None),
-        MessagePayload::File(f) => ("file", f.name.clone(), Some(f.size)),
+    let (kind, text, size, hash) = match &env.payload {
+        MessagePayload::Text(t) => ("text", t.clone(), None, None),
+        MessagePayload::File(f) => ("file", f.name.clone(), Some(f.size), Some(f.hash.clone())),
     };
     PartyMessageDto {
         sender_name,
@@ -659,6 +661,7 @@ fn message_dto(
         kind,
         text,
         size,
+        hash,
         timestamp: env.timestamp,
     }
 }
@@ -814,6 +817,132 @@ async fn party_clear_error(server: String, state: tauri::State<'_, Bridge>) -> R
     Ok(())
 }
 
+/// Open the native file picker (on a blocking thread) and read the chosen file's
+/// bytes, returning `(name, mime, data)`. `Ok(None)` if the user cancelled.
+async fn pick_upload() -> Result<Option<(String, String, Vec<u8>)>, String> {
+    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_file())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let mime = guess_mime(&path);
+    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(Some((name, mime, data)))
+}
+
+/// A minimal extension → MIME guess for common file types; defaults to
+/// `application/octet-stream`. The server keeps this only as display metadata.
+fn guess_mime(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Pick a file and post it to a community channel. The picker runs on a blocking
+/// thread; a cancelled dialog is a successful no-op.
+#[tauri::command]
+async fn party_send_file(
+    server: String,
+    channel: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let Some((name, mime, data)) = pick_upload().await? else {
+        return Ok(());
+    };
+    state
+        .party
+        .lock()
+        .await
+        .send_file(sid, cid, name, mime, data)
+        .map_err(|e| e.to_string())
+}
+
+/// Pick a file and send it as a direct message to another community member.
+#[tauri::command]
+async fn party_send_file_dm(
+    server: String,
+    to: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let peer = Uuid::parse_str(&to).map_err(|e| e.to_string())?;
+    let Some((name, mime, data)) = pick_upload().await? else {
+        return Ok(());
+    };
+    state
+        .party
+        .lock()
+        .await
+        .send_file_dm(sid, peer, name, mime, data)
+        .map_err(|e| e.to_string())
+}
+
+/// Download a community file by content hash and save it via the native dialog.
+/// `name` seeds the save dialog. The server only returns bytes the caller is
+/// allowed to see (access-checked there). A cancelled save dialog is a no-op.
+#[tauri::command]
+async fn party_download_file(
+    server: String,
+    hash: String,
+    name: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    // Register the download and drop the party lock BEFORE awaiting, so the poll
+    // loop can lock the manager, drain the FileData response, and complete us.
+    let rx = state
+        .party
+        .lock()
+        .await
+        .request_download(sid, hash)
+        .map_err(|e| e.to_string())?;
+    // Outer error: the sender was dropped (connection torn down). Inner error: the
+    // server refused (file gone / not permitted). Either way, surface a message
+    // rather than hang.
+    let data = match rx.await {
+        Ok(Ok(data)) => data,
+        Ok(Err(reason)) => return Err(reason),
+        Err(_) => return Err("download failed: the connection closed".to_string()),
+    };
+    let suggested = name;
+    let picked = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new().set_file_name(suggested).save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(path) = picked else {
+        return Ok(()); // user cancelled the save dialog
+    };
+    std::fs::write(&path, &data).map_err(|e| e.to_string())
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -876,6 +1005,9 @@ pub fn run() {
             party_send_dm,
             party_dm_history,
             party_clear_error,
+            party_send_file,
+            party_send_file_dm,
+            party_download_file,
         ])
         .setup(|app| {
             let b = app.state::<Bridge>();

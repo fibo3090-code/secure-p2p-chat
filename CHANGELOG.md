@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Community file sharing in the desktop app.** You can now share a file into a
+  Community channel or direct message (a paperclip button in the composer) and
+  download files others have shared (click a file message to save it via a native
+  dialog). This wires up the client half of the Party file feature that had a
+  complete server but no way to send or receive files from any client:
+  `PartyManager` gained `send_file` / `send_file_dm` (optimistic append + inline
+  upload, size-checked against the 4 MiB `MAX_INLINE_FILE_BYTES`) and
+  `request_download` (correlates the async `FileData` response by content hash);
+  the Tauri bridge added `party_send_file` / `party_send_file_dm` /
+  `party_download_file` commands; and file messages now surface their content hash
+  and size. Downloads remain access-checked server-side, so a member only receives
+  files they can see.
+
+### Security
+
+- **Party input length caps.** The server now bounds member usernames (≤ 32
+  characters), channel names (≤ 64 characters), and channel/DM message text (≤ 64
+  KiB, matching the P2P transport cap) instead of accepting any string up to the 8
+  MiB packet limit. This prevents a member from storing or broadcasting a
+  multi-megabyte username, channel name, or message that every client would then
+  persist and render. The desktop Communities UI mirrors the username/channel caps
+  for immediate feedback; the server remains authoritative.
+
 ### Documentation
 
 - Brought the docs back in sync with the code: the four-crate workspace (adding

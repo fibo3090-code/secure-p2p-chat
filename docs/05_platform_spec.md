@@ -280,9 +280,13 @@ history; `PartyRequest::PostFile` / `SendFileDm` upload bytes inline (bounded by
 text message; `DownloadFile { hash }` returns the bytes. The server stores each
 blob once, keyed by SHA-256, reference-counted, with the bytes on disk under
 `<data_dir>/blobs/<hash>` and metadata (`hash, size, mime, refcount`) in the
-`blobs` SQLite table. **Remaining:** chunked transfer for large files; the
-permission matrix, quotas, provenance, and the Drive UI panel below; client-side
-download/save wiring.
+`blobs` SQLite table. **Client wiring (done):** the desktop app can now share a
+file into a channel or DM (a paperclip in the composer → `PartyManager::send_file`
+/ `send_file_dm`, size-checked against `MAX_INLINE_FILE_BYTES`) and download a
+received file (a file card → `PartyManager::request_download`, which correlates the
+async `FileData` response by content hash and saves via a native dialog).
+**Remaining:** chunked transfer for large files; the permission matrix, quotas,
+provenance, and the Drive UI panel below; the same wiring in egui/TUI.
 
 Target data model — content-addressable, deduplicated storage:
 
@@ -510,10 +514,12 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   and stack notes in §10. Remaining: delete egui (E) and rebuild packaging so the
   release ships the Tauri app instead of the egui binary (F). Plan a `2.0.0`
   release when Phase F lands (owner authorizes the tag).
-- **Phase 2 — Drive / files. ◐ slice 1 done.** Inline (≤4 MiB) content-addressed
-  file sharing in channels & DMs with hash dedup + reference counting and on-disk
-  blobs landed (see §8). Remaining: chunked transfer for large files,
-  list/download/delete UX, logical + physical quotas, and the Drive panel.
+- **Phase 2 — Drive / files. ◐ slice 1 done + desktop client wiring.** Inline
+  (≤4 MiB) content-addressed file sharing in channels & DMs with hash dedup +
+  reference counting and on-disk blobs landed (see §8), and the **desktop app can
+  now upload and download** community files. Remaining: chunked transfer for large
+  files, delete UX, logical + physical quotas, the Drive panel, and egui/TUI
+  parity.
 - **Phase 3 — Governance & roles.** Trust-tier labeling, transparency panel,
   consent-or-leave, audit log, roles/permissions, visibility & contact policies,
   channel lock/password.
@@ -565,7 +571,7 @@ onion routing / anonymity layer, post-quantum migration, hardware-backed identit
 
 ## 13. Verification & Test Coverage
 
-The workspace passes **290 automated tests** (`cargo nextest run --workspace`)
+The workspace passes **297 automated tests** (`cargo nextest run --workspace`)
 spanning unit, integration, and end-to-end suites (the `p2pem-desktop` crate has
 no automated tests — it is verified with `cargo check -p p2pem-desktop` and
 `npm run build`):
@@ -615,7 +621,7 @@ The one area not deeply automated is GUI pixel rendering; the logic behind it
 ## 14. Status
 
 Phase 0 (workspace) and the Phase 1 Party server core are complete; the suite is
-green at 290 tests. The **Tauri + React desktop app** (§10) has shipped its P2P,
+green at 297 tests. The **Tauri + React desktop app** (§10) has shipped its P2P,
 Party, Relay, Contacts, and Settings surfaces (phases A–D) as the `desktop/` crate,
 closing most of the Phase 1 UI-polish items; retiring egui and rebuilding packaging
 (phases E–F) remain. The Independent P2P hardening (connection passwords +

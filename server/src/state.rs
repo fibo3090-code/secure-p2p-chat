@@ -45,12 +45,26 @@ const MAX_TOTAL_BLOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Filename of the legacy JSON snapshot, imported once into SQLite if present.
 const LEGACY_SNAPSHOT_FILE: &str = "party_state.json";
 
+/// Maximum length (in Unicode scalar values) of a member username. Usernames are
+/// display handles shown in every client's directory, not free text, so they are
+/// bounded well below the transport packet limit to keep the directory renderable
+/// and prevent a member from storing/broadcasting a multi-megabyte handle.
+pub const MAX_USERNAME_CHARS: usize = 32;
+/// Maximum length (in Unicode scalar values) of a channel name, bounded for the
+/// same reasons as [`MAX_USERNAME_CHARS`].
+pub const MAX_CHANNEL_NAME_CHARS: usize = 64;
+/// Maximum size (in bytes) of a channel or DM message's text payload. Mirrors the
+/// P2P transport cap (`messenger_core::MAX_TEXT_MESSAGE_BYTES`) so the two message
+/// paths agree, and bounds durable storage / broadcast fan-out per message.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = messenger_core::MAX_TEXT_MESSAGE_BYTES;
+
 /// Why a join was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinError {
     WrongPassword,
     UsernameTaken,
     EmptyUsername,
+    UsernameTooLong,
 }
 
 impl JoinError {
@@ -59,8 +73,21 @@ impl JoinError {
             JoinError::WrongPassword => "incorrect server password",
             JoinError::UsernameTaken => "username already taken",
             JoinError::EmptyUsername => "username must not be empty",
+            JoinError::UsernameTooLong => "username is too long (max 32 characters)",
         }
     }
+}
+
+/// Reject a message whose text payload exceeds [`MAX_MESSAGE_TEXT_BYTES`], so a
+/// member cannot store or broadcast an oversized message. Applies to both channel
+/// posts and DMs.
+fn validate_message_text(text: &str) -> Result<(), String> {
+    if text.len() > MAX_MESSAGE_TEXT_BYTES {
+        return Err(format!(
+            "message is too long (max {MAX_MESSAGE_TEXT_BYTES} bytes)"
+        ));
+    }
+    Ok(())
 }
 
 struct Member {
@@ -251,6 +278,9 @@ impl PartyState {
         if username.is_empty() {
             return Err(JoinError::EmptyUsername);
         }
+        if username.chars().count() > MAX_USERNAME_CHARS {
+            return Err(JoinError::UsernameTooLong);
+        }
         if self.password.as_deref() != password {
             return Err(JoinError::WrongPassword);
         }
@@ -336,6 +366,11 @@ impl PartyState {
         if name.is_empty() {
             return Err("channel name must not be empty".to_string());
         }
+        if name.chars().count() > MAX_CHANNEL_NAME_CHARS {
+            return Err(format!(
+                "channel name is too long (max {MAX_CHANNEL_NAME_CHARS} characters)"
+            ));
+        }
         if self
             .channels
             .iter()
@@ -382,6 +417,7 @@ impl PartyState {
         if !self.is_member(sender) {
             return Err("sender is not a member of this server".to_string());
         }
+        validate_message_text(&text)?;
         let tier = self.tier;
         let chan = self
             .channel_mut(channel)
@@ -425,6 +461,7 @@ impl PartyState {
         if !self.is_member(to) {
             return Err("recipient is not a member of this server".to_string());
         }
+        validate_message_text(&text)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);
         let tier = self.tier;
         let thread = self
@@ -1016,6 +1053,65 @@ mod tests {
             "username uniqueness is case-insensitive"
         );
         assert_eq!(state.join("   ", None, None), Err(JoinError::EmptyUsername));
+    }
+
+    #[test]
+    fn oversized_username_rejected_at_the_boundary() {
+        let mut state = PartyState::new("Open", None);
+        // Exactly at the cap is accepted (counted in Unicode scalar values, so the
+        // trailing surrounding whitespace is trimmed first).
+        let at_cap = "a".repeat(MAX_USERNAME_CHARS);
+        assert!(
+            state.join(&at_cap, None, None).is_ok(),
+            "{MAX_USERNAME_CHARS} chars is allowed"
+        );
+
+        // One past the cap is rejected before the member is ever stored.
+        let too_long = "b".repeat(MAX_USERNAME_CHARS + 1);
+        assert_eq!(
+            state.join(&too_long, None, None),
+            Err(JoinError::UsernameTooLong)
+        );
+        assert_eq!(
+            state.members().len(),
+            1,
+            "the oversized username is not registered"
+        );
+    }
+
+    #[test]
+    fn oversized_channel_name_rejected() {
+        let mut state = PartyState::new("Open", None);
+        let at_cap = "c".repeat(MAX_CHANNEL_NAME_CHARS);
+        assert!(state.create_channel(&at_cap).is_ok());
+
+        let too_long = "d".repeat(MAX_CHANNEL_NAME_CHARS + 1);
+        let err = state.create_channel(&too_long).unwrap_err();
+        assert!(err.contains("too long"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn oversized_message_text_rejected_in_channels_and_dms() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let chan = state.default_channel();
+
+        let too_long = "x".repeat(MAX_MESSAGE_TEXT_BYTES + 1);
+        assert!(
+            state.post_message(alice, chan, too_long.clone()).is_err(),
+            "an oversized channel message must be rejected"
+        );
+        assert!(
+            state.post_dm(alice, bob, too_long).is_err(),
+            "an oversized DM must be rejected"
+        );
+        // Nothing oversized was persisted to the channel.
+        assert!(state.history_since(chan, 0).is_empty());
+
+        // A message exactly at the cap is still accepted.
+        let at_cap = "y".repeat(MAX_MESSAGE_TEXT_BYTES);
+        assert!(state.post_message(alice, chan, at_cap).is_ok());
     }
 
     #[test]
