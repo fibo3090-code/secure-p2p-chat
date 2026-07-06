@@ -14,6 +14,7 @@ const MAP = {
   copy: "Copy", refresh: "RefreshCw", clock: "Clock", globe: "Globe", trash: "Trash2",
   swap: "ArrowLeftRight", more: "EllipsisVertical", edit: "Pencil", info: "Info",
   plug: "Plug", satellite: "Satellite", hash: "Hash", monitor: "Monitor",
+  folder: "Folder",
 };
 
 export function Icon({ name, size = 18, ...rest }) {

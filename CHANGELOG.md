@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Real settings in the desktop app.** The Settings pane now exposes the
+  settings the runtime actually honors: desktop notifications, typing-indicator
+  privacy, auto-host on startup with a configurable listening port, and the
+  download folder (with a native folder picker). Changes save immediately and
+  persist in the encrypted history file. The desktop bridge now also honors
+  **auto-host on startup** (start listening as soon as the app unlocks), like
+  the egui/TUI apps. Previously the pane only offered identity, theme, and an
+  about blurb — received files went to a default folder the user could neither
+  see nor change.
 - **Live file-transfer progress in the desktop app.** In-flight sends and
   receives now show a progress bar (filename, live percentage) above the
   composer, and failures surface their reason inline. Previously the desktop

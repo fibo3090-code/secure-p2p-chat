@@ -185,7 +185,29 @@ async fn unlock(password: String, state: tauri::State<'_, Bridge>) -> Result<(),
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
         tracing::warn!("Failed to load history after unlock: {}", e);
     }
+    auto_host_if_configured(&state, &mut mgr).await;
     Ok(())
+}
+
+/// Honor `auto_host_on_startup` once the identity is unlocked and history (with
+/// its persisted config) is loaded — "open the app and be reachable", matching
+/// the egui/TUI apps. Failures are logged, never fatal to the unlock.
+async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
+    if !mgr.config.auto_host_on_startup {
+        return;
+    }
+    let port = mgr.config.listen_port;
+    let pk = { state.identity.lock().unwrap().private_key() };
+    match pk {
+        Ok(pk) => {
+            if let Err(e) = mgr.start_host(port, pk).await {
+                tracing::warn!("auto-host on startup failed: {e}");
+            } else {
+                tracing::info!(port, "auto-hosting on startup");
+            }
+        }
+        Err(e) => tracing::warn!("auto-host: no private key: {e}"),
+    }
 }
 
 /// Set a password on a fresh / plaintext identity, persist it, and stay unlocked.
@@ -211,12 +233,88 @@ async fn set_password(password: String, state: tauri::State<'_, Bridge>) -> Resu
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
         tracing::warn!("Failed to load history after password setup: {}", e);
     }
+    auto_host_if_configured(&state, &mut mgr).await;
     Ok(())
 }
 
 #[tauri::command]
 fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
     auth_status(state)
+}
+
+/// The user-facing settings the desktop app exposes. Only fields the core
+/// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
+/// `download_dir` and typing/notification switches are read by `ChatManager`,
+/// and auto-host is implemented by this bridge on unlock.
+#[derive(Serialize)]
+struct SettingsDto {
+    download_dir: String,
+    enable_notifications: bool,
+    enable_typing_indicators: bool,
+    auto_host_on_startup: bool,
+    listen_port: u16,
+}
+
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    enable_notifications: bool,
+    enable_typing_indicators: bool,
+    auto_host_on_startup: bool,
+    listen_port: u16,
+}
+
+#[tauri::command]
+async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<SettingsDto, String> {
+    ensure_ready(&state)?;
+    let mgr = state.manager.lock().await;
+    Ok(SettingsDto {
+        download_dir: mgr.config.download_dir.display().to_string(),
+        enable_notifications: mgr.config.enable_notifications,
+        enable_typing_indicators: mgr.config.enable_typing_indicators,
+        auto_host_on_startup: mgr.config.auto_host_on_startup,
+        listen_port: mgr.config.listen_port,
+    })
+}
+
+/// Apply the toggle/number settings and persist them (config is part of the
+/// encrypted history file). The download directory has its own picker command.
+#[tauri::command]
+async fn update_settings(
+    settings: SettingsUpdate,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    if settings.listen_port == 0 {
+        return Err("listen port must be between 1 and 65535".to_string());
+    }
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.config.enable_notifications = settings.enable_notifications;
+        mgr.config.enable_typing_indicators = settings.enable_typing_indicators;
+        mgr.config.auto_host_on_startup = settings.auto_host_on_startup;
+        mgr.config.listen_port = settings.listen_port;
+    }
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Pick a new download directory with the native folder dialog (on a blocking
+/// thread) and persist it. Returns the new path, or `None` if cancelled.
+#[tauri::command]
+async fn pick_download_dir(state: tauri::State<'_, Bridge>) -> Result<Option<String>, String> {
+    ensure_ready(&state)?;
+    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_folder())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(dir) = picked else {
+        return Ok(None);
+    };
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.config.download_dir = dir.clone();
+    }
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(Some(dir.display().to_string()))
 }
 
 #[tauri::command]
@@ -1178,6 +1276,9 @@ pub fn run() {
             list_conversations,
             get_conversation,
             list_transfers,
+            get_settings,
+            update_settings,
+            pick_download_dir,
             send_message,
             send_file,
             start_host,
