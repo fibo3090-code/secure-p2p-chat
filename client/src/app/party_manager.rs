@@ -680,9 +680,7 @@ mod tests {
         let (mut mgr, id, tx, _out) = manager_with_server();
         mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
 
-        let mut rx = mgr
-            .request_download(id, "deadbeef".to_string())
-            .unwrap();
+        let mut rx = mgr.request_download(id, "deadbeef".to_string()).unwrap();
 
         // The server can't serve it (gone / not permitted); a download error is not
         // hash-correlated on the wire, so any in-flight download is failed.
@@ -705,8 +703,14 @@ mod tests {
         let too_big = vec![0u8; MAX_INLINE_FILE_BYTES + 1];
 
         assert!(
-            mgr.send_file(id, channel, "big.bin".to_string(), "application/octet-stream".to_string(), too_big)
-                .is_err(),
+            mgr.send_file(
+                id,
+                channel,
+                "big.bin".to_string(),
+                "application/octet-stream".to_string(),
+                too_big
+            )
+            .is_err(),
             "an oversized upload must be rejected"
         );
         // Nothing was appended locally and no request was emitted.

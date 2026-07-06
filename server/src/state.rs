@@ -1061,12 +1061,22 @@ mod tests {
         // Exactly at the cap is accepted (counted in Unicode scalar values, so the
         // trailing surrounding whitespace is trimmed first).
         let at_cap = "a".repeat(MAX_USERNAME_CHARS);
-        assert!(state.join(&at_cap, None, None).is_ok(), "{MAX_USERNAME_CHARS} chars is allowed");
+        assert!(
+            state.join(&at_cap, None, None).is_ok(),
+            "{MAX_USERNAME_CHARS} chars is allowed"
+        );
 
         // One past the cap is rejected before the member is ever stored.
         let too_long = "b".repeat(MAX_USERNAME_CHARS + 1);
-        assert_eq!(state.join(&too_long, None, None), Err(JoinError::UsernameTooLong));
-        assert_eq!(state.members().len(), 1, "the oversized username is not registered");
+        assert_eq!(
+            state.join(&too_long, None, None),
+            Err(JoinError::UsernameTooLong)
+        );
+        assert_eq!(
+            state.members().len(),
+            1,
+            "the oversized username is not registered"
+        );
     }
 
     #[test]
