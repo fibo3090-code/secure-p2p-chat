@@ -711,12 +711,17 @@ struct PartyMemberDto {
     username: String,
     online: bool,
     is_me: bool,
+    /// Message count in my DM thread with this member (0 when not joined yet).
+    /// The frontend derives DM unread badges from it.
+    dm_messages: usize,
 }
 
 #[derive(Serialize)]
 struct PartyChannelDto {
     id: String,
     name: String,
+    /// Message count in this channel; the frontend derives unread badges from it.
+    messages: usize,
 }
 
 #[derive(Serialize)]
@@ -770,6 +775,13 @@ fn server_dto(
             username: m.username.clone(),
             online: m.online,
             is_me: conn.member_id == Some(m.id),
+            dm_messages: conn
+                .member_id
+                .map(|me| {
+                    let thread = messenger_core::party::dm_thread_id(me, m.id);
+                    conn.messages.get(&thread).map_or(0, |v| v.len())
+                })
+                .unwrap_or(0),
         })
         .collect();
     let channels = conn
@@ -778,6 +790,7 @@ fn server_dto(
         .map(|c| PartyChannelDto {
             id: c.id.to_string(),
             name: c.name.clone(),
+            messages: conn.messages.get(&c.id).map_or(0, |v| v.len()),
         })
         .collect();
     PartyServerDto {

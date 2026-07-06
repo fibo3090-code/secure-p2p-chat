@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Community unread badges in the desktop app.** Channels, DM threads, and the
+  community switcher now show unread counts, and the Communities rail icon
+  badges the total — including messages that arrive while you're on another
+  tab. Pre-existing history is never counted as unread; the thread on screen
+  stays read.
 - **Real settings in the desktop app.** The Settings pane now exposes the
   settings the runtime actually honors: desktop notifications, typing-indicator
   privacy, auto-host on startup with a configurable listening port, and the

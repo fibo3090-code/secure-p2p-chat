@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onBridge, summaryToConv, chatToContact } from "./lib/bridge.js";
+import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
 import { cx, Avatar } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
@@ -75,6 +76,7 @@ export default function App() {
   const seenRef = useRef(null);
   const activeIdRef = useRef(null);
   const [transfers, setTransfers] = useState([]);
+  const [partyUnread, setPartyUnread] = useState(0);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
 
@@ -128,7 +130,12 @@ export default function App() {
     const u1 = onBridge("state-updated", () => refresh());
     const u2 = onBridge("fingerprint-request", (e) => setFpReq(e.payload));
     const u3 = onBridge("toast", (e) => toast(e.payload.message, e.payload.level));
-    return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); };
+    // Communities unread total for the rail badge — computed here (not in the
+    // Parties pane) so messages arriving while another tab is open still badge.
+    const u4 = onBridge("party-updated", async () => {
+      try { setPartyUnread(computeUnread(await api.partyList()).total); } catch { /* ignore */ }
+    });
+    return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
   }, [ready, refresh]);
 
   if (!auth) return null;
@@ -223,7 +230,8 @@ export default function App() {
           <div className="rail-nav">
             <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}
               badge={convs.reduce((n, c) => n + (c.unread || 0), 0)} />
-            <RailBtn icon="users" label="Communities" active={nav === "parties"} onClick={() => setNav("parties")} />
+            <RailBtn icon="users" label="Communities" active={nav === "parties"} onClick={() => setNav("parties")}
+              badge={partyUnread} />
             <RailBtn icon="server" label="Relays" active={nav === "relays"} onClick={() => setNav("relays")} />
             <RailBtn icon="user" label="Contacts" active={nav === "contacts"} onClick={() => setNav("contacts")} />
             <RailBtn icon="settings" label="Settings" active={nav === "settings"} onClick={() => setNav("settings")} />

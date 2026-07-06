@@ -632,6 +632,11 @@ input,textarea{font-family:inherit;color:inherit}
 .party-item:disabled{cursor:default}
 .party-hash{color:var(--faint);font-weight:600}
 .party-you{font-size:10px;color:var(--faint);border:1px solid var(--border);border-radius:6px;padding:0 5px;margin-left:auto}
+.party-unread{margin-left:auto;flex:none;min-width:17px;height:17px;padding:0 5px;border-radius:9px;
+  display:grid;place-items:center;background:var(--accent);color:var(--accent-ink,#fff);
+  font-size:10.5px;font-weight:700;line-height:1}
+.party-srv-tab .party-unread{margin-left:2px}
+.party-srv-tab.is-active .party-unread{background:#fff;color:var(--accent)}
 .party-dot{flex:none;width:8px;height:8px;border-radius:50%}
 .party-dot.is-online{background:var(--success)}
 .party-dot.is-offline{background:var(--faint)}

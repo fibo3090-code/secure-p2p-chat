@@ -103,11 +103,11 @@ function makeMock() {
       username: username || "you",
       fingerprint: "5f3a9c2e7b1d4068aa22cc55ee88ff00112233445566778899aabbccddeeff11",
       status: "joined", status_detail: null, member_id: me, last_error: null,
-      channels: [{ id: gen, name: "general" }, { id: rnd, name: "random" }],
+      channels: [{ id: gen, name: "general", messages: 0 }, { id: rnd, name: "random", messages: 0 }],
       members: [
-        { id: me, username: username || "you", online: true, is_me: true },
-        { id: "mem-nova", username: "nova", online: true, is_me: false },
-        { id: "mem-kite", username: "kite", online: false, is_me: false },
+        { id: me, username: username || "you", online: true, is_me: true, dm_messages: 0 },
+        { id: "mem-nova", username: "nova", online: true, is_me: false, dm_messages: 0 },
+        { id: "mem-kite", username: "kite", online: false, is_me: false, dm_messages: 0 },
       ],
     }];
     partyState.msgs[`${sid}|${gen}`] = [
