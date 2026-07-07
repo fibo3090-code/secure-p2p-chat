@@ -1316,6 +1316,11 @@ where
                     tracing::debug!("Message sent successfully");
                     // Track sent messages for rekeying
                     messages_since_rekey += 1;
+                    // The file's last frame just hit the wire: tell the app the
+                    // transfer is genuinely done (queueing is not delivery).
+                    if let ProtocolMessage::FileEnd { seq } = msg {
+                        let _ = to_app_tx.send(SessionEvent::FileSendComplete { seq });
+                    }
                 }
             }
 

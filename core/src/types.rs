@@ -200,6 +200,11 @@ pub enum SessionEvent {
     },
     Ready,
     MessageReceived(crate::core::ProtocolMessage),
+    /// The final frame of an outgoing file transfer (`FileEnd` with this seq)
+    /// was written to the wire — only now is the transfer actually complete.
+    FileSendComplete {
+        seq: u64,
+    },
     Disconnected,
     Error(String),
     Warning(String),
