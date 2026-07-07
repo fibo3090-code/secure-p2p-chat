@@ -91,6 +91,17 @@ All notable changes to this project will be documented in this file.
   persist and render. The desktop Communities UI mirrors the username/channel caps
   for immediate feedback; the server remains authoritative.
 
+### Performance
+
+- **Desktop app bundle cut by 70%** (886 KB → 266 KB, gzip 231 KB → 81 KB): the
+  icon component's namespace import defeated tree-shaking and shipped the
+  entire lucide icon library (~1500 icons) for the ~45 actually used. Icons are
+  now imported individually. Faster first load of the webview.
+- **Long threads render a bounded window.** Chats and community threads mount
+  only the most recent 150 messages ("Show earlier messages" widens the
+  window), so a multi-thousand-message history no longer re-renders thousands
+  of nodes on every 250 ms poll tick.
+
 ### Documentation
 
 - Brought the docs back in sync with the code: the four-crate workspace (adding

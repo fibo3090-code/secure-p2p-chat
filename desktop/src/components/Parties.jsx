@@ -139,7 +139,9 @@ export function Parties() {
   const [prefill, setPrefill] = useState(null);      // prefill for the join form (rejoin flows)
   const [confirmLeave, setConfirmLeave] = useState(false); // two-click leave confirmation
   const [unread, setUnread] = useState({});          // thread key -> unread count
+  const [shown, setShown] = useState(150);           // message window (see Messages.jsx)
   const scrollRef = useRef(null);
+  useEffect(() => setShown(150), [sid, cid, dm]);
 
   const server = useMemo(() => servers.find((s) => s.id === sid) || null, [servers, sid]);
 
@@ -391,7 +393,12 @@ export function Parties() {
         <div className="chat-scroll" ref={scrollRef}>
           <div className="chat-thread">
             {msgs.length === 0 && <div className="conv-empty">No messages yet.</div>}
-            {msgs.map((m, i) => <MessageRow key={i} m={m} onDownload={downloadFile} />)}
+            {msgs.length > shown && (
+              <button className="thread-more" onClick={() => setShown((s) => s + 150)}>
+                Show earlier messages ({msgs.length - shown} more)
+              </button>
+            )}
+            {msgs.slice(-shown).map((m, i) => <MessageRow key={i} m={m} onDownload={downloadFile} />)}
           </div>
         </div>
 
