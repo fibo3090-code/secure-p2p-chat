@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **"File sent" is now confirmed at the wire, not at the queue.** Sending a
+  file reported success as soon as its frames were queued on the session —
+  the transfer could still be in flight (or die with the connection) while
+  the sender saw "File sent". The session now reports when the file's final
+  frame is actually written to the socket; only then does the success toast
+  appear, and a disconnect with sends still pending shows an honest
+  "File may not have been delivered" error instead.
+
 ## [1.12.1] - 2026-07-07
 
 ### Fixed
