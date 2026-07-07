@@ -1,0 +1,11 @@
+# Gitleaks configuration: extend the default rules with a reviewed allowlist,
+# so a scan is clean by default and any new finding is a real signal.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Reviewed false positives"
+# A sequential hex placeholder ("0123456789abcdef" twice) used as a relay-token
+# test vector in a historical commit (pre-workspace src/ tree). Not a secret.
+regexes = ['''0123456789abcdef0123456789abcdef''']

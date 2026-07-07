@@ -4,6 +4,7 @@ description = "Shared core for the Encrypted Messenger: crypto, wire protocol, i
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 authors.workspace = true
 
 [lib]
