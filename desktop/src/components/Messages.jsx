@@ -68,7 +68,20 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
             </div>
           </button>
         ))}
-        {filtered.length === 0 && <div className="conv-empty">No conversations yet.</div>}
+        {filtered.length === 0 && (
+          <div className="conv-empty">
+            {contacts.length === 0 ? (
+              <>
+                No conversations yet.
+                <button className="conv-empty-cta" onClick={onAdd}>
+                  <Icon name="plus" size={14} /> Start a connection
+                </button>
+              </>
+            ) : (
+              "No conversations match your search."
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -146,8 +159,15 @@ function TransferBar({ transfers }) {
   );
 }
 
+// How many messages render at once. Long histories only mount their tail, so a
+// 10k-message thread doesn't re-render thousands of nodes on every poll tick;
+// "Show earlier messages" widens the window on demand.
+const MSG_WINDOW = 150;
+
 export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers }) {
   const scrollRef = useRef(null);
+  const [shown, setShown] = useState(MSG_WINDOW);
+  useEffect(() => setShown(MSG_WINDOW), [contact && contact.id]);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [contact && contact.id, contact && contact.messages.length]);
@@ -186,7 +206,12 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
 
       <div className="chat-scroll" ref={scrollRef}>
         <div className="chat-thread">
-          {contact.messages.map((m, i) => <MessageItem key={i} m={m} />)}
+          {contact.messages.length > shown && (
+            <button className="thread-more" onClick={() => setShown((s) => s + MSG_WINDOW)}>
+              Show earlier messages ({contact.messages.length - shown} more)
+            </button>
+          )}
+          {contact.messages.slice(-shown).map((m, i) => <MessageItem key={i} m={m} />)}
         </div>
       </div>
 
