@@ -49,7 +49,11 @@ pub async fn run(event_collector: EventCollector, launch: TuiLaunchConfig) -> Re
     terminal.show_cursor()?;
 
     if let Err(err) = res {
-        println!("{:?}", err)
+        // The alternate screen is already torn down here, so stderr is the only
+        // channel the user still sees; the tracing call keeps the structured
+        // record for diagnostics exports.
+        tracing::error!(error = ?err, "TUI exited with an error");
+        eprintln!("The TUI exited with an error: {err:?}");
     }
 
     Ok(())
