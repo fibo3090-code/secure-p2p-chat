@@ -8,7 +8,7 @@
 //! - Invite link generation and parsing (including QR codes)
 
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +44,9 @@ pub struct ChatManager {
     /// When a message is sent to incoming_chat_id, it's forwarded to the parent_session_chat_id's session.
     chat_id_mapping: HashMap<Uuid, Uuid>,
     active_transfers: HashMap<Uuid, FileTransferState>,
+    /// Outgoing files queued on a session but whose final frame has not hit the
+    /// wire yet (FIFO per chat; resolved by `SessionEvent::FileSendComplete`).
+    pending_file_sends: HashMap<Uuid, VecDeque<String>>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
@@ -321,6 +324,7 @@ impl ChatManager {
             session_events: HashMap::new(),
             chat_id_mapping: HashMap::new(),
             active_transfers: HashMap::new(),
+            pending_file_sends: HashMap::new(),
             incoming_files: HashMap::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
@@ -1485,10 +1489,10 @@ impl ChatManager {
         use tokio::io::AsyncReadExt;
 
         tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
-        let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
         let sender = self
             .sessions
-            .get(actual_id)
+            .get(&session_id)
             .map(|s| s.from_app_tx.clone())
             .ok_or_else(|| anyhow!("Session not found"))?;
 
@@ -1533,7 +1537,7 @@ impl ChatManager {
         // Send end marker with the next monotonic sequence value.
         chat.send_seq += 1;
         sender.send(ProtocolMessage::FileEnd { seq: chat.send_seq })?;
-        tracing::info!(file = %filename, total_bytes = %file_size, "File send complete");
+        tracing::info!(file = %filename, total_bytes = %file_size, "File queued for sending");
 
         // Add to local history.
         chat.messages.push(Message {
@@ -1547,9 +1551,34 @@ impl ChatManager {
             timestamp: chrono::Utc::now(),
         });
 
-        self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
+        // Queueing is not delivery: the success toast waits for the session to
+        // report the final frame on the wire (SessionEvent::FileSendComplete).
+        // File frames drain FIFO per session, so a per-session queue correlates;
+        // keyed by session id because that is where the event will arrive.
+        self.pending_file_sends
+            .entry(session_id)
+            .or_default()
+            .push_back(filename);
 
         Ok(())
+    }
+
+    /// Fail all not-yet-confirmed outgoing file sends for a chat (session died
+    /// before their final frame was written) with an honest error toast.
+    fn fail_pending_file_sends(&mut self, chat_id: Uuid, reason: &str) {
+        let Some(pending) = self.pending_file_sends.remove(&chat_id) else {
+            return;
+        };
+        for filename in pending {
+            tracing::warn!(file = %filename, reason = %reason, "Outgoing file send interrupted");
+            self.add_toast(
+                ToastLevel::Error,
+                format!(
+                    "File may not have been delivered ({}): {}",
+                    reason, filename
+                ),
+            );
+        }
     }
 
     /// Poll and process all pending session events
@@ -2122,9 +2151,26 @@ impl ChatManager {
                 }
             }
 
+            SessionEvent::FileSendComplete { seq } => {
+                match self
+                    .pending_file_sends
+                    .get_mut(&chat_id)
+                    .and_then(|q| q.pop_front())
+                {
+                    Some(filename) => {
+                        tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
+                        self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
+                    }
+                    None => {
+                        tracing::warn!(seq = %seq, "FileSendComplete with no pending file send");
+                    }
+                }
+            }
+
             SessionEvent::Disconnected => {
                 tracing::warn!("Session {} disconnected", chat_id);
                 self.add_toast(ToastLevel::Warning, "Connection lost".to_string());
+                self.fail_pending_file_sends(chat_id, "connection lost");
 
                 // Clean up session
                 self.sessions.remove(&chat_id);
@@ -2135,6 +2181,7 @@ impl ChatManager {
             SessionEvent::Error(err) => {
                 tracing::error!("Session {} error: {}", chat_id, err);
                 self.add_toast(ToastLevel::Error, format!("Connection error: {}", err));
+                self.fail_pending_file_sends(chat_id, "connection error");
             }
 
             SessionEvent::Warning(msg) => {
@@ -2953,6 +3000,70 @@ mod tests {
         assert!(
             seqs.windows(2).all(|w| w[1] == w[0] + 1),
             "File transfer messages must use strictly increasing sequence numbers"
+        );
+    }
+
+    /// Queueing frames on the session is not delivery: the "File sent" toast
+    /// must wait for the session's wire-level confirmation event.
+    #[tokio::test]
+    async fn file_sent_toast_waits_for_wire_confirmation() {
+        let mut mgr = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(chat_id, "Honest Send".to_string());
+
+        let (from_app_tx, _from_app_rx) = mpsc::unbounded_channel();
+        mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), b"payload").unwrap();
+        mgr.send_file(chat_id, temp_file.path().to_path_buf())
+            .await
+            .expect("send_file should succeed");
+
+        assert!(
+            !mgr.toasts.iter().any(|t| t.message.contains("File sent")),
+            "success toast must not fire before the wire confirmation"
+        );
+
+        mgr.handle_session_event(chat_id, SessionEvent::FileSendComplete { seq: 42 });
+        assert!(
+            mgr.toasts.iter().any(|t| t.message.contains("File sent")),
+            "success toast must fire once the final frame is on the wire"
+        );
+    }
+
+    /// If the session dies before the final frame is written, the user must be
+    /// told the file may not have arrived — not shown a success message.
+    #[tokio::test]
+    async fn disconnect_fails_pending_file_sends_honestly() {
+        let mut mgr = ChatManager::new(Config::default());
+        let chat_id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(chat_id, "Interrupted Send".to_string());
+
+        let (from_app_tx, _from_app_rx) = mpsc::unbounded_channel();
+        mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), b"payload").unwrap();
+        mgr.send_file(chat_id, temp_file.path().to_path_buf())
+            .await
+            .expect("send_file should succeed");
+
+        mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+
+        assert!(
+            !mgr.toasts.iter().any(|t| t.message.contains("File sent")),
+            "no success toast after a disconnect"
+        );
+        assert!(
+            mgr.toasts
+                .iter()
+                .any(|t| t.message.contains("may not have been delivered")),
+            "the user must see an honest delivery warning"
+        );
+        assert!(
+            !mgr.pending_file_sends.contains_key(&chat_id),
+            "pending sends must be cleared on disconnect"
         );
     }
 

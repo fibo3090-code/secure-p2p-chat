@@ -237,6 +237,15 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
         ProtocolMessage::FileEnd { .. }
     ));
 
+    // The SENDER must be told when the file's final frame actually hit the
+    // wire — queueing is not delivery. (The seq in the event is the transport
+    // sequence the loop stamped, not the app-supplied one, so only the variant
+    // is asserted.)
+    wait_until(&mut host.events, "host", |ev| {
+        matches!(ev, SessionEvent::FileSendComplete { .. })
+    })
+    .await;
+
     // --- Keep-alive ping: transport plumbing, consumed silently ---
     // A Ping must keep the session healthy but never surface to the app: the
     // very next app-visible message after it is the following Text, not the Ping.
