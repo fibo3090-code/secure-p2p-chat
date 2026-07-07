@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-05
+
 ### Added
 
 - **Community file sharing from the TUI.** `:party-send-file <path>` shares a
