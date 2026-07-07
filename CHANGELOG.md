@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Community file sharing from the TUI.** `:party-send-file <path>` shares a
+  file into the current community's channel and `:party-download <name|hash>`
+  saves a shared file into the download folder — files no longer work only in
+  the desktop app. Downloads never overwrite existing files (`name (2).ext`).
+- **A real server CLI.** `messenger-server` now takes `--name`, `--port`,
+  `--password`, and `--data-dir` flags (with `--help`/`--version`), so hosting
+  a community no longer requires environment variables, the community's display
+  name is finally configurable (it was hardcoded to "Encrypted Messenger
+  Party"), and the port is no longer fixed at 12345. The old `PARTY_*`
+  environment variables still work as fallbacks. Hosting is now documented in
+  the user guide ("Host a community").
 - **Community unread badges in the desktop app.** Channels, DM threads, and the
   community switcher now show unread counts, and the Communities rail icon
   badges the total — including messages that arrive while you're on another
@@ -67,6 +78,11 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+- **Community file names are sanitized server-side.** A member-chosen file name
+  like `..\..\Startup\evil.exe` is reduced to a safe filename at upload (the
+  single choke point for channel and DM files), so no client can be handed a
+  name that escapes its download directory. P2P transfers already had this at
+  protocol decode; TUI downloads also re-sanitize on save (defense in depth).
 - **Party input length caps.** The server now bounds member usernames (≤ 32
   characters), channel names (≤ 64 characters), and channel/DM message text (≤ 64
   KiB, matching the P2P transport cap) instead of accepting any string up to the 8

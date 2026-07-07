@@ -571,7 +571,7 @@ onion routing / anonymity layer, post-quantum migration, hardware-backed identit
 
 ## 13. Verification & Test Coverage
 
-The workspace passes **298 automated tests** (`cargo nextest run --workspace`)
+The workspace passes **301 automated tests** (`cargo nextest run --workspace`)
 spanning unit, integration, and end-to-end suites (the `p2pem-desktop` crate has
 no automated tests — it is verified with `cargo check -p p2pem-desktop` and
 `npm run build`):
@@ -621,7 +621,7 @@ The one area not deeply automated is GUI pixel rendering; the logic behind it
 ## 14. Status
 
 Phase 0 (workspace) and the Phase 1 Party server core are complete; the suite is
-green at 298 tests. The **Tauri + React desktop app** (§10) has shipped its P2P,
+green at 301 tests. The **Tauri + React desktop app** (§10) has shipped its P2P,
 Party, Relay, Contacts, and Settings surfaces (phases A–D) as the `desktop/` crate,
 closing most of the Phase 1 UI-polish items; retiring egui and rebuilding packaging
 (phases E–F) remain. The Independent P2P hardening (connection passwords +

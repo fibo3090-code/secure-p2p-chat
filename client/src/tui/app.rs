@@ -27,6 +27,13 @@ use uuid::Uuid;
 
 pub use crate::tui::command::TuiCommand;
 
+/// A pending Party file download: the byte receiver plus the file's display
+/// name (used for the saved filename and progress toasts).
+type PendingPartyDownload = (
+    tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
+    String,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiFocus {
     ChatList,
@@ -75,6 +82,9 @@ pub struct TuiApp {
     identity_path: PathBuf,
     history_path: PathBuf,
     pending_command: Option<TuiCommand>,
+    /// In-flight Party file downloads. `tick` polls them and writes finished
+    /// downloads into the download directory.
+    pending_party_downloads: Vec<PendingPartyDownload>,
     /// Per-chat count of messages already seen (for unread detection).
     seen_counts: HashMap<Uuid, usize>,
     unread: HashSet<Uuid>,
@@ -145,6 +155,7 @@ impl TuiApp {
             identity_path,
             history_path,
             pending_command: None,
+            pending_party_downloads: Vec::new(),
             seen_counts: HashMap::new(),
             unread: HashSet::new(),
             last_save: None,
@@ -158,6 +169,57 @@ impl TuiApp {
         app.sync_chat_ids();
         app.refresh_status_line();
         Ok(app)
+    }
+
+    /// Drain finished Party file downloads: write the bytes into the download
+    /// directory under a sanitized, non-clobbering name and toast the outcome.
+    fn poll_party_downloads(&mut self) {
+        if self.pending_party_downloads.is_empty() {
+            return;
+        }
+        let download_dir = self.chat_manager.config.download_dir.clone();
+        let mut i = 0;
+        while i < self.pending_party_downloads.len() {
+            use tokio::sync::oneshot::error::TryRecvError;
+            match self.pending_party_downloads[i].0.try_recv() {
+                Err(TryRecvError::Empty) => i += 1,
+                Ok(result) => {
+                    let (_, name) = self.pending_party_downloads.remove(i);
+                    match result {
+                        Ok(data) => {
+                            // The name was chosen by another member: sanitize it
+                            // (defense in depth — the server sanitizes too) and
+                            // never overwrite an existing file.
+                            let safe = crate::util::sanitize_filename(&name);
+                            let path = unique_download_path(&download_dir, &safe);
+                            let write = std::fs::create_dir_all(&download_dir)
+                                .and_then(|_| std::fs::write(&path, &data));
+                            match write {
+                                Ok(()) => self.toast(
+                                    ToastLevel::Success,
+                                    format!("Saved '{}'", path.display()),
+                                ),
+                                Err(e) => self.toast(
+                                    ToastLevel::Error,
+                                    format!("Saving '{safe}' failed: {e}"),
+                                ),
+                            }
+                        }
+                        Err(reason) => self.toast(
+                            ToastLevel::Error,
+                            format!("Download of '{name}' failed: {reason}"),
+                        ),
+                    }
+                }
+                Err(TryRecvError::Closed) => {
+                    let (_, name) = self.pending_party_downloads.remove(i);
+                    self.toast(
+                        ToastLevel::Error,
+                        format!("Download of '{name}' failed: connection closed"),
+                    );
+                }
+            }
+        }
     }
 
     /// At startup, greet the user with a password overlay when appropriate:
@@ -239,6 +301,7 @@ impl TuiApp {
     pub fn tick(&mut self) {
         self.chat_manager.poll_session_events();
         self.party_manager.poll_events();
+        self.poll_party_downloads();
         self.chat_manager.cleanup_expired_toasts();
 
         // Surface a pending fingerprint verification as an overlay.
@@ -1121,6 +1184,85 @@ impl TuiApp {
                     Err(e) => self.toast(ToastLevel::Error, format!("Create channel failed: {e}")),
                 }
             }
+            TuiCommand::PartySendFile(path) => {
+                let Some(server_id) = self.current_party else {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No Party server joined. Use :party-connect".to_string(),
+                    );
+                    return;
+                };
+                let Some(channel) = self
+                    .party_manager
+                    .server(server_id)
+                    .and_then(|s| s.channels.first().map(|c| c.id))
+                else {
+                    self.toast(ToastLevel::Error, "Party has no channels yet".to_string());
+                    return;
+                };
+                let p = std::path::Path::new(&path);
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                let mime = crate::util::guess_mime(p).to_string();
+                match std::fs::read(p) {
+                    Ok(data) => match self.party_manager.send_file(
+                        server_id,
+                        channel,
+                        name.clone(),
+                        mime,
+                        data,
+                    ) {
+                        Ok(()) => self.toast(ToastLevel::Info, format!("Sharing '{name}'…")),
+                        Err(e) => self.toast(ToastLevel::Error, format!("Share failed: {e}")),
+                    },
+                    Err(e) => self.toast(ToastLevel::Error, format!("Could not read {path}: {e}")),
+                }
+            }
+            TuiCommand::PartyDownload(query) => {
+                let Some(server_id) = self.current_party else {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No Party server joined. Use :party-connect".to_string(),
+                    );
+                    return;
+                };
+                // Match a shared file by name substring or content-hash prefix
+                // across everything this client has seen on the server.
+                let q = query.to_ascii_lowercase();
+                let meta = self.party_manager.server(server_id).and_then(|s| {
+                    s.messages
+                        .values()
+                        .flatten()
+                        .find_map(|env| match &env.payload {
+                            messenger_core::party::MessagePayload::File(f)
+                                if f.name.to_ascii_lowercase().contains(&q)
+                                    || f.hash.starts_with(&q) =>
+                            {
+                                Some(f.clone())
+                            }
+                            _ => None,
+                        })
+                });
+                match meta {
+                    Some(f) => match self
+                        .party_manager
+                        .request_download(server_id, f.hash.clone())
+                    {
+                        Ok(rx) => {
+                            self.pending_party_downloads.push((rx, f.name.clone()));
+                            self.toast(ToastLevel::Info, format!("Downloading '{}'…", f.name));
+                        }
+                        Err(e) => self.toast(ToastLevel::Error, format!("Download failed: {e}")),
+                    },
+                    None => self.toast(
+                        ToastLevel::Error,
+                        format!("No shared file matches '{query}'"),
+                    ),
+                }
+            }
             TuiCommand::PartyStatus => {
                 let ids = self.party_manager.server_ids();
                 if ids.is_empty() {
@@ -1525,6 +1667,32 @@ impl TuiApp {
     }
 }
 
+/// A path under `dir` for `name` that does not collide with an existing file:
+/// `name`, then `name (2)`, `name (3)`, … so a download never silently
+/// overwrites something the user already has.
+fn unique_download_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = std::path::Path::new(name);
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("received_file");
+    let ext = p.extension().and_then(|e| e.to_str());
+    for n in 2.. {
+        let candidate = match ext {
+            Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
+            None => dir.join(format!("{stem} ({n})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the counter loop always returns")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1538,6 +1706,28 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn unique_download_path_never_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = unique_download_path(dir.path(), "report.pdf");
+        assert_eq!(first, dir.path().join("report.pdf"));
+
+        std::fs::write(&first, b"one").unwrap();
+        let second = unique_download_path(dir.path(), "report.pdf");
+        assert_eq!(second, dir.path().join("report (2).pdf"));
+
+        std::fs::write(&second, b"two").unwrap();
+        let third = unique_download_path(dir.path(), "report.pdf");
+        assert_eq!(third, dir.path().join("report (3).pdf"));
+
+        // Extensionless names get the suffix too.
+        std::fs::write(dir.path().join("notes"), b"x").unwrap();
+        assert_eq!(
+            unique_download_path(dir.path(), "notes"),
+            dir.path().join("notes (2)")
+        );
     }
 
     #[test]

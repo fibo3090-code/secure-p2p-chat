@@ -1,13 +1,11 @@
-//! Party server for the Encrypted Messenger.
+//! Party/Community server for the Encrypted Messenger.
 //!
-//! Phase 1: the server binds a TCP listener and serves each client over a reused
+//! The server binds a TCP listener and serves each client over a reused
 //! Protocol v3 encrypted tunnel ([`messenger_core::network::host_handshake`]),
 //! driving the shared [`state::PartyState`] via the [`dispatch`] layer. Members
-//! join with a username + the optional server password, post to channels, and the
-//! server stores history so offline members catch up on reconnect.
-//!
-//! Not yet wired (next step): SQLite/blob persistence of state and history. See
-//! `docs/05_platform_spec.md`.
+//! join with a username + the optional server password, post to channels and DMs,
+//! share files, and the server stores history durably (SQLite + blob store) so
+//! offline members catch up on reconnect.
 
 mod connection;
 mod dispatch;
@@ -18,6 +16,7 @@ mod state;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use clap::Parser;
 use messenger_core::core::{fingerprint_pubkey, pem_encode_public};
 use rsa::RsaPublicKey;
 use tokio::net::TcpListener;
@@ -25,6 +24,31 @@ use tokio::sync::Mutex;
 
 use hub::Hub;
 use state::PartyState;
+
+/// Self-hosted Community (Party) server. Friends join with your address, an
+/// optional password, and a username — no port forwarding gymnastics on their
+/// side, no account system. All transport is end-to-end encrypted to the server
+/// (Protocol v3); clients pin this server's fingerprint on first join.
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Display name of this community, shown to everyone who joins.
+    #[arg(long, env = "PARTY_NAME", default_value = "Encrypted Messenger Party")]
+    name: String,
+
+    /// TCP port to listen on.
+    #[arg(long, env = "PARTY_PORT", default_value_t = messenger_core::PORT_DEFAULT)]
+    port: u16,
+
+    /// Require this password to join. Omit for an open server.
+    #[arg(long, env = "PARTY_PASSWORD")]
+    password: Option<String>,
+
+    /// Directory for durable state: member/channel/message database (party.db),
+    /// the file blob store, and the server identity key.
+    #[arg(long, env = "PARTY_DATA_DIR", default_value = "party-data")]
+    data_dir: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,35 +58,33 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let data_dir = std::env::var_os("PARTY_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("party-data"));
-    let server_password = std::env::var("PARTY_PASSWORD").ok();
+    let args = Args::parse();
+    let password_protected = args.password.is_some();
 
     // Durable state: members, channels, and history survive restarts (loaded from
     // and auto-saved to the data dir).
     let state = Arc::new(Mutex::new(PartyState::load(
-        "Encrypted Messenger Party",
-        server_password,
-        &data_dir,
+        &args.name,
+        args.password,
+        &args.data_dir,
     )?));
 
     // Persistent server identity: clients pin this fingerprint via TOFU on first
     // connect, so it must stay stable across restarts.
-    let privkey = Arc::new(identity::load_or_create_server_identity(&data_dir)?);
+    let privkey = Arc::new(identity::load_or_create_server_identity(&args.data_dir)?);
     let fingerprint =
         fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes());
     let hub = Arc::new(Hub::new());
 
-    let port = messenger_core::PORT_DEFAULT;
+    let port = args.port;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(
         server_name = %state.lock().await.name(),
         %fingerprint,
         port,
-        data_dir = %data_dir.display(),
-        password_protected = std::env::var("PARTY_PASSWORD").is_ok(),
-        "Party server listening"
+        data_dir = %args.data_dir.display(),
+        password_protected,
+        "Community server listening — share your address and this fingerprint with people you invite"
     );
 
     loop {

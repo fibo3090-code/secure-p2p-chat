@@ -1135,34 +1135,9 @@ async fn pick_upload() -> Result<Option<(String, String, Vec<u8>)>, String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let mime = guess_mime(&path);
+    let mime = messenger_core::util::guess_mime(&path).to_string();
     let data = std::fs::read(&path).map_err(|e| e.to_string())?;
     Ok(Some((name, mime, data)))
-}
-
-/// A minimal extension → MIME guess for common file types; defaults to
-/// `application/octet-stream`. The server keeps this only as display metadata.
-fn guess_mime(path: &std::path::Path) -> String {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "pdf" => "application/pdf",
-        "txt" | "log" | "md" => "text/plain",
-        "json" => "application/json",
-        "zip" => "application/zip",
-        "mp4" => "video/mp4",
-        "mp3" => "audio/mpeg",
-        _ => "application/octet-stream",
-    }
-    .to_string()
 }
 
 /// Pick a file and post it to a community channel. The picker runs on a blocking

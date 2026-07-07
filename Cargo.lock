@@ -4226,6 +4226,7 @@ name = "messenger-server"
 version = "1.11.1"
 dependencies = [
  "anyhow",
+ "clap",
  "messenger-core",
  "rsa",
  "rusqlite",

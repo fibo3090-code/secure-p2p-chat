@@ -1,6 +1,6 @@
 [package]
 name = "messenger-server"
-description = "Party server for the Encrypted Messenger (placeholder; implemented in Phase 1)."
+description = "Self-hosted Party/Community server for the Encrypted Messenger: channels, DMs, file sharing, and offline history over the v3 encrypted transport."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ messenger-core = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
