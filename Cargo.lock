@@ -2222,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "encodeur_rsa_rust"
-version = "1.12.0"
+version = "1.12.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4180,7 +4180,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-core"
-version = "1.12.0"
+version = "1.12.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4212,7 +4212,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-server"
-version = "1.12.0"
+version = "1.12.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5045,7 +5045,7 @@ dependencies = [
 
 [[package]]
 name = "p2pem-desktop"
-version = "1.12.0"
+version = "1.12.1"
 dependencies = [
  "anyhow",
  "directories",

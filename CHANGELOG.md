@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-07-07
+
 ### Fixed
 
 - **Idle sessions no longer disconnect after 5 minutes.** Nothing ever sent
