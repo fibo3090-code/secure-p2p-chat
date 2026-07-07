@@ -1,0 +1,246 @@
+//! Outgoing and incoming file transfers: validation, chunked sending, and
+//! wire-level delivery confirmation (see SessionEvent::FileSendComplete).
+
+use super::*;
+
+impl ChatManager {
+    /// Send a file to a chat
+    pub async fn send_file(&mut self, chat_id: Uuid, path: std::path::PathBuf) -> Result<()> {
+        use tokio::fs::File;
+        use tokio::io::AsyncReadExt;
+
+        tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
+        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        let sender = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.from_app_tx.clone())
+            .ok_or_else(|| anyhow!("Session not found"))?;
+
+        let (filename, file_size) = Self::validate_outgoing_file(&path).await?;
+        tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
+
+        let chat = self
+            .chats
+            .get_mut(&chat_id)
+            .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
+
+        // Send file metadata using the same monotonic sequence space as all other chat messages.
+        chat.send_seq += 1;
+        sender.send(ProtocolMessage::FileMeta {
+            filename: filename.clone(),
+            size: file_size,
+            seq: chat.send_seq,
+        })?;
+
+        // Send file chunks with globally monotonic sequence numbers.
+        let mut file = File::open(&path).await?;
+        let mut buffer = vec![0u8; crate::FILE_CHUNK_SIZE];
+        let mut sent_chunks = 0u64;
+
+        loop {
+            let n = file.read(&mut buffer).await?;
+            if n == 0 {
+                break; // EOF
+            }
+
+            chat.send_seq += 1;
+            sender.send(ProtocolMessage::FileChunk {
+                chunk: buffer[..n].to_vec(),
+                seq: chat.send_seq,
+            })?;
+            sent_chunks += 1;
+            if sent_chunks % 64 == 0 {
+                tracing::trace!(sent_chunks = %sent_chunks, "File sending progress");
+            }
+        }
+
+        // Send end marker with the next monotonic sequence value.
+        chat.send_seq += 1;
+        sender.send(ProtocolMessage::FileEnd { seq: chat.send_seq })?;
+        tracing::info!(file = %filename, total_bytes = %file_size, "File queued for sending");
+
+        // Add to local history.
+        chat.messages.push(Message {
+            id: Uuid::new_v4(),
+            from_me: true,
+            content: MessageContent::File {
+                filename: filename.clone(),
+                size: file_size,
+                path: Some(path),
+            },
+            timestamp: chrono::Utc::now(),
+        });
+
+        // Queueing is not delivery: the success toast waits for the session to
+        // report the final frame on the wire (SessionEvent::FileSendComplete).
+        // File frames drain FIFO per session, so a per-session queue correlates;
+        // keyed by session id because that is where the event will arrive.
+        self.pending_file_sends
+            .entry(session_id)
+            .or_default()
+            .push_back(filename);
+
+        Ok(())
+    }
+
+    /// Fail all not-yet-confirmed outgoing file sends for a chat (session died
+    /// before their final frame was written) with an honest error toast.
+    pub(super) fn fail_pending_file_sends(&mut self, chat_id: Uuid, reason: &str) {
+        let Some(pending) = self.pending_file_sends.remove(&chat_id) else {
+            return;
+        };
+        for filename in pending {
+            tracing::warn!(file = %filename, reason = %reason, "Outgoing file send interrupted");
+            self.add_toast(
+                ToastLevel::Error,
+                format!(
+                    "File may not have been delivered ({}): {}",
+                    reason, filename
+                ),
+            );
+        }
+    }
+    /// Start receiving a file
+    pub fn start_receiving_file(
+        &mut self,
+        chat_id: Uuid,
+        filename: &str,
+        size: u64,
+    ) -> Result<Uuid> {
+        if size > crate::MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File size {} exceeds maximum allowed ({} bytes)",
+                size,
+                crate::MAX_FILE_SIZE
+            );
+        }
+
+        for transfer_id in self.transfer_ids_for_chat_with_status(chat_id, |status| {
+            matches!(
+                status,
+                TransferStatus::Completed | TransferStatus::Failed(_) | TransferStatus::Cancelled
+            )
+        }) {
+            self.clear_transfer_state(transfer_id);
+        }
+
+        if self.active_transfer_id_for_chat(chat_id).is_some() {
+            bail!("Another file transfer is already in progress for this chat");
+        }
+
+        let transfer_id = Uuid::new_v4();
+
+        let state = FileTransferState {
+            id: transfer_id,
+            chat_id,
+            filename: filename.to_string(),
+            size,
+            received: 0,
+            status: TransferStatus::Pending,
+            seq: 0,
+        };
+
+        self.active_transfers.insert(transfer_id, state);
+
+        self.add_toast(ToastLevel::Info, format!("Receiving file: {}", filename));
+
+        Ok(transfer_id)
+    }
+
+    /// Update file transfer progress
+    pub fn update_transfer_progress(&mut self, transfer_id: Uuid, bytes: u64) {
+        if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+            transfer.received = bytes;
+            if bytes > 0 {
+                transfer.status = TransferStatus::InProgress;
+            }
+        }
+    }
+
+    async fn validate_outgoing_file(path: &Path) -> Result<(String, u64)> {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| Self::map_file_access_error(path, e, "read file metadata"))?;
+
+        if !metadata.is_file() {
+            bail!("Selected path is not a regular file: {}", path.display());
+        }
+
+        let file_size = metadata.len();
+        if file_size > crate::MAX_FILE_SIZE {
+            bail!(
+                "File is too large: {} bytes exceeds the {} byte limit",
+                file_size,
+                crate::MAX_FILE_SIZE
+            );
+        }
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| anyhow!("Selected file has an invalid filename"))?
+            .to_string();
+
+        tokio::fs::File::open(path)
+            .await
+            .map_err(|e| Self::map_file_access_error(path, e, "open file for reading"))?;
+
+        Ok((filename, file_size))
+    }
+
+    fn map_file_access_error(path: &Path, error: std::io::Error, action: &str) -> anyhow::Error {
+        let lower = error.to_string().to_lowercase();
+        let message = match error.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "Cannot {}: file not found or not available locally ({})",
+                action,
+                path.display()
+            ),
+            std::io::ErrorKind::PermissionDenied => format!(
+                "Cannot {}: permission denied for {}",
+                action,
+                path.display()
+            ),
+            _ if lower.contains("cloud")
+                || lower.contains("offline")
+                || lower.contains("not available") =>
+            {
+                format!(
+                    "Cannot {}: {} is not fully available locally. If it is stored in OneDrive, iCloud, or Dropbox, mark it for offline use first.",
+                    action,
+                    path.display()
+                )
+            }
+            _ => format!("Cannot {} {}: {}", action, path.display(), error),
+        };
+
+        anyhow!(message)
+    }
+
+    fn transfer_ids_for_chat_with_status<F>(&self, chat_id: Uuid, mut predicate: F) -> Vec<Uuid>
+    where
+        F: FnMut(&TransferStatus) -> bool,
+    {
+        self.active_transfers
+            .iter()
+            .filter_map(|(transfer_id, transfer)| {
+                (transfer.chat_id == chat_id && predicate(&transfer.status)).then_some(*transfer_id)
+            })
+            .collect()
+    }
+
+    pub(super) fn active_transfer_id_for_chat(&self, chat_id: Uuid) -> Option<Uuid> {
+        self.transfer_ids_for_chat_with_status(chat_id, |status| {
+            matches!(status, TransferStatus::Pending | TransferStatus::InProgress)
+        })
+        .into_iter()
+        .next()
+    }
+
+    fn clear_transfer_state(&mut self, transfer_id: Uuid) {
+        self.active_transfers.remove(&transfer_id);
+        self.incoming_files.remove(&transfer_id);
+    }
+}

@@ -52,7 +52,7 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 
 ## Architecture Overview
 
-`ChatManager` (`client/src/app/chat_manager.rs`) is the single source of truth for all app state — chats, contacts, sessions, transfers, toasts. It has **zero UI dependencies**, so three front-ends drive the same core:
+`ChatManager` (`client/src/app/chat_manager/` — split by concern into `connect`, `contacts`, `events`, `files`, `invites`, `text`, with the struct + accessors in `mod.rs`) is the single source of truth for all app state — chats, contacts, sessions, transfers, toasts. It has **zero UI dependencies**, so three front-ends drive the same core:
 
 ```text
 ┌── egui GUI ──┐  ┌── ratatui TUI ──┐  ┌── Tauri webview (React) ──┐
@@ -106,7 +106,7 @@ Authoritative docs: `docs/README.md`, `docs/03_architecture.md`, `docs/04_protoc
 ## File Transfer
 
 Chunked (`FILE_CHUNK_SIZE = 64 KiB`), tracked via `FileTransferState`, sharing the per-chat monotonic sequence namespace (so replay protection covers transfers too).
-- `client/src/app/chat_manager.rs` — orchestration + outgoing chunk dispatch
+- `client/src/app/chat_manager/files.rs` — orchestration + outgoing chunk dispatch + wire-level send confirmation
 - `core/src/transfer/receiver.rs` — receiving
 - `core/src/core/protocol.rs` — `FILE_CHUNK` encode/decode
 
@@ -120,7 +120,7 @@ Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`).
 
 | Task | Start Here |
 |------|------------|
-| Feature work (state/logic) | `client/src/app/chat_manager.rs` |
+| Feature work (state/logic) | `client/src/app/chat_manager/` (state in `mod.rs`, events in `events.rs`) |
 | Shared types / conversation model | `core/src/types.rs` |
 | Protocol changes | `core/src/network/session.rs`, `core/src/core/crypto.rs`, `core/src/core/protocol.rs` |
 | egui / TUI changes | `client/src/gui/` / `client/src/tui/` |
