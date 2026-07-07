@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
-use messenger_core::types::{Config, MessageContent, ToastLevel};
+use messenger_core::types::{Config, MessageContent, ToastLevel, TransferStatus};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -185,7 +185,29 @@ async fn unlock(password: String, state: tauri::State<'_, Bridge>) -> Result<(),
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
         tracing::warn!("Failed to load history after unlock: {}", e);
     }
+    auto_host_if_configured(&state, &mut mgr).await;
     Ok(())
+}
+
+/// Honor `auto_host_on_startup` once the identity is unlocked and history (with
+/// its persisted config) is loaded — "open the app and be reachable", matching
+/// the egui/TUI apps. Failures are logged, never fatal to the unlock.
+async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
+    if !mgr.config.auto_host_on_startup {
+        return;
+    }
+    let port = mgr.config.listen_port;
+    let pk = { state.identity.lock().unwrap().private_key() };
+    match pk {
+        Ok(pk) => {
+            if let Err(e) = mgr.start_host(port, pk).await {
+                tracing::warn!("auto-host on startup failed: {e}");
+            } else {
+                tracing::info!(port, "auto-hosting on startup");
+            }
+        }
+        Err(e) => tracing::warn!("auto-host: no private key: {e}"),
+    }
 }
 
 /// Set a password on a fresh / plaintext identity, persist it, and stay unlocked.
@@ -211,12 +233,88 @@ async fn set_password(password: String, state: tauri::State<'_, Bridge>) -> Resu
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
         tracing::warn!("Failed to load history after password setup: {}", e);
     }
+    auto_host_if_configured(&state, &mut mgr).await;
     Ok(())
 }
 
 #[tauri::command]
 fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
     auth_status(state)
+}
+
+/// The user-facing settings the desktop app exposes. Only fields the core
+/// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
+/// `download_dir` and typing/notification switches are read by `ChatManager`,
+/// and auto-host is implemented by this bridge on unlock.
+#[derive(Serialize)]
+struct SettingsDto {
+    download_dir: String,
+    enable_notifications: bool,
+    enable_typing_indicators: bool,
+    auto_host_on_startup: bool,
+    listen_port: u16,
+}
+
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    enable_notifications: bool,
+    enable_typing_indicators: bool,
+    auto_host_on_startup: bool,
+    listen_port: u16,
+}
+
+#[tauri::command]
+async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<SettingsDto, String> {
+    ensure_ready(&state)?;
+    let mgr = state.manager.lock().await;
+    Ok(SettingsDto {
+        download_dir: mgr.config.download_dir.display().to_string(),
+        enable_notifications: mgr.config.enable_notifications,
+        enable_typing_indicators: mgr.config.enable_typing_indicators,
+        auto_host_on_startup: mgr.config.auto_host_on_startup,
+        listen_port: mgr.config.listen_port,
+    })
+}
+
+/// Apply the toggle/number settings and persist them (config is part of the
+/// encrypted history file). The download directory has its own picker command.
+#[tauri::command]
+async fn update_settings(
+    settings: SettingsUpdate,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    if settings.listen_port == 0 {
+        return Err("listen port must be between 1 and 65535".to_string());
+    }
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.config.enable_notifications = settings.enable_notifications;
+        mgr.config.enable_typing_indicators = settings.enable_typing_indicators;
+        mgr.config.auto_host_on_startup = settings.auto_host_on_startup;
+        mgr.config.listen_port = settings.listen_port;
+    }
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Pick a new download directory with the native folder dialog (on a blocking
+/// thread) and persist it. Returns the new path, or `None` if cancelled.
+#[tauri::command]
+async fn pick_download_dir(state: tauri::State<'_, Bridge>) -> Result<Option<String>, String> {
+    ensure_ready(&state)?;
+    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_folder())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(dir) = picked else {
+        return Ok(None);
+    };
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.config.download_dir = dir.clone();
+    }
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(Some(dir.display().to_string()))
 }
 
 #[tauri::command]
@@ -245,6 +343,54 @@ async fn list_conversations(state: tauri::State<'_, Bridge>) -> Result<Vec<ConvS
         }
     }
     Ok(out)
+}
+
+/// A live file transfer, for progress display in the chat pane.
+#[derive(Serialize)]
+struct TransferDto {
+    id: String,
+    chat_id: String,
+    filename: String,
+    size: u64,
+    received: u64,
+    status: &'static str,
+    /// Failure reason when `status == "failed"`.
+    error: Option<String>,
+}
+
+fn transfer_status_parts(s: &TransferStatus) -> (&'static str, Option<String>) {
+    match s {
+        TransferStatus::Pending => ("pending", None),
+        TransferStatus::InProgress => ("active", None),
+        TransferStatus::Completed => ("done", None),
+        TransferStatus::Failed(e) => ("failed", Some(e.clone())),
+        TransferStatus::Cancelled => ("cancelled", None),
+    }
+}
+
+/// The active file transfers (both directions), polled by the frontend on the
+/// same `state-updated` cadence as the conversation list, so large sends and
+/// receives show live progress instead of nothing.
+#[tauri::command]
+async fn list_transfers(state: tauri::State<'_, Bridge>) -> Result<Vec<TransferDto>, String> {
+    ensure_ready(&state)?;
+    let mgr = state.manager.lock().await;
+    Ok(mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .map(|t| {
+            let (status, error) = transfer_status_parts(&t.status);
+            TransferDto {
+                id: t.id.to_string(),
+                chat_id: t.chat_id.to_string(),
+                filename: t.filename,
+                size: t.size,
+                received: t.received,
+                status,
+                error,
+            }
+        })
+        .collect())
 }
 
 /// Return the full conversation (with messages) as JSON for the chat pane.
@@ -565,12 +711,17 @@ struct PartyMemberDto {
     username: String,
     online: bool,
     is_me: bool,
+    /// Message count in my DM thread with this member (0 when not joined yet).
+    /// The frontend derives DM unread badges from it.
+    dm_messages: usize,
 }
 
 #[derive(Serialize)]
 struct PartyChannelDto {
     id: String,
     name: String,
+    /// Message count in this channel; the frontend derives unread badges from it.
+    messages: usize,
 }
 
 #[derive(Serialize)]
@@ -624,6 +775,13 @@ fn server_dto(
             username: m.username.clone(),
             online: m.online,
             is_me: conn.member_id == Some(m.id),
+            dm_messages: conn
+                .member_id
+                .map(|me| {
+                    let thread = messenger_core::party::dm_thread_id(me, m.id);
+                    conn.messages.get(&thread).map_or(0, |v| v.len())
+                })
+                .unwrap_or(0),
         })
         .collect();
     let channels = conn
@@ -632,6 +790,7 @@ fn server_dto(
         .map(|c| PartyChannelDto {
             id: c.id.to_string(),
             name: c.name.clone(),
+            messages: conn.messages.get(&c.id).map_or(0, |v| v.len()),
         })
         .collect();
     PartyServerDto {
@@ -1129,6 +1288,10 @@ pub fn run() {
             my_identity,
             list_conversations,
             get_conversation,
+            list_transfers,
+            get_settings,
+            update_settings,
+            pick_download_dir,
             send_message,
             send_file,
             start_host,

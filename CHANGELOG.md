@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Community unread badges in the desktop app.** Channels, DM threads, and the
+  community switcher now show unread counts, and the Communities rail icon
+  badges the total — including messages that arrive while you're on another
+  tab. Pre-existing history is never counted as unread; the thread on screen
+  stays read.
+- **Real settings in the desktop app.** The Settings pane now exposes the
+  settings the runtime actually honors: desktop notifications, typing-indicator
+  privacy, auto-host on startup with a configurable listening port, and the
+  download folder (with a native folder picker). Changes save immediately and
+  persist in the encrypted history file. The desktop bridge now also honors
+  **auto-host on startup** (start listening as soon as the app unlocks), like
+  the egui/TUI apps. Previously the pane only offered identity, theme, and an
+  about blurb — received files went to a default folder the user could neither
+  see nor change.
+- **Live file-transfer progress in the desktop app.** In-flight sends and
+  receives now show a progress bar (filename, live percentage) above the
+  composer, and failures surface their reason inline. Previously the desktop
+  app showed nothing between picking a file and its eventual completion, even
+  for multi-gigabyte transfers — the progress state existed in `ChatManager`
+  but was never exposed over the bridge (new `list_transfers` command).
+
 - **Community lifecycle in the desktop app.** Joined communities are now
   remembered across restarts (saved to `parties.json` — address, username, and
   server name; never the password) and offered as one-click rejoin cards on the

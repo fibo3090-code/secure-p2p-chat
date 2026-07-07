@@ -19,6 +19,10 @@ const realApi = {
   getConversation: (id) => invoke("get_conversation", { id }),
   sendMessage: (id, text) => invoke("send_message", { id, text }),
   sendFile: (id) => invoke("send_file", { id }),
+  listTransfers: () => invoke("list_transfers"),
+  getSettings: () => invoke("get_settings"),
+  updateSettings: (settings) => invoke("update_settings", { settings }),
+  pickDownloadDir: () => invoke("pick_download_dir"),
   startHost: (port) => invoke("start_host", { port }),
   connectPeer: (host, port) => invoke("connect_peer", { host, port }),
   hostViaRelay: (relay) => invoke("host_via_relay", { relay }),
@@ -51,6 +55,10 @@ const realApi = {
 function makeMock() {
   const now = new Date().toISOString();
   let authState = new URLSearchParams(location.search).get("mock") || "ready";
+  const mockSettings = {
+    download_dir: "~/Downloads", enable_notifications: true,
+    enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345,
+  };
   const chats = {
     "11111111-1111-1111-1111-111111111111": {
       id: "11111111-1111-1111-1111-111111111111", title: "Alice", peer_fingerprint: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
@@ -95,11 +103,11 @@ function makeMock() {
       username: username || "you",
       fingerprint: "5f3a9c2e7b1d4068aa22cc55ee88ff00112233445566778899aabbccddeeff11",
       status: "joined", status_detail: null, member_id: me, last_error: null,
-      channels: [{ id: gen, name: "general" }, { id: rnd, name: "random" }],
+      channels: [{ id: gen, name: "general", messages: 0 }, { id: rnd, name: "random", messages: 0 }],
       members: [
-        { id: me, username: username || "you", online: true, is_me: true },
-        { id: "mem-nova", username: "nova", online: true, is_me: false },
-        { id: "mem-kite", username: "kite", online: false, is_me: false },
+        { id: me, username: username || "you", online: true, is_me: true, dm_messages: 0 },
+        { id: "mem-nova", username: "nova", online: true, is_me: false, dm_messages: 0 },
+        { id: "mem-kite", username: "kite", online: false, is_me: false, dm_messages: 0 },
       ],
     }];
     partyState.msgs[`${sid}|${gen}`] = [
@@ -115,6 +123,10 @@ function makeMock() {
     getConversation: async (id) => chats[id],
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000 }, timestamp: new Date().toISOString() }); },
+    listTransfers: async () => [],
+    getSettings: async () => mockSettings,
+    updateSettings: async (s) => { Object.assign(mockSettings, s); },
+    pickDownloadDir: async () => { mockSettings.download_dir = "C:\\Users\\you\\Downloads"; return mockSettings.download_dir; },
     startHost: ok, connectPeer: ok, confirmFingerprint: ok,
     hostViaRelay: async () => "rly_" + Math.random().toString(36).slice(2, 10),
     connectViaRelay: ok,

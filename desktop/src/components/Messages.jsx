@@ -117,7 +117,36 @@ function MessageItem({ m }) {
   );
 }
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend }) {
+function transferPct(t) {
+  return t.size > 0 ? Math.min(100, Math.round((t.received / t.size) * 100)) : 0;
+}
+
+function transferLabel(t) {
+  if (t.status === "failed") return t.error || "failed";
+  if (t.status === "cancelled") return "cancelled";
+  if (t.status === "done") return "done";
+  return `${transferPct(t)}%`;
+}
+
+// Live progress cards for the conversation's in-flight file transfers, so a
+// large send/receive shows movement instead of nothing until completion.
+function TransferBar({ transfers }) {
+  if (!transfers || transfers.length === 0) return null;
+  return (
+    <div className="transfer-bar">
+      {transfers.map((t) => (
+        <div key={t.id} className={cx("transfer-item", "is-" + t.status)}>
+          <Icon name="file" size={13} />
+          <span className="transfer-name">{t.filename}</span>
+          <div className="transfer-track"><div className="transfer-fill" style={{ width: `${transferPct(t)}%` }} /></div>
+          <span className="transfer-pct mono">{transferLabel(t)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers }) {
   const scrollRef = useRef(null);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -160,6 +189,8 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
           {contact.messages.map((m, i) => <MessageItem key={i} m={m} />)}
         </div>
       </div>
+
+      <TransferBar transfers={transfers} />
 
       <div className="composer">
         <button className="composer-clip" title="Send file"

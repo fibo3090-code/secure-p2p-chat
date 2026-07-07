@@ -6,6 +6,7 @@ import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
 import { api, onBridge, fmtTime } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
+import { markRead, computeUnread } from "../lib/partyUnread.js";
 
 const STATUS_LABEL = {
   connecting: "Connecting…",
@@ -137,13 +138,24 @@ export function Parties() {
   const [adding, setAdding] = useState(false);       // show the join form to add another community
   const [prefill, setPrefill] = useState(null);      // prefill for the join form (rejoin flows)
   const [confirmLeave, setConfirmLeave] = useState(false); // two-click leave confirmation
+  const [unread, setUnread] = useState({});          // thread key -> unread count
   const scrollRef = useRef(null);
 
   const server = useMemo(() => servers.find((s) => s.id === sid) || null, [servers, sid]);
 
   const loadServers = useCallback(async () => {
-    try { setServers(await api.partyList()); } catch { /* ignore */ }
-  }, []);
+    try {
+      const list = await api.partyList();
+      // Unread bookkeeping: the thread on screen is always read; badge the rest.
+      const srv = list.find((s) => s.id === sid);
+      if (srv) {
+        if (dm) markRead(sid, `dm-${dm}`, srv.members.find((m) => m.id === dm)?.dm_messages);
+        else if (cid) markRead(sid, cid, srv.channels.find((c) => c.id === cid)?.messages);
+      }
+      setUnread(computeUnread(list).byKey);
+      setServers(list);
+    } catch { /* ignore */ }
+  }, [sid, cid, dm]);
 
   const loadMsgs = useCallback(async () => {
     if (!sid) { setMsgs([]); return; }
@@ -273,12 +285,17 @@ export function Parties() {
   return (
     <div className="party-layout">
       <div className="party-servers">
-        {servers.map((s) => (
-          <button key={s.id} className={cx("party-srv-tab", s.id === sid && "is-active")}
-            onClick={() => { setSid(s.id); setDm(null); setConfirmLeave(false); }}>
-            <Icon name="users" size={14} /> {s.name || s.address}
-          </button>
-        ))}
+        {servers.map((s) => {
+          const srvUnread = Object.entries(unread)
+            .reduce((n, [k, v]) => (k.startsWith(`${s.id}|`) ? n + v : n), 0);
+          return (
+            <button key={s.id} className={cx("party-srv-tab", s.id === sid && "is-active")}
+              onClick={() => { setSid(s.id); setDm(null); setConfirmLeave(false); }}>
+              <Icon name="users" size={14} /> {s.name || s.address}
+              {srvUnread > 0 && <span className="party-unread">{srvUnread}</span>}
+            </button>
+          );
+        })}
         <button className="party-srv-tab party-srv-add" title="Join another community"
           onClick={() => { setPrefill(null); setAdding(true); }}>
           <Icon name="plus" size={14} />
@@ -290,8 +307,11 @@ export function Parties() {
         <div className="party-list">
           {server?.channels.map((c) => (
             <button key={c.id} className={cx("party-item", !dm && c.id === cid && "is-active")}
-              onClick={() => { setDm(null); setCid(c.id); }}>
+              onClick={() => { setDm(null); setCid(c.id); markRead(server.id, c.id, c.messages); }}>
               <span className="party-hash">#</span> {c.name}
+              {unread[`${server.id}|${c.id}`] > 0 && (
+                <span className="party-unread">{unread[`${server.id}|${c.id}`]}</span>
+              )}
             </button>
           ))}
         </div>
@@ -307,10 +327,13 @@ export function Parties() {
           {server?.members.map((m) => (
             <button key={m.id} disabled={m.is_me}
               className={cx("party-item", "party-member", dm === m.id && "is-active")}
-              onClick={() => !m.is_me && setDm(m.id)}
+              onClick={() => { if (!m.is_me) { setDm(m.id); markRead(server.id, `dm-${m.id}`, m.dm_messages); } }}
               title={m.is_me ? "You" : `Direct message ${m.username}`}>
               <span className={cx("party-dot", m.online ? "is-online" : "is-offline")} />
               {m.is_me ? <>{m.username} <span className="party-you">you</span></> : <><Icon name="user" size={12} /> {m.username}</>}
+              {!m.is_me && unread[`${server.id}|dm-${m.id}`] > 0 && (
+                <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
+              )}
             </button>
           ))}
         </div>
