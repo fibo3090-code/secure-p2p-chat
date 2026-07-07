@@ -142,3 +142,6 @@ check_errors.txt
 clippy_errors.txt
 AGENTS.md
 .superpowers/
+
+# Local Party/Community server state (contains the server identity key - never commit)
+party-data/
