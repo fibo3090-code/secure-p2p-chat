@@ -251,11 +251,31 @@ pub enum NotificationSound {
     // Vibrate (for mobile, if applicable)
 }
 
+/// The user's real Downloads directory. The old default was the **relative**
+/// path `Downloads`, which resolved against the process working directory —
+/// received files landed next to wherever the app happened to be launched from
+/// (or failed outright when that location wasn't writable).
+pub fn default_download_dir() -> PathBuf {
+    if let Some(dirs) = directories::UserDirs::new() {
+        if let Some(dl) = dirs.download_dir() {
+            return dl.to_path_buf();
+        }
+        return dirs.home_dir().join("Downloads");
+    }
+    PathBuf::from("Downloads")
+}
+
+/// A per-app scratch directory under the OS temp dir (absolute, always
+/// writable), replacing the old relative `temp` default.
+pub fn default_temp_dir() -> PathBuf {
+    std::env::temp_dir().join("chat-p2p")
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            download_dir: PathBuf::from("Downloads"),
-            temp_dir: PathBuf::from("temp"),
+            download_dir: default_download_dir(),
+            temp_dir: default_temp_dir(),
             auto_accept_files: false,
             enable_notifications: true,
             enable_typing_indicators: true,

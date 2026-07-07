@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Idle sessions no longer disconnect after 5 minutes.** Nothing ever sent
+  keep-alives, so both peers' receive-idle timers (300 s) tore down any
+  healthy-but-quiet conversation — one side logged "Receive idle timeout
+  (300s)", the other "early eof". The transport now sends an encrypted
+  keep-alive ping every 120 s (consumed silently on receipt, sharing the
+  replay-protected sequence space). Regression-tested with shrunken test
+  windows.
+- **Received files now land in your real Downloads folder.** The default
+  download directory was the *relative* path `Downloads`, resolved against the
+  process working directory — files were saved next to wherever the app was
+  launched from (or failed where that wasn't writable). The default now
+  resolves the OS Downloads folder, the temp dir default moved under the OS
+  temp dir, and configs saved by older builds are upgraded automatically on
+  load.
+- **Honest error after a peer disconnects.** Sending a message in an
+  established conversation whose session dropped showed "Connecting... please
+  wait" and silently dropped the message; it now says the message was not
+  delivered because the peer is disconnected.
+- **v1.12.0 release: desktop installers failed to build** — tauri-action
+  invokes `npm run tauri build`, and `package.json` had no `tauri` script. The
+  four classic binaries published fine; the installers ship with the next
+  release.
+
 ## [1.12.0] - 2026-07-05
 
 ### Added

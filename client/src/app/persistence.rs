@@ -5,7 +5,7 @@ use chacha20poly1305::{
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::types::{Chat, Config};
 use uuid::Uuid;
@@ -47,13 +47,16 @@ fn is_dangerous_path(p: &Path) -> bool {
     false
 }
 
-/// Sanitize loaded config: replace dangerous paths with defaults.
+/// Sanitize loaded config: replace dangerous paths with defaults, and upgrade
+/// the legacy **relative** defaults (`Downloads`, `temp`) that older builds
+/// persisted — those resolved against the process working directory, so
+/// received files landed next to wherever the app was launched from.
 fn sanitize_loaded_config(mut config: Config) -> Config {
-    if is_dangerous_path(&config.download_dir) {
-        config.download_dir = PathBuf::from("Downloads");
+    if is_dangerous_path(&config.download_dir) || config.download_dir.is_relative() {
+        config.download_dir = crate::types::default_download_dir();
     }
-    if is_dangerous_path(&config.temp_dir) {
-        config.temp_dir = PathBuf::from("temp");
+    if is_dangerous_path(&config.temp_dir) || config.temp_dir.is_relative() {
+        config.temp_dir = crate::types::default_temp_dir();
     }
     config
 }
