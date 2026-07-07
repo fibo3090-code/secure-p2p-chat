@@ -91,7 +91,7 @@ hostname = "0.4"
 unicode-width = "0.2"
 
 # Windows-specific
-windows-sys = { version = "0.52", features = ["Win32_System_Console", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 # Dev / testing
 tokio-test = "0.4"
