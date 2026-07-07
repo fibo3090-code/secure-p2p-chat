@@ -134,6 +134,31 @@ pub fn format_fingerprint_short(fp: &str) -> String {
     }
 }
 
+/// A minimal extension → MIME guess for common file types; defaults to
+/// `application/octet-stream`. Display metadata only — never used for security
+/// decisions.
+pub fn guess_mime(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Best-effort discovery of the primary local IPv4 address.
 /// Uses a UDP "connect" to a public resolver to learn the outbound interface.
 pub fn primary_local_ipv4() -> Option<String> {

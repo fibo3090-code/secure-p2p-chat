@@ -29,7 +29,7 @@ use messenger_core::party::{
     blob_hash, ChannelInfo, ChannelKind, Envelope, FileMeta, MemberInfo, MessagePayload, TrustTier,
     MAX_INLINE_FILE_BYTES,
 };
-use messenger_core::util::current_timestamp_millis;
+use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -533,7 +533,12 @@ impl PartyState {
         }
         Ok(FileMeta {
             hash,
-            name: name.to_string(),
+            // The display name is member-supplied: reduce it to a safe filename
+            // here (the single choke point for channel and DM uploads) so no
+            // client ever receives a name that could escape its download
+            // directory (e.g. `..\..\evil.exe`). P2P transfers get the same
+            // treatment at protocol decode.
+            name: sanitize_filename(name),
             size,
             mime: mime.to_string(),
         })
@@ -1088,6 +1093,35 @@ mod tests {
         let too_long = "d".repeat(MAX_CHANNEL_NAME_CHARS + 1);
         let err = state.create_channel(&too_long).unwrap_err();
         assert!(err.contains("too long"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn uploaded_file_names_are_sanitized_against_path_traversal() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+
+        // A member-chosen name must never be able to escape a client's download
+        // directory when later joined onto it.
+        let env = state
+            .post_file(
+                alice,
+                chan,
+                "..\\..\\Startup\\evil.exe".to_string(),
+                "application/octet-stream".to_string(),
+                b"payload".to_vec(),
+            )
+            .unwrap();
+        match &env.payload {
+            MessagePayload::File(f) => {
+                assert!(
+                    !f.name.contains("..") && !f.name.contains('\\') && !f.name.contains('/'),
+                    "stored name must be traversal-safe, got {:?}",
+                    f.name
+                );
+            }
+            other => panic!("expected a File payload, got {other:?}"),
+        }
     }
 
     #[test]

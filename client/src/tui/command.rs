@@ -79,6 +79,11 @@ pub enum TuiCommand {
     },
     /// Create a channel on the current Party server.
     PartyCreateChannel(String),
+    /// Share a local file into the current Party server's channel.
+    PartySendFile(String),
+    /// Download a shared file (matched by name or content-hash prefix) from the
+    /// current Party server into the download directory.
+    PartyDownload(String),
     PartyStatus,
 
     // --- settings ---
@@ -172,6 +177,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "party-create-channel",
         ":party-create-channel <name>",
         "Create a channel on the current Party server",
+    ),
+    (
+        "party-send-file",
+        ":party-send-file <path>",
+        "Share a file in the current Party channel",
+    ),
+    (
+        "party-download",
+        ":party-download <name|hash>",
+        "Save a shared Party file to your download folder",
     ),
     ("party-status", ":party-status", "Show joined Party servers"),
     ("rename", ":rename <title>", "Rename the selected chat"),
@@ -421,6 +436,18 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
             }
             Ok(TuiCommand::PartyCreateChannel(rest))
         }
+        "party-send-file" => {
+            if rest.is_empty() {
+                return Err("Usage: :party-send-file <path>".to_string());
+            }
+            Ok(TuiCommand::PartySendFile(rest))
+        }
+        "party-download" => {
+            if rest.is_empty() {
+                return Err("Usage: :party-download <name|hash>".to_string());
+            }
+            Ok(TuiCommand::PartyDownload(rest))
+        }
         "party-status" => Ok(TuiCommand::PartyStatus),
 
         "rename" => {
@@ -516,6 +543,22 @@ mod tests {
                 token: "tok".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_party_file_commands() {
+        assert_eq!(
+            parse_command(":party-send-file C:\\pics\\cat photo.png").unwrap(),
+            TuiCommand::PartySendFile("C:\\pics\\cat photo.png".into()),
+            "the whole rest (spaces included) is the path"
+        );
+        assert!(parse_command(":party-send-file").is_err());
+
+        assert_eq!(
+            parse_command(":party-download cat photo.png").unwrap(),
+            TuiCommand::PartyDownload("cat photo.png".into())
+        );
+        assert!(parse_command(":party-download").is_err());
     }
 
     #[test]

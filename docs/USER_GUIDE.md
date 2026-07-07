@@ -165,6 +165,48 @@ Relay notes:
 - it forwards already encrypted session traffic
 - it improves reachability, not anonymity
 
+### Host a community (Party server)
+
+Communities are self-hosted, multi-user rooms with channels, direct messages,
+file sharing, and durable history — members who were offline catch up when they
+reconnect. One person runs the server; friends join with just an address, an
+optional password, and a username.
+
+Start a server:
+
+```bash
+cargo run --release -p messenger-server -- --name "Game Night" --port 12345
+```
+
+Options (also settable via `PARTY_NAME`, `PARTY_PORT`, `PARTY_PASSWORD`,
+`PARTY_DATA_DIR` environment variables):
+
+- `--name <NAME>` — the community name everyone sees (default: "Encrypted Messenger Party")
+- `--port <PORT>` — TCP port to listen on (default: 12345)
+- `--password <PASSWORD>` — require a password to join (omit for an open server)
+- `--data-dir <DIR>` — where the database, file store, and server identity live (default: `party-data`)
+
+On startup the server prints its **fingerprint**. Share your address
+(`your-ip:port`) and that fingerprint with the people you invite; their app pins
+the fingerprint on first join and warns them if it ever changes.
+
+Joining from the app:
+
+- **Desktop app**: Communities tab → enter the address, a username, and the
+  password if one is set. Rejoining later is one click (communities are
+  remembered).
+- **TUI**: `:party-connect <host[:port]> <username> [password]`
+- **GUI (egui)**: the Party window → join form.
+
+Operator notes:
+
+- state persists under the data dir (`party.db` + `blobs/`); back it up to keep
+  history
+- the server can read message contents (this is the "Administered" trust tier —
+  it is what enables offline delivery and history); tell your members
+- members are remembered by identity fingerprint, so someone who reconnects
+  keeps their username and history
+
 ### Verify fingerprints
 
 The app uses TOFU. First contact is only meaningful if you verify the fingerprint out of band.
