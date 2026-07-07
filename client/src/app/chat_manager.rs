@@ -1118,15 +1118,30 @@ impl ChatManager {
 
         // One-to-one chat path
         if !has_session {
+            // An established conversation (fingerprint confirmed) without a
+            // session means the peer dropped — telling the user "connecting"
+            // there is a lie that hides why their message went nowhere.
+            let was_established = self
+                .chats
+                .get(&chat_id)
+                .is_some_and(|c| c.peer_fingerprint.is_some());
             tracing::warn!(
-                "No active session for 1:1 chat {} (mapped to {}) yet. Likely still connecting.",
+                "No active session for 1:1 chat {} (mapped to {}); established={}",
                 chat_id,
                 actual_session_chat_id,
+                was_established,
             );
-            self.add_toast(
-                ToastLevel::Info,
-                "Connecting... please wait before sending messages".to_string(),
-            );
+            if was_established {
+                self.add_toast(
+                    ToastLevel::Error,
+                    "Not delivered: the peer is disconnected. Reconnect (or ask them to) and try again.".to_string(),
+                );
+            } else {
+                self.add_toast(
+                    ToastLevel::Info,
+                    "Connecting... please wait before sending messages".to_string(),
+                );
+            }
             return Ok(()); // Do not error; just inform the user and skip sending
         }
 

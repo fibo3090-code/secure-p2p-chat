@@ -237,14 +237,23 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
         ProtocolMessage::FileEnd { .. }
     ));
 
-    // --- Keep-alive ping ---
+    // --- Keep-alive ping: transport plumbing, consumed silently ---
+    // A Ping must keep the session healthy but never surface to the app: the
+    // very next app-visible message after it is the following Text, not the Ping.
     host.outbound
         .send(ProtocolMessage::Ping { seq: 7 })
         .unwrap();
-    assert!(matches!(
-        next_message(&mut client.events, "client").await,
-        ProtocolMessage::Ping { .. }
-    ));
+    host.outbound
+        .send(ProtocolMessage::Text {
+            text: "after-ping".into(),
+            timestamp: 99,
+            seq: 8,
+        })
+        .unwrap();
+    match next_message(&mut client.events, "client").await {
+        ProtocolMessage::Text { text, .. } => assert_eq!(text, "after-ping"),
+        other => panic!("ping must be consumed by the transport, got {other:?}"),
+    }
 
     // --- Disconnect: tearing down the client makes the host observe the drop ---
     client.handle.abort();
@@ -371,6 +380,57 @@ async fn reach_ready(host: &mut Peer, client: &mut Peer) {
         matches!(ev, SessionEvent::Ready)
     })
     .await;
+}
+
+/// Regression test for the 5-minute idle disconnect: nothing sent keep-alives,
+/// so both sides' receive-idle timers tore down any healthy-but-quiet session
+/// (each peer saw either "Receive idle timeout (300s)" or the other side's
+/// resulting "early eof"). With the transport's keep-alive pings, an idle
+/// session must survive past the idle window and still deliver messages.
+/// The env hooks shrink the windows so this verifies in seconds: keep-alive
+/// every 1 s against a 3 s idle timeout, then 6 s of pure silence.
+#[tokio::test]
+async fn idle_session_survives_past_the_idle_timeout() {
+    // Read at message-loop startup, so set before the pair connects. nextest
+    // runs each test in its own process, so this cannot leak across tests.
+    std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "1");
+    std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "3");
+
+    let (mut host, mut client) = connect_pair().await;
+    reach_ready(&mut host, &mut client).await;
+
+    // Twice the idle window with neither side sending anything.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    // The session must still be alive and deliver in both directions. If the
+    // idle timer had fired, the event stream would yield Error/Disconnected
+    // here and next_message would fail the test.
+    host.outbound
+        .send(ProtocolMessage::Text {
+            text: "still here".into(),
+            timestamp: 1,
+            seq: 1,
+        })
+        .unwrap();
+    match next_message(&mut client.events, "client").await {
+        ProtocolMessage::Text { text, .. } => assert_eq!(text, "still here"),
+        other => panic!("expected Text after idle period, got {other:?}"),
+    }
+    client
+        .outbound
+        .send(ProtocolMessage::Text {
+            text: "me too".into(),
+            timestamp: 2,
+            seq: 1,
+        })
+        .unwrap();
+    match next_message(&mut host.events, "host").await {
+        ProtocolMessage::Text { text, .. } => assert_eq!(text, "me too"),
+        other => panic!("expected Text after idle period, got {other:?}"),
+    }
+
+    host.handle.abort();
+    client.handle.abort();
 }
 
 /// Regression test for the rekey/replay desync: the transport rekeys after

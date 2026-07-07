@@ -1128,10 +1128,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+                                                                                        // Keep-alive pings run well inside the peer's idle window (2 pings per
+                                                                                        // 300 s), so a quiet-but-healthy session is never torn down. Before this,
+                                                                                        // two connected peers who simply didn't type for five minutes were
+                                                                                        // disconnected by each side's receive timeout.
+    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
     // Key rotation constants
     const REKEY_MESSAGE_COUNT: u64 = 100; // Rekey every 100 messages
     const REKEY_TIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+
+    // Test hooks: integration tests shrink these windows (seconds) to verify the
+    // keep-alive behavior in wall-clock-realistic time. Never set in production.
+    let recv_idle_timeout = duration_from_env("P2PEM_TEST_IDLE_TIMEOUT_SECS", RECV_IDLE_TIMEOUT);
+    let keepalive_interval = duration_from_env("P2PEM_TEST_KEEPALIVE_SECS", KEEPALIVE_INTERVAL);
 
     // Track last valid sequence number to detect replays and out-of-order messages
     // This is enforced at the transport layer, not just in the app layer
@@ -1144,10 +1154,17 @@ where
     let mut messages_since_rekey: u64 = 0;
     let mut last_rekey_time = std::time::Instant::now();
 
+    // First tick only after a full interval (interval() would fire immediately).
+    let mut keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + keepalive_interval,
+        keepalive_interval,
+    );
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             // Receive from network with timeout
-            result = tokio::time::timeout(RECV_IDLE_TIMEOUT, recv_packet(&mut stream)) => {
+            result = tokio::time::timeout(recv_idle_timeout, recv_packet(&mut stream)) => {
                 match result {
                     Ok(Ok(encrypted)) => {
                         tracing::trace!("Received {} bytes encrypted", encrypted.len());
@@ -1178,6 +1195,13 @@ where
                                             last_rekey_time = std::time::Instant::now();
                                             tracing::info!("Session key rotated (received Rekey message)");
                                             // Don't emit the Rekey message to the app
+                                        } else if matches!(msg, ProtocolMessage::Ping { .. }) {
+                                            // Keep-alive: transport-level plumbing that
+                                            // only exists to defeat the idle timeout —
+                                            // consume it here. (The app layer also
+                                            // tolerates Ping for peers that still
+                                            // forward it.)
+                                            tracing::trace!("Keep-alive ping received");
                                         } else {
                                             // Track message count for rekeying
                                             messages_since_rekey += 1;
@@ -1217,7 +1241,7 @@ where
                     }
                     Err(_) => {
                         // Timeout occurred
-                        let err_msg = format!("Receive idle timeout ({}s)", RECV_IDLE_TIMEOUT.as_secs());
+                        let err_msg = format!("Receive idle timeout ({}s)", recv_idle_timeout.as_secs());
                         tracing::warn!("{}", err_msg);
                         let _ = to_app_tx.send(SessionEvent::Error(err_msg));
                         break;
@@ -1294,6 +1318,21 @@ where
                     messages_since_rekey += 1;
                 }
             }
+
+            // Keep-alive: ping on the shared outbound sequence so the peer's
+            // receive-idle timer resets even when nobody is typing.
+            _ = keepalive.tick() => {
+                sent_seq += 1;
+                let ping = ProtocolMessage::Ping { seq: sent_seq };
+                let encrypted = cipher.encrypt(&ping.to_plain_bytes(), Some(&transport_aad));
+                if let Err(e) = send_packet(&mut stream, &encrypted).await {
+                    let err_msg = format!("Network send error (keep-alive): {}", e);
+                    tracing::error!("{}", err_msg);
+                    let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                    break;
+                }
+                tracing::trace!("Keep-alive ping sent");
+            }
         }
     }
 
@@ -1302,6 +1341,17 @@ where
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
     Ok(())
+}
+
+/// Read a duration override (whole seconds) from an environment variable, for
+/// integration tests that need realistic-wall-clock verification of the
+/// keep-alive/idle behavior. Falls back to `default` when unset or invalid.
+fn duration_from_env(var: &str, default: std::time::Duration) -> std::time::Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
