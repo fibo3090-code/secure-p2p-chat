@@ -69,7 +69,15 @@ client/src/
   support.rs      diagnostics export and panic/crash support
   colorgrid.rs    fingerprint color-grid rendering (egui Color32)
   app/
-    chat_manager.rs
+    chat_manager/   ChatManager split by concern:
+      mod.rs          struct, constructor, accessors, toasts, data deletion
+      connect.rs      hosting, connecting (direct/relay/contact), TOFU confirm
+      contacts.rs     contact CRUD, auto-reconnect, group-chat creation
+      events.rs       session-event pump (poll + handle)
+      files.rs        file transfers (validate, send, receive, wire confirm)
+      invites.rs      invite links (v1/v2/v3) + QR codes
+      text.rs         text send/chunk/reassembly, typing indicators
+      tests.rs        ChatManager unit tests
     party_manager.rs  Party server client-side state and operations
     persistence.rs
   gui/
@@ -120,14 +128,15 @@ desktop/
 - configures tracing
 - starts GUI or TUI
 
-### `client/src/app/chat_manager.rs`
+### `client/src/app/chat_manager/`
 
-- central application state
-- contact/chat/session mapping
-- message routing
-- send flows for text, typing, files
-- fingerprint-verification workflow
-- toast notifications
+- central application state (`mod.rs`)
+- contact/chat/session mapping (`contacts.rs`, `connect.rs`)
+- message routing and session-event handling (`events.rs`)
+- send flows for text, typing, files (`text.rs`, `files.rs`)
+- fingerprint-verification workflow (`connect.rs`, `events.rs`)
+- invite links and QR codes (`invites.rs`)
+- toast notifications (`mod.rs`)
 
 ### `client/src/app/persistence.rs`
 

@@ -24,7 +24,7 @@ This document is the contributor-facing guide for building, testing, changing, a
 - Main entry points:
   - GUI/TUI launcher: `client/src/main.rs`
   - Client library root: `client/src/lib.rs` (re-exports `messenger-core`)
-  - App coordinator: `client/src/app/chat_manager.rs`
+  - App coordinator: `client/src/app/chat_manager/` (module split by concern)
   - Core (crypto/protocol/network/identity): `core/src/`
   - Party server: `server/src/main.rs`
   - Tauri desktop bridge: `desktop/src-tauri/src/lib.rs`; React UI: `desktop/src/`
@@ -107,7 +107,9 @@ The tag-based release workflow in `.github/workflows/release.yml` builds and pub
 - `core/src/party/mod.rs`: the Party application protocol shared by client + server
 - `core/src/transfer/receiver.rs`: file receive path
 - `client/src/app/`
-  - `chat_manager.rs`: application state, routing, chat/contact/session operations
+  - `chat_manager/`: application state, routing, chat/contact/session operations —
+    split by concern (`mod.rs` state + accessors, `connect.rs`, `contacts.rs`,
+    `events.rs`, `files.rs`, `invites.rs`, `text.rs`, `tests.rs`)
   - `party_manager.rs`: client-side Party state and operations
   - `persistence.rs`: encrypted history load/save, migration compatibility
 - `client/src/gui/`: egui application, dialogs, help, styling, Party window

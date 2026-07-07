@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`ChatManager` split into focused modules.** The 3,200-line
+  `client/src/app/chat_manager.rs` is now `client/src/app/chat_manager/` with
+  one file per concern — `connect` (sessions), `contacts`, `events`
+  (session-event pump), `files` (transfers), `invites`, `text` (messaging),
+  and `tests` — with the state and accessors in `mod.rs`. Pure refactor: no
+  public API or behavior change.
+
 ### Fixed
 
 - **"File sent" is now confirmed at the wire, not at the queue.** Sending a
