@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
   (session-event pump), `files` (transfers), `invites`, `text` (messaging),
   and `tests` — with the state and accessors in `mod.rs`. Pure refactor: no
   public API or behavior change.
+- **Desktop bridge split into command modules.** `desktop/src-tauri/src/lib.rs`
+  (1,483 lines) now keeps only the Bridge state, entry point, and poll loop;
+  the Tauri command handlers moved to `src/commands/` grouped by concern
+  (`auth`, `chats`, `connect`, `contacts`, `party`). Pure refactor: command
+  names and behavior are unchanged, so the frontend is untouched.
 
 ### Fixed
 

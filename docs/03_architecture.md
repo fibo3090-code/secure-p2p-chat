@@ -107,10 +107,13 @@ server/src/
 
 desktop/
   src-tauri/
-    src/lib.rs    the Tauri bridge: wraps ChatManager + PartyManager in
-                  #[tauri::command]s, a background poll loop that forwards toasts /
-                  fingerprint requests / party events and persists history, and its
-                  own data dir (ProjectDirs "P2PEM", P2PEM_DATA_DIR override)
+    src/lib.rs    the Tauri bridge core: Bridge state, run()/init, the background
+                  poll loop that forwards toasts / fingerprint requests / party
+                  events and persists history, and its own data dir
+                  (ProjectDirs "P2PEM", P2PEM_DATA_DIR override)
+    src/commands/ the #[tauri::command] handlers, grouped by concern:
+                  auth.rs (identity + settings), chats.rs, connect.rs,
+                  contacts.rs, party.rs (Communities + parties.json pinning)
     tauri.conf.json  window, bundle identifier, and CSP
   src/            React/Vite web UI (JSX, plain CSS, lucide-react icons)
     App.jsx       shell: onboarding/unlock gate + tab rail + list/content panes
