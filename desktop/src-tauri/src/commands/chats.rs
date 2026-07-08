@@ -17,6 +17,8 @@ pub(crate) struct ConvSummary {
     /// Total message count; the frontend derives unread badges from it (count
     /// beyond what was on screen when the conversation was last open).
     messages: usize,
+    /// RFC 3339 timestamp of the newest message, for "last activity" display.
+    last_at: Option<String>,
 }
 
 fn kind_str(k: messenger_core::types::ChatKind) -> &'static str {
@@ -60,6 +62,7 @@ pub(crate) async fn list_conversations(
                 transport: transport_str(chat.transport),
                 verified: chat.peer_fingerprint.is_some(),
                 messages: chat.messages.len(),
+                last_at: chat.messages.last().map(|m| m.timestamp.to_rfc3339()),
             });
         }
     }
@@ -233,6 +236,122 @@ pub(crate) async fn decline_transfer(
         .await
         .reject_incoming_file(uuid)
         .map_err(|e| e.to_string())
+}
+
+/// Resolve a file message's on-disk path from history. The webview only ever
+/// passes (chat id, message id) — never a raw filesystem path — so the bridge
+/// cannot be used to open or read arbitrary files.
+async fn file_message_path(
+    state: &tauri::State<'_, Bridge>,
+    id: &str,
+    msg: &str,
+) -> Result<PathBuf, String> {
+    let chat_id = Uuid::parse_str(id).map_err(|e| e.to_string())?;
+    let msg_id = Uuid::parse_str(msg).map_err(|e| e.to_string())?;
+    let mgr = state.manager.lock().await;
+    let chat = mgr
+        .get_chat(chat_id)
+        .ok_or_else(|| "No such conversation".to_string())?;
+    let m = chat
+        .messages
+        .iter()
+        .find(|m| m.id == msg_id)
+        .ok_or_else(|| "No such message".to_string())?;
+    match &m.content {
+        MessageContent::File { path: Some(p), .. } => Ok(p.clone()),
+        MessageContent::File { path: None, .. } => {
+            Err("This file's location was not recorded".to_string())
+        }
+        _ => Err("Not a file message".to_string()),
+    }
+}
+
+/// Open a file with the OS default app, or reveal it in the file manager.
+fn open_path_os(path: &Path, reveal: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        if reveal {
+            // The `/select,` argument must reach explorer as one raw token,
+            // quoted, or paths with spaces get split.
+            std::process::Command::new("explorer")
+                .raw_arg(format!("/select,\"{}\"", path.display()))
+                .spawn()?;
+        } else {
+            std::process::Command::new("explorer").arg(path).spawn()?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        if reveal {
+            cmd.arg("-R");
+        }
+        cmd.arg(path).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // xdg-open has no "reveal" mode; open the containing directory instead.
+        let target = if reveal {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        std::process::Command::new("xdg-open").arg(target).spawn()?;
+    }
+    Ok(())
+}
+
+/// Open a sent/received file with the default app (`reveal: false`) or show it
+/// in the file manager (`reveal: true`). A file card in the chat is no longer
+/// a dead end — this is what its click and folder button call.
+#[tauri::command]
+pub(crate) async fn open_file(
+    id: String,
+    msg: String,
+    reveal: bool,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let path = file_message_path(&state, &id, &msg).await?;
+    if !path.exists() {
+        return Err(format!("File no longer exists on disk: {}", path.display()));
+    }
+    open_path_os(&path, reveal).map_err(|e| e.to_string())
+}
+
+/// Cap on how large an image is inlined as a preview; larger ones fall back to
+/// the plain file card (the webview would balloon on multi-MB data URLs).
+const PREVIEW_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Inline preview for an image file message, as a `data:` URL, or `None` when
+/// the file is not a previewable image (or too large). SVG is deliberately
+/// excluded — it can carry scripts, and history files may come from a peer.
+#[tauri::command]
+pub(crate) async fn file_preview(
+    id: String,
+    msg: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<Option<String>, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    ensure_ready(&state)?;
+    let path = file_message_path(&state, &id, &msg).await?;
+    let mime = messenger_core::util::guess_mime(&path);
+    if !mime.starts_with("image/") || mime == "image/svg+xml" {
+        return Ok(None);
+    }
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if meta.len() > PREVIEW_MAX_BYTES {
+        return Ok(None);
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+    Ok(Some(format!(
+        "data:{};base64,{}",
+        mime,
+        STANDARD.encode(bytes)
+    )))
 }
 
 #[tauri::command]

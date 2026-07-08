@@ -2,7 +2,11 @@
 // mockup's chat.jsx, driven by live data adapted in lib/bridge.js.
 import { useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
+import { api, fmtDay } from "../lib/bridge.js";
 import { cx, Avatar, IconButton, Button, TrustBadge, TransportBadge } from "./ui.jsx";
+
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const isImageName = (name) => IMAGE_RE.test(name || "");
 
 function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
   const [open, setOpen] = useState(false);
@@ -87,7 +91,7 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
   );
 }
 
-function MessageItem({ m }) {
+function MessageItem({ m, preview, onOpen, onReveal }) {
   if (m.kind === "system") {
     return (
       <div className={cx("sys-msg", m.warn && "is-warn", m.ok && "is-ok")}>
@@ -103,17 +107,32 @@ function MessageItem({ m }) {
     // Received files are auto-saved to the configured download directory, so a
     // completed card shows a "saved" state rather than a dead download button.
     const sub = done ? (mine ? "sent" : "saved to Downloads") : m.progress + "%";
+    const canOpen = done && m.hasPath;
+    const open = canOpen && onOpen ? () => onOpen(m) : undefined;
     return (
       <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
-        <div className={cx("file-card", mine && "is-mine")}>
-          <span className="file-ic"><Icon name="file" size={20} /></span>
-          <div className="file-meta">
-            <div className="file-name">{m.name}</div>
-            <div className="file-sub">{m.size} · {sub}</div>
+        <div className={cx("file-card", mine && "is-mine", canOpen && "is-openable")}>
+          {preview && (
+            <button className="file-thumb" onClick={open} title={"Open " + m.name}>
+              <img src={preview} alt={m.name} loading="lazy" />
+            </button>
+          )}
+          <div className="file-card-row">
+            <button className="file-ic" onClick={open} disabled={!canOpen}
+              title={canOpen ? "Open file" : undefined}><Icon name="file" size={20} /></button>
+            <button className="file-meta" onClick={open} disabled={!canOpen}
+              title={canOpen ? "Open file" : undefined}>
+              <div className="file-name">{m.name}</div>
+              <div className="file-sub">{m.size} · {sub} · {m.t}</div>
+            </button>
+            {canOpen && (
+              <button className="file-reveal" title="Show in folder"
+                onClick={() => onReveal && onReveal(m)}><Icon name="folder" size={15} /></button>
+            )}
+            <span className={cx("file-status", done && "is-done")} title={sub}>
+              <Icon name={done ? "check" : "clock"} size={16} />
+            </span>
           </div>
-          <span className={cx("file-status", done && "is-done")} title={sub}>
-            <Icon name={done ? "check" : "clock"} size={16} />
-          </span>
         </div>
       </div>
     );
@@ -187,10 +206,40 @@ const MSG_WINDOW = 150;
 export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
-  useEffect(() => setShown(MSG_WINDOW), [contact && contact.id]);
+  // Inline previews for image files, fetched once per message id (null =
+  // asked, not previewable) so the poll-driven re-renders never refetch.
+  const [previews, setPreviews] = useState({});
+  const requested = useRef(new Set());
+  useEffect(() => {
+    setShown(MSG_WINDOW);
+    setPreviews({});
+    requested.current = new Set();
+  }, [contact && contact.id]);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [contact && contact.id, contact && contact.messages.length]);
+  useEffect(() => {
+    if (!contact) return;
+    const want = contact.messages
+      .slice(-shown)
+      .filter((m) => m.kind === "file" && m.hasPath && m.progress >= 100 &&
+                     isImageName(m.name) && !requested.current.has(m.id));
+    if (want.length === 0) return;
+    want.forEach((m) => requested.current.add(m.id));
+    let cancelled = false;
+    (async () => {
+      const updates = {};
+      for (const m of want) {
+        try { updates[m.id] = await api.filePreview(contact.id, m.id); }
+        catch { updates[m.id] = null; }
+      }
+      if (!cancelled) setPreviews((p) => ({ ...p, ...updates }));
+    })();
+    return () => { cancelled = true; };
+  }, [contact && contact.id, contact && contact.messages.length, shown]);
+
+  const openFile = (m) => api.openFile(contact.id, m.id, false).catch(() => {});
+  const revealFile = (m) => api.openFile(contact.id, m.id, true).catch(() => {});
 
   if (!contact) {
     return (
@@ -231,7 +280,22 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               Show earlier messages ({contact.messages.length - shown} more)
             </button>
           )}
-          {contact.messages.slice(-shown).map((m, i) => <MessageItem key={i} m={m} />)}
+          {(() => {
+            const visible = contact.messages.slice(-shown);
+            let lastDay = null;
+            return visible.map((m, i) => {
+              const day = m.ts ? new Date(m.ts).toDateString() : null;
+              const sep = day && day !== lastDay ? fmtDay(m.ts) : null;
+              if (day) lastDay = day;
+              return (
+                <div key={m.id || i}>
+                  {sep && <div className="day-sep"><span>{sep}</span></div>}
+                  <MessageItem m={m} preview={m.id ? previews[m.id] : null}
+                    onOpen={openFile} onReveal={revealFile} />
+                </div>
+              );
+            });
+          })()}
         </div>
       </div>
 

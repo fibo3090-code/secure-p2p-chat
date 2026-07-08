@@ -25,6 +25,10 @@ const realApi = {
   getConversation: (id) => invoke("get_conversation", { id }),
   sendMessage: (id, text) => invoke("send_message", { id, text }),
   sendFile: (id) => invoke("send_file", { id }),
+  // File cards: open with the default app (reveal=false) or show in folder.
+  // Only (chat id, message id) cross the bridge — never filesystem paths.
+  openFile: (id, msg, reveal = false) => invoke("open_file", { id, msg, reveal }),
+  filePreview: (id, msg) => invoke("file_preview", { id, msg }),
   listTransfers: () => invoke("list_transfers"),
   acceptTransfer: (id) => invoke("accept_transfer", { id }),
   declineTransfer: (id) => invoke("decline_transfer", { id }),
@@ -143,7 +147,9 @@ function makeMock() {
     listConversations: async () => summaries(),
     getConversation: async (id) => chats[id],
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
-    sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000 }, timestamp: new Date().toISOString() }); },
+    sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000, path: "/mock/example.pdf" }, timestamp: new Date().toISOString() }); },
+    openFile: async () => {},
+    filePreview: async () => null,
     listTransfers: async () => [],
     acceptTransfer: async (_id) => {},
     declineTransfer: async (_id) => {},
@@ -205,6 +211,32 @@ export function fmtTime(ts) {
   catch { return ""; }
 }
 
+// Compact "last activity" stamp for the conversation list: time-of-day for
+// today, weekday within the last week, short date otherwise.
+export function fmtWhen(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    if (isNaN(d)) return "";
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) return fmtTime(d);
+    const days = (now - d) / 86400000;
+    if (days < 7) return d.toLocaleDateString([], { weekday: "short" });
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  } catch { return ""; }
+}
+
+// Label for day separators inside a thread.
+export function fmtDay(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return "";
+  const today = new Date();
+  const yesterday = new Date(today.getTime() - 86400000);
+  if (d.toDateString() === today.toDateString()) return "Today";
+  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+}
+
 function msgText(c) {
   if (!c) return "";
   if (c.type === "text") return c.text;
@@ -231,7 +263,7 @@ export function summaryToConv(s) {
   return {
     id: s.id, name: s.title,
     last: s.last || (s.connected ? "Connected" : s.placeholder ? "Waiting for a peer…" : ""),
-    lastT: "", typing: false,
+    lastT: fmtWhen(s.last_at), typing: false,
     kind: normalizeKind(s.kind),
     transport,
     relay: transport === "relay" || transport === "server",
@@ -259,9 +291,11 @@ export function chatToContact(chat, connected) {
     messages: (chat.messages || []).map((m) => {
       const c = m.content || {};
       if (c.type === "file") {
-        return { kind: "file", from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), delivered: !!m.delivered };
+        // hasPath gates the open/reveal actions — a file whose location was
+        // never recorded (old history) renders as a plain card.
+        return { kind: "file", id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), hasPath: !!c.path, delivered: !!m.delivered };
       }
-      return { from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp), delivered: !!m.delivered };
+      return { id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp), delivered: !!m.delivered };
     }),
   };
 }
