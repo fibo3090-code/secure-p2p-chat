@@ -8,6 +8,33 @@ import { cx, Avatar, IconButton, Button, TrustBadge, TransportBadge } from "./ui
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const isImageName = (name) => IMAGE_RE.test(name || "");
 
+// Render message text with http(s) URLs clickable. Opening goes through the
+// bridge's open_url (scheme re-checked there) so links launch the system
+// browser, never navigate the webview. Trailing punctuation stays text.
+const URL_RE = /(https?:\/\/[^\s<>"']+)/gi;
+function LinkifiedText({ text }) {
+  const parts = String(text ?? "").split(URL_RE);
+  if (parts.length === 1) return <>{text}</>;
+  return (
+    <>
+      {parts.map((part, i) => {
+        if (i % 2 === 0) return part;
+        const trimmed = part.replace(/[.,;:!?)\]]+$/, "");
+        const rest = part.slice(trimmed.length);
+        return (
+          <span key={i}>
+            <a className="msg-link" href={trimmed} title={trimmed}
+              onClick={(e) => { e.preventDefault(); api.openUrl(trimmed).catch(() => {}); }}>
+              {trimmed}
+            </a>
+            {rest}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
 function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -142,7 +169,7 @@ function MessageItem({ m, preview, onOpen, onReveal }) {
     <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
       <div className="msg-bubble">
         {m.author && !mine && <span className="msg-author">{m.author}</span>}
-        <span className="msg-text">{m.text}</span>
+        <span className="msg-text"><LinkifiedText text={m.text} /></span>
         <span className="msg-time">{m.t}{mine && m.delivered && <Icon name="check" size={12} />}</span>
       </div>
     </div>

@@ -21,6 +21,10 @@ predate tagged releases.
   GIF, WebP, BMP up to 4 MiB) render as a thumbnail right in the chat; click
   the thumbnail to open the full image. SVG is deliberately excluded (it can
   carry scripts).
+- **Links in messages are clickable (desktop).** http(s) URLs in message
+  text open in the system browser. Only web URLs launch — the scheme is
+  whitelisted at the bridge, so a peer cannot make a message open `file:` or
+  app-scheme links.
 - **Time you can actually see (desktop).** Threads now show day separators
   ("Today", "Yesterday", full date), file cards show their time, and the
   conversation list shows when the last message arrived (time today, weekday

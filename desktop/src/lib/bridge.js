@@ -29,6 +29,7 @@ const realApi = {
   // Only (chat id, message id) cross the bridge — never filesystem paths.
   openFile: (id, msg, reveal = false) => invoke("open_file", { id, msg, reveal }),
   filePreview: (id, msg) => invoke("file_preview", { id, msg }),
+  openUrl: (url) => invoke("open_url", { url }),
   listTransfers: () => invoke("list_transfers"),
   acceptTransfer: (id) => invoke("accept_transfer", { id }),
   declineTransfer: (id) => invoke("decline_transfer", { id }),
@@ -150,6 +151,7 @@ function makeMock() {
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000, path: "/mock/example.pdf" }, timestamp: new Date().toISOString() }); },
     openFile: async () => {},
     filePreview: async () => null,
+    openUrl: async (url) => { window.open(url, "_blank", "noopener"); },
     listTransfers: async () => [],
     acceptTransfer: async (_id) => {},
     declineTransfer: async (_id) => {},
