@@ -415,32 +415,52 @@ desktop/
 desktop app is launched separately with `cd desktop && npx tauri dev`. Phase E
 (below) will retire egui; only then does a single `client` launch route to Tauri.
 
-### Visual language (target design tokens)
+### Visual language (design tokens)
 
-A dark, layered aesthetic — information illuminated on a deep charcoal base, depth
+> This section originally documented a warm-amber/neon-green/Inter target that
+> was never implemented — the shipped system used a sky-blue accent and IBM
+> Plex Sans instead, and that drift went unremarked for a while. It's now
+> superseded by the "control teal-indigo" brand pass below; treat
+> **`design/tokens.json`** (repo root) as the source of record for exact hex
+> values going forward instead of re-embedding them in this prose, since
+> that's exactly what drifted last time.
+
+A dark, layered aesthetic — information illuminated on a deep-navy base, depth
 from tonal layering rather than borders or heavy shadows.
 
 - **Surfaces (no 1px section borders):** structure comes from background shifts,
-  negative space, and tonal transitions. Base `#0e0e0e` → `surface_container_low`
-  `#131313` (content) → `surface_container` `#1a1a1a` (interactive) →
-  `surface_container_high` `#20201f` (pop-overs / focus). Avoid pure black except
-  the lowest surface.
-- **Accents:** `primary` warm amber (`#ffd16c`→`#fdc003` gradient on key CTAs);
-  `secondary` neon green reserved as a sparse "signal" color for success / active
-  states.
-- **Typography:** `Space Grotesk` for display/headlines, `Inter` for body/labels
-  and dense data; muted gray for metadata, near-white for active content.
+  negative space, and tonal transitions, not divider lines. See `design/tokens.json`
+  → `themes.dark`/`themes.light` for the exact surface ramp (`bg`/`s1`/`s2`/`s3`/`s4`).
+- **Accent:** brand "control teal-indigo" (`design/tokens.json` → `brand`), a
+  teal→indigo gradient (`#2dd4bf`→`#4f46e5`) used on the app icon/logo mark; UI
+  chrome (buttons, borders, selection) uses the flat mid-tone `flatAccent`
+  (`#3e8dd2`) for the Dark and Light themes. Midnight/Forest/Rose keep their own
+  distinct accent hues (violet/green/pink) as alternate theme personalities, not
+  brand-compliance failures — only Dark/Light carry the brand color.
+  `success`/`warning`/`error` are separate semantic colors, unaffected by theme.
+- **Typography:** `Space Grotesk` for display/headlines, `IBM Plex Sans` for
+  body/labels, `IBM Plex Mono` for monospace — this is what's actually shipped
+  (`desktop/src/app-system.css` `--font`/`--display`/`--mono`).
 - **Elevation:** tonal layering over drop shadows; floating modals use a soft
   ambient "ghost" shadow and optional translucent blur. Any border that
   accessibility requires is a faint `outline_variant`, felt not seen.
-- **Components:** primary buttons are solid `primary`, no border, modest radius
+- **Components:** primary buttons are solid accent, no border, modest radius
   (no full pills); inputs use the highest surface with a focus underline/glow
   rather than a heavy outline; lists separate items with spacing / alternating
   surfaces, not divider lines.
 
-These tokens carry the existing theme names (Light / Dark / Midnight / Forest) as
-CSS custom-property token sets (`desktop/src/themes.css`) — the plan's Tailwind
-token system was replaced by plain CSS variables.
+These tokens carry the theme names Light / Dark / Midnight / Forest / Rose as
+CSS custom-property token sets (`desktop/src/app-system.css`, `desktop/src/themes.css`)
+— the plan's Tailwind token system was replaced by plain CSS variables. The same
+theme names exist as `core::types::Theme` (Rust, shared by egui/TUI persistence)
+and as egui `Visuals` builders in `client/src/gui/styling.rs`; the ratatui TUI
+does not implement per-theme rendering (terminal color-depth constraints make a
+5-theme TUI disproportionate) but does use the brand accent for theme-neutral
+chrome (active-pane borders, key hints) — see `client/src/tui/overlays.rs`'s
+`BRAND_ACCENT`. There is no automated cross-language token pipeline; a Rust test
+(`client/tests/theme_tokens_test.rs`) parses `design/tokens.json` and asserts it
+matches the egui `Visuals` builders, so future drift fails a test instead of
+going unnoticed again.
 
 ### Packaging rebuild
 

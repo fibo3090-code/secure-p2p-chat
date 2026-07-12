@@ -52,7 +52,7 @@ jobs:
         run: |
           mkdir dist
           cp target/release/encodeur_rsa_rust.exe dist/
-          cp encodeur_rsa_icon.ico dist/
+          cp app-icon.ico dist/
           cp README.md dist/
           cp LICENSE.md dist/
 
@@ -95,8 +95,8 @@ jobs:
           chmod +x Messenger.app/Contents/MacOS/Messenger
           
           # Use icon if exists
-          if [ -f "encodeur_rsa_icon.ico" ]; then
-            cp encodeur_rsa_icon.ico Messenger.app/Contents/Resources/icon.ico
+          if [ -f "app-icon.ico" ]; then
+            cp app-icon.ico Messenger.app/Contents/Resources/icon.ico
           fi
 
           cat > Messenger.app/Contents/Info.plist <<EOF

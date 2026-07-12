@@ -1522,7 +1522,8 @@ impl TuiApp {
                     Theme::Light => Theme::Dark,
                     Theme::Dark => Theme::Midnight,
                     Theme::Midnight => Theme::Forest,
-                    Theme::Forest => Theme::Light,
+                    Theme::Forest => Theme::Rose,
+                    Theme::Rose => Theme::Light,
                 }
             }
             _ => {
@@ -1587,7 +1588,11 @@ impl TuiApp {
                     cfg.theme = Theme::Forest;
                     Ok("theme = Forest".to_string())
                 }
-                _ => Err("theme: light|dark|midnight|forest".to_string()),
+                "rose" => {
+                    cfg.theme = Theme::Rose;
+                    Ok("theme = Rose".to_string())
+                }
+                _ => Err("theme: light|dark|midnight|forest|rose".to_string()),
             },
             _ => Err(format!(
                 "Unknown setting '{}'. Keys: {}",

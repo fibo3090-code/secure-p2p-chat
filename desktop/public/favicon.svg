@@ -1,15 +1,10 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#0f1521"/>
-      <stop offset="1" stop-color="#0a0e16"/>
-    </linearGradient>
     <linearGradient id="bubble" x1="0" y1="1" x2="1" y2="0">
       <stop offset="0" stop-color="#2dd4bf"/>
       <stop offset="1" stop-color="#4f46e5"/>
     </linearGradient>
   </defs>
-  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
   <g transform="translate(512 500) scale(1.58)">
     <path d="M-190 -120 a70 70 0 0 1 70 -70 h240 a70 70 0 0 1 70 70 v190 a70 70 0 0 1 -70 70 h-179 l-70 84 a10 10 0 0 1 -17.6 -6.6 l-3.4 -77.6 a70 70 0 0 1 -40 -63.8 Z" fill="url(#bubble)"/>
     <line x1="-62" y1="50" x2="66" y2="-60" stroke="#0a0a0a" stroke-width="34" stroke-linecap="round"/>

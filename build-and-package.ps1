@@ -10,7 +10,7 @@ param(
     [string]$Configuration = "release",
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$InnoPath = "", # Will attempt auto-detection if empty
-    [string]$IconSource = "encodeur_rsa_icon.ico",        # Relative to repo root or absolute path
+    [string]$IconSource = "app-icon.ico",        # Relative to repo root or absolute path
     [string]$PfxPath = "",                               # Optional: path to .pfx for signing
     [System.Security.SecureString]$PfxPassword = $null,   # Optional: password for .pfx (secure)
     [string]$SignToolPath = ""                            # Will attempt auto-detection if empty
