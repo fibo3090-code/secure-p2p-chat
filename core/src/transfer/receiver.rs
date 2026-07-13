@@ -178,7 +178,7 @@ impl IncomingFileSync {
         std::fs::create_dir_all(tmp_dir)?;
 
         let safe_filename = sanitize_filename(filename);
-        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), &safe_filename);
+        let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), safe_filename);
         let tmp_path = tmp_dir.join(tmp_name);
 
         let file = std::fs::File::create(&tmp_path)?;
