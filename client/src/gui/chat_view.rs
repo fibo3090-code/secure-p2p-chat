@@ -501,7 +501,10 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
             ui.painter().rect_stroke(
                 frame_response.response.rect,
                 rounding,
-                egui::Stroke::new(1.5, ui.visuals().widgets.active.bg_fill.gamma_multiply(0.5)),
+                egui::Stroke::new(
+                    1.5_f32,
+                    ui.visuals().widgets.active.bg_fill.gamma_multiply(0.5),
+                ),
             );
         }
     });

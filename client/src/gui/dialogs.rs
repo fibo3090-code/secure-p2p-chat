@@ -458,7 +458,7 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                             ..Default::default()
                         },
                         fill: frame_fill,
-                        stroke: egui::Stroke::new(1.0, stroke_color),
+                        stroke: egui::Stroke::new(1.0_f32, stroke_color),
                     };
 
                     toast_frame.show(ui, |ui| {

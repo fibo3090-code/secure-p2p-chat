@@ -458,8 +458,8 @@ does not implement per-theme rendering (terminal color-depth constraints make a
 5-theme TUI disproportionate) but does use the brand accent for theme-neutral
 chrome (active-pane borders, key hints) — see `client/src/tui/overlays.rs`'s
 `BRAND_ACCENT`. There is no automated cross-language token pipeline; a Rust test
-(`client/tests/theme_tokens_test.rs`) parses `design/tokens.json` and asserts it
-matches the egui `Visuals` builders, so future drift fails a test instead of
+(`client/src/gui/styling.rs`'s `token_drift_tests` module) parses `design/tokens.json`
+and asserts it matches the egui `Visuals` builders, so future drift fails a test instead of
 going unnoticed again.
 
 ### Packaging rebuild
