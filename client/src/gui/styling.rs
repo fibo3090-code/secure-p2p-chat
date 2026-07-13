@@ -235,12 +235,25 @@ mod token_drift_tests {
     #[test]
     fn egui_accents_match_design_tokens() {
         let tokens = load_tokens();
-        let theme_accent = |name: &str| hex_to_color32(tokens["themes"][name]["accent"].as_str().unwrap());
+        let theme_accent =
+            |name: &str| hex_to_color32(tokens["themes"][name]["accent"].as_str().unwrap());
 
         assert_eq!(ACCENT_PRIMARY, theme_accent("dark"), "dark accent drifted");
-        assert_eq!(ACCENT_PRIMARY, theme_accent("light"), "light accent drifted");
-        assert_eq!(MIDNIGHT_ACCENT, theme_accent("midnight"), "midnight accent drifted");
-        assert_eq!(FOREST_ACCENT, theme_accent("forest"), "forest accent drifted");
+        assert_eq!(
+            ACCENT_PRIMARY,
+            theme_accent("light"),
+            "light accent drifted"
+        );
+        assert_eq!(
+            MIDNIGHT_ACCENT,
+            theme_accent("midnight"),
+            "midnight accent drifted"
+        );
+        assert_eq!(
+            FOREST_ACCENT,
+            theme_accent("forest"),
+            "forest accent drifted"
+        );
         assert_eq!(ROSE_ACCENT, theme_accent("rose"), "rose accent drifted");
     }
 
