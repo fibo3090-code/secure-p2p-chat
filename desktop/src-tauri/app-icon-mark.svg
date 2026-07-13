@@ -7,8 +7,8 @@
   </defs>
   <g transform="translate(512 500) scale(1.58)">
     <path d="M-190 -120 a70 70 0 0 1 70 -70 h240 a70 70 0 0 1 70 70 v190 a70 70 0 0 1 -70 70 h-179 l-70 84 a10 10 0 0 1 -17.6 -6.6 l-3.4 -77.6 a70 70 0 0 1 -40 -63.8 Z" fill="url(#bubble)"/>
-    <line x1="-62" y1="50" x2="66" y2="-60" stroke="#0a0a0a" stroke-width="34" stroke-linecap="round"/>
-    <circle cx="-62" cy="50" r="42" fill="#0a0a0a"/>
-    <circle cx="66" cy="-60" r="42" fill="#0a0a0a"/>
+    <line x1="-64" y1="8" x2="64" y2="-103" stroke="#0a0a0a" stroke-width="34" stroke-linecap="round"/>
+    <circle cx="-64" cy="8" r="42" fill="#0a0a0a"/>
+    <circle cx="64" cy="-103" r="42" fill="#0a0a0a"/>
   </g>
 </svg>
