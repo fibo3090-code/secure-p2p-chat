@@ -1,7 +1,7 @@
 
 /* ============ TOKENS ============ */
 :root{
-  --accent:#38bdf8;
+  --accent:#3e8dd2;
   --radius:9px;
   --hex-op:0.04;
   --r-sm:calc(var(--radius) * .62);

@@ -458,7 +458,7 @@ pub fn render_toasts(app: &mut App, ctx: &egui::Context) {
                             ..Default::default()
                         },
                         fill: frame_fill,
-                        stroke: egui::Stroke::new(1.0, stroke_color),
+                        stroke: egui::Stroke::new(1.0_f32, stroke_color),
                     };
 
                     toast_frame.show(ui, |ui| {
@@ -1597,7 +1597,8 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                             ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Light, "Light").changed() ||
                             ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Dark, "Dark").changed() ||
                             ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Midnight, "Midnight").changed() ||
-                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Forest, "Forest").changed()
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Forest, "Forest").changed() ||
+                            ui.selectable_value(&mut manager.config.theme, crate::types::Theme::Rose, "Rose").changed()
                         }).inner.unwrap_or(false) {
                             queue_history_save(app.history_path.clone(), &mut manager);
                             // Apply theme immediately

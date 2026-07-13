@@ -246,6 +246,7 @@ pub enum Theme {
     Dark,
     Midnight,
     Forest,
+    Rose,
 }
 
 /// Notification sound options
@@ -399,7 +400,13 @@ mod tests {
 
     #[test]
     fn theme_and_notification_sound_serde_roundtrip() {
-        for theme in [Theme::Light, Theme::Dark, Theme::Midnight, Theme::Forest] {
+        for theme in [
+            Theme::Light,
+            Theme::Dark,
+            Theme::Midnight,
+            Theme::Forest,
+            Theme::Rose,
+        ] {
             let json = serde_json::to_string(&theme).unwrap();
             let back: Theme = serde_json::from_str(&json).unwrap();
             assert_eq!(theme, back);

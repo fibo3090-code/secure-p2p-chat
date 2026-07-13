@@ -6,7 +6,7 @@
 
 use crate::tui::app::{TuiApp, TuiFocus, TuiMode};
 use crate::tui::command::COMMANDS;
-use crate::tui::overlays::{self, toast_color};
+use crate::tui::overlays::{self, toast_color, BRAND_ACCENT};
 use crate::types::MessageContent;
 use ratatui::{prelude::*, widgets::*};
 use unicode_width::UnicodeWidthStr;
@@ -160,7 +160,7 @@ fn render_chat_list(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         _ => " Chats ",
     };
     let border = if app.focus == TuiFocus::ChatList {
-        Color::Cyan
+        BRAND_ACCENT
     } else {
         Color::DarkGray
     };
@@ -207,7 +207,7 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     for msg in &chat.messages {
         let ts = msg.timestamp.format("%H:%M ").to_string();
         let (prefix, color) = if msg.from_me {
-            ("You ", Color::Cyan)
+            ("You ", BRAND_ACCENT)
         } else {
             ("Peer ", Color::Green)
         };
@@ -241,7 +241,7 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         title.push_str("· typing… ");
     }
     let border = if app.focus == TuiFocus::MessageView {
-        Color::Cyan
+        BRAND_ACCENT
     } else {
         Color::DarkGray
     };
@@ -291,7 +291,7 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
             " Message ".to_string()
         };
         let border = if app.focus == TuiFocus::Input {
-            Color::Cyan
+            BRAND_ACCENT
         } else {
             Color::DarkGray
         };

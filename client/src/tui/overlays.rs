@@ -74,6 +74,12 @@ fn ratatui_color(c: eframe::egui::Color32) -> Color {
     Color::Rgb(c.r(), c.g(), c.b())
 }
 
+/// Brand-neutral chrome accent ("control teal-indigo", see design/tokens.json).
+/// Used only for UI chrome (borders, key-hint labels) that previously used an
+/// arbitrary `Color::Cyan` — semantic colors (success/warning/error/info) are
+/// untouched, since they carry meaning rather than brand.
+pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x3e, 0x8d, 0xd2);
+
 /// Render the active overlay over `area`. No-op when none is open.
 pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     match app.overlay.clone() {
@@ -109,7 +115,7 @@ fn clear_and_block(f: &mut Frame, area: Rect, title: &str) -> Rect {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(BRAND_ACCENT))
         .title(Span::styled(
             format!(" {} ", title),
             Style::default().add_modifier(Modifier::BOLD),
@@ -166,7 +172,7 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
             ("Esc", "close overlay / leave command mode"),
         ] {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<10}", k), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("  {:<10}", k), Style::default().fg(BRAND_ACCENT)),
                 Span::raw(v),
             ]));
         }

@@ -117,10 +117,19 @@ async fn main() -> anyhow::Result<()> {
         // Launch GUI
         tracing::info!("Starting GUI mode");
 
+        let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
+            .expect("bundled app icon must decode")
+            .into_rgba8();
+        let (icon_width, icon_height) = icon.dimensions();
         let native_options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1200.0, 800.0])
-                .with_min_inner_size([800.0, 600.0]),
+                .with_min_inner_size([800.0, 600.0])
+                .with_icon(egui::IconData {
+                    rgba: icon.into_raw(),
+                    width: icon_width,
+                    height: icon_height,
+                }),
             ..Default::default()
         };
 

@@ -52,7 +52,7 @@ jobs:
         run: |
           mkdir dist
           cp target/release/encodeur_rsa_rust.exe dist/
-          cp encodeur_rsa_icon.ico dist/
+          cp app-icon.ico dist/
           cp README.md dist/
           cp LICENSE.md dist/
 
@@ -94,9 +94,9 @@ jobs:
           cp target/${{ matrix.target }}/release/encodeur_rsa_rust Messenger.app/Contents/MacOS/Messenger
           chmod +x Messenger.app/Contents/MacOS/Messenger
           
-          # Use icon if exists
-          if [ -f "encodeur_rsa_icon.ico" ]; then
-            cp encodeur_rsa_icon.ico Messenger.app/Contents/Resources/icon.ico
+          # macOS bundles use .icns, not .ico - use the Tauri app's icon set
+          if [ -f "desktop/src-tauri/icons/icon.icns" ]; then
+            cp desktop/src-tauri/icons/icon.icns Messenger.app/Contents/Resources/icon.icns
           fi
 
           cat > Messenger.app/Contents/Info.plist <<EOF
@@ -110,6 +110,8 @@ jobs:
               <string>com.fibo3090.messenger</string>
               <key>CFBundleName</key>
               <string>Messenger</string>
+              <key>CFBundleIconFile</key>
+              <string>icon.icns</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>

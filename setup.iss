@@ -7,8 +7,8 @@
 #define MyAppExe "encodeur_rsa_rust.exe"
 
 ; Define icon only if it exists in dist
-#if FileExists("dist\encodeur_rsa_icon.ico")
-  #define MyAppIcon "dist\encodeur_rsa_icon.ico"
+#if FileExists("dist\app-icon.ico")
+  #define MyAppIcon "dist\app-icon.ico"
 #endif
 
 [Setup]
@@ -33,7 +33,7 @@ WizardStyle=modern
 DisableWelcomePage=no
 DisableFinishedPage=no
 ; Use .ico for Add/Remove Programs / Settings > Apps so the app logo displays correctly
-UninstallDisplayIcon={app}\encodeur_rsa_icon.ico
+UninstallDisplayIcon={app}\app-icon.ico
 ; Use installer icon only if present
 #if defined MyAppIcon
   SetupIconFile={#MyAppIcon}
@@ -46,7 +46,7 @@ Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "dist\encodeur_rsa_icon.ico"; DestDir: "{app}"; DestName: "encodeur_rsa_icon.ico"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "dist\app-icon.ico"; DestDir: "{app}"; DestName: "app-icon.ico"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "dist\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\README.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "dist\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -56,8 +56,8 @@ Source: "dist\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedo
 
 [Icons]
 #if defined MyAppIcon
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; IconFilename: "{app}\encodeur_rsa_icon.ico"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon; IconFilename: "{app}\encodeur_rsa_icon.ico"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; IconFilename: "{app}\app-icon.ico"
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon; IconFilename: "{app}\app-icon.ico"
 #else
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
 Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
