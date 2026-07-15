@@ -58,15 +58,15 @@ jobs:
 
       - name: Compile Installer
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" /O"Output" /F"P2PEM-Classic_${version}_x64-setup" setup.iss
 
       - name: Upload Installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          gh release upload "${{ github.ref_name }}" "./Output/P2PEM-Classic_${version}_x64-setup.exe" --repo "${{ github.repository }}" --clobber
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          gh release upload "$env:GITHUB_REF_NAME" "./Output/P2PEM-Classic_${version}_x64-setup.exe" --repo "$env:GITHUB_REPOSITORY" --clobber
 
   build-macos:
     needs: create-release
@@ -139,7 +139,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release upload "${{ github.ref_name }}" "./P2PEM-Classic_${VERSION}_macos-${{ matrix.arch }}.dmg" --repo "${{ github.repository }}" --clobber
+          gh release upload "$GITHUB_REF_NAME" "./P2PEM-Classic_${VERSION}_macos-${{ matrix.arch }}.dmg" --repo "$GITHUB_REPOSITORY" --clobber
 
   # The new Tauri desktop app (P2PEM). Builds the platform installers with
   # Tauri's own bundler and attaches them to the same release as the classic
@@ -240,4 +240,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release upload "${{ github.ref_name }}" "./P2PEM-Classic_${VERSION}_linux-x64.tar.gz" --repo "${{ github.repository }}" --clobber
+          gh release upload "$GITHUB_REF_NAME" "./P2PEM-Classic_${VERSION}_linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
