@@ -175,20 +175,9 @@ In the TUI, send a file with `:send <path>` and watch progress with `:transfers`
 On first launch the TUI prompts you to set or unlock your identity password.
 After that, press `:` and start typing — an autocomplete menu lists matching
 commands (`Tab` completes, `↑`/`↓` choose). Press `:help` any time for the full
-list and key reference. Common commands:
-
-```text
-:host [port]
-:connect <host[:port]>
-:host-relay <relay[:port]> [token]
-:connect-relay <relay[:port]> <token>
-:contacts                 :contact-add <name> <host:port> [fp]
-:invite                   :import <invite-link>
-:send <path>              :transfers
-:identity                 :settings        :set <key> <value>
-:party-connect <host[:port]> <username>    :party-create-channel <name>
-:disconnect   :rename <title>   :diagnostics   :help   :quit
-```
+list and key reference. The authoritative command reference lives in
+[USER_GUIDE.md](USER_GUIDE.md#tui-reference); this tutorial deliberately does
+not repeat it.
 
 Recommended first TUI session:
 

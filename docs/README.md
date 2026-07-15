@@ -7,35 +7,48 @@ This is the canonical index for project documentation.
 - Project overview: [../README.md](../README.md)
 - Guided first session: [TUTORIAL.md](TUTORIAL.md)
 - User setup and usage: [USER_GUIDE.md](USER_GUIDE.md)
-- Contributor workflow: [../DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md)
+- Contribution process: [../CONTRIBUTING.md](../CONTRIBUTING.md)
+- Technical developer guide: [../DEVELOPER_GUIDE.md](../DEVELOPER_GUIDE.md)
 
 ## Technical Docs
 
-- Architecture: [03_architecture.md](03_architecture.md)
-- Protocol: [04_protocol.md](04_protocol.md)
-- Platform plan & roadmap: [05_platform_spec.md](05_platform_spec.md)
+- Architecture: [architecture.md](architecture.md)
+- Protocol: [protocol.md](protocol.md)
+- Platform plan & roadmap: [platform_spec.md](platform_spec.md)
 - Security posture: [../SECURITY.md](../SECURITY.md)
 - Threat model: [../THREAT_MODEL.md](../THREAT_MODEL.md)
 
 ## Planning and History
 
-- Platform plan, roadmap & backlog: [05_platform_spec.md](05_platform_spec.md)
 - Release history: [../CHANGELOG.md](../CHANGELOG.md)
 - Audit history: [AUDITS.md](AUDITS.md)
-
-`05_platform_spec.md` is the single canonical forward-looking document — vision,
-architecture, trust tiers, the UI rewrite, the roadmap, and the backlog. Docs 03
-and 04 describe only what ships today.
 
 ## What Each Document Owns
 
 - `TUTORIAL.md`: the quickest path from install to a verified chat session
-- `USER_GUIDE.md`: day-to-day usage, commands, storage, troubleshooting
-- `03_architecture.md`: code layout and runtime responsibility boundaries (today)
-- `04_protocol.md`: shipped wire behavior and compatibility notes
-- `05_platform_spec.md`: the single canonical plan — vision, architecture, trust tiers, Party server, the Tauri/React desktop UI (shipped in `desktop/`, replacing egui), the phased roadmap, and the backlog
+- `USER_GUIDE.md`: day-to-day usage, commands, storage, troubleshooting — the user reference
+- `architecture.md`: code layout and runtime responsibility boundaries (today)
+- `protocol.md`: shipped wire behavior and compatibility notes
+- `platform_spec.md`: the single canonical forward-looking plan — vision, architecture, trust tiers, the Party server, the Tauri/React desktop UI, the phased roadmap, and the backlog
 - `SECURITY.md`: current security posture and disclosure guidance
 - `THREAT_MODEL.md`: assumptions, assets, attack surfaces, and limits
+- `CONTRIBUTING.md`: contribution process, local checks, PR checklist
+- `DEVELOPER_GUIDE.md`: toolchain, build/run, code map, release checklist
+- `DESIGN_NOTES.md`: UI/UX principles, brand, and theming constraints
+
+`architecture.md` and `protocol.md` describe only what ships today; `platform_spec.md` owns everything forward-looking.
+
+## Naming
+
+The product name is **Encrypted P2P Messenger**. Several internal identifiers
+predate the current name and are kept for compatibility and continuity:
+
+| Identifier | Where it appears | Meaning |
+|---|---|---|
+| `P2PEM` | Tauri desktop app (`p2pem-desktop`, window title, data dir) | Short product identifier for the new desktop app |
+| `encodeur_rsa_rust` | Client crate/binary name | Historical crate name; the protocol moved to X25519 session establishment long ago (RSA remains for identity signatures only) |
+| `messenger-core` / `messenger-server` | Core and server crate names | Descriptive crate names |
+| `chat-p2p://` | Invite-link URI scheme | Wire-compatible URI scheme; renaming it would break existing invites |
 
 ## Project Meta
 

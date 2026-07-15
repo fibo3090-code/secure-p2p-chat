@@ -5,7 +5,7 @@ This document describes the current codebase structure and the major runtime res
 ## Workspace Layout
 
 The project is a Cargo **workspace** of four crates so the client app, the Party
-server, and the desktop shell can share code (see `docs/05_platform_spec.md`):
+server, and the desktop shell can share code (see `docs/platform_spec.md`):
 
 ```text
 core/             messenger-core   — crypto, wire protocol, identity, transport, shared types,
@@ -242,7 +242,7 @@ desktop/
 
 - a React 19 + Vite app (JSX, plain CSS, `lucide-react` icons — no TypeScript or
   Tailwind) implementing the tab-rail / list / content shell from
-  `docs/05_platform_spec.md` §10; `lib/bridge.js` calls the Tauri commands and
+  `docs/platform_spec.md` §10; `lib/bridge.js` calls the Tauri commands and
   subscribes to the events (falling back to an in-memory mock in a plain browser)
 
 ## Important Runtime Rules

@@ -1,8 +1,24 @@
 # Security
 
-**Last Updated:** July 3, 2026
+**Last Updated:** July 13, 2026
 
 This document describes the current security posture of the project, what protections are implemented today, what risks remain open, and how to report issues responsibly.
+
+The division of labor across security documents:
+
+- this file: posture summary, open risks, supported versions, and disclosure process
+- [THREAT_MODEL.md](THREAT_MODEL.md): assumptions, assets, attack surfaces, and per-surface controls
+- [docs/protocol.md](docs/protocol.md): the cryptographic mechanics of the shipped wire protocol
+- [docs/AUDITS.md](docs/AUDITS.md): audit history and resolved findings
+
+## Supported Versions
+
+Only the latest released version receives security fixes.
+
+| Version | Supported |
+|---|---|
+| Latest release (see [CHANGELOG.md](CHANGELOG.md)) | Yes |
+| Older releases | No — upgrade to the latest release |
 
 ## Security Posture
 
@@ -17,37 +33,13 @@ Reasoning:
 
 ## Implemented Protections
 
-### In transit
+In transit, sessions are established with X25519 ECDH and HKDF-SHA256 (providing forward secrecy), encrypted with AES-256-GCM under transcript-bound AAD, replay-protected by per-session sequence validation, and automatically rekeyed every 100 messages. Identity is a long-term RSA-2048 key used **only for RSA-PSS signatures** (identity proofs and signed invites) — never for encryption. At rest, the identity keystore is encrypted with Argon2 + ChaCha20-Poly1305 and chat history is encrypted, with zeroization applied to sensitive in-memory material where implemented. Full mechanics: [docs/protocol.md](docs/protocol.md).
 
-- AES-256-GCM transport encryption
-- X25519 ECDH for ephemeral session establishment
-- HKDF-SHA256 for session key derivation
-- transcript-bound AAD for encrypted identity proofs and transport packets
-- replay protection using sequence validation
-- transport rekeying
-
-### Identity and storage
-
-- RSA-2048 identity keys
-- RSA-PSS identity proofs in the current runtime
-- password-based identity encryption using Argon2 + ChaCha20-Poly1305
-- encrypted chat history at rest
-- zeroization for sensitive in-memory material where implemented
-
-### Operational hardening
-
-- handshake timeouts
-- rate limiting
-- oversized packet rejection (DoS-hardened framing: bounded length prefix, chunked reads)
-- automatic session-key rotation (rekey every 100 messages)
-- signed v2 invite links
-- self-hosted relay-assisted transport that forwards only already-encrypted session traffic
-- Party file downloads are access-checked server-side (`blob_bytes_for(member, hash)`): content-addressed blobs are deduplicated globally, so the download endpoint enforces that only channel members or DM participants can fetch a given file
-- checked-in CI for format, lint, cross-platform tests, locked build verification, and tagged release packaging
+Operational hardening includes handshake timeouts, rate limiting, DoS-hardened framing (bounded length prefix, chunked reads, oversized-packet rejection), signed invite links, a self-hosted relay mode that forwards only already-encrypted session traffic, and server-side access checks on Party file downloads (`blob_bytes_for`: only channel members or DM participants can fetch a blob). CI enforces formatting, lints, cross-platform tests, and locked build verification.
 
 ### Desktop app (Tauri) attack surface
 
-The new Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
+The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 
 - all cryptography stays in Rust; the React webview only calls `#[tauri::command]`s and never handles key material
 - `tauri.conf.json` sets a restrictive **CSP** (`default-src 'self'`; no external hosts, scripts, or fonts) and disables the global Tauri injection (`withGlobalTauri: false`)
@@ -65,7 +57,7 @@ The new Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surfac
 
 ## Trust Model
 
-The app uses TOFU.
+The app uses TOFU (trust on first use).
 
 Users are responsible for verifying fingerprints on first contact using a separate trusted channel. Without that step, first-contact MITM remains possible.
 
@@ -79,15 +71,11 @@ It does not currently claim:
 - invite revocation or expiry enforcement
 - full protection against a compromised local machine
 
-## Related Documents
-
-- Threat assumptions and attack surfaces: [THREAT_MODEL.md](THREAT_MODEL.md)
-- Protocol details: [docs/04_protocol.md](docs/04_protocol.md)
-- Audit history: [docs/AUDITS.md](docs/AUDITS.md)
-
 ## Responsible Disclosure
 
-Security issues should not be reported in public issues.
+Security issues must **not** be reported in public issues.
+
+Report vulnerabilities privately through [GitHub's private vulnerability reporting](https://github.com/fibo3090-code/secure-p2p-chat/security/advisories/new) for this repository.
 
 Preferred report contents:
 
@@ -97,6 +85,3 @@ Preferred report contents:
 - affected components
 - proof of concept if available
 - mitigation ideas if known
-
-Contact: `security@fibo3090-code.dev`  
-Replace this with the real maintained address if the project adopts one.

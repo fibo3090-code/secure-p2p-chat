@@ -14,7 +14,8 @@ Secure peer-to-peer messaging for desktop, built with Rust. The app provides enc
 - Encrypted local identity and encrypted chat history at rest
 - Large text messages are chunked automatically, plus file transfer, typing indicators, invite links, QR generation, and optional LAN discovery
 - Diagnostics bundle export and on-disk panic/crash logs for support
-- GUI built with `egui`, terminal interface built with `ratatui`, and a Tauri 2 + React desktop app (in `desktop/`) that drives the same core — meant to replace the egui GUI (run from source today; the release still ships the egui binary)
+- GUI built with `egui`, terminal interface built with `ratatui`, and a Tauri 2 + React desktop app (in `desktop/`) that drives the same core — meant to replace the egui GUI over time
+- Five UI themes (Light, Dark, Midnight, Forest, Rose) driven by a shared design-token source (`design/tokens.json`)
 
 ## Current Status
 
@@ -23,7 +24,7 @@ The project is functional and actively maintained, but it is not a “finished p
 - Security posture: medium. See [SECURITY.md](SECURITY.md).
 - Internet connectivity: relay-assisted WAN connectivity is available for self-hosted deployments. Direct TCP is still the default.
 - LAN discovery: optional and privacy-sensitive. Disabled by default.
-- Packaging: Windows, Linux, and macOS release artifacts are published through GitHub Releases.
+- Packaging: Windows, Linux, and macOS release artifacts are published through GitHub Releases. The release pipeline also builds Tauri desktop installers; the egui binary remains the primary shipped artifact while the desktop app matures.
 
 ## Quick Start
 
@@ -51,7 +52,7 @@ cargo run --release -- --tui
 cd desktop && npx tauri dev     # native window + React UI (needs Node + the Tauri prereqs)
 ```
 
-This is the in-development replacement for the egui GUI. It is not yet in the release pipeline, so build it from source for now.
+This is the in-development replacement for the egui GUI. The release pipeline builds its installers alongside the egui artifacts, but the egui GUI remains the primary supported interface for now.
 
 The terminal UI is fully featured and keyboard-driven: press `:` and start typing for an autocomplete command menu, or `:help` for the full command and keybinding reference. Every action — connecting, fingerprint verification, contacts, invites, file transfer, settings — is reachable without leaving the terminal. See [docs/USER_GUIDE.md](docs/USER_GUIDE.md#tui-reference) for the command list.
 
@@ -82,16 +83,18 @@ Start with [docs/README.md](docs/README.md).
 - [docs/TUTORIAL.md](docs/TUTORIAL.md): step-by-step first session tutorial for GUI, TUI, and relay-assisted setup
 - [docs/USER_GUIDE.md](docs/USER_GUIDE.md): installation, usage, GUI/TUI flows, troubleshooting
 - [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md): contributor workflow, build/test/release process
-- [docs/03_architecture.md](docs/03_architecture.md): codebase architecture and runtime responsibilities
-- [docs/04_protocol.md](docs/04_protocol.md): wire protocol and handshake details
+- [docs/architecture.md](docs/architecture.md): codebase architecture and runtime responsibilities
+- [docs/protocol.md](docs/protocol.md): wire protocol and handshake details
 - [SECURITY.md](SECURITY.md): security posture, controls, open risks, disclosure
 - [THREAT_MODEL.md](THREAT_MODEL.md): assumptions, assets, attack surfaces, limitations
-- [docs/05_platform_spec.md](docs/05_platform_spec.md): platform plan, roadmap, and backlog
+- [docs/platform_spec.md](docs/platform_spec.md): platform plan, roadmap, and backlog
 - [docs/AUDITS.md](docs/AUDITS.md): consolidated audit history and findings
+- [DESIGN_NOTES.md](DESIGN_NOTES.md): UI/UX principles, brand, and theming
+- [CHANGELOG.md](CHANGELOG.md): release history
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution process and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards.
 
 ## License
 

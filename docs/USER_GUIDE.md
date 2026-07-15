@@ -368,7 +368,7 @@ Settings & app
 ```
 
 `:set` keys: `download-dir`, `listen-port`, `notifications`, `typing`,
-`auto-accept`, `auto-host`, `mdns`, `theme` (`light|dark|midnight|forest`).
+`auto-accept`, `auto-host`, `mdns`, `theme` (`light|dark|midnight|forest|rose`).
 Booleans accept `on`/`off`. Example: `:set notifications off`.
 
 History is saved automatically (encrypted) on a timer and on exit.
