@@ -54,7 +54,7 @@ shared core (all fixed unless noted; verified against current code):
   `peer_fingerprint`, so the TOFU check trivially matched and silently trusted every
   caller. Fixed: incoming chats start `peer_fingerprint: None`; returning peers are
   recognized by fingerprint across chats/contacts. (See `SECURITY.md` /
-  `docs/protocol.md` TOFU notes; regression tests added.)
+  `protocol.md` TOFU notes; regression tests added.)
 - **Desktop bridge never persisted history.** Unlock loaded history but nothing saved
   it. Fixed with autosave (poll loop + per-mutation + on-close).
 - **Party `DownloadFile` had no access control** — any member could fetch any blob by
