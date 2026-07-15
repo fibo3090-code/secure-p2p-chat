@@ -125,6 +125,28 @@ impl ChatManager {
                 "Successfully verified v2 signed invite"
             );
 
+            // Enforce expiry: the timestamp is covered by the signature, so a
+            // stale or future-dated value cannot be forged without breaking
+            // verification above.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let ts = signed_invite.payload.timestamp;
+            if ts > now + crate::INVITE_TIMESTAMP_SKEW_SECS {
+                tracing::warn!(timestamp = ts, now, "Rejecting invite dated in the future");
+                anyhow::bail!(
+                    "Invite timestamp is in the future - check the sender's clock and ask for a fresh invite"
+                );
+            }
+            if now.saturating_sub(ts) > crate::INVITE_MAX_AGE_SECS {
+                tracing::warn!(timestamp = ts, now, "Rejecting expired invite");
+                anyhow::bail!(
+                    "Invite has expired (older than {} days) - ask the sender for a fresh one",
+                    crate::INVITE_MAX_AGE_SECS / 86_400
+                );
+            }
+
             let payload = &signed_invite.payload;
 
             // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"

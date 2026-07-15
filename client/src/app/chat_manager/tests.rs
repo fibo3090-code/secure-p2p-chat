@@ -384,6 +384,117 @@ fn parse_v2_signed_invite_rejects_tampered_signature() {
     );
 }
 
+/// Re-sign a fresh invite with a rewritten timestamp, keeping the signature
+/// valid, so parse-time expiry is exercised independently of signature checks.
+#[cfg(test)]
+fn resign_invite_with_timestamp(identity: &crate::identity::Identity, timestamp: u64) -> String {
+    use base64::Engine;
+
+    let link = identity.generate_signed_invite_link(None).unwrap();
+    let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .unwrap();
+
+    // Mirror the parser's payload struct so the signature covers bytes with
+    // the same field order it will re-serialize for verification.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Payload {
+        version: u32,
+        timestamp: u64,
+        nonce: String,
+        name: String,
+        address: Option<String>,
+        relay_server: Option<String>,
+        relay_token: Option<String>,
+        fingerprint: String,
+        public_key: String,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SignedInvite {
+        payload: Payload,
+        signature: Vec<u8>,
+    }
+
+    let mut invite: SignedInvite = serde_json::from_slice(&decoded).unwrap();
+    invite.payload.timestamp = timestamp;
+
+    let payload_json = serde_json::to_string(&invite.payload).unwrap();
+    invite.signature = crate::core::crypto::rsa_sign_pss(
+        &identity.private_key().unwrap(),
+        payload_json.as_bytes(),
+    )
+    .unwrap();
+
+    let re_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_string(&invite).unwrap());
+    format!("chat-p2p://invite/v2/{}", re_encoded)
+}
+
+#[test]
+fn parse_signed_invite_rejects_expired_timestamp() {
+    use crate::identity::Identity;
+
+    let mgr = ChatManager::default();
+    let identity = Identity::new_with_plaintext("Expiry Test".to_string()).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expired = now - crate::INVITE_MAX_AGE_SECS - 60;
+    let link = resign_invite_with_timestamp(&identity, expired);
+
+    let err = mgr
+        .parse_invite_link(&link)
+        .expect_err("expired invite must be rejected");
+    assert!(
+        err.to_string().contains("expired"),
+        "error should mention expiry, got: {err}"
+    );
+}
+
+#[test]
+fn parse_signed_invite_rejects_future_timestamp() {
+    use crate::identity::Identity;
+
+    let mgr = ChatManager::default();
+    let identity = Identity::new_with_plaintext("Skew Test".to_string()).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let future = now + crate::INVITE_TIMESTAMP_SKEW_SECS + 60;
+    let link = resign_invite_with_timestamp(&identity, future);
+
+    let err = mgr
+        .parse_invite_link(&link)
+        .expect_err("future-dated invite must be rejected");
+    assert!(
+        err.to_string().contains("future"),
+        "error should mention future timestamp, got: {err}"
+    );
+}
+
+#[test]
+fn parse_signed_invite_accepts_recent_timestamp_within_window() {
+    use crate::identity::Identity;
+
+    let mgr = ChatManager::default();
+    let identity = Identity::new_with_plaintext("Fresh Test".to_string()).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // A week old: well inside the 30-day window.
+    let link = resign_invite_with_timestamp(&identity, now - 7 * 86_400);
+
+    mgr.parse_invite_link(&link)
+        .expect("invite inside the expiry window must still parse");
+}
+
 #[test]
 fn parse_v1_invite_link_still_works_with_warning() {
     let mgr = ChatManager::default();

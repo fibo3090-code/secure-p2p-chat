@@ -51,7 +51,10 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 - No STUN/TURN or peer-to-peer hole punching; WAN support currently relies on a self-hosted relay
 - LAN discovery exposes metadata tradeoffs when enabled
 - The runtime keeps a signature-scheme field on the wire, but currently only supports RSA-PSS identity proofs
-- Invite timestamps are informational and not enforced for expiry
+- Signed invites expire 30 days after issuance (the signature covers the
+  timestamp); legacy v1 unsigned invites carry no timestamp and are not
+  subject to expiry
+- Invite revocation (before expiry) is not supported
 - `rsa` still carries an unresolved upstream timing-sidechannel advisory (`RUSTSEC-2023-0071`)
 - `bincode` remains a tracked dependency migration concern
 
@@ -68,7 +71,7 @@ It does not currently claim:
 - anonymity against traffic analysis
 - managed relay infrastructure or anonymous global connectivity
 - Ed25519 identity-key support in the shipped runtime
-- invite revocation or expiry enforcement
+- invite revocation before the 30-day expiry
 - full protection against a compromised local machine
 
 ## Responsible Disclosure
