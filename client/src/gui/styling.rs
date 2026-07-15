@@ -210,7 +210,7 @@ pub fn apply_custom_visuals(theme: &crate::types::Theme) -> Visuals {
 #[cfg(test)]
 mod token_drift_tests {
     //! Guards against `design/tokens.json` (the canonical token source, see
-    //! docs/05_platform_spec.md "Visual language") drifting from what egui
+    //! docs/platform_spec.md "Visual language") drifting from what egui
     //! actually renders. There's no build-time codegen tying the two
     //! together, so this test is the drift check: if someone edits one and
     //! not the other, this fails instead of the mismatch going unnoticed.

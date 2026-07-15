@@ -1,16 +1,8 @@
 # Contributing
 
-This repository is intentionally documented in layers. Before changing code, read the doc that matches the kind of change you are making instead of guessing from stale comments.
+Thank you for contributing. This document covers the contribution process: branching, commits, local checks, and pull requests. For the technical side — toolchain, build and run commands, code map, and the release process — see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
 
-## Read First
-
-- `README.md`: project overview, quick start, current feature set.
-- `docs/README.md`: canonical documentation index.
-- `docs/USER_GUIDE.md`: user-facing behavior and troubleshooting.
-- `docs/03_architecture.md`: current module boundaries and state flow.
-- `docs/04_protocol.md`: current wire protocol and handshake behavior.
-- `SECURITY.md`: shipped protections, limits, and disclosure policy.
-- `docs/05_platform_spec.md`: platform plan, roadmap, and backlog.
+Before changing code, read the doc that matches the kind of change you are making; the canonical index is [docs/README.md](docs/README.md).
 
 ## Contribution Rules
 
@@ -41,6 +33,8 @@ Use the GitHub issue forms for bug reports and feature requests so reports inclu
 
 Check the docs first so the report is based on current behavior, not an outdated assumption.
 
+Security issues must **not** be reported in public issues — see the [responsible disclosure process](SECURITY.md#responsible-disclosure) instead.
+
 ## Pull Request Checklist
 
 - [ ] Scope is focused and reviewable.
@@ -56,16 +50,9 @@ Check the docs first so the report is based on current behavior, not an outdated
 
 - Do not duplicate large explanations across multiple files.
 - Prefer updating the canonical doc and linking to it.
-- If protocol behavior changes, update `docs/04_protocol.md`.
-- If architecture or module ownership changes, update `docs/03_architecture.md`.
+- If protocol behavior changes, update `docs/protocol.md`.
+- If architecture or module ownership changes, update `docs/architecture.md`.
 - If security guarantees or limits change, update `SECURITY.md` and `THREAT_MODEL.md`.
 - If UX changes materially, update `docs/USER_GUIDE.md` or `DESIGN_NOTES.md`.
 
-## Release Notes
-
-For releases:
-
-1. Move relevant `CHANGELOG.md` entries out of `Unreleased`.
-2. Bump the version in `Cargo.toml`.
-3. Re-run quality checks.
-4. Verify packaging scripts if release artifacts are being produced.
+Releases are cut by maintainers; the release checklist lives in [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#release-checklist).

@@ -1,18 +1,6 @@
 # Developer Guide
 
-This document is the contributor-facing guide for building, testing, changing, and releasing the project. It intentionally avoids duplicating full architecture and protocol detail; those live in the dedicated docs under [docs/README.md](docs/README.md).
-
-## Documentation Structure
-
-- Product overview: [README.md](README.md)
-- Guided onboarding: [docs/TUTORIAL.md](docs/TUTORIAL.md)
-- User workflows: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
-- Architecture: [docs/03_architecture.md](docs/03_architecture.md)
-- Protocol: [docs/04_protocol.md](docs/04_protocol.md)
-- Security posture: [SECURITY.md](SECURITY.md)
-- Threat assumptions: [THREAT_MODEL.md](THREAT_MODEL.md)
-- Plan, roadmap & backlog: [docs/05_platform_spec.md](docs/05_platform_spec.md)
-- Audit history: [docs/AUDITS.md](docs/AUDITS.md)
+This document is the technical guide for building, testing, changing, and releasing the project. The contribution process (branching, commits, PR checklist) lives in [CONTRIBUTING.md](CONTRIBUTING.md); full architecture and protocol detail live in the dedicated docs indexed at [docs/README.md](docs/README.md).
 
 ## Toolchain
 
@@ -28,6 +16,12 @@ This document is the contributor-facing guide for building, testing, changing, a
   - Core (crypto/protocol/network/identity): `core/src/`
   - Party server: `server/src/main.rs`
   - Tauri desktop bridge: `desktop/src-tauri/src/lib.rs`; React UI: `desktop/src/`
+
+> On crate naming: the client crate keeps its historical name `encodeur_rsa_rust`
+> for continuity, even though the protocol has long since moved to X25519-based
+> session establishment (RSA remains for identity signatures only). The product
+> name is **Encrypted P2P Messenger**; the Tauri desktop app uses the short
+> identifier **P2PEM**. See [docs/README.md](docs/README.md#naming) for the full map.
 
 ## Build and Run
 
@@ -61,69 +55,40 @@ cargo run --release -- --tui --host --port 9000
 cargo run --release -- --tui --connect 127.0.0.1:12345
 ```
 
-## Quality Gates
+## Quality Gates and CI
 
-Run these before opening a PR:
+The pre-PR check commands and the full PR checklist are in
+[CONTRIBUTING.md](CONTRIBUTING.md#local-workflow). Run the whole suite with
+`cargo nextest run --workspace` (or `cargo test --workspace`). The
+`p2pem-desktop` crate is not exercised by the test suite and cannot be driven
+headlessly, so it is verified by `cargo check -p p2pem-desktop` +
+`npm run build` only.
 
-```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace              # or: cargo test --workspace
-cargo check -p p2pem-desktop               # the desktop crate has no tests
-cd desktop && npm run build                # verify the React frontend builds
-```
-
-The workspace test suite is currently **301 tests**. The `p2pem-desktop` crate is
-not exercised by the test suite and cannot be driven headlessly here, so it is
-verified by `cargo check` + `npm run build` only.
-
-The repository also includes CI in `.github/workflows/ci.yml` for:
-
-- formatting
-- clippy
-- tests on Ubuntu, Windows, and macOS
-- locked Linux build verification
-
-The tag-based release workflow in `.github/workflows/release.yml` builds and publishes:
-
-- Windows installer
-- Linux tarball
-- macOS Intel DMG
-- macOS Apple Silicon DMG
+CI (`.github/workflows/ci.yml`) enforces formatting, clippy with warnings
+denied, tests on Ubuntu/Windows/macOS, and a locked Linux build verification.
+The tag-based release workflow (`.github/workflows/release.yml`) builds and
+publishes the Windows installer, Linux tarball, macOS Intel and Apple Silicon
+DMGs, and the Tauri desktop installers.
 
 ## Code Map
 
-### Core areas
+The canonical module map and directory tree live in
+[docs/architecture.md](docs/architecture.md). The short version:
 
-- `core/src/core/`
-  - `crypto.rs`: AEAD, RSA, X25519, HKDF, fingerprints
-  - `protocol.rs`: protocol message encoding/decoding (incl. `TextChunk`, `Rekey`)
-  - `framing.rs`: length-prefixed packet framing (DoS-hardened `recv_packet`)
-- `core/src/network/`
-  - `session.rs`: handshake, encrypted transport, replay protection, key rotation
-  - `discovery.rs`: optional mDNS registration and discovery
-  - `relay.rs`: self-hosted rendezvous / packet relay mode
-- `core/src/identity/mod.rs`: identity creation, password-based encryption, invite generation
-- `core/src/party/mod.rs`: the Party application protocol shared by client + server
-- `core/src/transfer/receiver.rs`: file receive path
-- `client/src/app/`
-  - `chat_manager/`: application state, routing, chat/contact/session operations —
-    split by concern (`mod.rs` state + accessors, `connect.rs`, `contacts.rs`,
-    `events.rs`, `files.rs`, `invites.rs`, `text.rs`, `tests.rs`)
-  - `party_manager.rs`: client-side Party state and operations
-  - `persistence.rs`: encrypted history load/save, migration compatibility
-- `client/src/gui/`: egui application, dialogs, help, styling, Party window
-- `client/src/tui/`: ratatui application and command-mode workflow
-- `server/src/`: the Party server (accept loop, `PartyState`, dispatcher, hub, identity)
-- `desktop/src-tauri/src/lib.rs`: the Tauri command/event bridge
-- `desktop/src/`: the React/Vite web UI
+- `core/` — crypto, protocol, framing, network session, discovery, relay,
+  identity, Party protocol, file transfer. UI-agnostic.
+- `client/` — `ChatManager` (application state, split by concern under
+  `client/src/app/chat_manager/`), persistence, the egui GUI, and the ratatui TUI.
+- `server/` — the Party server (accept loop, `PartyState`, dispatcher, hub).
+- `desktop/` — the Tauri command/event bridge (`src-tauri/`) and the React/Vite
+  web UI (`src/`).
 
 ### Important runtime invariants
 
 - `ChatManager` is the application source of truth.
 - Identity keys must remain encrypted on disk.
 - Transport sequence numbers are monotonic per active session/chat mapping.
-- Signed invite generation uses RSA-PSS over the application’s serialized payload bytes.
+- Signed invite generation uses RSA-PSS over the application's serialized payload bytes.
 - The runtime currently supports RSA-PSS identity proofs only, even though the wire format keeps a `SignatureScheme` field.
 
 ## Security-Sensitive Areas
@@ -146,32 +111,19 @@ When touching these:
 - never reintroduce plaintext identity persistence
 - update protocol/security docs in the same change
 
-## Documentation Maintenance Rules
-
-When behavior changes:
-
-- update `README.md` if user expectations change
-- update `docs/USER_GUIDE.md` if usage, commands, or troubleshooting changes
-- update `docs/03_architecture.md` if responsibilities or major flows change
-- update `docs/04_protocol.md` if wire/runtime behavior changes
-- update `SECURITY.md` and `THREAT_MODEL.md` if security claims or assumptions change
-- update `CHANGELOG.md` for any user-visible, protocol, or security-relevant change
-
-Avoid adding new top-level docs when an existing canonical document already owns the subject.
-
 ## Release Checklist
 
 1. Run format, clippy, and tests.
 2. Update docs affected by the change.
-3. Update [CHANGELOG.md](CHANGELOG.md) with the release notes.
-4. Bump version in `Cargo.toml` when cutting a release.
+3. Move relevant `CHANGELOG.md` entries out of `Unreleased` into the new version section.
+4. Bump the version in `Cargo.toml`.
 5. Update packaging artifacts if installer behavior or branding changed.
 6. Push `main`, then push the release tag so `.github/workflows/release.yml` publishes the assets.
 
 ## Notes for Security and Protocol Work
 
 - Identity proofs and transport packets are authenticated with transcript-bound AAD.
-- The session key rotates automatically every 100 messages via a `Rekey` message (16-byte HKDF salt); both sides re-derive and the frame is not surfaced to the app. See `docs/04_protocol.md`.
+- The session key rotates automatically every 100 messages via a `Rekey` message (16-byte HKDF salt); both sides re-derive and the frame is not surfaced to the app. See `docs/protocol.md`.
 - Text over 48 KiB is chunked into `TextChunk` frames (hard cap 64 KiB); file chunks are 64 KiB. Both share the per-session replay `seq` namespace.
-- Legacy invite format is still accepted for compatibility; the UI emits signed v2 invites.
+- Legacy invite format is still accepted for compatibility; the UI emits signed invites (v2 URL format carrying a v3 payload — see `docs/protocol.md`).
 - LAN discovery is optional and disabled by default because of privacy tradeoffs.

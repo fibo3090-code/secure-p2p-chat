@@ -6,7 +6,7 @@
 //! messages carry the Party-level application semantics (join, directory, channel
 //! messaging, offline catch-up).
 //!
-//! Two trust tiers share one data model (see `docs/05_platform_spec.md`):
+//! Two trust tiers share one data model (see `docs/platform_spec.md`):
 //! - **Administered** (default): the server stores plaintext payloads.
 //! - **E2EE** (Phase 4): payloads are ciphertext; the server never sees plaintext.
 //!

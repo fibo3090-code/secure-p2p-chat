@@ -19,6 +19,14 @@ HANDSHAKE_TIMEOUT_SECS: 15
 MAX_FILE_SIZE: 10 GiB
 ```
 
+Party server input caps (`server/src/state.rs`), enforced server-side:
+
+```rust
+MAX_USERNAME_CHARS: 32
+MAX_CHANNEL_NAME_CHARS: 64
+MAX_MESSAGE_TEXT_BYTES: 64 KiB   // channel and DM text
+```
+
 ## Cryptographic Summary
 
 - Session establishment: X25519 ECDH
@@ -164,7 +172,7 @@ Properties:
 - still accepted for compatibility
 - should not be emitted by current UI flows
 
-### Signed v2
+### Signed v2/v3
 
 Format:
 
@@ -172,17 +180,24 @@ Format:
 chat-p2p://invite/v2/<url_safe_base64_json>
 ```
 
+The URL prefix is `v2` for all signed invites. The **payload** carries its own
+`version` field: `2` for a direct invite, `3` when the invite embeds a relay
+route (`relay_server`/`relay_token` present). References to "v3 invites"
+elsewhere in the docs mean this payload version — the URL format is unchanged,
+so v2-era parsers reject v3 payload fields gracefully rather than failing on
+an unknown URL prefix.
+
 Payload fields:
 
-- `version`
+- `version` (`2` direct, `3` relay-routed)
 - `timestamp`
 - `nonce`
 - `name`
 - `address`
 - `fingerprint`
 - `public_key`
-- `relay_server` (optional)
-- `relay_token` (optional)
+- `relay_server` (optional, payload v3)
+- `relay_token` (optional, payload v3)
 
 Wrapper fields:
 

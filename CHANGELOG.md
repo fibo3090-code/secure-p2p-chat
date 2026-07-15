@@ -2,10 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Versions with a published tag link to a GitHub comparison; earlier versions
+predate tagged releases.
+
 ## [Unreleased]
+
+### Added
+
+- **New logo and brand identity.** A speech-bubble + linked-dots mark in a
+  teal-to-indigo gradient replaces the RSA-era icon everywhere: the Tauri
+  desktop icon trees (Windows/macOS/iOS/Android), the installer icon
+  (`encodeur_rsa_icon.ico` renamed to `app-icon.ico`), the egui window icon
+  (new — the window previously had no icon), the web favicon, and the GitHub
+  social preview. macOS app bundles now declare `CFBundleIconFile` and ship a
+  proper `.icns` (previously an inert `.ico` copy).
+- **Rose theme.** A fifth theme joins Light/Dark/Midnight/Forest in the egui
+  theme picker and the TUI (`:set theme rose`).
+- **Canonical design tokens.** `design/tokens.json` is the source of record
+  for brand and theme colors; a test asserts the egui palette matches it, so
+  the token file and the UI can no longer drift apart silently.
 
 ### Changed
 
+- **Documentation restructured.** The numbered docs are renamed
+  (`docs/03_architecture.md` → `docs/architecture.md`, `docs/04_protocol.md` →
+  `docs/protocol.md`, `docs/05_platform_spec.md` → `docs/platform_spec.md`);
+  the superseded UI-redesign spec under `docs/superpowers/` is deleted (its
+  content lives in `docs/platform_spec.md` §10). CONTRIBUTING.md now owns the
+  contribution process and DEVELOPER_GUIDE.md the technical guide, without
+  duplicating each other. SECURITY.md gains a Supported Versions table and
+  points to GitHub private vulnerability reporting instead of a placeholder
+  address. `docs/README.md` documents the product-naming map
+  (Encrypted P2P Messenger / P2PEM / legacy `encodeur_rsa_rust`).
+- **Accent colors converged across the three UIs.** egui's Dark and Light
+  themes previously used two different blues by accident; both now use the
+  brand accent, and Midnight/Forest were realigned to the desktop app's exact
+  hues. The TUI's theme-neutral chrome (active-pane borders, key hints) uses
+  the brand accent instead of terminal cyan; its semantic colors are untouched.
 - **`ChatManager` split into focused modules.** The 3,200-line
   `client/src/app/chat_manager.rs` is now `client/src/app/chat_manager/` with
   one file per concern — `connect` (sessions), `contacts`, `events`
@@ -676,7 +711,7 @@ This release transformed the application from a functional prototype into a poli
 - Consolidated and improved documentation.
 - Fixed various borrow checker issues and warnings.
 
-## [0.9.0] - Previous Version
+## [0.9.0] - Initial version (undated, pre-tagging)
 
 - Basic chat functionality.
 - End-to-end encryption (RSA + AES-GCM).
@@ -684,23 +719,9 @@ This release transformed the application from a functional prototype into a poli
 - Simple GUI interface.
 - Message history persistence.
 
-[Unreleased]: #
-[1.11.1]: #
-[1.11.0]: #
-[1.10.1]: #
-[1.10.0]: #
-[1.9.0]: #
-[1.7.3]: #
-[1.7.2]: #
-[1.7.1]: #
-[1.7.0]: #
-[1.6.0]: #
-[1.5.0]: #
-[1.4.0]: #
-[1.3.1]: #
-[1.3.0]: #
-[1.2.0]: #
-[1.1.0]: #
-[1.0.2]: #
-[1.0.0]: #
-[0.9.0]: #
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.1...HEAD
+[1.12.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.0...v1.12.1
+[1.12.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.11.1...v1.12.0
+[1.11.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.11.0...v1.11.1
+[1.11.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.9.0...v1.11.0
+[1.9.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.8.1...v1.9.0

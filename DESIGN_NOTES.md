@@ -24,11 +24,33 @@ This document records the current UI/UX principles for the app and the main desi
 - Password setup/unlock remains blocking by design.
 - LAN discovery must not be presented as harmless or always-on.
 
+## Brand and Theming
+
+- The brand mark is a speech bubble carrying a two-node link glyph, in a
+  teal-to-indigo gradient ("control teal-indigo", `#2dd4bf` → `#4f46e5`).
+  The master source is `desktop/src-tauri/app-icon.svg`; every derived asset
+  (icon trees, installer `.ico`, favicon, social preview) is regenerated from it.
+- **`design/tokens.json` is the canonical source of record for colors**: the
+  brand gradient, the flat UI accent, the five theme palettes (Light, Dark,
+  Midnight, Forest, Rose), and the semantic colors (success/warning/error).
+- Dark and Light carry the brand accent; Midnight, Forest, and Rose keep their
+  own accent hues deliberately — they are alternate theme personalities, not
+  brand-compliance failures.
+- There is no cross-language token pipeline. The desktop app consumes the
+  values as CSS custom properties (`desktop/src/app-system.css`,
+  `desktop/src/themes.css`), egui as `Color32` constants
+  (`client/src/gui/styling.rs`), and the TUI uses the flat accent only for
+  theme-neutral chrome. A test (`token_drift_tests` in
+  `client/src/gui/styling.rs`) asserts egui matches `design/tokens.json`, so
+  drift fails CI instead of going unnoticed.
+- When changing brand colors: update `design/tokens.json` first, then each
+  consumer, then the drift test will confirm egui agrees.
+
 ## Frontends
 
 There are three: the **egui** desktop GUI, the **ratatui** TUI, and the newer
 **Tauri + React desktop app** (`desktop/`), which realizes the designed tab-rail /
-list / content shell described in `docs/05_platform_spec.md` §10 and is meant to
+list / content shell described in `docs/platform_spec.md` §10 and is meant to
 replace egui. All three drive the same `ChatManager`, so behavior stays consistent;
 the design intent (one mental model, Party as a tab rather than a floating window,
 overlays only for interruptive flows) is expressed most fully in the desktop app.

@@ -1,4 +1,4 @@
-# Hybrid Messenger — Platform Plan & Roadmap
+# Encrypted P2P Messenger — Platform Plan & Roadmap
 
 This is the **single canonical forward-looking document** for the project. It owns
 the product vision, architecture, trust model, the planned UI rewrite, the phased
@@ -7,11 +7,11 @@ roadmap, and the backlog. It supersedes and absorbs the former separate plan doc
 
 Scope boundaries:
 
-- [03_architecture.md](03_architecture.md) describes the code as it is **today**.
-- [04_protocol.md](04_protocol.md) describes the **shipped wire behavior** only.
+- [architecture.md](architecture.md) describes the code as it is **today**.
+- [protocol.md](protocol.md) describes the **shipped wire behavior** only.
 - **This document** owns everything *forward-looking*: where the product is going
-  and how. When a planned item ships, move its description into 03/04 and trim it
-  here.
+  and how. When a planned item ships, move its description into `architecture.md`
+  or `protocol.md` and trim it here.
 
 ---
 
@@ -555,7 +555,7 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
 ## 12. Backlog
 
 Near-term items not tied to a numbered phase. (When one becomes real behavior,
-update the canonical doc — 03/04 — in the same change.)
+update the canonical doc — `architecture.md`/`protocol.md` — in the same change.)
 
 **Productization**
 
@@ -640,8 +640,8 @@ The one area not deeply automated is GUI pixel rendering; the logic behind it
 
 ## 14. Status
 
-Phase 0 (workspace) and the Phase 1 Party server core are complete; the suite is
-green at 301 tests. The **Tauri + React desktop app** (§10) has shipped its P2P,
+Phase 0 (workspace) and the Phase 1 Party server core are complete; the workspace
+test suite is green. The **Tauri + React desktop app** (§10) has shipped its P2P,
 Party, Relay, Contacts, and Settings surfaces (phases A–D) as the `desktop/` crate,
 closing most of the Phase 1 UI-polish items; retiring egui and rebuilding packaging
 (phases E–F) remain. The Independent P2P hardening (connection passwords +

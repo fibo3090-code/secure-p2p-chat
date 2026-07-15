@@ -80,7 +80,7 @@ RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
 - **Automatic key rotation (rekey)**: post-handshake, the message loop in `session.rs` rotates the session key every `REKEY_MESSAGE_COUNT` (100) messages by sending a `ProtocolMessage::Rekey` carrying a 16-byte `REKEY_NONCE_SIZE` HKDF salt; both sides re-derive and the `Rekey` frame is *not* surfaced to the app. It shares the per-session `seq` namespace (replay protection covers it). Covered by `client/tests/key_rotation_tests.rs`.
 - **Text is chunked like files**: messages over `TEXT_CHUNK_BYTES` (48 KiB) are split into `ProtocolMessage::TextChunk` frames and reassembled; a single message is hard-capped at `MAX_TEXT_MESSAGE_BYTES` (64 KiB) and rejected past it (`protocol.rs`).
 
-Authoritative docs: `docs/README.md`, `docs/03_architecture.md`, `docs/04_protocol.md`, `SECURITY.md`. UI-redesign roadmap: `docs/superpowers/specs/2026-06-03-ui-redesign-tauri-design.md`.
+Authoritative docs: `docs/README.md`, `docs/architecture.md`, `docs/protocol.md`, `SECURITY.md`. Forward-looking plan (incl. the UI redesign): `docs/platform_spec.md` §10.
 
 ## Tauri Bridge (`desktop/src-tauri/src/lib.rs`)
 
