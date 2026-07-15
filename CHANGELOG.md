@@ -26,6 +26,14 @@ predate tagged releases.
 
 ### Changed
 
+- **Release assets renamed to one consistent scheme.** The classic egui
+  artifacts drop the mixed `Messenger-Setup-v*` / `messenger-*` naming for
+  `P2PEM-Classic_<version>_<platform>-<arch>.<ext>` (e.g.
+  `P2PEM-Classic_1.13.0_x64-setup.exe`, `P2PEM-Classic_1.13.0_macos-aarch64.dmg`,
+  `P2PEM-Classic_1.13.0_linux-x64.tar.gz`), matching the Tauri app's
+  `P2PEM_<version>_*` convention on the same release page. The versionless
+  `P2PEM_*.app.tar.gz` archives are no longer published (the `.dmg` covers
+  macOS; the bare `.app` target is excluded from the bundle list).
 - **Documentation restructured.** The numbered docs are renamed
   (`docs/03_architecture.md` → `docs/architecture.md`, `docs/04_protocol.md` →
   `docs/protocol.md`, `docs/05_platform_spec.md` → `docs/platform_spec.md`);

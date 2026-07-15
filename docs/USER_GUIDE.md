@@ -10,10 +10,21 @@ If you want the fastest onboarding path instead of the full reference, start wit
 
 Download the latest platform asset from the [GitHub Releases](https://github.com/fibo3090-code/secure-p2p-chat/releases) page.
 
-- Windows: `Messenger-Setup-v*.exe`
-- macOS Intel: `messenger-x86_64-apple-darwin.dmg`
-- macOS Apple Silicon: `messenger-aarch64-apple-darwin.dmg`
-- Linux: `messenger-linux-v*.tar.gz`
+Classic egui app:
+
+- Windows: `P2PEM-Classic_<version>_x64-setup.exe`
+- macOS Intel: `P2PEM-Classic_<version>_macos-x64.dmg`
+- macOS Apple Silicon: `P2PEM-Classic_<version>_macos-aarch64.dmg`
+- Linux: `P2PEM-Classic_<version>_linux-x64.tar.gz`
+
+New Tauri desktop app (P2PEM):
+
+- Windows: `P2PEM_<version>_x64-setup.exe` (NSIS) or `P2PEM_<version>_x64_en-US.msi`
+- macOS: `P2PEM_<version>_aarch64.dmg` or `P2PEM_<version>_x64.dmg`
+- Linux: `P2PEM_<version>_amd64.deb`, `P2PEM_<version>_amd64.AppImage`, or `P2PEM-<version>-1.x86_64.rpm`
+
+Releases older than 1.13 used different asset names (`Messenger-Setup-v*.exe`,
+`messenger-*.dmg`, `messenger-linux-v*.tar.gz`) for the classic app.
 
 ### Build from source
 
