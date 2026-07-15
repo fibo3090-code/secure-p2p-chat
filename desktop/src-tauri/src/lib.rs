@@ -17,8 +17,8 @@ use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use encodeur_rsa_rust::app::party_manager::{PartyManager, PartyStatus};
-use encodeur_rsa_rust::app::ChatManager;
+use p2pem_classic::app::party_manager::{PartyManager, PartyStatus};
+use p2pem_classic::app::ChatManager;
 
 /// Shared application state managed by Tauri.
 struct Bridge {
@@ -118,9 +118,7 @@ pub fn run() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,encodeur_rsa_rust=debug,messenger_core=debug",
-                )
+                tracing_subscriber::EnvFilter::new("info,p2pem_classic=debug,messenger_core=debug")
             }),
         )
         .try_init();

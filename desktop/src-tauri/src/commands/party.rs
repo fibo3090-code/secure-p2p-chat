@@ -67,7 +67,7 @@ fn party_status_parts(status: &PartyStatus) -> (&'static str, Option<String>) {
 /// Serialize one connection's directory (channels + members), resolving "you".
 fn server_dto(
     id: Uuid,
-    conn: &encodeur_rsa_rust::app::party_manager::PartyServerConn,
+    conn: &p2pem_classic::app::party_manager::PartyServerConn,
 ) -> PartyServerDto {
     let (status, status_detail) = party_status_parts(&conn.status);
     let members = conn
@@ -115,7 +115,7 @@ fn server_dto(
 /// from the member directory and flagging the local user's own messages.
 fn message_dto(
     env: &messenger_core::party::Envelope,
-    conn: &encodeur_rsa_rust::app::party_manager::PartyServerConn,
+    conn: &p2pem_classic::app::party_manager::PartyServerConn,
 ) -> PartyMessageDto {
     use messenger_core::party::MessagePayload;
     let sender_name = conn

@@ -1,5 +1,5 @@
-use encodeur_rsa_rust::app::chat_manager::ChatManager;
-use encodeur_rsa_rust::types::{Config, Theme};
+use p2pem_classic::app::chat_manager::ChatManager;
+use p2pem_classic::types::{Config, Theme};
 use rand::RngCore;
 use tempfile::NamedTempFile;
 use uuid::Uuid;

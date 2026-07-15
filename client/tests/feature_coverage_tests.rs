@@ -3,8 +3,8 @@
 //! lifecycle, incoming file-transfer state, typing indicators without a session,
 //! contact import/association, and invite QR generation.
 
-use encodeur_rsa_rust::app::chat_manager::ChatManager;
-use encodeur_rsa_rust::types::{Config, Contact, ToastLevel, TransferStatus, TrustState};
+use p2pem_classic::app::chat_manager::ChatManager;
+use p2pem_classic::types::{Config, Contact, ToastLevel, TransferStatus, TrustState};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -132,7 +132,7 @@ fn start_receiving_oversized_file_is_rejected() {
     let mut mgr = ChatManager::default();
     let chat = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat, "Files".to_string());
-    let too_big = encodeur_rsa_rust::MAX_FILE_SIZE + 1;
+    let too_big = p2pem_classic::MAX_FILE_SIZE + 1;
     assert!(mgr.start_receiving_file(chat, "huge.bin", too_big).is_err());
 }
 

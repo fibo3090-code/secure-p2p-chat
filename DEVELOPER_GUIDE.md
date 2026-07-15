@@ -7,7 +7,7 @@ This document is the technical guide for building, testing, changing, and releas
 - Rust: `1.86+`
 - Edition: `2021`
 - The repo is a Cargo **workspace** of four crates: `core/` (`messenger-core`),
-  `client/` (`encodeur_rsa_rust`), `server/` (`messenger-server`), and
+  `client/` (`p2pem-classic`), `server/` (`messenger-server`), and
   `desktop/src-tauri/` (`p2pem-desktop`). Bare `cargo` commands target the client.
 - Main entry points:
   - GUI/TUI launcher: `client/src/main.rs`
@@ -17,11 +17,12 @@ This document is the technical guide for building, testing, changing, and releas
   - Party server: `server/src/main.rs`
   - Tauri desktop bridge: `desktop/src-tauri/src/lib.rs`; React UI: `desktop/src/`
 
-> On crate naming: the client crate keeps its historical name `encodeur_rsa_rust`
-> for continuity, even though the protocol has long since moved to X25519-based
-> session establishment (RSA remains for identity signatures only). The product
-> name is **Encrypted P2P Messenger**; the Tauri desktop app uses the short
-> identifier **P2PEM**. See [docs/README.md](docs/README.md#naming) for the full map.
+> On crate naming: the client crate is `p2pem-classic` (renamed from the
+> historical `encodeur_rsa_rust`, an RSA-era name; the protocol has long since
+> moved to X25519-based session establishment, with RSA kept for identity
+> signatures only). The product name is **Encrypted P2P Messenger**; the Tauri
+> desktop app uses the short identifier **P2PEM**, and the egui/TUI app ships as
+> **P2PEM-Classic**. See [docs/README.md](docs/README.md#naming) for the full map.
 
 ## Build and Run
 

@@ -3,9 +3,9 @@
 #[cfg(test)]
 mod diagnostics {
     use base64::Engine;
-    use encodeur_rsa_rust::app::chat_manager::ChatManager;
-    use encodeur_rsa_rust::types::Config;
-    use encodeur_rsa_rust::util::sanitize_filename;
+    use p2pem_classic::app::chat_manager::ChatManager;
+    use p2pem_classic::types::Config;
+    use p2pem_classic::util::sanitize_filename;
 
     use uuid::Uuid;
 
@@ -31,7 +31,7 @@ mod diagnostics {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         manager.add_session_for_test(
             chat_id,
-            encodeur_rsa_rust::app::chat_manager::SessionHandle { from_app_tx: tx },
+            p2pem_classic::app::chat_manager::SessionHandle { from_app_tx: tx },
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -48,7 +48,7 @@ mod diagnostics {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         manager.add_session_for_test(
             chat_id,
-            encodeur_rsa_rust::app::chat_manager::SessionHandle { from_app_tx: tx },
+            p2pem_classic::app::chat_manager::SessionHandle { from_app_tx: tx },
         );
 
         let missing_path = std::env::temp_dir().join(format!("missing-{}.txt", Uuid::new_v4()));

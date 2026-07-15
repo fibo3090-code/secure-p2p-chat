@@ -58,7 +58,7 @@ try {
     Write-Host "Target:        $Target"
 
     # Nom du binaire produit par cargo (adapté à ton projet)
-    $BinaryName = "encodeur_rsa_rust.exe"
+    $BinaryName = "p2pem-classic.exe"
     $BinaryBase = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
 
     # 1) Build release

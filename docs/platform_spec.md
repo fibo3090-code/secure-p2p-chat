@@ -96,11 +96,11 @@ landed as React rather than the originally-planned SolidJS (see §10).
 
 ### Crate layout — Cargo workspace (done, four crates)
 
-Four crates: `core` (`messenger-core`), `client` (`encodeur_rsa_rust`, the
+Four crates: `core` (`messenger-core`), `client` (`p2pem-classic`, the
 unified app + binary), `server` (`messenger-server`), and `p2pem-desktop`
 (`desktop/src-tauri`, the Tauri shell). The client re-exports core via
 `pub use messenger_core::*`; the desktop crate depends on `client` for the
-managers. The client binary kept the `encodeur_rsa_rust` name so packaging paths
+managers. The client crate is `p2pem-classic` (renamed from `encodeur_rsa_rust`) and packaging paths
 are unchanged. Bare `cargo` commands still target the client.
 
 ---
@@ -147,7 +147,7 @@ desktop/src-tauri the Tauri 2 shell (p2pem-desktop): #[tauri::command] bridge + 
 Relay stays a thin mode (`--relay-server`) alongside `core`.
 
 **Binaries** ship from one repo/release: a default `client` binary (named
-`encodeur_rsa_rust` for packaging continuity) and the `messenger-server` binary.
+`p2pem-classic`) and the `messenger-server` binary.
 The `p2pem-desktop` binary builds via `cargo tauri build`/`dev` but is not yet in
 the tagged release pipeline (which still ships the egui `client` binary).
 
@@ -464,8 +464,8 @@ going unnoticed again.
 
 ### Packaging rebuild
 
-The current pipeline still assumes one eframe binary named `encodeur_rsa_rust`:
-`release.yml` builds `-p encodeur_rsa_rust` then hand-rolls Inno Setup
+The current pipeline still assumes one eframe binary named `p2pem-classic`:
+`release.yml` builds `-p p2pem-classic` then hand-rolls Inno Setup
 (`setup.iss`), a macOS `.app`+`.dmg`, and a Linux tarball; `build-and-package.ps1`
 and `setup.iss` hardcode that name. **Done:** `desktop/src-tauri/tauri.conf.json`
 already exists (productName `P2PEM`, identifier `com.chat-p2p.p2pem`, window

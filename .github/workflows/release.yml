@@ -46,12 +46,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Release
-        run: cargo build --release --locked -p encodeur_rsa_rust
+        run: cargo build --release --locked -p p2pem-classic
 
       - name: Prepare Dist
         run: |
           mkdir dist
-          cp target/release/encodeur_rsa_rust.exe dist/
+          cp target/release/p2pem-classic.exe dist/
           cp app-icon.ico dist/
           cp README.md dist/
           cp LICENSE.md dist/
@@ -92,13 +92,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p encodeur_rsa_rust
+        run: cargo build --release --locked --target ${{ matrix.target }} -p p2pem-classic
 
       - name: Create App Bundle
         run: |
           mkdir -p Messenger.app/Contents/MacOS
           mkdir -p Messenger.app/Contents/Resources
-          cp target/${{ matrix.target }}/release/encodeur_rsa_rust Messenger.app/Contents/MacOS/Messenger
+          cp target/${{ matrix.target }}/release/p2pem-classic Messenger.app/Contents/MacOS/Messenger
           chmod +x Messenger.app/Contents/MacOS/Messenger
           
           # macOS bundles use .icns, not .ico - use the Tauri app's icon set
@@ -225,13 +225,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked -p encodeur_rsa_rust
+        run: cargo build --release --locked -p p2pem-classic
 
       - name: Create Tarball
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p p2pem-classic
-          cp target/release/encodeur_rsa_rust p2pem-classic/messenger
+          cp target/release/p2pem-classic p2pem-classic/p2pem-classic
           cp README.md LICENSE.md p2pem-classic/
           tar -czvf "P2PEM-Classic_${VERSION}_linux-x64.tar.gz" p2pem-classic/
 

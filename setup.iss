@@ -4,7 +4,7 @@
 #define MyAppName "Encrypted P2P Messenger"
 #define MyAppPublisher "fibo3090"
 #define MyAppURL "https://github.com/fibo3090/secure-p2p-chat"
-#define MyAppExe "encodeur_rsa_rust.exe"
+#define MyAppExe "p2pem-classic.exe"
 
 ; Define icon only if it exists in dist
 #if FileExists("dist\app-icon.ico")
@@ -77,7 +77,7 @@ var
   ErrorCode: Integer;
 begin
   // Check if the application is running
-  // 'encodeur_rsa_rust.exe' should match the binary name
+  // 'p2pem-classic.exe' should match the binary name
   // Note: ShellExec requires specific parameters to kill. 
   // A simpler way in Inno is usually to check for the mutex or window, 
   // but since we don't have a specific mutex defined in Rust app yet, 

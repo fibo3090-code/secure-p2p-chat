@@ -1,5 +1,5 @@
 [package]
-name = "encodeur_rsa_rust"
+name = "p2pem-classic"
 description = "Encrypted P2P Messenger - a secure peer-to-peer messaging application with end-to-end encryption and forward secrecy"
 version.workspace = true
 edition.workspace = true
@@ -8,11 +8,11 @@ license.workspace = true
 authors.workspace = true
 
 [lib]
-name = "encodeur_rsa_rust"
+name = "p2pem_classic"
 path = "src/lib.rs"
 
 [[bin]]
-name = "encodeur_rsa_rust"
+name = "p2pem-classic"
 path = "src/main.rs"
 
 [dependencies]

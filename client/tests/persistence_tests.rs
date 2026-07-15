@@ -1,9 +1,9 @@
 //! Encrypted-history persistence: encrypted round-trip, wrong-key rejection,
 //! plaintext/encrypted auto-detection, and graceful handling of corrupt files.
 
-use encodeur_rsa_rust::app::chat_manager::ChatManager;
-use encodeur_rsa_rust::app::persistence::HistoryFile;
-use encodeur_rsa_rust::types::{Chat, ChatKind, Config, Message, MessageContent, Transport};
+use p2pem_classic::app::chat_manager::ChatManager;
+use p2pem_classic::app::persistence::HistoryFile;
+use p2pem_classic::types::{Chat, ChatKind, Config, Message, MessageContent, Transport};
 use std::io::Write;
 use uuid::Uuid;
 
