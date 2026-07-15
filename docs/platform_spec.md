@@ -570,7 +570,40 @@ update the canonical doc — `architecture.md`/`protocol.md` — in the same cha
 - Keep security docs accurate as implementation changes; keep dependency risk
   under review.
 - Harden mDNS registration/removal behavior and discovery privacy.
-- Stronger invite lifecycle controls: **invite expiration and revocation**.
+- Stronger invite lifecycle controls: signed-invite **expiration is enforced**
+  (30 days, timestamp covered by the signature); **revocation** before expiry
+  remains open.
+- **Ed25519 identity proofs** (planned, own dedicated change — see below).
+
+### Ed25519 migration plan (proposal, not started)
+
+The wire already carries a `SignatureScheme` field in `IdentityProof`, but only
+RSA-PSS is implemented, and the `rsa` crate carries the unresolved
+RUSTSEC-2023-0071 timing advisory. Moving identity proofs to Ed25519
+(`ed25519-dalek` is already a dependency) removes that exposure and shrinks
+handshakes, but it is **not** a drop-in swap because the peer **fingerprint is
+derived from the identity public key** — naively replacing the key would change
+every user's fingerprint and break TOFU continuity for all existing contacts.
+Planned shape:
+
+1. **Dual-key identities**: new identities get both an RSA-2048 and an Ed25519
+   keypair; existing identities grow an Ed25519 keypair on first unlock after
+   upgrade. The fingerprint stays RSA-derived for now (continuity).
+2. **Cross-signing**: the RSA key signs the Ed25519 public key once; the proof
+   travels with the identity so peers can bind the new key to the fingerprint
+   they already trust.
+3. **Scheme negotiation**: `IdentityProof` advertises both schemes; peers that
+   understand Ed25519 verify the Ed25519 proof (plus the cross-signature on
+   first sight), older peers keep verifying RSA-PSS. No protocol version bump
+   needed — the scheme field exists.
+4. **Fingerprint cutover** (last, separate release): once Ed25519-capable
+   versions are assumed, re-derive fingerprints from the Ed25519 key with an
+   explicit re-verification prompt (a UX event, not silent), then retire the
+   RSA path and the `rsa` dependency.
+
+Steps 1–3 are back-compatible; step 4 is a breaking trust-model event and needs
+its own comms/UX design. Each step lands with handshake tests on both the
+old/new peer matrix.
 
 **Connectivity**
 
@@ -582,7 +615,11 @@ update the canonical doc — `architecture.md`/`protocol.md` — in the same cha
 - Accessibility pass over interactions and color usage.
 - Settings IA cleanup / tabbed organization (folds into the §10 settings page).
 - Better contact management UX and trust-state workflows.
-- File-transfer progress and cancellation improvements.
+- File-transfer **progress** now shows in all three UIs (desktop transfer bar,
+  egui progress bar above the input, TUI title indicator); **cancellation**
+  remains open — it needs a wire-level abort message (`ProtocolMessage`
+  addition with symmetric encode/decode and replay-protected sequencing), so
+  it is its own protocol change rather than a UI patch.
 
 **Tracked long-horizon gaps** (intentionally not described as "done" anywhere):
 onion routing / anonymity layer, post-quantum migration, hardware-backed identity.

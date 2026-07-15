@@ -150,6 +150,41 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
         .show_inside(ui, |ui| {
             ui.add_space(5.0);
 
+            // Live progress for this chat's in-flight file transfers (both
+            // directions), mirroring the desktop app's transfer bar.
+            let transfers: Vec<_> = if let Ok(manager) = app.chat_manager.try_lock() {
+                manager
+                    .active_transfers_snapshot()
+                    .into_iter()
+                    .filter(|t| t.chat_id == chat_id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for t in &transfers {
+                let frac = if t.size > 0 {
+                    (t.received as f32 / t.size as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.horizontal(|ui| {
+                    ui.label(format!("📎 {}", t.filename));
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(220.0)
+                            .text(format!(
+                                "{} / {}",
+                                crate::util::format_size(t.received),
+                                crate::util::format_size(t.size)
+                            )),
+                    );
+                });
+                // Keep repainting while a transfer is live so the bar moves
+                // without waiting for other UI activity.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            }
+
             // File preview if selected
             if let Some(file_path) = app.file_to_send.clone() {
                 let filename = file_path

@@ -24,6 +24,14 @@ predate tagged releases.
   for brand and theme colors; a test asserts the egui palette matches it, so
   the token file and the UI can no longer drift apart silently.
 
+- **File-transfer progress in every UI.** The egui GUI shows a live progress
+  bar above the chat input and the TUI shows a percentage in the message-view
+  title, matching the transfer bar the desktop app already had. (Wire-level
+  cancellation is planned separately — it needs a protocol message, see the
+  platform spec backlog.)
+- **First automated tests for the desktop frontend.** Vitest covers the pure
+  logic modules (`colorgrid`, `partyUnread`, `themes`), and `npm test` runs in
+  CI's new Frontend Build job.
 - **Signed invites now expire.** A signed invite older than 30 days is
   rejected at import with a clear error (the timestamp is covered by the
   invite's signature, so it cannot be back- or forward-dated without breaking
