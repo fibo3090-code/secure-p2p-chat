@@ -58,19 +58,26 @@ jobs:
 
       - name: Compile Installer
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="${{ github.ref_name }}" /O"Output" /F"Messenger-Setup-${{ github.ref_name }}" setup.iss
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" /O"Output" /F"P2PEM-Classic_${version}_x64-setup" setup.iss
 
       - name: Upload Installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "./Output/Messenger-Setup-${{ github.ref_name }}.exe" --repo "${{ github.repository }}" --clobber
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          gh release upload "$env:GITHUB_REF_NAME" "./Output/P2PEM-Classic_${version}_x64-setup.exe" --repo "$env:GITHUB_REPOSITORY" --clobber
 
   build-macos:
     needs: create-release
     runs-on: macos-latest
     strategy:
       matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+        include:
+          - target: x86_64-apple-darwin
+            arch: x64
+          - target: aarch64-apple-darwin
+            arch: aarch64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -124,12 +131,15 @@ jobs:
 
       - name: Create DMG
         run: |
-          hdiutil create -volname "Messenger" -srcfolder Messenger.app -ov -format UDZO messenger-${{ matrix.target }}.dmg
+          VERSION="${GITHUB_REF_NAME#v}"
+          hdiutil create -volname "Messenger" -srcfolder Messenger.app -ov -format UDZO "P2PEM-Classic_${VERSION}_macos-${{ matrix.arch }}.dmg"
 
       - name: Upload DMG
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "./messenger-${{ matrix.target }}.dmg#Messenger-macOS-${{ matrix.target }}-${{ github.ref_name }}.dmg" --repo "${{ github.repository }}" --clobber
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "$GITHUB_REF_NAME" "./P2PEM-Classic_${VERSION}_macos-${{ matrix.arch }}.dmg" --repo "$GITHUB_REPOSITORY" --clobber
 
   # The new Tauri desktop app (P2PEM). Builds the platform installers with
   # Tauri's own bundler and attaches them to the same release as the classic
@@ -219,12 +229,15 @@ jobs:
 
       - name: Create Tarball
         run: |
-          mkdir -p messenger-linux
-          cp target/release/encodeur_rsa_rust messenger-linux/messenger
-          cp README.md LICENSE.md messenger-linux/
-          tar -czvf messenger-linux-${{ github.ref_name }}.tar.gz messenger-linux/
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p p2pem-classic
+          cp target/release/encodeur_rsa_rust p2pem-classic/messenger
+          cp README.md LICENSE.md p2pem-classic/
+          tar -czvf "P2PEM-Classic_${VERSION}_linux-x64.tar.gz" p2pem-classic/
 
       - name: Upload Tarball
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "./messenger-linux-${{ github.ref_name }}.tar.gz#Messenger-Linux-${{ github.ref_name }}.tar.gz" --repo "${{ github.repository }}" --clobber
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "$GITHUB_REF_NAME" "./P2PEM-Classic_${VERSION}_linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber

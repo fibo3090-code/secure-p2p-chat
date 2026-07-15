@@ -18,10 +18,13 @@ By the end of this tutorial you will have:
 
 Use the latest release from GitHub:
 
-- Windows: download `Messenger-Setup-v*.exe`
-- macOS Intel: download `messenger-x86_64-apple-darwin.dmg`
-- macOS Apple Silicon: download `messenger-aarch64-apple-darwin.dmg`
-- Linux: download `messenger-linux-v*.tar.gz`
+- Windows: download `P2PEM-Classic_<version>_x64-setup.exe`
+- macOS Intel: download `P2PEM-Classic_<version>_macos-x64.dmg`
+- macOS Apple Silicon: download `P2PEM-Classic_<version>_macos-aarch64.dmg`
+- Linux: download `P2PEM-Classic_<version>_linux-x64.tar.gz`
+
+(The `P2PEM_<version>_*` assets on the same page are the newer Tauri desktop
+app; see the [User Guide](USER_GUIDE.md#installation) for the full list.)
 
 If you prefer to build from source:
 
