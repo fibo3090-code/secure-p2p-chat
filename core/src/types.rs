@@ -235,6 +235,12 @@ pub struct Config {
     /// and a fingerprint on the local network.
     #[serde(default)]
     pub enable_mdns: bool,
+    /// Ask the router (UPnP/IGD) to forward the listening port when hosting,
+    /// and embed the discovered external address in invites. Disabled by
+    /// default: it opens a port on the router and reveals the external IP to
+    /// invite recipients.
+    #[serde(default)]
+    pub enable_upnp: bool,
     #[serde(default)]
     pub relay_server: Option<String>,
 }
@@ -294,6 +300,7 @@ impl Default for Config {
             listen_port: crate::PORT_DEFAULT,
             auto_trust_on_first_use: false,
             enable_mdns: false,
+            enable_upnp: false,
             relay_server: None,
         }
     }
@@ -320,6 +327,7 @@ mod tests {
             "TOFU auto-trust must be off by default"
         );
         assert!(!c.enable_mdns, "mDNS advertising must be off by default");
+        assert!(!c.enable_upnp, "UPnP port mapping must be off by default");
         assert!(!c.auto_host_on_startup);
         assert!(!c.auto_connect);
         assert_eq!(c.listen_port, crate::PORT_DEFAULT);
@@ -333,6 +341,7 @@ mod tests {
             theme: Theme::Forest,
             font_size: 18,
             enable_mdns: true,
+            enable_upnp: true,
             relay_server: Some("relay.example:9000".to_string()),
             ..Config::default()
         };
@@ -341,6 +350,7 @@ mod tests {
         assert_eq!(back.theme, Theme::Forest);
         assert_eq!(back.font_size, 18);
         assert!(back.enable_mdns);
+        assert!(back.enable_upnp);
         assert_eq!(back.relay_server.as_deref(), Some("relay.example:9000"));
     }
 
@@ -366,6 +376,7 @@ mod tests {
         assert_eq!(c.listen_port, crate::PORT_DEFAULT);
         assert!(!c.auto_trust_on_first_use);
         assert!(!c.enable_mdns);
+        assert!(!c.enable_upnp);
         assert!(c.relay_server.is_none());
     }
 

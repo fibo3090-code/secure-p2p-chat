@@ -1071,12 +1071,15 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("📤 Share this link with your friends so they can add you:");
                     ui.add_space(10.0);
 
-                    // Generate link using actual identity and best-effort local address
+                    // Generate link using actual identity; prefer the UPnP
+                    // external address (reachable from outside the LAN) over
+                    // the best-effort local one.
                     if app.my_invite_link.is_none() {
                         if let Ok(manager) = app.chat_manager.try_lock() {
                             let port = manager.config.listen_port;
-                            let invite_addr =
-                                primary_local_ipv4().map(|ip| format!("{}:{}", ip, port));
+                            let invite_addr = manager.external_address.clone().or_else(|| {
+                                primary_local_ipv4().map(|ip| format!("{}:{}", ip, port))
+                            });
                             match app.identity.generate_signed_invite_link(invite_addr) {
                                 Ok(link) => {
                                     app.my_invite_link = Some(link);
@@ -1536,11 +1539,25 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 });
 
+                if ui
+                    .checkbox(
+                        &mut manager.config.enable_upnp,
+                        "UPnP port mapping (ask the router to make the host reachable from the internet)",
+                    )
+                    .changed()
+                {
+                    queue_history_save(app.history_path.clone(), &mut manager);
+                }
+
                 // Show my IP address (best-effort primary local IPv4)
                 ui.add_space(8.0);
                 ui.label("My IP address (primary, best-effort):");
                 let my_ip = primary_local_ipv4().unwrap_or_else(|| "Unavailable".to_string());
                 ui.monospace(my_ip);
+                if let Some(ext) = manager.external_address.clone() {
+                    ui.label("External address (UPnP):");
+                    ui.monospace(ext);
+                }
 
                 ui.add_space(10.0);
 

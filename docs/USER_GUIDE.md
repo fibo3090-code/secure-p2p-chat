@@ -154,6 +154,20 @@ Use invite links when:
 - you want the connector to avoid typing the address and key material by hand
 - you want relay route information bundled into the invite
 
+### Reach hosts across the internet with UPnP
+
+If your router supports UPnP, the app can ask it to forward your listening
+port while you host, and your invite will carry the external address instead
+of the LAN one — no manual port-forwarding.
+
+- Enable it in Settings ("UPnP port mapping") or in the TUI with `:set upnp on`.
+- It is **off by default**: turning it on opens a port on your router and
+  embeds your public IP in the invites you share.
+- It is best-effort: no UPnP gateway, a disabled IGD service, or carrier-grade
+  NAT all make it fail — you get a warning toast and LAN/relay keep working.
+- The mapping uses a 24-hour lease, so the router reclaims the port on its own
+  even if the app exits uncleanly.
+
 ### Use a self-hosted relay
 
 Use this when direct TCP is inconvenient across NAT or the public internet.

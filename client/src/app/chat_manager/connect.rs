@@ -127,6 +127,17 @@ impl ChatManager {
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 
+        // Best-effort UPnP port mapping so peers outside the LAN can reach us.
+        // Runs in the background; the result lands via poll_session_events so
+        // hosting is never delayed by a slow or absent gateway.
+        if self.config.enable_upnp && self.pending_upnp.is_none() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending_upnp = Some(rx);
+            tokio::spawn(async move {
+                let _ = tx.send(crate::network::nat::map_port(port).await);
+            });
+        }
+
         Ok(chat_id)
     }
 

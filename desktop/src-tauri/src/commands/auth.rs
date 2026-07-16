@@ -116,6 +116,7 @@ pub(crate) struct SettingsDto {
     enable_typing_indicators: bool,
     auto_host_on_startup: bool,
     listen_port: u16,
+    enable_upnp: bool,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +125,7 @@ pub(crate) struct SettingsUpdate {
     enable_typing_indicators: bool,
     auto_host_on_startup: bool,
     listen_port: u16,
+    enable_upnp: bool,
 }
 
 #[tauri::command]
@@ -136,6 +138,7 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         enable_typing_indicators: mgr.config.enable_typing_indicators,
         auto_host_on_startup: mgr.config.auto_host_on_startup,
         listen_port: mgr.config.listen_port,
+        enable_upnp: mgr.config.enable_upnp,
     })
 }
 
@@ -156,6 +159,7 @@ pub(crate) async fn update_settings(
         mgr.config.enable_typing_indicators = settings.enable_typing_indicators;
         mgr.config.auto_host_on_startup = settings.auto_host_on_startup;
         mgr.config.listen_port = settings.listen_port;
+        mgr.config.enable_upnp = settings.enable_upnp;
     }
     persist_history(&state.manager, &state.history_path).await;
     Ok(())

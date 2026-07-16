@@ -24,6 +24,15 @@ predate tagged releases.
   for brand and theme colors; a test asserts the egui palette matches it, so
   the token file and the UI can no longer drift apart silently.
 
+- **UPnP NAT traversal (opt-in).** When hosting with the new "UPnP port
+  mapping" setting enabled, the app asks the router (IGD) to forward the
+  listening port and discovers the external IP; generated invites then carry
+  the internet-reachable address instead of the LAN one. Strictly
+  best-effort: no gateway, disabled UPnP, or carrier-grade NAT produce a
+  warning toast and LAN/relay connectivity keep working. Off by default —
+  enabling it opens a router port (24-hour lease) and embeds the public IP
+  in shared invites. Exposed in all three UIs (egui settings, desktop
+  Settings, TUI `:set upnp on|off`).
 - **File-transfer progress in every UI.** The egui GUI shows a live progress
   bar above the chat input and the TUI shows a percentage in the message-view
   title, matching the transfer bar the desktop app already had. (Wire-level

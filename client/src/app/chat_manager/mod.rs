@@ -68,6 +68,12 @@ pub struct ChatManager {
     pub connection_password: Option<String>,
     /// When true, the conversation is locked: no auto-rehost, so no new peer joins.
     pub conversation_locked: bool,
+    /// External `host:port` discovered via UPnP when hosting (None until a
+    /// mapping succeeds). Preferred over the LAN address in generated invites.
+    pub external_address: Option<String>,
+    /// In-flight UPnP mapping attempt, resolved by `poll_session_events`.
+    pending_upnp:
+        Option<tokio::sync::oneshot::Receiver<anyhow::Result<crate::network::nat::MappedAddress>>>,
 }
 
 impl ChatManager {
@@ -91,6 +97,8 @@ impl ChatManager {
             is_hosting: false,
             connection_password: None,
             conversation_locked: false,
+            external_address: None,
+            pending_upnp: None,
         }
     }
 
