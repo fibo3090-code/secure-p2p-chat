@@ -10,7 +10,7 @@ server, and the desktop shell can share code (see `docs/platform_spec.md`):
 ```text
 core/             messenger-core   — crypto, wire protocol, identity, transport, shared types,
                                      and the Party application protocol (core::party)
-client/           encodeur_rsa_rust — the unified app (egui GUI + ratatui TUI) and its binary
+client/           p2pem-classic — the unified app (egui GUI + ratatui TUI) and its binary
 server/           messenger-server  — the Party server (TCP listener, state, dispatcher, hub)
 desktop/src-tauri p2pem-desktop     — the Tauri 2 desktop shell that bridges the same
                                      ChatManager/PartyManager to a React/Vite web UI (desktop/src/)
@@ -19,7 +19,7 @@ desktop/src-tauri p2pem-desktop     — the Tauri 2 desktop shell that bridges t
 `client` depends on `core` and re-exports it (`pub use messenger_core::*;`), so the
 client modules and integration tests reach core types via the usual paths. The
 `p2pem-desktop` crate depends on `client` (for the managers) and wraps them in
-`#[tauri::command]`s. The client binary keeps the name `encodeur_rsa_rust`
+`#[tauri::command]`s. The client crate/binary is named `p2pem-classic`
 (packaging is unchanged; the release pipeline still ships that egui binary — the
 Tauri app is run from source during development). Bare `cargo build`/`test`/`run`
 target the client via `default-members`; CI builds the whole workspace with

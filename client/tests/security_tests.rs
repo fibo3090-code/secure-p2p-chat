@@ -1,6 +1,6 @@
-use encodeur_rsa_rust::core::ProtocolMessage;
-use encodeur_rsa_rust::util::sanitize_filename;
-use encodeur_rsa_rust::{FILE_CHUNK_SIZE, MAX_FILE_SIZE, MAX_TEXT_MESSAGE_BYTES, TEXT_CHUNK_BYTES};
+use p2pem_classic::core::ProtocolMessage;
+use p2pem_classic::util::sanitize_filename;
+use p2pem_classic::{FILE_CHUNK_SIZE, MAX_FILE_SIZE, MAX_TEXT_MESSAGE_BYTES, TEXT_CHUNK_BYTES};
 use tempfile::TempDir;
 
 #[test]

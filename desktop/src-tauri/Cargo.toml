@@ -27,7 +27,7 @@ serde_json = { workspace = true }
 # bridge reuses it directly. NOTE (tech debt, see Phase 1 spec): this pulls in
 # egui/ratatui transitively. A later phase should extract ChatManager into a
 # UI-agnostic crate so the webview build doesn't compile the legacy GUIs.
-encodeur_rsa_rust = { path = "../../client" }
+p2pem-classic = { path = "../../client" }
 messenger-core = { workspace = true }
 
 tokio = { workspace = true }

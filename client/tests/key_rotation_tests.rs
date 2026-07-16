@@ -6,10 +6,8 @@
 /// - Rotation happens at correct message/time intervals
 /// - Both peers rotate to the same key
 /// - Messages continue to flow correctly after rotation
-use encodeur_rsa_rust::core::{
-    generate_rekey_nonce, rekey_session_key, AesCipher, ProtocolMessage,
-};
-use encodeur_rsa_rust::AES_KEY_SIZE;
+use p2pem_classic::core::{generate_rekey_nonce, rekey_session_key, AesCipher, ProtocolMessage};
+use p2pem_classic::AES_KEY_SIZE;
 use rand::Rng;
 use std::time::Instant;
 

@@ -1,5 +1,5 @@
-use encodeur_rsa_rust::app::chat_manager::ChatManager;
-use encodeur_rsa_rust::types::{Config, TrustState};
+use p2pem_classic::app::chat_manager::ChatManager;
+use p2pem_classic::types::{Config, TrustState};
 
 #[tokio::test]
 async fn simulation_contacts_lifecycle() {

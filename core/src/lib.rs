@@ -40,3 +40,7 @@ pub const RSA_KEY_BITS: usize = 2048;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 /// Maximum file size for transfers: 10 GiB
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+/// Signed invites older than this are rejected at import (30 days).
+pub const INVITE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+/// Tolerated clock skew for invite timestamps that appear to be in the future.
+pub const INVITE_TIMESTAMP_SKEW_SECS: u64 = 60 * 60;

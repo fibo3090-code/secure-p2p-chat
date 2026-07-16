@@ -36,8 +36,8 @@ cargo build --release
 
 Binary location:
 
-- Windows: `target\release\encodeur_rsa_rust.exe`
-- Linux/macOS: `target/release/encodeur_rsa_rust`
+- Windows: `target\release\p2pem-classic.exe`
+- Linux/macOS: `target/release/p2pem-classic`
 
 ### Linux build prerequisites
 
@@ -143,6 +143,8 @@ Invite links are the easiest way to hand a contact your identity details.
 Current behavior:
 
 - the app emits signed invite links
+- signed invites expire 30 days after they were generated; an expired invite
+  is rejected at import with a clear error - ask the sender for a fresh one
 - legacy unsigned invites may still import for compatibility
 - invalid addresses embedded in invites are dropped during import rather than trusted blindly
 

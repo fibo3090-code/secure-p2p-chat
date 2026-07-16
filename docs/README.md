@@ -46,7 +46,7 @@ predate the current name and are kept for compatibility and continuity:
 | Identifier | Where it appears | Meaning |
 |---|---|---|
 | `P2PEM` | Tauri desktop app (`p2pem-desktop`, window title, data dir) | Short product identifier for the new desktop app |
-| `encodeur_rsa_rust` | Client crate/binary name | Historical crate name; the protocol moved to X25519 session establishment long ago (RSA remains for identity signatures only) |
+| `p2pem-classic` | Client crate/binary name | Renamed from the historical `encodeur_rsa_rust` (an RSA-era name; the protocol moved to X25519 session establishment long ago, RSA remains for identity signatures only) |
 | `messenger-core` / `messenger-server` | Core and server crate names | Descriptive crate names |
 | `chat-p2p://` | Invite-link URI scheme | Wire-compatible URI scheme; renaming it would break existing invites |
 

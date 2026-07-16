@@ -240,6 +240,12 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     if chat.peer_typing {
         title.push_str("· typing… ");
     }
+    for t in app.chat_manager.active_transfers_snapshot() {
+        if t.chat_id == chat_id && t.size > 0 {
+            let pct = (t.received.saturating_mul(100) / t.size).min(100);
+            title.push_str(&format!("· 📎 {} {}% ", t.filename, pct));
+        }
+    }
     let border = if app.focus == TuiFocus::MessageView {
         BRAND_ACCENT
     } else {

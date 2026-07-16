@@ -5,7 +5,7 @@
 use clap::Parser;
 
 use egui_tracing::tracing::EventCollector;
-use encodeur_rsa_rust::*;
+use p2pem_classic::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,encodeur_rsa_rust=debug".into()),
+                .unwrap_or_else(|_| "info,p2pem_classic=debug".into()),
         )
         .with(event_collector.clone())
         .init();

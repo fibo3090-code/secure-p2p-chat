@@ -2221,46 +2221,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "encodeur_rsa_rust"
-version = "1.12.1"
-dependencies = [
- "anyhow",
- "arboard",
- "base64 0.21.7",
- "chacha20poly1305",
- "chrono",
- "clap",
- "directories",
- "eframe",
- "egui",
- "egui_commonmark",
- "egui_tracing",
- "emojis",
- "hex",
- "image",
- "messenger-core",
- "notify-rust",
- "open",
- "proptest",
- "qrcode",
- "rand 0.8.6",
- "ratatui",
- "ratatui-crossterm",
- "rfd",
- "rsa",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-subscriber",
- "unicode-width 0.2.2",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5044,14 +5004,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2pem-classic"
+version = "1.12.1"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64 0.21.7",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "directories",
+ "eframe",
+ "egui",
+ "egui_commonmark",
+ "egui_tracing",
+ "emojis",
+ "hex",
+ "image",
+ "messenger-core",
+ "notify-rust",
+ "open",
+ "proptest",
+ "qrcode",
+ "rand 0.8.6",
+ "ratatui",
+ "ratatui-crossterm",
+ "rfd",
+ "rsa",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width 0.2.2",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "p2pem-desktop"
 version = "1.12.1"
 dependencies = [
  "anyhow",
  "directories",
- "encodeur_rsa_rust",
  "log",
  "messenger-core",
+ "p2pem-classic",
  "rfd",
  "serde",
  "serde_json",

@@ -9,7 +9,7 @@ Cargo **workspace** with four members (root `src/` and `tests/` are vestigial â€
 | Crate | Path | What it is |
 |-------|------|------------|
 | `messenger-core` | `core/` | Crypto, protocol, network/session, transfer, identity, shared `types.rs` (UI-agnostic) |
-| `encodeur_rsa_rust` | `client/` | The app: ChatManager + egui GUI + ratatui TUI (lib + binary) |
+| `p2pem-classic` | `client/` | The app: ChatManager + egui GUI + ratatui TUI (lib + binary) |
 | `messenger-server` | `server/` | Party/Community server (hub, dispatch, connection, state) |
 | `p2pem-desktop` | `desktop/src-tauri/` | **New** Tauri 2 shell wrapping the React/Vite web UI in `desktop/src/` |
 
@@ -42,7 +42,7 @@ cd desktop && npx tauri build    # packaged desktop build
 cd desktop && npm run dev        # frontend only, in a plain browser (uses the dev mock â€” see bridge.js)
 
 # Logging
-RUST_LOG="info,encodeur_rsa_rust=debug" cargo run
+RUST_LOG="info,p2pem_classic=debug" cargo run
 
 # Windows packaging (egui binary)
 ./build-and-package.ps1

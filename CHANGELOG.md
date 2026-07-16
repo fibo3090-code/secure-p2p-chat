@@ -24,8 +24,35 @@ predate tagged releases.
   for brand and theme colors; a test asserts the egui palette matches it, so
   the token file and the UI can no longer drift apart silently.
 
+- **File-transfer progress in every UI.** The egui GUI shows a live progress
+  bar above the chat input and the TUI shows a percentage in the message-view
+  title, matching the transfer bar the desktop app already had. (Wire-level
+  cancellation is planned separately — it needs a protocol message, see the
+  platform spec backlog.)
+- **First automated tests for the desktop frontend.** Vitest covers the pure
+  logic modules (`colorgrid`, `partyUnread`, `themes`), and `npm test` runs in
+  CI's new Frontend Build job.
+- **Signed invites now expire.** A signed invite older than 30 days is
+  rejected at import with a clear error (the timestamp is covered by the
+  invite's signature, so it cannot be back- or forward-dated without breaking
+  verification; future-dated invites beyond a 1-hour clock-skew allowance are
+  rejected too). Legacy v1 unsigned invites carry no timestamp and still
+  import with the existing warning.
+
 ### Changed
 
+- **Client crate renamed `encodeur_rsa_rust` → `p2pem-classic`.** The last
+  RSA-era name in the repo is gone: the package, library, and binary are now
+  `p2pem-classic` (matching the release artifacts), so a task manager or `ps`
+  shows `p2pem-classic` instead of `encodeur_rsa_rust`. Build commands change
+  accordingly (`cargo build -p p2pem-classic`; the binary lands at
+  `target/release/p2pem-classic`), and the Linux tarball's inner binary is
+  `p2pem-classic` rather than `messenger`. Data directories are unchanged
+  (identity/history still load from the same location); `RUST_LOG` filters
+  that targeted `encodeur_rsa_rust=` must switch to `p2pem_classic=`.
+- **CI now builds the React frontend.** A `Frontend Build` job (`npm ci` +
+  `npm run build` in `desktop/`) joins the pipeline; previously a broken
+  frontend could pass CI because the committed `desktop/dist/` masked it.
 - **Release assets renamed to one consistent scheme.** The classic egui
   artifacts drop the mixed `Messenger-Setup-v*` / `messenger-*` naming for
   `P2PEM-Classic_<version>_<platform>-<arch>.<ext>` (e.g.

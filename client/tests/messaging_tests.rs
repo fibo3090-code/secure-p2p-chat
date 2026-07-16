@@ -1,6 +1,6 @@
-use encodeur_rsa_rust::app::chat_manager::{ChatManager, SessionHandle};
-use encodeur_rsa_rust::core::ProtocolMessage;
-use encodeur_rsa_rust::types::Config;
+use p2pem_classic::app::chat_manager::{ChatManager, SessionHandle};
+use p2pem_classic::core::ProtocolMessage;
+use p2pem_classic::types::Config;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 

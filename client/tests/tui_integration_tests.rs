@@ -1,7 +1,7 @@
 use egui_tracing::tracing::EventCollector;
-use encodeur_rsa_rust::app::chat_manager::SessionHandle;
-use encodeur_rsa_rust::core::ProtocolMessage;
-use encodeur_rsa_rust::tui::app::TuiApp;
+use p2pem_classic::app::chat_manager::SessionHandle;
+use p2pem_classic::core::ProtocolMessage;
+use p2pem_classic::tui::app::TuiApp;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 

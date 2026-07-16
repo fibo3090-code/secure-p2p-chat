@@ -1,5 +1,5 @@
 use egui_tracing::tracing::EventCollector;
-use encodeur_rsa_rust::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
+use p2pem_classic::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use uuid::Uuid;
 
@@ -41,7 +41,7 @@ fn parse_commands_cover_party_channel_aliases_and_ipv6() {
         TuiApp::parse_command(":connect ::1").unwrap(),
         TuiCommand::Connect {
             host: "::1".to_string(),
-            port: encodeur_rsa_rust::PORT_DEFAULT,
+            port: p2pem_classic::PORT_DEFAULT,
         }
     );
 }
