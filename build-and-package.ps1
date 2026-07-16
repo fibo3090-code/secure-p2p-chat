@@ -1,4 +1,4 @@
-<#
+﻿<#
   build-and-package.ps1
   Build and package script for Encrypted P2P Messenger
   Usage example:
