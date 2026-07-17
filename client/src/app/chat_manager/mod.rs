@@ -74,6 +74,10 @@ pub struct ChatManager {
     /// In-flight UPnP mapping attempt, resolved by `poll_session_events`.
     pending_upnp:
         Option<tokio::sync::oneshot::Receiver<anyhow::Result<crate::network::nat::MappedAddress>>>,
+    /// Dropping this cancels the background port-mapping renewal task, which
+    /// then unmaps the router port. `Some` while a UPnP/NAT-PMP mapping is
+    /// being maintained for the current hosting session.
+    upnp_cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ChatManager {
@@ -99,6 +103,7 @@ impl ChatManager {
             conversation_locked: false,
             external_address: None,
             pending_upnp: None,
+            upnp_cancel: None,
         }
     }
 
@@ -137,6 +142,11 @@ impl ChatManager {
     /// Stop hosting (user action).
     pub fn stop_hosting(&mut self) {
         self.is_hosting = false;
+        // Cancel the UPnP renewal task (it unmaps the router port on drop) and
+        // forget the external address so invites revert to the LAN address.
+        self.upnp_cancel = None;
+        self.pending_upnp = None;
+        self.external_address = None;
         // Remove placeholder if exists
         if let Some(id) = self
             .chats

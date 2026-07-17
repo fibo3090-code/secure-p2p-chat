@@ -630,10 +630,14 @@ impl ChatManager {
         match rx.try_recv() {
             Ok(Ok(mapping)) => {
                 let addr = mapping.to_host_port();
-                tracing::info!(%addr, "UPnP mapping active");
+                let proto = match mapping.protocol {
+                    crate::network::nat::Protocol::Upnp => "UPnP",
+                    crate::network::nat::Protocol::NatPmp => "NAT-PMP",
+                };
+                tracing::info!(%addr, protocol = proto, "port mapping active");
                 self.add_toast(
                     ToastLevel::Success,
-                    format!("UPnP: reachable from the internet at {}", addr),
+                    format!("{}: reachable from the internet at {}", proto, addr),
                 );
                 self.external_address = Some(addr);
                 self.pending_upnp = None;

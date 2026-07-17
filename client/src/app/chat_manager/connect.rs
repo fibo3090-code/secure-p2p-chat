@@ -127,14 +127,36 @@ impl ChatManager {
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 
-        // Best-effort UPnP port mapping so peers outside the LAN can reach us.
-        // Runs in the background; the result lands via poll_session_events so
-        // hosting is never delayed by a slow or absent gateway.
-        if self.config.enable_upnp && self.pending_upnp.is_none() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.pending_upnp = Some(rx);
+        // Best-effort UPnP / NAT-PMP port mapping so peers outside the LAN can
+        // reach us. Runs in the background; the first result lands via
+        // poll_session_events so hosting is never delayed by a slow or absent
+        // gateway. The task then renews the lease until hosting stops, and
+        // unmaps the port on cancellation.
+        if self.config.enable_upnp && self.upnp_cancel.is_none() {
+            use crate::network::nat;
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            self.pending_upnp = Some(result_rx);
+            self.upnp_cancel = Some(cancel_tx);
             tokio::spawn(async move {
-                let _ = tx.send(crate::network::nat::map_port(port).await);
+                let first = nat::map_port(port).await;
+                let protocol = first.as_ref().ok().map(|m| m.protocol);
+                let _ = result_tx.send(first);
+                // If the first mapping failed there's nothing to renew or clean.
+                let Some(protocol) = protocol else { return };
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(nat::RENEW_AFTER) => {
+                            // Re-map to refresh the lease; ignore transient errors,
+                            // the existing mapping is still valid until it expires.
+                            let _ = nat::map_port(port).await;
+                        }
+                        _ = &mut cancel_rx => {
+                            nat::unmap_port(port, protocol).await;
+                            return;
+                        }
+                    }
+                }
             });
         }
 

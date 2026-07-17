@@ -46,6 +46,7 @@ directories = { workspace = true }
 # Local peer discovery (mDNS/Bonjour)
 mdns-sd = { workspace = true }
 igd-next = { workspace = true }
+natpmp = { workspace = true }
 hostname = { workspace = true }
 
 [dev-dependencies]
