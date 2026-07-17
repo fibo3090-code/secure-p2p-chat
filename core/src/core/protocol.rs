@@ -483,7 +483,13 @@ impl ProtocolMessage {
                 cursor += 4;
                 let total_chunks = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?);
                 cursor += 4;
-                if total_chunks == 0 || chunk_index >= total_chunks {
+                // Reject a huge `total_chunks` here: the reassembler allocates one
+                // slot per chunk up front, so an unbounded value is a remote-OOM
+                // vector. A capped, non-zero, in-range index is required.
+                if total_chunks == 0
+                    || total_chunks > crate::MAX_TEXT_CHUNKS
+                    || chunk_index >= total_chunks
+                {
                     return None;
                 }
                 let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
@@ -768,6 +774,43 @@ mod tests {
             seq: 1,
         };
         assert!(ProtocolMessage::from_plain_bytes(&oob.to_plain_bytes()).is_none());
+    }
+
+    #[test]
+    fn textchunk_total_chunks_cap_enforced_on_decode() {
+        // A frame whose total_chunks exceeds the cap must be rejected before it
+        // can drive a giant reassembly-buffer allocation (remote-OOM guard).
+        let over = ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: crate::MAX_TEXT_CHUNKS + 1,
+            text_part: "x".to_string(),
+            timestamp: 1,
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&over.to_plain_bytes()).is_none());
+
+        // The exact cap is still allowed.
+        let at_cap = ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: crate::MAX_TEXT_CHUNKS,
+            text_part: "x".to_string(),
+            timestamp: 1,
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&at_cap.to_plain_bytes()).is_some());
+
+        // A pathological u32::MAX (the original OOM vector) is rejected.
+        let huge = ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: u32::MAX,
+            text_part: "x".to_string(),
+            timestamp: 1,
+            seq: 1,
+        };
+        assert!(ProtocolMessage::from_plain_bytes(&huge.to_plain_bytes()).is_none());
     }
 
     #[test]
