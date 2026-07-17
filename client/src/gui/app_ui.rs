@@ -49,6 +49,10 @@ pub struct App {
     pub help_tab: usize,
     pub invite_link_input: String,
     pub my_invite_link: Option<String>,
+    // Address the cached invite link was generated from, so the link can be
+    // regenerated once a UPnP external address resolves (up to 15s after
+    // hosting starts) and supersedes the local one.
+    pub my_invite_link_addr: Option<String>,
     // pub show_create_group: bool, REMOVED
     pub group_wizard_step: usize, // 0=Name, 1=Members, 2=Confirm
     pub group_selected: Vec<Uuid>,
@@ -292,6 +296,7 @@ impl App {
             new_contact_pubkey: String::new(),
             invite_link_input: String::new(),
             my_invite_link: None,
+            my_invite_link_addr: None,
             group_wizard_step: 0,
             group_selected: Vec::new(),
             group_title: String::new(),

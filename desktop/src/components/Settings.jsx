@@ -38,6 +38,7 @@ export function Settings({ identity, theme, setTheme }) {
         enable_typing_indicators: next.enable_typing_indicators,
         auto_host_on_startup: next.auto_host_on_startup,
         listen_port: next.listen_port,
+        enable_upnp: next.enable_upnp,
       });
     } catch (e) { toast(String(e), "error"); setS(s); }
   }
@@ -97,6 +98,8 @@ export function Settings({ identity, theme, setTheme }) {
               <div className="set-h">Hosting</div>
               <Toggle label="Host automatically on startup" hint="Start listening for peers as soon as the app unlocks"
                 on={s.auto_host_on_startup} onChange={(v) => apply({ auto_host_on_startup: v })} />
+              <Toggle label="UPnP port mapping" hint="Ask the router to make the host reachable from the internet; the external address goes into your invite"
+                on={s.enable_upnp} onChange={(v) => apply({ enable_upnp: v })} />
               <div className="set-row">
                 <span className="set-row-txt">
                   <span className="set-row-label">Listening port</span>

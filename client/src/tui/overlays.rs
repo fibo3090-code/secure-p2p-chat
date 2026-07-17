@@ -334,6 +334,7 @@ fn render_settings(f: &mut Frame, app: &mut TuiApp, full: Rect) {
         format!("auto-accept    {}", on_off(cfg.auto_accept_files)),
         format!("auto-host      {}", on_off(cfg.auto_host_on_startup)),
         format!("mdns           {}", on_off(cfg.enable_mdns)),
+        format!("upnp           {}", on_off(cfg.enable_upnp)),
         format!("theme          {:?}", cfg.theme),
     ];
     let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.clone())).collect();

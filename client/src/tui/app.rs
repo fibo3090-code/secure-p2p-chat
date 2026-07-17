@@ -1501,7 +1501,7 @@ impl TuiApp {
     // ---------------------------------------------------------------- settings overlay
 
     fn settings_select(&mut self, delta: i32) {
-        let len = 8i32; // number of settings rows rendered
+        let len = 9i32; // number of settings rows rendered
         let cur = self.settings_list_state.selected().unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(len) as usize;
         self.settings_list_state.select(Some(next));
@@ -1517,7 +1517,8 @@ impl TuiApp {
             4 => cfg.auto_accept_files = !cfg.auto_accept_files,
             5 => cfg.auto_host_on_startup = !cfg.auto_host_on_startup,
             6 => cfg.enable_mdns = !cfg.enable_mdns,
-            7 => {
+            7 => cfg.enable_upnp = !cfg.enable_upnp,
+            8 => {
                 cfg.theme = match cfg.theme {
                     Theme::Light => Theme::Dark,
                     Theme::Dark => Theme::Midnight,
@@ -1570,6 +1571,10 @@ impl TuiApp {
             "mdns" => parse_setting_bool(value).map(|b| {
                 cfg.enable_mdns = b;
                 format!("mdns = {}", b)
+            }),
+            "upnp" => parse_setting_bool(value).map(|b| {
+                cfg.enable_upnp = b;
+                format!("upnp = {}", b)
             }),
             "theme" => match value.to_ascii_lowercase().as_str() {
                 "light" => {

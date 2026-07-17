@@ -607,8 +607,11 @@ old/new peer matrix.
 
 **Connectivity**
 
-- A practical internet-connectivity story: **NAT traversal** / relay- or
-  overlay-assisted connection modes.
+- Internet connectivity: **UPnP + NAT-PMP port mapping is shipped** (opt-in;
+  the host asks the router to forward the listening port — UPnP/IGD first, then
+  NAT-PMP — and invites carry the external address, falling back to LAN/relay).
+  Still open: PCP gateways, real hole punching for routers without IGD/NAT-PMP,
+  and CGNAT (relay remains the answer there).
 
 **UX**
 

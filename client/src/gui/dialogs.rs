@@ -660,6 +660,7 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                     app.new_contact_pubkey.clear();
                     app.invite_link_input.clear();
                     app.my_invite_link = None;
+                    app.my_invite_link_addr = None;
                     app.qr_code_texture = None;
                     app.active_dialog = ActiveDialog::AddContact;
                 }
@@ -1071,25 +1072,48 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("📤 Share this link with your friends so they can add you:");
                     ui.add_space(10.0);
 
-                    // Generate link using actual identity and best-effort local address
-                    if app.my_invite_link.is_none() {
-                        if let Ok(manager) = app.chat_manager.try_lock() {
-                            let port = manager.config.listen_port;
-                            let invite_addr =
-                                primary_local_ipv4().map(|ip| format!("{}:{}", ip, port));
-                            match app.identity.generate_signed_invite_link(invite_addr) {
-                                Ok(link) => {
-                                    app.my_invite_link = Some(link);
-                                }
-                                Err(e) => {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "❌ Failed to generate signed link: {}",
-                                            e
-                                        ))
-                                        .color(crate::gui::styling::ERROR),
-                                    );
-                                }
+                    // Generate link using actual identity; prefer the UPnP
+                    // external address (reachable from outside the LAN) over
+                    // the best-effort local one. The external address resolves
+                    // asynchronously (up to 15s after hosting starts), so a link
+                    // first built from the LAN address is regenerated once the
+                    // external address appears or changes.
+                    let invite_addr = {
+                        let port = app
+                            .chat_manager
+                            .try_lock()
+                            .map(|m| m.config.listen_port)
+                            .ok();
+                        let external = app
+                            .chat_manager
+                            .try_lock()
+                            .ok()
+                            .and_then(|m| m.external_address.clone());
+                        external.or_else(|| {
+                            port.and_then(|port| {
+                                primary_local_ipv4().map(|ip| format!("{}:{}", ip, port))
+                            })
+                        })
+                    };
+                    if app.my_invite_link.is_none() || app.my_invite_link_addr != invite_addr {
+                        match app
+                            .identity
+                            .generate_signed_invite_link(invite_addr.clone())
+                        {
+                            Ok(link) => {
+                                app.my_invite_link = Some(link);
+                                app.my_invite_link_addr = invite_addr;
+                                // Force the QR to re-render for the new link.
+                                app.qr_code_texture = None;
+                            }
+                            Err(e) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "❌ Failed to generate signed link: {}",
+                                        e
+                                    ))
+                                    .color(crate::gui::styling::ERROR),
+                                );
                             }
                         }
                     }
@@ -1536,11 +1560,25 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 });
 
+                if ui
+                    .checkbox(
+                        &mut manager.config.enable_upnp,
+                        "UPnP port mapping (ask the router to make the host reachable from the internet)",
+                    )
+                    .changed()
+                {
+                    queue_history_save(app.history_path.clone(), &mut manager);
+                }
+
                 // Show my IP address (best-effort primary local IPv4)
                 ui.add_space(8.0);
                 ui.label("My IP address (primary, best-effort):");
                 let my_ip = primary_local_ipv4().unwrap_or_else(|| "Unavailable".to_string());
                 ui.monospace(my_ip);
+                if let Some(ext) = manager.external_address.clone() {
+                    ui.label("External address (UPnP):");
+                    ui.monospace(ext);
+                }
 
                 ui.add_space(10.0);
 

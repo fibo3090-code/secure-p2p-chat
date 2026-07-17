@@ -41,16 +41,19 @@ pub(crate) async fn list_contacts(
     Ok(mgr.contacts.values().map(contact_dto).collect())
 }
 
-/// The current user's signed invite link (address derived from the local IP +
-/// the configured listen port, when resolvable).
+/// The current user's signed invite link. The address prefers the UPnP
+/// external mapping (reachable from outside the LAN) and falls back to the
+/// local IP + the configured listen port, when resolvable.
 #[tauri::command]
 pub(crate) async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
     let address = {
         let mgr = state.manager.lock().await;
         let port = mgr.config.listen_port;
-        messenger_core::util::primary_local_ipv4()
-            .map(|ip| messenger_core::util::format_host_port(&ip, port))
+        mgr.external_address.clone().or_else(|| {
+            messenger_core::util::primary_local_ipv4()
+                .map(|ip| messenger_core::util::format_host_port(&ip, port))
+        })
     };
     let id = state.identity.lock().unwrap();
     id.generate_signed_invite_link(address)

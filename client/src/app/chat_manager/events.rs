@@ -7,6 +7,7 @@ impl ChatManager {
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
         self.cleanup_stale_incoming_text_messages();
+        self.poll_upnp_result();
         let chat_ids: Vec<Uuid> = self.session_events.keys().copied().collect();
         tracing::trace!(tracked_sessions = %chat_ids.len(), "Polling session events");
 
@@ -615,6 +616,43 @@ impl ChatManager {
             SessionEvent::Warning(msg) => {
                 tracing::warn!("Session {} warning: {}", chat_id, msg);
                 self.add_toast(ToastLevel::Warning, msg);
+            }
+        }
+    }
+
+    /// Resolve a background UPnP mapping attempt started by `start_host`.
+    /// On success the external address is stored (and preferred by invite
+    /// generation); on failure the host keeps working LAN/relay-only.
+    fn poll_upnp_result(&mut self) {
+        let Some(rx) = self.pending_upnp.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(mapping)) => {
+                let addr = mapping.to_host_port();
+                let proto = match mapping.protocol {
+                    crate::network::nat::Protocol::Upnp => "UPnP",
+                    crate::network::nat::Protocol::NatPmp => "NAT-PMP",
+                };
+                tracing::info!(%addr, protocol = proto, "port mapping active");
+                self.add_toast(
+                    ToastLevel::Success,
+                    format!("{}: reachable from the internet at {}", proto, addr),
+                );
+                self.external_address = Some(addr);
+                self.pending_upnp = None;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "UPnP mapping failed");
+                self.add_toast(
+                    ToastLevel::Warning,
+                    format!("UPnP port mapping failed: {} (LAN/relay still work)", e),
+                );
+                self.pending_upnp = None;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.pending_upnp = None;
             }
         }
     }

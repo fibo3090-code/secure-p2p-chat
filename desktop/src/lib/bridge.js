@@ -57,7 +57,7 @@ function makeMock() {
   let authState = new URLSearchParams(location.search).get("mock") || "ready";
   const mockSettings = {
     download_dir: "~/Downloads", enable_notifications: true,
-    enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345,
+    enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
   };
   const chats = {
     "11111111-1111-1111-1111-111111111111": {
