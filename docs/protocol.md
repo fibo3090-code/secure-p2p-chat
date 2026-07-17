@@ -147,14 +147,21 @@ exactly like file chunks.
 The transport rotates the session key automatically during the message loop
 (`core/src/network/session.rs`):
 
-- after every `REKEY_MESSAGE_COUNT` (100) messages, a side sends a
-  `Rekey { nonce, seq }` message carrying a fresh `REKEY_NONCE_SIZE` (16-byte) salt
+- **only the host initiates** a rekey (deterministic single initiator): after
+  `REKEY_MESSAGE_COUNT` (100) messages or `REKEY_TIME_INTERVAL` (5 min), the host
+  sends a `Rekey { nonce, seq }` carrying a fresh `REKEY_NONCE_SIZE` (16-byte) salt.
+  A single initiator means the two peers can never rekey in the same round trip
+  and desync (which would make the next frame undecryptable and drop the session).
+  The host rekeys on its keep-alive tick too, so a host that is only receiving
+  still rotates on schedule.
 - both peers independently derive the next key as
   `rekey_session_key(current_key, nonce)` (HKDF), and all subsequent frames use it
 - the `Rekey` frame shares the session `seq` namespace (so it is replay-protected)
   and is consumed by the transport — it is never surfaced to the application
-- the sender applies the new key immediately after sending; the receiver switches
-  on receipt
+- the initiator applies the new key immediately after sending (the frame itself is
+  encrypted under the old key); the receiver switches on receipt
+- **Limitation:** rekeying folds in no new DH material, so this provides forward
+  secrecy but **not** post-compromise security — see `SECURITY.md`.
 
 ## Invite Links
 

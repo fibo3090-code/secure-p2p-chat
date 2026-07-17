@@ -33,7 +33,7 @@ Reasoning:
 
 ## Implemented Protections
 
-In transit, sessions are established with X25519 ECDH and HKDF-SHA256 (providing forward secrecy), encrypted with AES-256-GCM under transcript-bound AAD, replay-protected by per-session sequence validation, and automatically rekeyed every 100 messages. Identity is a long-term RSA-2048 key used **only for RSA-PSS signatures** (identity proofs and signed invites) — never for encryption. At rest, the identity keystore is encrypted with Argon2 + ChaCha20-Poly1305 and chat history is encrypted, with zeroization applied to sensitive in-memory material where implemented. Full mechanics: [docs/protocol.md](docs/protocol.md).
+In transit, sessions are established with X25519 ECDH and HKDF-SHA256 (providing forward secrecy), encrypted with AES-256-GCM under transcript-bound AAD, replay-protected by per-session sequence validation, and automatically rekeyed every 100 messages (or 5 minutes). Rekeying is initiated by a single deterministic side (the host) so the two peers can never rotate simultaneously and desync their keys. Identity is a long-term RSA-2048 key used **only for RSA-PSS signatures** (identity proofs and signed invites) — the product performs **no RSA encryption/decryption at all** (those functions were removed from the codebase). At rest, the identity keystore is encrypted with Argon2 + ChaCha20-Poly1305 and chat history is encrypted, with zeroization applied to sensitive in-memory material where implemented. Full mechanics: [docs/protocol.md](docs/protocol.md).
 
 Operational hardening includes handshake timeouts, rate limiting, DoS-hardened framing (bounded length prefix, chunked reads, oversized-packet rejection), signed invite links, a self-hosted relay mode that forwards only already-encrypted session traffic, and server-side access checks on Party file downloads (`blob_bytes_for`: only channel members or DM participants can fetch a blob). CI enforces formatting, lints, cross-platform tests, and locked build verification.
 
@@ -60,7 +60,25 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   timestamp); legacy v1 unsigned invites carry no timestamp and are not
   subject to expiry
 - Invite revocation (before expiry) is not supported
-- `rsa` still carries an unresolved upstream timing-sidechannel advisory (`RUSTSEC-2023-0071`)
+- **No post-compromise security (no double ratchet).** Forward secrecy comes
+  from ephemeral-DH session keys plus symmetric rekeying (`next = HKDF(current,
+  nonce)`). Because rekeying folds in no *new* DH material, an attacker who
+  captures a live session key can follow the ratchet forward from that point
+  (the nonces travel on the wire) until the session ends and a fresh ephemeral
+  handshake runs. A Signal-style Double Ratchet (a DH step per ratchet) would
+  add self-healing after key compromise; it is a deliberate, larger protocol
+  change, not yet implemented.
+- **TOFU has no key transparency.** Trust is pinned on first use and a later
+  key change is surfaced loudly, but there is no external auditable log
+  (CONIKS/Keybase-style) to detect a malicious key swap presented consistently
+  to a victim from the start. Out-of-band fingerprint comparison remains the
+  backstop.
+- `rsa` is still a dependency (for RSA-PSS **signatures**), so the upstream
+  timing advisory `RUSTSEC-2023-0071` still appears in audits — but the attack
+  it describes targets RSA **decryption**, which this product does not perform
+  (the RSA encrypt/decrypt functions were removed). Migrating identity
+  signatures to Ed25519 (the wire already negotiates a scheme field) would drop
+  `rsa` from the security-critical path entirely.
 - `bincode` remains a tracked dependency migration concern
 
 ## Trust Model
