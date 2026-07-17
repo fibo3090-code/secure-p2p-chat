@@ -83,7 +83,7 @@ emojis = "0.9"
 qrcode = "0.14.0"
 image = "0.25.9"
 arboard = "3"
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11.0"
 
 # Local peer discovery (mDNS/Bonjour)
 mdns-sd = "0.20"
