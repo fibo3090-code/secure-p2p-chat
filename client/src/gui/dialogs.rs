@@ -660,6 +660,7 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                     app.new_contact_pubkey.clear();
                     app.invite_link_input.clear();
                     app.my_invite_link = None;
+                    app.my_invite_link_addr = None;
                     app.qr_code_texture = None;
                     app.active_dialog = ActiveDialog::AddContact;
                 }
@@ -1073,26 +1074,46 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
 
                     // Generate link using actual identity; prefer the UPnP
                     // external address (reachable from outside the LAN) over
-                    // the best-effort local one.
-                    if app.my_invite_link.is_none() {
-                        if let Ok(manager) = app.chat_manager.try_lock() {
-                            let port = manager.config.listen_port;
-                            let invite_addr = manager.external_address.clone().or_else(|| {
+                    // the best-effort local one. The external address resolves
+                    // asynchronously (up to 15s after hosting starts), so a link
+                    // first built from the LAN address is regenerated once the
+                    // external address appears or changes.
+                    let invite_addr = {
+                        let port = app
+                            .chat_manager
+                            .try_lock()
+                            .map(|m| m.config.listen_port)
+                            .ok();
+                        let external = app
+                            .chat_manager
+                            .try_lock()
+                            .ok()
+                            .and_then(|m| m.external_address.clone());
+                        external.or_else(|| {
+                            port.and_then(|port| {
                                 primary_local_ipv4().map(|ip| format!("{}:{}", ip, port))
-                            });
-                            match app.identity.generate_signed_invite_link(invite_addr) {
-                                Ok(link) => {
-                                    app.my_invite_link = Some(link);
-                                }
-                                Err(e) => {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "❌ Failed to generate signed link: {}",
-                                            e
-                                        ))
-                                        .color(crate::gui::styling::ERROR),
-                                    );
-                                }
+                            })
+                        })
+                    };
+                    if app.my_invite_link.is_none() || app.my_invite_link_addr != invite_addr {
+                        match app
+                            .identity
+                            .generate_signed_invite_link(invite_addr.clone())
+                        {
+                            Ok(link) => {
+                                app.my_invite_link = Some(link);
+                                app.my_invite_link_addr = invite_addr;
+                                // Force the QR to re-render for the new link.
+                                app.qr_code_texture = None;
+                            }
+                            Err(e) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "❌ Failed to generate signed link: {}",
+                                        e
+                                    ))
+                                    .color(crate::gui::styling::ERROR),
+                                );
                             }
                         }
                     }

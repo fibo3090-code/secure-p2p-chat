@@ -146,11 +146,15 @@ impl ChatManager {
                 let Some(protocol) = protocol else { return };
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(nat::RENEW_AFTER) => {
+                        // Compose the wait + remap into one future so a cancel
+                        // aborts even a slow (up-to-15s) remap in progress
+                        // instead of waiting for it to finish first.
+                        _ = async {
+                            tokio::time::sleep(nat::RENEW_AFTER).await;
                             // Re-map to refresh the lease; ignore transient errors,
                             // the existing mapping is still valid until it expires.
                             let _ = nat::map_port(port).await;
-                        }
+                        } => {}
                         _ = &mut cancel_rx => {
                             nat::unmap_port(port, protocol).await;
                             return;
