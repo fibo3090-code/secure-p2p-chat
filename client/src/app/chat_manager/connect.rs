@@ -139,22 +139,34 @@ impl ChatManager {
             self.pending_upnp = Some(result_rx);
             self.upnp_cancel = Some(cancel_tx);
             tokio::spawn(async move {
-                let first = nat::map_port(port).await;
+                // Initial mapping, cancellation-aware: if hosting stops while the
+                // gateway call is still pending (up to 15s), abort instead of
+                // creating a mapping after shutdown has begun.
+                let first = tokio::select! {
+                    m = nat::map_port(port) => m,
+                    _ = &mut cancel_rx => return,
+                };
                 let protocol = first.as_ref().ok().map(|m| m.protocol);
                 let _ = result_tx.send(first);
                 // If the first mapping failed there's nothing to renew or clean.
-                let Some(protocol) = protocol else { return };
+                // `protocol` tracks the protocol currently in force so cleanup
+                // unmaps the right one even if a renewal switches UPnP<->NAT-PMP.
+                let Some(mut protocol) = protocol else { return };
                 loop {
                     tokio::select! {
                         // Compose the wait + remap into one future so a cancel
                         // aborts even a slow (up-to-15s) remap in progress
                         // instead of waiting for it to finish first.
-                        _ = async {
+                        remapped = async {
                             tokio::time::sleep(nat::RENEW_AFTER).await;
                             // Re-map to refresh the lease; ignore transient errors,
                             // the existing mapping is still valid until it expires.
-                            let _ = nat::map_port(port).await;
-                        } => {}
+                            nat::map_port(port).await
+                        } => {
+                            if let Ok(m) = remapped {
+                                protocol = m.protocol;
+                            }
+                        }
                         _ = &mut cancel_rx => {
                             nat::unmap_port(port, protocol).await;
                             return;
