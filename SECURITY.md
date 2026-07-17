@@ -51,6 +51,9 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 - No STUN/TURN or peer-to-peer hole punching; WAN support relies on optional
   UPnP/NAT-PMP port mapping (off by default — it opens a router port and embeds
   the external IP in invites) or a self-hosted relay
+- Multi-address invites embed **both** the external and the LAN address when
+  UPnP is enabled, so a shared invite reveals the private LAN IP alongside the
+  public one — share invites only with people you intend to reach you
 - LAN discovery exposes metadata tradeoffs when enabled
 - The runtime keeps a signature-scheme field on the wire, but currently only supports RSA-PSS identity proofs
 - Signed invites expire 30 days after issuance (the signature covers the

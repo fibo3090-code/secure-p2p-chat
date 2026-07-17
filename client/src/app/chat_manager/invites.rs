@@ -61,6 +61,11 @@ impl ChatManager {
             relay_token: Option<String>,
             fingerprint: String,
             public_key: String,
+            // MUST mirror the generator exactly (last field, same skip rule) so
+            // the payload re-serializes to the same bytes that were signed —
+            // including older invites that predate this field.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            addresses: Vec<String>,
         }
 
         #[derive(Serialize, Deserialize)]
@@ -150,8 +155,8 @@ impl ChatManager {
             let payload = &signed_invite.payload;
 
             // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
-            let address = payload.address.as_ref().and_then(|addr| {
-                let trimmed = addr.trim();
+            let sanitize_addr = |raw: &str| -> Option<String> {
+                let trimmed = raw.trim();
                 if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("YOUR_IP:PORT") {
                     None
                 } else {
@@ -159,7 +164,32 @@ impl ChatManager {
                         .ok()
                         .map(|(host, port)| crate::util::format_host_port(&host, port))
                 }
-            });
+            };
+
+            // Collect candidate direct addresses in priority order. Prefer the
+            // multi-address list when present, otherwise fall back to the single
+            // legacy `address`. Sanitize each and drop duplicates while keeping
+            // order, so a peer can try them in turn (e.g. external then LAN).
+            let raw_candidates: Vec<&String> = if payload.addresses.is_empty() {
+                payload.address.iter().collect()
+            } else {
+                payload.addresses.iter().collect()
+            };
+            let mut candidates: Vec<String> = Vec::new();
+            for raw in raw_candidates {
+                if let Some(clean) = sanitize_addr(raw) {
+                    if !candidates.contains(&clean) {
+                        candidates.push(clean);
+                    }
+                }
+            }
+            let address = candidates.first().cloned();
+            // Only persist the extra list when it adds something beyond `address`.
+            let addresses = if candidates.len() > 1 {
+                candidates
+            } else {
+                Vec::new()
+            };
             let relay_server = payload.relay_server.as_ref().and_then(|server| {
                 let trimmed = server.trim();
                 if trimmed.is_empty() {
@@ -180,6 +210,7 @@ impl ChatManager {
                 id: Uuid::new_v4(),
                 name: payload.name.clone(),
                 address,
+                addresses,
                 relay_server,
                 relay_token,
                 fingerprint: Some(payload.fingerprint.clone()),
@@ -237,6 +268,7 @@ impl ChatManager {
                 id: Uuid::new_v4(),
                 name: payload.name,
                 address,
+                addresses: Vec::new(),
                 relay_server: None,
                 relay_token: None,
                 fingerprint: Some(payload.fingerprint),

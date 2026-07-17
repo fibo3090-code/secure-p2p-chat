@@ -41,22 +41,30 @@ pub(crate) async fn list_contacts(
     Ok(mgr.contacts.values().map(contact_dto).collect())
 }
 
-/// The current user's signed invite link. The address prefers the UPnP
-/// external mapping (reachable from outside the LAN) and falls back to the
-/// local IP + the configured listen port, when resolvable.
+/// The current user's signed invite link. Embeds every reachable candidate
+/// address in priority order — the UPnP external mapping first (reachable
+/// from outside the LAN), then the local IP + configured listen port — so
+/// peers try them in turn.
 #[tauri::command]
 pub(crate) async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
-    let address = {
+    let addresses = {
         let mgr = state.manager.lock().await;
         let port = mgr.config.listen_port;
-        mgr.external_address.clone().or_else(|| {
-            messenger_core::util::primary_local_ipv4()
-                .map(|ip| messenger_core::util::format_host_port(&ip, port))
-        })
+        let mut addrs = Vec::new();
+        if let Some(ext) = mgr.external_address.clone() {
+            addrs.push(ext);
+        }
+        if let Some(ip) = messenger_core::util::primary_local_ipv4() {
+            let lan = messenger_core::util::format_host_port(&ip, port);
+            if !addrs.contains(&lan) {
+                addrs.push(lan);
+            }
+        }
+        addrs
     };
     let id = state.identity.lock().unwrap();
-    id.generate_signed_invite_link(address)
+    id.generate_signed_invite_link_with_addresses(addresses, None, None)
         .map_err(|e| e.to_string())
 }
 

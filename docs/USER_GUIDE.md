@@ -158,11 +158,15 @@ Use invite links when:
 
 If your router supports UPnP (or NAT-PMP), the app can ask it to forward your
 listening port while you host, and your invite will carry the external address
-instead of the LAN one — no manual port-forwarding.
+— no manual port-forwarding.
 
 - Enable it in Settings ("UPnP port mapping") or in the TUI with `:set upnp on`.
+- Invites carry **both** addresses when available — the internet-reachable one
+  first, your LAN one second — and the connecting side tries them in order.
+  One invite therefore works for a friend across the internet *and* for a
+  laptop on your own network.
 - It is **off by default**: turning it on opens a port on your router and
-  embeds your public IP in the invites you share.
+  embeds your public IP (alongside your LAN IP) in the invites you share.
 - Two protocols are tried automatically: UPnP/IGD first, then NAT-PMP (common
   on Apple and newer routers).
 - It is best-effort: no gateway, the service disabled, or carrier-grade NAT all

@@ -11,6 +11,19 @@ predate tagged releases.
 
 ### Added
 
+- **Multi-address invites (payload v4).** Signed invites can now carry every
+  reachable candidate address in priority order — the UPnP external address
+  first, the LAN address second — instead of one or the other. A connecting
+  peer tries each in turn with a bounded 10-second per-attempt timeout (a
+  warning toast marks each fallback), so the same invite works from both the
+  internet and the local network. Fully backward compatible in both
+  directions: pre-v4 clients read the primary `address` field and connect as
+  before, and v4 clients keep verifying old invites (the new field is omitted
+  from the signed bytes unless it carries ≥2 entries, mirrored on both the
+  signing and verifying side). Contacts store the candidate list
+  (`Contact.addresses`, old history files load unchanged) and all three UIs
+  embed both addresses when hosting with UPnP enabled.
+
 - **New logo and brand identity.** A speech-bubble + linked-dots mark in a
   teal-to-indigo gradient replaces the RSA-era icon everywhere: the Tauri
   desktop icon trees (Windows/macOS/iOS/Android), the installer icon

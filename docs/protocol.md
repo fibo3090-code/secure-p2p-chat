@@ -172,7 +172,7 @@ Properties:
 - still accepted for compatibility
 - should not be emitted by current UI flows
 
-### Signed v2/v3
+### Signed v2/v3/v4
 
 Format:
 
@@ -182,22 +182,30 @@ chat-p2p://invite/v2/<url_safe_base64_json>
 
 The URL prefix is `v2` for all signed invites. The **payload** carries its own
 `version` field: `2` for a direct invite, `3` when the invite embeds a relay
-route (`relay_server`/`relay_token` present). References to "v3 invites"
-elsewhere in the docs mean this payload version — the URL format is unchanged,
-so v2-era parsers reject v3 payload fields gracefully rather than failing on
-an unknown URL prefix.
+route (`relay_server`/`relay_token` present), `4` when it carries several
+direct-connect candidate addresses (`addresses` present). References to
+"v3/v4 invites" elsewhere in the docs mean this payload version — the URL
+format is unchanged, so older parsers reject newer payload fields gracefully
+rather than failing on an unknown URL prefix.
 
 Payload fields:
 
-- `version` (`2` direct, `3` relay-routed)
+- `version` (`2` direct, `3` relay-routed, `4` multi-address)
 - `timestamp`
 - `nonce`
 - `name`
-- `address`
+- `address` (primary/first candidate — what pre-v4 clients connect to)
 - `fingerprint`
 - `public_key`
 - `relay_server` (optional, payload v3)
 - `relay_token` (optional, payload v3)
+- `addresses` (optional, payload v4): all direct-connect candidates in
+  priority order (e.g. UPnP external address first, LAN second); peers try
+  them in turn with a bounded per-attempt timeout. **Serialization rule:**
+  the field is omitted entirely when it would carry fewer than 2 entries,
+  and both the generator and verifier use the same omit-when-empty rule so
+  invites minted before this field existed re-serialize byte-identically
+  and their signatures keep verifying.
 
 Wrapper fields:
 
@@ -208,8 +216,10 @@ Current verification behavior:
 
 - the payload is serialized using the app’s `serde_json::to_string()` representation
 - the RSA-PSS signature is verified against those exact bytes
-- the timestamp is informational only and is not used for expiry enforcement
-- invalid addresses are dropped during import rather than trusted blindly
+- the signed timestamp is enforced: future-dated invites (beyond clock skew)
+  and invites older than the expiry window are rejected
+- invalid addresses are dropped during import rather than trusted blindly;
+  candidate lists are deduplicated preserving order
 - relay route data is preserved when present in a signed invite
 
 ## Compatibility Notes
