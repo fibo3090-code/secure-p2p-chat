@@ -425,6 +425,30 @@ impl Identity {
         relay_server: Option<String>,
         relay_token: Option<String>,
     ) -> Result<String> {
+        self.generate_signed_invite_link_with_addresses(
+            address.into_iter().collect(),
+            relay_server,
+            relay_token,
+        )
+    }
+
+    /// Generate a signed invite carrying multiple direct-connect candidate
+    /// addresses in priority order (e.g. an internet-reachable address first,
+    /// then a LAN one), plus an optional relay route.
+    ///
+    /// Wire back-compat: `address` is set to the first candidate so older
+    /// clients (which only read the single `address` field) still work, while
+    /// the full ordered list travels in the `addresses` field, which is omitted
+    /// from the signed bytes when it adds nothing beyond `address` (0 or 1
+    /// candidate). Because the verifier mirrors the same `skip_serializing_if`,
+    /// invites minted before this field existed re-serialize identically and
+    /// their signatures keep verifying.
+    pub fn generate_signed_invite_link_with_addresses(
+        &self,
+        addresses: Vec<String>,
+        relay_server: Option<String>,
+        relay_token: Option<String>,
+    ) -> Result<String> {
         use serde::{Deserialize, Serialize};
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -449,10 +473,25 @@ impl Identity {
             relay_token: Option<String>,
             fingerprint: String,
             public_key: String,
+            // MUST stay last with this exact skip rule so pre-existing invites
+            // (no `addresses` key) re-serialize byte-identically and verify.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            addresses: Vec<String>,
         }
 
+        // First candidate is the primary `address` for old-client back-compat;
+        // only carry the full list when it adds something beyond that.
+        let primary = addresses.first().cloned();
+        let multi = if addresses.len() > 1 {
+            addresses
+        } else {
+            Vec::new()
+        };
+
         let payload = SignedInvitePayload {
-            version: if relay_server.is_some() || relay_token.is_some() {
+            version: if !multi.is_empty() {
+                4
+            } else if relay_server.is_some() || relay_token.is_some() {
                 3
             } else {
                 2
@@ -460,11 +499,12 @@ impl Identity {
             timestamp,
             nonce,
             name: self.name.clone(),
-            address,
+            address: primary,
             relay_server,
             relay_token,
             fingerprint: self.fingerprint.clone(),
             public_key: self.public_key_pem.clone(),
+            addresses: multi,
         };
 
         // Serialize payload using the crate-local serde_json representation.
@@ -912,6 +952,72 @@ mod tests {
         assert!(json.contains("relay.example.com:23456"));
         assert!(json.contains("0123456789abcdef0123456789abcdef"));
         assert!(json.contains("\"version\":3"));
+    }
+
+    #[test]
+    fn test_multi_address_invite_carries_ordered_list_and_primary() {
+        let identity = Identity::new_with_plaintext("Multi Addr".to_string()).unwrap();
+        let link = identity
+            .generate_signed_invite_link_with_addresses(
+                vec![
+                    "203.0.113.7:12345".to_string(),
+                    "192.168.1.20:12345".to_string(),
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        let invite: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        let payload = &invite["payload"];
+
+        // Primary `address` is the first candidate (old-client back-compat)…
+        assert_eq!(
+            payload.get("address").and_then(|v| v.as_str()),
+            Some("203.0.113.7:12345")
+        );
+        // …and the full ordered list travels in `addresses`, bumping to v4.
+        let addrs: Vec<&str> = payload["addresses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(addrs, vec!["203.0.113.7:12345", "192.168.1.20:12345"]);
+        assert_eq!(payload.get("version").and_then(|v| v.as_u64()), Some(4));
+    }
+
+    #[test]
+    fn test_single_address_invite_omits_addresses_key() {
+        // Byte-format regression guard: a single-address invite must not emit
+        // an `addresses` key at all, so its signed payload is byte-identical
+        // to invites minted before the field existed (and old invites keep
+        // verifying through the mirrored skip rule on the parse side).
+        let identity = Identity::new_with_plaintext("Single Addr".to_string()).unwrap();
+        for link in [
+            identity
+                .generate_signed_invite_link(Some("192.168.1.20:12345".to_string()))
+                .unwrap(),
+            identity.generate_signed_invite_link(None).unwrap(),
+        ] {
+            let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .unwrap();
+            let invite: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            assert!(
+                invite["payload"].get("addresses").is_none(),
+                "single-address invite must omit the addresses key"
+            );
+            assert_ne!(
+                invite["payload"].get("version").and_then(|v| v.as_u64()),
+                Some(4)
+            );
+        }
     }
 
     #[test]

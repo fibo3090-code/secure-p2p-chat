@@ -660,7 +660,7 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                     app.new_contact_pubkey.clear();
                     app.invite_link_input.clear();
                     app.my_invite_link = None;
-                    app.my_invite_link_addr = None;
+                    app.my_invite_link_addrs.clear();
                     app.qr_code_texture = None;
                     app.active_dialog = ActiveDialog::AddContact;
                 }
@@ -1072,37 +1072,40 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
                     ui.label("📤 Share this link with your friends so they can add you:");
                     ui.add_space(10.0);
 
-                    // Generate link using actual identity; prefer the UPnP
-                    // external address (reachable from outside the LAN) over
-                    // the best-effort local one. The external address resolves
-                    // asynchronously (up to 15s after hosting starts), so a link
-                    // first built from the LAN address is regenerated once the
-                    // external address appears or changes.
-                    let invite_addr = {
-                        let port = app
+                    // Generate link using actual identity. The invite carries
+                    // every reachable candidate in priority order: the UPnP
+                    // external address first (reachable from the internet),
+                    // then the LAN one — peers try them in turn. The external
+                    // address resolves asynchronously (up to 15s after hosting
+                    // starts), so the link is regenerated once it appears or
+                    // changes.
+                    let invite_addrs: Vec<String> = {
+                        let (port, external) = app
                             .chat_manager
                             .try_lock()
-                            .map(|m| m.config.listen_port)
-                            .ok();
-                        let external = app
-                            .chat_manager
-                            .try_lock()
-                            .ok()
-                            .and_then(|m| m.external_address.clone());
-                        external.or_else(|| {
-                            port.and_then(|port| {
-                                primary_local_ipv4().map(|ip| format!("{}:{}", ip, port))
-                            })
-                        })
+                            .map(|m| (Some(m.config.listen_port), m.external_address.clone()))
+                            .unwrap_or((None, None));
+                        let mut addrs = Vec::new();
+                        if let Some(ext) = external {
+                            addrs.push(ext);
+                        }
+                        if let (Some(port), Some(ip)) = (port, primary_local_ipv4()) {
+                            let lan = format!("{}:{}", ip, port);
+                            if !addrs.contains(&lan) {
+                                addrs.push(lan);
+                            }
+                        }
+                        addrs
                     };
-                    if app.my_invite_link.is_none() || app.my_invite_link_addr != invite_addr {
-                        match app
-                            .identity
-                            .generate_signed_invite_link(invite_addr.clone())
-                        {
+                    if app.my_invite_link.is_none() || app.my_invite_link_addrs != invite_addrs {
+                        match app.identity.generate_signed_invite_link_with_addresses(
+                            invite_addrs.clone(),
+                            None,
+                            None,
+                        ) {
                             Ok(link) => {
                                 app.my_invite_link = Some(link);
-                                app.my_invite_link_addr = invite_addr;
+                                app.my_invite_link_addrs = invite_addrs;
                                 // Force the QR to re-render for the new link.
                                 app.qr_code_texture = None;
                             }

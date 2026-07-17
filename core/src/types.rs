@@ -72,6 +72,11 @@ pub struct Contact {
     pub id: Uuid,
     pub name: String,
     pub address: Option<String>,
+    /// Additional direct-connect candidate addresses in priority order
+    /// (e.g. an internet-reachable address plus a LAN one). `address` stays the
+    /// primary/first for back-compat; connecting tries these in order.
+    #[serde(default)]
+    pub addresses: Vec<String>,
     #[serde(default)]
     pub relay_server: Option<String>,
     #[serde(default)]
@@ -88,6 +93,19 @@ pub struct Contact {
     #[serde(default)]
     pub tags: Vec<String>,
     pub last_seen: Option<DateTime<Utc>>,
+}
+
+impl Contact {
+    /// Direct-connect candidate addresses in priority order. Falls back to the
+    /// single legacy `address` when the multi-address list is empty (contacts
+    /// imported from older invites or loaded from old history files).
+    pub fn candidate_addresses(&self) -> Vec<String> {
+        if self.addresses.is_empty() {
+            self.address.iter().cloned().collect()
+        } else {
+            self.addresses.clone()
+        }
+    }
 }
 
 /// Trust level for a contact

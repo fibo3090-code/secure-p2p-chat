@@ -258,20 +258,38 @@ impl ChatManager {
         existing_chat_id: Option<Uuid>,
         privkey: RsaPrivateKey,
     ) -> Result<Uuid> {
+        self.connect_to_host_candidates(vec![(host.to_string(), port)], existing_chat_id, privkey)
+            .await
+    }
+
+    /// Connect trying each `(host, port)` candidate in priority order (e.g. a
+    /// contact's internet-reachable address first, then the LAN one). The chat
+    /// is labeled after the first candidate; the session runs over whichever
+    /// address actually accepted the connection.
+    pub async fn connect_to_host_candidates(
+        &mut self,
+        targets: Vec<(String, u16)>,
+        existing_chat_id: Option<Uuid>,
+        privkey: RsaPrivateKey,
+    ) -> Result<Uuid> {
+        let (host, port) = targets
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No candidate addresses to connect to"))?;
+        let host = host.as_str();
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
-        tracing::info!(chat_id = %chat_id, host = %host, port = %port, "connect_to_host called");
+        tracing::info!(chat_id = %chat_id, host = %host, port = %port, candidates = %targets.len(), "connect_to_host called");
 
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
 
-        let host_copy = host.to_string();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let connection_password = self.connection_password.clone();
 
+        let targets_copy = targets.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_client_session(
-                &host_copy,
-                port,
+            if let Err(e) = run_client_session_multi(
+                &targets_copy,
                 privkey,
                 to_app_tx,
                 from_app_rx,
@@ -394,6 +412,15 @@ impl ChatManager {
             .get(&contact_id)
             .ok_or_else(|| anyhow::anyhow!("Contact not found"))?
             .clone();
+        // Direct-connect candidates in priority order (multi-address invites:
+        // e.g. internet-reachable first, LAN second). Unparsable entries are
+        // dropped rather than aborting, so a stale candidate can't block the
+        // relay/fingerprint fallbacks below.
+        let candidates: Vec<(String, u16)> = contact
+            .candidate_addresses()
+            .iter()
+            .filter_map(|a| Self::parse_address(a).ok())
+            .collect();
         // If we already have a mapped chat for this contact, ensure it has a session; otherwise try to establish one
         if let Some(mapped) = self.contact_to_chat.get(&contact_id).copied() {
             let has_session = self.sessions.contains_key(&mapped);
@@ -426,16 +453,18 @@ impl ChatManager {
                     return Ok(active_chat_id);
                 }
             }
-            // Otherwise, if the contact has an address, start a connection using the mapped chat id
-            if let Some(address) = contact.address.clone() {
-                if let Ok((host, port)) = Self::parse_address(&address) {
-                    tracing::info!("Connecting mapped chat {} to {}:{}", mapped, host, port);
-                    let chat_id = self
-                        .connect_to_host(&host, port, Some(mapped), privkey.clone())
-                        .await?;
-                    self.associate_contact_with_chat(contact_id, chat_id);
-                    return Ok(chat_id);
-                }
+            // Otherwise, if the contact has direct addresses, start a connection using the mapped chat id
+            if !candidates.is_empty() {
+                tracing::info!(
+                    "Connecting mapped chat {} via {} candidate address(es)",
+                    mapped,
+                    candidates.len()
+                );
+                let chat_id = self
+                    .connect_to_host_candidates(candidates.clone(), Some(mapped), privkey.clone())
+                    .await?;
+                self.associate_contact_with_chat(contact_id, chat_id);
+                return Ok(chat_id);
             }
             if let (Some(relay_server), Some(relay_token)) =
                 (contact.relay_server.clone(), contact.relay_token.clone())
@@ -450,16 +479,19 @@ impl ChatManager {
         }
 
         tracing::debug!(
-            "connect_to_contact: id={}, has_address={}, has_fp={}",
+            "connect_to_contact: id={}, candidates={}, has_fp={}",
             contact_id,
-            contact.address.is_some(),
+            candidates.len(),
             contact.fingerprint.is_some()
         );
-        if let Some(address) = contact.address.clone() {
-            let (host, port) = Self::parse_address(&address)?;
-            tracing::info!("Connecting to contact {} via {}:{}", contact_id, host, port);
+        if !candidates.is_empty() {
+            tracing::info!(
+                "Connecting to contact {} via {} candidate address(es)",
+                contact_id,
+                candidates.len()
+            );
             let chat_id = self
-                .connect_to_host(&host, port, existing_chat_id, privkey.clone())
+                .connect_to_host_candidates(candidates, existing_chat_id, privkey.clone())
                 .await?;
             self.associate_contact_with_chat(contact_id, chat_id);
             Ok(chat_id)

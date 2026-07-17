@@ -341,6 +341,94 @@ fn parse_v2_signed_invite_link_valid() {
     assert_eq!(contact.fingerprint, Some(identity.fingerprint.clone()));
     assert_eq!(contact.public_key, Some(identity.public_key_pem.clone()));
     assert_eq!(contact.trust_state, TrustState::Unverified);
+    // Single-address invite: no extra candidate list.
+    assert!(contact.addresses.is_empty());
+    assert_eq!(
+        contact.candidate_addresses(),
+        vec!["127.0.0.1:9001".to_string()]
+    );
+}
+
+#[test]
+fn parse_multi_address_invite_populates_ordered_candidates() {
+    use crate::identity::Identity;
+
+    let mgr = ChatManager::default();
+    let identity = Identity::new_with_plaintext("Multi Homed".to_string()).unwrap();
+
+    // External-first ordering, with a duplicate and an unparsable entry that
+    // must be sanitized out without breaking signature verification.
+    let link = identity
+        .generate_signed_invite_link_with_addresses(
+            vec![
+                "203.0.113.7:12345".to_string(),
+                "not an address".to_string(),
+                "192.168.1.20:12345".to_string(),
+                "203.0.113.7:12345".to_string(), // duplicate of the first
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+
+    let contact = mgr
+        .parse_invite_link(&link)
+        .expect("multi-address invite must verify and parse");
+
+    assert_eq!(contact.name, "Multi Homed");
+    // Primary address is the first valid candidate…
+    assert_eq!(contact.address, Some("203.0.113.7:12345".to_string()));
+    // …and the ordered, deduplicated, sanitized list is preserved.
+    assert_eq!(
+        contact.addresses,
+        vec![
+            "203.0.113.7:12345".to_string(),
+            "192.168.1.20:12345".to_string()
+        ]
+    );
+    assert_eq!(contact.candidate_addresses(), contact.addresses);
+}
+
+#[test]
+fn contact_candidate_addresses_falls_back_to_legacy_single() {
+    // Contacts imported before multi-address invites (or from old history
+    // files) have only `address`; candidate_addresses() must still yield it.
+    let contact = Contact {
+        id: uuid::Uuid::new_v4(),
+        name: "Legacy".to_string(),
+        address: Some("10.0.0.9:6000".to_string()),
+        addresses: Vec::new(),
+        relay_server: None,
+        relay_token: None,
+        fingerprint: None,
+        public_key: None,
+        created_at: chrono::Utc::now(),
+        trust_state: TrustState::Unverified,
+        notes: String::new(),
+        tags: Vec::new(),
+        last_seen: None,
+    };
+    assert_eq!(
+        contact.candidate_addresses(),
+        vec!["10.0.0.9:6000".to_string()]
+    );
+
+    // And an old-format JSON blob (no `addresses` key) still deserializes.
+    let old_json = serde_json::json!({
+        "id": uuid::Uuid::new_v4(),
+        "name": "Old JSON",
+        "address": "10.0.0.9:6000",
+        "fingerprint": null,
+        "public_key": null,
+        "created_at": chrono::Utc::now(),
+        "last_seen": null,
+    });
+    let loaded: Contact = serde_json::from_value(old_json).unwrap();
+    assert!(loaded.addresses.is_empty());
+    assert_eq!(
+        loaded.candidate_addresses(),
+        vec!["10.0.0.9:6000".to_string()]
+    );
 }
 
 #[test]

@@ -27,6 +27,7 @@ impl ChatManager {
             id,
             name,
             address,
+            addresses: Vec::new(),
             relay_server: None,
             relay_token: None,
             fingerprint,

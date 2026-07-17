@@ -13,6 +13,7 @@ fn sample_contact(name: &str) -> Contact {
         id: Uuid::new_v4(),
         name: name.to_string(),
         address: Some("127.0.0.1:12345".to_string()),
+        addresses: Vec::new(),
         relay_server: None,
         relay_token: None,
         fingerprint: Some("AA".repeat(32)),

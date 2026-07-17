@@ -609,9 +609,12 @@ old/new peer matrix.
 
 - Internet connectivity: **UPnP + NAT-PMP port mapping is shipped** (opt-in;
   the host asks the router to forward the listening port — UPnP/IGD first, then
-  NAT-PMP — and invites carry the external address, falling back to LAN/relay).
-  Still open: PCP gateways, real hole punching for routers without IGD/NAT-PMP,
-  and CGNAT (relay remains the answer there).
+  NAT-PMP — falling back to LAN/relay), and **invites are multi-address**
+  (payload v4: external + LAN candidates in priority order, tried in turn by
+  the connecting peer with a bounded per-attempt timeout; back-compatible both
+  ways with pre-v4 invites/clients). Still open: PCP gateways, real hole
+  punching for routers without IGD/NAT-PMP, and CGNAT (relay remains the
+  answer there).
 
 **UX**
 

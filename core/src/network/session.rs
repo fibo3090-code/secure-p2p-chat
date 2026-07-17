@@ -324,9 +324,78 @@ pub async fn run_host_session(
 
 /// Run client session: connect, handshake (v3), message loop
 #[allow(clippy::too_many_arguments)]
+/// Attempt a TCP connection to each candidate in order, bounding every attempt
+/// with [`crate::CONNECT_ATTEMPT_TIMEOUT_SECS`] so one dead address (which
+/// would otherwise hang for the OS connect timeout) cannot stall the fallback
+/// to the next. Emits a `Warning` event between failed attempts so the UI can
+/// show progress. Returns the connected stream plus the winning target.
+pub async fn connect_first_reachable(
+    targets: &[(String, u16)],
+    to_app_tx: &mpsc::UnboundedSender<SessionEvent>,
+) -> Result<(TcpStream, String, u16)> {
+    if targets.is_empty() {
+        return Err(anyhow!("No candidate addresses to connect to"));
+    }
+    let timeout = std::time::Duration::from_secs(crate::CONNECT_ATTEMPT_TIMEOUT_SECS);
+    let mut last_err: Option<anyhow::Error> = None;
+    for (i, (host, port)) in targets.iter().enumerate() {
+        match tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), *port))).await {
+            Ok(Ok(stream)) => return Ok((stream, host.clone(), *port)),
+            Ok(Err(e)) => {
+                tracing::warn!(host = %host, port = %port, error = %e, "Candidate address refused/unreachable");
+                last_err = Some(e.into());
+            }
+            Err(_) => {
+                tracing::warn!(host = %host, port = %port, "Candidate address timed out");
+                last_err = Some(anyhow!(
+                    "Connection to {}:{} timed out after {}s",
+                    host,
+                    port,
+                    crate::CONNECT_ATTEMPT_TIMEOUT_SECS
+                ));
+            }
+        }
+        // More candidates to go: tell the UI we're falling back.
+        if i + 1 < targets.len() {
+            let (next_host, next_port) = &targets[i + 1];
+            let _ = to_app_tx.send(SessionEvent::Warning(format!(
+                "Could not reach {}:{}, trying {}:{}…",
+                host, port, next_host, next_port
+            )));
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("All candidate addresses failed")))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_client_session(
     host: &str,
     port: u16,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+    connection_password: Option<String>,
+) -> Result<()> {
+    run_client_session_multi(
+        &[(host.to_string(), port)],
+        privkey,
+        to_app_tx,
+        from_app_rx,
+        confirm_rx,
+        chat_id,
+        connection_password,
+    )
+    .await
+}
+
+/// Try each `(host, port)` candidate in priority order (bounded per-attempt
+/// timeout) and run the client session over the first that accepts the TCP
+/// connection. Later candidates are only tried when earlier ones fail to
+/// *connect* — once a stream is established the session lives or dies there.
+pub async fn run_client_session_multi(
+    targets: &[(String, u16)],
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
@@ -334,9 +403,10 @@ pub async fn run_client_session(
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()> {
-    // 1. Connect to host
-    let mut stream = TcpStream::connect((host, port)).await?;
+    // 1. Connect to the first reachable candidate
+    let (mut stream, host, port) = connect_first_reachable(targets, &to_app_tx).await?;
     tracing::info!("Connected to {}:{}", host, port);
+    let host = host.as_str();
 
     to_app_tx
         .send(SessionEvent::Connected {
@@ -1366,6 +1436,53 @@ mod tests {
     use crate::RSA_KEY_BITS;
     use anyhow::Result;
     use rand::RngCore;
+
+    #[tokio::test]
+    async fn connect_first_reachable_falls_back_to_next_candidate() {
+        // A live listener…
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        // …and a dead candidate: bind-then-drop guarantees the port was free a
+        // moment ago, so connecting to it gets an immediate RST (fast fail).
+        let dead_port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let targets = vec![
+            ("127.0.0.1".to_string(), dead_port),
+            ("127.0.0.1".to_string(), live_port),
+        ];
+        let (_stream, host, port) = connect_first_reachable(&targets, &tx)
+            .await
+            .expect("must fall back to the live candidate");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, live_port);
+
+        // A Warning must have been emitted for the failed first candidate.
+        match rx.try_recv() {
+            Ok(SessionEvent::Warning(msg)) => {
+                assert!(msg.contains(&dead_port.to_string()));
+                assert!(msg.contains(&live_port.to_string()));
+            }
+            other => panic!("expected Warning event, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_first_reachable_errors_when_all_dead() {
+        let dead_port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let targets = vec![("127.0.0.1".to_string(), dead_port)];
+        assert!(connect_first_reachable(&targets, &tx).await.is_err());
+
+        // Empty candidate list is an error, not a panic.
+        assert!(connect_first_reachable(&[], &tx).await.is_err());
+    }
 
     fn test_cipher() -> AesCipher {
         let mut key = [0u8; crate::AES_KEY_SIZE];

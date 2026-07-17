@@ -1042,14 +1042,38 @@ impl TuiApp {
                 }
             }
 
-            TuiCommand::Invite(addr) => match self.identity.generate_signed_invite_link(addr) {
-                Ok(link) => {
-                    Self::copy_to_clipboard(&link);
-                    self.overlay = TuiOverlay::Invite { link };
-                    self.toast(ToastLevel::Success, "Invite link copied".to_string());
+            TuiCommand::Invite(addr) => {
+                // Explicit address wins; otherwise embed every reachable
+                // candidate in priority order (UPnP external first, LAN next)
+                // so peers can try them in turn.
+                let addrs: Vec<String> = match addr {
+                    Some(a) => vec![a],
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(ext) = self.chat_manager.external_address.clone() {
+                            v.push(ext);
+                        }
+                        if let Some(ip) = crate::util::primary_local_ipv4() {
+                            let lan = format!("{}:{}", ip, self.chat_manager.config.listen_port);
+                            if !v.contains(&lan) {
+                                v.push(lan);
+                            }
+                        }
+                        v
+                    }
+                };
+                match self
+                    .identity
+                    .generate_signed_invite_link_with_addresses(addrs, None, None)
+                {
+                    Ok(link) => {
+                        Self::copy_to_clipboard(&link);
+                        self.overlay = TuiOverlay::Invite { link };
+                        self.toast(ToastLevel::Success, "Invite link copied".to_string());
+                    }
+                    Err(e) => self.toast(ToastLevel::Error, format!("Invite failed: {}", e)),
                 }
-                Err(e) => self.toast(ToastLevel::Error, format!("Invite failed: {}", e)),
-            },
+            }
             TuiCommand::InviteRelay(relay) => {
                 self.pending_command = Some(TuiCommand::HostRelay { relay, token: None });
             }

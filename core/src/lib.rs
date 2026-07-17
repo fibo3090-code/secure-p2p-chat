@@ -38,6 +38,11 @@ pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits (GCM authentication tag)
 pub const REKEY_NONCE_SIZE: usize = 16; // 128-bit salt for HKDF key rotation
 pub const RSA_KEY_BITS: usize = 2048;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+/// Per-candidate TCP connect timeout when an invite carries several
+/// addresses to try in order (multi-address invites). Short enough that
+/// falling from a dead external address back to the LAN one feels snappy,
+/// long enough for a slow WAN round-trip.
+pub const CONNECT_ATTEMPT_TIMEOUT_SECS: u64 = 10;
 /// Maximum file size for transfers: 10 GiB
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 /// Signed invites older than this are rejected at import (30 days).

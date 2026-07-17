@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::core::ProtocolMessage;
 use crate::network::{
-    generate_relay_token, run_client_session, run_client_session_via_relay, run_host_session,
+    generate_relay_token, run_client_session_multi, run_client_session_via_relay, run_host_session,
     run_host_session_via_relay,
 };
 use crate::transfer::IncomingFileSync;

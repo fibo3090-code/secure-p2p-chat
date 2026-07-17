@@ -362,6 +362,7 @@ mod tests {
                 id: contact_id,
                 name: "Alice".into(),
                 address: Some("127.0.0.1:5000".into()),
+                addresses: Vec::new(),
                 relay_server: None,
                 relay_token: None,
                 fingerprint: None,
