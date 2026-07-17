@@ -32,6 +32,16 @@ pub const MAX_PACKET_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
 pub const MAX_TEXT_MESSAGE_BYTES: usize = 64 * 1024; // 64 KiB
 pub const TEXT_CHUNK_BYTES: usize = 48 * 1024; // 48 KiB to leave headroom for metadata
+/// Upper bound on how many chunks one large text message may be split into,
+/// enforced symmetrically on send and receive. Caps a chunked message at
+/// `MAX_TEXT_CHUNKS * TEXT_CHUNK_BYTES` (~24 MiB) and — critically — stops a
+/// peer from sending a single `TextChunk` whose `total_chunks` is huge, which
+/// would make the reassembly buffer pre-allocate gigabytes (remote OOM/DoS).
+pub const MAX_TEXT_CHUNKS: u32 = 512;
+/// Cap on distinct in-flight large-message reassembly buffers per chat, so a
+/// peer cannot exhaust memory by opening many partial messages that each sit
+/// around until the reassembly timeout.
+pub const MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT: usize = 16;
 pub const AES_KEY_SIZE: usize = 32; // 256 bits
 pub const AES_NONCE_SIZE: usize = 12; // 96 bits (GCM standard)
 pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits (GCM authentication tag)

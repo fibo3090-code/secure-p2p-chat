@@ -1081,3 +1081,48 @@ fn delete_all_data_removes_files_and_clears_state() {
     assert!(mgr.contact_to_chat.is_empty());
     assert!(mgr.fingerprint_verification_request.is_none());
 }
+
+#[test]
+fn register_incoming_text_chunk_rejects_oversized_total_chunks() {
+    // Defense in depth beyond the wire decoder: a bogus total_chunks must not
+    // drive a giant reassembly-buffer allocation.
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+
+    let err = mgr
+        .register_incoming_text_chunk(chat_id, message_id, 0, u32::MAX, "x".to_string(), 0)
+        .expect_err("oversized total_chunks must be rejected");
+    assert!(err.to_string().contains("Invalid chunk count"));
+    // No buffer should have been created.
+    assert!(mgr.incoming_text_messages.is_empty());
+}
+
+#[test]
+fn register_incoming_text_chunk_caps_concurrent_partial_messages() {
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+
+    // Open the maximum number of distinct partial messages (each 2 chunks, so
+    // none completes and they all stay in flight).
+    for _ in 0..crate::MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT {
+        let message_id = Uuid::new_v4();
+        mgr.register_incoming_text_chunk(chat_id, message_id, 0, 2, "a".to_string(), 0)
+            .expect("within the concurrent cap");
+    }
+
+    // One more distinct message must be rejected.
+    let err = mgr
+        .register_incoming_text_chunk(chat_id, Uuid::new_v4(), 0, 2, "a".to_string(), 0)
+        .expect_err("beyond the concurrent cap must be rejected");
+    assert!(err.to_string().contains("Too many concurrent"));
+
+    // But a further chunk for an already-tracked message is still accepted.
+    let existing = *mgr
+        .incoming_text_messages
+        .keys()
+        .find(|(c, _)| *c == chat_id)
+        .expect("a partial message exists");
+    mgr.register_incoming_text_chunk(existing.0, existing.1, 1, 2, "b".to_string(), 0)
+        .expect("completing an existing message stays allowed");
+}

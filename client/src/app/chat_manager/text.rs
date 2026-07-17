@@ -32,6 +32,16 @@ impl ChatManager {
         let message_id = Uuid::new_v4();
         let total_chunks = u32::try_from(chunks.len())
             .map_err(|_| anyhow!("Message is too large to chunk safely"))?;
+        // Symmetric with the receiver's decode cap: refuse to build a message
+        // the peer would reject anyway, so the user gets a clear error instead
+        // of a silently dropped message.
+        if total_chunks > crate::MAX_TEXT_CHUNKS {
+            bail!(
+                "Message is too large to send (would need {} chunks, max {})",
+                total_chunks,
+                crate::MAX_TEXT_CHUNKS
+            );
+        }
         let mut messages = Vec::with_capacity(chunks.len());
 
         for (chunk_index, text_part) in chunks.into_iter().enumerate() {
@@ -107,9 +117,28 @@ impl ChatManager {
         text_part: String,
         timestamp_millis: u64,
     ) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
+        // Defense in depth: the wire decoder already caps `total_chunks`, but
+        // guard here too so this buffer can never pre-allocate an unbounded
+        // number of slots regardless of how it is reached.
+        if total_chunks == 0 || total_chunks > crate::MAX_TEXT_CHUNKS {
+            bail!("Invalid chunk count for large text message");
+        }
+        let key = (chat_id, message_id);
+        // Bound the number of concurrent partial messages per chat so a peer
+        // cannot open many reassembly buffers and sit on memory until timeout.
+        if !self.incoming_text_messages.contains_key(&key) {
+            let in_flight = self
+                .incoming_text_messages
+                .keys()
+                .filter(|(c, _)| *c == chat_id)
+                .count();
+            if in_flight >= crate::MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT {
+                bail!("Too many concurrent large messages in flight for this chat");
+            }
+        }
         let entry = self
             .incoming_text_messages
-            .entry((chat_id, message_id))
+            .entry(key)
             .or_insert_with(|| IncomingTextMessage {
                 timestamp_millis,
                 parts: vec![None; total_chunks as usize],
