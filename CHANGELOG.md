@@ -113,6 +113,30 @@ predate tagged releases.
   (`auth`, `chats`, `connect`, `contacts`, `party`). Pure refactor: command
   names and behavior are unchanged, so the frontend is untouched.
 
+### Security
+
+- **Remote out-of-memory crash in large-text reassembly fixed.** A peer could
+  send a single chunked-text frame declaring a huge `total_chunks`, making the
+  receiver pre-allocate gigabytes and abort. The chunk count is now capped
+  before any allocation (symmetrically on send), with a bound on concurrent
+  partial messages per chat.
+- **Session rekey no longer drops active conversations.** A key rotation could
+  desync the two peers and tear the connection down — either because both sides
+  rotated in the same round trip, or because frames the peer had already sent
+  under the old key were still in flight when the initiator retired it. Rekeying
+  is now initiated by a single deterministic side (the host, so simultaneous
+  rotation cannot happen), and the receiver keeps the previous key for a bounded
+  window (dropped as soon as a frame decrypts under the new key) so in-flight
+  old-key frames still decrypt. The host also rekeys on its keep-alive tick, so
+  it rotates on schedule even when only receiving.
+- **RSA decryption removed from the codebase.** The product never decrypted
+  with RSA on the wire (X25519 does key agreement; RSA is signatures only), so
+  the unused RSA-OAEP encrypt/decrypt functions were deleted. This keeps the
+  operation targeted by the `rsa` timing advisory (`RUSTSEC-2023-0071`) out of
+  the product entirely. Known cryptographic-design limits (no post-compromise
+  security / double ratchet; TOFU without key transparency) are now documented
+  explicitly in `SECURITY.md`.
+
 ### Fixed
 
 - **"File sent" is now confirmed at the wire, not at the queue.** Sending a

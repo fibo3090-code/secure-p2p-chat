@@ -15,7 +15,7 @@ use rsa::{
     pkcs8::{DecodePublicKey, EncodePublicKey},
     pss::{SigningKey, VerifyingKey},
     signature::{RandomizedSigner, SignatureEncoding},
-    Oaep, RsaPrivateKey, RsaPublicKey,
+    RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -63,21 +63,13 @@ pub fn pem_decode_private(pem: &str) -> Result<RsaPrivateKey> {
     RsaPrivateKey::from_pkcs1_pem(pem).map_err(|e| anyhow!("Private PEM decode failed: {}", e))
 }
 
-/// Encrypt data using RSA-OAEP with SHA-256
-pub fn rsa_encrypt_oaep(pubkey: &RsaPublicKey, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let padding = Oaep::new::<Sha256>();
-    pubkey
-        .encrypt(&mut OsRng, padding, plaintext)
-        .map_err(|e| anyhow!("RSA encryption failed: {}", e))
-}
-
-/// Decrypt data using RSA-OAEP with SHA-256
-pub fn rsa_decrypt_oaep(privkey: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
-    let padding = Oaep::new::<Sha256>();
-    privkey
-        .decrypt(padding, ciphertext)
-        .map_err(|e| anyhow!("RSA decryption failed: {}", e))
-}
+// NOTE: RSA-OAEP encryption/decryption was intentionally removed. This product
+// never performs RSA *decryption* on the wire — the live handshake uses X25519
+// for key agreement and RSA only for PSS *signatures* on identity proofs. The
+// RSA private-key decryption path is precisely what the Marvin timing attack
+// (RUSTSEC-2023-0071) targets, so removing these functions keeps that
+// side-channel out of the product entirely rather than relying on it being
+// "unused". Do not reintroduce RSA encryption/decryption; use the AEAD tunnel.
 
 /// Calculate SHA-256 fingerprint of public key PEM
 pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> String {
@@ -673,18 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rsa_roundtrip() {
-        let privkey = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let pubkey = RsaPublicKey::from(&privkey);
-
-        let plaintext = b"Secret AES key";
-        let encrypted = rsa_encrypt_oaep(&pubkey, plaintext).unwrap();
-        let decrypted = rsa_decrypt_oaep(&privkey, &encrypted).unwrap();
-
-        assert_eq!(plaintext, &decrypted[..]);
-    }
-
-    #[test]
     fn test_rsa_pem_roundtrip() {
         let privkey = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let pubkey = RsaPublicKey::from(&privkey);
@@ -692,15 +672,14 @@ mod tests {
         let pem = pem_encode_public(&pubkey).unwrap();
         let decoded = pem_decode_public(&pem).unwrap();
 
-        // Keys should be functionally equivalent
-        let plaintext = b"Test";
-        let enc1 = rsa_encrypt_oaep(&pubkey, plaintext).unwrap();
-        let enc2 = rsa_encrypt_oaep(&decoded, plaintext).unwrap();
-
-        assert_eq!(
-            rsa_decrypt_oaep(&privkey, &enc1).unwrap(),
-            rsa_decrypt_oaep(&privkey, &enc2).unwrap()
-        );
+        // The PEM-decoded public key must be functionally equivalent to the
+        // original: a signature made with the private key verifies under both.
+        // (Verified via PSS signatures — the only RSA operation the product
+        // actually uses; RSA encryption was removed, see the note above.)
+        let data = b"pem roundtrip";
+        let sig = rsa_sign_pss(&privkey, data).unwrap();
+        assert!(rsa_verify_pss(&pubkey, data, &sig).is_ok());
+        assert!(rsa_verify_pss(&decoded, data, &sig).is_ok());
     }
 
     #[test]

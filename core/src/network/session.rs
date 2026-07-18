@@ -1186,6 +1186,52 @@ fn validate_message_sequence(
     Ok(())
 }
 
+/// Send a `Rekey` frame and rotate to the next session key.
+///
+/// Only ONE side of a session (the host) ever initiates a rekey. If both sides
+/// could initiate, they might rekey in the same round trip — each applying its
+/// own new key before the other's `Rekey` (encrypted under the *old* key)
+/// arrives — and the next frame would be undecryptable, tearing the session
+/// down. A single deterministic initiator makes that race impossible; the
+/// other side rekeys only in response to a received `Rekey`.
+async fn initiate_rekey<S>(
+    stream: &mut S,
+    cipher: &mut AesCipher,
+    prev_cipher: &mut Option<AesCipher>,
+    transport_aad: &[u8],
+    sent_seq: &mut u64,
+    messages_since_rekey: &mut u64,
+    last_rekey_time: &mut Instant,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    use crate::core::{generate_rekey_nonce, rekey_session_key};
+    let nonce = generate_rekey_nonce();
+    *sent_seq += 1;
+    let rekey_msg = ProtocolMessage::Rekey {
+        nonce: nonce.to_vec(),
+        seq: *sent_seq,
+    };
+    let encrypted = cipher.encrypt(&rekey_msg.to_plain_bytes(), Some(transport_aad));
+    send_packet(stream, &encrypted).await?;
+    // Apply the new key only after the frame is on the wire (encrypted under the
+    // current key), so the peer can still decrypt the Rekey itself.
+    let next_key = rekey_session_key(&cipher.get_current_key(), &nonce);
+    let role = cipher.role();
+    // Retain the outgoing side's *old* key for the receive path: the peer keeps
+    // sending under it until it processes this Rekey, so frames encrypted with
+    // the old key can still be in flight. The window closes as soon as a frame
+    // decrypts under the new key (proof the peer has switched). See the receive
+    // branch in run_message_loop.
+    *prev_cipher = Some(cipher.clone());
+    *cipher = AesCipher::new_with_role(&next_key, role)?;
+    *messages_since_rekey = 0;
+    *last_rekey_time = Instant::now();
+    tracing::info!("Session key rotated (initiated rekey)");
+    Ok(())
+}
+
 /// Main message loop: send and receive encrypted messages with replay protection
 async fn run_message_loop<S>(
     mut stream: S,
@@ -1224,6 +1270,18 @@ where
     let mut messages_since_rekey: u64 = 0;
     let mut last_rekey_time = std::time::Instant::now();
 
+    // Only the host initiates rekeys, so the two peers can never rekey
+    // simultaneously and desync their keys (the client rekeys only in response
+    // to a received `Rekey`). Role is fixed for the life of the session and
+    // preserved across rekeys, so this is stable.
+    let is_rekey_initiator = cipher.role() == NonceRole::Host;
+
+    // The key in force *before* the most recent rotation, kept for a bounded
+    // window so frames the peer sent under the old key (still in flight when we
+    // rotated) remain decryptable. Cleared the moment a frame decrypts under the
+    // current key — proof the peer has switched and no old-key frames remain.
+    let mut prev_cipher: Option<AesCipher> = None;
+
     // First tick only after a full interval (interval() would fire immediately).
     let mut keepalive = tokio::time::interval_at(
         tokio::time::Instant::now() + keepalive_interval,
@@ -1239,7 +1297,22 @@ where
                     Ok(Ok(encrypted)) => {
                         tracing::trace!("Received {} bytes encrypted", encrypted.len());
 
-                        if let Some(plaintext) = cipher.decrypt(&encrypted, Some(&transport_aad)) {
+                        // Try the current key first. If it works, the peer has
+                        // switched to it, so any retained previous key can be
+                        // dropped (its in-flight window is closed). If it fails,
+                        // fall back to the previous key for frames the peer sent
+                        // under the old key before it processed our Rekey.
+                        let decrypted = match cipher.decrypt(&encrypted, Some(&transport_aad)) {
+                            Some(pt) => {
+                                prev_cipher = None;
+                                Some(pt)
+                            }
+                            None => prev_cipher
+                                .as_ref()
+                                .and_then(|pc| pc.decrypt(&encrypted, Some(&transport_aad))),
+                        };
+
+                        if let Some(plaintext) = decrypted {
                             tracing::trace!("Decrypted {} bytes", plaintext.len());
 
                             if let Some(msg) = ProtocolMessage::from_plain_bytes(&plaintext) {
@@ -1260,6 +1333,11 @@ where
 
                                             let current_key_bytes = cipher.get_current_key();
                                             let next_key = rekey_session_key(&current_key_bytes, &received_nonce);
+                                            // Keep the old key briefly so any of our
+                                            // own not-yet-acknowledged frames or a
+                                            // reordered old-key frame still decrypt;
+                                            // dropped on the first new-key frame.
+                                            prev_cipher = Some(cipher.clone());
                                             cipher = AesCipher::new_with_role(&next_key, cipher.role())?;
                                             messages_since_rekey = 0;
                                             last_rekey_time = std::time::Instant::now();
@@ -1294,10 +1372,12 @@ where
                                 tracing::debug!("Raw plaintext (truncated): {:.64}", String::from_utf8_lossy(&plaintext));
                             }
                         } else {
-                            // An AEAD failure over a reliable, ordered stream means
-                            // the channel is desynced or tampered with — it cannot
-                            // recover, so fail closed instead of spinning on every
-                            // subsequent (also-undecryptable) packet until idle timeout.
+                            // Undecryptable under BOTH the current and the retained
+                            // previous key over a reliable, ordered stream means the
+                            // channel is genuinely desynced or tampered with — it
+                            // cannot recover, so fail closed instead of spinning on
+                            // every subsequent (also-undecryptable) packet until the
+                            // idle timeout.
                             tracing::error!("Decryption failed - possible tampering or key mismatch!");
                             let _ = to_app_tx.send(SessionEvent::Error("Decryption failed!".to_string()));
                             break;
@@ -1321,43 +1401,29 @@ where
 
             // Send to network
             Some(mut msg) = from_app_rx.recv() => {
-                // Check if we need to initiate rekeying
-                let should_rekey = messages_since_rekey >= REKEY_MESSAGE_COUNT ||
-                    last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL;
+                // Host-only rekey initiation (see initiate_rekey): rotate the
+                // key before sending this frame if we're due.
+                let should_rekey = is_rekey_initiator
+                    && (messages_since_rekey >= REKEY_MESSAGE_COUNT
+                        || last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL);
 
                 if should_rekey {
-                    // Generate a new rekeying nonce
-                    // Initiate rekey by sending Rekey message
-                    use crate::core::{generate_rekey_nonce, rekey_session_key};
-
-                    let nonce = generate_rekey_nonce();
-
-                    // Increment sent sequence and create Rekey message
-                    sent_seq += 1;
-                    let rekey_msg = ProtocolMessage::Rekey {
-                        nonce: nonce.to_vec(),
-                        seq: sent_seq,
-                    };
-
-                    let rekey_plaintext = rekey_msg.to_plain_bytes();
-                    let rekey_encrypted = cipher.encrypt(&rekey_plaintext, Some(&transport_aad));
-
-                    if let Err(e) = send_packet(&mut stream, &rekey_encrypted).await {
+                    if let Err(e) = initiate_rekey(
+                        &mut stream,
+                        &mut cipher,
+                        &mut prev_cipher,
+                        &transport_aad,
+                        &mut sent_seq,
+                        &mut messages_since_rekey,
+                        &mut last_rekey_time,
+                    )
+                    .await
+                    {
                         let err_msg = format!("Network send error (rekey): {}", e);
                         tracing::error!("{}", err_msg);
                         let _ = to_app_tx.send(SessionEvent::Error(err_msg));
                         break;
-                    } else {
-                        tracing::debug!("Rekey message sent with nonce");
                     }
-
-                    // Apply the new key immediately since we sent the Rekey message
-                    let current_key_bytes = cipher.get_current_key();
-                    let next_key = rekey_session_key(&current_key_bytes, &nonce);
-                    cipher = AesCipher::new_with_role(&next_key, cipher.role())?;
-                    messages_since_rekey = 0;
-                    last_rekey_time = std::time::Instant::now();
-                    tracing::info!("Session key rotated (initiated rekey)");
                 }
 
                 // Stamp the next monotonic transport sequence onto every outgoing
@@ -1395,18 +1461,44 @@ where
             }
 
             // Keep-alive: ping on the shared outbound sequence so the peer's
-            // receive-idle timer resets even when nobody is typing.
+            // receive-idle timer resets even when nobody is typing. If a rekey
+            // is due, the host rotates here instead of pinging — otherwise a
+            // silent-but-receiving host would never rekey (its send branch
+            // never fires), quietly weakening forward secrecy. The Rekey frame
+            // doubles as keep-alive traffic.
             _ = keepalive.tick() => {
-                sent_seq += 1;
-                let ping = ProtocolMessage::Ping { seq: sent_seq };
-                let encrypted = cipher.encrypt(&ping.to_plain_bytes(), Some(&transport_aad));
-                if let Err(e) = send_packet(&mut stream, &encrypted).await {
-                    let err_msg = format!("Network send error (keep-alive): {}", e);
-                    tracing::error!("{}", err_msg);
-                    let _ = to_app_tx.send(SessionEvent::Error(err_msg));
-                    break;
+                let rekey_due = is_rekey_initiator
+                    && (messages_since_rekey >= REKEY_MESSAGE_COUNT
+                        || last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL);
+                if rekey_due {
+                    if let Err(e) = initiate_rekey(
+                        &mut stream,
+                        &mut cipher,
+                        &mut prev_cipher,
+                        &transport_aad,
+                        &mut sent_seq,
+                        &mut messages_since_rekey,
+                        &mut last_rekey_time,
+                    )
+                    .await
+                    {
+                        let err_msg = format!("Network send error (rekey): {}", e);
+                        tracing::error!("{}", err_msg);
+                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                        break;
+                    }
+                } else {
+                    sent_seq += 1;
+                    let ping = ProtocolMessage::Ping { seq: sent_seq };
+                    let encrypted = cipher.encrypt(&ping.to_plain_bytes(), Some(&transport_aad));
+                    if let Err(e) = send_packet(&mut stream, &encrypted).await {
+                        let err_msg = format!("Network send error (keep-alive): {}", e);
+                        tracing::error!("{}", err_msg);
+                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                        break;
+                    }
+                    tracing::trace!("Keep-alive ping sent");
                 }
-                tracing::trace!("Keep-alive ping sent");
             }
         }
     }
@@ -1436,6 +1528,123 @@ mod tests {
     use crate::RSA_KEY_BITS;
     use anyhow::Result;
     use rand::RngCore;
+
+    #[tokio::test]
+    async fn initiate_rekey_frame_decryptable_by_peer_and_keys_agree() {
+        // The initiator sends the Rekey encrypted under the CURRENT key and only
+        // then rotates, so a peer still holding the old key can decrypt it and
+        // derive the same next key. This is the invariant the deterministic
+        // single-initiator design relies on.
+        let key = [7u8; crate::AES_KEY_SIZE];
+        let mut host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let aad = b"transport-aad".to_vec();
+
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let mut sent_seq = 5u64;
+        let mut msgs = 9u64;
+        let mut last = Instant::now();
+        let mut prev: Option<AesCipher> = None;
+
+        initiate_rekey(
+            &mut a,
+            &mut host,
+            &mut prev,
+            &aad,
+            &mut sent_seq,
+            &mut msgs,
+            &mut last,
+        )
+        .await
+        .unwrap();
+        // The initiator retains the pre-rotation key for the in-flight window.
+        assert!(prev.is_some(), "initiator must retain the previous key");
+
+        // Peer reads the frame and decrypts it with the OLD key.
+        let frame = recv_packet(&mut b).await.unwrap();
+        let pt = peer
+            .decrypt(&frame, Some(&aad))
+            .expect("peer must decrypt the Rekey with the pre-rotation key");
+        let nonce = match ProtocolMessage::from_plain_bytes(&pt).unwrap() {
+            ProtocolMessage::Rekey { nonce, seq } => {
+                assert_eq!(seq, 6, "rekey uses the next monotonic sequence");
+                nonce
+            }
+            other => panic!("expected Rekey, got {:?}", other),
+        };
+        let n: [u8; crate::REKEY_NONCE_SIZE] = nonce.as_slice().try_into().unwrap();
+        let peer_next = crate::core::rekey_session_key(&peer.get_current_key(), &n);
+
+        // Both sides land on the same next key, and the initiator reset its
+        // counters.
+        assert_eq!(host.get_current_key(), peer_next);
+        assert_eq!(sent_seq, 6);
+        assert_eq!(msgs, 0);
+    }
+
+    #[tokio::test]
+    async fn old_key_in_flight_frames_survive_a_rekey() {
+        // Reproduces the race CodeRabbit flagged: after the initiator rotates,
+        // a frame the peer sent under the OLD key (still in flight) must remain
+        // decryptable via the retained previous key, and the window must close
+        // once a NEW-key frame proves the peer has switched.
+        let key = [3u8; crate::AES_KEY_SIZE];
+        let mut host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let client_old = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let aad = b"aad".to_vec();
+
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let mut sent_seq = 0u64;
+        let mut msgs = 0u64;
+        let mut last = Instant::now();
+        let mut prev: Option<AesCipher> = None;
+
+        initiate_rekey(
+            &mut a,
+            &mut host,
+            &mut prev,
+            &aad,
+            &mut sent_seq,
+            &mut msgs,
+            &mut last,
+        )
+        .await
+        .unwrap();
+        let _ = recv_packet(&mut b).await.unwrap(); // drain the Rekey frame
+
+        // Mirror of the receive branch's dual-key decrypt.
+        let decrypt = |host: &AesCipher, prev: &mut Option<AesCipher>, frame: &[u8]| match host
+            .decrypt(frame, Some(&aad))
+        {
+            Some(pt) => {
+                *prev = None;
+                Some(pt)
+            }
+            None => prev
+                .as_ref()
+                .and_then(|pc: &AesCipher| pc.decrypt(frame, Some(&aad))),
+        };
+
+        // Old-key in-flight frame: fails under the new key, decrypts via prev.
+        let old_frame = client_old.encrypt(b"hello-old", Some(&aad));
+        assert_eq!(
+            decrypt(&host, &mut prev, &old_frame).as_deref(),
+            Some(&b"hello-old"[..]),
+            "old-key in-flight frame must decrypt via the retained key"
+        );
+        assert!(prev.is_some(), "prev retained while old-key frames arrive");
+
+        // Peer has now switched: a new-key frame decrypts under the current key
+        // and closes the window.
+        let client_new =
+            AesCipher::new_with_role(&host.get_current_key(), NonceRole::Client).unwrap();
+        let new_frame = client_new.encrypt(b"hello-new", Some(&aad));
+        assert_eq!(
+            decrypt(&host, &mut prev, &new_frame).as_deref(),
+            Some(&b"hello-new"[..])
+        );
+        assert!(prev.is_none(), "prev dropped once a new-key frame arrives");
+    }
 
     #[tokio::test]
     async fn connect_first_reachable_falls_back_to_next_candidate() {
