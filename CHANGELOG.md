@@ -120,11 +120,15 @@ predate tagged releases.
   receiver pre-allocate gigabytes and abort. The chunk count is now capped
   before any allocation (symmetrically on send), with a bound on concurrent
   partial messages per chat.
-- **Session rekey can no longer desync the keys.** Both peers could previously
-  rotate the session key in the same round trip and end up unable to decrypt
-  each other, dropping the connection. Rekeying is now initiated by a single
-  deterministic side (the host), so simultaneous rotation is impossible; the
-  host still rekeys on schedule even when it is only receiving.
+- **Session rekey no longer drops active conversations.** A key rotation could
+  desync the two peers and tear the connection down — either because both sides
+  rotated in the same round trip, or because frames the peer had already sent
+  under the old key were still in flight when the initiator retired it. Rekeying
+  is now initiated by a single deterministic side (the host, so simultaneous
+  rotation cannot happen), and the receiver keeps the previous key for a bounded
+  window (dropped as soon as a frame decrypts under the new key) so in-flight
+  old-key frames still decrypt. The host also rekeys on its keep-alive tick, so
+  it rotates on schedule even when only receiving.
 - **RSA decryption removed from the codebase.** The product never decrypted
   with RSA on the wire (X25519 does key agreement; RSA is signatures only), so
   the unused RSA-OAEP encrypt/decrypt functions were deleted. This keeps the

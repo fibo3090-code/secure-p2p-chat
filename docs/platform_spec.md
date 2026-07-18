@@ -605,6 +605,90 @@ Steps 1–3 are back-compatible; step 4 is a breaking trust-model event and need
 its own comms/UX design. Each step lands with handshake tests on both the
 old/new peer matrix.
 
+### Cryptographic hardening roadmap (post-audit)
+
+A security review rated the transport's *design* (not its implementation
+bugs) as the main gap. Concrete implementation issues found in that review are
+**already fixed** (documented in `CHANGELOG.md` / `SECURITY.md`): the
+large-text `total_chunks` remote-OOM, the rekey desync (single deterministic
+initiator + bounded dual-key receive window), and removal of the unused RSA
+decryption path (keeping RUSTSEC-2023-0071's target operation out of the
+product). What remains below are the **architectural** improvements — ordered
+by value-per-effort. None is a quick patch; each deserves its own PR with a
+threat-model note and dedicated tests. Written down now so we don't lose the
+plan even if we implement it "when we have extra time."
+
+**A. Ed25519 identity migration — see the dedicated plan above.**
+*Priority: high · Effort: medium.* Removes the `rsa` crate from the
+security-critical path entirely (RSA is currently signing-only, so the Marvin
+advisory doesn't apply to a live operation, but dropping the dependency closes
+the audit finding for good). Back-compatible through step 3; the fingerprint
+cutover (step 4) is the only breaking part.
+
+**B. Double Ratchet for post-compromise security (PCS).**
+*Priority: high (it's the headline crypto gap) · Effort: large.* Today forward
+secrecy comes from the ephemeral X25519 handshake plus a **symmetric** rekey
+(`next = HKDF(current, nonce)`). Because rekeying folds in **no new DH
+material** and the nonces travel on the wire, an attacker who captures one live
+session key can follow the ratchet forward until the session ends and a fresh
+handshake runs — i.e. **no self-healing after compromise**. The fix is a
+Signal-style Double Ratchet:
+- **Symmetric-key (chain) ratchet** per direction: a sending chain and a
+  receiving chain, each advanced by a KDF per message, giving per-message keys
+  (we already have per-message AEAD nonces; this adds per-message *keys*).
+- **DH ratchet**: each side ships a fresh ratchet public key; whenever a new
+  one is seen, both sides do a DH and derive a new root key that reseeds the
+  chains. This is what injects new entropy so a compromised key stops helping
+  the attacker after the next round trip.
+- **Skipped-message keys**: cache out-of-order/skipped message keys (bounded)
+  so reordering/loss doesn't wedge the chain. Our transport is TCP-ordered so
+  this is simpler than Signal's, but the bound still matters for a Rekey-style
+  transition.
+- **Header handling & wire format**: a new `ProtocolMessage` (or an extension
+  of `Rekey`) carries the ratchet public key + message number; symmetric
+  encode/decode + replay-protected sequencing, gated behind protocol-version
+  negotiation so old peers still interoperate during rollout.
+  Migration: negotiate at handshake (`PROTOCOL_VERSION` bump); peers that both
+  advertise the double-ratchet version use it, otherwise fall back to the
+  current session-rekey scheme. Requires the two-peer old/new test matrix and,
+  ideally, test vectors cross-checked against a reference implementation. This
+  is the single change that most raises the product's security rating; it is
+  deliberately **not** rushed.
+
+**C. TOFU key transparency / stronger verification.**
+*Priority: medium · Effort: medium→large.* TOFU pins on first use and shouts on
+a key change, but nothing detects a malicious key presented *consistently* from
+the very first contact, and out-of-band fingerprint comparison is friction
+users skip. Incremental, independently shippable improvements:
+- **Short Authentication String (SAS) / verified-session flow**: a
+  numeric/emoji SAS derived from the handshake transcript that two users read
+  aloud once to promote a contact to a "verified" trust state (the trust-state
+  field already exists). Cheaper than transparency logs and catches active MITM.
+- **Safety-number change surfacing**: make a fingerprint change a first-class,
+  sticky UI event with a re-verify flow (not just a toast).
+- **Key transparency (full)**: an append-only, auditable log (CONIKS/Keybase
+  style) so a victim can detect a key swap without an out-of-band channel. This
+  needs *infrastructure* (a log server + gossip/audit), so it is a larger,
+  likely post-2.0 effort; SAS is the pragmatic near-term step.
+
+**D. X25519 contributory-behaviour hardening.**
+*Priority: low · Effort: small.* Reject known low-order / all-zero X25519 public
+keys at `parse_x25519_public`. Not currently exploitable (the identity proof
+signs the ephemeral key and the transcript hash salts HKDF, so a MITM can't
+force a shared secret without the victim's identity key), but it's cheap
+defense-in-depth and standard hygiene.
+
+**E. Invite revocation.**
+*Priority: low · Effort: medium.* Signed invites now **expire** (30 days) but
+cannot be **revoked** before expiry. Options range from short-lived invites
+with easy reissue (no infra) to a revocation list distributed via the relay or
+Party server (infra). Start with the former; document the latter.
+
+**F. Metadata-resistance (long-horizon).**
+*Priority: deferred · Effort: very large.* Onion routing / anonymity layer and a
+post-quantum handshake migration (hybrid X25519 + ML-KEM) are tracked as
+long-horizon gaps (see below), not scheduled.
+
 **Connectivity**
 
 - Internet connectivity: **UPnP + NAT-PMP port mapping is shipped** (opt-in;
