@@ -28,6 +28,7 @@ pub enum TuiOverlay {
     FingerprintVerify {
         fingerprint: String,
         peer_name: String,
+        sas: String,
         chat_id: Uuid,
     },
     Contacts,
@@ -88,8 +89,9 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         TuiOverlay::FingerprintVerify {
             fingerprint,
             peer_name,
+            sas,
             ..
-        } => render_fingerprint(f, &fingerprint, &peer_name, area),
+        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, area),
         TuiOverlay::Contacts => render_contacts(f, app, area),
         TuiOverlay::Settings => render_settings(f, app, area),
         TuiOverlay::Invite { link } => render_invite(f, &link, area),
@@ -215,18 +217,20 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
     f.render_widget(para, inner);
 }
 
-fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: Rect) {
+fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &str, full: Rect) {
     let area = centered_rect(70, 70, full);
     let inner = clear_and_block(f, area, "🛡 Verify peer identity");
 
+    let has_sas = !sas.is_empty();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // heading
-            Constraint::Length(2), // instruction
-            Constraint::Min(6),    // color grid
-            Constraint::Length(2), // fingerprint hex
-            Constraint::Length(1), // actions
+            Constraint::Length(2),                           // heading
+            Constraint::Length(2),                           // instruction
+            Constraint::Length(if has_sas { 3 } else { 0 }), // SAS
+            Constraint::Min(6),                              // color grid
+            Constraint::Length(2),                           // fingerprint hex
+            Constraint::Length(1),                           // actions
         ])
         .split(inner);
 
@@ -235,14 +239,37 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
             .style(Style::default().add_modifier(Modifier::BOLD)),
         rows[0],
     );
-    f.render_widget(
-        Paragraph::new(
-            "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
-        )
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Gray)),
-        rows[1],
-    );
+
+    // The short authentication string leads: both peers see the same code,
+    // and an interposed MITM makes the two ends differ. Reading it aloud is
+    // the low-friction check; the safety grid / hex stays as the backstop.
+    if has_sas {
+        f.render_widget(
+            Paragraph::new("Read this code aloud with your peer — it must match on both ends:")
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Gray)),
+            rows[1],
+        );
+        f.render_widget(
+            Paragraph::new(sas.to_string())
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(BRAND_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            rows[2],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(
+                "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray)),
+            rows[1],
+        );
+    }
 
     // Color grid (matches the GUI's generate_color_grid palette exactly).
     let grid = crate::colorgrid::generate_color_grid(fingerprint);
@@ -256,13 +283,13 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
             )
         })
         .collect();
-    f.render_widget(Paragraph::new(grid_lines), rows[2]);
+    f.render_widget(Paragraph::new(grid_lines), rows[3]);
 
     f.render_widget(
         Paragraph::new(fingerprint.to_string())
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::White)),
-        rows[3],
+        rows[4],
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -271,7 +298,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
             Span::styled(" n ", Style::default().bg(Color::Red).fg(Color::White)),
             Span::raw(" reject   (or :verify accept|reject)"),
         ])),
-        rows[4],
+        rows[5],
     );
 }
 

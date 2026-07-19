@@ -276,6 +276,37 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
 }
 
 #[tokio::test]
+async fn both_peers_derive_the_same_short_authentication_string() {
+    let (mut host, mut client) = connect_pair().await;
+
+    // The SAS is carried on the confirmation-request events; both roles derive
+    // it independently from the shared transcript, so the two must be equal and
+    // well-formed. (A MITM would run two handshakes and the codes would differ.)
+    let host_sas = match wait_until(&mut host.events, "host", awaiting_confirmation).await {
+        SessionEvent::NewConnection { sas, .. } => sas,
+        other => panic!("host expected NewConnection, got {other:?}"),
+    };
+    let client_sas = match wait_until(&mut client.events, "client", awaiting_confirmation).await {
+        SessionEvent::ShowFingerprintVerification { sas, .. } => sas,
+        other => panic!("client expected ShowFingerprintVerification, got {other:?}"),
+    };
+
+    assert_eq!(host_sas, client_sas, "both ends must show the same SAS");
+    assert!(!host_sas.is_empty(), "SAS must be populated");
+    // "NN-NN-NN" digits followed by three emoji groups.
+    assert_eq!(
+        host_sas.split(' ').count(),
+        4,
+        "unexpected SAS shape: {host_sas}"
+    );
+
+    host.confirm.send(true).unwrap();
+    client.confirm.send(true).unwrap();
+    host.handle.abort();
+    client.handle.abort();
+}
+
+#[tokio::test]
 async fn rejecting_the_fingerprint_aborts_the_session() {
     let (mut host, mut client) = connect_pair().await;
 

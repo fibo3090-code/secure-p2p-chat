@@ -36,6 +36,7 @@ impl ChatManager {
         session_id: Uuid,
         fingerprint: &str,
         peer_name: &str,
+        sas: &str,
     ) {
         // Resolve the actual chat ID (important for host mode where session_id != chat_id)
         let actual_chat_id = self
@@ -87,8 +88,12 @@ impl ChatManager {
                     // Request explicit user verification via UI
                     // Note: fingerprint_verification_request uses the SESSION ID
                     // because confirmation (accept/reject) must be sent to that session's task.
-                    self.fingerprint_verification_request =
-                        Some((fingerprint.to_string(), peer_name.to_string(), session_id));
+                    self.fingerprint_verification_request = Some(PendingFingerprint {
+                        fingerprint: fingerprint.to_string(),
+                        peer_name: peer_name.to_string(),
+                        sas: sas.to_string(),
+                        session_id,
+                    });
                     self.add_toast(
                         ToastLevel::Warning,
                         "Fingerprint verification required".to_string(),
@@ -117,8 +122,12 @@ impl ChatManager {
                     fingerprint
                 );
                 // Trigger the UI dialog for manual verification using the session ID.
-                self.fingerprint_verification_request =
-                    Some((fingerprint.to_string(), peer_name.to_string(), session_id));
+                self.fingerprint_verification_request = Some(PendingFingerprint {
+                    fingerprint: fingerprint.to_string(),
+                    peer_name: peer_name.to_string(),
+                    sas: sas.to_string(),
+                    session_id,
+                });
                 self.add_toast(
                     ToastLevel::Warning,
                     "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
@@ -163,6 +172,7 @@ impl ChatManager {
             SessionEvent::NewConnection {
                 peer_addr,
                 fingerprint,
+                sas,
                 chat_id: incoming_chat_id,
             } => {
                 tracing::info!(
@@ -235,15 +245,16 @@ impl ChatManager {
                     }
                 }
 
-                self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr);
+                self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr, &sas);
             }
 
             SessionEvent::ShowFingerprintVerification {
                 fingerprint,
                 peer_name,
+                sas,
                 chat_id,
             } => {
-                self.handle_tofu_verification(chat_id, &fingerprint, &peer_name);
+                self.handle_tofu_verification(chat_id, &fingerprint, &peer_name, &sas);
             }
 
             SessionEvent::Ready => {

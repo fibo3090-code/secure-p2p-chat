@@ -209,11 +209,16 @@ pub enum SessionEvent {
     NewConnection {
         peer_addr: String,
         fingerprint: String,
+        /// Short authentication string for this session (identical on both
+        /// ends; an interposed MITM produces two different codes).
+        sas: String,
         chat_id: Uuid,
     },
     ShowFingerprintVerification {
         fingerprint: String,
         peer_name: String,
+        /// Short authentication string for this session (see `NewConnection`).
+        sas: String,
         chat_id: Uuid,
     },
     Ready,

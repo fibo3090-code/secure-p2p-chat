@@ -11,12 +11,15 @@ impl ChatManager {
             // If the user accepted and we have a pending verification request matching this chat,
             // persist the fingerprint in the chat record before confirming the session.
             if accept {
-                if let Some((fp, _peer_name, req_chat_id)) = &self.fingerprint_verification_request
+                if let Some((fp, req_chat_id)) = self
+                    .fingerprint_verification_request
+                    .as_ref()
+                    .map(|p| (p.fingerprint.clone(), p.session_id))
                 {
                     // IMPORTANT: In host mode, req_chat_id is the session ID (the host placeholder ID)
                     // but the fingerprint should be stored in the actual chat (the client's ID).
                     // However, confirm_fingerprint is called with the session ID.
-                    if *req_chat_id == chat_id {
+                    if req_chat_id == chat_id {
                         // Resolve the actual chat ID if this is a mapped session
                         let target_chat_id = self
                             .chat_id_mapping

@@ -36,6 +36,20 @@ pub struct SessionHandle {
     pub from_app_tx: mpsc::UnboundedSender<ProtocolMessage>,
 }
 
+/// A TOFU verification the UI must resolve before a session becomes `Ready`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFingerprint {
+    /// 64-char hex fingerprint of the peer's identity key.
+    pub fingerprint: String,
+    /// Peer display name / address for the prompt heading.
+    pub peer_name: String,
+    /// Short authentication string both peers read aloud to compare (empty
+    /// for a legacy/mismatch path that carries no session SAS).
+    pub sas: String,
+    /// Session id the accept/reject decision must be routed to.
+    pub session_id: Uuid,
+}
+
 /// Main chat manager - orchestrates sessions, messages, and file transfers
 pub struct ChatManager {
     pub chats: HashMap<Uuid, Chat>,
@@ -58,7 +72,7 @@ pub struct ChatManager {
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
-    pub fingerprint_verification_request: Option<(String, String, Uuid)>,
+    pub fingerprint_verification_request: Option<PendingFingerprint>,
     pub history_key: Option<[u8; 32]>,
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.

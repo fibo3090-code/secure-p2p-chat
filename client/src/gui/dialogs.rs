@@ -284,14 +284,46 @@ fn render_fingerprint_dialog(app: &mut App, ctx: &egui::Context) {
             .show(ctx, |ui| {
                 ui.heading(format!("Connecting to {}", peer_name));
                 ui.add_space(10.0);
-                ui.label("Please verify that the fingerprint below matches the one provided by your peer.");
-                ui.add_space(10.0);
 
-                let grid = generate_color_grid(fingerprint);
-                ui.add(ColorGrid::new(grid));
-
-                ui.add_space(10.0);
-                ui.monospace(fingerprint);
+                // Primary check: the short authentication string. Both peers
+                // see the SAME short code; an active MITM (two separate
+                // handshakes) makes the two ends show DIFFERENT codes. Reading
+                // it aloud once is far less error-prone than comparing 64 hex
+                // characters, so it leads the dialog.
+                if let Some(sas) = app.sas_to_verify.as_ref().filter(|s| !s.is_empty()) {
+                    ui.label(
+                        egui::RichText::new("Compare this code out loud with your peer:")
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(sas).size(30.0).monospace().strong());
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "If your codes differ, someone may be intercepting the \
+                             connection — reject it.",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.collapsing("Full fingerprint (advanced)", |ui| {
+                        let grid = generate_color_grid(fingerprint);
+                        ui.add(ColorGrid::new(grid));
+                        ui.add_space(6.0);
+                        ui.monospace(fingerprint);
+                    });
+                } else {
+                    ui.label("Please verify that the fingerprint below matches the one provided by your peer.");
+                    ui.add_space(10.0);
+                    let grid = generate_color_grid(fingerprint);
+                    ui.add(ColorGrid::new(grid));
+                    ui.add_space(10.0);
+                    ui.monospace(fingerprint);
+                }
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {

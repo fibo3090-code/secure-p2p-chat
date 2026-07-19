@@ -665,10 +665,13 @@ Signal-style Double Ratchet:
 a key change, but nothing detects a malicious key presented *consistently* from
 the very first contact, and out-of-band fingerprint comparison is friction
 users skip. Incremental, independently shippable improvements:
-- **Short Authentication String (SAS) / verified-session flow**: a
-  numeric/emoji SAS derived from the handshake transcript that two users read
-  aloud once to promote a contact to a "verified" trust state (the trust-state
-  field already exists). Cheaper than transparency logs and catches active MITM.
+- **Short Authentication String (SAS) / verified-session flow. ✅** A
+  transcript-bound SAS (six digits + three emoji, `derive_sas` in
+  `core/src/core/crypto.rs`) rides the TOFU confirmation events and leads the
+  verification prompt in all three UIs, so users compare a short code instead
+  of 64 hex chars; an active MITM's two handshakes yield two different codes.
+  Still open: promoting a compared SAS to a persisted "verified" trust state
+  (the trust-state field already exists).
 - **Safety-number change surfacing**: make a fingerprint change a first-class,
   sticky UI event with a re-verify flow (not just a toast).
 - **Key transparency (full)**: an append-only, auditable log (CONIKS/Keybase
@@ -676,12 +679,11 @@ users skip. Incremental, independently shippable improvements:
   needs *infrastructure* (a log server + gossip/audit), so it is a larger,
   likely post-2.0 effort; SAS is the pragmatic near-term step.
 
-**D. X25519 contributory-behaviour hardening.**
-*Priority: low · Effort: small.* Reject known low-order / all-zero X25519 public
-keys at `parse_x25519_public`. Not currently exploitable (the identity proof
-signs the ephemeral key and the transcript hash salts HKDF, so a MITM can't
-force a shared secret without the victim's identity key), but it's cheap
-defense-in-depth and standard hygiene.
+**D. X25519 contributory-behaviour hardening. ✅**
+*Priority: low · Effort: small.* Done: `parse_x25519_public` rejects the
+all-zero key, and `derive_session_key` rejects a non-contributory shared
+secret (`was_contributory()`), covering the low-order points. Cheap
+defense-in-depth / standard hygiene (RFC 7748 §6.1).
 
 **E. Invite revocation.**
 *Priority: low · Effort: medium.* Signed invites now **expire** (30 days) but

@@ -55,14 +55,34 @@ Current secure runtime behavior requires protocol version `>= 3`.
 ### Handshake flow
 
 1. Exchange protocol versions in plaintext.
-2. Exchange X25519 ephemeral public keys in plaintext.
+2. Exchange X25519 ephemeral public keys in plaintext. Each side rejects an
+   all-zero peer key on parse and a non-contributory shared secret at
+   agreement (low-order-point guard, RFC 7748 §6.1).
 3. Derive a shared session key using HKDF-SHA256.
 4. Establish encrypted transport with AES-256-GCM.
 5. Exchange encrypted `IdentityProof` messages inside that tunnel.
 6. Verify the peer's identity signature.
 7. Optional connection-password gate (see below).
-8. Confirm the peer fingerprint (TOFU) before surfacing the session.
+8. Confirm the peer fingerprint (TOFU) before surfacing the session. Both
+   ends also derive a **Short Authentication String** (see below) so users
+   can compare a short code instead of the full fingerprint.
 9. Enter the message loop.
+
+### Short Authentication String (SAS)
+
+Alongside the 64-char fingerprint, both peers derive an identical SAS from the
+handshake transport AAD (itself the transcript hash), via
+`HKDF-SHA256(info = "p2pem-sas-v1")`: six decimal digits (`NN-NN-NN`) plus
+three emoji from a fixed 32-entry table (~35 bits shown). Because it is bound
+to the transcript — which includes both ephemeral keys and both identity keys
+— an active MITM necessarily runs two *different* handshakes, so the two
+victims see two *different* SAS values. Reading the code aloud over any
+out-of-band channel (a call, in person) therefore detects interception with
+far less friction than a full-fingerprint compare. The SAS is display-only
+verification aid: it is never sent on the wire, and trust is still pinned by
+TOFU on the identity fingerprint. The derivation and emoji table are frozen
+(a known-answer test guards them) because both peers must compute byte-for-byte
+identical strings.
 
 ### Connection password (optional)
 

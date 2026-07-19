@@ -37,7 +37,7 @@ fn host_prompts_for_an_unknown_incoming_fingerprint() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
-    mgr.handle_tofu_verification(session_id, "UNKNOWN-FP", "Peer");
+    mgr.handle_tofu_verification(session_id, "UNKNOWN-FP", "Peer", "12-34-56");
 
     // The host must PROMPT for verification, not silently auto-trust.
     assert!(
@@ -65,7 +65,7 @@ fn host_auto_accepts_a_returning_known_fingerprint() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
-    mgr.handle_tofu_verification(session_id, "KNOWN-FP", "Peer");
+    mgr.handle_tofu_verification(session_id, "KNOWN-FP", "Peer", "12-34-56");
 
     // Returning peer: auto-confirmed without re-prompting.
     assert!(
@@ -202,6 +202,7 @@ fn test_tofu_logic() {
     let event1 = SessionEvent::ShowFingerprintVerification {
         fingerprint: fingerprint1.clone(),
         peer_name: peer_name.clone(),
+        sas: String::new(),
         chat_id,
     };
     mgr.handle_session_event(chat_id, event1);
@@ -226,6 +227,7 @@ fn test_tofu_logic() {
     let event2 = SessionEvent::ShowFingerprintVerification {
         fingerprint: fingerprint1.clone(),
         peer_name: peer_name.clone(),
+        sas: String::new(),
         chat_id,
     };
     mgr.handle_session_event(chat_id, event2);
@@ -238,13 +240,18 @@ fn test_tofu_logic() {
     let event3 = SessionEvent::ShowFingerprintVerification {
         fingerprint: fingerprint2.clone(),
         peer_name: peer_name.clone(),
+        sas: String::new(),
         chat_id,
     };
     mgr.handle_session_event(chat_id, event3);
 
     // Assert: A UI request IS made, and no confirmation is sent automatically.
     assert!(mgr.fingerprint_verification_request.is_some());
-    let (fp, _, _) = mgr.fingerprint_verification_request.clone().unwrap();
+    let fp = mgr
+        .fingerprint_verification_request
+        .clone()
+        .unwrap()
+        .fingerprint;
     assert_eq!(fp, fingerprint2);
     assert!(rx.try_recv().is_err());
 }
@@ -288,6 +295,7 @@ fn test_regression_auto_trust_default_off() {
     let event = SessionEvent::ShowFingerprintVerification {
         fingerprint: "first_fingerprint".to_string(),
         peer_name: "Alice".to_string(),
+        sas: String::new(),
         chat_id,
     };
 
@@ -1066,8 +1074,12 @@ fn delete_all_data_removes_files_and_clears_state() {
     );
     mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
     mgr.contact_to_chat.insert(contact_id, chat_id);
-    mgr.fingerprint_verification_request =
-        Some(("fingerprint".to_string(), "peer".to_string(), chat_id));
+    mgr.fingerprint_verification_request = Some(PendingFingerprint {
+        fingerprint: "fingerprint".to_string(),
+        peer_name: "peer".to_string(),
+        sas: String::new(),
+        session_id: chat_id,
+    });
 
     mgr.delete_all_data(&data_dir, &history_path, &identity_path)
         .unwrap();

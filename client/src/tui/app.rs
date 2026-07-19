@@ -306,13 +306,12 @@ impl TuiApp {
 
         // Surface a pending fingerprint verification as an overlay.
         if !self.overlay.is_open() {
-            if let Some((fingerprint, peer_name, chat_id)) =
-                self.chat_manager.fingerprint_verification_request.take()
-            {
+            if let Some(pending) = self.chat_manager.fingerprint_verification_request.take() {
                 self.overlay = TuiOverlay::FingerprintVerify {
-                    fingerprint,
-                    peer_name,
-                    chat_id,
+                    fingerprint: pending.fingerprint,
+                    peer_name: pending.peer_name,
+                    sas: pending.sas,
+                    chat_id: pending.session_id,
                 };
             }
         }
@@ -1776,6 +1775,7 @@ mod tests {
         app.overlay = TuiOverlay::FingerprintVerify {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),
+            sas: String::new(),
             chat_id,
         };
 
@@ -1802,6 +1802,7 @@ mod tests {
         app.overlay = TuiOverlay::FingerprintVerify {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),
+            sas: String::new(),
             chat_id,
         };
 

@@ -189,7 +189,7 @@ pub async fn run_host_session(
         &client_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -284,6 +284,7 @@ pub async fn run_host_session(
         .send(SessionEvent::NewConnection {
             peer_addr: peer_addr.to_string(),
             fingerprint: client_fingerprint,
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id: client_proof.chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -492,7 +493,7 @@ pub async fn run_client_session_multi(
         &host_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -585,6 +586,7 @@ pub async fn run_client_session_multi(
         .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: host_fingerprint.clone(),
             peer_name: host.to_string(),
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -703,7 +705,7 @@ where
         &client_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -840,7 +842,7 @@ where
         &host_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -1019,6 +1021,7 @@ where
         .send(SessionEvent::NewConnection {
             peer_addr: peer_label,
             fingerprint: peer_fingerprint,
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id: peer_chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -1094,6 +1097,7 @@ where
         .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: host_fingerprint,
             peer_name,
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -1774,7 +1778,8 @@ mod tests {
                 &client_ephemeral_public,
                 Some(&salt),
                 HKDF_INFO,
-            );
+            )
+            .unwrap();
             let cipher = AesCipher::new(&host_aes_key)?;
 
             // 4. Send Identity Proof (Encrypted)
@@ -1835,7 +1840,8 @@ mod tests {
                 &host_ephemeral_public,
                 Some(&salt),
                 HKDF_INFO,
-            );
+            )
+            .unwrap();
             let cipher = AesCipher::new(&client_aes_key)?;
 
             // 4. Recv Host Identity Proof (Encrypted)
