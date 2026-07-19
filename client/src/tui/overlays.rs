@@ -460,7 +460,7 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
     let area = centered_rect(70, 60, full);
     let inner = clear_and_block(f, area, "File transfers");
 
-    let transfers = app.chat_manager.active_transfers_snapshot();
+    let transfers = app.chat_manager.active_transfers_sorted();
     if transfers.is_empty() {
         f.render_widget(
             Paragraph::new("No active transfers.\n\nSend a file with :send <path>.")
@@ -470,9 +470,16 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
         );
         return;
     }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let sel = app.transfer_sel.min(transfers.len().saturating_sub(1));
     let lines: Vec<Line> = transfers
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let pct = if t.size > 0 {
                 (t.received as f64 / t.size as f64 * 100.0) as u64
             } else {
@@ -485,16 +492,38 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
                 TransferStatus::Failed(e) => format!("failed: {}", e),
                 TransferStatus::Cancelled => "cancelled".into(),
             };
-            Line::from(format!(
-                "{:<24} {} / {}  [{}]",
+            let arrow = match t.direction {
+                crate::types::TransferDirection::Incoming => "⬇",
+                crate::types::TransferDirection::Outgoing => "⬆",
+            };
+            let marker = if i == sel { "▶ " } else { "  " };
+            let text = format!(
+                "{}{} {:<22} {} / {}  [{}]",
+                marker,
+                arrow,
                 t.filename,
                 crate::util::format_size(t.received),
                 crate::util::format_size(t.size),
                 status
-            ))
+            );
+            let style = if i == sel {
+                Style::default()
+                    .fg(BRAND_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(text, style)
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "↑/↓ select · c cancel · Esc close",
+            Style::default().fg(Color::DarkGray),
+        )),
+        rows[1],
+    );
 }
 
 fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) {

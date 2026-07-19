@@ -76,6 +76,10 @@ pub(crate) struct TransferDto {
     size: u64,
     received: u64,
     status: &'static str,
+    /// "incoming" or "outgoing", so the UI can label the direction.
+    direction: &'static str,
+    /// Whether the transfer is still cancellable (pending or in progress).
+    cancellable: bool,
     /// Failure reason when `status == "failed"`.
     error: Option<String>,
 }
@@ -104,6 +108,14 @@ pub(crate) async fn list_transfers(
         .into_iter()
         .map(|t| {
             let (status, error) = transfer_status_parts(&t.status);
+            let cancellable = matches!(
+                t.status,
+                TransferStatus::Pending | TransferStatus::InProgress
+            );
+            let direction = match t.direction {
+                TransferDirection::Incoming => "incoming",
+                TransferDirection::Outgoing => "outgoing",
+            };
             TransferDto {
                 id: t.id.to_string(),
                 chat_id: t.chat_id.to_string(),
@@ -111,10 +123,24 @@ pub(crate) async fn list_transfers(
                 size: t.size,
                 received: t.received,
                 status,
+                direction,
+                cancellable,
                 error,
             }
         })
         .collect())
+}
+
+/// Cancel an in-flight file transfer (either direction) by id.
+#[tauri::command]
+pub(crate) async fn cancel_transfer(
+    id: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let transfer_id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state.manager.lock().await.cancel_transfer(transfer_id);
+    Ok(())
 }
 
 /// Return the full conversation (with messages) as JSON for the chat pane.

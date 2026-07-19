@@ -107,10 +107,11 @@ Authoritative docs: `docs/README.md`, `docs/architecture.md`, `docs/protocol.md`
 
 ## File Transfer
 
-Chunked (`FILE_CHUNK_SIZE = 64 KiB`), tracked via `FileTransferState`, sharing the per-chat monotonic sequence namespace (so replay protection covers transfers too).
-- `client/src/app/chat_manager/files.rs` — orchestration + outgoing chunk dispatch + wire-level send confirmation
+Chunked (`FILE_CHUNK_SIZE = 64 KiB`), tracked via `FileTransferState` (now carries a `direction: TransferDirection`), sharing the per-chat monotonic sequence namespace (so replay protection covers transfers too).
+- `client/src/app/chat_manager/files.rs` — orchestration + outgoing chunk dispatch + wire-level send confirmation. **Sends stream from a spawned task** (`spawn_file_stream`) so a large send never holds the manager lock or buffers eagerly; the task checks an `AtomicBool` cancel flag between chunks and reports bytes via an `AtomicU64` (mirrored into `active_transfers` by `sync_outgoing_transfer_progress` each poll). Outgoing seqs are placeholders — the session loop stamps the real wire sequence.
+- **Cancellation**: `ProtocolMessage::FileCancel { seq }` (binary tag 12, symmetric encode/decode, replay-protected). `cancel_transfer(id)` aborts either direction (stops the stream + emits FileCancel for outgoing; sends FileCancel + `abort_cleanup` for incoming); `handle_peer_file_cancel` handles an inbound FileCancel. Incoming vs outgoing are routed separately (`active_incoming_transfer_id_for_chat` / `active_outgoing_transfer_id_for_chat`) so a simultaneous send+receive on one chat never cross-routes. UI: egui transfer bar, TUI Transfers overlay (↑/↓ + `c`), desktop transfer cards (`cancel_transfer` command).
 - `core/src/transfer/receiver.rs` — receiving
-- `core/src/core/protocol.rs` — `FILE_CHUNK` encode/decode
+- `core/src/core/protocol.rs` — `FILE_CHUNK` / `FileCancel` encode/decode
 
 ## TOFU Flow
 

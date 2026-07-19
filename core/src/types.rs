@@ -157,6 +157,13 @@ pub enum ToastLevel {
     Error,
 }
 
+/// Whether a tracked transfer is being received from or sent to the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Incoming,
+    Outgoing,
+}
+
 /// File transfer state
 #[derive(Debug, Clone)]
 pub struct FileTransferState {
@@ -164,9 +171,11 @@ pub struct FileTransferState {
     pub chat_id: Uuid,
     pub filename: String,
     pub size: u64,
+    /// Bytes transferred so far (received for incoming, sent for outgoing).
     pub received: u64,
     pub status: TransferStatus,
     pub seq: u64,
+    pub direction: TransferDirection,
 }
 
 /// File transfer status

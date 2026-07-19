@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
-use messenger_core::types::{Config, MessageContent, ToastLevel, TransferStatus};
+use messenger_core::types::{
+    Config, MessageContent, ToastLevel, TransferDirection, TransferStatus,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -150,6 +152,7 @@ pub fn run() {
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,
+            commands::chats::cancel_transfer,
             commands::auth::get_settings,
             commands::auth::update_settings,
             commands::auth::pick_download_dir,

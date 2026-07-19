@@ -1142,6 +1142,7 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
         ProtocolMessage::FileMeta { seq, .. } => Some(*seq),
         ProtocolMessage::FileChunk { seq, .. } => Some(*seq),
         ProtocolMessage::FileEnd { seq } => Some(*seq),
+        ProtocolMessage::FileCancel { seq } => Some(*seq),
         ProtocolMessage::Ping { seq } => Some(*seq),
         ProtocolMessage::TypingStart { seq } => Some(*seq),
         ProtocolMessage::TypingStop { seq } => Some(*seq),

@@ -717,11 +717,14 @@ long-horizon gaps (see below), not scheduled.
 - Accessibility pass over interactions and color usage.
 - Settings IA cleanup / tabbed organization (folds into the §10 settings page).
 - Better contact management UX and trust-state workflows.
-- File-transfer **progress** now shows in all three UIs (desktop transfer bar,
-  egui progress bar above the input, TUI title indicator); **cancellation**
-  remains open — it needs a wire-level abort message (`ProtocolMessage`
-  addition with symmetric encode/decode and replay-protected sequencing), so
-  it is its own protocol change rather than a UI patch.
+- File-transfer **progress** shows in all three UIs, and **cancellation is
+  shipped ✅**: a `ProtocolMessage::FileCancel` wire frame (binary tag 12,
+  replay-protected) lets either side abort. Sends now stream from a background
+  task (so a multi-gigabyte send neither blocks the manager lock nor buffers
+  eagerly) and stop mid-flight on cancel; the receiver discards its partial
+  temp file. Both directions are tracked (`TransferDirection`) and cancellable
+  from the egui transfer bar, the TUI Transfers overlay (↑/↓ select, `c`
+  cancel), and the desktop transfer cards.
 
 **Tracked long-horizon gaps** (intentionally not described as "done" anywhere):
 onion routing / anonymity layer, post-quantum migration, hardware-backed identity.

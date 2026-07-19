@@ -136,6 +136,10 @@ Runtime messages include:
 - `FileMeta`
 - `FileChunk`
 - `FileEnd`
+- `FileCancel` (binary tag 12) — aborts the in-flight transfer on the chat;
+  sent by either the sender or the receiver. The peer stops streaming (sender)
+  or discards the partial temp file (receiver). Shares the per-session
+  replay-protected sequence space like every other framed message.
 - `Ping`
 - `TypingStart`
 - `TypingStop`

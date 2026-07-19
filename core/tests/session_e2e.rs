@@ -246,6 +246,16 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
     })
     .await;
 
+    // --- File cancel: a FileCancel frame traverses the encrypted transport and
+    // survives the replay check like any other sequenced message ---
+    host.outbound
+        .send(ProtocolMessage::FileCancel { seq: 7 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::FileCancel { .. }
+    ));
+
     // --- Keep-alive ping: transport plumbing, consumed silently ---
     // A Ping must keep the session healthy but never surface to the app: the
     // very next app-visible message after it is the following Text, not the Ping.

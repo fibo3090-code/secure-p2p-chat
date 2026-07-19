@@ -7,6 +7,7 @@ impl ChatManager {
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
         self.cleanup_stale_incoming_text_messages();
+        self.sync_outgoing_transfer_progress();
         self.poll_upnp_result();
         let chat_ids: Vec<Uuid> = self.session_events.keys().copied().collect();
         tracing::trace!(tracked_sessions = %chat_ids.len(), "Polling session events");
@@ -449,7 +450,7 @@ impl ChatManager {
                             return;
                         }
 
-                        let transfer_id = self.active_transfer_id_for_chat(actual_chat_id);
+                        let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                                 transfer.seq += 1;
@@ -507,7 +508,7 @@ impl ChatManager {
                             return;
                         }
 
-                        let transfer_id = self.active_transfer_id_for_chat(actual_chat_id);
+                        let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
                             if self.active_transfers.contains_key(&transfer_id) {
                                 tracing::info!("File transfer completed");
@@ -566,6 +567,27 @@ impl ChatManager {
                         }
                     }
 
+                    ProtocolMessage::FileCancel { seq } => {
+                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                true
+                            } else {
+                                tracing::warn!("Received FileCancel with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if valid_seq {
+                            tracing::info!(
+                                "Peer cancelled the file transfer for chat {}",
+                                actual_chat_id
+                            );
+                            self.handle_peer_file_cancel(actual_chat_id);
+                        }
+                    }
+
                     ProtocolMessage::Ping { seq } => {
                         if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
                             if seq > chat.recv_seq {
@@ -615,8 +637,15 @@ impl ChatManager {
                     .get_mut(&chat_id)
                     .and_then(|q| q.pop_front())
                 {
-                    Some(filename) => {
+                    Some((filename, transfer_id)) => {
                         tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
+                        // The stream finished; mark the tracked transfer done
+                        // and retire its live handle.
+                        self.outgoing_transfers.remove(&transfer_id);
+                        if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
+                            state.received = state.size;
+                            state.status = TransferStatus::Completed;
+                        }
                         self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
                     }
                     None => {

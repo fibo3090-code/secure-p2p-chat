@@ -702,17 +702,34 @@ fn v2_invite_signature_verification_prevents_fingerprint_swap() {
     );
 }
 
+/// Drain frames from the streaming send until `FileEnd` (or timeout), so the
+/// spawned chunk task has a chance to run.
+async fn drain_file_send(
+    rx: &mut mpsc::UnboundedReceiver<ProtocolMessage>,
+) -> Vec<ProtocolMessage> {
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        let done = matches!(
+            msg,
+            ProtocolMessage::FileEnd { .. } | ProtocolMessage::FileCancel { .. }
+        );
+        frames.push(msg);
+        if done {
+            break;
+        }
+    }
+    frames
+}
+
 #[tokio::test]
-async fn send_file_uses_monotonic_chat_sequence_space() {
+async fn send_file_streams_meta_chunks_and_end_and_tracks_transfer() {
     let mut mgr = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
-    mgr.create_local_chat_for_test(chat_id, "File Seq Test".to_string());
+    mgr.create_local_chat_for_test(chat_id, "File Send Test".to_string());
 
     let (from_app_tx, mut from_app_rx) = mpsc::unbounded_channel();
     mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
-
-    // Start from a non-zero value to ensure file transfer continues existing sequence space.
-    mgr.chats.get_mut(&chat_id).unwrap().send_seq = 5;
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     let content = vec![b'x'; crate::FILE_CHUNK_SIZE * 2 + 13];
@@ -722,40 +739,79 @@ async fn send_file_uses_monotonic_chat_sequence_space() {
         .await
         .expect("send_file should succeed");
 
-    let mut seqs = Vec::new();
-    let mut saw_meta = false;
-    let mut saw_end = false;
-    let mut chunk_count = 0usize;
-    while let Ok(msg) = from_app_rx.try_recv() {
-        match msg {
-            ProtocolMessage::FileMeta { seq, .. } => {
-                saw_meta = true;
-                seqs.push(seq);
-            }
-            ProtocolMessage::FileChunk { seq, .. } => {
-                chunk_count += 1;
-                seqs.push(seq);
-            }
-            ProtocolMessage::FileEnd { seq } => {
-                saw_end = true;
-                seqs.push(seq);
-            }
-            _ => {}
-        }
-    }
+    // An outgoing transfer is registered for the UI immediately.
+    let outgoing = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.direction == TransferDirection::Outgoing)
+        .expect("outgoing transfer should be tracked");
+    assert_eq!(outgoing.chat_id, chat_id);
 
-    assert!(saw_meta, "FileMeta should be emitted");
-    assert!(saw_end, "FileEnd should be emitted");
-    assert!(chunk_count >= 2, "Test file should produce multiple chunks");
-    assert_eq!(
-        seqs.first().copied(),
-        Some(6),
-        "Sequence should continue from chat.send_seq"
+    // The streamed frames arrive as Meta, then chunks, then End. The session
+    // loop owns wire sequencing, so ChatManager stamps placeholder seqs here.
+    let frames = drain_file_send(&mut from_app_rx).await;
+    assert!(
+        matches!(frames.first(), Some(ProtocolMessage::FileMeta { .. })),
+        "first frame must be FileMeta"
     );
     assert!(
-        seqs.windows(2).all(|w| w[1] == w[0] + 1),
-        "File transfer messages must use strictly increasing sequence numbers"
+        matches!(frames.last(), Some(ProtocolMessage::FileEnd { .. })),
+        "last frame must be FileEnd"
     );
+    let chunks = frames
+        .iter()
+        .filter(|m| matches!(m, ProtocolMessage::FileChunk { .. }))
+        .count();
+    assert!(chunks >= 3, "multi-chunk file should emit >= 3 chunks");
+}
+
+#[tokio::test]
+async fn cancel_outgoing_transfer_stops_stream_and_emits_file_cancel() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Cancel Test".to_string());
+
+    let (from_app_tx, mut from_app_rx) = mpsc::unbounded_channel();
+    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
+    // Large enough that streaming does not finish instantly.
+    let content = vec![b'y'; crate::FILE_CHUNK_SIZE * 50];
+    std::fs::write(temp_file.path(), content).unwrap();
+
+    mgr.send_file(chat_id, temp_file.path().to_path_buf())
+        .await
+        .expect("send_file should succeed");
+
+    let transfer_id = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.direction == TransferDirection::Outgoing)
+        .expect("outgoing transfer tracked")
+        .id;
+
+    // Cancel it. The streaming task stops and emits a FileCancel frame.
+    mgr.cancel_transfer(transfer_id);
+
+    let mut saw_cancel = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, from_app_rx.recv()).await {
+        if matches!(msg, ProtocolMessage::FileCancel { .. }) {
+            saw_cancel = true;
+            break;
+        }
+        if matches!(msg, ProtocolMessage::FileEnd { .. }) {
+            panic!("stream should not complete after cancellation");
+        }
+    }
+    assert!(saw_cancel, "cancellation must emit a FileCancel frame");
+
+    let status = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.id == transfer_id)
+        .map(|t| t.status);
+    assert_eq!(status, Some(TransferStatus::Cancelled));
 }
 
 /// Queueing frames on the session is not delivery: the "File sent" toast
