@@ -88,6 +88,14 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   signatures to Ed25519 (the wire already negotiates a scheme field) would drop
   `rsa` from the security-critical path entirely.
 - `bincode` remains a tracked dependency migration concern
+- Known-accepted `cargo audit` findings beyond `rsa` above: `quick-xml`
+  (RUSTSEC-2026-0194/0195) is pinned transitively by the GUI stacks
+  (egui-winit accessibility, wayland build tooling, Tauri) below the fixed
+  release — the parsed XML there is build-time or local desktop-bus data,
+  never peer-controlled input — and the unmaintained GTK3-binding warnings
+  come with Tauri's Linux backend until it moves off GTK3. Re-evaluate on
+  every GUI-stack upgrade; everything else in the tree is kept current via
+  in-semver `cargo update`.
 
 ## Trust Model
 
