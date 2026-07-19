@@ -48,9 +48,17 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 
 ## Current Limits and Open Risks
 
-- No STUN/TURN or peer-to-peer hole punching; WAN support relies on optional
-  UPnP/NAT-PMP port mapping (off by default — it opens a router port and embeds
-  the external IP in invites) or a self-hosted relay
+- WAN support relies on optional UPnP/NAT-PMP port mapping (off by default —
+  it opens a router port and embeds the external IP in invites) or a
+  self-hosted relay. The relay first coordinates a **TCP hole punch** (both
+  peers learn each other's relay-observed public endpoint and attempt a
+  simultaneous open from the reused source port), so most sessions go direct
+  and the relay only bridges when punching fails (symmetric NAT, CGNAT,
+  filtered networks). The punch hello tag is derived from the rendezvous
+  token and is pairing hygiene only — authentication is still the v3
+  handshake + TOFU on whichever socket wins. `P2PEM_NO_HOLEPUNCH=1` forces
+  the bridged path. Punching also reveals each peer's public *and* LAN
+  endpoint to the other (the relay already saw both source addresses)
 - Multi-address invites embed **both** the external and the LAN address when
   UPnP is enabled, so a shared invite reveals the private LAN IP alongside the
   public one — share invites only with people you intend to reach you

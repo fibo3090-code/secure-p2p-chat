@@ -181,7 +181,20 @@ desktop/
 
 - self-hosted rendezvous and packet relay server mode
 - relay transport setup for WAN/NAT-constrained peers
+- coordinates TCP hole punching between punch-capable peers (exchanges
+  observed public endpoints + LAN candidates, collects outcome reports) and
+  only bridges traffic when the punch fails; wire-compatible with pre-punch
+  clients and servers
 - forwards already-encrypted session traffic without terminating chat encryption
+
+### `core/src/network/punch.rs`
+
+- TCP hole punching engine (simultaneous open): re-binds the relay control
+  connection's local port (`SO_REUSEADDR`/`SO_REUSEPORT`), listens and dials
+  every peer candidate in parallel
+- validates each established socket with a token-derived hello tag, then the
+  host/joiner SELECT/ACK exchange deterministically picks exactly one socket
+- all phases deadline-bounded; any failure falls back to the bridged relay
 
 ### `core/src/identity/mod.rs`
 

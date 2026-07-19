@@ -111,7 +111,11 @@ TUI examples:
 :connect-relay relay.example.com:23456 <token>
 ```
 
-The relay forwards already encrypted session traffic. It does not terminate chat encryption for you.
+When both peers support it, the relay first coordinates a direct TCP hole
+punch, so after pairing your traffic flows peer-to-peer and the relay drops
+out of the path. If the punch fails, the relay forwards the already encrypted
+session traffic instead. Either way it never terminates chat encryption for
+you (set `P2PEM_NO_HOLEPUNCH=1` to always use forwarding).
 
 ## 4. Verify fingerprints before trusting the connection
 

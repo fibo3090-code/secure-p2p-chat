@@ -236,6 +236,50 @@ Current verification behavior:
   candidate lists are deduplicated preserving order
 - relay route data is preserved when present in a signed invite
 
+## Relay Rendezvous and Hole Punching
+
+The relay control protocol (`core/src/network/relay.rs`) runs over the same
+length-prefixed framing, carrying bincode-encoded enums. Because bincode
+encodes the variant index, **new variants are append-only**.
+
+Requests (client → server): `Host { token }` / `Join { token }` (legacy,
+always bridged) and `HostV2 { token, punch }` / `JoinV2 { token, punch }`
+(punch-capable; `punch.local_addrs` lists LAN candidates as `ip:port`,
+already carrying the punch source port). Responses (server → client):
+`Waiting`, `Paired`, `Error(String)`, and `PunchStart { peer_public,
+peer_locals }`. After a `PunchStart`, each client answers with a
+`PunchOutcome { success }` report.
+
+Flow:
+
+1. Both peers register with the same 32-hex-char token. The server observes
+   each peer's public endpoint from the control connection's source address —
+   it is never self-reported.
+2. If **both** registered punch-capable, the server sends each side a
+   `PunchStart` with the other's observed public endpoint and LAN candidates,
+   then waits (bounded) for both `PunchOutcome`s.
+3. Each peer re-binds the control connection's local port
+   (`SO_REUSEADDR`/`SO_REUSEPORT`; the control connection itself is dialed
+   from a reuse-enabled socket), listens on it, and dials every candidate in
+   parallel with retries — a TCP simultaneous open. Every established socket
+   is validated by exchanging a 25-byte hello: magic `P2PPNCH1` (8) + role
+   byte (1; host=0, joiner=1; must differ) + tag (16, first 16 bytes of
+   SHA-256 of the token). The host then sends `0xA5` (SELECT) on its chosen
+   socket and the joiner confirms with `0x5A` (ACK), so both ends provably
+   settle on one connection.
+4. Both reports `success: true` → the server drops both control connections;
+   the session runs on the punched socket (peer label `p2p:<addr>`).
+   Anything else → the server sends `Paired` to both and bridges bytes
+   (`copy_bidirectional`; peer label `relay:<server>`).
+
+The punch hello tag is rendezvous pairing, not authentication: whichever
+socket wins carries the full v3 handshake (ECDH, identity proof, TOFU).
+Compatibility: a legacy peer simply gets the bridged path (the server never
+starts a punch phase unless both sides are capable); a legacy *server* drops
+the unknown V2 variant, which new clients detect (connection closed before
+any response) and silently re-register in legacy mode.
+`P2PEM_NO_HOLEPUNCH=1` disables punching client-side.
+
 ## Compatibility Notes
 
 - history/storage migrations are separate from wire compatibility

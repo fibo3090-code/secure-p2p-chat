@@ -139,11 +139,24 @@ impl ChatManager {
 
             SessionEvent::Connected { peer } => {
                 tracing::info!("Session {} connected to {}", chat_id, peer);
-                self.add_toast(ToastLevel::Success, format!("Connected to {}", peer));
+                // A "p2p:" label means the relay rendezvous hole punched a
+                // direct socket, so the chat is no longer relay-transported.
+                let hole_punched = peer.starts_with("p2p:");
+                if hole_punched {
+                    self.add_toast(
+                        ToastLevel::Success,
+                        format!("Direct connection established (hole punched): {}", peer),
+                    );
+                } else {
+                    self.add_toast(ToastLevel::Success, format!("Connected to {}", peer));
+                }
 
                 if let Some(chat) = self.chats.get_mut(&chat_id) {
                     chat.title = peer;
                     chat.is_host_placeholder = false;
+                    if hole_punched {
+                        chat.transport = Transport::Direct;
+                    }
                 }
             }
 
@@ -176,12 +189,17 @@ impl ChatManager {
 
                 // Inherit the transport of the host session that accepted this peer:
                 // a relay-hosted listener (`start_host_via_relay`) must produce a
-                // Relay chat, not a hardcoded Direct one.
-                let inherited_transport = self
-                    .chats
-                    .get(&chat_id)
-                    .map(|c| c.transport)
-                    .unwrap_or(Transport::Direct);
+                // Relay chat, not a hardcoded Direct one. Exception: a "p2p:"
+                // peer label means the rendezvous hole punched a direct socket,
+                // so the chat is Direct even though it started via the relay.
+                let inherited_transport = if peer_addr.starts_with("p2p:") {
+                    Transport::Direct
+                } else {
+                    self.chats
+                        .get(&chat_id)
+                        .map(|c| c.transport)
+                        .unwrap_or(Transport::Direct)
+                };
 
                 // Create a chat for this new connection, or (on reconnect, where
                 // the entry already exists) normalize its transport so it isn't

@@ -59,13 +59,18 @@ after identity verification and before TOFU, with a constant-time compare) and a
 reachable from the GUI (Host/Connect dialogs + a lock toggle) and the TUI
 (`:connection-password`, `:lock`).
 
-### Relay — stateless 1:1 rendezvous
+### Relay — stateless 1:1 rendezvous with hole punching
 
-`core/src/network/relay.rs`. Pairs one host and one joiner by token and forwards
-ciphertext via `copy_bidirectional`; it never terminates chat encryption. No auth,
-rooms, or storage. The `--relay-server` mode ships (`client/src/main.rs`,
-`Args.relay_server` → `network::run_relay_server`). It cannot host a multi-user
-room.
+`core/src/network/relay.rs` (+ `punch.rs`). Pairs one host and one joiner by
+token. When both peers are punch-capable, the server hands each side the
+other's observed public endpoint plus LAN candidates and the peers **TCP hole
+punch** a direct connection (simultaneous open from the reused source port,
+validated and mutually confirmed — see `punch.rs`); the relay then carries no
+session bytes at all. Only when punching fails does it bridge ciphertext via
+`copy_bidirectional`; it never terminates chat encryption. Wire-compatible
+both ways with pre-punch peers and servers. No auth, rooms, or storage. The
+`--relay-server` mode ships (`client/src/main.rs`, `Args.relay_server` →
+`network::run_relay_server`). It cannot host a multi-user room.
 
 ### Party server — built (Administered MVP)
 
@@ -696,9 +701,14 @@ long-horizon gaps (see below), not scheduled.
   NAT-PMP — falling back to LAN/relay), and **invites are multi-address**
   (payload v4: external + LAN candidates in priority order, tried in turn by
   the connecting peer with a bounded per-attempt timeout; back-compatible both
-  ways with pre-v4 invites/clients). Still open: PCP gateways, real hole
-  punching for routers without IGD/NAT-PMP, and CGNAT (relay remains the
-  answer there).
+  ways with pre-v4 invites/clients). **TCP hole punching is shipped**: the
+  relay rendezvous coordinates a simultaneous open between punch-capable
+  peers (observed public endpoints + LAN candidates, reused source ports,
+  token-tag validation, deterministic socket selection) so relay sessions go
+  direct whenever the NATs allow it, bridging only as a fallback
+  (`core/src/network/punch.rs`; back-compatible both ways with pre-punch
+  peers/servers). Still open: PCP gateways and hard symmetric-NAT/CGNAT
+  pairs (the bridged relay remains the answer there).
 
 **UX**
 
@@ -738,8 +748,11 @@ no automated tests — it is verified with `cargo check -p p2pem-desktop` and
   in-memory `PartyState` (join/password/channels/history/DMs/persistence), the
   request dispatcher, and connection/broadcast end-to-end over the reused v3
   tunnel.
-- **Relay** (`core/tests/relay_e2e.rs`): two peers pair through a self-hosted relay
-  and exchange an application message over the forwarded encrypted transport.
+- **Relay** (`core/tests/relay_e2e.rs` + in-file): hole-punched direct sessions
+  and bridged fallback end-to-end (full handshake + message on both paths), the
+  punch engine (loopback punch, token-mismatch rejection, candidate filtering),
+  mixed punch-capable/legacy pairings, and a legacy-server emulation proving
+  new clients silently re-register in legacy mode.
 - **Types** (`core/src/types.rs`): `Config` defaults (privacy-conservative), serde
   round-trips, backward-compatible deserialization.
 - **Identity / persistence**: encrypted identity storage, encrypted-history
