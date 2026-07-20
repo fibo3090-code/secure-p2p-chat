@@ -82,12 +82,7 @@ fn host_auto_accepts_a_returning_known_fingerprint() {
 #[test]
 fn blocked_contact_fingerprint_is_auto_rejected() {
     let mut mgr = ChatManager::new(Config::default());
-    let contact_id = mgr.add_contact(
-        "Mallory".into(),
-        None,
-        Some("BLOCKED-FP".into()),
-        None,
-    );
+    let contact_id = mgr.add_contact("Mallory".into(), None, Some("BLOCKED-FP".into()), None);
     mgr.block_contact(contact_id).unwrap();
 
     let session_id = Uuid::new_v4();
@@ -1123,9 +1118,12 @@ fn incoming_file_is_held_until_accepted() {
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].status, TransferStatus::AwaitingAcceptance);
     assert!(
-        !mgr.chats.get(&chat_id).unwrap().messages.iter().any(|m| {
-            matches!(m.content, MessageContent::File { .. })
-        }),
+        !mgr.chats
+            .get(&chat_id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| { matches!(m.content, MessageContent::File { .. }) }),
         "no file message before acceptance"
     );
     assert!(
@@ -1163,9 +1161,13 @@ fn declined_incoming_file_is_deleted_and_discarded() {
         "declined transfer must leave nothing on disk, found: {:?}",
         spooled
     );
-    assert!(!mgr.chats.get(&chat_id).unwrap().messages.iter().any(|m| {
-        matches!(m.content, MessageContent::File { .. })
-    }));
+    assert!(!mgr
+        .chats
+        .get(&chat_id)
+        .unwrap()
+        .messages
+        .iter()
+        .any(|m| { matches!(m.content, MessageContent::File { .. }) }));
     assert_eq!(
         mgr.active_transfers_snapshot()[0].status,
         TransferStatus::Cancelled

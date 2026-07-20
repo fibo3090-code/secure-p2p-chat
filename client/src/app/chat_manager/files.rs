@@ -208,7 +208,11 @@ impl ChatManager {
         self.pending_file_end.remove(&transfer_id);
         if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
             if let Err(e) = incoming.abort_cleanup() {
-                tracing::warn!("Failed to clean up declined transfer {}: {}", transfer_id, e);
+                tracing::warn!(
+                    "Failed to clean up declined transfer {}: {}",
+                    transfer_id,
+                    e
+                );
             }
         }
         self.add_toast(

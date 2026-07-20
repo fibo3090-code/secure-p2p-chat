@@ -1369,9 +1369,7 @@ impl TuiApp {
                             ToastLevel::Success,
                             format!("Identity backup saved to {}", dest),
                         ),
-                        Err(e) => {
-                            self.toast(ToastLevel::Error, format!("Backup failed: {}", e))
-                        }
+                        Err(e) => self.toast(ToastLevel::Error, format!("Backup failed: {}", e)),
                     }
                 }
             }

@@ -420,7 +420,10 @@ impl ChatManager {
             .ok_or_else(|| anyhow::anyhow!("Contact not found"))?
             .clone();
         if contact.trust_state == TrustState::Blocked {
-            bail!("{} is blocked — unblock the contact to reconnect", contact.name);
+            bail!(
+                "{} is blocked — unblock the contact to reconnect",
+                contact.name
+            );
         }
         // Direct-connect candidates in priority order (multi-address invites:
         // e.g. internet-reachable first, LAN second). Unparsable entries are
