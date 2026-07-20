@@ -1,4 +1,4 @@
-//! Text messaging: chunked send/reassembly of large messages, group
+//! Text messaging: chunked send/reassembly of large messages,
 //! broadcast, typing indicators, and notification previews.
 
 use super::*;
@@ -188,85 +188,7 @@ impl ChatManager {
         }
     }
 
-    /// Send a text message to all participants of a group chat (convenience broadcast).
-    /// This looks up one-to-one chats associated with each contact and sends the message
-    /// via the existing session channels. Contacts without an active session are skipped.
-    ///
-    /// Returns the number of participants the message was successfully sent to.
-    pub fn send_group_message(&mut self, group_chat_id: Uuid, text: String) -> Result<usize> {
-        let chat = self
-            .chats
-            .get(&group_chat_id)
-            .ok_or_else(|| anyhow::anyhow!("Group chat not found"))?;
-
-        // Clone participants so we don't hold an immutable borrow while mutating chats
-        let participants = chat.participants.clone();
-
-        // Add message to group chat history ONCE (not per recipient)
-        if let Some(gchat) = self.chats.get_mut(&group_chat_id) {
-            gchat.messages.push(Message {
-                id: Uuid::new_v4(),
-                from_me: true,
-                content: MessageContent::Text { text: text.clone() },
-                timestamp: chrono::Utc::now(),
-            });
-        }
-
-        // Try to send to all participants with active sessions
-        let mut sent_count = 0;
-        let mut offline_contacts = Vec::new();
-
-        for participant_id in participants {
-            if let Some(contact) = self.contacts.get(&participant_id) {
-                if let Some(one_chat_id) = self.contact_to_chat.get(&participant_id).copied() {
-                    if let Some(session) = self.sessions.get(&one_chat_id) {
-                        if let Some(chat) = self.chats.get_mut(&one_chat_id) {
-                            let timestamp = crate::util::current_timestamp_millis();
-                            let Ok(messages) = Self::build_text_protocol_messages(
-                                &mut chat.send_seq,
-                                &text,
-                                timestamp,
-                            ) else {
-                                continue;
-                            };
-
-                            if messages
-                                .into_iter()
-                                .all(|msg| session.from_app_tx.send(msg).is_ok())
-                            {
-                                sent_count += 1;
-                            }
-                        }
-                    } else {
-                        offline_contacts.push(contact.name.clone());
-                    }
-                } else {
-                    offline_contacts.push(contact.name.clone());
-                }
-            }
-        }
-
-        // Show toast notification about offline participants
-        if !offline_contacts.is_empty() {
-            let offline_str = offline_contacts.join(", ");
-            let message = if sent_count == 0 {
-                format!(
-                    "⚠ Message sent locally but all recipients are offline: {}",
-                    offline_str
-                )
-            } else {
-                format!(
-                    "⚠ Sent to {} recipient(s), but offline: {}",
-                    sent_count, offline_str
-                )
-            };
-            self.add_toast(ToastLevel::Warning, message);
-        }
-
-        Ok(sent_count)
-    }
-
-    /// Send a text message (handles both 1-on-1 chats and group chats)
+    /// Send a text message over the chat's active session.
     pub fn send_message(&mut self, chat_id: Uuid, text: String) -> Result<()> {
         tracing::debug!(
             "send_message called for chat_id={}, len(text)={} chars",
@@ -281,30 +203,8 @@ impl ChatManager {
             .copied()
             .unwrap_or(chat_id);
 
-        // Determine if this is a true group chat
-        let (participants_len, has_session) = if let Some(chat) = self.chats.get(&chat_id) {
-            (
-                chat.participants.len(),
-                self.sessions.contains_key(&actual_session_chat_id),
-            )
-        } else {
-            (0, false)
-        };
-
-        let is_group_chat = participants_len >= 2;
-        tracing::debug!(
-            "chat classification: is_group_chat={}, participants_len={}, has_session={}, actual_session_chat_id={}",
-            is_group_chat,
-            participants_len,
-            has_session,
-            actual_session_chat_id,
-        );
-
-        if is_group_chat {
-            tracing::info!("Sending as group message to chat {}", chat_id);
-            self.send_group_message(chat_id, text)?;
-            return Ok(());
-        }
+        let has_session = self.chats.contains_key(&chat_id)
+            && self.sessions.contains_key(&actual_session_chat_id);
 
         // One-to-one chat path
         if !has_session {

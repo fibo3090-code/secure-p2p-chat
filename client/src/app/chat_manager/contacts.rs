@@ -1,5 +1,5 @@
-//! Contacts: adding/importing, chat association, auto-reconnect on
-//! startup, and group-chat creation.
+//! Contacts: adding/importing, chat association, trust lifecycle
+//! (verify/block), and auto-reconnect on startup.
 
 use super::*;
 
@@ -232,34 +232,4 @@ impl ChatManager {
         }
     }
 
-    /// Create a group chat with given participants and optional title
-    pub fn create_group_chat(&mut self, participants: Vec<Uuid>, title: Option<String>) -> Uuid {
-        let chat_id = Uuid::new_v4();
-        let default_title = title.unwrap_or_else(|| {
-            if participants.is_empty() {
-                "Group".to_string()
-            } else {
-                format!("Group ({})", participants.len())
-            }
-        });
-
-        let chat = Chat {
-            id: chat_id,
-            title: default_title,
-            kind: ChatKind::Group,
-            transport: Transport::Direct,
-            peer_fingerprint: None,
-            participants,
-            messages: Vec::new(),
-            created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
-            send_seq: 0,
-            recv_seq: 0,
-            is_host_placeholder: false,
-        };
-
-        self.chats.insert(chat_id, chat);
-        chat_id
-    }
 }

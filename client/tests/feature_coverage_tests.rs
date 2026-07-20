@@ -1,6 +1,6 @@
 //! Breadth coverage for ChatManager features that the other suites don't already
-//! exercise: group chats, conversation rename/delete, history clearing, toast
-//! lifecycle, incoming file-transfer state, typing indicators without a session,
+//! exercise: conversation rename/delete, history clearing, toast lifecycle,
+//! incoming file-transfer state, typing indicators without a session,
 //! contact import/association, and invite QR generation.
 
 use p2pem_classic::app::chat_manager::ChatManager;
@@ -24,39 +24,6 @@ fn sample_contact(name: &str) -> Contact {
         tags: Vec::new(),
         last_seen: None,
     }
-}
-
-#[test]
-fn group_chat_creation_and_offline_send() {
-    let mut mgr = ChatManager::default();
-    let alice = mgr.import_contact(sample_contact("Alice"));
-    let bob = mgr.import_contact(sample_contact("Bob"));
-
-    let group = mgr.create_group_chat(vec![alice, bob], Some("Study Group".to_string()));
-    let chat = mgr.get_chat(group).expect("group chat exists");
-    assert_eq!(chat.title, "Study Group");
-    assert_eq!(chat.participants.len(), 2);
-
-    // No active sessions, so nothing is delivered, but the message is recorded
-    // locally and an offline warning toast is raised.
-    let sent = mgr.send_group_message(group, "hi all".to_string()).unwrap();
-    assert_eq!(sent, 0, "no online recipients");
-    assert_eq!(mgr.get_chat(group).unwrap().messages.len(), 1);
-    assert!(mgr
-        .toasts
-        .iter()
-        .any(|t| t.level == ToastLevel::Warning && t.message.contains("offline")));
-}
-
-#[test]
-fn create_group_chat_defaults_title_from_participant_count() {
-    let mut mgr = ChatManager::default();
-    let a = mgr.import_contact(sample_contact("A"));
-    let group = mgr.create_group_chat(vec![a], None);
-    assert_eq!(mgr.get_chat(group).unwrap().title, "Group (1)");
-
-    let empty = mgr.create_group_chat(vec![], None);
-    assert_eq!(mgr.get_chat(empty).unwrap().title, "Group");
 }
 
 #[test]
