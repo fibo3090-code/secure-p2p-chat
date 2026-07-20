@@ -277,12 +277,13 @@ async fn select_as_joiner(
             joined = waiters.join_next(), if !waiters.is_empty() => {
                 match joined {
                     Some(Ok(Ok(stream))) => return Ok(stream),
-                    Some(_) => {
-                        if !rx_open && waiters.is_empty() {
-                            bail!("hole punch produced no usable connection");
-                        }
+                    // A waiter failed (bad SELECT byte / dropped socket). If the
+                    // receiver is closed and no waiters remain, nothing else can
+                    // arrive — give up so we fall back to the bridged relay.
+                    Some(_) if !rx_open && waiters.is_empty() => {
+                        bail!("hole punch produced no usable connection");
                     }
-                    None => {}
+                    _ => {}
                 }
             },
             _ = tokio::time::sleep_until(select_deadline) => bail!("hole punch timed out"),
