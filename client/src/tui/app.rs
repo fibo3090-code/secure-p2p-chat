@@ -1356,6 +1356,26 @@ impl TuiApp {
                 Err(e) => self.toast(ToastLevel::Error, format!("Invalid name: {}", e)),
             },
 
+            TuiCommand::Backup(dest) => {
+                let source = self.identity_path.clone();
+                if !source.exists() {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No identity file to back up yet".to_string(),
+                    );
+                } else {
+                    match std::fs::copy(&source, &dest) {
+                        Ok(_) => self.toast(
+                            ToastLevel::Success,
+                            format!("Identity backup saved to {}", dest),
+                        ),
+                        Err(e) => {
+                            self.toast(ToastLevel::Error, format!("Backup failed: {}", e))
+                        }
+                    }
+                }
+            }
+
             TuiCommand::Rename(title) => match self.selected_chat_id() {
                 Some(id) => {
                     if let Err(e) = self.chat_manager.rename_chat(id, title) {

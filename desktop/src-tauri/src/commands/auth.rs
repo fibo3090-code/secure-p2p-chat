@@ -122,6 +122,36 @@ pub(crate) fn set_display_name(
     Ok(auth_status(state))
 }
 
+/// Export a backup copy of the encrypted identity file (identity.json) to a
+/// user-chosen location. The file is already encrypted at rest (Argon2 +
+/// ChaCha20-Poly1305), so the copy is as safe as the original — but it IS the
+/// identity: losing it (and the password) means losing the account.
+/// Returns the destination path, or None if the dialog was cancelled.
+#[tauri::command]
+pub(crate) async fn export_identity(
+    state: tauri::State<'_, Bridge>,
+) -> Result<Option<String>, String> {
+    ensure_ready(&state)?;
+    let source = state.identity_save_path();
+    if !source.exists() {
+        return Err("No identity file to back up yet".to_string());
+    }
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_file_name("p2pem-identity-backup.json")
+            .save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(dest) = picked else {
+        return Ok(None); // cancelled
+    };
+    tokio::fs::copy(&source, &dest)
+        .await
+        .map_err(|e| format!("Backup failed: {e}"))?;
+    Ok(Some(dest.display().to_string()))
+}
+
 /// The user-facing settings the desktop app exposes. Only fields the core
 /// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
 /// `download_dir` and typing/notification switches are read by `ChatManager`,

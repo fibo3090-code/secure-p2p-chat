@@ -1809,7 +1809,37 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 if crate::gui::widgets::primary_button(ui, "Set/Change Password").clicked() {
                     app.active_dialog = ActiveDialog::SetPassword;
                 }
+                if crate::gui::widgets::secondary_button(ui, "Export Identity Backup").clicked() {
+                    let source = app.history_path.with_file_name("identity.json");
+                    if !source.exists() {
+                        app.add_toast(
+                            crate::types::ToastLevel::Error,
+                            "No identity file to back up yet".to_string(),
+                        );
+                    } else if let Some(dest) = rfd::FileDialog::new()
+                        .set_file_name("p2pem-identity-backup.json")
+                        .save_file()
+                    {
+                        match std::fs::copy(&source, &dest) {
+                            Ok(_) => app.add_toast(
+                                crate::types::ToastLevel::Success,
+                                format!("Identity backup saved to {}", dest.display()),
+                            ),
+                            Err(e) => app.add_toast(
+                                crate::types::ToastLevel::Error,
+                                format!("Backup failed: {}", e),
+                            ),
+                        }
+                    }
+                }
             });
+            ui.label(
+                egui::RichText::new(
+                    "The backup is your encrypted identity file. Without it (and your password), a lost disk means a lost identity.",
+                )
+                .small()
+                .weak(),
+            );
 
             ui.label(
                 egui::RichText::new(

@@ -145,6 +145,7 @@ pub fn run() {
             commands::auth::set_password,
             commands::auth::my_identity,
             commands::auth::set_display_name,
+            commands::auth::export_identity,
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,

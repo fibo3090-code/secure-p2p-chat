@@ -57,6 +57,7 @@ pub enum TuiCommand {
 
     // --- identity ---
     Name(String),
+    Backup(String),
 
     // --- chat management ---
     Rename(String),
@@ -166,6 +167,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("accept", ":accept", "Accept the incoming file offer"),
     ("decline", ":decline", "Decline the incoming file offer"),
     ("name", ":name <name>", "Change your display name"),
+    ("backup", ":backup <path>", "Export an encrypted identity backup"),
     (
         "party-connect",
         ":party-connect <host[:port]> <username> [password]",
@@ -411,6 +413,12 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
                 return Err("Usage: :name <display name>".to_string());
             }
             Ok(TuiCommand::Name(rest.trim().to_string()))
+        }
+        "backup" => {
+            if rest.trim().is_empty() {
+                return Err("Usage: :backup <destination path>".to_string());
+            }
+            Ok(TuiCommand::Backup(rest.trim().to_string()))
         }
 
         "party-connect" => {

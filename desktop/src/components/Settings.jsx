@@ -99,6 +99,20 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
             </div>
           </div>
           <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
+          <div className="set-row">
+            <span className="set-row-txt">
+              <span className="set-row-label">Identity backup</span>
+              <span className="set-row-hint">Save an encrypted copy of your identity file. Without it (and your password), a lost disk means a lost identity.</span>
+            </span>
+            <button className="set-change" onClick={async () => {
+              try {
+                const dest = await api.exportIdentity();
+                if (dest) toast(`Backup saved to ${dest}`, "success");
+              } catch (e) { toast(String(e), "error"); }
+            }}>
+              <Icon name="copy" size={14} /> Export
+            </button>
+          </div>
         </section>
 
         {s && (
