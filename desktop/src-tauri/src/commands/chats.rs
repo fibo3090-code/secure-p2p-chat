@@ -49,7 +49,6 @@ pub(crate) async fn list_conversations(
             let last = chat.messages.last().map(|m| match &m.content {
                 MessageContent::Text { text } => text.clone(),
                 MessageContent::File { filename, .. } => format!("📎 {}", filename),
-                MessageContent::Edited { new_text } => new_text.clone(),
             });
             out.push(ConvSummary {
                 id: id.to_string(),

@@ -541,14 +541,6 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
                         }
                     });
                 }
-                MessageContent::Edited { new_text } => {
-                    ui.label(
-                        egui::RichText::new(format!("{} (Edited)", new_text))
-                            .italics()
-                            .color(text_color.gamma_multiply(0.8))
-                            .size(14.0),
-                    );
-                }
             }
 
             ui.add_space(4.0);

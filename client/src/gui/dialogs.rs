@@ -1436,21 +1436,6 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
 
                 ui.add_space(10.0);
 
-                // Notification sound selection
-                ui.horizontal(|ui| {
-                    ui.label("Notification Sound:");
-                    if egui::ComboBox::from_id_salt("notification_sound_selector")
-                        .selected_text(format!("{:?}", manager.config.notification_sound))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::None, "None").changed() ||
-                            ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::Default, "Default").changed()
-                        }).inner.unwrap_or(false) {
-                            queue_history_save(app.history_path.clone(), &mut manager);
-                        }
-                });
-
-                ui.add_space(10.0);
-
                 let mut show_log = app.show_log_terminal;
                 if ui.checkbox(&mut show_log, "Show Log Terminal").changed() {
                     app.show_log_terminal = show_log;

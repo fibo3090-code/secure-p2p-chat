@@ -193,7 +193,6 @@ function msgText(c) {
   if (!c) return "";
   if (c.type === "text") return c.text;
   if (c.type === "file") return c.filename;
-  if (c.type === "Edited") return c.new_text;
   return c.text || "";
 }
 

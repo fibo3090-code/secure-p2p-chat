@@ -216,7 +216,6 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             MessageContent::File { filename, size, .. } => {
                 format!("📎 {} ({})", filename, crate::util::format_size(*size))
             }
-            MessageContent::Edited { .. } => "[edited]".to_string(),
         };
         plain_texts.push(format!("{}{}{}", ts, prefix, content));
         lines.push(Line::from(vec![
