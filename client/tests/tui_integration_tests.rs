@@ -15,7 +15,7 @@ fn test_message_roundtrip_integration() {
     // Setup dummy session
     let (tx, mut rx) = mpsc::unbounded_channel();
     app.chat_manager
-        .add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+        .add_session_for_test(chat_id, SessionHandle::for_test_control(tx));
 
     app.chat_ids = vec![chat_id];
     app.chat_list_state.select(Some(0));
@@ -57,9 +57,9 @@ fn test_multiple_chats_isolation() {
     let (tx2, mut rx2) = mpsc::unbounded_channel();
 
     app.chat_manager
-        .add_session_for_test(chat_id_1, SessionHandle { from_app_tx: tx1 });
+        .add_session_for_test(chat_id_1, SessionHandle::for_test_control(tx1));
     app.chat_manager
-        .add_session_for_test(chat_id_2, SessionHandle { from_app_tx: tx2 });
+        .add_session_for_test(chat_id_2, SessionHandle::for_test_control(tx2));
 
     app.chat_ids = vec![chat_id_1, chat_id_2];
 
@@ -129,7 +129,7 @@ fn test_typing_indicator_flow_integration() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     app.chat_manager
-        .add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+        .add_session_for_test(chat_id, SessionHandle::for_test_control(tx));
 
     app.chat_ids = vec![chat_id];
     app.chat_list_state.select(Some(0));

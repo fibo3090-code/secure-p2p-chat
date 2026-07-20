@@ -31,7 +31,7 @@ mod diagnostics {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         manager.add_session_for_test(
             chat_id,
-            p2pem_classic::app::chat_manager::SessionHandle { from_app_tx: tx },
+            p2pem_classic::app::chat_manager::SessionHandle::for_test_control(tx),
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -48,7 +48,7 @@ mod diagnostics {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         manager.add_session_for_test(
             chat_id,
-            p2pem_classic::app::chat_manager::SessionHandle { from_app_tx: tx },
+            p2pem_classic::app::chat_manager::SessionHandle::for_test_control(tx),
         );
 
         let missing_path = std::env::temp_dir().join(format!("missing-{}.txt", Uuid::new_v4()));

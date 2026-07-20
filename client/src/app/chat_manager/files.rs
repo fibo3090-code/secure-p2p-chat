@@ -5,6 +5,23 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Arguments for [`ChatManager::spawn_file_stream`]. Grouped into a struct to
+/// keep the streamer's setup readable (and satisfy the too-many-arguments lint).
+struct SpawnFileStream {
+    /// Bounded lane for bulk data frames (`FileChunk`/`FileEnd`); provides
+    /// backpressure via `send().await`.
+    file_tx: mpsc::Sender<ProtocolMessage>,
+    /// Unbounded control lane for the abort frame (`FileCancel`), so a cancel is
+    /// never queued behind pending chunks.
+    control_tx: mpsc::UnboundedSender<ProtocolMessage>,
+    path: std::path::PathBuf,
+    filename: String,
+    file_size: u64,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
+}
+
 impl ChatManager {
     /// Send a file to a chat.
     ///
@@ -15,29 +32,38 @@ impl ChatManager {
     pub async fn send_file(&mut self, chat_id: Uuid, path: std::path::PathBuf) -> Result<()> {
         tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
         let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
-        let sender = self
+        let (control_tx, file_tx) = self
             .sessions
             .get(&session_id)
-            .map(|s| s.from_app_tx.clone())
+            .map(|s| (s.from_app_tx.clone(), s.file_tx.clone()))
             .ok_or_else(|| anyhow!("Session not found"))?;
 
         let (filename, file_size) = Self::validate_outgoing_file(&path).await?;
         tracing::debug!(file = %filename, size = %file_size, "Sending file metadata");
 
+        // Placeholder seq: the session loop stamps the real monotonic wire
+        // sequence onto every frame it writes. FileMeta rides the bounded `file`
+        // lane so it stays ordered ahead of the chunks the stream task queues.
+        {
+            let chat = self
+                .chats
+                .get_mut(&chat_id)
+                .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
+            chat.send_seq += 1;
+        }
+        file_tx
+            .send(ProtocolMessage::FileMeta {
+                filename: filename.clone(),
+                size: file_size,
+                seq: 0,
+            })
+            .await
+            .map_err(|_| anyhow!("Session closed before file metadata was queued"))?;
+
         let chat = self
             .chats
             .get_mut(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
-
-        // Send file metadata. The session loop stamps the real monotonic wire
-        // sequence onto every frame it writes, so the seq passed here is a
-        // placeholder (kept only for local bookkeeping continuity).
-        chat.send_seq += 1;
-        sender.send(ProtocolMessage::FileMeta {
-            filename: filename.clone(),
-            size: file_size,
-            seq: chat.send_seq,
-        })?;
 
         // Add to local history.
         chat.messages.push(Message {
@@ -55,6 +81,7 @@ impl ChatManager {
         let transfer_id = Uuid::new_v4();
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
         self.active_transfers.insert(
             transfer_id,
             FileTransferState {
@@ -74,6 +101,7 @@ impl ChatManager {
                 session_id,
                 cancel: cancel.clone(),
                 progress: progress.clone(),
+                failed: failed.clone(),
             },
         );
 
@@ -86,32 +114,56 @@ impl ChatManager {
             .or_default()
             .push_back((filename.clone(), transfer_id));
 
-        // Stream the chunks off-thread so the send neither blocks the manager
-        // lock nor buffers the whole file eagerly, and can be cancelled between
-        // chunks. A cancel emits `FileCancel` and stops without a `FileEnd`, so
-        // no `FileSendComplete` fires for a cancelled send.
-        Self::spawn_file_stream(sender, path, filename, file_size, cancel, progress);
+        // Stream the chunks off-thread so the send never holds the manager lock
+        // for the (potentially multi-gigabyte) transfer and can be cancelled
+        // between chunks. Bounded backpressure (the `file` lane) caps how far the
+        // reader may run ahead of the network, so a slow link cannot balloon the
+        // outbound queue. A cancel or local I/O error stops without a `FileEnd`,
+        // so no `FileSendComplete` fires for it.
+        Self::spawn_file_stream(SpawnFileStream {
+            file_tx,
+            control_tx,
+            path,
+            filename,
+            file_size,
+            cancel,
+            progress,
+            failed,
+        });
         Ok(())
     }
 
     /// Background chunk streamer for one outgoing file. Runs until EOF (then
-    /// emits `FileEnd`), cancellation (then emits `FileCancel`), or a dead
-    /// channel (peer gone — stop silently; the session teardown reports it).
-    fn spawn_file_stream(
-        sender: mpsc::UnboundedSender<ProtocolMessage>,
-        path: std::path::PathBuf,
-        filename: String,
-        file_size: u64,
-        cancel: Arc<AtomicBool>,
-        progress: Arc<AtomicU64>,
-    ) {
+    /// emits `FileEnd`), cancellation (then emits `FileCancel` and flags the
+    /// task done), a local I/O error (flags `failed` so the poll loop marks the
+    /// transfer `Failed`), or a dead channel (peer gone — stop silently; the
+    /// session teardown reports it).
+    ///
+    /// Data frames (`FileMeta` is already queued by the caller, then `FileChunk`
+    /// / `FileEnd`) ride the **bounded** `file_tx` lane, so `send().await`
+    /// applies backpressure: the reader blocks once the lane is full instead of
+    /// buffering the whole file in memory when the network is slower than disk.
+    /// Abort frames (`FileCancel`) ride the unbounded `control_tx` lane so a
+    /// cancel is never stuck behind queued chunks.
+    fn spawn_file_stream(args: SpawnFileStream) {
+        let SpawnFileStream {
+            file_tx,
+            control_tx,
+            path,
+            filename,
+            file_size,
+            cancel,
+            progress,
+            failed,
+        } = args;
         use tokio::io::AsyncReadExt;
         tokio::spawn(async move {
             let mut file = match tokio::fs::File::open(&path).await {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!(file = %filename, error = %e, "Could not open file to stream");
-                    let _ = sender.send(ProtocolMessage::FileCancel { seq: 0 });
+                    failed.store(true, Ordering::Relaxed);
+                    let _ = control_tx.send(ProtocolMessage::FileCancel { seq: 0 });
                     return;
                 }
             };
@@ -120,7 +172,7 @@ impl ChatManager {
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     tracing::info!(file = %filename, "Outgoing transfer cancelled; sending FileCancel");
-                    let _ = sender.send(ProtocolMessage::FileCancel { seq: 0 });
+                    let _ = control_tx.send(ProtocolMessage::FileCancel { seq: 0 });
                     return;
                 }
                 let n = match file.read(&mut buffer).await {
@@ -128,15 +180,18 @@ impl ChatManager {
                     Ok(n) => n,
                     Err(e) => {
                         tracing::error!(file = %filename, error = %e, "Read error while streaming file");
-                        let _ = sender.send(ProtocolMessage::FileCancel { seq: 0 });
+                        failed.store(true, Ordering::Relaxed);
+                        let _ = control_tx.send(ProtocolMessage::FileCancel { seq: 0 });
                         return;
                     }
                 };
-                if sender
+                // Bounded lane: awaits when full, so a slow peer paces the reader.
+                if file_tx
                     .send(ProtocolMessage::FileChunk {
                         chunk: buffer[..n].to_vec(),
                         seq: 0,
                     })
+                    .await
                     .is_err()
                 {
                     return; // peer/session gone
@@ -147,7 +202,7 @@ impl ChatManager {
                     tracing::trace!(sent_chunks = %sent_chunks, "File sending progress");
                 }
             }
-            let _ = sender.send(ProtocolMessage::FileEnd { seq: 0 });
+            let _ = file_tx.send(ProtocolMessage::FileEnd { seq: 0 }).await;
             tracing::info!(file = %filename, total_bytes = %file_size, "File fully queued for sending");
         });
     }
@@ -211,7 +266,14 @@ impl ChatManager {
     /// state so the UI's snapshot reflects live send progress. Called each
     /// poll tick before events are drained.
     pub(super) fn sync_outgoing_transfer_progress(&mut self) {
+        // Collect transfers whose stream task hit a local I/O error, so we can
+        // finalize them after the immutable borrow of `outgoing_transfers` ends.
+        let mut failed_ids = Vec::new();
         for (transfer_id, handle) in &self.outgoing_transfers {
+            if handle.failed.load(Ordering::Relaxed) {
+                failed_ids.push((*transfer_id, handle.session_id));
+                continue;
+            }
             if let Some(state) = self.active_transfers.get_mut(transfer_id) {
                 let sent = handle.progress.load(Ordering::Relaxed);
                 state.received = sent;
@@ -219,6 +281,27 @@ impl ChatManager {
                     state.status = TransferStatus::InProgress;
                 }
             }
+        }
+
+        for (transfer_id, session_id) in failed_ids {
+            self.outgoing_transfers.remove(&transfer_id);
+            // Drop the pending-delivery entry so session teardown doesn't also
+            // report it as "not delivered".
+            if let Some(queue) = self.pending_file_sends.get_mut(&session_id) {
+                queue.retain(|(_, id)| *id != transfer_id);
+            }
+            let filename = self
+                .active_transfers
+                .get_mut(&transfer_id)
+                .map(|state| {
+                    state.status = TransferStatus::Failed("could not read the file".to_string());
+                    state.filename.clone()
+                })
+                .unwrap_or_default();
+            self.add_toast(
+                ToastLevel::Error,
+                format!("File send failed (could not read the file): {}", filename),
+            );
         }
     }
 

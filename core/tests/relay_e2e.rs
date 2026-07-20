@@ -81,10 +81,12 @@ async fn pair_and_exchange() -> (String, String) {
 
     let (host_ev_tx, mut host_events) = mpsc::unbounded_channel();
     let (host_out, host_out_rx) = mpsc::unbounded_channel();
+    let (_host_file_tx, host_file_rx) = mpsc::channel(8);
     let (host_confirm, host_confirm_rx) = mpsc::unbounded_channel();
 
     let (client_ev_tx, mut client_events) = mpsc::unbounded_channel();
     let (_client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (_client_file_tx, client_file_rx) = mpsc::channel(8);
     let (client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
 
     // Host registers the token first.
@@ -97,6 +99,7 @@ async fn pair_and_exchange() -> (String, String) {
             host_priv,
             host_ev_tx,
             host_out_rx,
+            host_file_rx,
             host_confirm_rx,
             uuid::Uuid::new_v4(),
         )
@@ -114,6 +117,7 @@ async fn pair_and_exchange() -> (String, String) {
             client_priv,
             client_ev_tx,
             client_out_rx,
+            client_file_rx,
             client_confirm_rx,
             uuid::Uuid::new_v4(),
         )

@@ -66,7 +66,7 @@ fn test_message_sequence_ordering() {
 
     // Add a mock session and KEEP RECEIVER ALIVE
     let (tx, _rx) = mpsc::unbounded_channel();
-    manager.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+    manager.add_session_for_test(chat_id, SessionHandle::for_test_control(tx));
 
     manager.send_message(chat_id, "One".to_string()).unwrap();
     manager.send_message(chat_id, "Two".to_string()).unwrap();
@@ -83,7 +83,7 @@ fn test_large_message_is_chunked_for_transport() {
     manager.create_local_chat_for_test(chat_id, "Chunk Test".to_string());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    manager.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+    manager.add_session_for_test(chat_id, SessionHandle::for_test_control(tx));
 
     let large_text = "abc123".repeat(20_000);
     manager.send_message(chat_id, large_text.clone()).unwrap();
