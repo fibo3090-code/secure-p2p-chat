@@ -301,7 +301,11 @@ socket wins carries the full v3 handshake (ECDH, identity proof, TOFU).
 Compatibility: a legacy peer simply gets the bridged path (the server never
 starts a punch phase unless both sides are capable); a legacy *server* drops
 the unknown V2 variant, which new clients detect (connection closed before
-any response) and silently re-register in legacy mode.
+any response) and silently re-register in legacy mode. To keep that detection
+unambiguous, a new server acknowledges every accepted join with an immediate
+`Waiting` frame before handing the socket to the host — so a later disconnect
+(e.g. the host vanished at the rendezvous) is treated as a genuine failure
+rather than mistaken for a legacy server and pointlessly retried.
 `P2PEM_NO_HOLEPUNCH=1` disables punching client-side.
 
 ## Compatibility Notes

@@ -139,12 +139,14 @@ pub async fn run_relay_server(port: u16) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_host_session_via_relay(
     relay_server: &str,
     token: &str,
     privkey: rsa::RsaPrivateKey,
     to_app_tx: tokio::sync::mpsc::UnboundedSender<crate::types::SessionEvent>,
     from_app_rx: tokio::sync::mpsc::UnboundedReceiver<crate::core::ProtocolMessage>,
+    file_rx: tokio::sync::mpsc::Receiver<crate::core::ProtocolMessage>,
     confirm_rx: tokio::sync::mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
 ) -> Result<()> {
@@ -158,6 +160,7 @@ pub async fn run_host_session_via_relay(
         privkey,
         to_app_tx,
         from_app_rx,
+        file_rx,
         confirm_rx,
         chat_id,
         None,
@@ -165,12 +168,14 @@ pub async fn run_host_session_via_relay(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_client_session_via_relay(
     relay_server: &str,
     token: &str,
     privkey: rsa::RsaPrivateKey,
     to_app_tx: tokio::sync::mpsc::UnboundedSender<crate::types::SessionEvent>,
     from_app_rx: tokio::sync::mpsc::UnboundedReceiver<crate::core::ProtocolMessage>,
+    file_rx: tokio::sync::mpsc::Receiver<crate::core::ProtocolMessage>,
     confirm_rx: tokio::sync::mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
 ) -> Result<()> {
@@ -184,6 +189,7 @@ pub async fn run_client_session_via_relay(
         privkey,
         to_app_tx,
         from_app_rx,
+        file_rx,
         confirm_rx,
         chat_id,
         None,
@@ -480,6 +486,14 @@ async fn join_flow(
         .await?;
         bail!("Relay token expired");
     }
+
+    // Acknowledge the join before handing the socket to the host. This is what
+    // lets a punch-capable joiner tell a *new* relay (that later drops the
+    // connection because the host vanished at the handoff) apart from a *legacy*
+    // relay that closed because it could not parse the `JoinV2` frame: only the
+    // legacy server stays silent, so the joiner falls back to legacy mode solely
+    // in that genuine case. The client treats `Waiting` as "keep reading".
+    send_relay_message(&mut stream, &RelayResponse::Waiting).await?;
 
     pending_entry
         .rendezvous_tx

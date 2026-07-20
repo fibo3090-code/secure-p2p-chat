@@ -14,7 +14,7 @@ fn input_flow_supports_multiline_and_send() {
         .create_local_chat_for_test(chat_id, "Integration".to_string());
     let (tx, mut rx) = mpsc::unbounded_channel();
     app.chat_manager
-        .add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+        .add_session_for_test(chat_id, SessionHandle::for_test_control(tx));
 
     app.sync_chat_ids();
     app.chat_list_state.select(Some(0));

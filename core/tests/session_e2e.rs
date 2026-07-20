@@ -67,6 +67,10 @@ struct Peer {
     outbound: Outbound,
     confirm: mpsc::UnboundedSender<bool>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Bounded file-data lane sender, kept alive for the session's lifetime.
+    /// These tests drive file frames over the control (`outbound`) lane, so it
+    /// is unused directly, but dropping it would close the loop's file branch.
+    _file_tx: mpsc::Sender<ProtocolMessage>,
 }
 
 /// Spin up a connected host+client pair over a duplex stream and run both
@@ -87,11 +91,13 @@ async fn connect_pair_with_passwords(
 
     let (host_ev_tx, host_events) = mpsc::unbounded_channel();
     let (host_out, host_out_rx) = mpsc::unbounded_channel();
+    let (host_file_tx, host_file_rx) = mpsc::channel(8);
     let (host_confirm, host_confirm_rx) = mpsc::unbounded_channel();
     let host_chat = uuid::Uuid::new_v4();
 
     let (client_ev_tx, client_events) = mpsc::unbounded_channel();
     let (client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (client_file_tx, client_file_rx) = mpsc::channel(8);
     let (client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
     let client_chat = uuid::Uuid::new_v4();
 
@@ -102,6 +108,7 @@ async fn connect_pair_with_passwords(
             host_priv,
             host_ev_tx,
             host_out_rx,
+            host_file_rx,
             host_confirm_rx,
             host_chat,
             host_password,
@@ -116,6 +123,7 @@ async fn connect_pair_with_passwords(
             client_priv,
             client_ev_tx,
             client_out_rx,
+            client_file_rx,
             client_confirm_rx,
             client_chat,
             client_password,
@@ -129,12 +137,14 @@ async fn connect_pair_with_passwords(
             outbound: host_out,
             confirm: host_confirm,
             handle: host_handle,
+            _file_tx: host_file_tx,
         },
         Peer {
             events: client_events,
             outbound: client_out,
             confirm: client_confirm,
             handle: client_handle,
+            _file_tx: client_file_tx,
         },
     )
 }

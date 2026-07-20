@@ -704,9 +704,7 @@ fn v2_invite_signature_verification_prevents_fingerprint_swap() {
 
 /// Drain frames from the streaming send until `FileEnd` (or timeout), so the
 /// spawned chunk task has a chance to run.
-async fn drain_file_send(
-    rx: &mut mpsc::UnboundedReceiver<ProtocolMessage>,
-) -> Vec<ProtocolMessage> {
+async fn drain_file_send(rx: &mut mpsc::Receiver<ProtocolMessage>) -> Vec<ProtocolMessage> {
     let mut frames = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -722,14 +720,33 @@ async fn drain_file_send(
     frames
 }
 
+/// Build a `SessionHandle` plus its two receivers (control lane, bounded file
+/// lane) for tests that drive `send_file` without a real session loop.
+fn test_session_handle() -> (
+    SessionHandle,
+    mpsc::UnboundedReceiver<ProtocolMessage>,
+    mpsc::Receiver<ProtocolMessage>,
+) {
+    let (from_app_tx, control_rx) = mpsc::unbounded_channel();
+    let (file_tx, file_rx) = mpsc::channel(super::FILE_LANE_CAPACITY);
+    (
+        SessionHandle {
+            from_app_tx,
+            file_tx,
+        },
+        control_rx,
+        file_rx,
+    )
+}
+
 #[tokio::test]
 async fn send_file_streams_meta_chunks_and_end_and_tracks_transfer() {
     let mut mgr = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "File Send Test".to_string());
 
-    let (from_app_tx, mut from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+    let (handle, _control_rx, mut file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     let content = vec![b'x'; crate::FILE_CHUNK_SIZE * 2 + 13];
@@ -747,9 +764,9 @@ async fn send_file_streams_meta_chunks_and_end_and_tracks_transfer() {
         .expect("outgoing transfer should be tracked");
     assert_eq!(outgoing.chat_id, chat_id);
 
-    // The streamed frames arrive as Meta, then chunks, then End. The session
-    // loop owns wire sequencing, so ChatManager stamps placeholder seqs here.
-    let frames = drain_file_send(&mut from_app_rx).await;
+    // Meta/chunks/End ride the bounded file lane, in order. (The session loop
+    // owns wire sequencing, so ChatManager stamps placeholder seqs here.)
+    let frames = drain_file_send(&mut file_rx).await;
     assert!(
         matches!(frames.first(), Some(ProtocolMessage::FileMeta { .. })),
         "first frame must be FileMeta"
@@ -771,8 +788,8 @@ async fn cancel_outgoing_transfer_stops_stream_and_emits_file_cancel() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Cancel Test".to_string());
 
-    let (from_app_tx, mut from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+    let (handle, mut control_rx, mut file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     // Large enough that streaming does not finish instantly.
@@ -790,20 +807,30 @@ async fn cancel_outgoing_transfer_stops_stream_and_emits_file_cancel() {
         .expect("outgoing transfer tracked")
         .id;
 
-    // Cancel it. The streaming task stops and emits a FileCancel frame.
+    // Keep draining the bounded file lane so the (otherwise backpressured)
+    // stream task keeps cycling and can observe the cancel flag; assert it never
+    // reaches FileEnd.
+    let drain = tokio::spawn(async move {
+        while let Some(msg) = file_rx.recv().await {
+            assert!(
+                !matches!(msg, ProtocolMessage::FileEnd { .. }),
+                "stream should not complete after cancellation"
+            );
+        }
+    });
+
+    // Cancel it. The stream stops and a FileCancel goes out on the control lane.
     mgr.cancel_transfer(transfer_id);
 
     let mut saw_cancel = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, from_app_rx.recv()).await {
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, control_rx.recv()).await {
         if matches!(msg, ProtocolMessage::FileCancel { .. }) {
             saw_cancel = true;
             break;
         }
-        if matches!(msg, ProtocolMessage::FileEnd { .. }) {
-            panic!("stream should not complete after cancellation");
-        }
     }
+    drain.abort();
     assert!(saw_cancel, "cancellation must emit a FileCancel frame");
 
     let status = mgr
@@ -814,6 +841,68 @@ async fn cancel_outgoing_transfer_stops_stream_and_emits_file_cancel() {
     assert_eq!(status, Some(TransferStatus::Cancelled));
 }
 
+/// The bounded file lane must pace the reader: with the consumer stalled, the
+/// stream task can only run a bounded number of chunks ahead instead of
+/// buffering the whole file in memory.
+#[tokio::test]
+async fn outgoing_stream_is_backpressured_by_the_bounded_lane() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Backpressure".to_string());
+
+    let (handle, _control_rx, mut file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
+
+    let total_chunks = 100u64;
+    let content = vec![b'z'; crate::FILE_CHUNK_SIZE * total_chunks as usize];
+    let file_size = content.len() as u64;
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp_file.path(), content).unwrap();
+
+    mgr.send_file(chat_id, temp_file.path().to_path_buf())
+        .await
+        .expect("send_file should succeed");
+    let transfer_id = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.direction == TransferDirection::Outgoing)
+        .expect("outgoing transfer tracked")
+        .id;
+
+    // With nothing draining the lane, give the task time to run as far ahead as
+    // it can, then confirm it is capped near the lane capacity — not the file.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    mgr.sync_outgoing_transfer_progress();
+    let sent = |mgr: &ChatManager| {
+        mgr.active_transfers_snapshot()
+            .into_iter()
+            .find(|t| t.id == transfer_id)
+            .map(|t| t.received)
+            .unwrap_or(0)
+    };
+    let stalled = sent(&mgr);
+    let cap_bytes = super::FILE_LANE_CAPACITY as u64 * crate::FILE_CHUNK_SIZE as u64;
+    assert!(
+        stalled <= cap_bytes,
+        "backpressure must cap in-flight bytes at ~lane capacity; got {stalled} > {cap_bytes}"
+    );
+    assert!(
+        stalled < file_size,
+        "the whole file must not be buffered when the consumer is stalled"
+    );
+
+    // Draining the lane must let the producer make further progress.
+    for _ in 0..20 {
+        let _ = file_rx.recv().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    mgr.sync_outgoing_transfer_progress();
+    assert!(
+        sent(&mgr) > stalled,
+        "draining the lane must let the backpressured reader advance"
+    );
+}
+
 /// Queueing frames on the session is not delivery: the "File sent" toast
 /// must wait for the session's wire-level confirmation event.
 #[tokio::test]
@@ -822,8 +911,8 @@ async fn file_sent_toast_waits_for_wire_confirmation() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Honest Send".to_string());
 
-    let (from_app_tx, _from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+    let (handle, _control_rx, _file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp_file.path(), b"payload").unwrap();
@@ -851,8 +940,8 @@ async fn disconnect_fails_pending_file_sends_honestly() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Interrupted Send".to_string());
 
-    let (from_app_tx, _from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+    let (handle, _control_rx, _file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp_file.path(), b"payload").unwrap();

@@ -33,7 +33,31 @@ use text::IncomingTextMessage;
 /// Session handle for communication with network task
 #[derive(Clone)]
 pub struct SessionHandle {
+    /// Unbounded control lane: text, typing, and file-transfer control frames
+    /// (`FileMeta` is sent on the file lane; `FileCancel` on this one).
     pub from_app_tx: mpsc::UnboundedSender<ProtocolMessage>,
+    /// Bounded bulk-data lane for outgoing `FileChunk`/`FileMeta`/`FileEnd`
+    /// frames, so a large send is paced by the network instead of buffering the
+    /// whole file in the outbound queue.
+    pub file_tx: mpsc::Sender<ProtocolMessage>,
+}
+
+/// Capacity (in chunks) of the bounded outgoing file-data lane. At
+/// `FILE_CHUNK_SIZE` (64 KiB) this caps in-flight outbound file data at a few
+/// hundred KiB regardless of file size, providing real backpressure.
+pub(crate) const FILE_LANE_CAPACITY: usize = 8;
+
+impl SessionHandle {
+    /// Test-support constructor for a handle whose bulk file lane is inert (its
+    /// receiver is dropped). For tests that exercise control-lane messaging and
+    /// never drive `send_file`.
+    pub fn for_test_control(from_app_tx: mpsc::UnboundedSender<ProtocolMessage>) -> Self {
+        let (file_tx, _file_rx) = mpsc::channel(1);
+        Self {
+            from_app_tx,
+            file_tx,
+        }
+    }
 }
 
 /// Live control handle for an in-flight outgoing file transfer. The chunk
@@ -47,6 +71,10 @@ pub(crate) struct OutgoingTransfer {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Bytes handed to the transport so far (mirrored into `active_transfers`).
     pub progress: Arc<std::sync::atomic::AtomicU64>,
+    /// Set by the streaming task on a local I/O error (open/read) so the poll
+    /// loop can mark the transfer `Failed` and drop it instead of leaving a
+    /// stuck row and a leaked handle.
+    pub failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A TOFU verification the UI must resolve before a session becomes `Ready`.

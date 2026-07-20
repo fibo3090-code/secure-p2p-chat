@@ -32,11 +32,12 @@ predate tagged releases.
   the egui dialog, the TUI overlay, and the desktop Verify panel.
 - **File-transfer cancellation.** Either side can now abort an in-flight
   transfer via a new replay-protected `FileCancel` wire frame. Sends stream
-  from a background task (a large send no longer freezes the app or buffers
-  the whole file eagerly) and stop promptly on cancel; the receiver discards
-  its partial file. Cancellable from the egui transfer bar, the TUI Transfers
-  overlay (↑/↓ select, `c` to cancel), and the desktop transfer cards, in
-  both directions.
+  from a background task (a large send no longer freezes the app) over a
+  **bounded outbound lane**, so a slow peer paces the disk reader with real
+  backpressure instead of buffering the whole file in memory; the send stops
+  promptly on cancel and the receiver discards its partial file. Cancellable
+  from the egui transfer bar, the TUI Transfers overlay (↑/↓ select, `c` to
+  cancel), and the desktop transfer cards, in both directions.
 
 ### Changed
 
@@ -47,6 +48,17 @@ predate tagged releases.
 
 ### Fixed
 
+- **Stuck outgoing transfer on a local file error.** If the file was deleted,
+  moved, or became unreadable after a send started, the streaming task told the
+  peer to cancel but never updated local state — the transfer row sat at
+  "in progress" forever and its handle leaked. It is now marked `Failed` (with
+  a toast) and cleaned up.
+- **Relay joiner no longer misreads a lost host as a legacy server.** A
+  punch-capable joiner that saw its connection drop before the first response
+  (e.g. the host vanished at the rendezvous) was mistaken for a pre-punch relay
+  and pointlessly retried in legacy mode. New relays now acknowledge a join
+  immediately, so only a genuine legacy server (which stays silent) triggers the
+  fallback.
 - **Workspace build restored on the declared toolchain.** Pinned `rusqlite`
   to 0.39 — 0.40 pulls `libsqlite3-sys` 0.38, whose build script uses the
   unstable `cfg_select` macro and broke `messenger-server` (and any
