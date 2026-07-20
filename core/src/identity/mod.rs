@@ -578,6 +578,20 @@ impl Identity {
     /// Save identity to file
     ///
     /// SECURITY: Enforces encryption and strictly secure file permissions (0600 on Unix).
+    /// Change the display name (shown in invite links and the local UI).
+    /// Validation only — persist with [`Identity::save`] afterwards.
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Display name cannot be empty"));
+        }
+        if name.chars().count() > 48 {
+            return Err(anyhow!("Display name is too long (max 48 characters)"));
+        }
+        self.name = name.to_string();
+        Ok(())
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         // Guard against saving unencrypted identities
         if self.encrypted_private_key.is_none() {

@@ -105,6 +105,23 @@ pub(crate) fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
     auth_status(state)
 }
 
+/// Change the identity's display name (used in invite links and the UI) and
+/// persist it. The key material and fingerprint are untouched.
+#[tauri::command]
+pub(crate) fn set_display_name(
+    name: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<AuthStatus, String> {
+    ensure_ready(&state)?;
+    {
+        let mut id = state.identity.lock().unwrap();
+        id.set_name(&name).map_err(|e| e.to_string())?;
+        id.save(&state.identity_save_path())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(auth_status(state))
+}
+
 /// The user-facing settings the desktop app exposes. Only fields the core
 /// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
 /// `download_dir` and typing/notification switches are read by `ChatManager`,

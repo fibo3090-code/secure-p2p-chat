@@ -1728,6 +1728,58 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
             }
 
             ui.add_space(20.0);
+            ui.heading("Profile");
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Display name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.display_name_input)
+                        .char_limit(48)
+                        .desired_width(180.0),
+                );
+                let changed = app.display_name_input.trim() != app.identity.name;
+                if ui
+                    .add_enabled(changed, egui::Button::new("Save"))
+                    .clicked()
+                {
+                    let new_name = app.display_name_input.clone();
+                    match app.identity.set_name(&new_name) {
+                        Ok(()) => {
+                            let path = app.history_path.with_file_name("identity.json");
+                            match app.identity.save(&path) {
+                                Ok(()) => {
+                                    app.display_name_input = app.identity.name.clone();
+                                    // Cached invite link embeds the old name.
+                                    app.my_invite_link = None;
+                                    app.my_invite_link_addrs.clear();
+                                    app.qr_code_texture = None;
+                                    app.add_toast(
+                                        crate::types::ToastLevel::Success,
+                                        "Display name updated".to_string(),
+                                    );
+                                }
+                                Err(e) => app.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to save identity: {}", e),
+                                ),
+                            }
+                        }
+                        Err(e) => app.add_toast(
+                            crate::types::ToastLevel::Error,
+                            format!("Invalid name: {}", e),
+                        ),
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("Shown in the invite links you share. Your fingerprint never changes.")
+                    .small()
+                    .weak(),
+            );
+
+            ui.add_space(20.0);
             ui.heading("Support");
             ui.separator();
             ui.add_space(10.0);

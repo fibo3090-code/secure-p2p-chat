@@ -144,6 +144,7 @@ pub fn run() {
             commands::auth::unlock,
             commands::auth::set_password,
             commands::auth::my_identity,
+            commands::auth::set_display_name,
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,

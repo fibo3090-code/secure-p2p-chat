@@ -281,7 +281,7 @@ export default function App() {
           <main className="col-full"><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
         )}
         {nav === "settings" && (
-          <main className="col-full"><Settings identity={auth} theme={theme} setTheme={setTheme} /></main>
+          <main className="col-full"><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
         )}
         {nav === "parties" && <main className="col-full"><Parties /></main>}
         {nav === "relays" && <main className="col-full"><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}

@@ -117,6 +117,8 @@ pub struct App {
     pub party_new_channel_input: String,
     /// Optional P2P connection password entered in the Host/Connect dialogs.
     pub connection_password_input: String,
+    /// Draft for the display-name field in Settings.
+    pub display_name_input: String,
 }
 
 impl App {
@@ -232,6 +234,7 @@ impl App {
         let initial_identity_locked = identity.is_locked();
         // Force password setup whenever the identity is not locked (i.e., private key available in plaintext)
         let force_password_setup = !initial_identity_locked;
+        let identity_name_for_ui = identity.name.clone();
         // Wrap manager in Arc<Mutex<..>> once and reuse
         let manager_arc = Arc::new(Mutex::new(chat_manager));
         // Do not start network (auto_host, auto_connect) until identity is unlocked or password set
@@ -341,6 +344,7 @@ impl App {
             party_selected_dm: None,
             party_new_channel_input: String::new(),
             connection_password_input: String::new(),
+            display_name_input: identity_name_for_ui,
         })
     }
 

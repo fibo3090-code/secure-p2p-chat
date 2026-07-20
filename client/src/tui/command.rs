@@ -55,6 +55,9 @@ pub enum TuiCommand {
     AcceptFile,
     DeclineFile,
 
+    // --- identity ---
+    Name(String),
+
     // --- chat management ---
     Rename(String),
     DeleteChat,
@@ -162,6 +165,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("transfers", ":transfers", "Show active file transfers"),
     ("accept", ":accept", "Accept the incoming file offer"),
     ("decline", ":decline", "Decline the incoming file offer"),
+    ("name", ":name <name>", "Change your display name"),
     (
         "party-connect",
         ":party-connect <host[:port]> <username> [password]",
@@ -402,6 +406,12 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "transfers" => Ok(TuiCommand::Transfers),
         "accept" => Ok(TuiCommand::AcceptFile),
         "decline" => Ok(TuiCommand::DeclineFile),
+        "name" => {
+            if rest.trim().is_empty() {
+                return Err("Usage: :name <display name>".to_string());
+            }
+            Ok(TuiCommand::Name(rest.trim().to_string()))
+        }
 
         "party-connect" => {
             let address = parts.next().ok_or_else(|| {

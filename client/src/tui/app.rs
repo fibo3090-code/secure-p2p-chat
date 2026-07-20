@@ -1343,6 +1343,19 @@ impl TuiApp {
                 }
             }
 
+            TuiCommand::Name(name) => match self.identity.set_name(&name) {
+                Ok(()) => match self.identity.save(&self.identity_path) {
+                    Ok(()) => self.toast(
+                        ToastLevel::Success,
+                        format!("Display name changed to {}", self.identity.name),
+                    ),
+                    Err(e) => {
+                        self.toast(ToastLevel::Error, format!("Failed to save identity: {}", e))
+                    }
+                },
+                Err(e) => self.toast(ToastLevel::Error, format!("Invalid name: {}", e)),
+            },
+
             TuiCommand::Rename(title) => match self.selected_chat_id() {
                 Some(id) => {
                     if let Err(e) = self.chat_manager.rename_chat(id, title) {

@@ -20,13 +20,25 @@ function Toggle({ on, onChange, label, hint }) {
   );
 }
 
-export function Settings({ identity, theme, setTheme }) {
+export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
   const [s, setS] = useState(null);
   const [portDraft, setPortDraft] = useState("");
+  const [nameDraft, setNameDraft] = useState(identity?.name || "");
 
   useEffect(() => {
     api.getSettings().then((v) => { setS(v); setPortDraft(String(v.listen_port)); }).catch(() => {});
   }, []);
+  useEffect(() => { setNameDraft(identity?.name || ""); }, [identity?.name]);
+
+  async function commitName() {
+    const name = nameDraft.trim();
+    if (!name || name === identity?.name) { setNameDraft(identity?.name || ""); return; }
+    try {
+      await api.setDisplayName(name);
+      toast("Display name updated.", "success");
+      onIdentityChanged && onIdentityChanged();
+    } catch (e) { toast(String(e), "error"); setNameDraft(identity?.name || ""); }
+  }
 
   // Apply one field and save; roll back the UI if the bridge rejects it.
   async function apply(patch) {
@@ -78,11 +90,15 @@ export function Settings({ identity, theme, setTheme }) {
           <div className="set-id">
             <Avatar name={identity?.name} size={46} />
             <div>
-              <div className="set-id-name">{identity?.name || "—"}</div>
+              <input className="set-id-name-input" value={nameDraft} maxLength={48}
+                aria-label="Display name"
+                onChange={(e) => setNameDraft(e.target.value)}
+                onBlur={commitName}
+                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} />
               <code className="set-id-fp">{(identity?.fingerprint || "").replace(/(.{4})/g, "$1 ").trim()}</code>
             </div>
           </div>
-          <div className="set-note">Keys are stored encrypted on this device and never leave it.</div>
+          <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
         </section>
 
         {s && (
