@@ -7,16 +7,16 @@ impl ChatManager {
     /// Send the user's accept/reject decision for a fingerprint verification to the session task
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");
-        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
+        if self.fingerprint_confirm_senders.contains_key(&chat_id) {
             // If the user accepted and we have a pending verification request matching this chat,
             // persist the fingerprint in the chat record before confirming the session.
             if accept {
-                if let Some((fp, _peer_name, req_chat_id)) = &self.fingerprint_verification_request
-                {
+                let pending = self.fingerprint_verification_request.clone();
+                if let Some((fp, _peer_name, req_chat_id)) = pending {
                     // IMPORTANT: In host mode, req_chat_id is the session ID (the host placeholder ID)
                     // but the fingerprint should be stored in the actual chat (the client's ID).
                     // However, confirm_fingerprint is called with the session ID.
-                    if *req_chat_id == chat_id {
+                    if req_chat_id == chat_id {
                         // Resolve the actual chat ID if this is a mapped session
                         let target_chat_id = self
                             .chat_id_mapping
@@ -32,12 +32,19 @@ impl ChatManager {
                             );
                             chat.peer_fingerprint = Some(fp.clone());
                         }
+                        // A user-confirmed fingerprint also verifies the
+                        // matching contact.
+                        self.promote_contact_verified(target_chat_id, &fp);
                         // Clear the pending request now that we've stored it
                         self.fingerprint_verification_request = None;
                     }
                 }
             }
 
+            let tx = self
+                .fingerprint_confirm_senders
+                .get(&chat_id)
+                .expect("checked above");
             tx.send(accept)
                 .map_err(|e| anyhow::anyhow!("Failed to send confirmation: {}", e))?;
             Ok(())
@@ -412,6 +419,9 @@ impl ChatManager {
             .get(&contact_id)
             .ok_or_else(|| anyhow::anyhow!("Contact not found"))?
             .clone();
+        if contact.trust_state == TrustState::Blocked {
+            bail!("{} is blocked — unblock the contact to reconnect", contact.name);
+        }
         // Direct-connect candidates in priority order (multi-address invites:
         // e.g. internet-reachable first, LAN second). Unparsable entries are
         // dropped rather than aborting, so a stale candidate can't block the

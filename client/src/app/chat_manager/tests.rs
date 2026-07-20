@@ -80,6 +80,99 @@ fn host_auto_accepts_a_returning_known_fingerprint() {
 }
 
 #[test]
+fn blocked_contact_fingerprint_is_auto_rejected() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Mallory".into(),
+        None,
+        Some("BLOCKED-FP".into()),
+        None,
+    );
+    mgr.block_contact(contact_id).unwrap();
+
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+    mgr.handle_tofu_verification(session_id, "BLOCKED-FP", "Mallory");
+
+    assert!(
+        mgr.fingerprint_verification_request.is_none(),
+        "a blocked fingerprint must not prompt the user"
+    );
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(false),
+        "a blocked fingerprint must be rejected automatically"
+    );
+}
+
+#[test]
+fn tofu_accept_promotes_contact_to_verified() {
+    let mut mgr = ChatManager::new(Config::default());
+    // Contact known by name but not yet verified, bound to the chat.
+    let contact_id = mgr.add_contact("Alice".into(), None, None, None);
+    let session_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(session_id, "Alice".into());
+    mgr.associate_contact_with_chat(contact_id, session_id);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+    mgr.handle_tofu_verification(session_id, "ALICE-FP", "Alice");
+    assert!(mgr.fingerprint_verification_request.is_some());
+
+    mgr.confirm_fingerprint(session_id, true).unwrap();
+
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.trust_state, TrustState::Verified);
+    assert_eq!(contact.fingerprint.as_deref(), Some("ALICE-FP"));
+}
+
+#[test]
+fn unblock_restores_verified_when_fingerprint_confirmed() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact("Bob".into(), None, Some("BOB-FP".into()), None);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Bob".into());
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("BOB-FP".into());
+
+    mgr.block_contact(contact_id).unwrap();
+    assert_eq!(
+        mgr.get_contact(contact_id).unwrap().trust_state,
+        TrustState::Blocked
+    );
+
+    mgr.unblock_contact(contact_id).unwrap();
+    assert_eq!(
+        mgr.get_contact(contact_id).unwrap().trust_state,
+        TrustState::Verified,
+        "confirmed fingerprint restores Verified after unblock"
+    );
+}
+
+#[tokio::test]
+async fn connect_to_blocked_contact_is_refused() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Mallory".into(),
+        Some("127.0.0.1:1".into()),
+        Some("BLOCKED-FP".into()),
+        None,
+    );
+    mgr.block_contact(contact_id).unwrap();
+
+    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let err = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .expect_err("connecting to a blocked contact must fail");
+    assert!(err.to_string().contains("blocked"));
+}
+
+#[test]
 fn parse_invite_with_valid_address_keeps_it() {
     let mgr = ChatManager::default();
 

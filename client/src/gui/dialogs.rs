@@ -811,6 +811,32 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                             }
                         }
 
+                        let blocked = contact.trust_state == crate::types::TrustState::Blocked;
+                        if blocked {
+                            ui.colored_label(crate::gui::styling::ERROR, "⛔ blocked");
+                        }
+                        let (block_label, block_hint) = if blocked {
+                            ("↩", "Unblock contact")
+                        } else {
+                            ("⛔", "Block contact (refuse its connections)")
+                        };
+                        if ui.small_button(block_label).on_hover_text(block_hint).clicked() {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                let result = if blocked {
+                                    manager.unblock_contact(contact.id)
+                                } else {
+                                    manager.block_contact(contact.id)
+                                };
+                                match result {
+                                    Ok(()) => queue_history_save(app.history_path.clone(), &mut manager),
+                                    Err(e) => manager.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Block/unblock failed: {}", e),
+                                    ),
+                                }
+                            }
+                        }
+
                         if ui
                             .small_button("🗑")
                             .on_hover_text("Delete contact")

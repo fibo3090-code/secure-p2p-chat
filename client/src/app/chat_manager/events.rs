@@ -45,6 +45,20 @@ impl ChatManager {
             .map(|(&cid, _)| cid)
             .unwrap_or(session_id);
 
+        // A blocked contact's fingerprint is refused outright: no prompt, no
+        // auto-accept, and the session is told to abort.
+        if self.is_fingerprint_blocked(fingerprint) {
+            tracing::warn!(peer = %peer_name, "Rejected connection from blocked contact");
+            if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
+                let _ = tx.send(false);
+            }
+            self.add_toast(
+                ToastLevel::Warning,
+                format!("Blocked contact {} tried to connect — refused", peer_name),
+            );
+            return;
+        }
+
         // Have we already confirmed this fingerprint elsewhere (another chat with
         // this peer, or a saved contact)? Then it's a returning peer under TOFU and
         // we accept without another prompt. Computed before the mutable borrow below.
@@ -83,6 +97,9 @@ impl ChatManager {
                             tracing::error!("Failed to auto-confirm fingerprint: {}", e);
                         }
                     }
+                    // The handshake confirmed this fingerprint; reflect it on
+                    // the matching contact (returning peer stays consistent).
+                    self.promote_contact_verified(actual_chat_id, fingerprint);
                 } else {
                     // Request explicit user verification via UI
                     // Note: fingerprint_verification_request uses the SESSION ID

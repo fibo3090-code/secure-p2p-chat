@@ -65,6 +65,106 @@ impl ChatManager {
         self.contacts.get(&contact_id)
     }
 
+    /// Block a contact: refuse its future connections (TOFU auto-rejects its
+    /// fingerprint) and drop any live session with it. History is kept.
+    pub fn block_contact(&mut self, contact_id: Uuid) -> Result<()> {
+        let contact = self
+            .contacts
+            .get_mut(&contact_id)
+            .ok_or_else(|| anyhow::anyhow!("No such contact"))?;
+        contact.trust_state = TrustState::Blocked;
+        let name = contact.name.clone();
+        let fingerprint = contact.fingerprint.clone();
+        tracing::info!(%contact_id, name = %name, "Contact blocked");
+
+        // Disconnect every live session with that fingerprint right away.
+        if let Some(fp) = fingerprint {
+            let session_ids: Vec<Uuid> = self
+                .chats
+                .values()
+                .filter(|c| c.peer_fingerprint.as_deref() == Some(fp.as_str()))
+                .map(|c| *self.chat_id_mapping.get(&c.id).unwrap_or(&c.id))
+                .collect();
+            for sid in session_ids {
+                if self.sessions.remove(&sid).is_some() {
+                    tracing::info!(session = %sid, "Disconnected session of blocked contact");
+                }
+            }
+        }
+        self.add_toast(ToastLevel::Info, format!("Blocked {}", name));
+        Ok(())
+    }
+
+    /// Unblock a contact. Trust returns to Verified when its fingerprint was
+    /// confirmed in some chat, otherwise back to Unverified.
+    pub fn unblock_contact(&mut self, contact_id: Uuid) -> Result<()> {
+        let confirmed = {
+            let contact = self
+                .contacts
+                .get(&contact_id)
+                .ok_or_else(|| anyhow::anyhow!("No such contact"))?;
+            contact.fingerprint.as_deref().is_some_and(|fp| {
+                self.chats
+                    .values()
+                    .any(|c| c.peer_fingerprint.as_deref() == Some(fp))
+            })
+        };
+        let contact = self
+            .contacts
+            .get_mut(&contact_id)
+            .ok_or_else(|| anyhow::anyhow!("No such contact"))?;
+        contact.trust_state = if confirmed {
+            TrustState::Verified
+        } else {
+            TrustState::Unverified
+        };
+        let name = contact.name.clone();
+        tracing::info!(%contact_id, name = %name, state = ?contact.trust_state, "Contact unblocked");
+        self.add_toast(ToastLevel::Info, format!("Unblocked {}", name));
+        Ok(())
+    }
+
+    /// Whether a peer fingerprint belongs to a blocked contact.
+    pub(super) fn is_fingerprint_blocked(&self, fingerprint: &str) -> bool {
+        self.contacts.values().any(|c| {
+            c.trust_state == TrustState::Blocked && c.fingerprint.as_deref() == Some(fingerprint)
+        })
+    }
+
+    /// Record a successful TOFU confirmation on the matching contact: the
+    /// contact bound to this chat (or one sharing the fingerprint) becomes
+    /// Verified, filling in its fingerprint when it had none. Blocked contacts
+    /// are never promoted.
+    pub(super) fn promote_contact_verified(&mut self, chat_id: Uuid, fingerprint: &str) {
+        let contact_id = self
+            .contact_to_chat
+            .iter()
+            .find(|(_, &cid)| cid == chat_id)
+            .map(|(&id, _)| id)
+            .or_else(|| {
+                self.contacts
+                    .values()
+                    .find(|c| c.fingerprint.as_deref() == Some(fingerprint))
+                    .map(|c| c.id)
+            });
+        let Some(id) = contact_id else { return };
+        let Some(contact) = self.contacts.get_mut(&id) else {
+            return;
+        };
+        if contact.trust_state == TrustState::Blocked {
+            return;
+        }
+        if contact.fingerprint.is_none() {
+            contact.fingerprint = Some(fingerprint.to_string());
+        }
+        if contact.fingerprint.as_deref() == Some(fingerprint)
+            && contact.trust_state == TrustState::Unverified
+        {
+            contact.trust_state = TrustState::Verified;
+            tracing::info!(contact = %contact.name, "Contact promoted to Verified after TOFU confirmation");
+        }
+    }
+
     /// Associate a contact with a one-to-one chat (useful when a session is created for that contact)
     pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
         tracing::debug!(
@@ -105,6 +205,10 @@ impl ChatManager {
                 self.contact_to_chat.remove(&contact_id);
                 continue;
             };
+            if contact.trust_state == TrustState::Blocked {
+                tracing::info!(%contact_id, "Skipping reconnect: contact is blocked");
+                continue;
+            }
 
             tracing::debug!(
                 %contact_id,
