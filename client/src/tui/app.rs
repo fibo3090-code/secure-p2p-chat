@@ -72,6 +72,8 @@ pub struct TuiApp {
     pub should_quit: bool,
     pub overlay: TuiOverlay,
     pub overlay_scroll: u16,
+    /// Selected row in the Transfers overlay (index into the id-sorted list).
+    pub transfer_sel: usize,
     pub contact_ids: Vec<Uuid>,
     pub contacts_list_state: ListState,
     pub settings_list_state: ListState,
@@ -146,6 +148,7 @@ impl TuiApp {
             should_quit: false,
             overlay: TuiOverlay::None,
             overlay_scroll: 0,
+            transfer_sel: 0,
             contact_ids: Vec::new(),
             contacts_list_state: ListState::default(),
             settings_list_state: ListState::default(),
@@ -306,13 +309,12 @@ impl TuiApp {
 
         // Surface a pending fingerprint verification as an overlay.
         if !self.overlay.is_open() {
-            if let Some((fingerprint, peer_name, chat_id)) =
-                self.chat_manager.fingerprint_verification_request.take()
-            {
+            if let Some(pending) = self.chat_manager.fingerprint_verification_request.take() {
                 self.overlay = TuiOverlay::FingerprintVerify {
-                    fingerprint,
-                    peer_name,
-                    chat_id,
+                    fingerprint: pending.fingerprint,
+                    peer_name: pending.peer_name,
+                    sas: pending.sas,
+                    chat_id: pending.session_id,
                 };
             }
         }
@@ -677,9 +679,26 @@ impl TuiApp {
                 _ => {}
             },
             // Plain informational overlays: any of Esc/Enter/q closes.
-            TuiOverlay::Invite { .. } | TuiOverlay::Identity | TuiOverlay::Transfers => {
+            TuiOverlay::Invite { .. } | TuiOverlay::Identity => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = TuiOverlay::None;
+                }
+            }
+            // Transfers overlay supports selecting and cancelling a transfer.
+            TuiOverlay::Transfers => {
+                let count = self.chat_manager.active_transfers_sorted().len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if count > 0 {
+                            self.transfer_sel = (self.transfer_sel + 1).min(count - 1);
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.transfer_sel = self.transfer_sel.saturating_sub(1);
+                    }
+                    KeyCode::Char('c') => self.cancel_selected_transfer(),
+                    _ => {}
                 }
             }
             TuiOverlay::None => {}
@@ -1394,6 +1413,23 @@ impl TuiApp {
         self.overlay_scroll = 0;
     }
 
+    // ---------------------------------------------------------------- transfers
+
+    /// Cancel the transfer highlighted in the Transfers overlay, if it is still
+    /// in flight (id-sorted so the index matches the render).
+    fn cancel_selected_transfer(&mut self) {
+        let transfers = self.chat_manager.active_transfers_sorted();
+        let Some(t) = transfers.get(self.transfer_sel) else {
+            return;
+        };
+        if matches!(
+            t.status,
+            crate::types::TransferStatus::Pending | crate::types::TransferStatus::InProgress
+        ) {
+            self.chat_manager.cancel_transfer(t.id);
+        }
+    }
+
     // ---------------------------------------------------------------- fingerprint
 
     fn verify_pending(&mut self, accept: bool) {
@@ -1776,6 +1812,7 @@ mod tests {
         app.overlay = TuiOverlay::FingerprintVerify {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),
+            sas: String::new(),
             chat_id,
         };
 
@@ -1802,6 +1839,7 @@ mod tests {
         app.overlay = TuiOverlay::FingerprintVerify {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),
+            sas: String::new(),
             chat_id,
         };
 

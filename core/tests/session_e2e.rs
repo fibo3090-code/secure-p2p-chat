@@ -246,6 +246,16 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
     })
     .await;
 
+    // --- File cancel: a FileCancel frame traverses the encrypted transport and
+    // survives the replay check like any other sequenced message ---
+    host.outbound
+        .send(ProtocolMessage::FileCancel { seq: 7 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::FileCancel { .. }
+    ));
+
     // --- Keep-alive ping: transport plumbing, consumed silently ---
     // A Ping must keep the session healthy but never surface to the app: the
     // very next app-visible message after it is the following Text, not the Ping.
@@ -273,6 +283,37 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
     .await;
 
     host.handle.abort();
+}
+
+#[tokio::test]
+async fn both_peers_derive_the_same_short_authentication_string() {
+    let (mut host, mut client) = connect_pair().await;
+
+    // The SAS is carried on the confirmation-request events; both roles derive
+    // it independently from the shared transcript, so the two must be equal and
+    // well-formed. (A MITM would run two handshakes and the codes would differ.)
+    let host_sas = match wait_until(&mut host.events, "host", awaiting_confirmation).await {
+        SessionEvent::NewConnection { sas, .. } => sas,
+        other => panic!("host expected NewConnection, got {other:?}"),
+    };
+    let client_sas = match wait_until(&mut client.events, "client", awaiting_confirmation).await {
+        SessionEvent::ShowFingerprintVerification { sas, .. } => sas,
+        other => panic!("client expected ShowFingerprintVerification, got {other:?}"),
+    };
+
+    assert_eq!(host_sas, client_sas, "both ends must show the same SAS");
+    assert!(!host_sas.is_empty(), "SAS must be populated");
+    // "NN-NN-NN" digits followed by three emoji groups.
+    assert_eq!(
+        host_sas.split(' ').count(),
+        4,
+        "unexpected SAS shape: {host_sas}"
+    );
+
+    host.confirm.send(true).unwrap();
+    client.confirm.send(true).unwrap();
+    host.handle.abort();
+    client.handle.abort();
 }
 
 #[tokio::test]

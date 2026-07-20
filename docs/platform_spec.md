@@ -59,13 +59,18 @@ after identity verification and before TOFU, with a constant-time compare) and a
 reachable from the GUI (Host/Connect dialogs + a lock toggle) and the TUI
 (`:connection-password`, `:lock`).
 
-### Relay — stateless 1:1 rendezvous
+### Relay — stateless 1:1 rendezvous with hole punching
 
-`core/src/network/relay.rs`. Pairs one host and one joiner by token and forwards
-ciphertext via `copy_bidirectional`; it never terminates chat encryption. No auth,
-rooms, or storage. The `--relay-server` mode ships (`client/src/main.rs`,
-`Args.relay_server` → `network::run_relay_server`). It cannot host a multi-user
-room.
+`core/src/network/relay.rs` (+ `punch.rs`). Pairs one host and one joiner by
+token. When both peers are punch-capable, the server hands each side the
+other's observed public endpoint plus LAN candidates and the peers **TCP hole
+punch** a direct connection (simultaneous open from the reused source port,
+validated and mutually confirmed — see `punch.rs`); the relay then carries no
+session bytes at all. Only when punching fails does it bridge ciphertext via
+`copy_bidirectional`; it never terminates chat encryption. Wire-compatible
+both ways with pre-punch peers and servers. No auth, rooms, or storage. The
+`--relay-server` mode ships (`client/src/main.rs`, `Args.relay_server` →
+`network::run_relay_server`). It cannot host a multi-user room.
 
 ### Party server — built (Administered MVP)
 
@@ -660,10 +665,13 @@ Signal-style Double Ratchet:
 a key change, but nothing detects a malicious key presented *consistently* from
 the very first contact, and out-of-band fingerprint comparison is friction
 users skip. Incremental, independently shippable improvements:
-- **Short Authentication String (SAS) / verified-session flow**: a
-  numeric/emoji SAS derived from the handshake transcript that two users read
-  aloud once to promote a contact to a "verified" trust state (the trust-state
-  field already exists). Cheaper than transparency logs and catches active MITM.
+- **Short Authentication String (SAS) / verified-session flow. ✅** A
+  transcript-bound SAS (six digits + three emoji, `derive_sas` in
+  `core/src/core/crypto.rs`) rides the TOFU confirmation events and leads the
+  verification prompt in all three UIs, so users compare a short code instead
+  of 64 hex chars; an active MITM's two handshakes yield two different codes.
+  Still open: promoting a compared SAS to a persisted "verified" trust state
+  (the trust-state field already exists).
 - **Safety-number change surfacing**: make a fingerprint change a first-class,
   sticky UI event with a re-verify flow (not just a toast).
 - **Key transparency (full)**: an append-only, auditable log (CONIKS/Keybase
@@ -671,12 +679,11 @@ users skip. Incremental, independently shippable improvements:
   needs *infrastructure* (a log server + gossip/audit), so it is a larger,
   likely post-2.0 effort; SAS is the pragmatic near-term step.
 
-**D. X25519 contributory-behaviour hardening.**
-*Priority: low · Effort: small.* Reject known low-order / all-zero X25519 public
-keys at `parse_x25519_public`. Not currently exploitable (the identity proof
-signs the ephemeral key and the transcript hash salts HKDF, so a MITM can't
-force a shared secret without the victim's identity key), but it's cheap
-defense-in-depth and standard hygiene.
+**D. X25519 contributory-behaviour hardening. ✅**
+*Priority: low · Effort: small.* Done: `parse_x25519_public` rejects the
+all-zero key, and `derive_session_key` rejects a non-contributory shared
+secret (`was_contributory()`), covering the low-order points. Cheap
+defense-in-depth / standard hygiene (RFC 7748 §6.1).
 
 **E. Invite revocation.**
 *Priority: low · Effort: medium.* Signed invites now **expire** (30 days) but
@@ -696,20 +703,28 @@ long-horizon gaps (see below), not scheduled.
   NAT-PMP — falling back to LAN/relay), and **invites are multi-address**
   (payload v4: external + LAN candidates in priority order, tried in turn by
   the connecting peer with a bounded per-attempt timeout; back-compatible both
-  ways with pre-v4 invites/clients). Still open: PCP gateways, real hole
-  punching for routers without IGD/NAT-PMP, and CGNAT (relay remains the
-  answer there).
+  ways with pre-v4 invites/clients). **TCP hole punching is shipped**: the
+  relay rendezvous coordinates a simultaneous open between punch-capable
+  peers (observed public endpoints + LAN candidates, reused source ports,
+  token-tag validation, deterministic socket selection) so relay sessions go
+  direct whenever the NATs allow it, bridging only as a fallback
+  (`core/src/network/punch.rs`; back-compatible both ways with pre-punch
+  peers/servers). Still open: PCP gateways and hard symmetric-NAT/CGNAT
+  pairs (the bridged relay remains the answer there).
 
 **UX**
 
 - Accessibility pass over interactions and color usage.
 - Settings IA cleanup / tabbed organization (folds into the §10 settings page).
 - Better contact management UX and trust-state workflows.
-- File-transfer **progress** now shows in all three UIs (desktop transfer bar,
-  egui progress bar above the input, TUI title indicator); **cancellation**
-  remains open — it needs a wire-level abort message (`ProtocolMessage`
-  addition with symmetric encode/decode and replay-protected sequencing), so
-  it is its own protocol change rather than a UI patch.
+- File-transfer **progress** shows in all three UIs, and **cancellation is
+  shipped ✅**: a `ProtocolMessage::FileCancel` wire frame (binary tag 12,
+  replay-protected) lets either side abort. Sends now stream from a background
+  task (so a multi-gigabyte send neither blocks the manager lock nor buffers
+  eagerly) and stop mid-flight on cancel; the receiver discards its partial
+  temp file. Both directions are tracked (`TransferDirection`) and cancellable
+  from the egui transfer bar, the TUI Transfers overlay (↑/↓ select, `c`
+  cancel), and the desktop transfer cards.
 
 **Tracked long-horizon gaps** (intentionally not described as "done" anywhere):
 onion routing / anonymity layer, post-quantum migration, hardware-backed identity.
@@ -738,8 +753,11 @@ no automated tests — it is verified with `cargo check -p p2pem-desktop` and
   in-memory `PartyState` (join/password/channels/history/DMs/persistence), the
   request dispatcher, and connection/broadcast end-to-end over the reused v3
   tunnel.
-- **Relay** (`core/tests/relay_e2e.rs`): two peers pair through a self-hosted relay
-  and exchange an application message over the forwarded encrypted transport.
+- **Relay** (`core/tests/relay_e2e.rs` + in-file): hole-punched direct sessions
+  and bridged fallback end-to-end (full handshake + message on both paths), the
+  punch engine (loopback punch, token-mismatch rejection, candidate filtering),
+  mixed punch-capable/legacy pairings, and a legacy-server emulation proving
+  new clients silently re-register in legacy mode.
 - **Types** (`core/src/types.rs`): `Config` defaults (privacy-conservative), serde
   round-trips, backward-compatible deserialization.
 - **Identity / persistence**: encrypted identity storage, encrypted-history

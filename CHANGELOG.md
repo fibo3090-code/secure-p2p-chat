@@ -11,6 +11,49 @@ predate tagged releases.
 
 ### Added
 
+- **Real TCP hole punching over the relay.** The relay rendezvous now
+  coordinates a genuine direct connection between two peers instead of only
+  forwarding their traffic. When both sides are punch-capable, the server
+  hands each the other's observed public endpoint plus LAN candidates and the
+  peers perform a TCP simultaneous open (reused source ports, token-tag
+  validated, host-led socket selection — `core/src/network/punch.rs`); the
+  relay then carries no session bytes at all. It falls back to the previous
+  bridged forwarding only when punching fails (symmetric NAT, CGNAT, filtered
+  networks). UIs label a punched session `p2p:<addr>` (Direct badge) vs
+  `relay:<server>`. The control protocol is append-only, so new clients and
+  servers stay wire-compatible with pre-punch peers in both directions;
+  `P2PEM_NO_HOLEPUNCH=1` forces the bridged path.
+- **Short Authentication String (SAS) verification.** Peer verification now
+  leads with a six-digit + three-emoji code derived from the handshake
+  transcript (`derive_sas`), which both peers compute identically — an active
+  MITM's two handshakes yield two different codes. Users read the short code
+  aloud instead of comparing a 64-character fingerprint; the full
+  fingerprint / safety grid is demoted to an "advanced" section. Surfaced in
+  the egui dialog, the TUI overlay, and the desktop Verify panel.
+- **File-transfer cancellation.** Either side can now abort an in-flight
+  transfer via a new replay-protected `FileCancel` wire frame. Sends stream
+  from a background task (a large send no longer freezes the app or buffers
+  the whole file eagerly) and stop promptly on cancel; the receiver discards
+  its partial file. Cancellable from the egui transfer bar, the TUI Transfers
+  overlay (↑/↓ select, `c` to cancel), and the desktop transfer cards, in
+  both directions.
+
+### Changed
+
+- **X25519 key-exchange hardening.** The handshake now rejects an all-zero
+  peer public key on parse and a non-contributory (low-order-point) shared
+  secret at agreement, so a peer cannot force a predictable session key
+  (RFC 7748 §6.1).
+
+### Fixed
+
+- **Workspace build restored on the declared toolchain.** Pinned `rusqlite`
+  to 0.39 — 0.40 pulls `libsqlite3-sys` 0.38, whose build script uses the
+  unstable `cfg_select` macro and broke `messenger-server` (and any
+  `--workspace` build) on the supported Rust version. Also refreshed
+  dependencies in-semver, dropping the yanked `spin`/`core2` pins and picking
+  up the `memmap2` unsoundness fix.
+
 - **Multi-address invites (payload v4).** Signed invites can now carry every
   reachable candidate address in priority order — the UPnP external address
   first, the LAN address second — instead of one or the other. A connecting

@@ -167,22 +167,41 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                 } else {
                     0.0
                 };
+                let active = matches!(
+                    t.status,
+                    crate::types::TransferStatus::Pending
+                        | crate::types::TransferStatus::InProgress
+                );
+                let arrow = match t.direction {
+                    crate::types::TransferDirection::Incoming => "⬇",
+                    crate::types::TransferDirection::Outgoing => "⬆",
+                };
                 ui.horizontal(|ui| {
-                    ui.label(format!("📎 {}", t.filename));
+                    ui.label(format!("{} {}", arrow, t.filename));
                     ui.add(
                         egui::ProgressBar::new(frac)
-                            .desired_width(220.0)
+                            .desired_width(200.0)
                             .text(format!(
                                 "{} / {}",
                                 crate::util::format_size(t.received),
                                 crate::util::format_size(t.size)
                             )),
                     );
+                    // Only in-flight transfers can be cancelled.
+                    if active && ui.small_button("✖ Cancel").clicked() {
+                        let manager = app.chat_manager.clone();
+                        let transfer_id = t.id;
+                        tokio::spawn(async move {
+                            manager.lock().await.cancel_transfer(transfer_id);
+                        });
+                    }
                 });
                 // Keep repainting while a transfer is live so the bar moves
                 // without waiting for other UI activity.
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(250));
+                if active {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(250));
+                }
             }
 
             // File preview if selected

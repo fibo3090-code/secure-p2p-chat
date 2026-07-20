@@ -50,6 +50,11 @@ pub enum ProtocolMessage {
     /// File transfer complete
     FileEnd { seq: u64 },
 
+    /// Abort the in-flight file transfer on this chat. Sent by either side
+    /// (sender or receiver) to cancel; the peer stops sending / discards the
+    /// partial file. Shares the per-session replay-protected sequence space.
+    FileCancel { seq: u64 },
+
     /// Keep-alive ping
     Ping { seq: u64 },
 
@@ -118,6 +123,7 @@ impl std::fmt::Debug for ProtocolMessage {
                 .field("chunk_len", &chunk.len())
                 .finish(),
             Self::FileEnd { seq } => f.debug_struct("FileEnd").field("seq", seq).finish(),
+            Self::FileCancel { seq } => f.debug_struct("FileCancel").field("seq", seq).finish(),
             Self::Ping { seq } => f.debug_struct("Ping").field("seq", seq).finish(),
             Self::TypingStart { seq } => f.debug_struct("TypingStart").field("seq", seq).finish(),
             Self::TypingStop { seq } => f.debug_struct("TypingStop").field("seq", seq).finish(),
@@ -170,6 +176,7 @@ impl ProtocolMessage {
             | Self::FileMeta { seq, .. }
             | Self::FileChunk { seq, .. }
             | Self::FileEnd { seq }
+            | Self::FileCancel { seq }
             | Self::Ping { seq }
             | Self::TypingStart { seq }
             | Self::TypingStop { seq }
@@ -263,6 +270,11 @@ impl ProtocolMessage {
 
             Self::FileEnd { seq } => {
                 v.push(5u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+            }
+
+            Self::FileCancel { seq } => {
+                v.push(12u8);
                 v.extend_from_slice(&seq.to_be_bytes());
             }
 
@@ -558,6 +570,13 @@ impl ProtocolMessage {
                 let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
                 Some(Self::FileEnd { seq })
             }
+            12 => {
+                if cursor + 8 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                Some(Self::FileCancel { seq })
+            }
             6 => {
                 if cursor + 8 > b.len() {
                     return None;
@@ -650,6 +669,7 @@ mod tests {
             seq: 2,
         });
         assert_roundtrip(ProtocolMessage::FileEnd { seq: 3 });
+        assert_roundtrip(ProtocolMessage::FileCancel { seq: 4 });
         assert_roundtrip(ProtocolMessage::Ping { seq: 4 });
         assert_roundtrip(ProtocolMessage::TypingStart { seq: 5 });
         assert_roundtrip(ProtocolMessage::TypingStop { seq: 6 });

@@ -37,12 +37,34 @@ export function Verify({ req, onClose }) {
     <Modal open={!!req} onClose={onClose} width={440} title={`Verify ${req.peer_name}`} icon="fingerprint"
       sub="Trust on first use — confirm out of band">
       <div className="verify-body">
-        <SafetyGrid fingerprint={req.fingerprint} n={8} cell={28} />
-        <div className="verify-code">{group(req.fingerprint)}</div>
-        <div className="verify-hint">
-          Compare this grid (or the code) with {req.peer_name.split(" ")[0]} over a separate trusted channel —
-          a call or in person. Only accept if they match exactly.
-        </div>
+        {req.sas ? (
+          <>
+            {/* Primary check: the short authentication string. Both peers see
+                the SAME code; an interposed MITM makes the two ends differ.
+                Reading it aloud is far less error-prone than a 64-char hex
+                compare, so it leads and the grid/hex become the backstop. */}
+            <div className="verify-sas-label">Read this aloud with {req.peer_name.split(" ")[0]}:</div>
+            <div className="verify-sas">{req.sas}</div>
+            <div className="verify-hint">
+              It must match on both screens. If the codes differ, someone may be
+              intercepting the connection — reject it.
+            </div>
+            <details className="verify-advanced">
+              <summary>Full fingerprint (advanced)</summary>
+              <SafetyGrid fingerprint={req.fingerprint} n={8} cell={28} />
+              <div className="verify-code">{group(req.fingerprint)}</div>
+            </details>
+          </>
+        ) : (
+          <>
+            <SafetyGrid fingerprint={req.fingerprint} n={8} cell={28} />
+            <div className="verify-code">{group(req.fingerprint)}</div>
+            <div className="verify-hint">
+              Compare this grid (or the code) with {req.peer_name.split(" ")[0]} over a separate trusted channel —
+              a call or in person. Only accept if they match exactly.
+            </div>
+          </>
+        )}
         {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
         <div className="verify-actions">
           <Button icon="shieldCheck" disabled={busy} onClick={() => decide(true)}>Verify &amp; trust</Button>

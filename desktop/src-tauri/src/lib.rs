@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
-use messenger_core::types::{Config, MessageContent, ToastLevel, TransferStatus};
+use messenger_core::types::{
+    Config, MessageContent, ToastLevel, TransferDirection, TransferStatus,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -19,6 +21,10 @@ use uuid::Uuid;
 
 use p2pem_classic::app::party_manager::{PartyManager, PartyStatus};
 use p2pem_classic::app::ChatManager;
+
+/// A pending TOFU fingerprint prompt held for the frontend to poll:
+/// `(fingerprint, peer_name, sas, session_id)`.
+type PendingFp = Arc<StdMutex<Option<(String, String, String, String)>>>;
 
 /// Shared application state managed by Tauri.
 struct Bridge {
@@ -38,10 +44,9 @@ struct Bridge {
     is_new: StdMutex<bool>,
     /// Plaintext key present (no password set) — force a set-password step.
     force_setup: StdMutex<bool>,
-    /// Pending TOFU fingerprint request `(fingerprint, peer_name, session_id)`,
-    /// held as queryable state so a missed `fingerprint-request` event never
-    /// strands a session waiting for verification.
-    pending_fp: Arc<StdMutex<Option<(String, String, String)>>>,
+    /// Pending TOFU fingerprint request, held as queryable state so a missed
+    /// `fingerprint-request` event never strands a session awaiting verification.
+    pending_fp: PendingFp,
 }
 
 impl Bridge {
@@ -147,6 +152,7 @@ pub fn run() {
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,
+            commands::chats::cancel_transfer,
             commands::auth::get_settings,
             commands::auth::update_settings,
             commands::auth::pick_download_dir,
@@ -278,7 +284,7 @@ fn spawn_poll_loop(
     party: Arc<Mutex<PartyManager>>,
     history_path: PathBuf,
     parties_path: PathBuf,
-    pending_fp: Arc<StdMutex<Option<(String, String, String)>>>,
+    pending_fp: PendingFp,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -343,17 +349,24 @@ fn spawn_poll_loop(
                     serde_json::json!({ "level": level, "message": message }),
                 );
             }
-            if let Some((fingerprint, peer_name, chat_id)) = req {
-                let id = chat_id.to_string();
+            if let Some(pending) = req {
+                let id = pending.session_id.to_string();
+                let (fingerprint, peer_name, sas) =
+                    (pending.fingerprint, pending.peer_name, pending.sas);
                 tracing::info!(peer = %peer_name, session = %id, "TOFU fingerprint verification requested");
                 // Persist it as queryable state first, then emit the event.
-                *pending_fp.lock().unwrap() =
-                    Some((fingerprint.clone(), peer_name.clone(), id.clone()));
+                *pending_fp.lock().unwrap() = Some((
+                    fingerprint.clone(),
+                    peer_name.clone(),
+                    sas.clone(),
+                    id.clone(),
+                ));
                 let _ = app.emit(
                     "fingerprint-request",
                     serde_json::json!({
                         "fingerprint": fingerprint,
                         "peer_name": peer_name,
+                        "sas": sas,
                         "chat_id": id,
                     }),
                 );

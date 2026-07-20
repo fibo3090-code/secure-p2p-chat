@@ -80,6 +80,13 @@ from the egui app on the same machine.
 cargo run --release -- --relay-server --port 23456
 ```
 
+When both peers support it, the relay only plays matchmaker: it gives each
+side the other's addresses and the peers **hole punch** a direct TCP
+connection, so chat traffic never crosses the relay. If punching fails
+(strict/symmetric NAT, CGNAT), the relay transparently falls back to
+forwarding the encrypted traffic. Set `P2PEM_NO_HOLEPUNCH=1` to always use
+the forwarding path.
+
 ### Useful CLI flags
 
 - `--host`
