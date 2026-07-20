@@ -173,6 +173,10 @@ pub struct FileTransferState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransferStatus {
     Pending,
+    /// Incoming transfer held until the user accepts it (when
+    /// `Config::auto_accept_files` is off). Chunks are spooled to the temp
+    /// file meanwhile; declining deletes the spool and discards the rest.
+    AwaitingAcceptance,
     InProgress,
     Completed,
     Failed(String),

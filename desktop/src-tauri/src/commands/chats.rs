@@ -83,6 +83,7 @@ pub(crate) struct TransferDto {
 fn transfer_status_parts(s: &TransferStatus) -> (&'static str, Option<String>) {
     match s {
         TransferStatus::Pending => ("pending", None),
+        TransferStatus::AwaitingAcceptance => ("awaiting", None),
         TransferStatus::InProgress => ("active", None),
         TransferStatus::Completed => ("done", None),
         TransferStatus::Failed(e) => ("failed", Some(e.clone())),
@@ -172,6 +173,41 @@ pub(crate) async fn send_file(id: String, state: tauri::State<'_, Bridge>) -> Re
         .map_err(|e| e.to_string())?;
     persist_history(&state.manager, &state.history_path).await;
     Ok(())
+}
+
+/// Accept an incoming file offer (a transfer in the "awaiting" state).
+#[tauri::command]
+pub(crate) async fn accept_transfer(
+    id: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state
+        .manager
+        .lock()
+        .await
+        .accept_incoming_file(uuid)
+        .map_err(|e| e.to_string())?;
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Decline an incoming file offer: the spooled data is deleted and the rest
+/// of the stream is discarded.
+#[tauri::command]
+pub(crate) async fn decline_transfer(
+    id: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state
+        .manager
+        .lock()
+        .await
+        .reject_incoming_file(uuid)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

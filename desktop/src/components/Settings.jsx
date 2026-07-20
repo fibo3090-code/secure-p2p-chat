@@ -39,6 +39,7 @@ export function Settings({ identity, theme, setTheme }) {
         auto_host_on_startup: next.auto_host_on_startup,
         listen_port: next.listen_port,
         enable_upnp: next.enable_upnp,
+        auto_accept_files: next.auto_accept_files,
       });
     } catch (e) { toast(String(e), "error"); setS(s); }
   }
@@ -114,6 +115,8 @@ export function Settings({ identity, theme, setTheme }) {
 
             <section className="set-block">
               <div className="set-h">Files</div>
+              <Toggle label="Auto-accept incoming files" hint="When off, each incoming file must be accepted in the conversation before it is saved"
+                on={s.auto_accept_files} onChange={(v) => apply({ auto_accept_files: v })} />
               <div className="set-row">
                 <span className="set-row-txt">
                   <span className="set-row-label">Download folder</span>

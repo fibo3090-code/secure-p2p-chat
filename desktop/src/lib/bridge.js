@@ -20,6 +20,8 @@ const realApi = {
   sendMessage: (id, text) => invoke("send_message", { id, text }),
   sendFile: (id) => invoke("send_file", { id }),
   listTransfers: () => invoke("list_transfers"),
+  acceptTransfer: (id) => invoke("accept_transfer", { id }),
+  declineTransfer: (id) => invoke("decline_transfer", { id }),
   getSettings: () => invoke("get_settings"),
   updateSettings: (settings) => invoke("update_settings", { settings }),
   pickDownloadDir: () => invoke("pick_download_dir"),
@@ -58,6 +60,7 @@ function makeMock() {
   const mockSettings = {
     download_dir: "~/Downloads", enable_notifications: true,
     enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
+    auto_accept_files: false,
   };
   const chats = {
     "11111111-1111-1111-1111-111111111111": {
@@ -124,6 +127,8 @@ function makeMock() {
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000 }, timestamp: new Date().toISOString() }); },
     listTransfers: async () => [],
+    acceptTransfer: async () => {},
+    declineTransfer: async () => {},
     getSettings: async () => mockSettings,
     updateSettings: async (s) => { Object.assign(mockSettings, s); },
     pickDownloadDir: async () => { mockSettings.download_dir = "C:\\Users\\you\\Downloads"; return mockSettings.download_dir; },

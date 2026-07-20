@@ -1314,6 +1314,34 @@ impl TuiApp {
                 }
             }
             TuiCommand::Transfers => self.overlay = TuiOverlay::Transfers,
+            TuiCommand::AcceptFile | TuiCommand::DeclineFile => {
+                let accept = matches!(cmd, TuiCommand::AcceptFile);
+                // Prefer an offer in the selected chat, else take any pending one.
+                let selected = self.selected_chat_id();
+                let mut offers: Vec<_> = self
+                    .chat_manager
+                    .active_transfers_snapshot()
+                    .into_iter()
+                    .filter(|t| t.status == crate::types::TransferStatus::AwaitingAcceptance)
+                    .collect();
+                offers.sort_by_key(|t| Some(t.chat_id) != selected);
+                match offers.first() {
+                    Some(t) => {
+                        let result = if accept {
+                            self.chat_manager.accept_incoming_file(t.id)
+                        } else {
+                            self.chat_manager.reject_incoming_file(t.id)
+                        };
+                        if let Err(e) = result {
+                            self.toast(ToastLevel::Error, format!("File offer: {}", e));
+                        }
+                    }
+                    None => self.toast(
+                        ToastLevel::Warning,
+                        "No incoming file is awaiting approval".to_string(),
+                    ),
+                }
+            }
 
             TuiCommand::Rename(title) => match self.selected_chat_id() {
                 Some(id) => {

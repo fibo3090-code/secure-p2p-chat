@@ -147,6 +147,8 @@ pub fn run() {
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,
+            commands::chats::accept_transfer,
+            commands::chats::decline_transfer,
             commands::auth::get_settings,
             commands::auth::update_settings,
             commands::auth::pick_download_dir,

@@ -117,6 +117,7 @@ pub(crate) struct SettingsDto {
     auto_host_on_startup: bool,
     listen_port: u16,
     enable_upnp: bool,
+    auto_accept_files: bool,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +127,7 @@ pub(crate) struct SettingsUpdate {
     auto_host_on_startup: bool,
     listen_port: u16,
     enable_upnp: bool,
+    auto_accept_files: bool,
 }
 
 #[tauri::command]
@@ -139,6 +141,7 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         auto_host_on_startup: mgr.config.auto_host_on_startup,
         listen_port: mgr.config.listen_port,
         enable_upnp: mgr.config.enable_upnp,
+        auto_accept_files: mgr.config.auto_accept_files,
     })
 }
 
@@ -160,6 +163,7 @@ pub(crate) async fn update_settings(
         mgr.config.auto_host_on_startup = settings.auto_host_on_startup;
         mgr.config.listen_port = settings.listen_port;
         mgr.config.enable_upnp = settings.enable_upnp;
+        mgr.config.auto_accept_files = settings.auto_accept_files;
     }
     persist_history(&state.manager, &state.history_path).await;
     Ok(())

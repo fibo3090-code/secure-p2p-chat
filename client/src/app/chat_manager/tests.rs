@@ -897,6 +897,9 @@ fn sequential_incoming_files_do_not_reuse_completed_transfer_state() {
     let config = Config {
         download_dir: download_dir.clone(),
         temp_dir: temp_download_dir,
+        // This test covers the frictionless path; the acceptance gate has its
+        // own tests below.
+        auto_accept_files: true,
         ..Config::default()
     };
 
@@ -978,6 +981,177 @@ fn sequential_incoming_files_do_not_reuse_completed_transfer_state() {
         second_payload,
         "second file should keep its payload"
     );
+}
+
+/// Build a manager with the acceptance gate on (auto_accept_files = false)
+/// and feed it a complete incoming file (Meta + one chunk + End).
+fn manager_with_held_incoming_file(temp_dir: &std::path::Path) -> (ChatManager, Uuid, Vec<u8>) {
+    let config = Config {
+        download_dir: temp_dir.join("downloads"),
+        temp_dir: temp_dir.join("temp"),
+        auto_accept_files: false,
+        ..Config::default()
+    };
+    let mut mgr = ChatManager::new(config);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Gated Files".to_string());
+
+    let payload = b"held until accepted".to_vec();
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "offer.txt".to_string(),
+            size: payload.len() as u64,
+            seq: 1,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: payload.clone(),
+            seq: 2,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+    );
+    (mgr, chat_id, payload)
+}
+
+#[test]
+fn incoming_file_is_held_until_accepted() {
+    let temp_dir = tempdir().unwrap();
+    let (mut mgr, chat_id, payload) = manager_with_held_incoming_file(temp_dir.path());
+
+    // Fully streamed, but not accepted: no chat message, no file in downloads,
+    // transfer still awaiting.
+    let transfers = mgr.active_transfers_snapshot();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].status, TransferStatus::AwaitingAcceptance);
+    assert!(
+        !mgr.chats.get(&chat_id).unwrap().messages.iter().any(|m| {
+            matches!(m.content, MessageContent::File { .. })
+        }),
+        "no file message before acceptance"
+    );
+    assert!(
+        !temp_dir.path().join("downloads").join("offer.txt").exists(),
+        "file must not land in downloads before acceptance"
+    );
+
+    // Accept → finalized into downloads + recorded in the chat.
+    mgr.accept_incoming_file(transfers[0].id).unwrap();
+    let final_path = temp_dir.path().join("downloads").join("offer.txt");
+    assert_eq!(std::fs::read(&final_path).unwrap(), payload);
+    assert!(mgr.chats.get(&chat_id).unwrap().messages.iter().any(|m| {
+        matches!(&m.content, MessageContent::File { filename, .. } if filename == "offer.txt")
+    }));
+    assert!(mgr.active_transfers.is_empty());
+    assert!(mgr.incoming_files.is_empty());
+}
+
+#[test]
+fn declined_incoming_file_is_deleted_and_discarded() {
+    let temp_dir = tempdir().unwrap();
+    let (mut mgr, chat_id, _payload) = manager_with_held_incoming_file(temp_dir.path());
+
+    let transfer_id = mgr.active_transfers_snapshot()[0].id;
+    mgr.reject_incoming_file(transfer_id).unwrap();
+
+    // Spool deleted, nothing in downloads, no chat message, status cancelled.
+    assert!(mgr.incoming_files.is_empty());
+    let downloads = temp_dir.path().join("downloads");
+    let spooled: Vec<_> = std::fs::read_dir(&downloads)
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        spooled.is_empty(),
+        "declined transfer must leave nothing on disk, found: {:?}",
+        spooled
+    );
+    assert!(!mgr.chats.get(&chat_id).unwrap().messages.iter().any(|m| {
+        matches!(m.content, MessageContent::File { .. })
+    }));
+    assert_eq!(
+        mgr.active_transfers_snapshot()[0].status,
+        TransferStatus::Cancelled
+    );
+
+    // Late chunks for the declined transfer are discarded (no new spool file).
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: b"late".to_vec(),
+            seq: 4,
+        }),
+    );
+    assert!(mgr.incoming_files.is_empty());
+
+    // Double-decline / accept-after-decline are rejected cleanly.
+    assert!(mgr.reject_incoming_file(transfer_id).is_err());
+    assert!(mgr.accept_incoming_file(transfer_id).is_err());
+
+    // A fresh offer afterwards works (cancelled state is cleared).
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "second.txt".to_string(),
+            size: 4,
+            seq: 5,
+        }),
+    );
+    assert_eq!(
+        mgr.active_transfers_snapshot()
+            .iter()
+            .filter(|t| t.status == TransferStatus::AwaitingAcceptance)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn accept_before_file_end_continues_transfer() {
+    let temp_dir = tempdir().unwrap();
+    let config = Config {
+        download_dir: temp_dir.path().join("downloads"),
+        temp_dir: temp_dir.path().join("temp"),
+        auto_accept_files: false,
+        ..Config::default()
+    };
+    let mut mgr = ChatManager::new(config);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Early Accept".to_string());
+
+    let payload = b"accepted mid-stream";
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "early.txt".to_string(),
+            size: payload.len() as u64,
+            seq: 1,
+        }),
+    );
+
+    // Accept while the stream is still going.
+    let transfer_id = mgr.active_transfers_snapshot()[0].id;
+    mgr.accept_incoming_file(transfer_id).unwrap();
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: payload.to_vec(),
+            seq: 2,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+    );
+
+    let final_path = temp_dir.path().join("downloads").join("early.txt");
+    assert_eq!(std::fs::read(&final_path).unwrap(), payload.to_vec());
+    assert!(mgr.active_transfers.is_empty());
 }
 
 #[test]

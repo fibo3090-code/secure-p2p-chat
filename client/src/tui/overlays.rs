@@ -453,6 +453,9 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
             };
             let status = match &t.status {
                 TransferStatus::Pending => "pending".into(),
+                TransferStatus::AwaitingAcceptance => {
+                    "awaiting approval — :accept / :decline".into()
+                }
                 TransferStatus::InProgress => format!("{}%", pct),
                 TransferStatus::Completed => "done".into(),
                 TransferStatus::Failed(e) => format!("failed: {}", e),

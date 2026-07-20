@@ -110,6 +110,9 @@ fn toast_lifecycle_add_and_expire() {
 #[test]
 fn incoming_file_transfer_state_tracks_progress() {
     let mut mgr = ChatManager::default();
+    // Auto-accept keeps the transfer on the frictionless Pending → InProgress
+    // path; the acceptance gate (default) is covered by the chat_manager tests.
+    mgr.config.auto_accept_files = true;
     let chat = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat, "Files".to_string());
 

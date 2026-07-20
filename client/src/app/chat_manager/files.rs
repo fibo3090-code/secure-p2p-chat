@@ -130,6 +130,12 @@ impl ChatManager {
         }
 
         let transfer_id = Uuid::new_v4();
+        // Honor the auto-accept setting: when off, the transfer is held in
+        // AwaitingAcceptance until the user decides. Chunks still spool to the
+        // temp file (the sender streams without flow control), but nothing
+        // lands in the download directory or the chat history until accepted,
+        // and declining deletes the spool immediately.
+        let auto_accept = self.config.auto_accept_files;
 
         let state = FileTransferState {
             id: transfer_id,
@@ -137,22 +143,130 @@ impl ChatManager {
             filename: filename.to_string(),
             size,
             received: 0,
-            status: TransferStatus::Pending,
+            status: if auto_accept {
+                TransferStatus::Pending
+            } else {
+                TransferStatus::AwaitingAcceptance
+            },
             seq: 0,
         };
 
         self.active_transfers.insert(transfer_id, state);
 
-        self.add_toast(ToastLevel::Info, format!("Receiving file: {}", filename));
+        if auto_accept {
+            self.add_toast(ToastLevel::Info, format!("Receiving file: {}", filename));
+        } else {
+            self.add_toast(
+                ToastLevel::Info,
+                format!(
+                    "Incoming file: {} ({}) — accept or decline it in the conversation",
+                    filename,
+                    crate::util::format_size(size)
+                ),
+            );
+        }
 
         Ok(transfer_id)
+    }
+
+    /// Accept an incoming transfer that is awaiting the user's decision. If the
+    /// sender already finished streaming, the held file is finalized right away;
+    /// otherwise the transfer simply continues as a normal in-progress one.
+    pub fn accept_incoming_file(&mut self, transfer_id: Uuid) -> Result<()> {
+        let status = self
+            .active_transfers
+            .get(&transfer_id)
+            .map(|t| t.status.clone())
+            .ok_or_else(|| anyhow!("No such transfer"))?;
+        if status != TransferStatus::AwaitingAcceptance {
+            bail!("Transfer is not awaiting acceptance");
+        }
+        if self.pending_file_end.remove(&transfer_id) {
+            self.finalize_incoming_file(transfer_id);
+        } else if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+            transfer.status = if transfer.received > 0 {
+                TransferStatus::InProgress
+            } else {
+                TransferStatus::Pending
+            };
+        }
+        Ok(())
+    }
+
+    /// Decline an incoming transfer that is awaiting the user's decision: the
+    /// spooled temp file is deleted and any further chunks for it are discarded.
+    pub fn reject_incoming_file(&mut self, transfer_id: Uuid) -> Result<()> {
+        let transfer = self
+            .active_transfers
+            .get_mut(&transfer_id)
+            .ok_or_else(|| anyhow!("No such transfer"))?;
+        if transfer.status != TransferStatus::AwaitingAcceptance {
+            bail!("Transfer is not awaiting acceptance");
+        }
+        transfer.status = TransferStatus::Cancelled;
+        let filename = transfer.filename.clone();
+        self.pending_file_end.remove(&transfer_id);
+        if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+            if let Err(e) = incoming.abort_cleanup() {
+                tracing::warn!("Failed to clean up declined transfer {}: {}", transfer_id, e);
+            }
+        }
+        self.add_toast(
+            ToastLevel::Info,
+            format!("Declined incoming file: {}", filename),
+        );
+        Ok(())
+    }
+
+    /// Move a fully received file into the download directory, record it in the
+    /// chat history, and drop the transfer bookkeeping. Shared by the `FileEnd`
+    /// handler (auto-accepted transfers) and `accept_incoming_file` (held ones).
+    pub(super) fn finalize_incoming_file(&mut self, transfer_id: Uuid) {
+        let Some(incoming) = self.incoming_files.remove(&transfer_id) else {
+            return;
+        };
+        let bytes_received = incoming.bytes_received();
+        match incoming.finalize() {
+            Ok(final_path) => {
+                if let Some(mut transfer) = self.active_transfers.remove(&transfer_id) {
+                    transfer.status = TransferStatus::Completed;
+                    if let Some(chat) = self.chats.get_mut(&transfer.chat_id) {
+                        chat.messages.push(Message {
+                            id: Uuid::new_v4(),
+                            from_me: false,
+                            content: MessageContent::File {
+                                filename: transfer.filename.clone(),
+                                size: transfer.size,
+                                path: Some(final_path),
+                            },
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                    self.add_toast(
+                        ToastLevel::Success,
+                        format!("File received: {}", transfer.filename),
+                    );
+                }
+                self.update_transfer_progress(transfer_id, bytes_received);
+            }
+            Err(e) => {
+                if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                    transfer.status = TransferStatus::Failed(e.to_string());
+                }
+                tracing::error!("Failed to finalize file: {}", e);
+                self.add_toast(ToastLevel::Error, format!("File transfer error: {}", e));
+                self.active_transfers.remove(&transfer_id);
+            }
+        }
     }
 
     /// Update file transfer progress
     pub fn update_transfer_progress(&mut self, transfer_id: Uuid, bytes: u64) {
         if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
             transfer.received = bytes;
-            if bytes > 0 {
+            // Only promote Pending: a transfer awaiting user acceptance keeps
+            // its status even while chunks spool in the background.
+            if bytes > 0 && transfer.status == TransferStatus::Pending {
                 transfer.status = TransferStatus::InProgress;
             }
         }
@@ -233,7 +347,12 @@ impl ChatManager {
 
     pub(super) fn active_transfer_id_for_chat(&self, chat_id: Uuid) -> Option<Uuid> {
         self.transfer_ids_for_chat_with_status(chat_id, |status| {
-            matches!(status, TransferStatus::Pending | TransferStatus::InProgress)
+            matches!(
+                status,
+                TransferStatus::Pending
+                    | TransferStatus::AwaitingAcceptance
+                    | TransferStatus::InProgress
+            )
         })
         .into_iter()
         .next()

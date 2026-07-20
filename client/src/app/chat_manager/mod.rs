@@ -55,6 +55,10 @@ pub struct ChatManager {
     pending_file_sends: HashMap<Uuid, VecDeque<String>>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
+    /// Incoming transfers whose `FileEnd` arrived while still awaiting the
+    /// user's acceptance: the spooled file is complete and held until the
+    /// user accepts (finalize) or declines (delete).
+    pending_file_end: std::collections::HashSet<Uuid>,
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
@@ -92,6 +96,7 @@ impl ChatManager {
             active_transfers: HashMap::new(),
             pending_file_sends: HashMap::new(),
             incoming_files: HashMap::new(),
+            pending_file_end: std::collections::HashSet::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
@@ -328,6 +333,7 @@ impl ChatManager {
         self.fingerprint_confirm_senders.clear();
         self.active_transfers.clear();
         self.incoming_files.clear();
+        self.pending_file_end.clear();
         self.incoming_text_messages.clear();
         self.toasts.clear();
         self.fingerprint_verification_request = None;

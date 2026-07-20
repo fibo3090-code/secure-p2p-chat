@@ -161,6 +161,9 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
             } else {
                 Vec::new()
             };
+            // (transfer_id, accept) decided by a click below; applied after the
+            // loop so we don't hold the manager lock while rendering.
+            let mut offer_decision: Option<(Uuid, bool)> = None;
             for t in &transfers {
                 let frac = if t.size > 0 {
                     (t.received as f32 / t.size as f32).clamp(0.0, 1.0)
@@ -169,20 +172,51 @@ pub fn render_chat(app: &mut App, ui: &mut egui::Ui, chat_id: Uuid) {
                 };
                 ui.horizontal(|ui| {
                     ui.label(format!("📎 {}", t.filename));
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(220.0)
-                            .text(format!(
-                                "{} / {}",
-                                crate::util::format_size(t.received),
+                    if t.status == crate::types::TransferStatus::AwaitingAcceptance {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Incoming file ({})",
                                 crate::util::format_size(t.size)
-                            )),
-                    );
+                            ))
+                            .color(crate::gui::styling::WARNING),
+                        );
+                        if ui.button("✅ Accept").clicked() {
+                            offer_decision = Some((t.id, true));
+                        }
+                        if ui.button("❌ Decline").clicked() {
+                            offer_decision = Some((t.id, false));
+                        }
+                    } else {
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(220.0)
+                                .text(format!(
+                                    "{} / {}",
+                                    crate::util::format_size(t.received),
+                                    crate::util::format_size(t.size)
+                                )),
+                        );
+                    }
                 });
                 // Keep repainting while a transfer is live so the bar moves
                 // without waiting for other UI activity.
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            if let Some((transfer_id, accept)) = offer_decision {
+                if let Ok(mut manager) = app.chat_manager.try_lock() {
+                    let result = if accept {
+                        manager.accept_incoming_file(transfer_id)
+                    } else {
+                        manager.reject_incoming_file(transfer_id)
+                    };
+                    if let Err(e) = result {
+                        manager.add_toast(
+                            crate::types::ToastLevel::Error,
+                            format!("File offer: {}", e),
+                        );
+                    }
+                }
             }
 
             // File preview if selected

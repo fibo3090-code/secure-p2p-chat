@@ -317,6 +317,8 @@ input,textarea{font-family:inherit;color:inherit}
 .transfer-item.is-done .transfer-fill{background:var(--success)}
 .transfer-item.is-done .transfer-pct{color:var(--success)}
 .transfer-item.is-failed .transfer-fill,.transfer-item.is-cancelled .transfer-fill{background:var(--danger,#e5484d)}
+.transfer-offer{flex:1;display:flex;gap:8px;justify-content:flex-end}
+.transfer-item.is-awaiting .transfer-pct{color:var(--accent)}
 .transfer-item.is-failed .transfer-pct{color:var(--danger,#e5484d)}
 /* composer */
 .composer{flex:none;display:flex;align-items:flex-end;gap:9px;padding:13px 18px;background:var(--s1);
