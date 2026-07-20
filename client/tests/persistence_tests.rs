@@ -22,6 +22,7 @@ fn sample_chat(title: &str) -> Chat {
                 text: "remember this".to_string(),
             },
             timestamp: chrono::Utc::now(),
+            delivered: false,
         }],
         created_at: chrono::Utc::now(),
         send_seq: 0,

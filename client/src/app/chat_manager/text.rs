@@ -256,12 +256,22 @@ impl ChatManager {
         }
 
         // Add to local history
+        let message_id = Uuid::new_v4();
         chat.messages.push(Message {
-            id: Uuid::new_v4(),
+            id: message_id,
             from_me: true,
             content: MessageContent::Text { text },
             timestamp: chrono::Utc::now(),
+            delivered: false,
         });
+
+        // Register for a delivery receipt: TextSendComplete will report the
+        // wire seq for this message (frames drain FIFO per session), and the
+        // peer's Ack for that seq marks it delivered.
+        self.pending_text_sends
+            .entry(actual_session_chat_id)
+            .or_default()
+            .push_back((chat_id, message_id));
 
         Ok(())
     }

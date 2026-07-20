@@ -545,12 +545,18 @@ fn render_message(_app: &App, ui: &mut egui::Ui, message: &Message) {
 
             ui.add_space(4.0);
 
-            // Timestamp (bottom right of bubble)
+            // Timestamp (bottom right of bubble), with a delivery check once
+            // the peer acknowledged receipt of our message.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 let timestamp_text =
                     crate::gui::widgets::format_timestamp_relative(&message.timestamp);
+                let label = if message.from_me && message.delivered {
+                    format!("{} ✓", timestamp_text)
+                } else {
+                    timestamp_text
+                };
                 ui.label(
-                    egui::RichText::new(timestamp_text)
+                    egui::RichText::new(label)
                         .size(9.0)
                         .color(text_color.gamma_multiply(0.6)),
                 );

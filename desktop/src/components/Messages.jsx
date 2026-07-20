@@ -124,7 +124,7 @@ function MessageItem({ m }) {
       <div className="msg-bubble">
         {m.author && !mine && <span className="msg-author">{m.author}</span>}
         <span className="msg-text">{m.text}</span>
-        <span className="msg-time">{m.t}{mine && <Icon name="check" size={12} />}</span>
+        <span className="msg-time">{m.t}{mine && m.delivered && <Icon name="check" size={12} />}</span>
       </div>
     </div>
   );

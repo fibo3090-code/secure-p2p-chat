@@ -1250,6 +1250,67 @@ fn accept_before_file_end_continues_transfer() {
 }
 
 #[test]
+fn sent_text_is_marked_delivered_by_peer_ack() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Receipts".to_string());
+    let (tx, mut _rx) = mpsc::unbounded_channel();
+    mgr.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+
+    mgr.send_message(chat_id, "hello".to_string()).unwrap();
+    let msg_id = mgr.chats.get(&chat_id).unwrap().messages[0].id;
+    assert!(!mgr.chats.get(&chat_id).unwrap().messages[0].delivered);
+
+    // The session loop reports the wire seq it stamped on the frame…
+    mgr.handle_session_event(chat_id, SessionEvent::TextSendComplete { seq: 7 });
+    // …and the peer acknowledges that seq.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Ack {
+            acked_seq: 7,
+            seq: 1,
+        }),
+    );
+
+    let msg = &mgr.chats.get(&chat_id).unwrap().messages[0];
+    assert_eq!(msg.id, msg_id);
+    assert!(msg.delivered, "peer ack must mark the message delivered");
+
+    // A replayed/duplicate ack is harmless.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Ack {
+            acked_seq: 7,
+            seq: 2,
+        }),
+    );
+    assert!(mgr.chats.get(&chat_id).unwrap().messages[0].delivered);
+}
+
+#[test]
+fn received_text_queues_a_delivery_receipt() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Receipts".to_string());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    mgr.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Text {
+            text: "hi".to_string(),
+            timestamp: 1,
+            seq: 5,
+        }),
+    );
+
+    match rx.try_recv() {
+        Ok(ProtocolMessage::Ack { acked_seq, .. }) => assert_eq!(acked_seq, 5),
+        other => panic!("expected a queued Ack for seq 5, got {:?}", other),
+    }
+}
+
+#[test]
 fn parse_v2_signed_invite_normalizes_ipv6_address() {
     use crate::identity::Identity;
 

@@ -64,6 +64,12 @@ pub struct Message {
     pub from_me: bool,
     pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
+    /// True once the peer acknowledged receipt (delivery receipt, sent
+    /// messages only). Messages from before this field — or sent to peers
+    /// that predate receipts — simply stay `false`; the UI shows nothing
+    /// rather than an error state.
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 /// A contact (a known peer)
@@ -220,6 +226,12 @@ pub enum SessionEvent {
     /// The final frame of an outgoing file transfer (`FileEnd` with this seq)
     /// was written to the wire — only now is the transfer actually complete.
     FileSendComplete {
+        seq: u64,
+    },
+    /// An outgoing text message's frame (or the last chunk of a large one)
+    /// was written to the wire with this transport seq. The app records it to
+    /// match the peer's later `Ack { acked_seq }` back to the message.
+    TextSendComplete {
         seq: u64,
     },
     Disconnected,

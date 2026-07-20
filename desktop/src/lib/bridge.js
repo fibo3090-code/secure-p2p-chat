@@ -243,9 +243,9 @@ export function chatToContact(chat, connected) {
     messages: (chat.messages || []).map((m) => {
       const c = m.content || {};
       if (c.type === "file") {
-        return { kind: "file", from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp) };
+        return { kind: "file", from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), delivered: !!m.delivered };
       }
-      return { from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp) };
+      return { from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp), delivered: !!m.delivered };
     }),
   };
 }

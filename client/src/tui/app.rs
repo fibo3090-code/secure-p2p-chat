@@ -1933,6 +1933,7 @@ mod tests {
                 from_me: false,
                 content: crate::types::MessageContent::Text { text: "hi".into() },
                 timestamp: chrono::Utc::now(),
+                delivered: false,
             });
         }
         app.update_unread();

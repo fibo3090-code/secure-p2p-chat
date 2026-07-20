@@ -61,8 +61,9 @@ impl ChatManager {
         tracing::info!(file = %filename, total_bytes = %file_size, "File queued for sending");
 
         // Add to local history.
+        let message_id = Uuid::new_v4();
         chat.messages.push(Message {
-            id: Uuid::new_v4(),
+            id: message_id,
             from_me: true,
             content: MessageContent::File {
                 filename: filename.clone(),
@@ -70,16 +71,18 @@ impl ChatManager {
                 path: Some(path),
             },
             timestamp: chrono::Utc::now(),
+            delivered: false,
         });
 
         // Queueing is not delivery: the success toast waits for the session to
         // report the final frame on the wire (SessionEvent::FileSendComplete).
         // File frames drain FIFO per session, so a per-session queue correlates;
-        // keyed by session id because that is where the event will arrive.
+        // keyed by session id because that is where the event will arrive. The
+        // chat/message ids let the completion register for a delivery receipt.
         self.pending_file_sends
             .entry(session_id)
             .or_default()
-            .push_back(filename);
+            .push_back((filename, chat_id, message_id));
 
         Ok(())
     }
@@ -90,7 +93,7 @@ impl ChatManager {
         let Some(pending) = self.pending_file_sends.remove(&chat_id) else {
             return;
         };
-        for filename in pending {
+        for (filename, _chat, _message) in pending {
             tracing::warn!(file = %filename, reason = %reason, "Outgoing file send interrupted");
             self.add_toast(
                 ToastLevel::Error,
@@ -181,8 +184,8 @@ impl ChatManager {
         if status != TransferStatus::AwaitingAcceptance {
             bail!("Transfer is not awaiting acceptance");
         }
-        if self.pending_file_end.remove(&transfer_id) {
-            self.finalize_incoming_file(transfer_id);
+        if let Some(end_seq) = self.pending_file_end.remove(&transfer_id) {
+            self.finalize_incoming_file(transfer_id, Some(end_seq));
         } else if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
             transfer.status = if transfer.received > 0 {
                 TransferStatus::InProgress
@@ -225,7 +228,9 @@ impl ChatManager {
     /// Move a fully received file into the download directory, record it in the
     /// chat history, and drop the transfer bookkeeping. Shared by the `FileEnd`
     /// handler (auto-accepted transfers) and `accept_incoming_file` (held ones).
-    pub(super) fn finalize_incoming_file(&mut self, transfer_id: Uuid) {
+    /// `ack_seq` is the FileEnd's wire seq: on success a delivery receipt for
+    /// it is sent back to the peer.
+    pub(super) fn finalize_incoming_file(&mut self, transfer_id: Uuid, ack_seq: Option<u64>) {
         let Some(incoming) = self.incoming_files.remove(&transfer_id) else {
             return;
         };
@@ -244,7 +249,12 @@ impl ChatManager {
                                 path: Some(final_path),
                             },
                             timestamp: chrono::Utc::now(),
+                            delivered: false,
                         });
+                    }
+                    // Delivery receipt: the file is on disk, tell the sender.
+                    if let Some(acked_seq) = ack_seq {
+                        self.send_ack_for_chat(transfer.chat_id, acked_seq);
                     }
                     self.add_toast(
                         ToastLevel::Success,

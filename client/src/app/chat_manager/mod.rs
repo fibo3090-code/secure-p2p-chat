@@ -51,14 +51,24 @@ pub struct ChatManager {
     chat_id_mapping: HashMap<Uuid, Uuid>,
     active_transfers: HashMap<Uuid, FileTransferState>,
     /// Outgoing files queued on a session but whose final frame has not hit the
-    /// wire yet (FIFO per chat; resolved by `SessionEvent::FileSendComplete`).
-    pending_file_sends: HashMap<Uuid, VecDeque<String>>,
+    /// wire yet (FIFO per session; resolved by `SessionEvent::FileSendComplete`).
+    /// Entries are `(filename, chat_id, message_id)` so the completion can both
+    /// toast and register the message for a delivery receipt.
+    pending_file_sends: HashMap<Uuid, VecDeque<(String, Uuid, Uuid)>>,
+    /// Outgoing text messages queued on a session but whose frame has not hit
+    /// the wire yet (FIFO per session; resolved by `TextSendComplete`).
+    /// Entries are `(chat_id, message_id)`.
+    pending_text_sends: HashMap<Uuid, VecDeque<(Uuid, Uuid)>>,
+    /// Sent messages waiting for the peer's delivery receipt, keyed by
+    /// `(session_id, wire seq)` → `(chat_id, message_id)`.
+    awaiting_ack: HashMap<(Uuid, u64), (Uuid, Uuid)>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
     /// Incoming transfers whose `FileEnd` arrived while still awaiting the
-    /// user's acceptance: the spooled file is complete and held until the
-    /// user accepts (finalize) or declines (delete).
-    pending_file_end: std::collections::HashSet<Uuid>,
+    /// user's acceptance: the spooled file is complete and held (with the
+    /// FileEnd's wire seq, for the delivery receipt) until the user accepts
+    /// (finalize) or declines (delete).
+    pending_file_end: HashMap<Uuid, u64>,
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
@@ -95,8 +105,10 @@ impl ChatManager {
             chat_id_mapping: HashMap::new(),
             active_transfers: HashMap::new(),
             pending_file_sends: HashMap::new(),
+            pending_text_sends: HashMap::new(),
+            awaiting_ack: HashMap::new(),
             incoming_files: HashMap::new(),
-            pending_file_end: std::collections::HashSet::new(),
+            pending_file_end: HashMap::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
@@ -306,6 +318,19 @@ impl ChatManager {
         self.active_transfers.values().cloned().collect()
     }
 
+    /// Queue a delivery receipt on the session serving `chat_id`, acknowledging
+    /// the peer's frame with wire seq `acked_seq`. Best-effort: no session, no
+    /// receipt (the peer's message simply stays unmarked on their side). The
+    /// frame's own seq is stamped by the session loop like every message.
+    pub(crate) fn send_ack_for_chat(&self, chat_id: Uuid, acked_seq: u64) {
+        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        if let Some(session) = self.sessions.get(&session_id) {
+            let _ = session
+                .from_app_tx
+                .send(ProtocolMessage::Ack { acked_seq, seq: 0 });
+        }
+    }
+
     /// Delete a chat and its associated session
     pub fn delete_chat(&mut self, chat_id: Uuid) {
         tracing::info!(chat_id = %chat_id, "Deleting chat");
@@ -334,6 +359,8 @@ impl ChatManager {
         self.active_transfers.clear();
         self.incoming_files.clear();
         self.pending_file_end.clear();
+        self.pending_text_sends.clear();
+        self.awaiting_ack.clear();
         self.incoming_text_messages.clear();
         self.toasts.clear();
         self.fingerprint_verification_request = None;
