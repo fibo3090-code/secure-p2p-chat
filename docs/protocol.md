@@ -55,14 +55,34 @@ Current secure runtime behavior requires protocol version `>= 3`.
 ### Handshake flow
 
 1. Exchange protocol versions in plaintext.
-2. Exchange X25519 ephemeral public keys in plaintext.
+2. Exchange X25519 ephemeral public keys in plaintext. Each side rejects an
+   all-zero peer key on parse and a non-contributory shared secret at
+   agreement (low-order-point guard, RFC 7748 §6.1).
 3. Derive a shared session key using HKDF-SHA256.
 4. Establish encrypted transport with AES-256-GCM.
 5. Exchange encrypted `IdentityProof` messages inside that tunnel.
 6. Verify the peer's identity signature.
 7. Optional connection-password gate (see below).
-8. Confirm the peer fingerprint (TOFU) before surfacing the session.
+8. Confirm the peer fingerprint (TOFU) before surfacing the session. Both
+   ends also derive a **Short Authentication String** (see below) so users
+   can compare a short code instead of the full fingerprint.
 9. Enter the message loop.
+
+### Short Authentication String (SAS)
+
+Alongside the 64-char fingerprint, both peers derive an identical SAS from the
+handshake transport AAD (itself the transcript hash), via
+`HKDF-SHA256(info = "p2pem-sas-v1")`: six decimal digits (`NN-NN-NN`) plus
+three emoji from a fixed 32-entry table (~35 bits shown). Because it is bound
+to the transcript — which includes both ephemeral keys and both identity keys
+— an active MITM necessarily runs two *different* handshakes, so the two
+victims see two *different* SAS values. Reading the code aloud over any
+out-of-band channel (a call, in person) therefore detects interception with
+far less friction than a full-fingerprint compare. The SAS is display-only
+verification aid: it is never sent on the wire, and trust is still pinned by
+TOFU on the identity fingerprint. The derivation and emoji table are frozen
+(a known-answer test guards them) because both peers must compute byte-for-byte
+identical strings.
 
 ### Connection password (optional)
 
@@ -116,6 +136,10 @@ Runtime messages include:
 - `FileMeta`
 - `FileChunk`
 - `FileEnd`
+- `FileCancel` (binary tag 12) — aborts the in-flight transfer on the chat;
+  sent by either the sender or the receiver. The peer stops streaming (sender)
+  or discards the partial temp file (receiver). Shares the per-session
+  replay-protected sequence space like every other framed message.
 - `Ping`
 - `TypingStart`
 - `TypingStop`
@@ -252,6 +276,54 @@ Current verification behavior:
 - invalid addresses are dropped during import rather than trusted blindly;
   candidate lists are deduplicated preserving order
 - relay route data is preserved when present in a signed invite
+
+## Relay Rendezvous and Hole Punching
+
+The relay control protocol (`core/src/network/relay.rs`) runs over the same
+length-prefixed framing, carrying bincode-encoded enums. Because bincode
+encodes the variant index, **new variants are append-only**.
+
+Requests (client → server): `Host { token }` / `Join { token }` (legacy,
+always bridged) and `HostV2 { token, punch }` / `JoinV2 { token, punch }`
+(punch-capable; `punch.local_addrs` lists LAN candidates as `ip:port`,
+already carrying the punch source port). Responses (server → client):
+`Waiting`, `Paired`, `Error(String)`, and `PunchStart { peer_public,
+peer_locals }`. After a `PunchStart`, each client answers with a
+`PunchOutcome { success }` report.
+
+Flow:
+
+1. Both peers register with the same 32-hex-char token. The server observes
+   each peer's public endpoint from the control connection's source address —
+   it is never self-reported.
+2. If **both** registered punch-capable, the server sends each side a
+   `PunchStart` with the other's observed public endpoint and LAN candidates,
+   then waits (bounded) for both `PunchOutcome`s.
+3. Each peer re-binds the control connection's local port
+   (`SO_REUSEADDR`/`SO_REUSEPORT`; the control connection itself is dialed
+   from a reuse-enabled socket), listens on it, and dials every candidate in
+   parallel with retries — a TCP simultaneous open. Every established socket
+   is validated by exchanging a 25-byte hello: magic `P2PPNCH1` (8) + role
+   byte (1; host=0, joiner=1; must differ) + tag (16, first 16 bytes of
+   SHA-256 of the token). The host then sends `0xA5` (SELECT) on its chosen
+   socket and the joiner confirms with `0x5A` (ACK), so both ends provably
+   settle on one connection.
+4. Both reports `success: true` → the server drops both control connections;
+   the session runs on the punched socket (peer label `p2p:<addr>`).
+   Anything else → the server sends `Paired` to both and bridges bytes
+   (`copy_bidirectional`; peer label `relay:<server>`).
+
+The punch hello tag is rendezvous pairing, not authentication: whichever
+socket wins carries the full v3 handshake (ECDH, identity proof, TOFU).
+Compatibility: a legacy peer simply gets the bridged path (the server never
+starts a punch phase unless both sides are capable); a legacy *server* drops
+the unknown V2 variant, which new clients detect (connection closed before
+any response) and silently re-register in legacy mode. To keep that detection
+unambiguous, a new server acknowledges every accepted join with an immediate
+`Waiting` frame before handing the socket to the host — so a later disconnect
+(e.g. the host vanished at the rendezvous) is treated as a genuine failure
+rather than mistaken for a legacy server and pointlessly retried.
+`P2PEM_NO_HOLEPUNCH=1` disables punching client-side.
 
 ## Compatibility Notes
 

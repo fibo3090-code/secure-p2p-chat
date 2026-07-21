@@ -37,7 +37,7 @@ fn host_prompts_for_an_unknown_incoming_fingerprint() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
-    mgr.handle_tofu_verification(session_id, "UNKNOWN-FP", "Peer");
+    mgr.handle_tofu_verification(session_id, "UNKNOWN-FP", "Peer", "12-34-56");
 
     // The host must PROMPT for verification, not silently auto-trust.
     assert!(
@@ -65,7 +65,7 @@ fn host_auto_accepts_a_returning_known_fingerprint() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
-    mgr.handle_tofu_verification(session_id, "KNOWN-FP", "Peer");
+    mgr.handle_tofu_verification(session_id, "KNOWN-FP", "Peer", "12-34-56");
 
     // Returning peer: auto-confirmed without re-prompting.
     assert!(
@@ -92,7 +92,7 @@ fn blocked_contact_fingerprint_is_auto_rejected() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
-    mgr.handle_tofu_verification(session_id, "BLOCKED-FP", "Mallory");
+    mgr.handle_tofu_verification(session_id, "BLOCKED-FP", "Mallory", "");
 
     assert!(
         mgr.fingerprint_verification_request.is_none(),
@@ -118,10 +118,12 @@ fn blocking_tears_down_the_live_session_completely() {
     mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("BLOCKED-FP".into());
     mgr.chat_id_mapping.insert(chat_id, session_id);
     let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(4);
     mgr.add_session_for_test(
         session_id,
         SessionHandle {
             from_app_tx: app_tx,
+            file_tx,
         },
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
@@ -154,7 +156,7 @@ fn tofu_accept_promotes_contact_to_verified() {
     let (tx, _rx) = mpsc::unbounded_channel();
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
-    mgr.handle_tofu_verification(session_id, "ALICE-FP", "Alice");
+    mgr.handle_tofu_verification(session_id, "ALICE-FP", "Alice", "");
     assert!(mgr.fingerprint_verification_request.is_some());
 
     mgr.confirm_fingerprint(session_id, true).unwrap();
@@ -328,6 +330,7 @@ fn test_tofu_logic() {
     let event1 = SessionEvent::ShowFingerprintVerification {
         fingerprint: fingerprint1.clone(),
         peer_name: peer_name.clone(),
+        sas: String::new(),
         chat_id,
     };
     mgr.handle_session_event(chat_id, event1);
@@ -352,6 +355,7 @@ fn test_tofu_logic() {
     let event2 = SessionEvent::ShowFingerprintVerification {
         fingerprint: fingerprint1.clone(),
         peer_name: peer_name.clone(),
+        sas: String::new(),
         chat_id,
     };
     mgr.handle_session_event(chat_id, event2);
@@ -364,13 +368,18 @@ fn test_tofu_logic() {
     let event3 = SessionEvent::ShowFingerprintVerification {
         fingerprint: fingerprint2.clone(),
         peer_name: peer_name.clone(),
+        sas: String::new(),
         chat_id,
     };
     mgr.handle_session_event(chat_id, event3);
 
     // Assert: A UI request IS made, and no confirmation is sent automatically.
     assert!(mgr.fingerprint_verification_request.is_some());
-    let (fp, _, _) = mgr.fingerprint_verification_request.clone().unwrap();
+    let fp = mgr
+        .fingerprint_verification_request
+        .clone()
+        .unwrap()
+        .fingerprint;
     assert_eq!(fp, fingerprint2);
     assert!(rx.try_recv().is_err());
 }
@@ -414,6 +423,7 @@ fn test_regression_auto_trust_default_off() {
     let event = SessionEvent::ShowFingerprintVerification {
         fingerprint: "first_fingerprint".to_string(),
         peer_name: "Alice".to_string(),
+        sas: String::new(),
         chat_id,
     };
 
@@ -820,17 +830,51 @@ fn v2_invite_signature_verification_prevents_fingerprint_swap() {
     );
 }
 
+/// Drain frames from the streaming send until `FileEnd` (or timeout), so the
+/// spawned chunk task has a chance to run.
+async fn drain_file_send(rx: &mut mpsc::Receiver<ProtocolMessage>) -> Vec<ProtocolMessage> {
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        let done = matches!(
+            msg,
+            ProtocolMessage::FileEnd { .. } | ProtocolMessage::FileCancel { .. }
+        );
+        frames.push(msg);
+        if done {
+            break;
+        }
+    }
+    frames
+}
+
+/// Build a `SessionHandle` plus its two receivers (control lane, bounded file
+/// lane) for tests that drive `send_file` without a real session loop.
+fn test_session_handle() -> (
+    SessionHandle,
+    mpsc::UnboundedReceiver<ProtocolMessage>,
+    mpsc::Receiver<ProtocolMessage>,
+) {
+    let (from_app_tx, control_rx) = mpsc::unbounded_channel();
+    let (file_tx, file_rx) = mpsc::channel(super::FILE_LANE_CAPACITY);
+    (
+        SessionHandle {
+            from_app_tx,
+            file_tx,
+        },
+        control_rx,
+        file_rx,
+    )
+}
+
 #[tokio::test]
-async fn send_file_uses_monotonic_chat_sequence_space() {
+async fn send_file_streams_meta_chunks_and_end_and_tracks_transfer() {
     let mut mgr = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
-    mgr.create_local_chat_for_test(chat_id, "File Seq Test".to_string());
+    mgr.create_local_chat_for_test(chat_id, "File Send Test".to_string());
 
-    let (from_app_tx, mut from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
-
-    // Start from a non-zero value to ensure file transfer continues existing sequence space.
-    mgr.chats.get_mut(&chat_id).unwrap().send_seq = 5;
+    let (handle, _control_rx, mut file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     let content = vec![b'x'; crate::FILE_CHUNK_SIZE * 2 + 13];
@@ -840,39 +884,150 @@ async fn send_file_uses_monotonic_chat_sequence_space() {
         .await
         .expect("send_file should succeed");
 
-    let mut seqs = Vec::new();
-    let mut saw_meta = false;
-    let mut saw_end = false;
-    let mut chunk_count = 0usize;
-    while let Ok(msg) = from_app_rx.try_recv() {
-        match msg {
-            ProtocolMessage::FileMeta { seq, .. } => {
-                saw_meta = true;
-                seqs.push(seq);
-            }
-            ProtocolMessage::FileChunk { seq, .. } => {
-                chunk_count += 1;
-                seqs.push(seq);
-            }
-            ProtocolMessage::FileEnd { seq } => {
-                saw_end = true;
-                seqs.push(seq);
-            }
-            _ => {}
-        }
-    }
+    // An outgoing transfer is registered for the UI immediately.
+    let outgoing = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.direction == TransferDirection::Outgoing)
+        .expect("outgoing transfer should be tracked");
+    assert_eq!(outgoing.chat_id, chat_id);
 
-    assert!(saw_meta, "FileMeta should be emitted");
-    assert!(saw_end, "FileEnd should be emitted");
-    assert!(chunk_count >= 2, "Test file should produce multiple chunks");
-    assert_eq!(
-        seqs.first().copied(),
-        Some(6),
-        "Sequence should continue from chat.send_seq"
+    // Meta/chunks/End ride the bounded file lane, in order. (The session loop
+    // owns wire sequencing, so ChatManager stamps placeholder seqs here.)
+    let frames = drain_file_send(&mut file_rx).await;
+    assert!(
+        matches!(frames.first(), Some(ProtocolMessage::FileMeta { .. })),
+        "first frame must be FileMeta"
     );
     assert!(
-        seqs.windows(2).all(|w| w[1] == w[0] + 1),
-        "File transfer messages must use strictly increasing sequence numbers"
+        matches!(frames.last(), Some(ProtocolMessage::FileEnd { .. })),
+        "last frame must be FileEnd"
+    );
+    let chunks = frames
+        .iter()
+        .filter(|m| matches!(m, ProtocolMessage::FileChunk { .. }))
+        .count();
+    assert!(chunks >= 3, "multi-chunk file should emit >= 3 chunks");
+}
+
+#[tokio::test]
+async fn cancel_outgoing_transfer_stops_stream_and_emits_file_cancel() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Cancel Test".to_string());
+
+    let (handle, mut control_rx, mut file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
+
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
+    // Large enough that streaming does not finish instantly.
+    let content = vec![b'y'; crate::FILE_CHUNK_SIZE * 50];
+    std::fs::write(temp_file.path(), content).unwrap();
+
+    mgr.send_file(chat_id, temp_file.path().to_path_buf())
+        .await
+        .expect("send_file should succeed");
+
+    let transfer_id = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.direction == TransferDirection::Outgoing)
+        .expect("outgoing transfer tracked")
+        .id;
+
+    // Keep draining the bounded file lane so the (otherwise backpressured)
+    // stream task keeps cycling and can observe the cancel flag; assert it never
+    // reaches FileEnd.
+    let drain = tokio::spawn(async move {
+        while let Some(msg) = file_rx.recv().await {
+            assert!(
+                !matches!(msg, ProtocolMessage::FileEnd { .. }),
+                "stream should not complete after cancellation"
+            );
+        }
+    });
+
+    // Cancel it. The stream stops and a FileCancel goes out on the control lane.
+    mgr.cancel_transfer(transfer_id);
+
+    let mut saw_cancel = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, control_rx.recv()).await {
+        if matches!(msg, ProtocolMessage::FileCancel { .. }) {
+            saw_cancel = true;
+            break;
+        }
+    }
+    drain.abort();
+    assert!(saw_cancel, "cancellation must emit a FileCancel frame");
+
+    let status = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.id == transfer_id)
+        .map(|t| t.status);
+    assert_eq!(status, Some(TransferStatus::Cancelled));
+}
+
+/// The bounded file lane must pace the reader: with the consumer stalled, the
+/// stream task can only run a bounded number of chunks ahead instead of
+/// buffering the whole file in memory.
+#[tokio::test]
+async fn outgoing_stream_is_backpressured_by_the_bounded_lane() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Backpressure".to_string());
+
+    let (handle, _control_rx, mut file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
+
+    let total_chunks = 100u64;
+    let content = vec![b'z'; crate::FILE_CHUNK_SIZE * total_chunks as usize];
+    let file_size = content.len() as u64;
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp_file.path(), content).unwrap();
+
+    mgr.send_file(chat_id, temp_file.path().to_path_buf())
+        .await
+        .expect("send_file should succeed");
+    let transfer_id = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.direction == TransferDirection::Outgoing)
+        .expect("outgoing transfer tracked")
+        .id;
+
+    // With nothing draining the lane, give the task time to run as far ahead as
+    // it can, then confirm it is capped near the lane capacity — not the file.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    mgr.sync_outgoing_transfer_progress();
+    let sent = |mgr: &ChatManager| {
+        mgr.active_transfers_snapshot()
+            .into_iter()
+            .find(|t| t.id == transfer_id)
+            .map(|t| t.received)
+            .unwrap_or(0)
+    };
+    let stalled = sent(&mgr);
+    let cap_bytes = super::FILE_LANE_CAPACITY as u64 * crate::FILE_CHUNK_SIZE as u64;
+    assert!(
+        stalled <= cap_bytes,
+        "backpressure must cap in-flight bytes at ~lane capacity; got {stalled} > {cap_bytes}"
+    );
+    assert!(
+        stalled < file_size,
+        "the whole file must not be buffered when the consumer is stalled"
+    );
+
+    // Draining the lane must let the producer make further progress.
+    for _ in 0..20 {
+        let _ = file_rx.recv().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    mgr.sync_outgoing_transfer_progress();
+    assert!(
+        sent(&mgr) > stalled,
+        "draining the lane must let the backpressured reader advance"
     );
 }
 
@@ -884,8 +1039,8 @@ async fn file_sent_toast_waits_for_wire_confirmation() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Honest Send".to_string());
 
-    let (from_app_tx, _from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+    let (handle, _control_rx, _file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp_file.path(), b"payload").unwrap();
@@ -913,8 +1068,8 @@ async fn disconnect_fails_pending_file_sends_honestly() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Interrupted Send".to_string());
 
-    let (from_app_tx, _from_app_rx) = mpsc::unbounded_channel();
-    mgr.sessions.insert(chat_id, SessionHandle { from_app_tx });
+    let (handle, _control_rx, _file_rx) = test_session_handle();
+    mgr.sessions.insert(chat_id, handle);
 
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp_file.path(), b"payload").unwrap();
@@ -1293,7 +1448,14 @@ fn sent_text_is_marked_delivered_by_peer_ack() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Receipts".to_string());
     let (tx, mut _rx) = mpsc::unbounded_channel();
-    mgr.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+    let (file_tx, _file_rx) = mpsc::channel(4);
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: tx,
+            file_tx,
+        },
+    );
 
     mgr.send_message(chat_id, "hello".to_string()).unwrap();
     let msg_id = mgr.chats.get(&chat_id).unwrap().messages[0].id;
@@ -1331,7 +1493,14 @@ fn received_text_queues_a_delivery_receipt() {
     let chat_id = Uuid::new_v4();
     mgr.create_local_chat_for_test(chat_id, "Receipts".to_string());
     let (tx, mut rx) = mpsc::unbounded_channel();
-    mgr.add_session_for_test(chat_id, SessionHandle { from_app_tx: tx });
+    let (file_tx, _file_rx) = mpsc::channel(4);
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: tx,
+            file_tx,
+        },
+    );
 
     mgr.handle_session_event(
         chat_id,
@@ -1434,8 +1603,12 @@ fn delete_all_data_removes_files_and_clears_state() {
     );
     mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
     mgr.contact_to_chat.insert(contact_id, chat_id);
-    mgr.fingerprint_verification_request =
-        Some(("fingerprint".to_string(), "peer".to_string(), chat_id));
+    mgr.fingerprint_verification_request = Some(PendingFingerprint {
+        fingerprint: "fingerprint".to_string(),
+        peer_name: "peer".to_string(),
+        sas: String::new(),
+        session_id: chat_id,
+    });
 
     mgr.delete_all_data(&data_dir, &history_path, &identity_path)
         .unwrap();

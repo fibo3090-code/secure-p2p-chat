@@ -28,6 +28,7 @@ pub enum TuiOverlay {
     FingerprintVerify {
         fingerprint: String,
         peer_name: String,
+        sas: String,
         chat_id: Uuid,
     },
     Contacts,
@@ -88,8 +89,9 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         TuiOverlay::FingerprintVerify {
             fingerprint,
             peer_name,
+            sas,
             ..
-        } => render_fingerprint(f, &fingerprint, &peer_name, area),
+        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, area),
         TuiOverlay::Contacts => render_contacts(f, app, area),
         TuiOverlay::Settings => render_settings(f, app, area),
         TuiOverlay::Invite { link } => render_invite(f, &link, area),
@@ -215,18 +217,20 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
     f.render_widget(para, inner);
 }
 
-fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: Rect) {
+fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &str, full: Rect) {
     let area = centered_rect(70, 70, full);
     let inner = clear_and_block(f, area, "🛡 Verify peer identity");
 
+    let has_sas = !sas.is_empty();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // heading
-            Constraint::Length(2), // instruction
-            Constraint::Min(6),    // color grid
-            Constraint::Length(2), // fingerprint hex
-            Constraint::Length(1), // actions
+            Constraint::Length(2),                           // heading
+            Constraint::Length(2),                           // instruction
+            Constraint::Length(if has_sas { 3 } else { 0 }), // SAS
+            Constraint::Min(6),                              // color grid
+            Constraint::Length(2),                           // fingerprint hex
+            Constraint::Length(1),                           // actions
         ])
         .split(inner);
 
@@ -235,14 +239,37 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
             .style(Style::default().add_modifier(Modifier::BOLD)),
         rows[0],
     );
-    f.render_widget(
-        Paragraph::new(
-            "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
-        )
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Gray)),
-        rows[1],
-    );
+
+    // The short authentication string leads: both peers see the same code,
+    // and an interposed MITM makes the two ends differ. Reading it aloud is
+    // the low-friction check; the safety grid / hex stays as the backstop.
+    if has_sas {
+        f.render_widget(
+            Paragraph::new("Read this code aloud with your peer — it must match on both ends:")
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Gray)),
+            rows[1],
+        );
+        f.render_widget(
+            Paragraph::new(sas.to_string())
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(BRAND_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            rows[2],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(
+                "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray)),
+            rows[1],
+        );
+    }
 
     // Color grid (matches the GUI's generate_color_grid palette exactly).
     let grid = crate::colorgrid::generate_color_grid(fingerprint);
@@ -256,13 +283,13 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
             )
         })
         .collect();
-    f.render_widget(Paragraph::new(grid_lines), rows[2]);
+    f.render_widget(Paragraph::new(grid_lines), rows[3]);
 
     f.render_widget(
         Paragraph::new(fingerprint.to_string())
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::White)),
-        rows[3],
+        rows[4],
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -271,7 +298,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, full: R
             Span::styled(" n ", Style::default().bg(Color::Red).fg(Color::White)),
             Span::raw(" reject   (or :verify accept|reject)"),
         ])),
-        rows[4],
+        rows[5],
     );
 }
 
@@ -433,7 +460,7 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
     let area = centered_rect(70, 60, full);
     let inner = clear_and_block(f, area, "File transfers");
 
-    let transfers = app.chat_manager.active_transfers_snapshot();
+    let transfers = app.chat_manager.active_transfers_sorted();
     if transfers.is_empty() {
         f.render_widget(
             Paragraph::new("No active transfers.\n\nSend a file with :send <path>.")
@@ -443,9 +470,16 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
         );
         return;
     }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let sel = app.transfer_sel.min(transfers.len().saturating_sub(1));
     let lines: Vec<Line> = transfers
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let pct = if t.size > 0 {
                 (t.received as f64 / t.size as f64 * 100.0) as u64
             } else {
@@ -461,16 +495,38 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
                 TransferStatus::Failed(e) => format!("failed: {}", e),
                 TransferStatus::Cancelled => "cancelled".into(),
             };
-            Line::from(format!(
-                "{:<24} {} / {}  [{}]",
+            let arrow = match t.direction {
+                crate::types::TransferDirection::Incoming => "⬇",
+                crate::types::TransferDirection::Outgoing => "⬆",
+            };
+            let marker = if i == sel { "▶ " } else { "  " };
+            let text = format!(
+                "{}{} {:<22} {} / {}  [{}]",
+                marker,
+                arrow,
                 t.filename,
                 crate::util::format_size(t.received),
                 crate::util::format_size(t.size),
                 status
-            ))
+            );
+            let style = if i == sel {
+                Style::default()
+                    .fg(BRAND_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(text, style)
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "↑/↓ select · c cancel · Esc close",
+            Style::default().fg(Color::DarkGray),
+        )),
+        rows[1],
+    );
 }
 
 fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) {

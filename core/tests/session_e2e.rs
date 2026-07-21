@@ -67,6 +67,10 @@ struct Peer {
     outbound: Outbound,
     confirm: mpsc::UnboundedSender<bool>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Bounded file-data lane sender, kept alive for the session's lifetime.
+    /// These tests drive file frames over the control (`outbound`) lane, so it
+    /// is unused directly, but dropping it would close the loop's file branch.
+    _file_tx: mpsc::Sender<ProtocolMessage>,
 }
 
 /// Spin up a connected host+client pair over a duplex stream and run both
@@ -87,11 +91,13 @@ async fn connect_pair_with_passwords(
 
     let (host_ev_tx, host_events) = mpsc::unbounded_channel();
     let (host_out, host_out_rx) = mpsc::unbounded_channel();
+    let (host_file_tx, host_file_rx) = mpsc::channel(8);
     let (host_confirm, host_confirm_rx) = mpsc::unbounded_channel();
     let host_chat = uuid::Uuid::new_v4();
 
     let (client_ev_tx, client_events) = mpsc::unbounded_channel();
     let (client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (client_file_tx, client_file_rx) = mpsc::channel(8);
     let (client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
     let client_chat = uuid::Uuid::new_v4();
 
@@ -102,6 +108,7 @@ async fn connect_pair_with_passwords(
             host_priv,
             host_ev_tx,
             host_out_rx,
+            host_file_rx,
             host_confirm_rx,
             host_chat,
             host_password,
@@ -116,6 +123,7 @@ async fn connect_pair_with_passwords(
             client_priv,
             client_ev_tx,
             client_out_rx,
+            client_file_rx,
             client_confirm_rx,
             client_chat,
             client_password,
@@ -129,12 +137,14 @@ async fn connect_pair_with_passwords(
             outbound: host_out,
             confirm: host_confirm,
             handle: host_handle,
+            _file_tx: host_file_tx,
         },
         Peer {
             events: client_events,
             outbound: client_out,
             confirm: client_confirm,
             handle: client_handle,
+            _file_tx: client_file_tx,
         },
     )
 }
@@ -246,6 +256,16 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
     })
     .await;
 
+    // --- File cancel: a FileCancel frame traverses the encrypted transport and
+    // survives the replay check like any other sequenced message ---
+    host.outbound
+        .send(ProtocolMessage::FileCancel { seq: 7 })
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut client.events, "client").await,
+        ProtocolMessage::FileCancel { .. }
+    ));
+
     // --- Keep-alive ping: transport plumbing, consumed silently ---
     // A Ping must keep the session healthy but never surface to the app: the
     // very next app-visible message after it is the following Text, not the Ping.
@@ -273,6 +293,37 @@ async fn full_pipeline_handshake_messages_typing_file_and_disconnect() {
     .await;
 
     host.handle.abort();
+}
+
+#[tokio::test]
+async fn both_peers_derive_the_same_short_authentication_string() {
+    let (mut host, mut client) = connect_pair().await;
+
+    // The SAS is carried on the confirmation-request events; both roles derive
+    // it independently from the shared transcript, so the two must be equal and
+    // well-formed. (A MITM would run two handshakes and the codes would differ.)
+    let host_sas = match wait_until(&mut host.events, "host", awaiting_confirmation).await {
+        SessionEvent::NewConnection { sas, .. } => sas,
+        other => panic!("host expected NewConnection, got {other:?}"),
+    };
+    let client_sas = match wait_until(&mut client.events, "client", awaiting_confirmation).await {
+        SessionEvent::ShowFingerprintVerification { sas, .. } => sas,
+        other => panic!("client expected ShowFingerprintVerification, got {other:?}"),
+    };
+
+    assert_eq!(host_sas, client_sas, "both ends must show the same SAS");
+    assert!(!host_sas.is_empty(), "SAS must be populated");
+    // "NN-NN-NN" digits followed by three emoji groups.
+    assert_eq!(
+        host_sas.split(' ').count(),
+        4,
+        "unexpected SAS shape: {host_sas}"
+    );
+
+    host.confirm.send(true).unwrap();
+    client.confirm.send(true).unwrap();
+    host.handle.abort();
+    client.handle.abort();
 }
 
 #[tokio::test]

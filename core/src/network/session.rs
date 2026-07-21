@@ -79,11 +79,13 @@ fn labeled_aad(label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
 }
 
 /// Run host session: listen, accept, handshake (v3), message loop
+#[allow(clippy::too_many_arguments)]
 pub async fn run_host_session(
     port: u16,
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
@@ -189,7 +191,7 @@ pub async fn run_host_session(
         &client_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -284,6 +286,7 @@ pub async fn run_host_session(
         .send(SessionEvent::NewConnection {
             peer_addr: peer_addr.to_string(),
             fingerprint: client_fingerprint,
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id: client_proof.chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -319,7 +322,15 @@ pub async fn run_host_session(
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+    run_message_loop(
+        stream,
+        cipher,
+        transport_aad,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+    )
+    .await
 }
 
 /// Run client session: connect, handshake (v3), message loop
@@ -374,6 +385,7 @@ pub async fn run_client_session(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
     confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
@@ -383,6 +395,7 @@ pub async fn run_client_session(
         privkey,
         to_app_tx,
         from_app_rx,
+        file_rx,
         confirm_rx,
         chat_id,
         connection_password,
@@ -394,11 +407,13 @@ pub async fn run_client_session(
 /// timeout) and run the client session over the first that accepts the TCP
 /// connection. Later candidates are only tried when earlier ones fail to
 /// *connect* — once a stream is established the session lives or dies there.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_client_session_multi(
     targets: &[(String, u16)],
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
@@ -492,7 +507,7 @@ pub async fn run_client_session_multi(
         &host_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -585,6 +600,7 @@ pub async fn run_client_session_multi(
         .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: host_fingerprint.clone(),
             peer_name: host.to_string(),
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -620,7 +636,15 @@ pub async fn run_client_session_multi(
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+    run_message_loop(
+        stream,
+        cipher,
+        transport_aad,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+    )
+    .await
 }
 
 /// A completed Protocol v3 cryptographic handshake: the peer's verified identity
@@ -703,7 +727,7 @@ where
         &client_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -840,7 +864,7 @@ where
         &host_ephemeral_public,
         Some(&salt),
         HKDF_INFO,
-    ));
+    )?);
     let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
     let transcript_hash = salt.as_slice();
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
@@ -988,6 +1012,7 @@ pub async fn run_host_session_over_stream<S>(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
@@ -1019,6 +1044,7 @@ where
         .send(SessionEvent::NewConnection {
             peer_addr: peer_label,
             fingerprint: peer_fingerprint,
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id: peer_chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -1048,7 +1074,15 @@ where
     to_app_tx
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
-    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+    run_message_loop(
+        stream,
+        cipher,
+        transport_aad,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1058,6 +1092,7 @@ pub async fn run_client_session_over_stream<S>(
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
     mut confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
@@ -1094,6 +1129,7 @@ where
         .send(SessionEvent::ShowFingerprintVerification {
             fingerprint: host_fingerprint,
             peer_name,
+            sas: crate::core::derive_sas(&transport_aad),
             chat_id,
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
@@ -1123,7 +1159,15 @@ where
     to_app_tx
         .send(SessionEvent::Ready)
         .map_err(|e| anyhow!("Send error: {}", e))?;
-    run_message_loop(stream, cipher, transport_aad, to_app_tx, from_app_rx).await
+    run_message_loop(
+        stream,
+        cipher,
+        transport_aad,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+    )
+    .await
 }
 
 /// Extract sequence number from a ProtocolMessage
@@ -1138,6 +1182,7 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
         ProtocolMessage::FileMeta { seq, .. } => Some(*seq),
         ProtocolMessage::FileChunk { seq, .. } => Some(*seq),
         ProtocolMessage::FileEnd { seq } => Some(*seq),
+        ProtocolMessage::FileCancel { seq } => Some(*seq),
         ProtocolMessage::Ping { seq } => Some(*seq),
         ProtocolMessage::TypingStart { seq } => Some(*seq),
         ProtocolMessage::TypingStop { seq } => Some(*seq),
@@ -1234,12 +1279,95 @@ where
 }
 
 /// Main message loop: send and receive encrypted messages with replay protection
+/// Encrypt and write one outbound application frame, first rotating the key if a
+/// host-initiated rekey is due. Shared by the control lane and the bounded
+/// file-data lane so both stamp the single monotonic outbound sequence and both
+/// surface `FileSendComplete` on the final file frame.
+#[allow(clippy::too_many_arguments)]
+async fn send_outbound_frame<S>(
+    stream: &mut S,
+    cipher: &mut AesCipher,
+    prev_cipher: &mut Option<AesCipher>,
+    transport_aad: &[u8],
+    to_app_tx: &mpsc::UnboundedSender<SessionEvent>,
+    sent_seq: &mut u64,
+    messages_since_rekey: &mut u64,
+    last_rekey_time: &mut std::time::Instant,
+    is_rekey_initiator: bool,
+    rekey_message_count: u64,
+    rekey_time_interval: std::time::Duration,
+    mut msg: ProtocolMessage,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // Host-only rekey initiation (see initiate_rekey): rotate the key before
+    // sending this frame if we're due.
+    let should_rekey = is_rekey_initiator
+        && (*messages_since_rekey >= rekey_message_count
+            || last_rekey_time.elapsed() >= rekey_time_interval);
+    if should_rekey {
+        initiate_rekey(
+            stream,
+            cipher,
+            prev_cipher,
+            transport_aad,
+            sent_seq,
+            messages_since_rekey,
+            last_rekey_time,
+        )
+        .await
+        .map_err(|e| anyhow!("Network send error (rekey): {}", e))?;
+    }
+
+    // Stamp the next monotonic transport sequence onto every outgoing frame. The
+    // loop owns the outbound sequence space so application frames and interleaved
+    // Rekey frames form one strictly-increasing stream the peer's replay check
+    // accepts. Interleaving the two lanes is safe: each frame still gets the next
+    // seq in the order it is written.
+    *sent_seq += 1;
+    msg.set_seq(*sent_seq);
+    tracing::debug!("Sending message: {:?}", msg);
+
+    let plaintext = msg.to_plain_bytes();
+    let encrypted = cipher.encrypt(&plaintext, Some(transport_aad));
+    send_packet(stream, &encrypted)
+        .await
+        .map_err(|e| anyhow!("Network send error: {}", e))?;
+
+    *messages_since_rekey += 1;
+    // Report the transport seq of load-bearing final frames back to the app:
+    // FileEnd ("queueing is not delivery"), and the frame carrying an outgoing
+    // text message (single frame, or the final chunk of a large one) so the app
+    // can correlate the peer's delivery receipt (`Ack { acked_seq }`) back to
+    // that message. Frames drain FIFO per lane, so order correlates.
+    match &msg {
+        ProtocolMessage::FileEnd { seq } => {
+            let _ = to_app_tx.send(SessionEvent::FileSendComplete { seq: *seq });
+        }
+        ProtocolMessage::Text { seq, .. } => {
+            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
+        }
+        ProtocolMessage::TextChunk {
+            seq,
+            chunk_index,
+            total_chunks,
+            ..
+        } if chunk_index + 1 == *total_chunks => {
+            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn run_message_loop<S>(
     mut stream: S,
     mut cipher: AesCipher,
     transport_aad: Vec<u8>,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     mut from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    mut file_rx: mpsc::Receiver<ProtocolMessage>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -1400,83 +1528,36 @@ where
                 }
             }
 
-            // Send to network
-            Some(mut msg) = from_app_rx.recv() => {
-                // Host-only rekey initiation (see initiate_rekey): rotate the
-                // key before sending this frame if we're due.
-                let should_rekey = is_rekey_initiator
-                    && (messages_since_rekey >= REKEY_MESSAGE_COUNT
-                        || last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL);
-
-                if should_rekey {
-                    if let Err(e) = initiate_rekey(
-                        &mut stream,
-                        &mut cipher,
-                        &mut prev_cipher,
-                        &transport_aad,
-                        &mut sent_seq,
-                        &mut messages_since_rekey,
-                        &mut last_rekey_time,
-                    )
-                    .await
-                    {
-                        let err_msg = format!("Network send error (rekey): {}", e);
-                        tracing::error!("{}", err_msg);
-                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
-                        break;
-                    }
-                }
-
-                // Stamp the next monotonic transport sequence onto every outgoing
-                // frame. The loop owns the outbound sequence space so that
-                // application messages and interleaved Rekey messages form one
-                // strictly-increasing stream the peer's replay check accepts.
-                // (Without this, Rekey used an independent counter whose seq was
-                // rejected as a replay, desyncing the keys and killing the session.)
-                sent_seq += 1;
-                msg.set_seq(sent_seq);
-
-                tracing::debug!("Sending message: {:?}", msg);
-
-                let plaintext = msg.to_plain_bytes();
-                tracing::trace!("Plaintext {} bytes", plaintext.len());
-
-                let encrypted = cipher.encrypt(&plaintext, Some(&transport_aad));
-                tracing::trace!("Encrypted to {} bytes", encrypted.len());
-
-                if let Err(e) = send_packet(&mut stream, &encrypted).await {
-                    let err_msg = format!("Network send error: {}", e);
-                    tracing::error!("{}", err_msg);
-                    let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+            // Send from the control lane: text, typing, and file-transfer
+            // control frames (FileCancel). Unbounded, so an abort is never stuck
+            // behind queued bulk data.
+            Some(msg) = from_app_rx.recv() => {
+                if let Err(e) = send_outbound_frame(
+                    &mut stream, &mut cipher, &mut prev_cipher, &transport_aad,
+                    &to_app_tx, &mut sent_seq, &mut messages_since_rekey,
+                    &mut last_rekey_time, is_rekey_initiator,
+                    REKEY_MESSAGE_COUNT, REKEY_TIME_INTERVAL, msg,
+                ).await {
+                    tracing::error!("{}", e);
+                    let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
                     break;
-                } else {
-                    tracing::debug!("Message sent successfully");
-                    // Track sent messages for rekeying
-                    messages_since_rekey += 1;
-                    // Report the transport seq of load-bearing final frames back
-                    // to the app: FileEnd ("queueing is not delivery"), and the
-                    // frame carrying an outgoing text message (single frame, or
-                    // the final chunk of a large one) so the app can correlate
-                    // the peer's delivery receipt (`Ack { acked_seq }`) back to
-                    // that message. Frames drain FIFO per session, so order
-                    // correlates.
-                    match &msg {
-                        ProtocolMessage::FileEnd { seq } => {
-                            let _ = to_app_tx.send(SessionEvent::FileSendComplete { seq: *seq });
-                        }
-                        ProtocolMessage::Text { seq, .. } => {
-                            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
-                        }
-                        ProtocolMessage::TextChunk {
-                            seq,
-                            chunk_index,
-                            total_chunks,
-                            ..
-                        } if chunk_index + 1 == *total_chunks => {
-                            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
-                        }
-                        _ => {}
-                    }
+                }
+            }
+
+            // Send from the bounded file-data lane: FileMeta/FileChunk/FileEnd.
+            // The bounded capacity is what applies backpressure to the streaming
+            // task, so a slow peer paces the disk reader instead of letting the
+            // whole file pile up in memory.
+            Some(msg) = file_rx.recv() => {
+                if let Err(e) = send_outbound_frame(
+                    &mut stream, &mut cipher, &mut prev_cipher, &transport_aad,
+                    &to_app_tx, &mut sent_seq, &mut messages_since_rekey,
+                    &mut last_rekey_time, is_rekey_initiator,
+                    REKEY_MESSAGE_COUNT, REKEY_TIME_INTERVAL, msg,
+                ).await {
+                    tracing::error!("{}", e);
+                    let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+                    break;
                 }
             }
 
@@ -1729,11 +1810,12 @@ mod tests {
         let (loop_stream, mut peer_stream) = tokio::io::duplex(4096);
 
         let (to_app_tx, mut to_app_rx) = mpsc::unbounded_channel();
-        // Keep the app->loop sender alive so the loop only exits via the network side.
+        // Keep the app->loop senders alive so the loop only exits via the network side.
         let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        let (_file_tx, file_rx) = mpsc::channel(1);
 
         let handle = tokio::spawn(async move {
-            run_message_loop(loop_stream, cipher, aad, to_app_tx, from_app_rx).await
+            run_message_loop(loop_stream, cipher, aad, to_app_tx, from_app_rx, file_rx).await
         });
 
         // A well-formed packet whose contents cannot be authenticated under the key.
@@ -1794,7 +1876,8 @@ mod tests {
                 &client_ephemeral_public,
                 Some(&salt),
                 HKDF_INFO,
-            );
+            )
+            .unwrap();
             let cipher = AesCipher::new(&host_aes_key)?;
 
             // 4. Send Identity Proof (Encrypted)
@@ -1855,7 +1938,8 @@ mod tests {
                 &host_ephemeral_public,
                 Some(&salt),
                 HKDF_INFO,
-            );
+            )
+            .unwrap();
             let cipher = AesCipher::new(&client_aes_key)?;
 
             // 4. Recv Host Identity Proof (Encrypted)

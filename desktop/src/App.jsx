@@ -250,6 +250,7 @@ export default function App() {
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
+                onCancelTransfer={(id) => api.cancelTransfer(id).catch(() => {})}
                 transfers={transfers.filter((t) =>
                   // done/cancelled rows can linger in the snapshot until the next
                   // transfer; the completed file already shows as a message, so

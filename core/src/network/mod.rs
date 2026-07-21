@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod nat;
+pub(crate) mod punch;
 pub mod relay;
 pub mod session;
 

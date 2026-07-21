@@ -11,8 +11,11 @@ impl ChatManager {
             // If the user accepted and we have a pending verification request matching this chat,
             // persist the fingerprint in the chat record before confirming the session.
             if accept {
-                let pending = self.fingerprint_verification_request.clone();
-                if let Some((fp, _peer_name, req_chat_id)) = pending {
+                if let Some((fp, req_chat_id)) = self
+                    .fingerprint_verification_request
+                    .as_ref()
+                    .map(|p| (p.fingerprint.clone(), p.session_id))
+                {
                     // IMPORTANT: In host mode, req_chat_id is the session ID (the host placeholder ID)
                     // but the fingerprint should be stored in the actual chat (the client's ID).
                     // However, confirm_fingerprint is called with the session ID.
@@ -85,6 +88,8 @@ impl ChatManager {
         // Create channels
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        // Bounded lane for outgoing bulk file data (backpressure).
+        let (file_tx, file_rx) = mpsc::channel(FILE_LANE_CAPACITY);
 
         // Create confirmation channel so UI can accept/reject the fingerprint
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
@@ -97,6 +102,7 @@ impl ChatManager {
                 privkey,
                 to_app_tx,
                 from_app_rx,
+                file_rx,
                 confirm_rx,
                 chat_id,
                 connection_password,
@@ -125,7 +131,13 @@ impl ChatManager {
         };
 
         self.chats.insert(chat_id, chat);
-        self.sessions.insert(chat_id, SessionHandle { from_app_tx });
+        self.sessions.insert(
+            chat_id,
+            SessionHandle {
+                from_app_tx,
+                file_tx,
+            },
+        );
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -208,6 +220,8 @@ impl ChatManager {
         let chat_id = Uuid::new_v4();
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        // Bounded lane for outgoing bulk file data (backpressure).
+        let (file_tx, file_rx) = mpsc::channel(FILE_LANE_CAPACITY);
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let relay_server_owned = relay_server.to_string();
         let relay_token_owned = relay_token.clone();
@@ -219,6 +233,7 @@ impl ChatManager {
                 privkey,
                 to_app_tx,
                 from_app_rx,
+                file_rx,
                 confirm_rx,
                 chat_id,
             )
@@ -246,7 +261,13 @@ impl ChatManager {
                 is_host_placeholder: true,
             },
         );
-        self.sessions.insert(chat_id, SessionHandle { from_app_tx });
+        self.sessions.insert(
+            chat_id,
+            SessionHandle {
+                from_app_tx,
+                file_tx,
+            },
+        );
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -290,6 +311,8 @@ impl ChatManager {
 
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        // Bounded lane for outgoing bulk file data (backpressure).
+        let (file_tx, file_rx) = mpsc::channel(FILE_LANE_CAPACITY);
 
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let connection_password = self.connection_password.clone();
@@ -301,6 +324,7 @@ impl ChatManager {
                 privkey,
                 to_app_tx,
                 from_app_rx,
+                file_rx,
                 confirm_rx,
                 chat_id,
                 connection_password,
@@ -331,7 +355,13 @@ impl ChatManager {
             tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
         }
 
-        self.sessions.insert(chat_id, SessionHandle { from_app_tx });
+        self.sessions.insert(
+            chat_id,
+            SessionHandle {
+                from_app_tx,
+                file_tx,
+            },
+        );
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -352,6 +382,8 @@ impl ChatManager {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        // Bounded lane for outgoing bulk file data (backpressure).
+        let (file_tx, file_rx) = mpsc::channel(FILE_LANE_CAPACITY);
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let relay_server_owned = relay_server.to_string();
         let relay_token_owned = token.to_string();
@@ -363,6 +395,7 @@ impl ChatManager {
                 privkey,
                 to_app_tx,
                 from_app_rx,
+                file_rx,
                 confirm_rx,
                 chat_id,
             )
@@ -398,7 +431,13 @@ impl ChatManager {
             }
         }
 
-        self.sessions.insert(chat_id, SessionHandle { from_app_tx });
+        self.sessions.insert(
+            chat_id,
+            SessionHandle {
+                from_app_tx,
+                file_tx,
+            },
+        );
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);

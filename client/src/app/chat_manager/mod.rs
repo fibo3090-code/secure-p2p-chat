@@ -33,7 +33,62 @@ use text::IncomingTextMessage;
 /// Session handle for communication with network task
 #[derive(Clone)]
 pub struct SessionHandle {
+    /// Unbounded control lane: text, typing, and file-transfer control frames
+    /// (`FileMeta` is sent on the file lane; `FileCancel` on this one).
     pub from_app_tx: mpsc::UnboundedSender<ProtocolMessage>,
+    /// Bounded bulk-data lane for outgoing `FileChunk`/`FileMeta`/`FileEnd`
+    /// frames, so a large send is paced by the network instead of buffering the
+    /// whole file in the outbound queue.
+    pub file_tx: mpsc::Sender<ProtocolMessage>,
+}
+
+/// Capacity (in chunks) of the bounded outgoing file-data lane. At
+/// `FILE_CHUNK_SIZE` (64 KiB) this caps in-flight outbound file data at a few
+/// hundred KiB regardless of file size, providing real backpressure.
+pub(crate) const FILE_LANE_CAPACITY: usize = 8;
+
+impl SessionHandle {
+    /// Test-support constructor for a handle whose bulk file lane is inert (its
+    /// receiver is dropped). For tests that exercise control-lane messaging and
+    /// never drive `send_file`.
+    pub fn for_test_control(from_app_tx: mpsc::UnboundedSender<ProtocolMessage>) -> Self {
+        let (file_tx, _file_rx) = mpsc::channel(1);
+        Self {
+            from_app_tx,
+            file_tx,
+        }
+    }
+}
+
+/// Live control handle for an in-flight outgoing file transfer. The chunk
+/// streaming runs in a background task; this lets the manager observe progress
+/// and request cancellation without holding the manager lock for the whole
+/// (potentially multi-gigabyte) send.
+pub(crate) struct OutgoingTransfer {
+    /// Session the file is streaming on (where `FileSendComplete` will arrive).
+    pub session_id: Uuid,
+    /// Set to request the streaming task stop; it then emits `FileCancel`.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes handed to the transport so far (mirrored into `active_transfers`).
+    pub progress: Arc<std::sync::atomic::AtomicU64>,
+    /// Set by the streaming task on a local I/O error (open/read) so the poll
+    /// loop can mark the transfer `Failed` and drop it instead of leaving a
+    /// stuck row and a leaked handle.
+    pub failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A TOFU verification the UI must resolve before a session becomes `Ready`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFingerprint {
+    /// 64-char hex fingerprint of the peer's identity key.
+    pub fingerprint: String,
+    /// Peer display name / address for the prompt heading.
+    pub peer_name: String,
+    /// Short authentication string both peers read aloud to compare (empty
+    /// for a legacy/mismatch path that carries no session SAS).
+    pub sas: String,
+    /// Session id the accept/reject decision must be routed to.
+    pub session_id: Uuid,
 }
 
 /// Main chat manager - orchestrates sessions, messages, and file transfers
@@ -52,9 +107,10 @@ pub struct ChatManager {
     active_transfers: HashMap<Uuid, FileTransferState>,
     /// Outgoing files queued on a session but whose final frame has not hit the
     /// wire yet (FIFO per session; resolved by `SessionEvent::FileSendComplete`).
-    /// Entries are `(filename, chat_id, message_id)` so the completion can both
-    /// toast and register the message for a delivery receipt.
-    pending_file_sends: HashMap<Uuid, VecDeque<(String, Uuid, Uuid)>>,
+    /// Each entry is `(filename, transfer_id, chat_id, message_id)` so the
+    /// completion can map back to its tracked transfer AND register the file
+    /// message for a delivery receipt.
+    pending_file_sends: HashMap<Uuid, VecDeque<(String, Uuid, Uuid, Uuid)>>,
     /// Outgoing text messages queued on a session but whose frame has not hit
     /// the wire yet (FIFO per session; resolved by `TextSendComplete`).
     /// Entries are `(chat_id, message_id)`.
@@ -62,6 +118,10 @@ pub struct ChatManager {
     /// Sent messages waiting for the peer's delivery receipt, keyed by
     /// `(session_id, wire seq)` → `(chat_id, message_id)`.
     awaiting_ack: HashMap<(Uuid, u64), (Uuid, Uuid)>,
+    /// Live handles for in-flight outgoing transfers, keyed by transfer id.
+    /// The streaming task reports bytes sent via `progress` and stops when
+    /// `cancel` is set; the poll loop mirrors both into `active_transfers`.
+    outgoing_transfers: HashMap<Uuid, OutgoingTransfer>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
     /// Incoming transfers whose `FileEnd` arrived while still awaiting the
@@ -72,7 +132,7 @@ pub struct ChatManager {
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
-    pub fingerprint_verification_request: Option<(String, String, Uuid)>,
+    pub fingerprint_verification_request: Option<PendingFingerprint>,
     pub history_key: Option<[u8; 32]>,
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
@@ -111,6 +171,7 @@ impl ChatManager {
             pending_file_sends: HashMap::new(),
             pending_text_sends: HashMap::new(),
             awaiting_ack: HashMap::new(),
+            outgoing_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             pending_file_end: HashMap::new(),
             incoming_text_messages: HashMap::new(),
@@ -337,6 +398,14 @@ impl ChatManager {
         }
     }
 
+    /// Transfers sorted by id, so an index-based selection (the TUI overlay) is
+    /// stable across polls even though the backing map is unordered.
+    pub fn active_transfers_sorted(&self) -> Vec<FileTransferState> {
+        let mut v: Vec<_> = self.active_transfers.values().cloned().collect();
+        v.sort_by_key(|t| t.id);
+        v
+    }
+
     /// Delete a chat and its associated session
     pub fn delete_chat(&mut self, chat_id: Uuid) {
         tracing::info!(chat_id = %chat_id, "Deleting chat");
@@ -362,6 +431,14 @@ impl ChatManager {
         self.sessions.clear();
         self.session_events.clear();
         self.fingerprint_confirm_senders.clear();
+        // Signal any streaming send tasks to stop, then drop all transfer state.
+        for handle in self.outgoing_transfers.values() {
+            handle
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.outgoing_transfers.clear();
+        self.pending_file_sends.clear();
         self.active_transfers.clear();
         self.incoming_files.clear();
         self.pending_file_end.clear();

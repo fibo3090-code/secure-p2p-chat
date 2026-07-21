@@ -7,6 +7,7 @@ impl ChatManager {
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
         self.cleanup_stale_incoming_text_messages();
+        self.sync_outgoing_transfer_progress();
         self.poll_upnp_result();
         let chat_ids: Vec<Uuid> = self.session_events.keys().copied().collect();
         tracing::trace!(tracked_sessions = %chat_ids.len(), "Polling session events");
@@ -30,12 +31,34 @@ impl ChatManager {
         }
     }
 
+    /// Register a sent message as waiting for the peer's delivery receipt,
+    /// keeping the map bounded: a peer that predates `Ack` never acknowledges
+    /// anything, so on a long-lived session the entries would otherwise grow
+    /// forever. Hitting the cap means the peer isn't acking at all — dropping
+    /// the backlog only costs ✓ marks that were never going to arrive.
+    pub(super) fn register_awaiting_ack(
+        &mut self,
+        session_id: Uuid,
+        seq: u64,
+        chat_id: Uuid,
+        message_id: Uuid,
+    ) {
+        const MAX_AWAITING_ACK: usize = 2048;
+        if self.awaiting_ack.len() >= MAX_AWAITING_ACK {
+            tracing::info!("awaiting_ack backlog full (peer not acking); dropping old entries");
+            self.awaiting_ack.clear();
+        }
+        self.awaiting_ack
+            .insert((session_id, seq), (chat_id, message_id));
+    }
+
     /// Consolidate Trust-On-First-Use (TOFU) verification logic
     pub(super) fn handle_tofu_verification(
         &mut self,
         session_id: Uuid,
         fingerprint: &str,
         peer_name: &str,
+        sas: &str,
     ) {
         // Resolve the actual chat ID (important for host mode where session_id != chat_id)
         let actual_chat_id = self
@@ -104,8 +127,12 @@ impl ChatManager {
                     // Request explicit user verification via UI
                     // Note: fingerprint_verification_request uses the SESSION ID
                     // because confirmation (accept/reject) must be sent to that session's task.
-                    self.fingerprint_verification_request =
-                        Some((fingerprint.to_string(), peer_name.to_string(), session_id));
+                    self.fingerprint_verification_request = Some(PendingFingerprint {
+                        fingerprint: fingerprint.to_string(),
+                        peer_name: peer_name.to_string(),
+                        sas: sas.to_string(),
+                        session_id,
+                    });
                     self.add_toast(
                         ToastLevel::Warning,
                         "Fingerprint verification required".to_string(),
@@ -134,8 +161,12 @@ impl ChatManager {
                     fingerprint
                 );
                 // Trigger the UI dialog for manual verification using the session ID.
-                self.fingerprint_verification_request =
-                    Some((fingerprint.to_string(), peer_name.to_string(), session_id));
+                self.fingerprint_verification_request = Some(PendingFingerprint {
+                    fingerprint: fingerprint.to_string(),
+                    peer_name: peer_name.to_string(),
+                    sas: sas.to_string(),
+                    session_id,
+                });
                 self.add_toast(
                     ToastLevel::Warning,
                     "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
@@ -156,17 +187,31 @@ impl ChatManager {
 
             SessionEvent::Connected { peer } => {
                 tracing::info!("Session {} connected to {}", chat_id, peer);
-                self.add_toast(ToastLevel::Success, format!("Connected to {}", peer));
+                // A "p2p:" label means the relay rendezvous hole punched a
+                // direct socket, so the chat is no longer relay-transported.
+                let hole_punched = peer.starts_with("p2p:");
+                if hole_punched {
+                    self.add_toast(
+                        ToastLevel::Success,
+                        format!("Direct connection established (hole punched): {}", peer),
+                    );
+                } else {
+                    self.add_toast(ToastLevel::Success, format!("Connected to {}", peer));
+                }
 
                 if let Some(chat) = self.chats.get_mut(&chat_id) {
                     chat.title = peer;
                     chat.is_host_placeholder = false;
+                    if hole_punched {
+                        chat.transport = Transport::Direct;
+                    }
                 }
             }
 
             SessionEvent::NewConnection {
                 peer_addr,
                 fingerprint,
+                sas,
                 chat_id: incoming_chat_id,
             } => {
                 tracing::info!(
@@ -193,12 +238,17 @@ impl ChatManager {
 
                 // Inherit the transport of the host session that accepted this peer:
                 // a relay-hosted listener (`start_host_via_relay`) must produce a
-                // Relay chat, not a hardcoded Direct one.
-                let inherited_transport = self
-                    .chats
-                    .get(&chat_id)
-                    .map(|c| c.transport)
-                    .unwrap_or(Transport::Direct);
+                // Relay chat, not a hardcoded Direct one. Exception: a "p2p:"
+                // peer label means the rendezvous hole punched a direct socket,
+                // so the chat is Direct even though it started via the relay.
+                let inherited_transport = if peer_addr.starts_with("p2p:") {
+                    Transport::Direct
+                } else {
+                    self.chats
+                        .get(&chat_id)
+                        .map(|c| c.transport)
+                        .unwrap_or(Transport::Direct)
+                };
 
                 // Create a chat for this new connection, or (on reconnect, where
                 // the entry already exists) normalize its transport so it isn't
@@ -234,15 +284,16 @@ impl ChatManager {
                     }
                 }
 
-                self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr);
+                self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr, &sas);
             }
 
             SessionEvent::ShowFingerprintVerification {
                 fingerprint,
                 peer_name,
+                sas,
                 chat_id,
             } => {
-                self.handle_tofu_verification(chat_id, &fingerprint, &peer_name);
+                self.handle_tofu_verification(chat_id, &fingerprint, &peer_name, &sas);
             }
 
             SessionEvent::Ready => {
@@ -444,7 +495,7 @@ impl ChatManager {
                             return;
                         }
 
-                        let transfer_id = self.active_transfer_id_for_chat(actual_chat_id);
+                        let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                                 transfer.seq += 1;
@@ -502,7 +553,7 @@ impl ChatManager {
                             return;
                         }
 
-                        let transfer_id = self.active_transfer_id_for_chat(actual_chat_id);
+                        let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
                             let awaiting = self
                                 .active_transfers
@@ -521,6 +572,27 @@ impl ChatManager {
                                 // Finalize only the matching transfer, not all incoming files.
                                 self.finalize_incoming_file(transfer_id, Some(seq));
                             }
+                        }
+                    }
+
+                    ProtocolMessage::FileCancel { seq } => {
+                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                true
+                            } else {
+                                tracing::warn!("Received FileCancel with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if valid_seq {
+                            tracing::info!(
+                                "Peer cancelled the file transfer for chat {}",
+                                actual_chat_id
+                            );
+                            self.handle_peer_file_cancel(actual_chat_id);
                         }
                     }
 
@@ -614,11 +686,17 @@ impl ChatManager {
                     .get_mut(&chat_id)
                     .and_then(|q| q.pop_front())
                 {
-                    Some((filename, target_chat, message_id)) => {
+                    Some((filename, transfer_id, target_chat, message_id)) => {
                         tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
+                        // The stream finished; mark the tracked transfer done
+                        // and retire its live handle.
+                        self.outgoing_transfers.remove(&transfer_id);
+                        if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
+                            state.received = state.size;
+                            state.status = TransferStatus::Completed;
+                        }
                         // Wait for the peer's receipt to mark it delivered.
-                        self.awaiting_ack
-                            .insert((chat_id, seq), (target_chat, message_id));
+                        self.register_awaiting_ack(chat_id, seq, target_chat, message_id);
                         self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
                     }
                     None => {
@@ -637,8 +715,7 @@ impl ChatManager {
                     .and_then(|q| q.pop_front())
                 {
                     Some((target_chat, message_id)) => {
-                        self.awaiting_ack
-                            .insert((chat_id, seq), (target_chat, message_id));
+                        self.register_awaiting_ack(chat_id, seq, target_chat, message_id);
                     }
                     None => {
                         tracing::warn!(seq = %seq, "TextSendComplete with no pending text send");

@@ -146,13 +146,14 @@ function transferLabel(t) {
 // large send/receive shows movement instead of nothing until completion.
 // An "awaiting" transfer is an incoming offer: it shows Accept / Decline
 // instead of a progress bar (nothing is saved until the user accepts).
-function TransferBar({ transfers, onAccept, onDecline }) {
+// In-flight transfers get a cancel button (either direction).
+function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
   if (!transfers || transfers.length === 0) return null;
   return (
     <div className="transfer-bar">
       {transfers.map((t) => (
         <div key={t.id} className={cx("transfer-item", "is-" + t.status)}>
-          <Icon name="file" size={13} />
+          <Icon name={t.direction === "outgoing" ? "arrowUp" : "arrowDown"} size={13} />
           <span className="transfer-name">{t.filename}</span>
           {t.status === "awaiting" ? (
             <span className="transfer-offer">
@@ -163,6 +164,15 @@ function TransferBar({ transfers, onAccept, onDecline }) {
             <div className="transfer-track"><div className="transfer-fill" style={{ width: `${transferPct(t)}%` }} /></div>
           )}
           <span className="transfer-pct mono">{transferLabel(t)}</span>
+          {t.cancellable && (
+            <button
+              className="transfer-cancel"
+              title="Cancel transfer"
+              onClick={() => onCancel && onCancel(t.id)}
+            >
+              <Icon name="x" size={12} />
+            </button>
+          )}
         </div>
       ))}
     </div>
@@ -174,7 +184,7 @@ function TransferBar({ transfers, onAccept, onDecline }) {
 // "Show earlier messages" widens the window on demand.
 const MSG_WINDOW = 150;
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer }) {
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
   useEffect(() => setShown(MSG_WINDOW), [contact && contact.id]);
@@ -225,7 +235,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         </div>
       </div>
 
-      <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} />
+      <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
       <div className="composer">
         <button className="composer-clip" title="Send file"

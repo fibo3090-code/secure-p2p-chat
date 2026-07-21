@@ -83,6 +83,7 @@ pub struct App {
     // pub show_fingerprint_dialog: bool, REMOVED
     pub fingerprint_to_verify: Option<String>,
     pub peer_name_to_verify: Option<String>,
+    pub sas_to_verify: Option<String>,
     pub chat_id_to_verify: Option<Uuid>,
     pub show_log_terminal: bool,
     // pub show_clear_history_dialog: bool, REMOVED
@@ -113,6 +114,10 @@ pub struct App {
     pub connection_password_input: String,
     /// Draft for the display-name field in Settings.
     pub display_name_input: String,
+    /// A file-offer Accept/Decline click that could not be applied because the
+    /// manager lock was contended; retried on the next frame instead of being
+    /// silently dropped.
+    pub pending_transfer_decision: Option<(Uuid, bool)>,
 }
 
 impl App {
@@ -309,6 +314,7 @@ impl App {
             // Fingerprint verification dialog
             fingerprint_to_verify: None,
             peer_name_to_verify: None,
+            sas_to_verify: None,
             chat_id_to_verify: None,
             show_log_terminal: initial_show_log_terminal,
             event_collector,
@@ -335,6 +341,7 @@ impl App {
             party_new_channel_input: String::new(),
             connection_password_input: String::new(),
             display_name_input: identity_name_for_ui,
+            pending_transfer_decision: None,
         })
     }
 
@@ -546,12 +553,11 @@ impl eframe::App for App {
         // Always poll session events to keep the app responsive
         if let Ok(mut manager) = self.chat_manager.try_lock() {
             manager.poll_session_events();
-            if let Some((fingerprint, peer_name, chat_id)) =
-                manager.fingerprint_verification_request.take()
-            {
-                self.fingerprint_to_verify = Some(fingerprint);
-                self.peer_name_to_verify = Some(peer_name);
-                self.chat_id_to_verify = Some(chat_id);
+            if let Some(pending) = manager.fingerprint_verification_request.take() {
+                self.fingerprint_to_verify = Some(pending.fingerprint);
+                self.peer_name_to_verify = Some(pending.peer_name);
+                self.sas_to_verify = Some(pending.sas);
+                self.chat_id_to_verify = Some(pending.session_id);
                 self.active_dialog = ActiveDialog::FingerprintVerification;
             }
             manager.cleanup_expired_toasts();

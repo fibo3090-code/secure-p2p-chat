@@ -298,14 +298,26 @@ pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
 ///
 /// # Returns
 /// 32-byte AES-256 key derived from shared secret
+///
+/// # Errors
+/// Rejects non-contributory exchanges: a low-order (or all-zero) peer public
+/// key collapses the shared secret to the identity, letting an attacker force
+/// a predictable key. Not exploitable here on its own (the identity proof
+/// signs the ephemeral key and the transcript salts HKDF), but refusing such
+/// keys outright is standard hygiene (RFC 7748 §6.1).
 pub fn derive_session_key(
     our_secret: EphemeralSecret,
     their_public: &X25519PublicKey,
     salt: Option<&[u8]>,
     info: &[u8],
-) -> [u8; AES_KEY_SIZE] {
+) -> Result<[u8; AES_KEY_SIZE]> {
     // Perform ECDH to get shared secret
     let shared_secret = our_secret.diffie_hellman(their_public);
+    if !shared_secret.was_contributory() {
+        return Err(anyhow!(
+            "peer sent a low-order X25519 public key (non-contributory key exchange refused)"
+        ));
+    }
 
     // Use HKDF-SHA256 to derive session key
     // Salt is now supported (and recommended to be transcript hash)
@@ -315,7 +327,7 @@ pub fn derive_session_key(
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
 
-    session_key
+    Ok(session_key)
 }
 
 /// Generate a new session key by rekeying the current key with a nonce
@@ -350,7 +362,10 @@ pub fn generate_rekey_nonce() -> [u8; 16] {
     rand::random()
 }
 
-/// Parse X25519 public key from 32 bytes
+/// Parse X25519 public key from 32 bytes.
+///
+/// Rejects the all-zero key outright; the remaining low-order points are
+/// caught at agreement time by [`derive_session_key`]'s contributory check.
 pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
     if bytes.len() != 32 {
         return Err(anyhow!(
@@ -358,10 +373,56 @@ pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
             bytes.len()
         ));
     }
+    if bytes.iter().all(|&b| b == 0) {
+        return Err(anyhow!("X25519 public key must not be all zeros"));
+    }
 
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(bytes);
     Ok(X25519PublicKey::from(key_bytes))
+}
+
+// ============================================================================
+// Short Authentication String (SAS)
+// ============================================================================
+
+/// 32 visually distinct, easy-to-name emoji for the SAS display. Indexed by
+/// 5-bit groups of the SAS material — the table is part of the SAS format, so
+/// entries must never be reordered or replaced (append-only via a new label).
+const SAS_EMOJI: [&str; 32] = [
+    "🐶", "🐱", "🦊", "🐻", "🐼", "🦁", "🐮", "🐷", "🐸", "🐵", "🐔", "🐧", "🦉", "🦄", "🐝", "🦋",
+    "🐢", "🐙", "🐬", "🐳", "🌹", "🌻", "🌵", "🍀", "🍎", "🍋", "🍇", "🍓", "🥕", "🍕", "🎈", "⚽",
+];
+
+/// Derive the Short Authentication String both peers display during
+/// fingerprint verification: six digits plus three emoji, derived from the
+/// handshake transcript material via HKDF.
+///
+/// Both sides of one session compute the identical SAS; an active MITM runs
+/// two distinct handshakes whose transcripts (ephemeral keys, identity keys)
+/// differ, so the two victims see different codes. Reading the code aloud on
+/// any out-of-band channel therefore detects an interposed session — far less
+/// friction than comparing a 64-character fingerprint. ~35 bits shown; the
+/// attacker gets one guess per connection attempt.
+pub fn derive_sas(transcript_material: &[u8]) -> String {
+    let hkdf = Hkdf::<Sha256>::new(None, transcript_material);
+    let mut out = [0u8; 5];
+    hkdf.expand(b"p2pem-sas-v1", &mut out)
+        .expect("HKDF expand should not fail with valid length");
+
+    let digits = u32::from_be_bytes([0, out[0], out[1], out[2]]) % 1_000_000;
+    let e1 = SAS_EMOJI[(out[3] & 0x1f) as usize];
+    let e2 = SAS_EMOJI[((out[3] >> 5) | ((out[4] & 0x03) << 3)) as usize];
+    let e3 = SAS_EMOJI[((out[4] >> 2) & 0x1f) as usize];
+    format!(
+        "{:02}-{:02}-{:02} {} {} {}",
+        digits / 10_000,
+        (digits / 100) % 100,
+        digits % 100,
+        e1,
+        e2,
+        e3
+    )
 }
 
 /// Which side of a session a cipher belongs to. Both peers derive the *same*
@@ -718,8 +779,8 @@ mod tests {
 
         // Both derive the same session key
         let info = b"test-context";
-        let alice_session_key = derive_session_key(alice_secret, &_bob_public, None, info);
-        let bob_session_key = derive_session_key(bob_secret, &_alice_public, None, info);
+        let alice_session_key = derive_session_key(alice_secret, &_bob_public, None, info).unwrap();
+        let bob_session_key = derive_session_key(bob_secret, &_alice_public, None, info).unwrap();
 
         // Keys should match
         assert_eq!(alice_session_key, bob_session_key);
@@ -732,10 +793,10 @@ mod tests {
         let (_bob_secret, bob_public) = generate_ephemeral_keypair();
 
         // Different context strings produce different keys
-        let key1 = derive_session_key(alice_secret, &bob_public, None, b"context1");
+        let key1 = derive_session_key(alice_secret, &bob_public, None, b"context1").unwrap();
 
         let (alice_secret2, _) = generate_ephemeral_keypair();
-        let key2 = derive_session_key(alice_secret2, &bob_public, None, b"context2");
+        let key2 = derive_session_key(alice_secret2, &bob_public, None, b"context2").unwrap();
 
         // Keys should be different (different secrets)
         assert_ne!(key1, key2);
@@ -757,6 +818,47 @@ mod tests {
     }
 
     #[test]
+    fn test_sas_is_deterministic_and_transcript_bound() {
+        let a = derive_sas(b"transcript-one");
+        let b = derive_sas(b"transcript-one");
+        let c = derive_sas(b"transcript-two");
+        assert_eq!(a, b, "same transcript must give the same SAS");
+        assert_ne!(a, c, "different transcripts must give different SAS");
+        // Format: "NN-NN-NN" then three emoji.
+        let digits = a.split(' ').next().unwrap();
+        assert_eq!(digits.len(), 8);
+        assert_eq!(digits.matches('-').count(), 2);
+        assert_eq!(a.split(' ').count(), 4);
+    }
+
+    #[test]
+    fn test_sas_known_answer_is_stable() {
+        // The SAS format is user-facing and must not silently change: both
+        // peers of one session render it independently, so any change to the
+        // derivation or the emoji table breaks cross-version comparison.
+        assert_eq!(derive_sas(b"p2pem-test-vector"), "20-19-64 🌻 🍎 🐔");
+    }
+
+    #[test]
+    fn test_x25519_rejects_all_zero_public_key() {
+        assert!(parse_x25519_public(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_x25519_rejects_low_order_public_key() {
+        // Canonical order-8 point on Curve25519 (libsodium's blacklist entry):
+        // DH against it collapses to the identity, so the exchange must fail.
+        let low_order: [u8; 32] = [
+            0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+            0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+            0x5f, 0x49, 0xb8, 0x00,
+        ];
+        let malicious = parse_x25519_public(&low_order).expect("parses; caught at agreement");
+        let (our_secret, _) = generate_ephemeral_keypair();
+        assert!(derive_session_key(our_secret, &malicious, None, b"test").is_err());
+    }
+
+    #[test]
     fn test_forward_secrecy_full_flow() {
         // Simulate full handshake with forward secrecy
 
@@ -774,8 +876,10 @@ mod tests {
 
         // 4. Derive session keys
         let info = b"p2p-messenger-v2";
-        let alice_key = derive_session_key(alice_ephemeral_secret, &bob_public_parsed, None, info);
-        let bob_key = derive_session_key(bob_ephemeral_secret, &alice_public_parsed, None, info);
+        let alice_key =
+            derive_session_key(alice_ephemeral_secret, &bob_public_parsed, None, info).unwrap();
+        let bob_key =
+            derive_session_key(bob_ephemeral_secret, &alice_public_parsed, None, info).unwrap();
 
         // 5. Keys should match
         assert_eq!(alice_key, bob_key);

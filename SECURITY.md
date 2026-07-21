@@ -33,7 +33,7 @@ Reasoning:
 
 ## Implemented Protections
 
-In transit, sessions are established with X25519 ECDH and HKDF-SHA256 (providing forward secrecy), encrypted with AES-256-GCM under transcript-bound AAD, replay-protected by per-session sequence validation, and automatically rekeyed every 100 messages (or 5 minutes). Rekeying is initiated by a single deterministic side (the host) so the two peers never rotate simultaneously, and the receiver keeps the previous key for a bounded window (until the first frame decrypts under the new key) so peer frames still in flight under the old key are not lost — together these keep a rotation from desyncing the keys and dropping the session. Identity is a long-term RSA-2048 key used **only for RSA-PSS signatures** (identity proofs and signed invites) — the product performs **no RSA encryption/decryption at all** (those functions were removed from the codebase). At rest, the identity keystore is encrypted with Argon2 + ChaCha20-Poly1305 and chat history is encrypted, with zeroization applied to sensitive in-memory material where implemented. Full mechanics: [docs/protocol.md](docs/protocol.md).
+In transit, sessions are established with X25519 ECDH and HKDF-SHA256 (providing forward secrecy), encrypted with AES-256-GCM under transcript-bound AAD, replay-protected by per-session sequence validation, and automatically rekeyed every 100 messages (or 5 minutes). The X25519 exchange rejects all-zero peer keys and non-contributory (low-order-point) shared secrets, so a peer cannot force a predictable session key. At verification time both peers derive an identical transcript-bound **Short Authentication String** (six digits + three emoji); users compare that short code out-of-band to catch an active MITM without reading a 64-character fingerprint (an interposed attacker's two handshakes produce two different codes). Rekeying is initiated by a single deterministic side (the host) so the two peers never rotate simultaneously, and the receiver keeps the previous key for a bounded window (until the first frame decrypts under the new key) so peer frames still in flight under the old key are not lost — together these keep a rotation from desyncing the keys and dropping the session. Identity is a long-term RSA-2048 key used **only for RSA-PSS signatures** (identity proofs and signed invites) — the product performs **no RSA encryption/decryption at all** (those functions were removed from the codebase). At rest, the identity keystore is encrypted with Argon2 + ChaCha20-Poly1305 and chat history is encrypted, with zeroization applied to sensitive in-memory material where implemented. Full mechanics: [docs/protocol.md](docs/protocol.md).
 
 Operational hardening includes handshake timeouts, rate limiting, DoS-hardened framing (bounded length prefix, chunked reads, oversized-packet rejection), signed invite links, a self-hosted relay mode that forwards only already-encrypted session traffic, and server-side access checks on Party file downloads (`blob_bytes_for`: only channel members or DM participants can fetch a blob). CI enforces formatting, lints, cross-platform tests, and locked build verification.
 
@@ -48,9 +48,17 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 
 ## Current Limits and Open Risks
 
-- No STUN/TURN or peer-to-peer hole punching; WAN support relies on optional
-  UPnP/NAT-PMP port mapping (off by default — it opens a router port and embeds
-  the external IP in invites) or a self-hosted relay
+- WAN support relies on optional UPnP/NAT-PMP port mapping (off by default —
+  it opens a router port and embeds the external IP in invites) or a
+  self-hosted relay. The relay first coordinates a **TCP hole punch** (both
+  peers learn each other's relay-observed public endpoint and attempt a
+  simultaneous open from the reused source port), so most sessions go direct
+  and the relay only bridges when punching fails (symmetric NAT, CGNAT,
+  filtered networks). The punch hello tag is derived from the rendezvous
+  token and is pairing hygiene only — authentication is still the v3
+  handshake + TOFU on whichever socket wins. `P2PEM_NO_HOLEPUNCH=1` forces
+  the bridged path. Punching also reveals each peer's public *and* LAN
+  endpoint to the other (the relay already saw both source addresses)
 - Multi-address invites embed **both** the external and the LAN address when
   UPnP is enabled, so a shared invite reveals the private LAN IP alongside the
   public one — share invites only with people you intend to reach you
@@ -80,6 +88,14 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   signatures to Ed25519 (the wire already negotiates a scheme field) would drop
   `rsa` from the security-critical path entirely.
 - `bincode` remains a tracked dependency migration concern
+- Known-accepted `cargo audit` findings beyond `rsa` above: `quick-xml`
+  (RUSTSEC-2026-0194/0195) is pinned transitively by the GUI stacks
+  (egui-winit accessibility, wayland build tooling, Tauri) below the fixed
+  release — the parsed XML there is build-time or local desktop-bus data,
+  never peer-controlled input — and the unmaintained GTK3-binding warnings
+  come with Tauri's Linux backend until it moves off GTK3. Re-evaluate on
+  every GUI-stack upgrade; everything else in the tree is kept current via
+  in-semver `cargo update`.
 
 ## Trust Model
 

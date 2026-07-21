@@ -158,6 +158,13 @@ pub enum ToastLevel {
     Error,
 }
 
+/// Whether a tracked transfer is being received from or sent to the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Incoming,
+    Outgoing,
+}
+
 /// File transfer state
 #[derive(Debug, Clone)]
 pub struct FileTransferState {
@@ -165,9 +172,11 @@ pub struct FileTransferState {
     pub chat_id: Uuid,
     pub filename: String,
     pub size: u64,
+    /// Bytes transferred so far (received for incoming, sent for outgoing).
     pub received: u64,
     pub status: TransferStatus,
     pub seq: u64,
+    pub direction: TransferDirection,
 }
 
 /// File transfer status
@@ -214,11 +223,16 @@ pub enum SessionEvent {
     NewConnection {
         peer_addr: String,
         fingerprint: String,
+        /// Short authentication string for this session (identical on both
+        /// ends; an interposed MITM produces two different codes).
+        sas: String,
         chat_id: Uuid,
     },
     ShowFingerprintVerification {
         fingerprint: String,
         peer_name: String,
+        /// Short authentication string for this session (see `NewConnection`).
+        sas: String,
         chat_id: Uuid,
     },
     Ready,

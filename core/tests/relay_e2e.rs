@@ -1,20 +1,26 @@
-//! End-to-end test for the relay path: a self-hosted rendezvous server pairs a
-//! host and a joiner by token and forwards their (already-encrypted) v3 session
-//! traffic. Verifies that two peers who both reach the relay complete the full
-//! handshake and exchange an application message — without the relay ever
-//! terminating the chat encryption.
+//! End-to-end tests for the relay rendezvous: a self-hosted server pairs a
+//! host and a joiner by token. Punch-capable peers hole punch a direct TCP
+//! connection (the relay never carries session bytes); when punching is
+//! disabled the relay bridges the (already-encrypted) v3 session traffic as
+//! before. Both paths must complete the full handshake and deliver an
+//! application message without the relay ever terminating the chat encryption.
 
 use messenger_core::core::{generate_rsa_keypair, ProtocolMessage};
 use messenger_core::network::{
     generate_relay_token, run_client_session_via_relay, run_host_session_via_relay,
-    run_relay_server,
+    run_relay_server, NO_HOLEPUNCH_ENV,
 };
 use messenger_core::types::SessionEvent;
 use messenger_core::RSA_KEY_BITS;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// `NO_HOLEPUNCH_ENV` is process-global; serialize the tests that read it so
+/// `cargo test` (threaded) behaves like `cargo nextest` (process-per-test).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Host emits `NewConnection`; client emits `ShowFingerprintVerification`. Both
 /// mean "peer identity received, awaiting TOFU confirmation".
@@ -56,16 +62,17 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
-#[tokio::test]
-async fn two_peers_pair_through_relay_and_exchange_a_message() {
+/// Drive a full host+joiner pairing through a fresh relay server: handshake,
+/// TOFU confirmation on both ends, and one host→client message. Returns the
+/// peer labels observed on each side (`p2p:*` for a punched direct socket,
+/// `relay:*` when bridged) so callers can assert which transport was used.
+async fn pair_and_exchange() -> (String, String) {
     let port = free_port();
     let relay_addr = format!("127.0.0.1:{port}");
 
-    // Start the relay server in the background.
     tokio::spawn(async move {
         let _ = run_relay_server(port).await;
     });
-    // Give the listener a moment to come up.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let token = generate_relay_token();
@@ -74,10 +81,12 @@ async fn two_peers_pair_through_relay_and_exchange_a_message() {
 
     let (host_ev_tx, mut host_events) = mpsc::unbounded_channel();
     let (host_out, host_out_rx) = mpsc::unbounded_channel();
+    let (_host_file_tx, host_file_rx) = mpsc::channel(8);
     let (host_confirm, host_confirm_rx) = mpsc::unbounded_channel();
 
     let (client_ev_tx, mut client_events) = mpsc::unbounded_channel();
     let (_client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (_client_file_tx, client_file_rx) = mpsc::channel(8);
     let (client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
 
     // Host registers the token first.
@@ -90,6 +99,7 @@ async fn two_peers_pair_through_relay_and_exchange_a_message() {
             host_priv,
             host_ev_tx,
             host_out_rx,
+            host_file_rx,
             host_confirm_rx,
             uuid::Uuid::new_v4(),
         )
@@ -107,14 +117,29 @@ async fn two_peers_pair_through_relay_and_exchange_a_message() {
             client_priv,
             client_ev_tx,
             client_out_rx,
+            client_file_rx,
             client_confirm_rx,
             uuid::Uuid::new_v4(),
         )
         .await
     });
 
-    // TOFU confirmation on both ends.
-    wait_until(&mut host_events, "host", awaiting_confirmation).await;
+    // The client announces the transport it ended up with before handshaking.
+    let client_label = match wait_until(&mut client_events, "client", |ev| {
+        matches!(ev, SessionEvent::Connected { .. })
+    })
+    .await
+    {
+        SessionEvent::Connected { peer } => peer,
+        _ => unreachable!(),
+    };
+
+    // TOFU confirmation on both ends; the host's NewConnection carries its
+    // own view of the peer label.
+    let host_label = match wait_until(&mut host_events, "host", awaiting_confirmation).await {
+        SessionEvent::NewConnection { peer_addr, .. } => peer_addr,
+        other => panic!("host expected NewConnection, got {other:?}"),
+    };
     wait_until(&mut client_events, "client", awaiting_confirmation).await;
     host_confirm.send(true).unwrap();
     client_confirm.send(true).unwrap();
@@ -128,11 +153,11 @@ async fn two_peers_pair_through_relay_and_exchange_a_message() {
     })
     .await;
 
-    // A message sent by the host arrives at the client, proving the relay
-    // forwarded the encrypted transport end to end.
+    // A message sent by the host arrives at the client, proving the selected
+    // transport carries the encrypted session end to end.
     host_out
         .send(ProtocolMessage::Text {
-            text: "relayed hello".to_string(),
+            text: "rendezvous hello".to_string(),
             timestamp: 1,
             seq: 1,
         })
@@ -147,11 +172,50 @@ async fn two_peers_pair_through_relay_and_exchange_a_message() {
     .await;
     match received {
         SessionEvent::MessageReceived(ProtocolMessage::Text { text, .. }) => {
-            assert_eq!(text, "relayed hello");
+            assert_eq!(text, "rendezvous hello");
         }
         _ => unreachable!(),
     }
 
     host_handle.abort();
     client_handle.abort();
+    (host_label, client_label)
+}
+
+// Each test runs on its own single-threaded runtime, so blocking that thread
+// on the std mutex cannot deadlock — the lock exists to serialize env access.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn two_peers_hole_punch_a_direct_session_via_the_rendezvous() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var(NO_HOLEPUNCH_ENV);
+
+    let (host_label, client_label) = pair_and_exchange().await;
+    assert!(
+        host_label.starts_with("p2p:"),
+        "host should see a punched direct peer, got {host_label}"
+    );
+    assert!(
+        client_label.starts_with("p2p:"),
+        "client should see a punched direct peer, got {client_label}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn two_peers_pair_through_the_bridged_relay_when_punching_is_disabled() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(NO_HOLEPUNCH_ENV, "1");
+
+    let (host_label, client_label) = pair_and_exchange().await;
+    std::env::remove_var(NO_HOLEPUNCH_ENV);
+
+    assert!(
+        host_label.starts_with("relay:"),
+        "host should be bridged, got {host_label}"
+    );
+    assert!(
+        client_label.starts_with("relay:"),
+        "client should be bridged, got {client_label}"
+    );
 }

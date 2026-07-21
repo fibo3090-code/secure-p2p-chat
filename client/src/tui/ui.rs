@@ -464,6 +464,7 @@ mod tests {
             TuiOverlay::FingerprintVerify {
                 fingerprint: "ab".repeat(32),
                 peer_name: "Peer".into(),
+                sas: "12-34-56 🐶 🐱 🦊".into(),
                 chat_id: Uuid::new_v4(),
             },
             TuiOverlay::Contacts,

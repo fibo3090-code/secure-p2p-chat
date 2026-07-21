@@ -206,10 +206,11 @@ pub(crate) fn pending_fingerprint(state: tauri::State<'_, Bridge>) -> Option<ser
         .lock()
         .unwrap()
         .clone()
-        .map(|(fingerprint, peer_name, chat_id)| {
+        .map(|(fingerprint, peer_name, sas, chat_id)| {
             serde_json::json!({
                 "fingerprint": fingerprint,
                 "peer_name": peer_name,
+                "sas": sas,
                 "chat_id": chat_id,
             })
         })
