@@ -2,7 +2,7 @@
 // wait for a peer (Host), or share/import an invite link (Invite).
 import { useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { Modal, Button, Input } from "./ui.jsx";
+import { Modal, Button, Input, PasswordInput } from "./ui.jsx";
 import { api } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
@@ -39,6 +39,9 @@ export function Creator({ open, onClose }) {
   const [hostToken, setHostToken] = useState("");
   const [myLink, setMyLink] = useState("");
   const [importLink, setImportLink] = useState("");
+  const [password, setPassword] = useState("");
+  const [hostAddr, setHostAddr] = useState(null);
+  const [nearby, setNearby] = useState(null);
   const [err, setErr] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -49,7 +52,33 @@ export function Creator({ open, onClose }) {
     }
   }, [open, mode, myLink]);
 
-  function reset() { setErr(""); setNote(""); setHostToken(""); }
+  // The UPnP external address can resolve up to ~15s after hosting starts;
+  // keep refreshing the shown addresses while the host pane is open.
+  useEffect(() => {
+    if (!open || !hostAddr) return;
+    const t = setInterval(async () => {
+      try { setHostAddr(await api.myAddresses()); } catch { /* keep last */ }
+    }, 3000);
+    return () => clearInterval(t);
+  }, [open, hostAddr !== null]);
+
+  // Nearby peers (mDNS) for the direct-connect pane, refreshed while it is
+  // open. Hidden entirely when the setting is off (nearby === null).
+  useEffect(() => {
+    if (!open || mode !== "connect" || transport !== "direct") return;
+    let live = true;
+    const tick = async () => {
+      try {
+        const r = await api.listDiscoveredPeers();
+        if (live) setNearby(r.enabled ? r.peers : null);
+      } catch { if (live) setNearby(null); }
+    };
+    tick();
+    const t = setInterval(tick, 2000);
+    return () => { live = false; clearInterval(t); };
+  }, [open, mode, transport]);
+
+  function reset() { setErr(""); setNote(""); setHostToken(""); setHostAddr(null); }
   function done(msg) { if (msg) { setNote(msg); } else onClose(); }
 
   // Single in-flight guard: each connect/host call creates a session in
@@ -69,14 +98,19 @@ export function Creator({ open, onClose }) {
     const h = i > -1 ? raw.slice(0, i) : raw;
     const p = i > -1 ? parseInt(raw.slice(i + 1), 10) || 12345 : 12345;
     await run(async () => {
-      try { await api.connectPeer(h, p); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(String(e)); }
+      try { await api.connectPeer(h, p, password.trim()); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(String(e)); }
     });
   }
   async function host() {
     reset();
     const p = parseInt(port, 10) || 12345;
     await run(async () => {
-      try { await api.startHost(p); toast(`Hosting on :${p} — waiting for a peer`, "success"); onClose(); } catch (e) { setErr(String(e)); }
+      try {
+        await api.startHost(p, password.trim());
+        toast(`Hosting on :${p} — waiting for a peer`, "success");
+        // Keep the dialog open and show the address to share.
+        try { setHostAddr(await api.myAddresses()); } catch { onClose(); }
+      } catch (e) { setErr(String(e)); }
     });
   }
   async function relayConnect() {
@@ -138,11 +172,28 @@ export function Creator({ open, onClose }) {
       {mode === "connect" && transport === "direct" && (
         <div className="creator-pane">
           <p className="creator-lead"><strong>Dial a peer</strong> who is hosting. You'll verify their fingerprint before any message is trusted.</p>
+          {nearby && nearby.length > 0 && (
+            <div className="creator-nearby">
+              <span className="creator-nearby-h"><Icon name="search" size={13} /> Nearby peers</span>
+              {nearby.map((p) => (
+                <button key={`${p.address}:${p.port}`} className="creator-nearby-row"
+                  onClick={() => setAddr(`${p.address}:${p.port}`)}>
+                  <span>{p.name}</span>
+                  <code>{p.address}:{p.port}</code>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="creator-row">
             <Input value={addr} autoFocus placeholder="192.168.1.20:12345"
               onChange={(e) => setAddr(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && connect()} />
             <Button icon="send" onClick={connect} disabled={busy}>Connect</Button>
+          </div>
+          <div className="creator-row">
+            <PasswordInput value={password} placeholder="Connection password (if the host set one)"
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && connect()} />
           </div>
         </div>
       )}
@@ -170,6 +221,22 @@ export function Creator({ open, onClose }) {
             <Input value={port} onChange={(e) => setPort(e.target.value)} style={{ maxWidth: 130 }} />
             <Button variant="ghost" icon="server" onClick={host} disabled={busy}>Start hosting</Button>
           </div>
+          <div className="creator-row">
+            <PasswordInput value={password} placeholder="Require a connection password (optional)"
+              onChange={(e) => setPassword(e.target.value)} />
+          </div>
+          {hostAddr && (
+            <>
+              <p className="creator-lead" style={{ marginTop: 10 }}><strong>Share this address</strong> with your peer:</p>
+              <CopyLine value={hostAddr.local || "address unavailable — share an invite link instead"} />
+              {hostAddr.external && (
+                <>
+                  <p className="creator-lead" style={{ marginTop: 6 }}>Reachable from the internet (UPnP):</p>
+                  <CopyLine value={hostAddr.external} />
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
 

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
+use messenger_core::network::{DiscoveredPeer, Discovery};
 use messenger_core::types::{Config, MessageContent, ToastLevel, TransferStatus};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
@@ -26,7 +27,12 @@ struct Bridge {
     /// Client-side Party/Community server connections (channels, members, DMs).
     /// State is ephemeral and re-fetched on join — the server holds durable history.
     party: Arc<Mutex<PartyManager>>,
-    identity: StdMutex<Identity>,
+    /// Shared with the poll loop, which needs the private key for auto-rehost.
+    identity: Arc<StdMutex<Identity>>,
+    /// mDNS browse/advertise handle, created lazily when `enable_mdns` is on.
+    discovery: Arc<StdMutex<Option<Discovery>>>,
+    /// Peers found on the local network (mDNS), refreshed on demand.
+    discovered: Arc<StdMutex<Vec<DiscoveredPeer>>>,
     history_path: PathBuf,
     /// Identity file (sibling of the history file).
     identity_path: PathBuf,
@@ -171,6 +177,8 @@ pub fn run() {
             commands::contacts::import_invite,
             commands::contacts::connect_contact,
             commands::connect::pending_fingerprint,
+            commands::connect::list_discovered_peers,
+            commands::connect::my_addresses,
             commands::party::party_join,
             commands::party::party_list,
             commands::party::party_history,
@@ -191,6 +199,7 @@ pub fn run() {
                 app.handle().clone(),
                 b.manager.clone(),
                 b.party.clone(),
+                b.identity.clone(),
                 b.history_path.clone(),
                 b.parties_path.clone(),
                 b.pending_fp.clone(),
@@ -260,7 +269,9 @@ fn init_bridge() -> Bridge {
     Bridge {
         manager,
         party: Arc::new(Mutex::new(PartyManager::new())),
-        identity: StdMutex::new(identity),
+        identity: Arc::new(StdMutex::new(identity)),
+        discovery: Arc::new(StdMutex::new(None)),
+        discovered: Arc::new(StdMutex::new(Vec::new())),
         history_path,
         identity_path,
         parties_path,
@@ -283,6 +294,7 @@ fn spawn_poll_loop(
     app: tauri::AppHandle,
     manager: Arc<Mutex<ChatManager>>,
     party: Arc<Mutex<PartyManager>>,
+    identity: Arc<StdMutex<Identity>>,
     history_path: PathBuf,
     parties_path: PathBuf,
     pending_fp: Arc<StdMutex<Option<(String, String, String)>>>,
@@ -293,6 +305,8 @@ fn spawn_poll_loop(
         // triggers a spurious write; only real changes (notably peer messages
         // arriving via poll_session_events) are persisted.
         let mut last_saved_sig: Option<u64> = None;
+        // Rate-limits the auto-rehost check (mirrors the egui app's 1.5s timer).
+        let mut last_rehost = std::time::Instant::now();
         // Servers already recorded as Joined, so the saved-communities file is
         // touched once per join (to fill in the server's display name), not every tick.
         let mut joined_recorded: std::collections::HashSet<Uuid> = Default::default();
@@ -321,6 +335,34 @@ fn spawn_poll_loop(
                                     fingerprint: conn.server_fingerprint.clone(),
                                 },
                             );
+                        }
+                    }
+                }
+            }
+            // Auto-rehost: with auto-host enabled, an accepted connection
+            // consumes the listening placeholder — without this, the app
+            // silently stops accepting new peers after the first one (the
+            // egui app has the same loop). No-op while the identity is
+            // locked (private key unavailable, config not loaded yet).
+            if last_rehost.elapsed() >= Duration::from_millis(1500) {
+                last_rehost = std::time::Instant::now();
+                let pk = {
+                    let id = identity.lock().unwrap();
+                    if id.is_locked() {
+                        None
+                    } else {
+                        id.private_key().ok()
+                    }
+                };
+                if let Some(pk) = pk {
+                    let mut m = manager.lock().await;
+                    if m.config.auto_host_on_startup && m.check_rehost_needed() {
+                        let port = m.config.listen_port;
+                        match m.start_host(port, pk).await {
+                            Ok(_) => {
+                                tracing::info!(port, "auto-rehosted after a consumed listener")
+                            }
+                            Err(e) => tracing::warn!("auto-rehost failed: {e}"),
                         }
                     }
                 }

@@ -318,6 +318,14 @@ input,textarea{font-family:inherit;color:inherit}
 .transfer-item.is-done .transfer-pct{color:var(--success)}
 .transfer-item.is-failed .transfer-fill,.transfer-item.is-cancelled .transfer-fill{background:var(--danger,#e5484d)}
 .transfer-offer{flex:1;display:flex;gap:8px;justify-content:flex-end}
+/* nearby (mDNS) peers in the connect pane */
+.creator-nearby{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.creator-nearby-h{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--dim)}
+.creator-nearby-row{display:flex;justify-content:space-between;align-items:center;gap:10px;
+  padding:7px 10px;border-radius:8px;background:var(--s1);border:1px solid var(--s3);
+  color:var(--txt);cursor:pointer;font-size:13px}
+.creator-nearby-row:hover{border-color:var(--accent)}
+.creator-nearby-row code{font-size:11.5px;color:var(--dim)}
 .transfer-item.is-awaiting .transfer-pct{color:var(--accent)}
 .transfer-item.is-failed .transfer-pct{color:var(--danger,#e5484d)}
 /* composer */

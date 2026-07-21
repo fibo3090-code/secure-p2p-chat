@@ -49,25 +49,28 @@ pub(crate) async fn unlock(
     Ok(())
 }
 
-/// Honor `auto_host_on_startup` once the identity is unlocked and history (with
-/// its persisted config) is loaded — "open the app and be reachable", matching
-/// the egui/TUI apps. Failures are logged, never fatal to the unlock.
+/// Honor `auto_host_on_startup` and `auto_connect` once the identity is
+/// unlocked and history (with its persisted config) is loaded — "open the app
+/// and be reachable / reconnected", matching the egui/TUI apps. Failures are
+/// logged, never fatal to the unlock.
 async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
-    if !mgr.config.auto_host_on_startup {
-        return;
-    }
-    let port = mgr.config.listen_port;
-    let pk = { state.identity.lock().unwrap().private_key() };
-    match pk {
-        Ok(pk) => {
-            if let Err(e) = mgr.start_host(port, pk).await {
-                tracing::warn!("auto-host on startup failed: {e}");
-            } else {
-                tracing::info!(port, "auto-hosting on startup");
-            }
+    let pk = match { state.identity.lock().unwrap().private_key() } {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!("auto-host/auto-connect skipped: no private key: {e}");
+            return;
         }
-        Err(e) => tracing::warn!("auto-host: no private key: {e}"),
+    };
+    if mgr.config.auto_host_on_startup {
+        let port = mgr.config.listen_port;
+        if let Err(e) = mgr.start_host(port, pk.clone()).await {
+            tracing::warn!("auto-host on startup failed: {e}");
+        } else {
+            tracing::info!(port, "auto-hosting on startup");
+        }
     }
+    // Self-gated on config.auto_connect; best-effort per contact.
+    mgr.auto_reconnect_contacts(&pk).await;
 }
 
 /// Set a password on a fresh / plaintext identity, persist it, and stay unlocked.
@@ -165,6 +168,8 @@ pub(crate) struct SettingsDto {
     listen_port: u16,
     enable_upnp: bool,
     auto_accept_files: bool,
+    auto_connect: bool,
+    enable_mdns: bool,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +180,8 @@ pub(crate) struct SettingsUpdate {
     listen_port: u16,
     enable_upnp: bool,
     auto_accept_files: bool,
+    auto_connect: bool,
+    enable_mdns: bool,
 }
 
 #[tauri::command]
@@ -189,6 +196,8 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         listen_port: mgr.config.listen_port,
         enable_upnp: mgr.config.enable_upnp,
         auto_accept_files: mgr.config.auto_accept_files,
+        auto_connect: mgr.config.auto_connect,
+        enable_mdns: mgr.config.enable_mdns,
     })
 }
 
@@ -211,6 +220,8 @@ pub(crate) async fn update_settings(
         mgr.config.listen_port = settings.listen_port;
         mgr.config.enable_upnp = settings.enable_upnp;
         mgr.config.auto_accept_files = settings.auto_accept_files;
+        mgr.config.auto_connect = settings.auto_connect;
+        mgr.config.enable_mdns = settings.enable_mdns;
     }
     persist_history(&state.manager, &state.history_path).await;
     Ok(())

@@ -27,8 +27,10 @@ const realApi = {
   getSettings: () => invoke("get_settings"),
   updateSettings: (settings) => invoke("update_settings", { settings }),
   pickDownloadDir: () => invoke("pick_download_dir"),
-  startHost: (port) => invoke("start_host", { port }),
-  connectPeer: (host, port) => invoke("connect_peer", { host, port }),
+  startHost: (port, password) => invoke("start_host", { port, password: password || null }),
+  connectPeer: (host, port, password) => invoke("connect_peer", { host, port, password: password || null }),
+  listDiscoveredPeers: () => invoke("list_discovered_peers"),
+  myAddresses: () => invoke("my_addresses"),
   hostViaRelay: (relay) => invoke("host_via_relay", { relay }),
   connectViaRelay: (relay, token) => invoke("connect_via_relay", { relay, token }),
   confirmFingerprint: (chatId, accept) => invoke("confirm_fingerprint", { id: chatId, accept }),
@@ -65,7 +67,7 @@ function makeMock() {
   const mockSettings = {
     download_dir: "~/Downloads", enable_notifications: true,
     enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
-    auto_accept_files: false,
+    auto_accept_files: false, auto_connect: false, enable_mdns: false,
   };
   const chats = {
     "11111111-1111-1111-1111-111111111111": {
@@ -140,6 +142,10 @@ function makeMock() {
     updateSettings: async (s) => { Object.assign(mockSettings, s); },
     pickDownloadDir: async () => { mockSettings.download_dir = "C:\\Users\\you\\Downloads"; return mockSettings.download_dir; },
     startHost: ok, connectPeer: ok, confirmFingerprint: ok,
+    listDiscoveredPeers: async () => (mockSettings.enable_mdns
+      ? { enabled: true, peers: [{ name: "laptop-alice", address: "192.168.1.21", port: 12345, fingerprint: "a1b2c3" }] }
+      : { enabled: false, peers: [] }),
+    myAddresses: async () => ({ hosting: true, local: "192.168.1.9:12345", external: null }),
     hostViaRelay: async () => "rly_" + Math.random().toString(36).slice(2, 10),
     connectViaRelay: ok,
     pendingFingerprint: async () => null,

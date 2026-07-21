@@ -52,6 +52,8 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
         listen_port: next.listen_port,
         enable_upnp: next.enable_upnp,
         auto_accept_files: next.auto_accept_files,
+        auto_connect: next.auto_connect,
+        enable_mdns: next.enable_mdns,
       });
     } catch (e) { toast(String(e), "error"); setS(s); }
   }
@@ -131,6 +133,10 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
                 on={s.auto_host_on_startup} onChange={(v) => apply({ auto_host_on_startup: v })} />
               <Toggle label="UPnP port mapping" hint="Ask the router to make the host reachable from the internet; the external address goes into your invite"
                 on={s.enable_upnp} onChange={(v) => apply({ enable_upnp: v })} />
+              <Toggle label="Reconnect contacts on startup" hint="Dial your saved contacts automatically after unlock"
+                on={s.auto_connect} onChange={(v) => apply({ auto_connect: v })} />
+              <Toggle label="LAN peer discovery (mDNS)" hint="Find nearby peers and advertise yourself on the local network — reveals your name and fingerprint on the LAN"
+                on={s.enable_mdns} onChange={(v) => apply({ enable_mdns: v })} />
               <div className="set-row">
                 <span className="set-row-txt">
                   <span className="set-row-label">Listening port</span>
