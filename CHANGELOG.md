@@ -141,8 +141,9 @@ Nothing yet.
   over the mock runtime's IPC — the same path the webview uses — covering the
   auth barrier (no command runs before unlock/set-password), the invoke-key
   contract with `bridge.js` (an argument-name mismatch now fails CI instead
-  of silently no-oping in production), settings round-trips, display-name
-  validation, conversation-lock semantics, TOFU confirmation guards, and the
+  of silently becoming a no-op in production), settings round-trips,
+  display-name validation, conversation-lock semantics, TOFU confirmation
+  guards, and the
   invite-link round-trip. The command registration moved into a shared
   `invoke_handler()` so tests and the shipping app can never register
   different command lists.
