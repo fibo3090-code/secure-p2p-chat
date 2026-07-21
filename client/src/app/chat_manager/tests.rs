@@ -80,6 +80,134 @@ fn host_auto_accepts_a_returning_known_fingerprint() {
 }
 
 #[test]
+fn blocked_contact_fingerprint_is_auto_rejected() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact("Mallory".into(), None, Some("BLOCKED-FP".into()), None);
+    mgr.block_contact(contact_id).unwrap();
+
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+    mgr.handle_tofu_verification(session_id, "BLOCKED-FP", "Mallory", "");
+
+    assert!(
+        mgr.fingerprint_verification_request.is_none(),
+        "a blocked fingerprint must not prompt the user"
+    );
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(false),
+        "a blocked fingerprint must be rejected automatically"
+    );
+}
+
+#[test]
+fn blocking_tears_down_the_live_session_completely() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact("Mallory".into(), None, Some("BLOCKED-FP".into()), None);
+
+    // Live session: chat with the blocked fingerprint, mapped to a session id
+    // with a handle, an event receiver, and a confirm sender.
+    let session_id = Uuid::new_v4();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Mallory".into());
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("BLOCKED-FP".into());
+    mgr.chat_id_mapping.insert(chat_id, session_id);
+    let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(4);
+    mgr.add_session_for_test(
+        session_id,
+        SessionHandle {
+            from_app_tx: app_tx,
+            file_tx,
+        },
+    );
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    mgr.session_events
+        .insert(session_id, Arc::new(Mutex::new(event_rx)));
+    let (confirm_tx, _confirm_rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, confirm_tx);
+
+    mgr.block_contact(contact_id).unwrap();
+
+    // Everything about the session must be gone: without this, the network
+    // task's events kept being polled and the blocked peer could still
+    // deliver messages on the established session.
+    assert!(!mgr.sessions.contains_key(&session_id));
+    assert!(!mgr.session_events.contains_key(&session_id));
+    assert!(!mgr.fingerprint_confirm_senders.contains_key(&session_id));
+    assert!(!mgr.chat_id_mapping.values().any(|v| *v == session_id));
+    // The dropped receiver is what ends the network task's loop.
+    assert!(event_tx.send(SessionEvent::Disconnected).is_err());
+}
+
+#[test]
+fn tofu_accept_promotes_contact_to_verified() {
+    let mut mgr = ChatManager::new(Config::default());
+    // Contact known by name but not yet verified, bound to the chat.
+    let contact_id = mgr.add_contact("Alice".into(), None, None, None);
+    let session_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(session_id, "Alice".into());
+    mgr.associate_contact_with_chat(contact_id, session_id);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+    mgr.handle_tofu_verification(session_id, "ALICE-FP", "Alice", "");
+    assert!(mgr.fingerprint_verification_request.is_some());
+
+    mgr.confirm_fingerprint(session_id, true).unwrap();
+
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.trust_state, TrustState::Verified);
+    assert_eq!(contact.fingerprint.as_deref(), Some("ALICE-FP"));
+}
+
+#[test]
+fn unblock_restores_verified_when_fingerprint_confirmed() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact("Bob".into(), None, Some("BOB-FP".into()), None);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Bob".into());
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("BOB-FP".into());
+
+    mgr.block_contact(contact_id).unwrap();
+    assert_eq!(
+        mgr.get_contact(contact_id).unwrap().trust_state,
+        TrustState::Blocked
+    );
+
+    mgr.unblock_contact(contact_id).unwrap();
+    assert_eq!(
+        mgr.get_contact(contact_id).unwrap().trust_state,
+        TrustState::Verified,
+        "confirmed fingerprint restores Verified after unblock"
+    );
+}
+
+#[tokio::test]
+async fn connect_to_blocked_contact_is_refused() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Mallory".into(),
+        Some("127.0.0.1:1".into()),
+        Some("BLOCKED-FP".into()),
+        None,
+    );
+    mgr.block_contact(contact_id).unwrap();
+
+    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let err = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .expect_err("connecting to a blocked contact must fail");
+    assert!(err.to_string().contains("blocked"));
+}
+
+#[test]
 fn parse_invite_with_valid_address_keeps_it() {
     let mgr = ChatManager::default();
 
@@ -1050,6 +1178,9 @@ fn sequential_incoming_files_do_not_reuse_completed_transfer_state() {
     let config = Config {
         download_dir: download_dir.clone(),
         temp_dir: temp_download_dir,
+        // This test covers the frictionless path; the acceptance gate has its
+        // own tests below.
+        auto_accept_files: true,
         ..Config::default()
     };
 
@@ -1131,6 +1262,259 @@ fn sequential_incoming_files_do_not_reuse_completed_transfer_state() {
         second_payload,
         "second file should keep its payload"
     );
+}
+
+/// Build a manager with the acceptance gate on (auto_accept_files = false)
+/// and feed it a complete incoming file (Meta + one chunk + End).
+fn manager_with_held_incoming_file(temp_dir: &std::path::Path) -> (ChatManager, Uuid, Vec<u8>) {
+    let config = Config {
+        download_dir: temp_dir.join("downloads"),
+        temp_dir: temp_dir.join("temp"),
+        auto_accept_files: false,
+        ..Config::default()
+    };
+    let mut mgr = ChatManager::new(config);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Gated Files".to_string());
+
+    let payload = b"held until accepted".to_vec();
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "offer.txt".to_string(),
+            size: payload.len() as u64,
+            seq: 1,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: payload.clone(),
+            seq: 2,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+    );
+    (mgr, chat_id, payload)
+}
+
+#[test]
+fn incoming_file_is_held_until_accepted() {
+    let temp_dir = tempdir().unwrap();
+    let (mut mgr, chat_id, payload) = manager_with_held_incoming_file(temp_dir.path());
+
+    // Fully streamed, but not accepted: no chat message, no file in downloads,
+    // transfer still awaiting.
+    let transfers = mgr.active_transfers_snapshot();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].status, TransferStatus::AwaitingAcceptance);
+    assert!(
+        !mgr.chats
+            .get(&chat_id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| { matches!(m.content, MessageContent::File { .. }) }),
+        "no file message before acceptance"
+    );
+    assert!(
+        !temp_dir.path().join("downloads").join("offer.txt").exists(),
+        "file must not land in downloads before acceptance"
+    );
+
+    // Accept → finalized into downloads + recorded in the chat.
+    mgr.accept_incoming_file(transfers[0].id).unwrap();
+    let final_path = temp_dir.path().join("downloads").join("offer.txt");
+    assert_eq!(std::fs::read(&final_path).unwrap(), payload);
+    assert!(mgr.chats.get(&chat_id).unwrap().messages.iter().any(|m| {
+        matches!(&m.content, MessageContent::File { filename, .. } if filename == "offer.txt")
+    }));
+    assert!(mgr.active_transfers.is_empty());
+    assert!(mgr.incoming_files.is_empty());
+}
+
+#[test]
+fn declined_incoming_file_is_deleted_and_discarded() {
+    let temp_dir = tempdir().unwrap();
+    let (mut mgr, chat_id, _payload) = manager_with_held_incoming_file(temp_dir.path());
+
+    let transfer_id = mgr.active_transfers_snapshot()[0].id;
+    mgr.reject_incoming_file(transfer_id).unwrap();
+
+    // Spool deleted, nothing in downloads, no chat message, status cancelled.
+    assert!(mgr.incoming_files.is_empty());
+    let downloads = temp_dir.path().join("downloads");
+    let spooled: Vec<_> = std::fs::read_dir(&downloads)
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        spooled.is_empty(),
+        "declined transfer must leave nothing on disk, found: {:?}",
+        spooled
+    );
+    assert!(!mgr
+        .chats
+        .get(&chat_id)
+        .unwrap()
+        .messages
+        .iter()
+        .any(|m| { matches!(m.content, MessageContent::File { .. }) }));
+    assert_eq!(
+        mgr.active_transfers_snapshot()[0].status,
+        TransferStatus::Cancelled
+    );
+
+    // Late chunks for the declined transfer are discarded (no new spool file).
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: b"late".to_vec(),
+            seq: 4,
+        }),
+    );
+    assert!(mgr.incoming_files.is_empty());
+
+    // Double-decline / accept-after-decline are rejected cleanly.
+    assert!(mgr.reject_incoming_file(transfer_id).is_err());
+    assert!(mgr.accept_incoming_file(transfer_id).is_err());
+
+    // A fresh offer afterwards works (cancelled state is cleared).
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "second.txt".to_string(),
+            size: 4,
+            seq: 5,
+        }),
+    );
+    assert_eq!(
+        mgr.active_transfers_snapshot()
+            .iter()
+            .filter(|t| t.status == TransferStatus::AwaitingAcceptance)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn accept_before_file_end_continues_transfer() {
+    let temp_dir = tempdir().unwrap();
+    let config = Config {
+        download_dir: temp_dir.path().join("downloads"),
+        temp_dir: temp_dir.path().join("temp"),
+        auto_accept_files: false,
+        ..Config::default()
+    };
+    let mut mgr = ChatManager::new(config);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Early Accept".to_string());
+
+    let payload = b"accepted mid-stream";
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "early.txt".to_string(),
+            size: payload.len() as u64,
+            seq: 1,
+        }),
+    );
+
+    // Accept while the stream is still going.
+    let transfer_id = mgr.active_transfers_snapshot()[0].id;
+    mgr.accept_incoming_file(transfer_id).unwrap();
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: payload.to_vec(),
+            seq: 2,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+    );
+
+    let final_path = temp_dir.path().join("downloads").join("early.txt");
+    assert_eq!(std::fs::read(&final_path).unwrap(), payload.to_vec());
+    assert!(mgr.active_transfers.is_empty());
+}
+
+#[test]
+fn sent_text_is_marked_delivered_by_peer_ack() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Receipts".to_string());
+    let (tx, mut _rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(4);
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: tx,
+            file_tx,
+        },
+    );
+
+    mgr.send_message(chat_id, "hello".to_string()).unwrap();
+    let msg_id = mgr.chats.get(&chat_id).unwrap().messages[0].id;
+    assert!(!mgr.chats.get(&chat_id).unwrap().messages[0].delivered);
+
+    // The session loop reports the wire seq it stamped on the frame…
+    mgr.handle_session_event(chat_id, SessionEvent::TextSendComplete { seq: 7 });
+    // …and the peer acknowledges that seq.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Ack {
+            acked_seq: 7,
+            seq: 1,
+        }),
+    );
+
+    let msg = &mgr.chats.get(&chat_id).unwrap().messages[0];
+    assert_eq!(msg.id, msg_id);
+    assert!(msg.delivered, "peer ack must mark the message delivered");
+
+    // A replayed/duplicate ack is harmless.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Ack {
+            acked_seq: 7,
+            seq: 2,
+        }),
+    );
+    assert!(mgr.chats.get(&chat_id).unwrap().messages[0].delivered);
+}
+
+#[test]
+fn received_text_queues_a_delivery_receipt() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Receipts".to_string());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(4);
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: tx,
+            file_tx,
+        },
+    );
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Text {
+            text: "hi".to_string(),
+            timestamp: 1,
+            seq: 5,
+        }),
+    );
+
+    match rx.try_recv() {
+        Ok(ProtocolMessage::Ack { acked_seq, .. }) => assert_eq!(acked_seq, 5),
+        other => panic!("expected a queued Ack for seq 5, got {:?}", other),
+    }
 }
 
 #[test]

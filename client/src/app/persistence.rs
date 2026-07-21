@@ -443,6 +443,7 @@ mod tests {
                         text: "Secret message".to_string(),
                     },
                     timestamp: chrono::Utc::now(),
+                    delivered: false,
                 }],
                 created_at: chrono::Utc::now(),
                 peer_typing: false,

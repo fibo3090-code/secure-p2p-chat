@@ -1,7 +1,7 @@
 //! Chat management and application state orchestration.
 //!
 //! Provides the `ChatManager` which coordinates:
-//! - Contacts and chats lifecycle (create, rename, group chats)
+//! - Contacts and chats lifecycle (create, rename, trust)
 //! - Network sessions and event handling (`SessionEvent`)
 //! - Message routing and typing indicators
 //! - File transfer state and toasts/notifications
@@ -107,15 +107,28 @@ pub struct ChatManager {
     active_transfers: HashMap<Uuid, FileTransferState>,
     /// Outgoing files queued on a session but whose final frame has not hit the
     /// wire yet (FIFO per session; resolved by `SessionEvent::FileSendComplete`).
-    /// Each entry is `(filename, transfer_id)` so completion maps back to its
-    /// tracked transfer.
-    pending_file_sends: HashMap<Uuid, VecDeque<(String, Uuid)>>,
+    /// Each entry is `(filename, transfer_id, chat_id, message_id)` so the
+    /// completion can map back to its tracked transfer AND register the file
+    /// message for a delivery receipt.
+    pending_file_sends: HashMap<Uuid, VecDeque<(String, Uuid, Uuid, Uuid)>>,
+    /// Outgoing text messages queued on a session but whose frame has not hit
+    /// the wire yet (FIFO per session; resolved by `TextSendComplete`).
+    /// Entries are `(chat_id, message_id)`.
+    pending_text_sends: HashMap<Uuid, VecDeque<(Uuid, Uuid)>>,
+    /// Sent messages waiting for the peer's delivery receipt, keyed by
+    /// `(session_id, wire seq)` → `(chat_id, message_id)`.
+    awaiting_ack: HashMap<(Uuid, u64), (Uuid, Uuid)>,
     /// Live handles for in-flight outgoing transfers, keyed by transfer id.
     /// The streaming task reports bytes sent via `progress` and stops when
     /// `cancel` is set; the poll loop mirrors both into `active_transfers`.
     outgoing_transfers: HashMap<Uuid, OutgoingTransfer>,
     #[allow(dead_code)] // Reserved for future file transfer implementation
     incoming_files: HashMap<Uuid, IncomingFileSync>,
+    /// Incoming transfers whose `FileEnd` arrived while still awaiting the
+    /// user's acceptance: the spooled file is complete and held (with the
+    /// FileEnd's wire seq, for the delivery receipt) until the user accepts
+    /// (finalize) or declines (delete).
+    pending_file_end: HashMap<Uuid, u64>,
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
@@ -124,6 +137,10 @@ pub struct ChatManager {
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
+    /// The port the live listener actually bound (which can differ from
+    /// `config.listen_port` when the user typed another one in the Host
+    /// dialog). This is what "share this address" displays must use.
+    pub hosting_port: Option<u16>,
     /// Optional P2P connection password: required from peers when hosting, and
     /// supplied to the host when connecting. Verified inside the encrypted tunnel.
     pub connection_password: Option<String>,
@@ -152,8 +169,11 @@ impl ChatManager {
             chat_id_mapping: HashMap::new(),
             active_transfers: HashMap::new(),
             pending_file_sends: HashMap::new(),
+            pending_text_sends: HashMap::new(),
+            awaiting_ack: HashMap::new(),
             outgoing_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
+            pending_file_end: HashMap::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
@@ -161,6 +181,7 @@ impl ChatManager {
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
             is_hosting: false,
+            hosting_port: None,
             connection_password: None,
             conversation_locked: false,
             external_address: None,
@@ -204,6 +225,7 @@ impl ChatManager {
     /// Stop hosting (user action).
     pub fn stop_hosting(&mut self) {
         self.is_hosting = false;
+        self.hosting_port = None;
         // Cancel the UPnP renewal task (it unmaps the router port on drop) and
         // forget the external address so invites revert to the LAN address.
         self.upnp_cancel = None;
@@ -363,6 +385,19 @@ impl ChatManager {
         self.active_transfers.values().cloned().collect()
     }
 
+    /// Queue a delivery receipt on the session serving `chat_id`, acknowledging
+    /// the peer's frame with wire seq `acked_seq`. Best-effort: no session, no
+    /// receipt (the peer's message simply stays unmarked on their side). The
+    /// frame's own seq is stamped by the session loop like every message.
+    pub(crate) fn send_ack_for_chat(&self, chat_id: Uuid, acked_seq: u64) {
+        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        if let Some(session) = self.sessions.get(&session_id) {
+            let _ = session
+                .from_app_tx
+                .send(ProtocolMessage::Ack { acked_seq, seq: 0 });
+        }
+    }
+
     /// Transfers sorted by id, so an index-based selection (the TUI overlay) is
     /// stable across polls even though the backing map is unordered.
     pub fn active_transfers_sorted(&self) -> Vec<FileTransferState> {
@@ -406,6 +441,9 @@ impl ChatManager {
         self.pending_file_sends.clear();
         self.active_transfers.clear();
         self.incoming_files.clear();
+        self.pending_file_end.clear();
+        self.pending_text_sends.clear();
+        self.awaiting_ack.clear();
         self.incoming_text_messages.clear();
         self.toasts.clear();
         self.fingerprint_verification_request = None;

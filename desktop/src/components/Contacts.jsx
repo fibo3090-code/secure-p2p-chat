@@ -25,6 +25,19 @@ export function Contacts({ onConnected }) {
     try { await api.connectContact(id); onConnected && onConnected(); }
     catch (e) { setErr(String(e)); }
   }
+  async function toggleBlock(c) {
+    setErr("");
+    try {
+      if (c.trust === "blocked") await api.unblockContact(c.id);
+      else await api.blockContact(c.id);
+      load();
+    } catch (e) { setErr(String(e)); }
+  }
+  async function remove(id) {
+    setErr("");
+    try { await api.removeContact(id); load(); }
+    catch (e) { setErr(String(e)); }
+  }
 
   return (
     <div className="chat-pane">
@@ -69,8 +82,12 @@ export function Contacts({ onConnected }) {
                   {c.address ? "ready" : "missing address"}
                 </span>
                 <div className="contact-card-actions">
-                  <IconButton name="send" label="Connect" onClick={() => connect(c.id)} disabled={!c.address} />
+                  <IconButton name="send" label="Connect" onClick={() => connect(c.id)}
+                    disabled={!c.address || c.trust === "blocked"} />
                   <IconButton name="copy" label="Copy fingerprint" onClick={() => navigator.clipboard?.writeText(c.fingerprint || "")} />
+                  <IconButton name={c.trust === "blocked" ? "check" : "x"}
+                    label={c.trust === "blocked" ? "Unblock" : "Block"} onClick={() => toggleBlock(c)} />
+                  <IconButton name="trash" label="Delete contact" onClick={() => remove(c.id)} />
                 </div>
               </div>
             </div>

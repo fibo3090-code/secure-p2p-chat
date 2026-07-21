@@ -144,6 +144,7 @@ Runtime messages include:
 - `TypingStart`
 - `TypingStop`
 - `Rekey`
+- `Ack`
 
 ## Replay Protection
 
@@ -165,6 +166,22 @@ reassembled by the receiver into one logical message. A single message is
 hard-capped at `MAX_TEXT_MESSAGE_BYTES` (64 KiB); encoding or decoding a larger one
 is rejected. Each chunk carries its own `seq`, so replay protection covers chunks
 exactly like file chunks.
+
+## Delivery receipts
+
+`Ack { acked_seq, seq }` acknowledges that the frame the peer sent with
+transport sequence `acked_seq` was received and processed: a text message
+recorded in history (the single `Text` frame, or the final `TextChunk` of a
+large one), or a file finalized on disk (`FileEnd` — for a gated transfer the
+receipt is sent only when the user accepts it). The sender correlates the
+receipt via the wire seq its session loop stamped on the outgoing frame and
+marks the message `delivered`.
+
+`Ack` carries its own `seq` and shares the session sequence namespace, so it
+is replay-protected like every other frame. Peers that predate the variant
+drop the unknown tag; since replay validation only requires strictly
+increasing sequences (gaps are fine), interoperability is unaffected — the
+sender's messages simply never show as delivered.
 
 ## Rekeying
 

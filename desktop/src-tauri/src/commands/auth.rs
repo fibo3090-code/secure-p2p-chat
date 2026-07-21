@@ -49,25 +49,29 @@ pub(crate) async fn unlock(
     Ok(())
 }
 
-/// Honor `auto_host_on_startup` once the identity is unlocked and history (with
-/// its persisted config) is loaded — "open the app and be reachable", matching
-/// the egui/TUI apps. Failures are logged, never fatal to the unlock.
+/// Honor `auto_host_on_startup` and `auto_connect` once the identity is
+/// unlocked and history (with its persisted config) is loaded — "open the app
+/// and be reachable / reconnected", matching the egui/TUI apps. Failures are
+/// logged, never fatal to the unlock.
 async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
-    if !mgr.config.auto_host_on_startup {
-        return;
-    }
-    let port = mgr.config.listen_port;
-    let pk = { state.identity.lock().unwrap().private_key() };
-    match pk {
-        Ok(pk) => {
-            if let Err(e) = mgr.start_host(port, pk).await {
-                tracing::warn!("auto-host on startup failed: {e}");
-            } else {
-                tracing::info!(port, "auto-hosting on startup");
-            }
+    let pk_result = state.identity.lock().unwrap().private_key();
+    let pk = match pk_result {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!("auto-host/auto-connect skipped: no private key: {e}");
+            return;
         }
-        Err(e) => tracing::warn!("auto-host: no private key: {e}"),
+    };
+    if mgr.config.auto_host_on_startup {
+        let port = mgr.config.listen_port;
+        if let Err(e) = mgr.start_host(port, pk.clone()).await {
+            tracing::warn!("auto-host on startup failed: {e}");
+        } else {
+            tracing::info!(port, "auto-hosting on startup");
+        }
     }
+    // Self-gated on config.auto_connect; best-effort per contact.
+    mgr.auto_reconnect_contacts(&pk).await;
 }
 
 /// Set a password on a fresh / plaintext identity, persist it, and stay unlocked.
@@ -105,6 +109,53 @@ pub(crate) fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
     auth_status(state)
 }
 
+/// Change the identity's display name (used in invite links and the UI) and
+/// persist it. The key material and fingerprint are untouched.
+#[tauri::command]
+pub(crate) fn set_display_name(
+    name: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<AuthStatus, String> {
+    ensure_ready(&state)?;
+    {
+        let mut id = state.identity.lock().unwrap();
+        id.set_name(&name).map_err(|e| e.to_string())?;
+        id.save(&state.identity_save_path())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(auth_status(state))
+}
+
+/// Export a backup copy of the encrypted identity file (identity.json) to a
+/// user-chosen location. The file is already encrypted at rest (Argon2 +
+/// ChaCha20-Poly1305), so the copy is as safe as the original — but it IS the
+/// identity: losing it (and the password) means losing the account.
+/// Returns the destination path, or None if the dialog was cancelled.
+#[tauri::command]
+pub(crate) async fn export_identity(
+    state: tauri::State<'_, Bridge>,
+) -> Result<Option<String>, String> {
+    ensure_ready(&state)?;
+    let source = state.identity_save_path();
+    if !source.exists() {
+        return Err("No identity file to back up yet".to_string());
+    }
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_file_name("p2pem-identity-backup.json")
+            .save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(dest) = picked else {
+        return Ok(None); // cancelled
+    };
+    tokio::fs::copy(&source, &dest)
+        .await
+        .map_err(|e| format!("Backup failed: {e}"))?;
+    Ok(Some(dest.display().to_string()))
+}
+
 /// The user-facing settings the desktop app exposes. Only fields the core
 /// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
 /// `download_dir` and typing/notification switches are read by `ChatManager`,
@@ -117,6 +168,9 @@ pub(crate) struct SettingsDto {
     auto_host_on_startup: bool,
     listen_port: u16,
     enable_upnp: bool,
+    auto_accept_files: bool,
+    auto_connect: bool,
+    enable_mdns: bool,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +180,9 @@ pub(crate) struct SettingsUpdate {
     auto_host_on_startup: bool,
     listen_port: u16,
     enable_upnp: bool,
+    auto_accept_files: bool,
+    auto_connect: bool,
+    enable_mdns: bool,
 }
 
 #[tauri::command]
@@ -139,6 +196,9 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         auto_host_on_startup: mgr.config.auto_host_on_startup,
         listen_port: mgr.config.listen_port,
         enable_upnp: mgr.config.enable_upnp,
+        auto_accept_files: mgr.config.auto_accept_files,
+        auto_connect: mgr.config.auto_connect,
+        enable_mdns: mgr.config.enable_mdns,
     })
 }
 
@@ -160,6 +220,9 @@ pub(crate) async fn update_settings(
         mgr.config.auto_host_on_startup = settings.auto_host_on_startup;
         mgr.config.listen_port = settings.listen_port;
         mgr.config.enable_upnp = settings.enable_upnp;
+        mgr.config.auto_accept_files = settings.auto_accept_files;
+        mgr.config.auto_connect = settings.auto_connect;
+        mgr.config.enable_mdns = settings.enable_mdns;
     }
     persist_history(&state.manager, &state.history_path).await;
     Ok(())

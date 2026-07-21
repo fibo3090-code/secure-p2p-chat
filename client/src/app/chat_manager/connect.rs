@@ -7,7 +7,7 @@ impl ChatManager {
     /// Send the user's accept/reject decision for a fingerprint verification to the session task
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");
-        if let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id) {
+        if self.fingerprint_confirm_senders.contains_key(&chat_id) {
             // If the user accepted and we have a pending verification request matching this chat,
             // persist the fingerprint in the chat record before confirming the session.
             if accept {
@@ -35,12 +35,19 @@ impl ChatManager {
                             );
                             chat.peer_fingerprint = Some(fp.clone());
                         }
+                        // A user-confirmed fingerprint also verifies the
+                        // matching contact.
+                        self.promote_contact_verified(target_chat_id, &fp);
                         // Clear the pending request now that we've stored it
                         self.fingerprint_verification_request = None;
                     }
                 }
             }
 
+            let tx = self
+                .fingerprint_confirm_senders
+                .get(&chat_id)
+                .expect("checked above");
             tx.send(accept)
                 .map_err(|e| anyhow::anyhow!("Failed to send confirmation: {}", e))?;
             Ok(())
@@ -136,6 +143,7 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
         self.is_hosting = true;
+        self.hosting_port = Some(port);
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 
@@ -451,6 +459,12 @@ impl ChatManager {
             .get(&contact_id)
             .ok_or_else(|| anyhow::anyhow!("Contact not found"))?
             .clone();
+        if contact.trust_state == TrustState::Blocked {
+            bail!(
+                "{} is blocked — unblock the contact to reconnect",
+                contact.name
+            );
+        }
         // Direct-connect candidates in priority order (multi-address invites:
         // e.g. internet-reachable first, LAN second). Unparsable entries are
         // dropped rather than aborting, so a stale candidate can't block the

@@ -317,6 +317,16 @@ input,textarea{font-family:inherit;color:inherit}
 .transfer-item.is-done .transfer-fill{background:var(--success)}
 .transfer-item.is-done .transfer-pct{color:var(--success)}
 .transfer-item.is-failed .transfer-fill,.transfer-item.is-cancelled .transfer-fill{background:var(--danger,#e5484d)}
+.transfer-offer{flex:1;display:flex;gap:8px;justify-content:flex-end}
+/* nearby (mDNS) peers in the connect pane */
+.creator-nearby{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.creator-nearby-h{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--dim)}
+.creator-nearby-row{display:flex;justify-content:space-between;align-items:center;gap:10px;
+  padding:7px 10px;border-radius:8px;background:var(--s1);border:1px solid var(--s3);
+  color:var(--txt);cursor:pointer;font-size:13px}
+.creator-nearby-row:hover{border-color:var(--accent)}
+.creator-nearby-row code{font-size:11.5px;color:var(--dim)}
+.transfer-item.is-awaiting .transfer-pct{color:var(--accent)}
 .transfer-item.is-failed .transfer-pct{color:var(--danger,#e5484d)}
 .transfer-cancel{flex:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
   padding:0;border:none;border-radius:5px;background:transparent;color:var(--faint);cursor:pointer}
@@ -345,6 +355,8 @@ input,textarea{font-family:inherit;color:inherit}
   border-color:color-mix(in oklab,var(--warning) 28%,transparent)}
 .trust-party{color:var(--accent);background:color-mix(in oklab,var(--accent) 13%,transparent);
   border-color:color-mix(in oklab,var(--accent) 26%,transparent)}
+.trust-blocked{color:var(--danger,#e5484d);background:color-mix(in oklab,var(--danger,#e5484d) 13%,transparent);
+  border-color:color-mix(in oklab,var(--danger,#e5484d) 28%,transparent)}
 /* transport badge — how bytes travel (direct / relay / server) + kind chip */
 .transport-badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
   padding:3px 8px;border-radius:30px;border:1px solid transparent;color:var(--dim);
@@ -489,6 +501,10 @@ input,textarea{font-family:inherit;color:inherit}
 .set-id-l{display:flex;align-items:center;gap:12px}
 .set-id-ic{display:grid;place-items:center;width:40px;height:40px;border-radius:var(--r-sm);background:var(--s3);color:var(--accent)}
 .set-id-name{font-family:var(--display);font-weight:700;font-size:14px}
+.set-id-name-input{font-family:var(--display);font-weight:700;font-size:14px;color:var(--txt);
+  background:transparent;border:1px solid transparent;border-radius:6px;padding:2px 6px;margin-left:-7px;max-width:260px}
+.set-id-name-input:hover{border-color:var(--s3)}
+.set-id-name-input:focus{outline:none;border-color:var(--accent);background:var(--s1)}
 .set-id-fp{display:block;font-size:11.5px;color:var(--dim);margin-top:2px}
 .set-warn{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--warning);padding:10px 0}
 .set-warn svg{flex:none}

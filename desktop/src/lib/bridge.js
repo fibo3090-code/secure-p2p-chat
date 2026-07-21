@@ -15,17 +15,23 @@ const realApi = {
   authStatus: () => invoke("auth_status"),
   unlock: (password) => invoke("unlock", { password }),
   setPassword: (password) => invoke("set_password", { password }),
+  setDisplayName: (name) => invoke("set_display_name", { name }),
+  exportIdentity: () => invoke("export_identity"),
   listConversations: () => invoke("list_conversations"),
   getConversation: (id) => invoke("get_conversation", { id }),
   sendMessage: (id, text) => invoke("send_message", { id, text }),
   sendFile: (id) => invoke("send_file", { id }),
   listTransfers: () => invoke("list_transfers"),
+  acceptTransfer: (id) => invoke("accept_transfer", { id }),
+  declineTransfer: (id) => invoke("decline_transfer", { id }),
   cancelTransfer: (id) => invoke("cancel_transfer", { id }),
   getSettings: () => invoke("get_settings"),
   updateSettings: (settings) => invoke("update_settings", { settings }),
   pickDownloadDir: () => invoke("pick_download_dir"),
-  startHost: (port) => invoke("start_host", { port }),
-  connectPeer: (host, port) => invoke("connect_peer", { host, port }),
+  startHost: (port, password) => invoke("start_host", { port, password: password || null }),
+  connectPeer: (host, port, password) => invoke("connect_peer", { host, port, password: password || null }),
+  listDiscoveredPeers: () => invoke("list_discovered_peers"),
+  myAddresses: () => invoke("my_addresses"),
   hostViaRelay: (relay) => invoke("host_via_relay", { relay }),
   connectViaRelay: (relay, token) => invoke("connect_via_relay", { relay, token }),
   confirmFingerprint: (chatId, accept) => invoke("confirm_fingerprint", { id: chatId, accept }),
@@ -33,6 +39,9 @@ const realApi = {
   renameChat: (id, title) => invoke("rename_chat", { id, title }),
   deleteChat: (id) => invoke("delete_chat", { id }),
   listContacts: () => invoke("list_contacts"),
+  removeContact: (id) => invoke("remove_contact", { id }),
+  blockContact: (id) => invoke("block_contact", { id }),
+  unblockContact: (id) => invoke("unblock_contact", { id }),
   myInviteLink: () => invoke("my_invite_link"),
   importInvite: (link) => invoke("import_invite", { link }),
   connectContact: (id) => invoke("connect_contact", { id }),
@@ -59,6 +68,7 @@ function makeMock() {
   const mockSettings = {
     download_dir: "~/Downloads", enable_notifications: true,
     enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
+    auto_accept_files: false, auto_connect: false, enable_mdns: false,
   };
   const chats = {
     "11111111-1111-1111-1111-111111111111": {
@@ -120,22 +130,33 @@ function makeMock() {
     authStatus: async () => ({ state: authState, name: "Maya", fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
     unlock: async () => { authState = "ready"; },
     setPassword: async () => { authState = "ready"; },
+    setDisplayName: async (name) => ({ state: authState, name, fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
+    exportIdentity: async () => "C:\\Users\\you\\p2pem-identity-backup.json",
     listConversations: async () => summaries(),
     getConversation: async (id) => chats[id],
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000 }, timestamp: new Date().toISOString() }); },
     listTransfers: async () => [],
-    cancelTransfer: async () => {},
+    acceptTransfer: async (_id) => {},
+    declineTransfer: async (_id) => {},
+    cancelTransfer: async (_id) => {},
     getSettings: async () => mockSettings,
     updateSettings: async (s) => { Object.assign(mockSettings, s); },
     pickDownloadDir: async () => { mockSettings.download_dir = "C:\\Users\\you\\Downloads"; return mockSettings.download_dir; },
     startHost: ok, connectPeer: ok, confirmFingerprint: ok,
+    listDiscoveredPeers: async () => (mockSettings.enable_mdns
+      ? { enabled: true, peers: [{ name: "laptop-alice", address: "192.168.1.21", port: 12345, fingerprint: "a1b2c3" }] }
+      : { enabled: false, peers: [] }),
+    myAddresses: async () => ({ hosting: true, local: "192.168.1.9:12345", external: null }),
     hostViaRelay: async () => "rly_" + Math.random().toString(36).slice(2, 10),
     connectViaRelay: ok,
     pendingFingerprint: async () => null,
     renameChat: async (id, title) => { if (chats[id]) chats[id].title = title; },
     deleteChat: async (id) => { delete chats[id]; },
     listContacts: async () => contacts,
+    removeContact: async (id) => { const i = contacts.findIndex((c) => c.id === id); if (i > -1) contacts.splice(i, 1); },
+    blockContact: async (id) => { const c = contacts.find((x) => x.id === id); if (c) c.trust = "blocked"; },
+    unblockContact: async (id) => { const c = contacts.find((x) => x.id === id); if (c) c.trust = "unverified"; },
     myInviteLink: async () => "chat-p2p://invite/eyJuYW1lIjoiTWF5YSIsImFkZHJlc3MiOiIxOTIuMTY4LjEuOToxMjM0NSJ9",
     importInvite: async () => ({ id: "c3", name: "Imported", fingerprint: "abc", address: "1.2.3.4:12345", trust: "unverified" }),
     connectContact: ok,
@@ -180,7 +201,6 @@ function msgText(c) {
   if (!c) return "";
   if (c.type === "text") return c.text;
   if (c.type === "file") return c.filename;
-  if (c.type === "Edited") return c.new_text;
   return c.text || "";
 }
 
@@ -231,9 +251,9 @@ export function chatToContact(chat, connected) {
     messages: (chat.messages || []).map((m) => {
       const c = m.content || {};
       if (c.type === "file") {
-        return { kind: "file", from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp) };
+        return { kind: "file", from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), delivered: !!m.delivered };
       }
-      return { from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp) };
+      return { from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp), delivered: !!m.delivered };
     }),
   };
 }

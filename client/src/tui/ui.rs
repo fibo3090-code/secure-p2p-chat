@@ -211,13 +211,16 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         } else {
             ("Peer ", Color::Green)
         };
-        let content = match &msg.content {
+        let mut content = match &msg.content {
             MessageContent::Text { text } => text.clone(),
             MessageContent::File { filename, size, .. } => {
                 format!("📎 {} ({})", filename, crate::util::format_size(*size))
             }
-            MessageContent::Edited { .. } => "[edited]".to_string(),
         };
+        // Delivery receipt: the peer acknowledged this sent message.
+        if msg.from_me && msg.delivered {
+            content.push_str(" ✓");
+        }
         plain_texts.push(format!("{}{}{}", ts, prefix, content));
         lines.push(Line::from(vec![
             Span::styled(ts, Style::default().fg(Color::DarkGray)),

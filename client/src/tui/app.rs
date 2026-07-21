@@ -1333,6 +1333,78 @@ impl TuiApp {
                 }
             }
             TuiCommand::Transfers => self.overlay = TuiOverlay::Transfers,
+            TuiCommand::AcceptFile | TuiCommand::DeclineFile => {
+                let accept = matches!(cmd, TuiCommand::AcceptFile);
+                // Prefer an offer in the selected chat, else take any pending one.
+                let selected = self.selected_chat_id();
+                let mut offers: Vec<_> = self
+                    .chat_manager
+                    .active_transfers_snapshot()
+                    .into_iter()
+                    .filter(|t| t.status == crate::types::TransferStatus::AwaitingAcceptance)
+                    .collect();
+                offers.sort_by_key(|t| Some(t.chat_id) != selected);
+                match offers.first() {
+                    Some(t) => {
+                        let result = if accept {
+                            self.chat_manager.accept_incoming_file(t.id)
+                        } else {
+                            self.chat_manager.reject_incoming_file(t.id)
+                        };
+                        if let Err(e) = result {
+                            self.toast(ToastLevel::Error, format!("File offer: {}", e));
+                        }
+                    }
+                    None => self.toast(
+                        ToastLevel::Warning,
+                        "No incoming file is awaiting approval".to_string(),
+                    ),
+                }
+            }
+
+            TuiCommand::Name(name) => match self.identity.set_name(&name) {
+                Ok(()) => match self.identity.save(&self.identity_path) {
+                    Ok(()) => {
+                        // The identity overlay renders this cached copy.
+                        self.identity_name = self.identity.name.clone();
+                        self.toast(
+                            ToastLevel::Success,
+                            format!("Display name changed to {}", self.identity.name),
+                        )
+                    }
+                    Err(e) => {
+                        self.toast(ToastLevel::Error, format!("Failed to save identity: {}", e))
+                    }
+                },
+                Err(e) => self.toast(ToastLevel::Error, format!("Invalid name: {}", e)),
+            },
+
+            TuiCommand::Backup(dest) => {
+                let source = self.identity_path.clone();
+                if !self.identity.is_encrypted() {
+                    // A legacy plaintext identity must never be copied around:
+                    // the backup would contain the raw private key. (The
+                    // startup password prompt can be dismissed with Esc, so
+                    // this state is reachable.)
+                    self.toast(
+                        ToastLevel::Error,
+                        "Set a password first (:password) — refusing to export an unencrypted identity".to_string(),
+                    );
+                } else if !source.exists() {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No identity file to back up yet".to_string(),
+                    );
+                } else {
+                    match std::fs::copy(&source, &dest) {
+                        Ok(_) => self.toast(
+                            ToastLevel::Success,
+                            format!("Identity backup saved to {}", dest),
+                        ),
+                        Err(e) => self.toast(ToastLevel::Error, format!("Backup failed: {}", e)),
+                    }
+                }
+            }
 
             TuiCommand::Rename(title) => match self.selected_chat_id() {
                 Some(id) => {
@@ -1912,6 +1984,7 @@ mod tests {
                 from_me: false,
                 content: crate::types::MessageContent::Text { text: "hi".into() },
                 timestamp: chrono::Utc::now(),
+                delivered: false,
             });
         }
         app.update_unread();

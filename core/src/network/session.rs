@@ -1187,6 +1187,7 @@ fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
         ProtocolMessage::TypingStart { seq } => Some(*seq),
         ProtocolMessage::TypingStop { seq } => Some(*seq),
         ProtocolMessage::Rekey { seq, .. } => Some(*seq),
+        ProtocolMessage::Ack { seq, .. } => Some(*seq),
     }
 }
 
@@ -1335,10 +1336,27 @@ where
         .map_err(|e| anyhow!("Network send error: {}", e))?;
 
     *messages_since_rekey += 1;
-    // The file's last frame just hit the wire: tell the app the transfer is
-    // genuinely done (queueing is not delivery).
-    if let ProtocolMessage::FileEnd { seq } = msg {
-        let _ = to_app_tx.send(SessionEvent::FileSendComplete { seq });
+    // Report the transport seq of load-bearing final frames back to the app:
+    // FileEnd ("queueing is not delivery"), and the frame carrying an outgoing
+    // text message (single frame, or the final chunk of a large one) so the app
+    // can correlate the peer's delivery receipt (`Ack { acked_seq }`) back to
+    // that message. Frames drain FIFO per lane, so order correlates.
+    match &msg {
+        ProtocolMessage::FileEnd { seq } => {
+            let _ = to_app_tx.send(SessionEvent::FileSendComplete { seq: *seq });
+        }
+        ProtocolMessage::Text { seq, .. } => {
+            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
+        }
+        ProtocolMessage::TextChunk {
+            seq,
+            chunk_index,
+            total_chunks,
+            ..
+        } if chunk_index + 1 == *total_chunks => {
+            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
+        }
+        _ => {}
     }
     Ok(())
 }

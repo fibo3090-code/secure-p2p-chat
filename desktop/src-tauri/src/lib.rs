@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
+use messenger_core::network::{DiscoveredPeer, Discovery};
 use messenger_core::types::{
     Config, MessageContent, ToastLevel, TransferDirection, TransferStatus,
 };
@@ -32,7 +33,12 @@ struct Bridge {
     /// Client-side Party/Community server connections (channels, members, DMs).
     /// State is ephemeral and re-fetched on join — the server holds durable history.
     party: Arc<Mutex<PartyManager>>,
-    identity: StdMutex<Identity>,
+    /// Shared with the poll loop, which needs the private key for auto-rehost.
+    identity: Arc<StdMutex<Identity>>,
+    /// mDNS browse/advertise handle, created lazily when `enable_mdns` is on.
+    discovery: Arc<StdMutex<Option<Discovery>>>,
+    /// Peers found on the local network (mDNS), refreshed on demand.
+    discovered: Arc<StdMutex<Vec<DiscoveredPeer>>>,
     history_path: PathBuf,
     /// Identity file (sibling of the history file).
     identity_path: PathBuf,
@@ -79,17 +85,21 @@ async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path) {
 }
 
 /// A cheap signature of the persisted-state surface (chat count + per-chat
-/// message count and title length). Used by the poll loop to save only when
-/// something actually changed, so received messages are persisted without
-/// rewriting the encrypted history to disk on every idle tick.
+/// message count, delivered count, and title length). Used by the poll loop to
+/// save only when something actually changed, so received messages — and
+/// delivery receipts, which flip `Message.delivered` without changing any
+/// count — are persisted without rewriting the encrypted history on every
+/// idle tick.
 fn state_signature(mgr: &ChatManager) -> u64 {
     let ids = mgr.chat_ids();
     let mut sig = ids.len() as u64;
     for id in &ids {
         if let Some(c) = mgr.get_chat(*id) {
+            let delivered = c.messages.iter().filter(|m| m.delivered).count() as u64;
             sig = sig
                 .wrapping_mul(1_000_003)
                 .wrapping_add(c.messages.len() as u64)
+                .wrapping_add(delivered.wrapping_mul(65_537))
                 .wrapping_add(c.title.len() as u64);
         }
     }
@@ -149,9 +159,13 @@ pub fn run() {
             commands::auth::unlock,
             commands::auth::set_password,
             commands::auth::my_identity,
+            commands::auth::set_display_name,
+            commands::auth::export_identity,
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,
+            commands::chats::accept_transfer,
+            commands::chats::decline_transfer,
             commands::chats::cancel_transfer,
             commands::auth::get_settings,
             commands::auth::update_settings,
@@ -166,10 +180,15 @@ pub fn run() {
             commands::chats::rename_chat,
             commands::chats::delete_chat,
             commands::contacts::list_contacts,
+            commands::contacts::remove_contact,
+            commands::contacts::block_contact,
+            commands::contacts::unblock_contact,
             commands::contacts::my_invite_link,
             commands::contacts::import_invite,
             commands::contacts::connect_contact,
             commands::connect::pending_fingerprint,
+            commands::connect::list_discovered_peers,
+            commands::connect::my_addresses,
             commands::party::party_join,
             commands::party::party_list,
             commands::party::party_history,
@@ -190,6 +209,7 @@ pub fn run() {
                 app.handle().clone(),
                 b.manager.clone(),
                 b.party.clone(),
+                b.identity.clone(),
                 b.history_path.clone(),
                 b.parties_path.clone(),
                 b.pending_fp.clone(),
@@ -259,7 +279,9 @@ fn init_bridge() -> Bridge {
     Bridge {
         manager,
         party: Arc::new(Mutex::new(PartyManager::new())),
-        identity: StdMutex::new(identity),
+        identity: Arc::new(StdMutex::new(identity)),
+        discovery: Arc::new(StdMutex::new(None)),
+        discovered: Arc::new(StdMutex::new(Vec::new())),
         history_path,
         identity_path,
         parties_path,
@@ -282,6 +304,7 @@ fn spawn_poll_loop(
     app: tauri::AppHandle,
     manager: Arc<Mutex<ChatManager>>,
     party: Arc<Mutex<PartyManager>>,
+    identity: Arc<StdMutex<Identity>>,
     history_path: PathBuf,
     parties_path: PathBuf,
     pending_fp: PendingFp,
@@ -292,6 +315,8 @@ fn spawn_poll_loop(
         // triggers a spurious write; only real changes (notably peer messages
         // arriving via poll_session_events) are persisted.
         let mut last_saved_sig: Option<u64> = None;
+        // Rate-limits the auto-rehost check (mirrors the egui app's 1.5s timer).
+        let mut last_rehost = std::time::Instant::now();
         // Servers already recorded as Joined, so the saved-communities file is
         // touched once per join (to fill in the server's display name), not every tick.
         let mut joined_recorded: std::collections::HashSet<Uuid> = Default::default();
@@ -320,6 +345,34 @@ fn spawn_poll_loop(
                                     fingerprint: conn.server_fingerprint.clone(),
                                 },
                             );
+                        }
+                    }
+                }
+            }
+            // Auto-rehost: with auto-host enabled, an accepted connection
+            // consumes the listening placeholder — without this, the app
+            // silently stops accepting new peers after the first one (the
+            // egui app has the same loop). No-op while the identity is
+            // locked (private key unavailable, config not loaded yet).
+            if last_rehost.elapsed() >= Duration::from_millis(1500) {
+                last_rehost = std::time::Instant::now();
+                let pk = {
+                    let id = identity.lock().unwrap();
+                    if id.is_locked() {
+                        None
+                    } else {
+                        id.private_key().ok()
+                    }
+                };
+                if let Some(pk) = pk {
+                    let mut m = manager.lock().await;
+                    if m.config.auto_host_on_startup && m.check_rehost_needed() {
+                        let port = m.config.listen_port;
+                        match m.start_host(port, pk).await {
+                            Ok(_) => {
+                                tracing::info!(port, "auto-rehosted after a consumed listener")
+                            }
+                            Err(e) => tracing::warn!("auto-rehost failed: {e}"),
                         }
                     }
                 }

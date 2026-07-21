@@ -64,6 +64,12 @@ pub struct Message {
     pub from_me: bool,
     pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
+    /// True once the peer acknowledged receipt (delivery receipt, sent
+    /// messages only). Messages from before this field — or sent to peers
+    /// that predate receipts — simply stay `false`; the UI shows nothing
+    /// rather than an error state.
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 /// A contact (a known peer)
@@ -123,18 +129,13 @@ pub enum TrustState {
 #[serde(tag = "type")]
 pub enum MessageContent {
     #[serde(rename = "text")]
-    Text {
-        text: String,
-    },
+    Text { text: String },
 
     #[serde(rename = "file")]
     File {
         filename: String,
         size: u64,
         path: Option<PathBuf>,
-    },
-    Edited {
-        new_text: String,
     },
 }
 
@@ -182,6 +183,10 @@ pub struct FileTransferState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransferStatus {
     Pending,
+    /// Incoming transfer held until the user accepts it (when
+    /// `Config::auto_accept_files` is off). Chunks are spooled to the temp
+    /// file meanwhile; declining deletes the spool and discards the rest.
+    AwaitingAcceptance,
     InProgress,
     Completed,
     Failed(String),
@@ -237,6 +242,12 @@ pub enum SessionEvent {
     FileSendComplete {
         seq: u64,
     },
+    /// An outgoing text message's frame (or the last chunk of a large one)
+    /// was written to the wire with this transport seq. The app records it to
+    /// match the peer's later `Ack { acked_seq }` back to the message.
+    TextSendComplete {
+        seq: u64,
+    },
     Disconnected,
     Error(String),
     Warning(String),
@@ -254,7 +265,6 @@ pub struct Config {
     pub theme: Theme,
     pub font_size: u8,
     pub auto_connect: bool,
-    pub notification_sound: NotificationSound,
     // Auto-host settings
     #[serde(default)]
     pub auto_host_on_startup: bool,
@@ -285,14 +295,6 @@ pub enum Theme {
     Midnight,
     Forest,
     Rose,
-}
-
-/// Notification sound options
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NotificationSound {
-    None,
-    Default,
-    // Vibrate (for mobile, if applicable)
 }
 
 /// The user's real Downloads directory. The old default was the **relative**
@@ -327,7 +329,6 @@ impl Default for Config {
             theme: Theme::Dark,
             font_size: 14,
             auto_connect: false,
-            notification_sound: NotificationSound::Default,
             auto_host_on_startup: false,
             listen_port: crate::PORT_DEFAULT,
             auto_trust_on_first_use: false,
@@ -390,6 +391,8 @@ mod tests {
     fn config_deserializes_with_optional_fields_missing() {
         // A minimal config that predates the newer #[serde(default)] fields must
         // still load, filling defaults for auto_host_on_startup, listen_port, etc.
+        // The retired `notification_sound` key stays in this fixture on purpose:
+        // configs saved by old versions contain it and must be tolerated.
         let json = r#"{
             "download_dir": "Downloads",
             "temp_dir": "temp",
@@ -442,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_and_notification_sound_serde_roundtrip() {
+    fn theme_serde_roundtrip() {
         for theme in [
             Theme::Light,
             Theme::Dark,
@@ -453,11 +456,6 @@ mod tests {
             let json = serde_json::to_string(&theme).unwrap();
             let back: Theme = serde_json::from_str(&json).unwrap();
             assert_eq!(theme, back);
-        }
-        for sound in [NotificationSound::None, NotificationSound::Default] {
-            let json = serde_json::to_string(&sound).unwrap();
-            let back: NotificationSound = serde_json::from_str(&json).unwrap();
-            assert_eq!(sound, back);
         }
     }
 

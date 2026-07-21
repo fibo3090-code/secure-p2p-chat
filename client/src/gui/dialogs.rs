@@ -48,7 +48,6 @@ pub fn render_dialogs(app: &mut App, ctx: &egui::Context) {
         ActiveDialog::Connect => render_connect_dialog(app, ctx),
         ActiveDialog::Contacts => render_contacts_window(app, ctx),
         ActiveDialog::AddContact => render_add_contact_dialog(app, ctx),
-        ActiveDialog::CreateGroup => render_create_group_wizard(app, ctx),
         ActiveDialog::RenameChat => render_rename_dialog(app, ctx),
         ActiveDialog::Settings => render_settings_dialog(app, ctx),
         ActiveDialog::About => crate::gui::help_view::render_help_window(app, ctx),
@@ -697,10 +696,6 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                     app.active_dialog = ActiveDialog::AddContact;
                 }
 
-                if ui.button("🧩 Create Group").clicked() {
-                    app.active_dialog = ActiveDialog::CreateGroup;
-                    app.group_selected.clear();
-                }
             });
 
             ui.separator();
@@ -722,17 +717,6 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (contact, existing_chat_id) in contact_snapshots {
                     ui.horizontal(|ui| {
-                        let mut is_selected = app.group_selected.contains(&contact.id);
-                        if ui.checkbox(&mut is_selected, "").changed() {
-                            if is_selected {
-                                if !app.group_selected.contains(&contact.id) {
-                                    app.group_selected.push(contact.id);
-                                }
-                            } else {
-                                app.group_selected.retain(|id| id != &contact.id);
-                            }
-                        }
-
                         ui.label(&contact.name);
                         if let Some(fp) = &contact.fingerprint {
                             ui.monospace(crate::util::format_fingerprint_short(fp));
@@ -840,6 +824,32 @@ fn render_contacts_window(app: &mut App, ctx: &egui::Context) {
                                     }
                                 });
                                 app.active_dialog = ActiveDialog::None; // Close dialog after action
+                            }
+                        }
+
+                        let blocked = contact.trust_state == crate::types::TrustState::Blocked;
+                        if blocked {
+                            ui.colored_label(crate::gui::styling::ERROR, "⛔ blocked");
+                        }
+                        let (block_label, block_hint) = if blocked {
+                            ("↩", "Unblock contact")
+                        } else {
+                            ("⛔", "Block contact (refuse its connections)")
+                        };
+                        if ui.small_button(block_label).on_hover_text(block_hint).clicked() {
+                            if let Ok(mut manager) = app.chat_manager.try_lock() {
+                                let result = if blocked {
+                                    manager.unblock_contact(contact.id)
+                                } else {
+                                    manager.block_contact(contact.id)
+                                };
+                                match result {
+                                    Ok(()) => queue_history_save(app.history_path.clone(), &mut manager),
+                                    Err(e) => manager.add_toast(
+                                        crate::types::ToastLevel::Error,
+                                        format!("Block/unblock failed: {}", e),
+                                    ),
+                                }
                             }
                         }
 
@@ -1226,258 +1236,6 @@ fn render_add_contact_dialog(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-fn render_create_group_wizard(app: &mut App, ctx: &egui::Context) {
-    let step_titles = [
-        "Step 1: Name Your Group",
-        "Step 2: Select Members",
-        "Step 3: Review & Create",
-    ];
-    let title = format!(
-        "🧩 Create Group - {}",
-        step_titles[app.group_wizard_step.min(2)]
-    );
-
-    egui::Window::new(title)
-        .collapsible(false)
-        .resizable(false)
-        .default_width(450.0)
-        .show(ctx, |ui| {
-            // Progress indicator
-            ui.horizontal(|ui| {
-                for i in 0..3 {
-                    if i == app.group_wizard_step {
-                        ui.label(egui::RichText::new(format!("● {}", i + 1)).strong().color(crate::gui::styling::ACCENT_PRIMARY));
-                    } else if i < app.group_wizard_step {
-                        ui.label(egui::RichText::new(format!("✓ {}", i + 1)).color(crate::gui::styling::SUCCESS));
-                    } else {
-                        ui.label(egui::RichText::new(format!("○ {}", i + 1)).weak());
-                    }
-                    if i < 2 {
-                        ui.label("─");
-                    }
-                }
-            });
-            ui.separator();
-            ui.add_space(5.0);
-
-            match app.group_wizard_step {
-                // Step 0: Group Name & Description
-                0 => {
-                    ui.label(egui::RichText::new("Give your group a name").heading());
-                    ui.add_space(10.0);
-
-                    ui.label("Group name:");
-                    let name_response = ui.text_edit_singleline(&mut app.group_title);
-
-                    let name_valid = !app.group_title.trim().is_empty();
-                    if !name_valid && name_response.lost_focus() {
-                        ui.label(egui::RichText::new("⚠ Group name is required").color(crate::gui::styling::ERROR));
-                    }
-
-                    ui.add_space(5.0);
-                    ui.label(egui::RichText::new("💡 Tip: Choose a descriptive name like \"Project Team\" or \"Family Chat\"").weak().italics());
-                    ui.add_space(15.0);
-
-                    ui.horizontal(|ui| {
-                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
-                            app.active_dialog = ActiveDialog::None;
-                            app.group_wizard_step = 0;
-                            app.group_title.clear();
-                            app.group_selected.clear();
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled(name_valid, egui::Button::new("Next ▶")).clicked() {
-                                app.group_wizard_step = 1;
-                            }
-                        });
-                    });
-                }
-
-                // Step 1: Select Members
-                1 => {
-                    ui.label(egui::RichText::new("Add members to your group").heading());
-                    ui.add_space(10.0);
-
-                    // Search bar
-                    ui.horizontal(|ui| {
-                        ui.label("🔍 Search:");
-                        ui.text_edit_singleline(&mut app.group_search);
-                        if ui.small_button("✖").on_hover_text("Clear search").clicked() {
-                            app.group_search.clear();
-                        }
-                    });
-                    ui.add_space(5.0);
-
-                    // Member selection list
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::same(8.0))
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(200.0)
-                                .show(ui, |ui| {
-                                    if let Ok(manager) = app.chat_manager.try_lock() {
-                                        let search_lower = app.group_search.to_lowercase();
-                                        let mut contacts: Vec<_> = manager.contacts.values().collect();
-                                        contacts.sort_by(|a, b| a.name.cmp(&b.name));
-
-                                        let mut found_any = false;
-                                        for contact in contacts {
-                                            // Filter by search
-                                            if !search_lower.is_empty() && !contact.name.to_lowercase().contains(&search_lower) {
-                                                continue;
-                                            }
-                                            found_any = true;
-
-                                            ui.horizontal(|ui| {
-                                                let mut checked = app.group_selected.contains(&contact.id);
-                                                if ui.checkbox(&mut checked, "").changed() {
-                                                    if checked {
-                                                        if !app.group_selected.contains(&contact.id) {
-                                                            app.group_selected.push(contact.id);
-                                                        }
-                                                    } else {
-                                                        app.group_selected.retain(|id| id != &contact.id);
-                                                    }
-                                                }
-
-                                                ui.label(&contact.name);
-                                                if let Some(fp) = &contact.fingerprint {
-                                                    ui.monospace(crate::util::format_fingerprint_short(fp));
-                                                }
-                                            });
-                                        }
-
-                                        if !found_any {
-                                            ui.label(egui::RichText::new("No contacts found").weak().italics());
-                                        }
-                                    } else {
-                                        ui.label(egui::RichText::new("Loading contacts...").weak().italics());
-                                    }
-                                });
-                        });
-
-                    ui.add_space(5.0);
-                    ui.label(format!("✅ {} member(s) selected", app.group_selected.len()));
-
-                    if app.group_selected.is_empty() {
-                        ui.label(egui::RichText::new("⚠ At least one member is required").color(crate::gui::styling::WARNING).italics());
-                    }
-
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if crate::gui::widgets::secondary_button(ui, "◀ Back").clicked() {
-                            app.group_wizard_step = 0;
-                        }
-
-                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
-                            app.active_dialog = ActiveDialog::None;
-                            app.group_wizard_step = 0;
-                            app.group_title.clear();
-                            app.group_selected.clear();
-                            app.group_search.clear();
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let can_proceed = !app.group_selected.is_empty();
-                            if ui.add_enabled(can_proceed, egui::Button::new("Next ▶")).clicked() {
-                                app.group_wizard_step = 2;
-                            }
-                        });
-                    });
-                }
-
-                // Step 2: Review & Create
-                2 => {
-                    ui.label(egui::RichText::new("Review and create your group").heading());
-                    ui.add_space(10.0);
-
-                    // Summary
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::same(10.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Group Name:").strong());
-                                ui.label(&app.group_title);
-                            });
-
-                            ui.add_space(5.0);
-
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Members:").strong());
-                                ui.label(format!("{}", app.group_selected.len()));
-                            });
-
-                            ui.add_space(5.0);
-
-                            // List member names
-                            if let Ok(manager) = app.chat_manager.try_lock() {
-                                ui.label(egui::RichText::new("Member list:").weak());
-                                egui::ScrollArea::vertical()
-                                    .max_height(120.0)
-                                    .show(ui, |ui| {
-                                        for contact_id in &app.group_selected {
-                                            if let Some(contact) = manager.contacts.get(contact_id) {
-                                                ui.label(format!("  • {}", contact.name));
-                                            }
-                                        }
-                                    });
-                            }
-                        });
-
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("🎉 Everything looks good? Click Create to start your group!").weak().italics());
-
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if crate::gui::widgets::secondary_button(ui, "◀ Back").clicked() {
-                            app.group_wizard_step = 1;
-                        }
-
-                        if crate::gui::widgets::secondary_button(ui, "Cancel").clicked() {
-                            app.active_dialog = ActiveDialog::None;
-                            app.group_wizard_step = 0;
-                            app.group_title.clear();
-                            app.group_selected.clear();
-                            app.group_search.clear();
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if crate::gui::widgets::primary_button(ui, "✓ Create Group").clicked() {
-                                let participants = app.group_selected.clone();
-                                let title = Some(app.group_title.trim().to_string());
-                                let manager = app.chat_manager.clone();
-                                let history_path = app.history_path.clone();
-
-                                tokio::spawn(async move {
-                                    let mut mgr = manager.lock().await;
-                                    let _chat_id = mgr.create_group_chat(participants, title);
-                                    let _ = mgr.save_history(&history_path);
-                                    mgr.add_toast(crate::types::ToastLevel::Success, "Group created!".to_string());
-                                });
-
-                                // Close wizard and reset
-                                app.active_dialog = ActiveDialog::None;
-                                app.group_wizard_step = 0;
-                                app.group_selected.clear();
-                                app.group_title.clear();
-                                app.group_search.clear();
-                            }
-                        });
-                    });
-                }
-
-                _ => {
-                    // Fallback - should never happen
-                    ui.label("Invalid wizard step");
-                    if crate::gui::widgets::secondary_button(ui, "Reset").clicked() {
-                        app.group_wizard_step = 0;
-                    }
-                }
-            }
-        });
-}
-
 fn render_rename_dialog(app: &mut App, ctx: &egui::Context) {
     if let Some(chat_id) = app.rename_chat_id {
         tracing::info!("Rendering rename dialog for chat_id: {}", chat_id);
@@ -1710,21 +1468,6 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
 
                 ui.add_space(10.0);
 
-                // Notification sound selection
-                ui.horizontal(|ui| {
-                    ui.label("Notification Sound:");
-                    if egui::ComboBox::from_id_salt("notification_sound_selector")
-                        .selected_text(format!("{:?}", manager.config.notification_sound))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::None, "None").changed() ||
-                            ui.selectable_value(&mut manager.config.notification_sound, crate::types::NotificationSound::Default, "Default").changed()
-                        }).inner.unwrap_or(false) {
-                            queue_history_save(app.history_path.clone(), &mut manager);
-                        }
-                });
-
-                ui.add_space(10.0);
-
                 let mut show_log = app.show_log_terminal;
                 if ui.checkbox(&mut show_log, "Show Log Terminal").changed() {
                     app.show_log_terminal = show_log;
@@ -1732,6 +1475,58 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                     queue_history_save(app.history_path.clone(), &mut manager);
                 }
             }
+
+            ui.add_space(20.0);
+            ui.heading("Profile");
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Display name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.display_name_input)
+                        .char_limit(48)
+                        .desired_width(180.0),
+                );
+                let changed = app.display_name_input.trim() != app.identity.name;
+                if ui
+                    .add_enabled(changed, egui::Button::new("Save"))
+                    .clicked()
+                {
+                    let new_name = app.display_name_input.clone();
+                    match app.identity.set_name(&new_name) {
+                        Ok(()) => {
+                            let path = app.history_path.with_file_name("identity.json");
+                            match app.identity.save(&path) {
+                                Ok(()) => {
+                                    app.display_name_input = app.identity.name.clone();
+                                    // Cached invite link embeds the old name.
+                                    app.my_invite_link = None;
+                                    app.my_invite_link_addrs.clear();
+                                    app.qr_code_texture = None;
+                                    app.add_toast(
+                                        crate::types::ToastLevel::Success,
+                                        "Display name updated".to_string(),
+                                    );
+                                }
+                                Err(e) => app.add_toast(
+                                    crate::types::ToastLevel::Error,
+                                    format!("Failed to save identity: {}", e),
+                                ),
+                            }
+                        }
+                        Err(e) => app.add_toast(
+                            crate::types::ToastLevel::Error,
+                            format!("Invalid name: {}", e),
+                        ),
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("Shown in the invite links you share. Your fingerprint never changes.")
+                    .small()
+                    .weak(),
+            );
 
             ui.add_space(20.0);
             ui.heading("Support");
@@ -1763,7 +1558,37 @@ fn render_settings_dialog(app: &mut App, ctx: &egui::Context) {
                 if crate::gui::widgets::primary_button(ui, "Set/Change Password").clicked() {
                     app.active_dialog = ActiveDialog::SetPassword;
                 }
+                if crate::gui::widgets::secondary_button(ui, "Export Identity Backup").clicked() {
+                    let source = app.history_path.with_file_name("identity.json");
+                    if !source.exists() {
+                        app.add_toast(
+                            crate::types::ToastLevel::Error,
+                            "No identity file to back up yet".to_string(),
+                        );
+                    } else if let Some(dest) = rfd::FileDialog::new()
+                        .set_file_name("p2pem-identity-backup.json")
+                        .save_file()
+                    {
+                        match std::fs::copy(&source, &dest) {
+                            Ok(_) => app.add_toast(
+                                crate::types::ToastLevel::Success,
+                                format!("Identity backup saved to {}", dest.display()),
+                            ),
+                            Err(e) => app.add_toast(
+                                crate::types::ToastLevel::Error,
+                                format!("Backup failed: {}", e),
+                            ),
+                        }
+                    }
+                }
             });
+            ui.label(
+                egui::RichText::new(
+                    "The backup is your encrypted identity file. Without it (and your password), a lost disk means a lost identity.",
+                )
+                .small()
+                .weak(),
+            );
 
             ui.label(
                 egui::RichText::new(

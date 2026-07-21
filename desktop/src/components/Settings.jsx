@@ -20,13 +20,25 @@ function Toggle({ on, onChange, label, hint }) {
   );
 }
 
-export function Settings({ identity, theme, setTheme }) {
+export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
   const [s, setS] = useState(null);
   const [portDraft, setPortDraft] = useState("");
+  const [nameDraft, setNameDraft] = useState(identity?.name || "");
 
   useEffect(() => {
     api.getSettings().then((v) => { setS(v); setPortDraft(String(v.listen_port)); }).catch(() => {});
   }, []);
+  useEffect(() => { setNameDraft(identity?.name || ""); }, [identity?.name]);
+
+  async function commitName() {
+    const name = nameDraft.trim();
+    if (!name || name === identity?.name) { setNameDraft(identity?.name || ""); return; }
+    try {
+      await api.setDisplayName(name);
+      toast("Display name updated.", "success");
+      onIdentityChanged && onIdentityChanged();
+    } catch (e) { toast(String(e), "error"); setNameDraft(identity?.name || ""); }
+  }
 
   // Apply one field and save; roll back the UI if the bridge rejects it.
   async function apply(patch) {
@@ -39,6 +51,9 @@ export function Settings({ identity, theme, setTheme }) {
         auto_host_on_startup: next.auto_host_on_startup,
         listen_port: next.listen_port,
         enable_upnp: next.enable_upnp,
+        auto_accept_files: next.auto_accept_files,
+        auto_connect: next.auto_connect,
+        enable_mdns: next.enable_mdns,
       });
     } catch (e) { toast(String(e), "error"); setS(s); }
   }
@@ -77,11 +92,29 @@ export function Settings({ identity, theme, setTheme }) {
           <div className="set-id">
             <Avatar name={identity?.name} size={46} />
             <div>
-              <div className="set-id-name">{identity?.name || "—"}</div>
+              <input className="set-id-name-input" value={nameDraft} maxLength={48}
+                aria-label="Display name"
+                onChange={(e) => setNameDraft(e.target.value)}
+                onBlur={commitName}
+                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} />
               <code className="set-id-fp">{(identity?.fingerprint || "").replace(/(.{4})/g, "$1 ").trim()}</code>
             </div>
           </div>
-          <div className="set-note">Keys are stored encrypted on this device and never leave it.</div>
+          <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
+          <div className="set-row">
+            <span className="set-row-txt">
+              <span className="set-row-label">Identity backup</span>
+              <span className="set-row-hint">Save an encrypted copy of your identity file. Without it (and your password), a lost disk means a lost identity.</span>
+            </span>
+            <button className="set-change" onClick={async () => {
+              try {
+                const dest = await api.exportIdentity();
+                if (dest) toast(`Backup saved to ${dest}`, "success");
+              } catch (e) { toast(String(e), "error"); }
+            }}>
+              <Icon name="copy" size={14} /> Export
+            </button>
+          </div>
         </section>
 
         {s && (
@@ -100,6 +133,10 @@ export function Settings({ identity, theme, setTheme }) {
                 on={s.auto_host_on_startup} onChange={(v) => apply({ auto_host_on_startup: v })} />
               <Toggle label="UPnP port mapping" hint="Ask the router to make the host reachable from the internet; the external address goes into your invite"
                 on={s.enable_upnp} onChange={(v) => apply({ enable_upnp: v })} />
+              <Toggle label="Reconnect contacts on startup" hint="Dial your saved contacts automatically after unlock"
+                on={s.auto_connect} onChange={(v) => apply({ auto_connect: v })} />
+              <Toggle label="LAN peer discovery (mDNS)" hint="Find nearby peers and advertise yourself on the local network — reveals your name and fingerprint on the LAN"
+                on={s.enable_mdns} onChange={(v) => apply({ enable_mdns: v })} />
               <div className="set-row">
                 <span className="set-row-txt">
                   <span className="set-row-label">Listening port</span>
@@ -114,6 +151,8 @@ export function Settings({ identity, theme, setTheme }) {
 
             <section className="set-block">
               <div className="set-h">Files</div>
+              <Toggle label="Auto-accept incoming files" hint="When off, each incoming file must be accepted in the conversation before it is saved"
+                on={s.auto_accept_files} onChange={(v) => apply({ auto_accept_files: v })} />
               <div className="set-row">
                 <span className="set-row-txt">
                   <span className="set-row-label">Download folder</span>

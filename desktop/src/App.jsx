@@ -256,6 +256,12 @@ export default function App() {
                   // transfer; the completed file already shows as a message, so
                   // only surface in-flight work and failures (with their reason).
                   t.chat_id === activeId && t.status !== "done" && t.status !== "cancelled")}
+                onAcceptTransfer={async (t) => {
+                  try { await api.acceptTransfer(t.id); refresh(); } catch (e) { toast(String(e), "error"); }
+                }}
+                onDeclineTransfer={async (t) => {
+                  try { await api.declineTransfer(t.id); refresh(); } catch (e) { toast(String(e), "error"); }
+                }}
                 onVerify={async (c) => {
                   // Open the accept/reject dialog only when a real TOFU request
                   // is pending for this chat; an established chat has nothing to
@@ -276,7 +282,7 @@ export default function App() {
           <main className="col-full"><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
         )}
         {nav === "settings" && (
-          <main className="col-full"><Settings identity={auth} theme={theme} setTheme={setTheme} /></main>
+          <main className="col-full"><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
         )}
         {nav === "parties" && <main className="col-full"><Parties /></main>}
         {nav === "relays" && <main className="col-full"><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}

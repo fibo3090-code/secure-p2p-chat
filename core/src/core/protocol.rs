@@ -69,6 +69,14 @@ pub enum ProtocolMessage {
     /// next_key = rekey_session_key(current_key, nonce)
     /// All subsequent messages use the new key.
     Rekey { nonce: Vec<u8>, seq: u64 },
+
+    /// Delivery receipt: acknowledges that the frame the peer sent with
+    /// transport sequence `acked_seq` was received and processed (a text
+    /// message recorded, a file finalized). `seq` is this frame's own
+    /// transport sequence, stamped by the session loop like every other
+    /// message. Peers that predate this variant simply drop the frame
+    /// (unknown tag) — sequence gaps are tolerated, so nothing breaks.
+    Ack { acked_seq: u64, seq: u64 },
 }
 
 impl std::fmt::Debug for ProtocolMessage {
@@ -132,6 +140,11 @@ impl std::fmt::Debug for ProtocolMessage {
                 .field("seq", seq)
                 .field("nonce_len", &nonce.len())
                 .finish(),
+            Self::Ack { acked_seq, seq } => f
+                .debug_struct("Ack")
+                .field("seq", seq)
+                .field("acked_seq", acked_seq)
+                .finish(),
         }
     }
 }
@@ -180,7 +193,8 @@ impl ProtocolMessage {
             | Self::Ping { seq }
             | Self::TypingStart { seq }
             | Self::TypingStop { seq }
-            | Self::Rekey { seq, .. } => *seq = new_seq,
+            | Self::Rekey { seq, .. }
+            | Self::Ack { seq, .. } => *seq = new_seq,
             Self::Version { .. }
             | Self::EphemeralKey { .. }
             | Self::SupportedSignatureSchemes { .. } => {}
@@ -299,6 +313,12 @@ impl ProtocolMessage {
                 let len = (nonce.len() as u32).to_be_bytes();
                 v.extend_from_slice(&len);
                 v.extend_from_slice(nonce);
+            }
+
+            Self::Ack { acked_seq, seq } => {
+                v.push(13u8);
+                v.extend_from_slice(&seq.to_be_bytes());
+                v.extend_from_slice(&acked_seq.to_be_bytes());
             }
         }
         v
@@ -616,6 +636,15 @@ impl ProtocolMessage {
                 let nonce = b[cursor..cursor + nonce_len].to_vec();
                 Some(Self::Rekey { nonce, seq })
             }
+            13 => {
+                if cursor + 8 + 8 > b.len() {
+                    return None;
+                }
+                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                cursor += 8;
+                let acked_seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                Some(Self::Ack { acked_seq, seq })
+            }
             _ => None,
         }
     }
@@ -676,6 +705,10 @@ mod tests {
         assert_roundtrip(ProtocolMessage::Rekey {
             nonce: vec![0xAB; 16],
             seq: 7,
+        });
+        assert_roundtrip(ProtocolMessage::Ack {
+            acked_seq: 42,
+            seq: 8,
         });
     }
 
@@ -745,6 +778,8 @@ mod tests {
         assert!(ProtocolMessage::from_plain_bytes(&[200u8, 1, 2, 3]).is_none());
         // Truncated FileEnd (needs 8 bytes of seq).
         assert!(ProtocolMessage::from_plain_bytes(&[5u8, 0, 0]).is_none());
+        // Truncated Ack (needs 8 bytes of seq + 8 bytes of acked_seq).
+        assert!(ProtocolMessage::from_plain_bytes(&[13u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
     }
 
     #[test]

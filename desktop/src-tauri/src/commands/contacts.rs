@@ -84,6 +84,57 @@ pub(crate) async fn import_invite(
     Ok(contact_dto(mgr.get_contact(id).expect("just inserted")))
 }
 
+/// Delete a saved contact (its conversations and history are kept).
+#[tauri::command]
+pub(crate) async fn remove_contact(
+    id: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state.manager.lock().await.remove_contact(uuid);
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Block a contact: live sessions with it are dropped and future connection
+/// attempts from its fingerprint are refused automatically.
+#[tauri::command]
+pub(crate) async fn block_contact(
+    id: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state
+        .manager
+        .lock()
+        .await
+        .block_contact(uuid)
+        .map_err(|e| e.to_string())?;
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Undo a block; trust returns to Verified when the fingerprint was already
+/// confirmed in a conversation, otherwise Unverified.
+#[tauri::command]
+pub(crate) async fn unblock_contact(
+    id: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state
+        .manager
+        .lock()
+        .await
+        .unblock_contact(uuid)
+        .map_err(|e| e.to_string())?;
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
 /// Dial a stored contact by its saved address.
 #[tauri::command]
 pub(crate) async fn connect_contact(

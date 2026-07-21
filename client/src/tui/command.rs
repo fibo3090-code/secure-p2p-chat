@@ -52,6 +52,12 @@ pub enum TuiCommand {
     // --- files ---
     Send(String),
     Transfers,
+    AcceptFile,
+    DeclineFile,
+
+    // --- identity ---
+    Name(String),
+    Backup(String),
 
     // --- chat management ---
     Rename(String),
@@ -158,6 +164,10 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("import", ":import <invite-link>", "Import an invite link as a contact"),
     ("send", ":send <path>", "Send a file to the selected chat"),
     ("transfers", ":transfers", "Show active file transfers"),
+    ("accept", ":accept", "Accept the incoming file offer"),
+    ("decline", ":decline", "Decline the incoming file offer"),
+    ("name", ":name <name>", "Change your display name"),
+    ("backup", ":backup <path>", "Export an encrypted identity backup"),
     (
         "party-connect",
         ":party-connect <host[:port]> <username> [password]",
@@ -396,6 +406,20 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
             Ok(TuiCommand::Send(rest))
         }
         "transfers" => Ok(TuiCommand::Transfers),
+        "accept" => Ok(TuiCommand::AcceptFile),
+        "decline" => Ok(TuiCommand::DeclineFile),
+        "name" => {
+            if rest.trim().is_empty() {
+                return Err("Usage: :name <display name>".to_string());
+            }
+            Ok(TuiCommand::Name(rest.trim().to_string()))
+        }
+        "backup" => {
+            if rest.trim().is_empty() {
+                return Err("Usage: :backup <destination path>".to_string());
+            }
+            Ok(TuiCommand::Backup(rest.trim().to_string()))
+        }
 
         "party-connect" => {
             let address = parts.next().ok_or_else(|| {

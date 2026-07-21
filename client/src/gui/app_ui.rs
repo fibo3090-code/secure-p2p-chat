@@ -17,7 +17,6 @@ pub enum ActiveDialog {
     None,
     Contacts,
     AddContact,
-    CreateGroup,
     RenameChat,
     Connect,
     Host,
@@ -53,11 +52,6 @@ pub struct App {
     // link can be regenerated once a UPnP external address resolves (up to 15s
     // after hosting starts) and joins/supersedes the LAN one.
     pub my_invite_link_addrs: Vec<String>,
-    // pub show_create_group: bool, REMOVED
-    pub group_wizard_step: usize, // 0=Name, 1=Members, 2=Confirm
-    pub group_selected: Vec<Uuid>,
-    pub group_title: String,
-    pub group_search: String,
     // Rename conversation dialog
     // pub show_rename_dialog: bool, REMOVED
     pub rename_chat_id: Option<Uuid>,
@@ -118,6 +112,12 @@ pub struct App {
     pub party_new_channel_input: String,
     /// Optional P2P connection password entered in the Host/Connect dialogs.
     pub connection_password_input: String,
+    /// Draft for the display-name field in Settings.
+    pub display_name_input: String,
+    /// A file-offer Accept/Decline click that could not be applied because the
+    /// manager lock was contended; retried on the next frame instead of being
+    /// silently dropped.
+    pub pending_transfer_decision: Option<(Uuid, bool)>,
 }
 
 impl App {
@@ -233,6 +233,7 @@ impl App {
         let initial_identity_locked = identity.is_locked();
         // Force password setup whenever the identity is not locked (i.e., private key available in plaintext)
         let force_password_setup = !initial_identity_locked;
+        let identity_name_for_ui = identity.name.clone();
         // Wrap manager in Arc<Mutex<..>> once and reuse
         let manager_arc = Arc::new(Mutex::new(chat_manager));
         // Do not start network (auto_host, auto_connect) until identity is unlocked or password set
@@ -298,10 +299,6 @@ impl App {
             invite_link_input: String::new(),
             my_invite_link: None,
             my_invite_link_addrs: Vec::new(),
-            group_wizard_step: 0,
-            group_selected: Vec::new(),
-            group_title: String::new(),
-            group_search: String::new(),
             rename_chat_id: None,
             rename_input: String::new(),
             history_path,
@@ -343,6 +340,8 @@ impl App {
             party_selected_dm: None,
             party_new_channel_input: String::new(),
             connection_password_input: String::new(),
+            display_name_input: identity_name_for_ui,
+            pending_transfer_decision: None,
         })
     }
 
@@ -732,7 +731,9 @@ impl eframe::App for App {
                 ui.add_enabled_ui(!any_modal_open, |ui| {
                     ui.add_space(crate::gui::styling::SPACING_MEDIUM);
                     if let Ok(manager) = self.chat_manager.try_lock() {
-                        let listen_port = manager.config.listen_port;
+                        // The port the listener actually bound, not the settings one.
+                        let listen_port =
+                            manager.hosting_port.unwrap_or(manager.config.listen_port);
                         let is_listening = manager.is_hosting;
                         let sessions = manager.sessions_len();
                         let toasts = manager.toasts.len();

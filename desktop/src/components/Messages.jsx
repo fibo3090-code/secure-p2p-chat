@@ -124,7 +124,7 @@ function MessageItem({ m }) {
       <div className="msg-bubble">
         {m.author && !mine && <span className="msg-author">{m.author}</span>}
         <span className="msg-text">{m.text}</span>
-        <span className="msg-time">{m.t}{mine && <Icon name="check" size={12} />}</span>
+        <span className="msg-time">{m.t}{mine && m.delivered && <Icon name="check" size={12} />}</span>
       </div>
     </div>
   );
@@ -138,13 +138,16 @@ function transferLabel(t) {
   if (t.status === "failed") return t.error || "failed";
   if (t.status === "cancelled") return "cancelled";
   if (t.status === "done") return "done";
+  if (t.status === "awaiting") return "incoming file";
   return `${transferPct(t)}%`;
 }
 
 // Live progress cards for the conversation's in-flight file transfers, so a
 // large send/receive shows movement instead of nothing until completion.
+// An "awaiting" transfer is an incoming offer: it shows Accept / Decline
+// instead of a progress bar (nothing is saved until the user accepts).
 // In-flight transfers get a cancel button (either direction).
-function TransferBar({ transfers, onCancel }) {
+function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
   if (!transfers || transfers.length === 0) return null;
   return (
     <div className="transfer-bar">
@@ -152,7 +155,14 @@ function TransferBar({ transfers, onCancel }) {
         <div key={t.id} className={cx("transfer-item", "is-" + t.status)}>
           <Icon name={t.direction === "outgoing" ? "arrowUp" : "arrowDown"} size={13} />
           <span className="transfer-name">{t.filename}</span>
-          <div className="transfer-track"><div className="transfer-fill" style={{ width: `${transferPct(t)}%` }} /></div>
+          {t.status === "awaiting" && t.direction !== "outgoing" ? (
+            <span className="transfer-offer">
+              <Button icon="check" onClick={() => onAccept && onAccept(t)}>Accept</Button>
+              <Button variant="danger-ghost" icon="x" onClick={() => onDecline && onDecline(t)}>Decline</Button>
+            </span>
+          ) : (
+            <div className="transfer-track"><div className="transfer-fill" style={{ width: `${transferPct(t)}%` }} /></div>
+          )}
           <span className="transfer-pct mono">{transferLabel(t)}</span>
           {t.cancellable && (
             <button
@@ -174,7 +184,7 @@ function TransferBar({ transfers, onCancel }) {
 // "Show earlier messages" widens the window on demand.
 const MSG_WINDOW = 150;
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onCancelTransfer }) {
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
   useEffect(() => setShown(MSG_WINDOW), [contact && contact.id]);
@@ -225,7 +235,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         </div>
       </div>
 
-      <TransferBar transfers={transfers} onCancel={onCancelTransfer} />
+      <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
       <div className="composer">
         <button className="composer-clip" title="Send file"

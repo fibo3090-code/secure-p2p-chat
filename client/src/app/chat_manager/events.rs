@@ -31,6 +31,27 @@ impl ChatManager {
         }
     }
 
+    /// Register a sent message as waiting for the peer's delivery receipt,
+    /// keeping the map bounded: a peer that predates `Ack` never acknowledges
+    /// anything, so on a long-lived session the entries would otherwise grow
+    /// forever. Hitting the cap means the peer isn't acking at all — dropping
+    /// the backlog only costs ✓ marks that were never going to arrive.
+    pub(super) fn register_awaiting_ack(
+        &mut self,
+        session_id: Uuid,
+        seq: u64,
+        chat_id: Uuid,
+        message_id: Uuid,
+    ) {
+        const MAX_AWAITING_ACK: usize = 2048;
+        if self.awaiting_ack.len() >= MAX_AWAITING_ACK {
+            tracing::info!("awaiting_ack backlog full (peer not acking); dropping old entries");
+            self.awaiting_ack.clear();
+        }
+        self.awaiting_ack
+            .insert((session_id, seq), (chat_id, message_id));
+    }
+
     /// Consolidate Trust-On-First-Use (TOFU) verification logic
     pub(super) fn handle_tofu_verification(
         &mut self,
@@ -46,6 +67,20 @@ impl ChatManager {
             .find(|(_, &sid)| sid == session_id)
             .map(|(&cid, _)| cid)
             .unwrap_or(session_id);
+
+        // A blocked contact's fingerprint is refused outright: no prompt, no
+        // auto-accept, and the session is told to abort.
+        if self.is_fingerprint_blocked(fingerprint) {
+            tracing::warn!(peer = %peer_name, "Rejected connection from blocked contact");
+            if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
+                let _ = tx.send(false);
+            }
+            self.add_toast(
+                ToastLevel::Warning,
+                format!("Blocked contact {} tried to connect — refused", peer_name),
+            );
+            return;
+        }
 
         // Have we already confirmed this fingerprint elsewhere (another chat with
         // this peer, or a saved contact)? Then it's a returning peer under TOFU and
@@ -85,6 +120,9 @@ impl ChatManager {
                             tracing::error!("Failed to auto-confirm fingerprint: {}", e);
                         }
                     }
+                    // The handshake confirmed this fingerprint; reflect it on
+                    // the matching contact (returning peer stays consistent).
+                    self.promote_contact_verified(actual_chat_id, fingerprint);
                 } else {
                     // Request explicit user verification via UI
                     // Note: fingerprint_verification_request uses the SESSION ID
@@ -288,11 +326,14 @@ impl ChatManager {
                                     from_me: false,
                                     content: MessageContent::Text { text: text.clone() },
                                     timestamp: chrono::Utc::now(),
+                                    delivered: false,
                                 });
 
                                 // Clear typing indicator
                                 chat.peer_typing = false;
                                 chat.typing_since = None;
+                                // Delivery receipt for the sender.
+                                self.send_ack_for_chat(actual_chat_id, seq);
                                 // Show desktop notification
                                 let preview = Self::preview_text_for_notification(&text);
                                 self.show_notification("New message", &preview);
@@ -346,10 +387,14 @@ impl ChatManager {
                                         from_me: false,
                                         content: MessageContent::Text { text: text.clone() },
                                         timestamp: assembled_timestamp,
+                                        delivered: false,
                                     });
                                     chat.peer_typing = false;
                                     chat.typing_since = None;
                                 }
+                                // Delivery receipt: ack the final chunk's seq
+                                // (chunks arrive in order on the one stream).
+                                self.send_ack_for_chat(actual_chat_id, seq);
 
                                 let preview = Self::preview_text_for_notification(&text);
                                 self.show_notification("New message", &preview);
@@ -510,59 +555,22 @@ impl ChatManager {
 
                         let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
-                            if self.active_transfers.contains_key(&transfer_id) {
+                            let awaiting = self
+                                .active_transfers
+                                .get(&transfer_id)
+                                .is_some_and(|t| t.status == TransferStatus::AwaitingAcceptance);
+                            if awaiting {
+                                // Fully received but not yet accepted: hold the
+                                // spooled file (and the FileEnd seq, for the
+                                // eventual delivery receipt) until the user decides.
+                                tracing::info!(
+                                    "File fully received; holding until the user accepts"
+                                );
+                                self.pending_file_end.insert(transfer_id, seq);
+                            } else if self.active_transfers.contains_key(&transfer_id) {
                                 tracing::info!("File transfer completed");
-
                                 // Finalize only the matching transfer, not all incoming files.
-                                if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
-                                    let bytes_received = incoming.bytes_received();
-                                    match incoming.finalize() {
-                                        Ok(final_path) => {
-                                            if let Some(mut transfer) =
-                                                self.active_transfers.remove(&transfer_id)
-                                            {
-                                                transfer.status = TransferStatus::Completed;
-                                                // Add to chat history.
-                                                if let Some(chat) =
-                                                    self.chats.get_mut(&actual_chat_id)
-                                                {
-                                                    chat.messages.push(Message {
-                                                        id: Uuid::new_v4(),
-                                                        from_me: false,
-                                                        content: MessageContent::File {
-                                                            filename: transfer.filename.clone(),
-                                                            size: transfer.size,
-                                                            path: Some(final_path),
-                                                        },
-                                                        timestamp: chrono::Utc::now(),
-                                                    });
-                                                }
-                                                self.add_toast(
-                                                    ToastLevel::Success,
-                                                    format!("File received: {}", transfer.filename),
-                                                );
-                                            }
-                                            self.update_transfer_progress(
-                                                transfer_id,
-                                                bytes_received,
-                                            );
-                                        }
-                                        Err(e) => {
-                                            if let Some(transfer) =
-                                                self.active_transfers.get_mut(&transfer_id)
-                                            {
-                                                transfer.status =
-                                                    TransferStatus::Failed(e.to_string());
-                                            }
-                                            tracing::error!("Failed to finalize file: {}", e);
-                                            self.add_toast(
-                                                ToastLevel::Error,
-                                                format!("File transfer error: {}", e),
-                                            );
-                                            self.active_transfers.remove(&transfer_id);
-                                        }
-                                    }
-                                }
+                                self.finalize_incoming_file(transfer_id, Some(seq));
                             }
                         }
                     }
@@ -622,6 +630,47 @@ impl ChatManager {
                             }
                         }
                     }
+
+                    ProtocolMessage::Ack { acked_seq, seq } => {
+                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
+                            if seq > chat.recv_seq {
+                                chat.recv_seq = seq;
+                                true
+                            } else {
+                                tracing::warn!("Received Ack with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !valid_seq {
+                            return;
+                        }
+                        // Mark the acknowledged message as delivered. The key is
+                        // the SESSION id: that is where the wire seq was stamped.
+                        if let Some((target_chat, message_id)) =
+                            self.awaiting_ack.remove(&(chat_id, acked_seq))
+                        {
+                            if let Some(chat) = self.chats.get_mut(&target_chat) {
+                                if let Some(message) =
+                                    chat.messages.iter_mut().find(|m| m.id == message_id)
+                                {
+                                    message.delivered = true;
+                                    tracing::debug!(
+                                        "Message {} in chat {} marked delivered",
+                                        message_id,
+                                        target_chat
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                "Ack for unknown seq {} on session {} (already acked, or sent before restart)",
+                                acked_seq,
+                                chat_id
+                            );
+                        }
+                    }
                     other => {
                         tracing::warn!(
                             "Received unhandled protocol message in message loop: {:?}",
@@ -637,7 +686,7 @@ impl ChatManager {
                     .get_mut(&chat_id)
                     .and_then(|q| q.pop_front())
                 {
-                    Some((filename, transfer_id)) => {
+                    Some((filename, transfer_id, target_chat, message_id)) => {
                         tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
                         // The stream finished; mark the tracked transfer done
                         // and retire its live handle.
@@ -646,10 +695,30 @@ impl ChatManager {
                             state.received = state.size;
                             state.status = TransferStatus::Completed;
                         }
+                        // Wait for the peer's receipt to mark it delivered.
+                        self.register_awaiting_ack(chat_id, seq, target_chat, message_id);
                         self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
                     }
                     None => {
                         tracing::warn!(seq = %seq, "FileSendComplete with no pending file send");
+                    }
+                }
+            }
+
+            SessionEvent::TextSendComplete { seq } => {
+                // The frame carrying the oldest queued text message hit the wire
+                // with this seq (FIFO per session): register it so the peer's
+                // Ack can mark the right message delivered.
+                match self
+                    .pending_text_sends
+                    .get_mut(&chat_id)
+                    .and_then(|q| q.pop_front())
+                {
+                    Some((target_chat, message_id)) => {
+                        self.register_awaiting_ack(chat_id, seq, target_chat, message_id);
+                    }
+                    None => {
+                        tracing::warn!(seq = %seq, "TextSendComplete with no pending text send");
                     }
                 }
             }
@@ -659,10 +728,12 @@ impl ChatManager {
                 self.add_toast(ToastLevel::Warning, "Connection lost".to_string());
                 self.fail_pending_file_sends(chat_id, "connection lost");
 
-                // Clean up session
+                // Clean up session (unacked messages simply stay unmarked).
                 self.sessions.remove(&chat_id);
                 self.session_events.remove(&chat_id);
                 self.chat_id_mapping.retain(|_, v| *v != chat_id);
+                self.pending_text_sends.remove(&chat_id);
+                self.awaiting_ack.retain(|(sid, _), _| *sid != chat_id);
             }
 
             SessionEvent::Error(err) => {
