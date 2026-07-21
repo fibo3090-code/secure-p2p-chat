@@ -106,6 +106,44 @@ fn blocked_contact_fingerprint_is_auto_rejected() {
 }
 
 #[test]
+fn blocking_tears_down_the_live_session_completely() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact("Mallory".into(), None, Some("BLOCKED-FP".into()), None);
+
+    // Live session: chat with the blocked fingerprint, mapped to a session id
+    // with a handle, an event receiver, and a confirm sender.
+    let session_id = Uuid::new_v4();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Mallory".into());
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("BLOCKED-FP".into());
+    mgr.chat_id_mapping.insert(chat_id, session_id);
+    let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    mgr.add_session_for_test(
+        session_id,
+        SessionHandle {
+            from_app_tx: app_tx,
+        },
+    );
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    mgr.session_events
+        .insert(session_id, Arc::new(Mutex::new(event_rx)));
+    let (confirm_tx, _confirm_rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, confirm_tx);
+
+    mgr.block_contact(contact_id).unwrap();
+
+    // Everything about the session must be gone: without this, the network
+    // task's events kept being polled and the blocked peer could still
+    // deliver messages on the established session.
+    assert!(!mgr.sessions.contains_key(&session_id));
+    assert!(!mgr.session_events.contains_key(&session_id));
+    assert!(!mgr.fingerprint_confirm_senders.contains_key(&session_id));
+    assert!(!mgr.chat_id_mapping.values().any(|v| *v == session_id));
+    // The dropped receiver is what ends the network task's loop.
+    assert!(event_tx.send(SessionEvent::Disconnected).is_err());
+}
+
+#[test]
 fn tofu_accept_promotes_contact_to_verified() {
     let mut mgr = ChatManager::new(Config::default());
     // Contact known by name but not yet verified, bound to the chat.

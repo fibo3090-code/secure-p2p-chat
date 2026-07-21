@@ -80,17 +80,21 @@ async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path) {
 }
 
 /// A cheap signature of the persisted-state surface (chat count + per-chat
-/// message count and title length). Used by the poll loop to save only when
-/// something actually changed, so received messages are persisted without
-/// rewriting the encrypted history to disk on every idle tick.
+/// message count, delivered count, and title length). Used by the poll loop to
+/// save only when something actually changed, so received messages — and
+/// delivery receipts, which flip `Message.delivered` without changing any
+/// count — are persisted without rewriting the encrypted history on every
+/// idle tick.
 fn state_signature(mgr: &ChatManager) -> u64 {
     let ids = mgr.chat_ids();
     let mut sig = ids.len() as u64;
     for id in &ids {
         if let Some(c) = mgr.get_chat(*id) {
+            let delivered = c.messages.iter().filter(|m| m.delivered).count() as u64;
             sig = sig
                 .wrapping_mul(1_000_003)
                 .wrapping_add(c.messages.len() as u64)
+                .wrapping_add(delivered.wrapping_mul(65_537))
                 .wrapping_add(c.title.len() as u64);
         }
     }

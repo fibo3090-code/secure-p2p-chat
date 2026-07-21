@@ -725,7 +725,9 @@ impl eframe::App for App {
                 ui.add_enabled_ui(!any_modal_open, |ui| {
                     ui.add_space(crate::gui::styling::SPACING_MEDIUM);
                     if let Ok(manager) = self.chat_manager.try_lock() {
-                        let listen_port = manager.config.listen_port;
+                        // The port the listener actually bound, not the settings one.
+                        let listen_port =
+                            manager.hosting_port.unwrap_or(manager.config.listen_port);
                         let is_listening = manager.is_hosting;
                         let sessions = manager.sessions_len();
                         let toasts = manager.toasts.len();

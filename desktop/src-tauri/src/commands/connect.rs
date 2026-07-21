@@ -113,8 +113,11 @@ pub(crate) async fn my_addresses(
 ) -> Result<serde_json::Value, String> {
     ensure_ready(&state)?;
     let mgr = state.manager.lock().await;
+    // The live listener's port, not the settings one — the user may have
+    // typed a different port in the Host pane.
+    let port = mgr.hosting_port.unwrap_or(mgr.config.listen_port);
     let local = messenger_core::util::primary_local_ipv4()
-        .map(|ip| messenger_core::util::format_host_port(&ip, mgr.config.listen_port));
+        .map(|ip| messenger_core::util::format_host_port(&ip, port));
     Ok(serde_json::json!({
         "hosting": mgr.is_hosting,
         "local": local,

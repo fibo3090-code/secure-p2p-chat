@@ -78,6 +78,11 @@ impl ChatManager {
         tracing::info!(%contact_id, name = %name, "Contact blocked");
 
         // Disconnect every live session with that fingerprint right away.
+        // Tearing down ONLY the SessionHandle is not enough: the network task
+        // would keep running and its events would keep being polled, so the
+        // blocked peer could still deliver messages on an established session.
+        // Dropping the event receiver too makes the task's next send fail,
+        // which ends its loop and closes the socket.
         if let Some(fp) = fingerprint {
             let session_ids: Vec<Uuid> = self
                 .chats
@@ -86,7 +91,11 @@ impl ChatManager {
                 .map(|c| *self.chat_id_mapping.get(&c.id).unwrap_or(&c.id))
                 .collect();
             for sid in session_ids {
-                if self.sessions.remove(&sid).is_some() {
+                let had_session = self.sessions.remove(&sid).is_some();
+                self.session_events.remove(&sid);
+                self.fingerprint_confirm_senders.remove(&sid);
+                self.chat_id_mapping.retain(|_, v| *v != sid);
+                if had_session {
                     tracing::info!(session = %sid, "Disconnected session of blocked contact");
                 }
             }

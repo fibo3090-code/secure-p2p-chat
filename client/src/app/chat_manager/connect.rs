@@ -131,6 +131,7 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
 
         self.is_hosting = true;
+        self.hosting_port = Some(port);
         self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 

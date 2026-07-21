@@ -77,6 +77,10 @@ pub struct ChatManager {
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
+    /// The port the live listener actually bound (which can differ from
+    /// `config.listen_port` when the user typed another one in the Host
+    /// dialog). This is what "share this address" displays must use.
+    pub hosting_port: Option<u16>,
     /// Optional P2P connection password: required from peers when hosting, and
     /// supplied to the host when connecting. Verified inside the encrypted tunnel.
     pub connection_password: Option<String>,
@@ -116,6 +120,7 @@ impl ChatManager {
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
             is_hosting: false,
+            hosting_port: None,
             connection_password: None,
             conversation_locked: false,
             external_address: None,
@@ -159,6 +164,7 @@ impl ChatManager {
     /// Stop hosting (user action).
     pub fn stop_hosting(&mut self) {
         self.is_hosting = false;
+        self.hosting_port = None;
         // Cancel the UPnP renewal task (it unmaps the router port on drop) and
         // forget the external address so invites revert to the LAN address.
         self.upnp_cancel = None;
