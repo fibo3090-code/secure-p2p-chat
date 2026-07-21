@@ -39,15 +39,6 @@ predate tagged releases.
   LAN peer discovery (mDNS browse + advertise, gated behind the new
   `enable_mdns` toggle) with a "Nearby peers" list in the connect pane.
 
-### Removed
-
-- **Group chats.** The feature was an illusion (local-only fan-out over 1:1
-  sessions; recipients saw a plain DM, offline members lost messages) and is
-  removed until a real wire-level design lands. Old histories containing
-  legacy group chats still load and display.
-
-- Dead code: the never-created `MessageContent::Edited` variant and the
-  no-op `NotificationSound` setting.
 - **Real TCP hole punching over the relay.** The relay rendezvous now
   coordinates a genuine direct connection between two peers instead of only
   forwarding their traffic. When both sides are punch-capable, the server
@@ -75,6 +66,16 @@ predate tagged releases.
   promptly on cancel and the receiver discards its partial file. Cancellable
   from the egui transfer bar, the TUI Transfers overlay (↑/↓ select, `c` to
   cancel), and the desktop transfer cards, in both directions.
+
+### Removed
+
+- **Group chats.** The feature was an illusion (local-only fan-out over 1:1
+  sessions; recipients saw a plain DM, offline members lost messages) and is
+  removed until a real wire-level design lands. Old histories containing
+  legacy group chats still load and display.
+
+- Dead code: the never-created `MessageContent::Edited` variant and the
+  no-op `NotificationSound` setting.
 
 ### Changed
 
@@ -143,9 +144,7 @@ predate tagged releases.
   all three UIs (egui settings, desktop Settings, TUI `:set upnp on|off`).
 - **File-transfer progress in every UI.** The egui GUI shows a live progress
   bar above the chat input and the TUI shows a percentage in the message-view
-  title, matching the transfer bar the desktop app already had. (Wire-level
-  cancellation is planned separately — it needs a protocol message, see the
-  platform spec backlog.)
+  title, matching the transfer bar the desktop app already had.
 - **First automated tests for the desktop frontend.** Vitest covers the pure
   logic modules (`colorgrid`, `partyUnread`, `themes`), and `npm test` runs in
   CI's new Frontend Build job.

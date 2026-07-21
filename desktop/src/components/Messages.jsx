@@ -155,7 +155,7 @@ function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
         <div key={t.id} className={cx("transfer-item", "is-" + t.status)}>
           <Icon name={t.direction === "outgoing" ? "arrowUp" : "arrowDown"} size={13} />
           <span className="transfer-name">{t.filename}</span>
-          {t.status === "awaiting" ? (
+          {t.status === "awaiting" && t.direction !== "outgoing" ? (
             <span className="transfer-offer">
               <Button icon="check" onClick={() => onAccept && onAccept(t)}>Accept</Button>
               <Button variant="danger-ghost" icon="x" onClick={() => onDecline && onDecline(t)}>Decline</Button>
