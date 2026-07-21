@@ -180,8 +180,53 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
         </section>
 
         <section className="set-block">
-          <div className="set-h">About</div>
-          <div className="set-note">P2PEM — encrypted peer-to-peer messenger. Direct, end-to-end encrypted conversations with trust-on-first-use fingerprint verification.</div>
+          <div className="set-h">Support</div>
+          <div className="set-row">
+            <span className="set-row-txt">
+              <span className="set-row-label">Export diagnostics</span>
+              <span className="set-row-hint">A bundle with app state metadata and config — never keys or message content. Useful when reporting a bug.</span>
+            </span>
+            <button className="set-change" onClick={async () => {
+              try { const p = await api.exportDiagnostics(); toast(`Diagnostics exported to ${p}`, "success"); }
+              catch (e) { toast(String(e), "error"); }
+            }}>
+              <Icon name="file" size={14} /> Export
+            </button>
+          </div>
+          <div className="set-row">
+            <span className="set-row-txt">
+              <span className="set-row-label">Data folder</span>
+              <span className="set-row-hint">Where your identity, encrypted history and diagnostics live</span>
+            </span>
+            <button className="set-change" onClick={async () => {
+              try { await api.openDataDir(); } catch (e) { toast(String(e), "error"); }
+            }}>
+              <Icon name="folder" size={14} /> Open
+            </button>
+          </div>
+        </section>
+
+        <section className="set-block">
+          <div className="set-h">How P2PEM works</div>
+          <div className="set-note">
+            P2PEM is an encrypted peer-to-peer messenger: conversations go directly
+            between you and your peer (or through a blind relay that only forwards
+            bytes), end-to-end encrypted with forward secrecy. There is no account
+            and no central server holding your messages.
+          </div>
+          <div className="set-note">
+            <strong>Connecting:</strong> one side hosts (or opens a relay session) and shares
+            an address, invite link, or relay token; the other side dials it. With LAN
+            discovery enabled, nearby peers appear automatically in the connect pane.
+          </div>
+          <div className="set-note">
+            <strong>Trust:</strong> the first time you talk to someone, compare the short
+            verification code (six digits + three emoji) over another channel — a call
+            or in person — before accepting. If it matches on both ends, nobody is in
+            the middle; the app then remembers that fingerprint and warns you if it
+            ever changes. A ✓ next to your message means the peer's device confirmed
+            receipt.
+          </div>
         </section>
       </div>
     </div>

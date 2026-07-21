@@ -38,3 +38,5 @@ tracing-subscriber = { workspace = true }
 directories = { workspace = true }
 # Native file picker for "send file" (sync dialog run on a blocking thread).
 rfd = { workspace = true }
+open = { workspace = true }
+chrono = { workspace = true }
