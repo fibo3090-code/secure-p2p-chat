@@ -121,10 +121,22 @@ pub(crate) async fn set_locked(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let mut mgr = state.manager.lock().await;
-    mgr.set_conversation_locked(locked);
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.set_conversation_locked(locked);
+        if locked {
+            mgr.stop_hosting();
+        }
+    }
+    // A locked user must also disappear from the LAN: the mDNS registration
+    // from start_host would otherwise keep advertising name/fingerprint and a
+    // now-dead address.
     if locked {
-        mgr.stop_hosting();
+        if let Some(d) = state.discovery.lock().unwrap().as_mut() {
+            if let Err(e) = d.unregister() {
+                tracing::warn!("mDNS unregister on lock failed: {e}");
+            }
+        }
     }
     Ok(())
 }

@@ -307,6 +307,12 @@ fn ui_signature(mgr: &ChatManager) -> u64 {
     state_signature(mgr).hash(&mut h);
     for id in mgr.chat_ids() {
         mgr.is_connected(&id).hash(&mut h);
+        // TOFU trust: accepting a fingerprint flips the conversation's
+        // "verified" badge without changing any message count, so it must
+        // perturb the signature or the warning UI goes stale.
+        if let Some(chat) = mgr.get_chat(id) {
+            chat.peer_fingerprint.hash(&mut h);
+        }
     }
     for t in mgr.active_transfers_snapshot() {
         t.id.hash(&mut h);
