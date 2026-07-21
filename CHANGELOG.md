@@ -11,6 +11,44 @@ predate tagged releases.
 
 ### Added
 
+- **Delivery receipts.** New `Ack` protocol frame: receiving a text (or
+  finalizing a file) acknowledges the sender, whose message gains a ✓ in all
+  three UIs (`Message.delivered`, persisted). Backward compatible — peers
+  that predate the frame drop it harmlessly. See `docs/protocol.md`.
+
+- **Incoming files now require acceptance.** The `auto_accept_files` setting
+  (default off) is finally enforced: an incoming file is held (spooled to a
+  temp file) until accepted — Accept/Decline in the egui transfer row, the
+  desktop transfer bar, and new TUI `:accept`/`:decline` commands. Declining
+  deletes the spool. The toggle is now exposed in the desktop Settings too.
+
+- **Contact trust lifecycle.** Accepting a TOFU prompt promotes the matching
+  contact to Verified, and contacts can now be blocked/unblocked (egui
+  contacts window, desktop contact cards): a blocked contact's connections
+  are auto-refused, its live sessions dropped, and outbound dialing refused.
+  Desktop also gains contact deletion.
+
+- **Editable display name** (Settings in egui and desktop, `:name` in the
+  TUI) — invite links stop advertising everyone as "User". **Identity
+  backup export** in all three UIs (`:backup <path>` in the TUI) saves a
+  copy of the encrypted `identity.json`.
+
+- **Desktop P2P parity.** Connection passwords on direct Host/Connect,
+  auto-rehost after a consumed listener, auto-reconnect of saved contacts on
+  unlock, the address to share shown after "Start hosting" (LAN + UPnP), and
+  LAN peer discovery (mDNS browse + advertise, gated behind the new
+  `enable_mdns` toggle) with a "Nearby peers" list in the connect pane.
+
+### Removed
+
+- **Group chats.** The feature was an illusion (local-only fan-out over 1:1
+  sessions; recipients saw a plain DM, offline members lost messages) and is
+  removed until a real wire-level design lands. Old histories containing
+  legacy group chats still load and display.
+
+- Dead code: the never-created `MessageContent::Edited` variant and the
+  no-op `NotificationSound` setting.
+
 - **Multi-address invites (payload v4).** Signed invites can now carry every
   reachable candidate address in priority order — the UPnP external address
   first, the LAN address second — instead of one or the other. A connecting
