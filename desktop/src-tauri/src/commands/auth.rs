@@ -156,6 +156,74 @@ pub(crate) async fn export_identity(
     Ok(Some(dest.display().to_string()))
 }
 
+/// Export a support bundle (state metadata + config, never key material) to
+/// `<data dir>/diagnostics/bundle-<stamp>/`, mirroring the egui app's export.
+/// Returns the bundle directory path.
+#[tauri::command]
+pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Result<String, String> {
+    ensure_ready(&state)?;
+    let (identity_locked, identity_name, fp_prefix) = {
+        let id = state.identity.lock().unwrap();
+        (
+            id.is_locked(),
+            id.name.clone(),
+            id.fingerprint.chars().take(16).collect::<String>(),
+        )
+    };
+    let report = {
+        let mgr = state.manager.lock().await;
+        p2pem_classic::support::DiagnosticsReport {
+            generated_at_utc: chrono::Utc::now().to_rfc3339(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            history_path: state.history_path.display().to_string(),
+            identity_path: state.identity_path.display().to_string(),
+            history_exists: state.history_path.exists(),
+            identity_exists: state.identity_path.exists(),
+            identity_locked,
+            identity_name,
+            identity_fingerprint_prefix: fp_prefix,
+            chats: mgr.chats.len(),
+            contacts: mgr.contacts.len(),
+            sessions: mgr.sessions_len(),
+            active_toasts: mgr.toasts.len(),
+            discovered_peers: state.discovered.lock().unwrap().len(),
+            config: p2pem_classic::support::DiagnosticsConfig::from(&mgr.config),
+        }
+    };
+    let base_dir = state
+        .history_path
+        .parent()
+        .map(|d| d.join("diagnostics"))
+        .ok_or_else(|| "no data directory".to_string())?;
+    // The desktop bridge logs to stdout (tracing subscriber); there is no
+    // in-app log buffer to bundle, so say so instead of shipping an empty file.
+    let logs = "Desktop bridge logs go to stdout (run with `tauri dev` or check the OS console); \
+                no in-app log buffer is captured in this bundle.\n";
+    let bundle = tokio::task::spawn_blocking(move || {
+        p2pem_classic::support::export_diagnostics_bundle(&base_dir, &report, logs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    Ok(bundle.display().to_string())
+}
+
+/// Open the app's data directory (identity, encrypted history, diagnostics)
+/// in the system file manager.
+#[tauri::command]
+pub(crate) fn open_data_dir(state: tauri::State<'_, Bridge>) -> Result<String, String> {
+    ensure_ready(&state)?;
+    let dir = state
+        .history_path
+        .parent()
+        .ok_or_else(|| "no data directory".to_string())?
+        .to_path_buf();
+    open::that(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.display().to_string())
+}
+
 /// The user-facing settings the desktop app exposes. Only fields the core
 /// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
 /// `download_dir` and typing/notification switches are read by `ChatManager`,

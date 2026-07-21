@@ -161,6 +161,10 @@ pub fn run() {
             commands::auth::my_identity,
             commands::auth::set_display_name,
             commands::auth::export_identity,
+            commands::auth::export_diagnostics,
+            commands::auth::open_data_dir,
+            commands::connect::lock_state,
+            commands::connect::set_locked,
             commands::chats::list_conversations,
             commands::chats::get_conversation,
             commands::chats::list_transfers,
@@ -291,6 +295,53 @@ fn init_bridge() -> Bridge {
     }
 }
 
+/// Signature of everything the chat UI renders (a superset of
+/// `state_signature`): connection states, transfer progress, hosting and lock
+/// state. The poll loop emits `state-updated` only when this changes, so an
+/// idle app no longer makes the webview refetch conversations four times a
+/// second.
+fn ui_signature(mgr: &ChatManager) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    state_signature(mgr).hash(&mut h);
+    for id in mgr.chat_ids() {
+        mgr.is_connected(&id).hash(&mut h);
+    }
+    for t in mgr.active_transfers_snapshot() {
+        t.id.hash(&mut h);
+        t.received.hash(&mut h);
+        std::mem::discriminant(&t.status).hash(&mut h);
+    }
+    mgr.is_hosting.hash(&mut h);
+    mgr.hosting_port.hash(&mut h);
+    mgr.external_address.is_some().hash(&mut h);
+    mgr.is_conversation_locked().hash(&mut h);
+    mgr.contacts.len().hash(&mut h);
+    h.finish()
+}
+
+/// Signature of the Communities surface, so `party-updated` fires only when
+/// the directory or a thread actually changed.
+fn party_signature(p: &PartyManager) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for sid in p.server_ids() {
+        sid.hash(&mut h);
+        if let Some(conn) = p.server(sid) {
+            format!("{:?}", conn.status).hash(&mut h);
+            conn.server_name.hash(&mut h);
+            conn.channels.len().hash(&mut h);
+            conn.members.len().hash(&mut h);
+            conn.last_error.is_some().hash(&mut h);
+            let total_msgs: usize = conn.messages.values().map(|v| v.len()).sum();
+            total_msgs.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 fn toast_level_str(l: ToastLevel) -> &'static str {
     match l {
         ToastLevel::Success => "success",
@@ -315,6 +366,10 @@ fn spawn_poll_loop(
         // triggers a spurious write; only real changes (notably peer messages
         // arriving via poll_session_events) are persisted.
         let mut last_saved_sig: Option<u64> = None;
+        // Change-only event emission: the webview refetches on `state-updated`
+        // and `party-updated`, so an idle tick must not fire them.
+        let mut last_ui_sig: Option<u64> = None;
+        let mut last_party_sig: Option<u64> = None;
         // Rate-limits the auto-rehost check (mirrors the egui app's 1.5s timer).
         let mut last_rehost = std::time::Instant::now();
         // Servers already recorded as Joined, so the saved-communities file is
@@ -324,9 +379,11 @@ fn spawn_poll_loop(
             interval.tick().await;
             // Drain Party/Community server events (joins, channel/member updates,
             // incoming messages) so the webview's Communities pane stays live.
+            let party_sig;
             {
                 let mut p = party.lock().await;
                 p.poll_events();
+                party_sig = party_signature(&p);
                 // Once a server completes its join, copy its (now known) display
                 // name into the saved-communities entry for a nicer rejoin card.
                 for sid in p.server_ids() {
@@ -377,7 +434,7 @@ fn spawn_poll_loop(
                     }
                 }
             }
-            let (req, toasts, sig) = {
+            let (req, toasts, sig, ui_sig) = {
                 let mut m = manager.lock().await;
                 m.poll_session_events();
                 // Drain ChatManager's internal toasts (Connected, errors,
@@ -388,7 +445,8 @@ fn spawn_poll_loop(
                     .collect();
                 let req = m.fingerprint_verification_request.take();
                 let sig = state_signature(&m);
-                (req, toasts, sig)
+                let ui_sig = ui_signature(&m);
+                (req, toasts, sig, ui_sig)
             };
             // Persist when the conversation surface changed (e.g. a received
             // message). User-initiated commands save themselves immediately.
@@ -402,6 +460,7 @@ fn spawn_poll_loop(
                     serde_json::json!({ "level": level, "message": message }),
                 );
             }
+            let had_fp_request = req.is_some();
             if let Some(pending) = req {
                 let id = pending.session_id.to_string();
                 let (fingerprint, peer_name, sas) =
@@ -424,9 +483,17 @@ fn spawn_poll_loop(
                     }),
                 );
             }
-            let _ = app.emit("state-updated", ());
-            // Nudge the Communities pane to re-read the party directory + messages.
-            let _ = app.emit("party-updated", ());
+            // Emit refresh events only when the rendered surface changed (or a
+            // TOFU prompt appeared, so its fallback polling always runs).
+            if last_ui_sig != Some(ui_sig) || had_fp_request {
+                last_ui_sig = Some(ui_sig);
+                let _ = app.emit("state-updated", ());
+            }
+            // Nudge the Communities pane only when the directory/messages changed.
+            if last_party_sig != Some(party_sig) {
+                last_party_sig = Some(party_sig);
+                let _ = app.emit("party-updated", ());
+            }
         }
     });
 }

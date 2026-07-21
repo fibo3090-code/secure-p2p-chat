@@ -5183,9 +5183,11 @@ name = "p2pem-desktop"
 version = "1.12.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "directories",
  "log",
  "messenger-core",
+ "open",
  "p2pem-classic",
  "rfd",
  "serde",

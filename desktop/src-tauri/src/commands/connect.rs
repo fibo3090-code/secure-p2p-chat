@@ -104,6 +104,31 @@ pub(crate) async fn list_discovered_peers(
     Ok(serde_json::json!({ "enabled": true, "peers": peers }))
 }
 
+/// Whether the conversation is locked (no new peer may connect; auto-rehost
+/// paused). Mirrors the egui menu-bar toggle.
+#[tauri::command]
+pub(crate) async fn lock_state(state: tauri::State<'_, Bridge>) -> Result<bool, String> {
+    ensure_ready(&state)?;
+    Ok(state.manager.lock().await.is_conversation_locked())
+}
+
+/// Lock or unlock the conversation. Locking also stops the live listener so
+/// no new peer can join until unlocked (existing sessions keep running);
+/// unlocking lets auto-rehost resume when enabled.
+#[tauri::command]
+pub(crate) async fn set_locked(
+    locked: bool,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let mut mgr = state.manager.lock().await;
+    mgr.set_conversation_locked(locked);
+    if locked {
+        mgr.stop_hosting();
+    }
+    Ok(())
+}
+
 /// The addresses a peer can use to reach this host: the LAN address (primary
 /// local IPv4 + listening port) and, when UPnP resolved one, the external
 /// address. Shown after "Start hosting" so the user knows what to share.

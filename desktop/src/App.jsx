@@ -77,6 +77,9 @@ export default function App() {
   const activeIdRef = useRef(null);
   const [transfers, setTransfers] = useState([]);
   const [partyUnread, setPartyUnread] = useState(0);
+  // Conversation lock: when on, no new peer can connect (listener stopped,
+  // auto-rehost paused). Existing sessions keep running.
+  const [locked, setLockedState] = useState(false);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
 
@@ -113,6 +116,7 @@ export default function App() {
       api.listTransfers().then(setTransfers).catch(() => {});
       // Surface any pending TOFU prompt even if its one-shot event was missed.
       api.pendingFingerprint().then((p) => { if (p) setFpReq((cur) => cur || p); }).catch(() => {});
+      api.lockState().then(setLockedState).catch(() => {});
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
@@ -218,6 +222,16 @@ export default function App() {
           </span>
         </div>
         <div className="tb-right">
+          <button className={cx("tb-icon", locked && "is-locked")}
+            title={locked
+              ? "Conversation locked: no new peer can connect. Click to unlock."
+              : "Lock the conversation: stop listening and refuse new peers."}
+            onClick={async () => {
+              try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Locked — no new peers can connect" : "Unlocked", "info"); }
+              catch (e) { toast(String(e), "error"); }
+            }}>
+            <Icon name={locked ? "lock" : "unlock"} size={16} />
+          </button>
           <button className="tb-btn" onClick={() => setCreatorOpen(true)}>
             <Icon name="plus" size={15} /> New connection
           </button>
