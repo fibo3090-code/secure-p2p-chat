@@ -54,7 +54,8 @@ pub(crate) async fn unlock(
 /// and be reachable / reconnected", matching the egui/TUI apps. Failures are
 /// logged, never fatal to the unlock.
 async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
-    let pk = match { state.identity.lock().unwrap().private_key() } {
+    let pk_result = state.identity.lock().unwrap().private_key();
+    let pk = match pk_result {
         Ok(pk) => pk,
         Err(e) => {
             tracing::warn!("auto-host/auto-connect skipped: no private key: {e}");
