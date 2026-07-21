@@ -40,3 +40,14 @@ directories = { workspace = true }
 rfd = { workspace = true }
 open = { workspace = true }
 chrono = { workspace = true }
+
+# The mock runtime lets tests drive the real command handlers over IPC without
+# a display server — this is what CI uses to exercise the bridge headlessly.
+# Not on Windows: a Rust test-harness exe linking tauri aborts at startup with
+# STATUS_ENTRYPOINT_NOT_FOUND there (it lacks the Windows manifest tauri-build
+# embeds into the real app binary), so Windows would fail before running a
+# single test. The suite is OS-independent (it exercises IPC arg binding, not
+# windowing), so Linux/macOS coverage in CI loses nothing.
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "2.11.3", features = ["test"] }
+tempfile = { workspace = true }

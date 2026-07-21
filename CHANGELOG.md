@@ -11,6 +11,10 @@ predate tagged releases.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.13.0] - 2026-07-21
+
 ### Added
 
 - **Real TCP hole punching over the relay.** The relay rendezvous now
@@ -131,6 +135,18 @@ predate tagged releases.
 - **First automated tests for the desktop frontend.** Vitest covers the pure
   logic modules (`colorgrid`, `partyUnread`, `themes`); `npm test` runs in
   CI's new Frontend Build job.
+
+- **Bridge integration tests for the desktop app.** A new suite
+  (`desktop/src-tauri/src/tests.rs`) drives the real Tauri command handlers
+  over the mock runtime's IPC — the same path the webview uses — covering the
+  auth barrier (no command runs before unlock/set-password), the invoke-key
+  contract with `bridge.js` (an argument-name mismatch now fails CI instead
+  of silently becoming a no-op in production), settings round-trips,
+  display-name validation, conversation-lock semantics, TOFU confirmation
+  guards, and the
+  invite-link round-trip. The command registration moved into a shared
+  `invoke_handler()` so tests and the shipping app can never register
+  different command lists.
 
 ### Changed
 
@@ -776,7 +792,8 @@ predate tagged releases.
 - Basic chat functionality, end-to-end encryption (RSA + AES-GCM), file
   transfer, a simple GUI, and message history persistence.
 
-[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.1...HEAD
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.1...v1.13.0
 [1.12.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.11.1...v1.12.0
 [1.11.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.11.0...v1.11.1
