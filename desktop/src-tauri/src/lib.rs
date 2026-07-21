@@ -123,7 +123,8 @@ fn ensure_ready(state: &Bridge) -> Result<(), String> {
 mod commands;
 use commands::party::{upsert_saved_party, SavedParty};
 
-#[cfg(test)]
+// Not on Windows — see the dev-dependencies note in Cargo.toml.
+#[cfg(all(test, not(windows)))]
 mod tests;
 
 /// The full command registration, shared by the real app and the test harness
