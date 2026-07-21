@@ -11,6 +11,14 @@ predate tagged releases.
 
 ### Added
 
+- **Desktop: conversation lock, calmer poll loop, diagnostics and in-app
+  help.** A titlebar toggle refuses new incoming peers (stops the listener,
+  pauses auto-rehost) like the egui menu toggle; the bridge now emits UI
+  refresh events only when state actually changed instead of four times a
+  second; Settings gains a Support section (diagnostics bundle export +
+  open data folder) and a "How P2PEM works" explainer covering the SAS
+  verification ritual and delivery checkmarks.
+
 - **Delivery receipts.** New `Ack` protocol frame: receiving a text (or
   finalizing a file) acknowledges the sender, whose message gains a ✓ in all
   three UIs (`Message.delivered`, persisted). Backward compatible — peers
