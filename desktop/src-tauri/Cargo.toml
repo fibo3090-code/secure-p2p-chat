@@ -40,3 +40,9 @@ directories = { workspace = true }
 rfd = { workspace = true }
 open = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# The mock runtime lets tests drive the real command handlers over IPC without
+# a display server — this is what CI uses to exercise the bridge headlessly.
+tauri = { version = "2.11.3", features = ["test"] }
+tempfile = { workspace = true }

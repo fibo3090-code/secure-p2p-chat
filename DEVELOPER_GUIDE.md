@@ -61,9 +61,11 @@ cargo run --release -- --tui --connect 127.0.0.1:12345
 The pre-PR check commands and the full PR checklist are in
 [CONTRIBUTING.md](CONTRIBUTING.md#local-workflow). Run the whole suite with
 `cargo nextest run --workspace` (or `cargo test --workspace`). The
-`p2pem-desktop` crate is not exercised by the test suite and cannot be driven
-headlessly, so it is verified by `cargo check -p p2pem-desktop` +
-`npm run build` only.
+`p2pem-desktop` bridge has its own integration tests
+(`desktop/src-tauri/src/tests.rs`) that drive the Tauri command layer over a
+mock runtime — no display needed, but compiling the crate requires the
+GTK/webkit dev packages CI installs. The webview UI itself cannot be driven
+headlessly; it is covered by `npm test` + `npm run build` in `desktop/`.
 
 CI (`.github/workflows/ci.yml`) enforces formatting, clippy with warnings
 denied, tests on Ubuntu/Windows/macOS, and a locked Linux build verification.

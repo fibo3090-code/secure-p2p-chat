@@ -123,6 +123,68 @@ fn ensure_ready(state: &Bridge) -> Result<(), String> {
 mod commands;
 use commands::party::{upsert_saved_party, SavedParty};
 
+#[cfg(test)]
+mod tests;
+
+/// The full command registration, shared by the real app and the test harness
+/// so a command can never be reachable in tests but unregistered in the app
+/// (or vice versa).
+fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync {
+    tauri::generate_handler![
+        commands::auth::auth_status,
+        commands::auth::unlock,
+        commands::auth::set_password,
+        commands::auth::my_identity,
+        commands::auth::set_display_name,
+        commands::auth::export_identity,
+        commands::auth::export_diagnostics,
+        commands::auth::open_data_dir,
+        commands::connect::lock_state,
+        commands::connect::set_locked,
+        commands::chats::list_conversations,
+        commands::chats::get_conversation,
+        commands::chats::list_transfers,
+        commands::chats::accept_transfer,
+        commands::chats::decline_transfer,
+        commands::chats::cancel_transfer,
+        commands::auth::get_settings,
+        commands::auth::update_settings,
+        commands::auth::pick_download_dir,
+        commands::chats::send_message,
+        commands::chats::send_file,
+        commands::connect::start_host,
+        commands::connect::connect_peer,
+        commands::connect::host_via_relay,
+        commands::connect::connect_via_relay,
+        commands::connect::confirm_fingerprint,
+        commands::chats::rename_chat,
+        commands::chats::delete_chat,
+        commands::contacts::list_contacts,
+        commands::contacts::remove_contact,
+        commands::contacts::block_contact,
+        commands::contacts::unblock_contact,
+        commands::contacts::my_invite_link,
+        commands::contacts::import_invite,
+        commands::contacts::connect_contact,
+        commands::connect::pending_fingerprint,
+        commands::connect::list_discovered_peers,
+        commands::connect::my_addresses,
+        commands::party::party_join,
+        commands::party::party_list,
+        commands::party::party_history,
+        commands::party::party_post,
+        commands::party::party_create_channel,
+        commands::party::party_send_dm,
+        commands::party::party_dm_history,
+        commands::party::party_clear_error,
+        commands::party::party_send_file,
+        commands::party::party_send_file_dm,
+        commands::party::party_download_file,
+        commands::party::party_saved,
+        commands::party::party_leave,
+    ]
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -154,59 +216,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(bridge)
-        .invoke_handler(tauri::generate_handler![
-            commands::auth::auth_status,
-            commands::auth::unlock,
-            commands::auth::set_password,
-            commands::auth::my_identity,
-            commands::auth::set_display_name,
-            commands::auth::export_identity,
-            commands::auth::export_diagnostics,
-            commands::auth::open_data_dir,
-            commands::connect::lock_state,
-            commands::connect::set_locked,
-            commands::chats::list_conversations,
-            commands::chats::get_conversation,
-            commands::chats::list_transfers,
-            commands::chats::accept_transfer,
-            commands::chats::decline_transfer,
-            commands::chats::cancel_transfer,
-            commands::auth::get_settings,
-            commands::auth::update_settings,
-            commands::auth::pick_download_dir,
-            commands::chats::send_message,
-            commands::chats::send_file,
-            commands::connect::start_host,
-            commands::connect::connect_peer,
-            commands::connect::host_via_relay,
-            commands::connect::connect_via_relay,
-            commands::connect::confirm_fingerprint,
-            commands::chats::rename_chat,
-            commands::chats::delete_chat,
-            commands::contacts::list_contacts,
-            commands::contacts::remove_contact,
-            commands::contacts::block_contact,
-            commands::contacts::unblock_contact,
-            commands::contacts::my_invite_link,
-            commands::contacts::import_invite,
-            commands::contacts::connect_contact,
-            commands::connect::pending_fingerprint,
-            commands::connect::list_discovered_peers,
-            commands::connect::my_addresses,
-            commands::party::party_join,
-            commands::party::party_list,
-            commands::party::party_history,
-            commands::party::party_post,
-            commands::party::party_create_channel,
-            commands::party::party_send_dm,
-            commands::party::party_dm_history,
-            commands::party::party_clear_error,
-            commands::party::party_send_file,
-            commands::party::party_send_file_dm,
-            commands::party::party_download_file,
-            commands::party::party_saved,
-            commands::party::party_leave,
-        ])
+        .invoke_handler(invoke_handler())
         .setup(|app| {
             let b = app.state::<Bridge>();
             spawn_poll_loop(
