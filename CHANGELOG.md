@@ -11,7 +11,20 @@ predate tagged releases.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **File messages are no longer dead ends (desktop).** A finished file card
+  can be clicked to open the file with its default app, and a folder button
+  reveals it in Explorer/Finder/file manager. The webview only ever passes
+  (chat id, message id) across the bridge — never filesystem paths.
+- **Inline image previews (desktop).** Received and sent images (PNG, JPEG,
+  GIF, WebP, BMP up to 4 MiB) render as a thumbnail right in the chat; click
+  the thumbnail to open the full image. SVG is deliberately excluded (it can
+  carry scripts).
+- **Time you can actually see (desktop).** Threads now show day separators
+  ("Today", "Yesterday", full date), file cards show their time, and the
+  conversation list shows when the last message arrived (time today, weekday
+  within a week, date otherwise).
 
 ## [1.13.0] - 2026-07-21
 

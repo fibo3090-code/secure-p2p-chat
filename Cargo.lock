@@ -5262,6 +5262,7 @@ name = "p2pem-desktop"
 version = "1.13.0"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
  "chrono",
  "directories",
  "log",

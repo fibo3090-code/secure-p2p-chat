@@ -40,6 +40,8 @@ directories = { workspace = true }
 rfd = { workspace = true }
 open = { workspace = true }
 chrono = { workspace = true }
+# Inline image previews: file bytes -> data URL for the webview.
+base64 = { workspace = true }
 
 # The mock runtime lets tests drive the real command handlers over IPC without
 # a display server — this is what CI uses to exercise the bridge headlessly.
