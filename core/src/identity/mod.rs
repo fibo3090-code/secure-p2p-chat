@@ -30,6 +30,21 @@ use zeroize::Zeroizing;
 // Constants for encryption
 const KEY_SIZE: usize = 32; // 256-bit key
 
+/// Upper bounds on the Argon2 cost parameters this app will honour from an
+/// identity file. `Params::new` enforces only the RFC's own limits, which run
+/// to terabytes of memory, so a corrupted or hostile `identity.json` could
+/// otherwise turn an unlock into a multi-gigabyte allocation — and since the
+/// recorded parameters are the only ones tried, nothing else would catch it.
+///
+/// These sit far above anything the app writes (64 MiB, t=3, p=4), so a future
+/// release can raise its own costs without tripping them. There is deliberately
+/// no *lower* bound: weak parameters only weaken the file that carries them,
+/// and a floor would reject parameter sets a future release might legitimately
+/// choose.
+const MAX_ARGON_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+const MAX_ARGON_T_COST: u32 = 16;
+const MAX_ARGON_P_COST: u32 = 16;
+
 /// User identity with RSA key pair
 ///
 /// SECURITY: Private keys are wrapped in Zeroizing to ensure they are
@@ -282,13 +297,40 @@ impl Identity {
         Ok(())
     }
 
+    /// Derive the wrapping key with `argon` and open the encrypted private key.
+    /// `None` means these parameters do not open it — a wrong password, or the
+    /// wrong configuration for this file. The two are deliberately
+    /// indistinguishable to the caller.
+    fn unwrap_private_key(
+        argon: &Argon2<'_>,
+        password: &str,
+        salt: &[u8],
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Option<Zeroizing<String>> {
+        let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
+        argon
+            .hash_password_into(password.as_bytes(), salt, &mut key_bytes[..])
+            .ok()?;
+        let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
+        let plaintext = cipher.decrypt(nonce.into(), ciphertext).ok()?;
+        String::from_utf8(plaintext).ok().map(Zeroizing::new)
+    }
+
     /// Decrypt the private key with a password.
+    ///
+    /// SECURITY: when the file records its Argon2 parameters, they are the
+    /// *only* ones tried. Re-deriving with a different configuration on failure
+    /// would make an unlock cost one, two or three Argon2 passes depending on
+    /// how the file happened to be written (~1 s each), so anyone able to time
+    /// the unlock would learn which configuration protects the key — useful
+    /// context for an offline attack on a stolen identity file.
     pub fn decrypt(&mut self, password: &str) -> Result<()> {
-        let salt_bytes = self
+        let salt = self
             .salt
             .as_ref()
             .ok_or_else(|| anyhow!("Salt not found"))?;
-        let nonce_bytes = self
+        let nonce = self
             .nonce
             .as_ref()
             .ok_or_else(|| anyhow!("Nonce not found"))?;
@@ -296,80 +338,57 @@ impl Identity {
             .encrypted_private_key
             .as_ref()
             .ok_or_else(|| anyhow!("Encrypted private key not found"))?;
+        let wrong_password = || anyhow!("Decryption failed (likely wrong password)");
 
-        // Use same strict parameters as encryption
-        // Ideally we should store params in the file, but for now we enforce defaults.
-        // If we change params, we break old keys.
-        // Note: Argon2::default() uses different params, so this changes format.
-        // We assume new keys use new params. Old keys?
-        // Wait, if we change params now, we might break existing identities on disk?
-        // Yes. If user updates app, they can't decrypt old identity if params mismatch.
-        // We need backward compatibility or migration?
-        // Audit says: "Use explicit parameters".
-        // Solution: Try strict params first, fallback to default?
-        // Or store params in Identity struct.
-        // Given this is a small project, specific breaking changes are noted in v1.6.0.
-        // But breaking users' ability to login is bad.
-        // I'll assume users will re-create identity or I should implement fallback.
-        // I will attempt strictly first.
-        // Try stored params first (if present)
-        let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
-
-        if let Some(ref ap) = self.argon_params {
-            if let Ok(params) = Params::new(
+        if let Some(ap) = &self.argon_params {
+            if ap.m_cost_kib > MAX_ARGON_M_COST_KIB
+                || ap.t_cost > MAX_ARGON_T_COST
+                || ap.p_cost > MAX_ARGON_P_COST
+            {
+                return Err(anyhow!(
+                    "Stored Argon2 parameters are out of range (m={} KiB, t={}, p={})",
+                    ap.m_cost_kib,
+                    ap.t_cost,
+                    ap.p_cost
+                ));
+            }
+            let params = Params::new(
                 ap.m_cost_kib,
                 ap.t_cost,
                 ap.p_cost,
                 Some(ap.output_len as usize),
-            ) {
-                let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-                if argon
-                    .hash_password_into(password.as_bytes(), salt_bytes, &mut key_bytes[..])
-                    .is_ok()
-                {
-                    let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
-                    let nonce = nonce_bytes.as_slice().into();
-                    if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext.as_ref()) {
-                        self.private_key_pem_plaintext =
-                            Some(Zeroizing::new(String::from_utf8(plaintext)?));
-                        return Ok(());
-                    }
-                }
+            )
+            .map_err(|e| anyhow!("Stored Argon2 parameters are unusable: {}", e))?;
+            let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let pem = Self::unwrap_private_key(&argon, password, salt, nonce, ciphertext)
+                .ok_or_else(wrong_password)?;
+            self.private_key_pem_plaintext = Some(pem);
+            return Ok(());
+        }
+
+        // No recorded parameters: the file predates `argon_params` and was
+        // written by one of two earlier schemes. Trying both leaks nothing an
+        // attacker holding the file does not already know — the absence of the
+        // field is right there in the JSON. Every identity `encrypt()` writes
+        // records its parameters, so this path only ever runs for files that
+        // have not been re-encrypted since.
+        let legacy_schemes = [
+            Argon2::new(
+                Algorithm::Argon2id,
+                Version::V0x13,
+                Params::new(65536, 3, 4, Some(KEY_SIZE))
+                    .map_err(|e| anyhow!("Invalid Argon2 parameters: {}", e))?,
+            ),
+            Argon2::default(),
+        ];
+        for argon in &legacy_schemes {
+            if let Some(pem) = Self::unwrap_private_key(argon, password, salt, nonce, ciphertext) {
+                self.private_key_pem_plaintext = Some(pem);
+                return Ok(());
             }
         }
 
-        // Fallback to strict default parameters (new scheme)
-        if let Ok(params) = Params::new(65536, 3, 4, Some(KEY_SIZE)) {
-            let argon2_strict = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-            if argon2_strict
-                .hash_password_into(password.as_bytes(), salt_bytes, &mut key_bytes[..])
-                .is_ok()
-            {
-                let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
-                let nonce = nonce_bytes.as_slice().into();
-                if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext.as_ref()) {
-                    self.private_key_pem_plaintext =
-                        Some(Zeroizing::new(String::from_utf8(plaintext)?));
-                    return Ok(());
-                }
-            }
-        }
-
-        // Legacy fallback: Argon2::default()
-        let argon2_default = Argon2::default();
-        argon2_default
-            .hash_password_into(password.as_bytes(), salt_bytes, &mut key_bytes[..])
-            .map_err(|e| anyhow!("Argon2 hash failed: {}", e))?;
-
-        let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
-        let nonce = nonce_bytes.as_slice().into();
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext.as_ref())
-            .map_err(|e| anyhow!("Decryption failed (likely wrong password): {}", e))?;
-
-        self.private_key_pem_plaintext = Some(Zeroizing::new(String::from_utf8(plaintext)?));
-
-        Ok(())
+        Err(wrong_password())
     }
 
     /// Removing password protection is intentionally unsupported.
@@ -1032,6 +1051,135 @@ mod tests {
                 Some(4)
             );
         }
+    }
+
+    // ── Argon2 key-derivation compatibility ─────────────────────────────────
+    //
+    // This app has written three on-disk shapes over its life: keys wrapped
+    // with `Argon2::default()`, keys wrapped with explicit strict parameters
+    // but no record of them, and (current) keys wrapped with strict parameters
+    // recorded in `argon_params`. The tests below pin down which of those
+    // `decrypt` may still open, and — more importantly — that a recorded
+    // parameter set is the *only* thing tried when it is present.
+
+    /// Wrap the identity's private key the way a given Argon2 configuration
+    /// would, without recording the parameters — i.e. reproduce an identity
+    /// file as written by a release that predates `argon_params`.
+    fn wrap_private_key_with(identity: &mut Identity, password: &str, argon: &Argon2<'_>) {
+        let pem = identity
+            .private_key_pem_plaintext
+            .clone()
+            .expect("fixture needs a plaintext key");
+        let mut salt = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
+        argon
+            .hash_password_into(password.as_bytes(), &salt, &mut key_bytes[..])
+            .expect("fixture key derivation");
+        let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut rand::rngs::OsRng);
+
+        identity.encrypted_private_key = Some(
+            cipher
+                .encrypt(&nonce, pem.as_bytes())
+                .expect("fixture encryption"),
+        );
+        identity.salt = Some(salt.to_vec());
+        identity.nonce = Some(nonce.to_vec());
+        identity.argon_params = None;
+        identity.private_key_pem_plaintext = None;
+    }
+
+    /// The explicit parameters this app has used since the hardening pass.
+    fn strict_argon() -> Argon2<'static> {
+        Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(65536, 3, 4, Some(KEY_SIZE)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn stored_argon_params_are_the_only_ones_tried() {
+        let mut identity = Identity::new_with_plaintext("Mismatched User".to_string()).unwrap();
+        let password = test_password();
+
+        // A key wrapped with the oldest scheme...
+        wrap_private_key_with(&mut identity, &password, &Argon2::default());
+        // ...in a file that claims the current parameters.
+        identity.argon_params = Some(ArgonParams {
+            m_cost_kib: 65536,
+            t_cost: 3,
+            p_cost: 4,
+            output_len: KEY_SIZE as u32,
+        });
+
+        // Opening this anyway — by quietly re-deriving with other parameters —
+        // is what made unlock time reveal which configuration protects the key.
+        // A recorded parameter set that does not work is a failure, full stop.
+        assert!(
+            identity.decrypt(&password).is_err(),
+            "decrypt fell back to parameters other than the recorded ones"
+        );
+    }
+
+    #[test]
+    fn absurd_stored_argon_params_are_refused() {
+        let mut identity = Identity::new_with_plaintext("Hostile File".to_string()).unwrap();
+        let password = test_password();
+        identity.encrypt(&password).unwrap();
+
+        // 2 GiB of Argon2 memory. The RFC allows it, so `Params::new` is happy;
+        // honouring it would have unlock allocate 2 GiB from a file the app
+        // never wrote. Now that stored parameters are the only ones tried, they
+        // are the only thing standing between a corrupt file and that
+        // allocation.
+        identity.argon_params.as_mut().unwrap().m_cost_kib = 2 * 1024 * 1024;
+
+        let err = identity
+            .decrypt(&password)
+            .expect_err("out-of-range parameters must be refused");
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected a parameter-range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_predating_stored_params_still_opens_default_scheme() {
+        let mut identity = Identity::new_with_plaintext("Oldest User".to_string()).unwrap();
+        let original_pem = identity.private_key_pem_plaintext.clone().unwrap();
+        let password = test_password();
+        wrap_private_key_with(&mut identity, &password, &Argon2::default());
+        assert!(identity.argon_params.is_none());
+
+        identity
+            .decrypt(&password)
+            .expect("legacy identity must open");
+        assert_eq!(identity.private_key_pem_plaintext.unwrap(), original_pem);
+    }
+
+    #[test]
+    fn identity_predating_stored_params_still_opens_strict_scheme() {
+        let mut identity = Identity::new_with_plaintext("Interim User".to_string()).unwrap();
+        let original_pem = identity.private_key_pem_plaintext.clone().unwrap();
+        let password = test_password();
+        wrap_private_key_with(&mut identity, &password, &strict_argon());
+        assert!(identity.argon_params.is_none());
+
+        identity
+            .decrypt(&password)
+            .expect("legacy identity must open");
+        assert_eq!(identity.private_key_pem_plaintext.unwrap(), original_pem);
+    }
+
+    #[test]
+    fn wrong_password_on_a_legacy_identity_still_fails() {
+        let mut identity = Identity::new_with_plaintext("Oldest User".to_string()).unwrap();
+        let password = test_password();
+        wrap_private_key_with(&mut identity, &password, &Argon2::default());
+
+        assert!(identity.decrypt(&test_password()).is_err());
     }
 
     #[test]
