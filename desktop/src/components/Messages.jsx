@@ -218,6 +218,14 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [contact && contact.id, contact && contact.messages.length]);
+  // Which file cards are currently previewable. Keying the effect on this —
+  // rather than on the message count — means a card that becomes eligible
+  // without the thread growing (it gains a path, or finishes) still gets its
+  // thumbnail. `requested` keeps repeat evaluations idempotent.
+  const previewKey = (contact ? contact.messages.slice(-shown) : [])
+    .filter((m) => m.kind === "file")
+    .map((m) => `${m.id}:${m.hasPath ? 1 : 0}:${m.progress}`)
+    .join(",");
   useEffect(() => {
     if (!contact) return;
     const want = contact.messages
@@ -236,7 +244,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       if (!cancelled) setPreviews((p) => ({ ...p, ...updates }));
     })();
     return () => { cancelled = true; };
-  }, [contact && contact.id, contact && contact.messages.length, shown]);
+  }, [contact && contact.id, previewKey, shown]);
 
   const openFile = (m) => api.openFile(contact.id, m.id, false).catch(() => {});
   const revealFile = (m) => api.openFile(contact.id, m.id, true).catch(() => {});
