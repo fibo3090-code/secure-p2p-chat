@@ -44,6 +44,14 @@ predate tagged releases.
   alone), and that costs nothing in secrecy — the absence of the field is
   already visible in the file. Closes #33.
 
+- **Identity files can no longer demand unbounded work at unlock.** Argon2
+  cost parameters read from `identity.json` are now checked against
+  application limits (1 GiB memory, t≤16, p≤16) before use. The RFC's own
+  limits run to terabytes, so a corrupted or hostile file could previously
+  make unlock allocate gigabytes — and with recorded parameters now
+  authoritative, nothing else would have caught it. The bounds sit far above
+  what the app writes (64 MiB, t=3, p=4).
+
 ## [1.13.0] - 2026-07-21
 
 ### Added

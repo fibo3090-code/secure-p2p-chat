@@ -30,6 +30,21 @@ use zeroize::Zeroizing;
 // Constants for encryption
 const KEY_SIZE: usize = 32; // 256-bit key
 
+/// Upper bounds on the Argon2 cost parameters this app will honour from an
+/// identity file. `Params::new` enforces only the RFC's own limits, which run
+/// to terabytes of memory, so a corrupted or hostile `identity.json` could
+/// otherwise turn an unlock into a multi-gigabyte allocation — and since the
+/// recorded parameters are the only ones tried, nothing else would catch it.
+///
+/// These sit far above anything the app writes (64 MiB, t=3, p=4), so a future
+/// release can raise its own costs without tripping them. There is deliberately
+/// no *lower* bound: weak parameters only weaken the file that carries them,
+/// and a floor would reject parameter sets a future release might legitimately
+/// choose.
+const MAX_ARGON_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+const MAX_ARGON_T_COST: u32 = 16;
+const MAX_ARGON_P_COST: u32 = 16;
+
 /// User identity with RSA key pair
 ///
 /// SECURITY: Private keys are wrapped in Zeroizing to ensure they are
@@ -326,6 +341,17 @@ impl Identity {
         let wrong_password = || anyhow!("Decryption failed (likely wrong password)");
 
         if let Some(ap) = &self.argon_params {
+            if ap.m_cost_kib > MAX_ARGON_M_COST_KIB
+                || ap.t_cost > MAX_ARGON_T_COST
+                || ap.p_cost > MAX_ARGON_P_COST
+            {
+                return Err(anyhow!(
+                    "Stored Argon2 parameters are out of range (m={} KiB, t={}, p={})",
+                    ap.m_cost_kib,
+                    ap.t_cost,
+                    ap.p_cost
+                ));
+            }
             let params = Params::new(
                 ap.m_cost_kib,
                 ap.t_cost,
@@ -1094,6 +1120,28 @@ mod tests {
         assert!(
             identity.decrypt(&password).is_err(),
             "decrypt fell back to parameters other than the recorded ones"
+        );
+    }
+
+    #[test]
+    fn absurd_stored_argon_params_are_refused() {
+        let mut identity = Identity::new_with_plaintext("Hostile File".to_string()).unwrap();
+        let password = test_password();
+        identity.encrypt(&password).unwrap();
+
+        // 2 GiB of Argon2 memory. The RFC allows it, so `Params::new` is happy;
+        // honouring it would have unlock allocate 2 GiB from a file the app
+        // never wrote. Now that stored parameters are the only ones tried, they
+        // are the only thing standing between a corrupt file and that
+        // allocation.
+        identity.argon_params.as_mut().unwrap().m_cost_kib = 2 * 1024 * 1024;
+
+        let err = identity
+            .decrypt(&password)
+            .expect_err("out-of-range parameters must be refused");
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected a parameter-range error, got: {err}"
         );
     }
 
