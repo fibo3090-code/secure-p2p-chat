@@ -162,6 +162,7 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::chats::delete_chat,
         commands::chats::open_file,
         commands::chats::file_preview,
+        commands::chats::open_url,
         commands::contacts::list_contacts,
         commands::contacts::remove_contact,
         commands::contacts::block_contact,

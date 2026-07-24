@@ -162,6 +162,12 @@ fn fresh_identity_requires_password_setup() {
         ("pick_download_dir", json!({})),
         ("my_invite_link", json!({})),
         ("set_locked", json!({ "locked": true })),
+        (
+            "open_file",
+            json!({ "id": "x", "msg": "y", "reveal": false }),
+        ),
+        ("file_preview", json!({ "id": "x", "msg": "y" })),
+        ("open_url", json!({ "url": "https://example.invalid" })),
     ] {
         let err = h.ipc(cmd, args).expect_err(cmd);
         assert_eq!(
@@ -230,6 +236,13 @@ fn frontend_payload_keys_bind_to_command_args() {
         ("rename_chat", json!({ "id": uuid, "title": "T" })),
         ("delete_chat", json!({ "id": uuid })),
         (
+            "open_file",
+            json!({ "id": uuid, "msg": uuid, "reveal": false }),
+        ),
+        ("file_preview", json!({ "id": uuid, "msg": uuid })),
+        // A non-web scheme so the args bind but nothing is ever launched.
+        ("open_url", json!({ "url": "ftp://example.invalid/x" })),
+        (
             "confirm_fingerprint",
             json!({ "id": uuid, "accept": false }),
         ),
@@ -282,6 +295,27 @@ fn frontend_payload_keys_bind_to_command_args() {
         h.ipc_binds(cmd, json!({})).unwrap_or_else(|e| {
             panic!("no-arg command `{cmd}` failed: {e}");
         });
+    }
+}
+
+/// Message text comes from the peer, so `open_url` must launch nothing but
+/// plain web URLs — `file:`, `smb:` and custom app schemes have to be refused
+/// before anything reaches the OS. Only the rejected half is exercised here:
+/// a valid https URL would spawn a real browser under the test runner.
+#[test]
+fn open_url_rejects_non_web_schemes() {
+    let h = ready_harness();
+    for url in [
+        "file:///etc/passwd",
+        "smb://host/share",
+        "javascript:alert(1)",
+        "p2pem://whatever",
+        "HTTPS-but-not-really://example.com",
+    ] {
+        let err = h
+            .ipc("open_url", json!({ "url": url }))
+            .expect_err(&format!("`{url}` was accepted"));
+        assert_eq!(err_text(&err), "Only http(s) links can be opened");
     }
 }
 

@@ -354,6 +354,27 @@ pub(crate) async fn file_preview(
     )))
 }
 
+/// Open an http(s) link from a message in the system browser. The scheme is
+/// whitelisted here — message text comes from the peer, and anything except
+/// plain web URLs (file:, smb:, custom app schemes, …) must not launch.
+#[tauri::command]
+pub(crate) async fn open_url(url: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("Only http(s) links can be opened".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", &url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub(crate) async fn rename_chat(
     id: String,
