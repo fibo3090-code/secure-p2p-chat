@@ -30,6 +30,20 @@ predate tagged releases.
   conversation list shows when the last message arrived (time today, weekday
   within a week, date otherwise).
 
+### Security
+
+- **Unlock no longer reveals how the identity file is protected.**
+  `Identity::decrypt` used to try up to three Argon2 configurations in turn —
+  the parameters recorded in the file, then two older defaults — so an unlock
+  cost one, two or three ~1 s derivations depending on how the file happened to
+  be written. Anyone able to time the unlock locally learned which
+  configuration protects the private key, which narrows an offline attack on a
+  stolen identity file. Recorded parameters are now the only ones tried: one
+  derivation, and a failure is a failure. Files written before the parameters
+  were recorded still open (the two historical schemes are tried for them
+  alone), and that costs nothing in secrecy — the absence of the field is
+  already visible in the file. Closes #33.
+
 ## [1.13.0] - 2026-07-21
 
 ### Added
