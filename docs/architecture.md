@@ -10,7 +10,8 @@ server, and the desktop shell can share code (see `docs/platform_spec.md`):
 ```text
 core/             messenger-core   — crypto, wire protocol, identity, transport, shared types,
                                      and the Party application protocol (core::party)
-client/           p2pem-classic — the unified app (egui GUI + ratatui TUI) and its binary
+client/           p2pem-classic — the app core (ChatManager, PartyManager, persistence)
+                                     plus the ratatui TUI binary. No GUI toolkit.
 server/           messenger-server  — the Party server (TCP listener, state, dispatcher, hub)
 desktop/src-tauri p2pem-desktop     — the Tauri 2 desktop shell that bridges the same
                                      ChatManager/PartyManager to a React/Vite web UI (desktop/src/)
@@ -19,19 +20,20 @@ desktop/src-tauri p2pem-desktop     — the Tauri 2 desktop shell that bridges t
 `client` depends on `core` and re-exports it (`pub use messenger_core::*;`), so the
 client modules and integration tests reach core types via the usual paths. The
 `p2pem-desktop` crate depends on `client` (for the managers) and wraps them in
-`#[tauri::command]`s. The client crate/binary is named `p2pem-classic`
-(packaging is unchanged; the release pipeline still ships that egui binary — the
-Tauri app is run from source during development). Bare `cargo build`/`test`/`run`
+`#[tauri::command]`s. The client crate/binary is still named `p2pem-classic` for
+continuity, but it is now the *terminal* client; the release pipeline ships the
+Tauri app as the primary product and the client binary as a secondary tool
+archive. Bare `cargo build`/`test`/`run`
 target the client via `default-members`; CI builds the whole workspace with
 `--workspace` (installing the WebKitGTK system libraries the desktop crate needs).
 
 ## High-Level Shape
 
 ```text
-GUI (egui)   TUI (ratatui)   Tauri desktop (React webview)
-     \            |            /
-      \           |           / #[tauri::command] + events (desktop/src-tauri)
-       v          v          v
+TUI (ratatui)      Tauri desktop (React webview)
+       \                    /
+        \                  / #[tauri::command] + events (desktop/src-tauri)
+         v                v
               ChatManager
                   |
   -------------------------------------
@@ -39,7 +41,17 @@ GUI (egui)   TUI (ratatui)   Tauri desktop (React webview)
 network   core    identity  transfer  persistence
 ```
 
-The project is centered around `ChatManager`, which coordinates chats, contacts, sessions, file-transfer state, toasts, and persistence. All three front-ends drive the same `ChatManager` (and `PartyManager`) instance — the egui GUI and TUI hold `Arc<Mutex<ChatManager>>` directly; the Tauri desktop shell wraps the same `Arc<Mutex<…>>` behind commands and events.
+The project is centered around `ChatManager`, which coordinates chats, contacts,
+sessions, file-transfer state, toasts, and persistence. Both front-ends drive the
+same `ChatManager` (and `PartyManager`) instance — the TUI holds
+`Arc<Mutex<ChatManager>>` directly; the Tauri desktop shell wraps the same
+`Arc<Mutex<…>>` behind commands and events.
+
+`ChatManager` has **no UI dependencies at all**, which is what made deleting the
+egui GUI a packaging change rather than a rewrite. The one thing it cannot know
+on its own is what the user can see, so the shell pushes that down via
+`set_ui_presence(focused, active_chat)`; without it, "notify when a message
+arrives in the background" would fire for the conversation on screen.
 
 ## Directory Structure
 
@@ -64,10 +76,11 @@ core/src/
     receiver.rs
 
 client/src/
-  main.rs         entry point for GUI/TUI launch
+  main.rs         entry point: terminal UI + relay-server mode
   lib.rs          client exports; re-exports messenger-core
   support.rs      diagnostics export and panic/crash support
-  colorgrid.rs    fingerprint color-grid rendering (egui Color32)
+  logbuf.rs       bounded in-process tracing buffer (log overlay + diagnostics)
+  colorgrid.rs    fingerprint safety-grid colours as plain (r,g,b) — toolkit-agnostic
   app/
     chat_manager/   ChatManager split by concern:
       mod.rs          struct, constructor, accessors, toasts, data deletion
@@ -221,11 +234,7 @@ desktop/
 ### `client/src/app/party_manager.rs`
 
 - client-side Party state: connect/join, post, DMs, channel creation, history
-  fetch, and event polling for the GUI/TUI Party surfaces
-
-### `client/src/gui/`
-
-- egui interface, dialogs, state presentation, and log/help UI
+  fetch, and event polling for the Communities surfaces
 
 ### `client/src/tui/`
 
@@ -246,10 +255,15 @@ desktop/
 - runs a background poll loop that drains toasts → `toast` events, fingerprint
   requests → `fingerprint-request`, and party events → `party-updated`, **and
   persists encrypted history** (on state change, after mutations, and on window
-  close) — the egui GUI's per-frame polling equivalent
-- resolves its **own** data dir from `ProjectDirs("com","chat-p2p","P2PEM")` (not
-  egui's `"EncryptedMessenger"`), with a `P2PEM_DATA_DIR` override, so the desktop
-  app is a distinct identity/peer rather than a self-connection to a running egui
+  close)
+- resolves its **own** data dir from `ProjectDirs("com","chat-p2p","P2PEM")` —
+  distinct from the terminal client's `"EncryptedMessenger"` — with a
+  `P2PEM_DATA_DIR` override, so the two apps are separate peers on one machine
+  (which is what lets you connect them to each other for testing) rather than a
+  self-connection racing on one `history.json.enc`
+- is covered by an IPC-level test suite (`desktop/src-tauri/src/tests.rs`) that
+  drives the real handlers through Tauri's mock runtime; CI runs it on Linux and
+  macOS (see `SECURITY.md` for why Windows is skipped)
 
 ### `desktop/src/` (the React web UI)
 
@@ -270,8 +284,16 @@ desktop/
 
 These are real limitations, not hidden assumptions:
 
-- relay-assisted WAN transport exists, but GUI configuration and broader operational polish are still limited
+- relay-assisted WAN transport exists, but every WAN path still requires someone to self-host (port forward, UPnP, or a relay)
+- direct P2P has **no offline delivery**: both peers must be online at once. Only the community server buffers history
 - discovery subsystem is optional and not privacy-neutral
-- three front-ends (egui, ratatui, Tauri/React desktop) share backend state but not identical UX depth; the Tauri desktop app is meant to replace egui but the release pipeline still ships the egui binary, so both coexist during the migration
-- the desktop crate has no automated tests and cannot be driven headlessly here — it is verified via `cargo check -p p2pem-desktop` and `npm run build`, not the workspace test suite
+- two front-ends (Tauri/React desktop, ratatui TUI) share backend state but not identical UX depth; the desktop app is the product and the TUI is for headless/terminal use
+- the desktop crate's *bridge* is tested over mock IPC, but the webview itself cannot be driven headlessly here — rendering is verified by `npm run build` + `npm test` over the frontend's pure logic
+- there is no mobile client
+- **history writes are O(total history) per change.** The whole `HistoryFile` is
+  re-serialized, encrypted, and rewritten whenever the conversation surface
+  changes, which for an active chat means once per message. Compact JSON keeps
+  the constant factor down, and the write is atomic + `fsync`ed, but the cost
+  still grows with history size and there is no retention policy or incremental
+  format. A per-conversation or append-only store is the real fix
 - persistence and migration are practical, but still lightweight rather than enterprise-grade

@@ -4,7 +4,7 @@ import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
 import { cx, Avatar } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
-import { LockScreen, SetPasswordScreen } from "./components/Onboarding.jsx";
+import { BootScreen, LockScreen, SetPasswordScreen, BackupPrompt } from "./components/Onboarding.jsx";
 import { Creator } from "./components/Creator.jsx";
 import { Verify } from "./components/Verify.jsx";
 import { Contacts } from "./components/Contacts.jsx";
@@ -56,8 +56,19 @@ function ThemeMenu({ theme, setTheme }) {
   );
 }
 
+// Backoff for the startup `auth_status` handshake: quick first retries so a
+// slow bridge is invisible, then back off so a hard failure doesn't spin.
+const BOOT_RETRY_MS = [400, 800, 1600, 3200, 6400, 10000];
+
 export default function App() {
   const [auth, setAuth] = useState(null);
+  // Boot state. `auth === null` used to render nothing at all, so a single
+  // failed or slow `auth_status` left a permanently blank window with no
+  // message, no spinner and no recovery. Now the failure is visible and retried.
+  const [bootError, setBootError] = useState("");
+  const [bootAttempt, setBootAttempt] = useState(0);
+  // Shown once, right after a new identity is created.
+  const [backupPrompt, setBackupPrompt] = useState(false);
   const [theme, setThemeState] = useState(loadTheme());
   const [nav, setNav] = useState("chats");
   const [convs, setConvs] = useState([]);
@@ -70,16 +81,23 @@ export default function App() {
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [infoTarget, setInfoTarget] = useState(null);
-  // Unread bookkeeping: per-conversation message counts already seen (null until
-  // seeded from the first list load), plus a ref mirror of the active id so the
-  // event-driven refresh never reads a stale closure.
-  const seenRef = useRef(null);
+  // Unread is computed by the bridge from a read mark persisted inside the
+  // encrypted history, so a message that arrived while the app was closed is
+  // still unread on the next launch. The refs mirror the open conversation and
+  // visibility so the event-driven refresh never reads a stale closure.
   const activeIdRef = useRef(null);
+  const visibleRef = useRef(true);
   const [transfers, setTransfers] = useState([]);
   const [partyUnread, setPartyUnread] = useState(0);
   // Conversation lock: when on, no new peer can connect (listener stopped,
   // auto-rehost paused). Existing sessions keep running.
   const [locked, setLockedState] = useState(false);
+  // Does the user actually have the window in front of them? Pushed down to the
+  // bridge so "notify when a message arrives in the background" means it.
+  // `visible` is tracked separately because it is the far more reliable of the
+  // two signals — see the effect below.
+  const [focused, setFocused] = useState(true);
+  const [visible, setVisible] = useState(true);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
 
@@ -89,29 +107,81 @@ export default function App() {
   }, [theme]);
 
   const refreshAuth = useCallback(async () => {
-    try { setAuth(await api.authStatus()); } catch { /* bridge not ready */ }
+    const status = await api.authStatus();
+    setAuth(status);
+    setBootError("");
+    return status;
   }, []);
-  useEffect(() => { refreshAuth(); }, [refreshAuth]);
+
+  // Keep trying until the bridge answers. Every failure is shown, so the user
+  // knows the app is working on it rather than staring at an empty window.
+  useEffect(() => {
+    if (auth) return undefined;
+    let cancelled = false;
+    let timer;
+    (async () => {
+      try {
+        await refreshAuth();
+      } catch (e) {
+        if (cancelled) return;
+        setBootError(String(e?.message || e) || "The backend did not respond.");
+        const delay = BOOT_RETRY_MS[Math.min(bootAttempt, BOOT_RETRY_MS.length - 1)];
+        timer = setTimeout(() => !cancelled && setBootAttempt((n) => n + 1), delay);
+      }
+    })();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [auth, bootAttempt, refreshAuth]);
+
+  // Window focus + visibility, tracked separately because they are trusted
+  // differently:
+  //
+  // - `visible` (visibilityState) is reliable across webviews and is what gates
+  //   clearing unread. If it were gated on focus instead, a webview that
+  //   under-reports `hasFocus()` would leave conversations badged forever —
+  //   a worse failure than an occasional extra notification.
+  // - `focused` (visible AND hasFocus) is what the notification gate uses:
+  //   suppressing a popup needs *more* confidence that the user is looking.
+  useEffect(() => {
+    const update = () => {
+      const vis = document.visibilityState === "visible";
+      const foc = vis && document.hasFocus();
+      visibleRef.current = vis;
+      setVisible(vis);
+      setFocused(foc);
+    };
+    update();
+    window.addEventListener("focus", update);
+    window.addEventListener("blur", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.removeEventListener("focus", update);
+      window.removeEventListener("blur", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, []);
 
   const ready = auth?.state === "ready";
+
+  // Tell the bridge what is on screen. ChatManager owns no window handle, so
+  // without this it cannot tell a background message from one the user is
+  // reading right now.
+  useEffect(() => {
+    if (!ready) return;
+    api.setPresence(focused, activeId).catch(() => {});
+  }, [ready, focused, activeId]);
 
   const refresh = useCallback(async () => {
     if (!ready) return;
     try {
       const list = await api.listConversations();
-      // Unread bookkeeping (mirrors the TUI): seed the per-conversation "seen"
-      // counts on first load so old history never shows as unread, keep the open
-      // conversation always read, and badge anything beyond the seen count.
-      if (seenRef.current === null) {
-        seenRef.current = Object.fromEntries(list.map((c) => [c.id, c.messages ?? 0]));
-      }
-      const seen = seenRef.current;
+      // `unread` comes from the bridge (a persisted read mark), so it is already
+      // correct across restarts. The only local adjustment is optimistic: the
+      // conversation the user is looking at right now reads as zero immediately,
+      // instead of flashing a badge until `mark_read` round-trips.
       const cur = activeIdRef.current;
-      if (cur) {
-        const act = list.find((c) => c.id === cur);
-        if (act) seen[cur] = act.messages ?? 0;
-      }
-      setConvs(list.map((c) => ({ ...c, unread: Math.max(0, (c.messages ?? 0) - (seen[c.id] ?? 0)) })));
+      setConvs(list.map((c) => (
+        c.id === cur && visibleRef.current ? { ...c, unread: 0 } : c
+      )));
       // Live file-transfer progress, shown in the chat pane.
       api.listTransfers().then(setTransfers).catch(() => {});
       // Surface any pending TOFU prompt even if its one-shot event was missed.
@@ -142,7 +212,28 @@ export default function App() {
     return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
   }, [ready, refresh]);
 
-  if (!auth) return null;
+  // Clear the read mark for the conversation the user is actually looking at.
+  // Keyed on that conversation's message count so an arrival in the open chat
+  // is marked read too, without firing on every idle poll.
+  const activeMessages = convs.find((c) => c.id === activeId)?.messages ?? 0;
+  useEffect(() => {
+    if (!ready || !activeId || !visible) return;
+    api.markRead(activeId).catch(() => {});
+  }, [ready, activeId, visible, activeMessages]);
+
+  if (!auth) {
+    return (
+      <BootScreen error={bootError} retrying={!bootError}
+        onRetry={() => { setBootError(""); setBootAttempt((n) => n + 1); }} />
+    );
+  }
+
+  // Startup found an identity file it could not read. The backend refuses to
+  // replace it (that would abandon the user's history and their contacts'
+  // trust), so there is nothing to retry — explain and stop.
+  if (auth.state === "error") {
+    return <BootScreen fatal error={auth.error || "The identity could not be loaded."} />;
+  }
 
   if (auth.state === "unlock") {
     return <LockScreen onUnlock={async (pw) => {
@@ -150,9 +241,22 @@ export default function App() {
     }} />;
   }
   if (auth.state === "set_password") {
-    return <SetPasswordScreen fingerprint={auth.fingerprint} onSet={async (pw) => {
-      try { await api.setPassword(pw); await refreshAuth(); return ""; } catch (e) { return String(e); }
-    }} />;
+    return <SetPasswordScreen fingerprint={auth.fingerprint} minLength={auth.min_password_len}
+      onSet={async (pw) => {
+        try {
+          await api.setPassword(pw);
+          await refreshAuth();
+          // A brand-new identity is exactly when a backup matters and exactly
+          // when nobody thinks to make one — so ask here, once, with the action
+          // attached rather than only a warning that it can't be reset.
+          setBackupPrompt(true);
+          return "";
+        } catch (e) { return String(e); }
+      }} />;
+  }
+  if (backupPrompt) {
+    return <BackupPrompt onSkip={() => setBackupPrompt(false)}
+      onExport={() => api.exportIdentity()} />;
   }
 
   const contacts = convs.map(summaryToConv);
@@ -161,13 +265,10 @@ export default function App() {
   async function openConv(id) {
     setActiveId(id);
     activeIdRef.current = id;
-    // Opening a conversation reads it: sync the seen count and clear its badge
-    // immediately (the next poll would do it anyway, this avoids a flicker).
-    if (seenRef.current) {
-      const c = convs.find((x) => x.id === id);
-      if (c) seenRef.current[id] = c.messages ?? 0;
-    }
+    // Opening a conversation reads it. Clear the badge locally for an instant
+    // response; `mark_read` persists it so the badge stays cleared next launch.
     setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, unread: 0 } : c)));
+    api.markRead(id).catch(() => {});
     setNav("chats");
     // Drafts are per-conversation: clear on switch so unsent text can't follow
     // the user into another thread and be sent to the wrong recipient.
@@ -251,7 +352,12 @@ export default function App() {
             <RailBtn icon="settings" label="Settings" active={nav === "settings"} onClick={() => setNav("settings")} />
           </div>
           <div className="rail-foot">
-            <button className="rail-id" title={auth.name}><Avatar name={auth.name} size={34} /></button>
+            <button className={cx("rail-id", nav === "settings" && "is-active")}
+              title={`${auth.name} — open your identity settings`}
+              aria-label={`${auth.name} — open your identity settings`}
+              onClick={() => setNav("settings")}>
+              <Avatar name={auth.name} size={34} />
+            </button>
           </div>
         </nav>
 

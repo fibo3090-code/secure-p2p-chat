@@ -49,6 +49,15 @@ fn fresh_bridge(dir: &std::path::Path) -> Bridge {
         is_new: StdMutex::new(true),
         force_setup: StdMutex::new(true),
         pending_fp: Arc::new(StdMutex::new(None)),
+        init_error: None,
+    }
+}
+
+/// A bridge that failed to read an existing identity at startup.
+fn broken_identity_bridge(dir: &std::path::Path) -> Bridge {
+    Bridge {
+        init_error: Some("identity file could not be read".to_string()),
+        ..fresh_bridge(dir)
     }
 }
 
@@ -85,8 +94,11 @@ fn harness() -> Harness {
 /// A harness that has completed password setup and is fully "ready".
 fn ready_harness() -> Harness {
     let h = harness();
-    h.ipc("set_password", json!({ "password": "test-pass" }))
-        .expect("set_password");
+    h.ipc(
+        "set_password",
+        json!({ "password": "bridge-test-passphrase" }),
+    )
+    .expect("set_password");
     h
 }
 
@@ -129,6 +141,46 @@ impl Harness {
     }
 }
 
+impl Harness {
+    /// Seed a conversation holding `incoming` peer messages, as if they had
+    /// arrived over the wire. Returns the chat id.
+    fn seed_chat_with_incoming(&self, title: &str, incoming: usize) -> uuid::Uuid {
+        use tauri::Manager;
+        let id = uuid::Uuid::new_v4();
+        let bridge = self._app.state::<Bridge>();
+        let manager = bridge.manager.clone();
+        tauri::async_runtime::block_on(async move {
+            let mut mgr = manager.lock().await;
+            mgr.create_local_chat_for_test(id, title.to_string());
+            if let Some(chat) = mgr.get_chat_mut(id) {
+                for _ in 0..incoming {
+                    chat.messages.push(messenger_core::types::Message {
+                        id: uuid::Uuid::new_v4(),
+                        from_me: false,
+                        content: messenger_core::types::MessageContent::Text {
+                            text: "hi".to_string(),
+                        },
+                        timestamp: chrono::Utc::now(),
+                        delivered: false,
+                    });
+                }
+            }
+        });
+        id
+    }
+
+    /// The `unread` field the conversation list reports for a chat.
+    fn unread_of(&self, id: uuid::Uuid) -> u64 {
+        let list = self.ipc("list_conversations", json!({})).unwrap();
+        list.as_array()
+            .expect("list")
+            .iter()
+            .find(|c| c["id"] == id.to_string())
+            .and_then(|c| c["unread"].as_u64())
+            .expect("conversation missing from the list")
+    }
+}
+
 fn err_text(e: &Value) -> &str {
     e.as_str().unwrap_or_default()
 }
@@ -153,6 +205,8 @@ fn fresh_identity_requires_password_setup() {
     for (cmd, args) in [
         ("get_settings", json!({})),
         ("list_conversations", json!({})),
+        ("mark_read", json!({ "id": "x" })),
+        ("set_presence", json!({ "focused": true, "chat": null })),
         ("list_contacts", json!({})),
         ("start_host", json!({ "port": 0, "password": null })),
         ("send_message", json!({ "id": "x", "text": "hi" })),
@@ -178,12 +232,87 @@ fn fresh_identity_requires_password_setup() {
     }
 
     // Setup completes → the same surface opens up.
-    h.ipc("set_password", json!({ "password": "test-pass" }))
-        .unwrap();
+    h.ipc(
+        "set_password",
+        json!({ "password": "bridge-test-passphrase" }),
+    )
+    .unwrap();
     let status = h.ipc("auth_status", json!({})).unwrap();
     assert_eq!(status["state"], "ready");
     let settings = h.ipc("get_settings", json!({})).unwrap();
     assert_eq!(settings["listen_port"], 12345);
+}
+
+/// The password floor is enforced by the core, not merely suggested by the UI —
+/// a frontend that skipped its own validation must still be refused, and the
+/// error has to be specific enough to show the user.
+#[test]
+fn set_password_enforces_the_length_floor() {
+    let h = harness();
+    let min = messenger_core::MIN_PASSWORD_LEN;
+    let short = "a".repeat(min - 1);
+    let err = h
+        .ipc("set_password", json!({ "password": short }))
+        .expect_err("a short password was accepted");
+    assert!(
+        err_text(&err).contains("at least"),
+        "unhelpful error for a short password: {}",
+        err_text(&err)
+    );
+    // The rejection must not half-apply: setup is still pending.
+    assert_eq!(
+        h.ipc("auth_status", json!({})).unwrap()["state"],
+        "set_password"
+    );
+
+    h.ipc("set_password", json!({ "password": "a".repeat(min) }))
+        .expect("an acceptable password was refused");
+    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
+}
+
+/// An identity file that exists but cannot be read must surface as a distinct
+/// terminal state — **never** as `set_password`, which would invite the user to
+/// create a new identity right over the one that failed to load, abandoning
+/// their history and their contacts' verified fingerprint.
+#[test]
+fn unreadable_identity_reports_an_error_state_and_gates_everything() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness_with(broken_identity_bridge(dir.path()), dir);
+
+    let status = h.ipc("auth_status", json!({})).unwrap();
+    assert_eq!(status["state"], "error");
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read"),
+        "the reason must reach the user: {status}"
+    );
+
+    // Nothing may run in this state — least of all set_password.
+    for (cmd, args) in [
+        ("set_password", json!({ "password": "a-long-enough-pass" })),
+        ("get_settings", json!({})),
+        ("list_conversations", json!({})),
+        ("export_identity", json!({})),
+        ("set_display_name", json!({ "name": "Eve" })),
+    ] {
+        let err = h.ipc(cmd, args).expect_err(cmd);
+        assert!(
+            err_text(&err).contains("could not be read"),
+            "command `{cmd}` ran with a broken identity: {}",
+            err_text(&err)
+        );
+    }
+}
+
+/// The screen reads the floor from the bridge rather than hardcoding one, so
+/// `auth_status` has to report it.
+#[test]
+fn auth_status_publishes_the_password_floor() {
+    let h = harness();
+    let status = h.ipc("auth_status", json!({})).unwrap();
+    assert_eq!(status["min_password_len"], messenger_core::MIN_PASSWORD_LEN);
 }
 
 #[test]
@@ -191,7 +320,7 @@ fn locked_identity_requires_unlock() {
     let dir = tempfile::tempdir().expect("tempdir");
     // An identity that already has a password, as saved by a previous run.
     let mut identity = Identity::new_with_plaintext("Tester".to_string()).expect("identity");
-    identity.encrypt("right-password").expect("encrypt");
+    identity.encrypt("right-password-1234").expect("encrypt");
     let mut bridge = fresh_bridge(dir.path());
     identity.save(&bridge.identity_path).expect("save identity");
     bridge.identity = Arc::new(StdMutex::new(identity));
@@ -209,7 +338,7 @@ fn locked_identity_requires_unlock() {
     assert_eq!(err_text(&err), "Wrong password");
     assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
 
-    h.ipc("unlock", json!({ "password": "right-password" }))
+    h.ipc("unlock", json!({ "password": "right-password-1234" }))
         .expect("unlock");
     assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
 }
@@ -246,6 +375,9 @@ fn frontend_payload_keys_bind_to_command_args() {
             "confirm_fingerprint",
             json!({ "id": uuid, "accept": false }),
         ),
+        ("mark_read", json!({ "id": uuid })),
+        ("set_presence", json!({ "focused": true, "chat": uuid })),
+        ("set_presence", json!({ "focused": false, "chat": null })),
         ("remove_contact", json!({ "id": uuid })),
         ("block_contact", json!({ "id": uuid })),
         ("unblock_contact", json!({ "id": uuid })),
@@ -474,4 +606,73 @@ fn conversation_commands_reject_unknown_ids() {
     // Malformed UUIDs are a parse error, never a panic.
     h.ipc("get_conversation", json!({ "id": "not-a-uuid" }))
         .expect_err("parsed a malformed uuid");
+}
+
+// ── Unread accounting ───────────────────────────────────────────────────────
+
+/// The list must report messages the user has never seen as unread, and only
+/// stop doing so once the conversation is explicitly marked read. The previous
+/// frontend derived this from the message count at first load, which silently
+/// marked everything that arrived while the app was closed as already read.
+#[test]
+fn unread_reflects_the_persisted_read_mark() {
+    let h = ready_harness();
+    let id = h.seed_chat_with_incoming("Alice", 3);
+    assert_eq!(h.unread_of(id), 3, "unseen peer messages must badge");
+
+    h.ipc("mark_read", json!({ "id": id.to_string() }))
+        .expect("mark_read");
+    assert_eq!(h.unread_of(id), 0);
+
+    // A later arrival badges again, from the mark — not from zero.
+    let bridge_manager = {
+        use tauri::Manager;
+        h._app.state::<Bridge>().manager.clone()
+    };
+    tauri::async_runtime::block_on(async {
+        let mut mgr = bridge_manager.lock().await;
+        if let Some(chat) = mgr.get_chat_mut(id) {
+            chat.messages.push(messenger_core::types::Message {
+                id: uuid::Uuid::new_v4(),
+                from_me: false,
+                content: messenger_core::types::MessageContent::Text {
+                    text: "later".to_string(),
+                },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            });
+        }
+    });
+    assert_eq!(h.unread_of(id), 1);
+}
+
+/// Marking an unknown conversation read is a no-op, not an error: the shell can
+/// race a deletion, and that must not surface as a failure to the user.
+#[test]
+fn mark_read_tolerates_unknown_and_malformed_ids() {
+    let h = ready_harness();
+    h.ipc(
+        "mark_read",
+        json!({ "id": uuid::Uuid::new_v4().to_string() }),
+    )
+    .expect("unknown id should be a no-op");
+    h.ipc("mark_read", json!({ "id": "not-a-uuid" }))
+        .expect_err("malformed id should be rejected");
+}
+
+/// Presence is best-effort telemetry from the shell, so a malformed chat id
+/// must degrade to "nothing open" rather than fail the call.
+#[test]
+fn set_presence_accepts_partial_information() {
+    let h = ready_harness();
+    let id = uuid::Uuid::new_v4().to_string();
+    h.ipc("set_presence", json!({ "focused": true, "chat": id }))
+        .expect("focused with a chat");
+    h.ipc("set_presence", json!({ "focused": false, "chat": null }))
+        .expect("blurred with nothing open");
+    h.ipc(
+        "set_presence",
+        json!({ "focused": true, "chat": "garbage" }),
+    )
+    .expect("a malformed chat id must not fail the call");
 }

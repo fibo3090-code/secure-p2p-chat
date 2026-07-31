@@ -82,22 +82,28 @@ channels and server-routed DMs with offline history catch-up, and persists state
 to an embedded SQLite database. A client can join, chat in channels, DM, and create
 channels via TUI commands and a GUI Party window.
 
-### Current UI — egui + ratatui, plus the new Tauri/React desktop app
+### Current UI — one desktop app (Tauri/React) plus a ratatui TUI
 
-The app ships an **egui/eframe** desktop GUI and a **ratatui** TUI, both driving
-the same `ChatManager` (and `PartyManager`). The egui GUI is a top menu bar +
-status bar + a left "Chats" sidebar + a central panel + a stack of modeless
-dialogs, with the Party experience in a separate floating window.
+The product is **P2PEM Desktop**: the `p2pem-desktop` crate (`desktop/src-tauri`)
+wrapping a **React/Vite** web UI (`desktop/src/`) that realizes the tab-rail /
+list / content shell. It drives `ChatManager` and `PartyManager` through a
+`#[tauri::command]` bridge and covers onboarding, P2P conversations, contacts,
+invites, fingerprint verification, relays, the Party/Communities surface,
+settings, and toasts. The stack landed as React rather than the
+originally-planned SolidJS (see §10).
 
-The **§10 rewrite has shipped** as a fourth crate, `p2pem-desktop`
-(`desktop/src-tauri`), wrapping a **React/Vite** web UI (`desktop/src/`) that
-realizes the tab-rail / list / content shell. It drives the same managers through a
-`#[tauri::command]` bridge and reaches feature parity for onboarding, P2P
-conversations, contacts, invites, fingerprint verification, relays, the
-Party/Communities surface, settings, and toasts. It is meant to **replace egui**,
-but the release pipeline still builds the egui binary — so today both GUIs coexist
-and the desktop app is run from source (`cd desktop && npx tauri dev`). The stack
-landed as React rather than the originally-planned SolidJS (see §10).
+A **ratatui** TUI ships alongside it in the `client` binary, for headless boxes
+and terminal users. It drives the same managers.
+
+The **egui/eframe GUI has been deleted** (§10 phase E). Shipping two desktop
+apps meant a customer arriving at the releases page had to guess which to
+install — and the older, less capable one looked like the default. Nothing
+in the workspace depends on egui/eframe any more, which also removed the
+winit/wayland half of the Linux dependency surface. Two capabilities that
+lived in egui-coupled code were rehomed rather than lost: the log collector
+(now `client/src/logbuf.rs`, a bounded `tracing` layer) and the design-token
+drift guard (now `desktop/src/lib/tokens.test.js` for the CSS, plus
+`token_drift_tests` in `client/src/tui/overlays.rs` for the TUI accent).
 
 ### Crate layout — Cargo workspace (done, four crates)
 
@@ -142,7 +148,8 @@ one product:
 ```text
 core/             crypto, protocol/wire types, framing, identity, transport, shared
                   types, and the Party application protocol (core::party). Reused everywhere.
-client/           the unified app: egui GUI + ratatui TUI, ChatManager, PartyManager, persistence.
+client/           app core (ChatManager, PartyManager, persistence, diagnostics) + the
+                  ratatui TUI. No GUI toolkit: the desktop app links this as a library.
 server/           the Party server: TCP listener, PartyState, dispatcher, broadcast hub,
                   persistent identity, SQLite store.
 desktop/src-tauri the Tauri 2 shell (p2pem-desktop): #[tauri::command] bridge + event
@@ -151,10 +158,16 @@ desktop/src-tauri the Tauri 2 shell (p2pem-desktop): #[tauri::command] bridge + 
 
 Relay stays a thin mode (`--relay-server`) alongside `core`.
 
-**Binaries** ship from one repo/release: a default `client` binary (named
-`p2pem-classic`) and the `messenger-server` binary.
-The `p2pem-desktop` binary builds via `cargo tauri build`/`dev` but is not yet in
-the tagged release pipeline (which still ships the egui `client` binary).
+**Binaries** ship from one repo/release, in two clearly-separated tiers:
+
+- **P2PEM Desktop** (`p2pem-desktop`) — *the app*. Built by `tauri-action` into
+  real per-OS installers (`.msi`/`.exe`, `.dmg`, `.deb`/`.AppImage`) and
+  attached as the primary artifacts. The release body leads with a table telling
+  the user which file to take.
+- **P2PEM Tools** — one archive per OS containing the terminal client
+  (`p2pem`, the `p2pem-classic` crate, which also runs a relay via
+  `--relay-server`) and the community server (`p2pem-server`, the
+  `messenger-server` crate). Secondary, and labelled as such.
 
 ### Transport matrix
 
@@ -327,16 +340,17 @@ former interim JSON snapshot is imported once on first load, then superseded.
 
 ## 10. UI Rewrite (Tauri + React) — shipped
 
-> **Status:** shipped as the `p2pem-desktop` crate (`desktop/`). This section is
-> the design of record; the stack notes below record **what actually landed**
-> (React/Vite, not the originally-planned SolidJS) and the phase list marks what is
-> done. What remains is egui retirement and packaging (phases E–F).
+> **Status:** shipped as the `p2pem-desktop` crate (`desktop/`), and now the
+> only desktop app — phases A–F are complete. This section is the design of
+> record; the stack notes below record **what actually landed** (React/Vite, not
+> the originally-planned SolidJS). Phase G (the TUI 3-pane redesign) remains.
 
-The egui GUI is an accumulation, not a design: a top menu bar, a status
-bar, a left "Chats" sidebar, a central panel, a pile of modeless dialogs (the
-dialog file alone is ~84 KB), and — the clearest symptom — the **Party experience
-in a separate floating window**, disconnected from everything else. Users juggle
-two mental models. This rewrite realizes §3's tab-rail vision with a designed UI.
+The egui GUI it replaced was an accumulation, not a design: a top menu bar, a
+status bar, a left "Chats" sidebar, a central panel, a pile of modeless dialogs
+(the dialog file alone was ~84 KB), and — the clearest symptom — the **Party
+experience in a separate floating window**, disconnected from everything else.
+Users juggled two mental models. This rewrite realizes §3's tab-rail vision with
+a designed UI.
 
 ### Target shape — a 3-pane shell
 
@@ -378,11 +392,10 @@ libraries were dropped in favor of hand-rolled components and plain CSS.
 | Build | **Vite 8** + `@vitejs/plugin-react` | `tauri dev`/`tauri build` orchestrate it; `npm run dev`/`build` for frontend-only work. |
 
 **Accepted costs (owned deliberately):** a JS toolchain joined a previously
-pure-Rust repo; the ratatui TUI stays Rust; **packaging is not yet rebuilt** (the
-release pipeline still ships the egui binary — see below); the security surface
-grew by a system webview + IPC (crypto stays in Rust; the CSP in `tauri.conf.json`
-is restrictive, no external hosts). Because egui is not yet deleted, both GUIs
-coexist during the migration.
+pure-Rust repo; the ratatui TUI stays Rust; the security surface grew by a system
+webview + IPC (crypto stays in Rust; the CSP in `tauri.conf.json` is restrictive,
+no external hosts). Packaging has since been rebuilt around `tauri-action`, and
+egui is deleted — so there is one desktop app, not two.
 
 ### The Rust↔web bridge
 
@@ -406,19 +419,20 @@ exposes them to the web UI:
   the `to_plain_bytes`/`from_plain_bytes` symmetry discipline is unaffected.
 
 The rewrite landed as its **own top-level crate** rather than nested under
-`client/` (so the egui `client` binary is untouched during the migration):
+`client/`, which kept the migration reviewable and left the `client` binary
+buildable throughout:
 
 ```text
 core/ (unchanged)
-client/ (egui + ratatui, unchanged)
+client/ (app core + ratatui TUI; egui deleted in phase E)
 desktop/
 ├── src-tauri/   Rust: #[tauri::command] bridge + event pump over client's managers (lib.rs)
 └── src/         React/Vite app: rail / list / content + overlays + CSS design tokens
 ```
 
-`client --tui` opens the ratatui UI and `client` opens the egui GUI; the Tauri
-desktop app is launched separately with `cd desktop && npx tauri dev`. Phase E
-(below) will retire egui; only then does a single `client` launch route to Tauri.
+The `client` binary is the terminal UI (its retired `--gui` flag now exits with a
+pointer to the desktop download rather than silently starting a different
+interface). The desktop app runs with `cd desktop && npx tauri dev`.
 
 ### Visual language (design tokens)
 
@@ -457,34 +471,48 @@ from tonal layering rather than borders or heavy shadows.
 These tokens carry the theme names Light / Dark / Midnight / Forest / Rose as
 CSS custom-property token sets (`desktop/src/app-system.css`, `desktop/src/themes.css`)
 — the plan's Tailwind token system was replaced by plain CSS variables. The same
-theme names exist as `core::types::Theme` (Rust, shared by egui/TUI persistence)
-and as egui `Visuals` builders in `client/src/gui/styling.rs`; the ratatui TUI
+theme names exist as `core::types::Theme` (Rust, for persistence); the ratatui TUI
 does not implement per-theme rendering (terminal color-depth constraints make a
 5-theme TUI disproportionate) but does use the brand accent for theme-neutral
 chrome (active-pane borders, key hints) — see `client/src/tui/overlays.rs`'s
-`BRAND_ACCENT`. There is no automated cross-language token pipeline; a Rust test
-(`client/src/gui/styling.rs`'s `token_drift_tests` module) parses `design/tokens.json`
-and asserts it matches the egui `Visuals` builders, so future drift fails a test instead of
-going unnoticed again.
+`BRAND_ACCENT`.
 
-### Packaging rebuild
+There is no automated cross-language token pipeline, so **two drift guards** keep
+`design/tokens.json` honest against what actually ships:
 
-The current pipeline still assumes one eframe binary named `p2pem-classic`:
-`release.yml` builds `-p p2pem-classic` then hand-rolls Inno Setup
-(`setup.iss`), a macOS `.app`+`.dmg`, and a Linux tarball; `build-and-package.ps1`
-and `setup.iss` hardcode that name. **Done:** `desktop/src-tauri/tauri.conf.json`
-already exists (productName `P2PEM`, identifier `com.chat-p2p.p2pem`, window
-1040×720) with a restrictive CSP, and `ci.yml` builds the desktop crate (WebKitGTK
-deps installed). **Remaining (phase F):** rewrite `release.yml` to install Node +
-Rust and run **`tauri-action`** per-OS (Tauri's own bundler → `.msi`/`.nsis`,
-`.app`/`.dmg`, `.deb`/`.AppImage`), keeping the `on: push: tags: 'v*'` trigger;
-retire `setup.iss` and `build-and-package.ps1`; and add a frontend build/lint job
-to `ci.yml`. Until that lands, releases ship the egui binary.
+- `desktop/src/lib/tokens.test.js` parses the token file and the shipped CSS and
+  asserts every theme's surface ramp, accent, ink, and the semantic colours
+  match — plus that the theme registry and the token file list the same themes.
+- `token_drift_tests` in `client/src/tui/overlays.rs` asserts the TUI's
+  `BRAND_ACCENT` equals `brand.flatAccent`, and that the safety-grid palette
+  (`client/src/colorgrid.rs`) is unchanged — it is a security signal users
+  compare across devices, so it must not drift between versions.
+
+These replace the equivalent Rust guard that lived in the egui theming module
+before phase E removed it.
+
+### Packaging rebuild — done (phase F)
+
+`release.yml` now publishes **one product with one obvious download**:
+
+- `tauri-action` builds P2PEM Desktop per OS with Tauri's own bundler
+  (`.msi`/`.nsis`, `.dmg` for both Apple architectures, `.deb`/`.AppImage`) from
+  `desktop/src-tauri/tauri.conf.json` (productName `P2PEM`, identifier
+  `com.chat-p2p.p2pem`, restrictive CSP). The frontend is rebuilt in the job, so
+  a stale committed `desktop/dist/` can never ship.
+- A secondary **P2PEM Tools** archive per OS carries the terminal client and the
+  community server for self-hosters.
+- The release body is composed *before* the artifacts upload, so the page opens
+  with a table saying which file to take.
+
+The Inno Setup script (`setup.iss`) and `build-and-package.ps1` — both of which
+hardcoded the egui binary — are deleted. `ci.yml` runs the frontend test + build
+job and no longer installs the winit/wayland packages egui needed.
 
 ### Phased execution
 
-Sequenced so each phase is reviewable and the shipped binary keeps building (egui +
-TUI stay functional throughout). Phases A–D shipped as the `desktop/` crate:
+Sequenced so each phase was reviewable and the shipped binary kept building
+throughout. Phases A–F are complete:
 
 - **A — Scaffold & bridge. ✅** Tauri 2 + React/Vite as a top-level `desktop/`
   crate (`src-tauri/` + `src/`); command + event round-trip; CI builds both
@@ -497,12 +525,19 @@ TUI stay functional throughout). Phases A–D shipped as the `desktop/` crate:
   channel creation, presence — reusing the list+content layout (`Parties.jsx`).
 - **D — Relay tab + Settings/Contacts pages. ✅** Remaining dialogs moved into
   inline panes; themes via CSS tokens (`themes.css`).
-- **E — Delete egui. ☐ remaining.** Remove `client/src/gui/` and the egui deps;
-  route the default GUI launch to Tauri. Not started — egui still ships.
-- **F — Packaging + docs. ◐ in progress.** Rewrite `release.yml` to `tauri-action`
-  and retire the old packaging scripts (**not done** — release still builds the
-  egui binary); add a webview/CSP note to `SECURITY.md` and refresh docs (this
-  pass). 
+- **E — Delete egui. ✅** `client/src/gui/` and the `eframe`/`egui`/
+  `egui_commonmark`/`egui_tracing` dependencies are gone, along with the
+  now-unused `rfd`/`emojis`/`windows-sys` entries. `cargo tree` shows no egui
+  anywhere in the workspace. Two capabilities were rehomed rather than dropped:
+  the log collector (→ `client/src/logbuf.rs`) and the token drift guard
+  (→ the two tests described above). `colorgrid` now emits plain `(r,g,b)`
+  instead of egui `Color32`, so the terminal UI no longer depends on a GUI
+  toolkit to draw a safety grid. `--gui` exits with a pointer to the desktop
+  download instead of silently starting a different interface.
+- **F — Packaging + docs. ✅** `release.yml` rewritten around `tauri-action` with
+  a self-explaining release body; `setup.iss` and `build-and-package.ps1`
+  deleted; `ci.yml` runs the frontend job and dropped the egui-only Linux
+  packages; webview/CSP and bridge-test notes in `SECURITY.md`; docs refreshed.
 - **G — TUI 3-pane redesign. ☐ remaining.** Apply the rail/list/content model to
   ratatui, preserving the typed command language.
 
@@ -515,7 +550,7 @@ Each phase gets its own detailed plan before code lands.
 ```text
 Phase 0  Workspace refactor                         ✅ done
 Phase 1  Party Server MVP (Administered)            ✅ core + SQLite done · UI polish remains
-UI       Tauri + React desktop app (§10)            ◐ shipped (A–D) · egui retirement + packaging (E–F) remain
+UI       Tauri + React desktop app (§10)            ✅ shipped (A–F) · TUI redesign (G) remains
 Phase 2  Drive / files                              ◐ slice 1 (inline file sharing) done
 Phase 3  Governance & roles
 Phase 4  E2EE server tier
@@ -534,11 +569,13 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   TOFU on the wire, and SQLite-backed durable state (`party.db`). **Remaining:**
   the filesystem blob store for files (Phase 2); TUI Party pane; GUI
   server-TOFU/error polish (see §7).
-- **UI rewrite — Tauri + React. ◐ shipped (A–D).** Landed as the `desktop/`
-  crate with P2P, Party, Relay, Contacts, and Settings reaching parity; full plan
-  and stack notes in §10. Remaining: delete egui (E) and rebuild packaging so the
-  release ships the Tauri app instead of the egui binary (F). Plan a `2.0.0`
-  release when Phase F lands (owner authorizes the tag).
+- **UI rewrite — Tauri + React. ✅ shipped (A–F).** Landed as the `desktop/`
+  crate with P2P, Party, Relay, Contacts, and Settings at parity; egui deleted
+  (E) and the release pipeline rebuilt around it (F), so there is one desktop
+  app. Full plan and stack notes in §10. Remaining: the TUI 3-pane redesign (G).
+  A `2.0.0` tag is warranted for the packaging change (owner authorizes it) —
+  the shipped desktop artifact changes name and installer, so existing
+  installations of the retired GUI will not upgrade in place.
 - **Phase 2 — Drive / files. ◐ slice 1 done + desktop client wiring.** Inline
   (≤4 MiB) content-addressed file sharing in channels & DMs with hash dedup +
   reference counting and on-disk blobs landed (see §8), and the **desktop app can
@@ -733,10 +770,11 @@ onion routing / anonymity layer, post-quantum migration, hardware-backed identit
 
 ## 13. Verification & Test Coverage
 
-The workspace passes **301 automated tests** (`cargo nextest run --workspace`)
-spanning unit, integration, and end-to-end suites (the `p2pem-desktop` crate has
-no automated tests — it is verified with `cargo check -p p2pem-desktop` and
-`npm run build`):
+The workspace passes **360 automated tests** (`cargo nextest run --workspace`) on
+Windows, plus **15 desktop-bridge tests** that CI runs on Linux and macOS
+(skipped on Windows, where a Rust test harness linking Tauri aborts at startup),
+and **29 frontend tests** (`cd desktop && npm test`) — spanning unit,
+integration, and end-to-end suites:
 
 - **Protocol** (`core/src/core/protocol.rs`): round-trip symmetry for every
   `ProtocolMessage` variant, edge values (empty/unicode/max-size), malformed and
@@ -768,16 +806,30 @@ no automated tests — it is verified with `cargo check -p p2pem-desktop` and
   rejection), invite-QR generation.
 - **TUI**: command parsing, focus cycling, message round-trip, multi-chat
   isolation, typing flow.
+- **Unread & notifications** (`core/src/types.rs`, `client/src/app/chat_manager`):
+  the persisted read mark (back-compat with pre-`read_count` history, own
+  messages never badging, saturating on a trimmed history) and the notification
+  focus gate (silent only for the conversation actually on screen, session-id
+  resolution for incoming connections, notify-by-default when a front-end never
+  reports presence).
+- **Desktop bridge** (`desktop/src-tauri/src/tests.rs`, Linux/macOS CI): the auth
+  barrier, the core-enforced password floor, unread reported from the persisted
+  read mark, and every frontend payload key binding to its command parameter.
+- **Frontend** (`cd desktop && npm test`): password policy, safety-grid colours,
+  Communities unread accounting, theme registry, and design-token drift against
+  `design/tokens.json`.
 
-The one area not deeply automated is GUI pixel rendering; the logic behind it
-(`ChatManager`) is covered directly. Per-phase verification targets:
+The one area not deeply automated is webview pixel rendering; the logic behind it
+(`ChatManager`, the bridge, and the frontend's pure modules) is covered directly.
+Per-phase verification targets:
 
 - **Phase 1**: two clients join over LAN, appear in the directory, exchange channel
   + DM messages; a message sent while a peer is offline is delivered on reconnect.
   (Met by the in-memory E2E tests in `server::connection` + client integration.)
-- **UI rewrite**: per-phase gates in §10 — both toolchains build in CI; P2P then
-  Party flows work end-to-end through the new UI; no `egui`/`eframe` symbols remain
-  after Phase E; `tauri build` produces installers on all three OSes.
+- **UI rewrite**: per-phase gates in §10. Met: both toolchains build in CI; P2P
+  and Party flows work end-to-end through the new UI; **no `egui`/`eframe`
+  symbols remain anywhere in the workspace** (`cargo tree` is the check);
+  `tauri build` produces installers on all three OSes via `tauri-action`.
 - **Later phases**: dedup/refcount/quota tests; governance consent-flow tests;
   E2EE group-key rotation tests; render-no-panic tests for new UI.
 
@@ -786,9 +838,25 @@ The one area not deeply automated is GUI pixel rendering; the logic behind it
 ## 14. Status
 
 Phase 0 (workspace) and the Phase 1 Party server core are complete; the workspace
-test suite is green. The **Tauri + React desktop app** (§10) has shipped its P2P,
-Party, Relay, Contacts, and Settings surfaces (phases A–D) as the `desktop/` crate,
-closing most of the Phase 1 UI-polish items; retiring egui and rebuilding packaging
-(phases E–F) remain. The Independent P2P hardening (connection passwords +
-conversation lock) shipped. This document is the approved north star; each phase
-gets its own detailed plan before implementation.
+test suite is green. The **Tauri + React desktop app** (§10) is now *the* app:
+phases A–F have shipped, egui is deleted, and the release pipeline publishes one
+clearly-labelled product. The Independent P2P hardening (connection passwords +
+conversation lock) shipped.
+
+The honest remaining gaps, in the order they cost the most:
+
+1. **No mobile client.** The single biggest structural gap against any
+   mainstream messenger. Tauri 2 supports mobile targets, and the bridge is
+   already the only UI-coupled layer, so the path exists — but it is a project,
+   not a follow-up.
+2. **No offline delivery for direct P2P.** Both peers must be online at once.
+   Only the community server buffers. Store-and-forward without a trusted server
+   is the interesting design problem here.
+3. **Every WAN path requires someone to self-host** (a port forward, UPnP, or a
+   relay). There is no operated infrastructure, by design and by resourcing.
+4. **No third-party audit.** The posture in `SECURITY.md` is self-assessed and
+   now says so out loud.
+5. **Phase G** — the TUI 3-pane redesign.
+
+This document is the approved north star; each phase gets its own detailed plan
+before implementation.

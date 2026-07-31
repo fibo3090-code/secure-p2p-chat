@@ -30,6 +30,31 @@ pub struct Chat {
     /// How bytes reach the peer(s) for this conversation (orthogonal to `kind`).
     #[serde(default)]
     pub transport: Transport,
+    /// How many entries of `messages` the user has already seen. Persisted with
+    /// the (encrypted) history so unread badges survive a restart — seeding this
+    /// from the live message count at startup instead would mark everything that
+    /// arrived while the app was closed as read, which is the one thing a
+    /// messenger must never do. Older history files load with `0`, which is
+    /// conservative: the first launch after upgrading shows real history as
+    /// unread rather than hiding a message the user never saw.
+    #[serde(default)]
+    pub read_count: usize,
+}
+
+impl Chat {
+    /// Messages received from the peer that the user has not seen yet. Own
+    /// messages never count, so sending never badges your own conversation.
+    pub fn unread_count(&self) -> usize {
+        self.messages
+            .get(self.read_count.min(self.messages.len())..)
+            .map(|tail| tail.iter().filter(|m| !m.from_me).count())
+            .unwrap_or(0)
+    }
+
+    /// Mark every message currently in the conversation as seen.
+    pub fn mark_read(&mut self) {
+        self.read_count = self.messages.len();
+    }
 }
 
 /// The kind of conversation, independent of how it is transported.
@@ -285,6 +310,12 @@ pub struct Config {
     pub enable_upnp: bool,
     #[serde(default)]
     pub relay_server: Option<String>,
+    /// RFC 3339 timestamp of the last successful identity backup, or `None` if
+    /// the user has never made one. Recorded so the app can say "never backed
+    /// up" instead of leaving the single unrecoverable failure mode — a lost
+    /// identity file — as a line of small print the user reads once.
+    #[serde(default)]
+    pub identity_backed_up_at: Option<String>,
 }
 
 /// Theme options
@@ -335,6 +366,7 @@ impl Default for Config {
             enable_mdns: false,
             enable_upnp: false,
             relay_server: None,
+            identity_backed_up_at: None,
         }
     }
 }
@@ -442,6 +474,65 @@ mod tests {
         let back: Chat = serde_json::from_str(&serde_json::to_string(&c2).unwrap()).unwrap();
         assert_eq!(back.kind, ChatKind::Group);
         assert_eq!(back.transport, Transport::Relay);
+    }
+
+    /// The read mark must survive a save/load cycle, or unread badges reset on
+    /// every restart and messages that arrived while the app was closed are
+    /// silently marked as seen.
+    #[test]
+    fn read_count_persists_and_defaults_for_old_history() {
+        let json = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "title":"old","peer_fingerprint":null,"participants":[],
+            "messages":[],"created_at":"2020-01-01T00:00:00Z"
+        }"#;
+        let old: Chat = serde_json::from_str(json).unwrap();
+        assert_eq!(old.read_count, 0, "old history loads as fully unread");
+
+        let mut c = old.clone();
+        c.read_count = 7;
+        let back: Chat = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.read_count, 7);
+    }
+
+    #[test]
+    fn unread_counts_only_unseen_peer_messages() {
+        fn msg(from_me: bool) -> Message {
+            Message {
+                id: Uuid::new_v4(),
+                from_me,
+                content: MessageContent::Text {
+                    text: "hi".to_string(),
+                },
+                timestamp: Utc::now(),
+                delivered: false,
+            }
+        }
+        let mut chat: Chat = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","title":"c",
+                "peer_fingerprint":null,"participants":[],"messages":[],
+                "created_at":"2020-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        chat.messages.push(msg(false));
+        chat.messages.push(msg(false));
+        assert_eq!(chat.unread_count(), 2);
+
+        chat.mark_read();
+        assert_eq!(chat.unread_count(), 0);
+
+        // Own messages never badge the conversation you just typed in.
+        chat.messages.push(msg(true));
+        assert_eq!(chat.unread_count(), 0);
+
+        chat.messages.push(msg(false));
+        assert_eq!(chat.unread_count(), 1);
+
+        // A read mark ahead of the message list (history trimmed/reloaded) must
+        // saturate instead of panicking on an out-of-range slice.
+        chat.read_count = 99;
+        assert_eq!(chat.unread_count(), 0);
     }
 
     #[test]

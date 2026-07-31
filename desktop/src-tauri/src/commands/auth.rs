@@ -6,11 +6,30 @@ pub(crate) struct AuthStatus {
     state: &'static str,
     name: String,
     fingerprint: String,
+    /// The password floor the core enforces, surfaced so the set-password
+    /// screen validates against the real rule instead of a hardcoded number
+    /// that can silently drift from it.
+    min_password_len: usize,
+    /// Populated only when `state == "error"`: what went wrong at startup, in
+    /// words meant for the user.
+    error: Option<String>,
 }
 
 #[tauri::command]
 pub(crate) fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
-    let id = state.identity.lock().unwrap();
+    // A startup failure outranks every other state. In particular it must NOT
+    // present as "set_password", which would invite the user to create a new
+    // identity over the one that failed to load.
+    if let Some(err) = &state.init_error {
+        return AuthStatus {
+            state: "error",
+            name: String::new(),
+            fingerprint: String::new(),
+            min_password_len: messenger_core::MIN_PASSWORD_LEN,
+            error: Some(err.clone()),
+        };
+    }
+    let id = crate::lock_identity(&state.identity);
     let st = if id.is_locked() {
         "unlock"
     } else if *state.is_new.lock().unwrap() || *state.force_setup.lock().unwrap() {
@@ -22,6 +41,23 @@ pub(crate) fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
         state: st,
         name: id.name.clone(),
         fingerprint: id.fingerprint.clone(),
+        min_password_len: messenger_core::MIN_PASSWORD_LEN,
+        error: None,
+    }
+}
+
+/// Refuse the auth commands when startup could not read the identity file.
+///
+/// These two are deliberately *not* behind `ensure_ready` (they are what makes
+/// the app ready), so they need their own guard. `set_password` in particular
+/// must never run here: it would encrypt and save the throwaway identity created
+/// only to display the error, overwriting the unreadable-but-recoverable file
+/// with a brand new one — the exact destruction this whole path exists to
+/// prevent.
+fn ensure_identity_loaded(state: &Bridge) -> Result<(), String> {
+    match &state.init_error {
+        Some(err) => Err(err.clone()),
+        None => Ok(()),
     }
 }
 
@@ -31,6 +67,7 @@ pub(crate) async fn unlock(
     password: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_identity_loaded(&state)?;
     let key = {
         let mut id = state.identity.lock().unwrap();
         id.decrypt(&password)
@@ -80,8 +117,11 @@ pub(crate) async fn set_password(
     password: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
+    ensure_identity_loaded(&state)?;
     let key = {
-        let mut id = state.identity.lock().unwrap();
+        let mut id = crate::lock_identity(&state.identity);
+        // `encrypt` enforces the length floor; the message it returns is
+        // already user-facing, so pass it straight through to the screen.
         id.encrypt(&password).map_err(|e| e.to_string())?;
         id.save(&state.identity_save_path())
             .map_err(|e| e.to_string())?;
@@ -153,6 +193,13 @@ pub(crate) async fn export_identity(
     tokio::fs::copy(&source, &dest)
         .await
         .map_err(|e| format!("Backup failed: {e}"))?;
+    // Record that a backup exists so the app can stop nagging — and, more
+    // importantly, so it *can* nag when one never happened.
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.config.identity_backed_up_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    persist_history(&state.manager, &state.history_path).await;
     Ok(Some(dest.display().to_string()))
 }
 
@@ -239,6 +286,10 @@ pub(crate) struct SettingsDto {
     auto_accept_files: bool,
     auto_connect: bool,
     enable_mdns: bool,
+    /// RFC 3339 timestamp of the last identity backup, or `null` if there has
+    /// never been one. Read-only — it is set by `export_identity`, not by the
+    /// settings form.
+    identity_backed_up_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +318,7 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         auto_accept_files: mgr.config.auto_accept_files,
         auto_connect: mgr.config.auto_connect,
         enable_mdns: mgr.config.enable_mdns,
+        identity_backed_up_at: mgr.config.identity_backed_up_at.clone(),
     })
 }
 

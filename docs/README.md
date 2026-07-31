@@ -40,15 +40,23 @@ This is the canonical index for project documentation.
 
 ## Naming
 
-The product name is **Encrypted P2P Messenger**. Several internal identifiers
-predate the current name and are kept for compatibility and continuity:
+The product is **P2PEM**. What users download:
+
+| Artifact | What it is |
+|---|---|
+| **P2PEM Desktop** | *The app.* Tauri + React installers for Windows, macOS, Linux |
+| **P2PEM Tools** | Secondary archive: the terminal client (`p2pem`, also runs a relay) and the community server (`p2pem-server`) |
+
+Several internal identifiers predate the current name and are kept for
+compatibility and continuity:
 
 | Identifier | Where it appears | Meaning |
 |---|---|---|
-| `P2PEM` | Tauri desktop app (`p2pem-desktop`, window title, data dir) | Short product identifier for the new desktop app |
-| `p2pem-classic` | Client crate/binary name | Renamed from the historical `encodeur_rsa_rust` (an RSA-era name; the protocol moved to X25519 session establishment long ago, RSA remains for identity signatures only) |
+| `P2PEM` | Desktop app (`p2pem-desktop`, window title, data dir) | The product identifier |
+| `p2pem-classic` | Client crate/binary name | Renamed from the historical `encodeur_rsa_rust` (an RSA-era name; the protocol moved to X25519 session establishment long ago, RSA remains for identity signatures only). The "classic" once distinguished the egui GUI, which has been deleted — the crate is now the app core plus the terminal UI, and renaming it is deferred to avoid churning packaging again |
 | `messenger-core` / `messenger-server` | Core and server crate names | Descriptive crate names |
 | `chat-p2p://` | Invite-link URI scheme | Wire-compatible URI scheme; renaming it would break existing invites |
+| `EncryptedMessenger` | Terminal client's data dir (`ProjectDirs`) | Historical; deliberately **not** shared with the desktop app's `P2PEM` dir, so the two are distinct peers |
 
 ## Project Meta
 

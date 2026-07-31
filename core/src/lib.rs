@@ -47,6 +47,13 @@ pub const AES_NONCE_SIZE: usize = 12; // 96 bits (GCM standard)
 pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits (GCM authentication tag)
 pub const REKEY_NONCE_SIZE: usize = 16; // 128-bit salt for HKDF key rotation
 pub const RSA_KEY_BITS: usize = 2048;
+/// Minimum length for the password that protects the identity keystore and the
+/// encrypted history. Argon2 over this password is the *entire* at-rest story,
+/// so the floor has to match the advice the UI gives ("use 12+ characters")
+/// rather than undercut it. Enforced in the identity layer, not just the UI, so
+/// no front-end can set a weaker one. Unlocking an existing identity is
+/// deliberately unaffected — a floor change must never lock anyone out.
+pub const MIN_PASSWORD_LEN: usize = 12;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 /// Per-candidate TCP connect timeout when an invite carries several
 /// addresses to try in order (multi-address invites). Short enough that

@@ -1,13 +1,13 @@
-use egui_tracing::tracing::EventCollector;
 use p2pem_classic::app::chat_manager::SessionHandle;
 use p2pem_classic::core::ProtocolMessage;
+use p2pem_classic::logbuf::LogBuffer;
 use p2pem_classic::tui::app::TuiApp;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[test]
 fn test_message_roundtrip_integration() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     let chat_id = Uuid::new_v4();
     app.chat_manager
         .create_local_chat_for_test(chat_id, "Integration Test".to_string());
@@ -43,7 +43,7 @@ fn test_message_roundtrip_integration() {
 
 #[test]
 fn test_multiple_chats_isolation() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
 
     let chat_id_1 = Uuid::new_v4();
     let chat_id_2 = Uuid::new_v4();
@@ -102,7 +102,7 @@ fn test_multiple_chats_isolation() {
 
 #[test]
 fn test_chat_switching_preserves_input_state() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     app.chat_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
     app.chat_list_state.select(Some(0));
 
@@ -122,7 +122,7 @@ fn test_chat_switching_preserves_input_state() {
 
 #[test]
 fn test_typing_indicator_flow_integration() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     let chat_id = Uuid::new_v4();
     app.chat_manager
         .create_local_chat_for_test(chat_id, "Typing Test".to_string());

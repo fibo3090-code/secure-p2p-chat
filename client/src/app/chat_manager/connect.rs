@@ -128,6 +128,7 @@ impl ChatManager {
             send_seq: 0,
             recv_seq: 0,
             is_host_placeholder: true,
+            read_count: 0,
         };
 
         self.chats.insert(chat_id, chat);
@@ -259,6 +260,7 @@ impl ChatManager {
                 send_seq: 0,
                 recv_seq: 0,
                 is_host_placeholder: true,
+                read_count: 0,
             },
         );
         self.sessions.insert(
@@ -350,6 +352,7 @@ impl ChatManager {
                 send_seq: 0,
                 recv_seq: 0,
                 is_host_placeholder: false,
+                read_count: 0,
             };
             e.insert(chat);
             tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
@@ -421,6 +424,7 @@ impl ChatManager {
                     send_seq: 0,
                     recv_seq: 0,
                     is_host_placeholder: false,
+                    read_count: 0,
                 });
             }
             // Reconnecting or a chat pre-created elsewhere (e.g. the contacts

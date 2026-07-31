@@ -12,152 +12,93 @@ concurrency:
 permissions:
   contents: write
 
+# One product, one obvious download.
+#
+# Releases used to attach two different desktop apps — the egui binary (via Inno
+# Setup / a hand-rolled .app / a tarball) *and* the Tauri installers — with
+# nothing on the page saying which to install, and the older egui one looking
+# like the default. The egui GUI has since been deleted (see docs/platform_spec.md
+# §10, phase E), so this pipeline publishes:
+#
+#   1. P2PEM Desktop  — the app. Real installers from Tauri's bundler.
+#   2. P2PEM Tools    — terminal client + relay + community server, for people
+#                       running this on a headless box. Clearly secondary.
+#
+# The release body is written first, so the page explains itself the moment the
+# artifacts start landing.
 jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure Release Exists
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compose release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "## Download"
+            echo
+            echo "**[P2PEM Desktop](#assets) — this is the app.** Pick the installer for your system:"
+            echo
+            echo "| System | File |"
+            echo "|---|---|"
+            echo "| Windows | \`P2PEM_${VERSION}_x64-setup.exe\` (or the \`.msi\`) |"
+            echo "| macOS (Apple silicon) | \`P2PEM_${VERSION}_aarch64.dmg\` |"
+            echo "| macOS (Intel) | \`P2PEM_${VERSION}_x64.dmg\` |"
+            echo "| Linux | \`p2pem_${VERSION}_amd64.AppImage\` (portable) or \`.deb\` |"
+            echo
+            echo "Not sure? Take the Windows \`.exe\`, the macOS \`.dmg\` matching your chip, or the Linux \`.AppImage\`."
+            echo
+            echo "<details><summary>Running a server, or prefer a terminal?</summary>"
+            echo
+            echo "\`P2PEM-Tools_${VERSION}_<os>.tar.gz\` contains the terminal client (\`p2pem\`,"
+            echo "which also runs a relay with \`--relay-server\`) and the community server"
+            echo "(\`messenger-server\`). You do **not** need these to use the desktop app."
+            echo
+            echo "</details>"
+            echo
+            echo "> First launch creates an identity and asks for a password that encrypts it."
+            echo "> There is no account and no password reset — export a backup when prompted."
+            echo
+            echo "---"
+          } > release-notes.md
+
+      - name: Ensure release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release ${{ github.ref_name }} already exists."
+            echo "Release ${{ github.ref_name }} already exists; leaving its notes alone."
           else
             gh release create "${{ github.ref_name }}" \
               --repo "${{ github.repository }}" \
               --target "${{ github.sha }}" \
-              --title "Release ${{ github.ref_name }}" \
+              --title "P2PEM ${{ github.ref_name }}" \
+              --notes-file release-notes.md \
               --generate-notes
           fi
 
-  build-windows:
-    needs: create-release
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build Release
-        run: cargo build --release --locked -p p2pem-classic
-
-      - name: Prepare Dist
-        run: |
-          mkdir dist
-          cp target/release/p2pem-classic.exe dist/
-          cp app-icon.ico dist/
-          cp README.md dist/
-          cp LICENSE.md dist/
-
-      - name: Compile Installer
-        run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart("v")
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" /O"Output" /F"P2PEM-Classic_${version}_x64-setup" setup.iss
-
-      - name: Upload Installer
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart("v")
-          gh release upload "$env:GITHUB_REF_NAME" "./Output/P2PEM-Classic_${version}_x64-setup.exe" --repo "$env:GITHUB_REPOSITORY" --clobber
-
-  build-macos:
-    needs: create-release
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            arch: x64
-          - target: aarch64-apple-darwin
-            arch: aarch64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p p2pem-classic
-
-      - name: Create App Bundle
-        run: |
-          mkdir -p Messenger.app/Contents/MacOS
-          mkdir -p Messenger.app/Contents/Resources
-          cp target/${{ matrix.target }}/release/p2pem-classic Messenger.app/Contents/MacOS/Messenger
-          chmod +x Messenger.app/Contents/MacOS/Messenger
-          
-          # macOS bundles use .icns, not .ico - use the Tauri app's icon set
-          if [ -f "desktop/src-tauri/icons/icon.icns" ]; then
-            cp desktop/src-tauri/icons/icon.icns Messenger.app/Contents/Resources/icon.icns
-          fi
-
-          cat > Messenger.app/Contents/Info.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>Messenger</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.fibo3090.messenger</string>
-              <key>CFBundleName</key>
-              <string>Messenger</string>
-              <key>CFBundleIconFile</key>
-              <string>icon.icns</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleShortVersionString</key>
-              <string>${{ github.ref_name }}</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>10.15</string>
-          </dict>
-          </plist>
-          EOF
-
-      - name: Create DMG
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          hdiutil create -volname "Messenger" -srcfolder Messenger.app -ov -format UDZO "P2PEM-Classic_${VERSION}_macos-${{ matrix.arch }}.dmg"
-
-      - name: Upload DMG
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release upload "$GITHUB_REF_NAME" "./P2PEM-Classic_${VERSION}_macos-${{ matrix.arch }}.dmg" --repo "$GITHUB_REPOSITORY" --clobber
-
-  # The new Tauri desktop app (P2PEM). Builds the platform installers with
-  # Tauri's own bundler and attaches them to the same release as the classic
-  # egui binaries above, so users can pick either UI from one release page.
-  build-desktop:
+  # ── The app ───────────────────────────────────────────────────────────────
+  desktop:
+    name: P2PEM Desktop (${{ matrix.label }})
     needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: windows-latest
+            label: windows-x64
             args: ''
           - platform: macos-latest
+            label: macos-aarch64
             args: '--target aarch64-apple-darwin'
           - platform: macos-latest
+            label: macos-x64
             args: '--target x86_64-apple-darwin'
           # 22.04 keeps the glibc baseline low so the bundles run on older distros.
           - platform: ubuntu-22.04
+            label: linux-x64
             args: ''
     runs-on: ${{ matrix.platform }}
     steps:
@@ -194,6 +135,12 @@ jobs:
         run: npm ci
         working-directory: desktop
 
+      # The webview loads whatever is in desktop/dist; building it here means a
+      # stale committed bundle can never ship in a release.
+      - name: Build frontend
+        run: npm run build
+        working-directory: desktop
+
       - name: Build and upload desktop installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -201,20 +148,27 @@ jobs:
         with:
           projectPath: desktop
           tagName: ${{ github.ref_name }}
-          releaseName: 'Release ${{ github.ref_name }}'
+          releaseName: 'P2PEM ${{ github.ref_name }}'
           args: ${{ matrix.args }}
 
-  build-linux:
+  # ── Secondary: headless / self-hosting tools ──────────────────────────────
+  tools:
+    name: P2PEM Tools (${{ matrix.label }})
     needs: create-release
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: macos-latest
+            label: macos
+          - os: windows-latest
+            label: windows-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -224,20 +178,39 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # No GUI toolkit is needed any more: the client crate is the app core plus
+      # a terminal UI, and the server is headless.
       - name: Build
-        run: cargo build --release --locked -p p2pem-classic
+        run: cargo build --release --locked -p p2pem-classic -p messenger-server
 
-      - name: Create Tarball
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p p2pem-classic
-          cp target/release/p2pem-classic p2pem-classic/p2pem-classic
-          cp README.md LICENSE.md p2pem-classic/
-          tar -czvf "P2PEM-Classic_${VERSION}_linux-x64.tar.gz" p2pem-classic/
+          STAGE="P2PEM-Tools_${VERSION}_${{ matrix.label }}"
+          mkdir -p "$STAGE"
+          cp target/release/p2pem-classic "$STAGE/p2pem"
+          cp target/release/messenger-server "$STAGE/p2pem-server"
+          cp README.md LICENSE.md "$STAGE/"
+          cp docs/USER_GUIDE.md "$STAGE/" 2>/dev/null || true
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Upload Tarball
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $stage = "P2PEM-Tools_${version}_${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/p2pem-classic.exe "$stage/p2pem.exe"
+          Copy-Item target/release/messenger-server.exe "$stage/p2pem-server.exe"
+          Copy-Item README.md, LICENSE.md $stage
+          if (Test-Path docs/USER_GUIDE.md) { Copy-Item docs/USER_GUIDE.md $stage }
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
+          "ASSET=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release upload "$GITHUB_REF_NAME" "./P2PEM-Classic_${VERSION}_linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+        shell: bash

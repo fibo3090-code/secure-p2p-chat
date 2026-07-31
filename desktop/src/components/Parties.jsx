@@ -6,7 +6,7 @@ import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
 import { api, onBridge, fmtTime } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
-import { markRead, computeUnread } from "../lib/partyUnread.js";
+import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
 
 const STATUS_LABEL = {
   connecting: "Connecting…",
@@ -154,6 +154,9 @@ export function Parties() {
         if (dm) markRead(sid, `dm-${dm}`, srv.members.find((m) => m.id === dm)?.dm_messages);
         else if (cid) markRead(sid, cid, srv.channels.find((c) => c.id === cid)?.messages);
       }
+      // Forget marks for communities the user has left, so the persisted store
+      // does not grow without bound as servers come and go.
+      pruneTo(list);
       setUnread(computeUnread(list).byKey);
       setServers(list);
     } catch { /* ignore */ }

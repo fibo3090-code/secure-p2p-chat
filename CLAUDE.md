@@ -9,9 +9,15 @@ Cargo **workspace** with four members (root `src/` and `tests/` are vestigial �
 | Crate | Path | What it is |
 |-------|------|------------|
 | `messenger-core` | `core/` | Crypto, protocol, network/session, transfer, identity, shared `types.rs` (UI-agnostic) |
-| `p2pem-classic` | `client/` | The app: ChatManager + egui GUI + ratatui TUI (lib + binary) |
+| `p2pem-classic` | `client/` | App core (ChatManager, persistence, diagnostics) + ratatui TUI. **No GUI toolkit** — the egui GUI was deleted; the crate name is vestigial |
 | `messenger-server` | `server/` | Party/Community server (hub, dispatch, connection, state) |
-| `p2pem-desktop` | `desktop/src-tauri/` | **New** Tauri 2 shell wrapping the React/Vite web UI in `desktop/src/` |
+| `p2pem-desktop` | `desktop/src-tauri/` | **The shipped app**: Tauri 2 shell wrapping the React/Vite web UI in `desktop/src/` |
+
+⚠️ **There is one desktop app.** The egui GUI (`client/src/gui/`) and its
+`eframe`/`egui`/`egui_commonmark`/`egui_tracing` dependencies are deleted, along
+with `setup.iss` and `build-and-package.ps1`. Do not reintroduce a second
+front-end: the whole point was that a customer on the releases page should not
+have to guess which app to install. `cargo tree` must show no egui anywhere.
 
 **Agent CLI** lives in a **sibling repo** (`../secure-p2p-chat-agent`), not in this workspace — see that repo's README.
 
@@ -21,65 +27,65 @@ Cargo **workspace** with four members (root `src/` and `tests/` are vestigial �
 
 ```bash
 # Build / test (Rust)
-cargo build --release          # client (LTO, opt-level=3) — egui GUI binary
 cargo build --workspace        # all crates
-cargo test --workspace         # all Rust tests (core + client)
+cargo test --workspace         # all Rust tests
 cargo nextest run --workspace  # faster runner (preferred per global tooling)
 cargo test <name> -- --exact   # one test
 cargo fmt --all
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings   # CI gate
 
-# Run the legacy egui/TUI binary
-cargo run --release                              # egui GUI (default)
-cargo run --release -- --tui                     # ratatui TUI
+# The shipped app (Tauri + React)
+cd desktop && npx tauri dev      # runs `npm run dev` (Vite :5173) + the Tauri shell
+cd desktop && npx tauri build    # packaged installers
+cd desktop && npm run dev        # frontend only, in a plain browser (uses the dev mock — see bridge.js)
+cd desktop && npm test           # frontend unit tests (CI gate)
+
+# Terminal client (ratatui) + server
+cargo run --release                              # TUI
 cargo run --release -- --host --port 9000        # host
 cargo run --release -- --connect 127.0.0.1:12345 # connect
+cargo run --release -- --relay-server --port 23456
 cargo run -p messenger-server                    # Party server
-
-# Run the new Tauri desktop app (the UI direction going forward)
-cd desktop && npx tauri dev      # runs `npm run dev` (Vite :5173) + the Tauri shell
-cd desktop && npx tauri build    # packaged desktop build
-cd desktop && npm run dev        # frontend only, in a plain browser (uses the dev mock — see bridge.js)
 
 # Logging
 RUST_LOG="info,p2pem_classic=debug" cargo run
-
-# Windows packaging (egui binary)
-./build-and-package.ps1
 ```
 
 > ⚠️ Building under OneDrive can fail; this machine sets `CARGO_TARGET_DIR` outside the synced tree.
 
 ## Architecture Overview
 
-`ChatManager` (`client/src/app/chat_manager/` — split by concern into `connect`, `contacts`, `events`, `files`, `invites`, `text`, with the struct + accessors in `mod.rs`) is the single source of truth for all app state — chats, contacts, sessions, transfers, toasts. It has **zero UI dependencies**, so three front-ends drive the same core:
+`ChatManager` (`client/src/app/chat_manager/` — split by concern into `connect`, `contacts`, `events`, `files`, `invites`, `text`, with the struct + accessors in `mod.rs`) is the single source of truth for all app state — chats, contacts, sessions, transfers, toasts. It has **zero UI dependencies**, so both front-ends drive the same core:
 
 ```text
-┌── egui GUI ──┐  ┌── ratatui TUI ──┐  ┌── Tauri webview (React) ──┐
-│ client/gui/  │  │ client/tui/     │  │ desktop/src/ (frontend)   │
-└──────┬───────┘  └────────┬────────┘  └─────────────┬─────────────┘
-       │  Arc<Mutex<ChatManager>>                    │ Tauri commands + events
-       └────────────────────┬───────────────────────-┘   (desktop/src-tauri/src/lib.rs = bridge)
-                ┌────────────▼────────────┐
-                │  ChatManager (app/)     │  poll_session_events(), persistence (encrypted)
-                └────────────┬────────────┘
-                             │ tokio::sync::mpsc
-        ┌──────────┬─────────┼──────────┬──────────┐
-     Network     Crypto   Transfer   Identity    Party
-   (core/network)(core/core)(core/transfer)(core/identity)(core/party + server/)
+┌── ratatui TUI ──┐  ┌── Tauri webview (React) ──┐
+│ client/tui/     │  │ desktop/src/ (frontend)   │
+└────────┬────────┘  └─────────────┬─────────────┘
+   Arc<Mutex<ChatManager>>         │ Tauri commands + events
+         └───────────┬─────────────┘   (desktop/src-tauri/src/lib.rs = bridge)
+          ┌──────────▼──────────┐
+          │ ChatManager (app/)  │  poll_session_events(), persistence (encrypted)
+          └──────────┬──────────┘
+                     │ tokio::sync::mpsc
+  ┌──────────┬───────┼──────────┬──────────┐
+Network    Crypto  Transfer  Identity    Party
+(core/network)(core/core)(core/transfer)(core/identity)(core/party + server/)
 ```
 
 ### Key Patterns
 
-- **ChatManager**: all state changes (persisting, session mapping, chat ops) go through its methods. egui/TUI hold `Arc<Mutex<ChatManager>>` directly; the Tauri bridge wraps the same `Arc<Mutex<ChatManager>>` and exposes it via `#[tauri::command]`s.
-- **Async**: `tokio` throughout; `tokio::spawn` background tasks; `tokio::sync::mpsc` (often `unbounded_channel()`) for low-latency messaging. Bridge and egui share one runtime.
+- **ChatManager**: all state changes (persisting, session mapping, chat ops) go through its methods. The TUI holds `Arc<Mutex<ChatManager>>` directly; the Tauri bridge wraps the same `Arc<Mutex<ChatManager>>` and exposes it via `#[tauri::command]`s.
+- **UI presence is pushed down, not inferred**: `ChatManager` owns no window handle, so the shell reports focus + open conversation via `set_ui_presence(focused, active_chat)` (desktop: the `set_presence` command, driven by `focus`/`blur`/`visibilitychange`). `should_notify_for(chat_id)` consults it so a desktop notification never fires for the thread on screen. A front-end that never reports presence keeps notifying — the default is "unfocused", because a missing notification is worse than an extra one.
+- **Unread is persisted, not inferred**: `Chat::read_count` (`core/src/types.rs`, `#[serde(default)]`) is saved inside the encrypted history. `unread_count()` counts trailing peer messages past the mark, so your own sends never badge and anything that arrived while the app was closed is still unread. **Never seed read state from the current message count at startup** — that is the bug this replaced.
+- **Async**: `tokio` throughout; `tokio::spawn` background tasks; `tokio::sync::mpsc` (often `unbounded_channel()`) for low-latency messaging. The bridge and ChatManager share one runtime.
 - **Session Events**: the network layer emits `SessionEvent` (`Listening`, `Connected`, `NewConnection`, `ShowFingerprintVerification`, `MessageReceived`, `FileSendComplete`/`TextSendComplete` (wire-seq confirmations used for delivery receipts), `Disconnected`, `Error`, `Warning`); UIs poll `ChatManager::poll_session_events()`.
 - **Delivery receipts**: receiving a text (or finalizing a file) queues `ProtocolMessage::Ack { acked_seq }` back to the sender, which marks the matching `Message.delivered` (correlated FIFO via `TextSendComplete`/`FileSendComplete` wire seqs). Old peers drop the unknown frame harmlessly (seq gaps are allowed). See `docs/protocol.md` § Delivery receipts.
 - **Relay = rendezvous-first, bridge-second**: `core/src/network/relay.rs` pairs two peers by token, then coordinates a real **TCP hole punch** (`punch.rs`: simultaneous open from the reused control-connection port, token-tag validation, host-led SELECT/ACK socket selection) so sessions go direct whenever NATs allow; it only bridges bytes (`copy_bidirectional`) as a fallback. Control protocol is append-only bincode enums (wire compat with pre-punch peers/servers both ways); peer labels `p2p:<addr>` vs `relay:<server>` tell the UIs which transport won. `P2PEM_NO_HOLEPUNCH=1` forces bridging.
-- **LAN peer discovery**: `core/src/network/discovery.rs` advertises `_p2p-messenger._tcp.local.` (mDNS/Bonjour) when hosting and browses for peers, yielding `DiscoveredPeer { name, address, port, fingerprint }`. Surfaced by egui (Connect dialog), the TUI, and the desktop app (`list_discovered_peers` + "Nearby peers" in the connect pane); gated everywhere behind `Config::enable_mdns` (off by default — it reveals presence on the LAN). TOFU still applies — discovery only supplies the address, never trust.
-- **Conversation model (Phase 3)**: every `Chat` (`core/src/types.rs`) carries `kind: ChatKind` (`Dm` / `Group` / `Channel`) and `transport: Transport` (`Direct` / `Relay` / `Server`). Both are `#[serde(default)]` for back-compat with old history files. The UI uses these for badges; all 14 `Chat` construction sites set them explicitly.
+- **LAN peer discovery**: `core/src/network/discovery.rs` advertises `_p2p-messenger._tcp.local.` (mDNS/Bonjour) when hosting and browses for peers, yielding `DiscoveredPeer { name, address, port, fingerprint }`. Surfaced by the TUI and the desktop app (`list_discovered_peers` + "Nearby peers" in the connect pane); gated behind `Config::enable_mdns` (off by default — it reveals presence on the LAN). TOFU still applies — discovery only supplies the address, never trust.
+- **Conversation model (Phase 3)**: every `Chat` (`core/src/types.rs`) carries `kind: ChatKind` (`Dm` / `Group` / `Channel`), `transport: Transport` (`Direct` / `Relay` / `Server`), and `read_count`. All are `#[serde(default)]` for back-compat with old history files. The UI uses kind/transport for badges; every `Chat` construction site sets all of them explicitly.
+- **Password floor**: `MIN_PASSWORD_LEN` (`core/src/lib.rs`, 12) is enforced in `Identity::encrypt`, **not** in the UIs — a front-end that forgets to validate must still be unable to create a weakly-protected keystore. `decrypt` deliberately has no check, so raising the floor never locks anyone out. `auth_status` publishes it as `min_password_len` so the set-password screen validates against the real rule.
 - **Protocol v3 handshake (ECDH-first)**: (1) version exchange (plaintext u32), (2) X25519 ephemeral exchange (forward secrecy; all-zero/low-order peer keys rejected at parse + `was_contributory()` at agreement), (3) HKDF-SHA256 session-key derivation, (4) AES-256-GCM tunnel, (5) identity exchange inside the tunnel (`IdentityProof`, RSA-PSS signature binding ephemeral key → identity), (6) TOFU fingerprint verification (with SAS — see below).
-- **Short Authentication String (SAS)**: `derive_sas` (`core/src/core/crypto.rs`) turns the transport AAD (transcript hash) into six digits + three emoji, carried on the `sas` field of `NewConnection`/`ShowFingerprintVerification`. Both peers compute it identically; a MITM's two handshakes differ. All three UIs lead the verification prompt with it (fingerprint/grid demoted to "advanced"). Derivation + emoji table are frozen (known-answer test) — never reorder or change them.
+- **Short Authentication String (SAS)**: `derive_sas` (`core/src/core/crypto.rs`) turns the transport AAD (transcript hash) into six digits + three emoji, carried on the `sas` field of `NewConnection`/`ShowFingerprintVerification`. Both peers compute it identically; a MITM's two handshakes differ. Both UIs lead the verification prompt with it (fingerprint/grid demoted to "advanced"). Derivation + emoji table are frozen (known-answer test) — never reorder or change them.
 - **Automatic key rotation (rekey)**: post-handshake, the message loop in `session.rs` rotates the session key every `REKEY_MESSAGE_COUNT` (100) messages by sending a `ProtocolMessage::Rekey` carrying a 16-byte `REKEY_NONCE_SIZE` HKDF salt; both sides re-derive and the `Rekey` frame is *not* surfaced to the app. It shares the per-session `seq` namespace (replay protection covers it). Covered by `client/tests/key_rotation_tests.rs`.
 - **Text is chunked like files**: messages over `TEXT_CHUNK_BYTES` (48 KiB) are split into `ProtocolMessage::TextChunk` frames and reassembled; a single message is hard-capped at `MAX_TEXT_MESSAGE_BYTES` (64 KiB) and rejected past it (`protocol.rs`).
 
@@ -90,7 +96,7 @@ Authoritative docs: `docs/README.md`, `docs/architecture.md`, `docs/protocol.md`
 - `Bridge` holds `Arc<Mutex<ChatManager>>` + `Arc<Mutex<PartyManager>>` (Communities) + identity + history/identity paths + `pending_fp`. A background poll loop drains ChatManager toasts → `toast` events, forwards fingerprint requests → `fingerprint-request`, drains party events → `party-updated`, **and persists history** (on state change, after mutations, and on window close). The frontend listens via `onBridge(...)` in `desktop/src/lib/bridge.js`.
 - Commands: auth (`auth_status`/`unlock`/`set_password`/`my_identity`), chats (`list_conversations`/`get_conversation`/`send_message`/`send_file`/`open_file`/`file_preview`/`rename_chat`/`delete_chat`), connect (`start_host`/`connect_peer`/`host_via_relay`/`connect_via_relay`/`connect_contact`), TOFU (`confirm_fingerprint`/`pending_fingerprint`), contacts (`list_contacts`/`my_invite_link`/`import_invite`), Communities (`party_join`/`party_list`/`party_history`/`party_post`/`party_create_channel`/`party_send_dm`/`party_dm_history`/`party_clear_error`). Every non-auth command is gated by `ensure_ready()`.
 - ⚠️ **Arg-naming footgun**: Tauri 2 binds JS invoke keys by exact name. Use **single-word** Rust params (e.g. `id`, not `chat_id`) or camelCase JS keys — a mismatch makes `invoke` *silently no-op* (was the root cause of "messages send but don't arrive" / "fingerprint verify does nothing"). When `inTauri` is false, `bridge.js` falls back to an in-memory mock so the UI is navigable in a plain browser.
-- **Own data dir**: the desktop app resolves its data dir from *its own* `ProjectDirs("com","chat-p2p","P2PEM")`, **not** egui's `"EncryptedMessenger"` — otherwise both apps load the same `identity.json` and become the same peer (a self-connection). `P2PEM_DATA_DIR` overrides it to run extra test peers on one machine.
+- **Own data dir**: the desktop app resolves its data dir from *its own* `ProjectDirs("com","chat-p2p","P2PEM")`, **not** the terminal client's `"EncryptedMessenger"` — otherwise both apps load the same `identity.json` and become the same peer (a self-connection). `P2PEM_DATA_DIR` overrides it to run extra test peers on one machine.
 
 ## Security-Sensitive Areas
 
@@ -100,6 +106,8 @@ Authoritative docs: `docs/README.md`, `docs/architecture.md`, `docs/protocol.md`
 - `core/src/identity/` — private-key storage (Argon2 + ChaCha20-Poly1305)
 
 **Critical constraints**:
+- **`identity.json` is the only key to the message history** (`history_key` derives from the private key). Write it only via `messenger_core::util::write_file_atomic` (temp + fsync + rename, 0600 from creation), and **never** replace an identity that merely failed to *load* — `get_or_create` returns an error for a present-but-unreadable file, the desktop bridge surfaces it as `auth_status.state == "error"`, and `unlock`/`set_password`/`ensure_ready` all refuse. Regenerating there silently makes every stored message undecryptable and breaks TOFU with every contact, while looking like a fresh install.
+- `apply_history` **replaces** in-memory state (it does not merge), so a deleted chat cannot reappear on a reload. Live host placeholders are preserved because they represent a listener, not history.
 - `to_plain_bytes()`/`from_plain_bytes()` in `core/src/core/protocol.rs` must stay **symmetric** — change both sides together or break wire compat.
 - Session keys bind the full handshake transcript via HKDF salt/info — only touch key derivation if you understand the implications.
 - Replay protection uses per-session sequence numbers; file-transfer packets share that namespace (`last_recv_seq` in `Session`).
@@ -109,10 +117,10 @@ Authoritative docs: `docs/README.md`, `docs/architecture.md`, `docs/protocol.md`
 ## File Transfer
 
 Chunked (`FILE_CHUNK_SIZE = 64 KiB`), tracked via `FileTransferState` (now carries a `direction: TransferDirection`), sharing the per-chat monotonic sequence namespace (so replay protection covers transfers too).
-- **Acceptance gate**: `Config::auto_accept_files` is enforced (default **off**): an incoming `FileMeta` holds the transfer in `TransferStatus::AwaitingAcceptance` — chunks spool to the temp file, but nothing reaches the download dir or chat history until `accept_incoming_file()`; `reject_incoming_file()` deletes the spool and discards the rest. All three UIs expose accept/decline (egui transfer row, TUI `:accept`/`:decline`, desktop transfer bar).
+- **Acceptance gate**: `Config::auto_accept_files` is enforced (default **off**): an incoming `FileMeta` holds the transfer in `TransferStatus::AwaitingAcceptance` — chunks spool to the temp file, but nothing reaches the download dir or chat history until `accept_incoming_file()`; `reject_incoming_file()` deletes the spool and discards the rest. Both UIs expose accept/decline (TUI `:accept`/`:decline`, desktop transfer bar).
 - `client/src/app/chat_manager/files.rs` — orchestration + outgoing chunk dispatch + wire-level send confirmation. **Sends stream from a spawned task** (`spawn_file_stream`) so a large send never holds the manager lock; the task checks an `AtomicBool` cancel flag between chunks, sets an `AtomicBool` `failed` flag on a local I/O error (open/read → `sync_outgoing_transfer_progress` marks the transfer `Failed`), and reports bytes via an `AtomicU64` (mirrored into `active_transfers` by `sync_outgoing_transfer_progress` each poll). Outgoing seqs are placeholders — the session loop stamps the real wire sequence.
 - **Two outbound lanes** (see `SessionHandle`): bulk file data (`FileMeta`/`FileChunk`/`FileEnd`) rides a **bounded** `file_tx` (`FILE_LANE_CAPACITY` chunks), so `send().await` applies real backpressure and a slow peer paces the disk reader instead of ballooning the outbound queue up to `MAX_FILE_SIZE` in RAM; the unbounded `from_app_tx` control lane carries text/typing and the `FileCancel` abort (never stuck behind queued chunks). `run_message_loop` (`session.rs`) selects both lanes via the shared `send_outbound_frame` helper, stamping one monotonic wire sequence across both.
-- **Cancellation**: `ProtocolMessage::FileCancel { seq }` (binary tag 12, symmetric encode/decode, replay-protected). `cancel_transfer(id)` aborts either direction (stops the stream + emits FileCancel for outgoing; sends FileCancel + `abort_cleanup` for incoming); `handle_peer_file_cancel` handles an inbound FileCancel. Incoming vs outgoing are routed separately (`active_incoming_transfer_id_for_chat` / `active_outgoing_transfer_id_for_chat`) so a simultaneous send+receive on one chat never cross-routes. UI: egui transfer bar, TUI Transfers overlay (↑/↓ + `c`), desktop transfer cards (`cancel_transfer` command).
+- **Cancellation**: `ProtocolMessage::FileCancel { seq }` (binary tag 12, symmetric encode/decode, replay-protected). `cancel_transfer(id)` aborts either direction (stops the stream + emits FileCancel for outgoing; sends FileCancel + `abort_cleanup` for incoming); `handle_peer_file_cancel` handles an inbound FileCancel. Incoming vs outgoing are routed separately (`active_incoming_transfer_id_for_chat` / `active_outgoing_transfer_id_for_chat`) so a simultaneous send+receive on one chat never cross-routes. UI: TUI Transfers overlay (↑/↓ + `c`), desktop transfer cards (`cancel_transfer` command).
 - `core/src/transfer/receiver.rs` — receiving
 - `core/src/core/protocol.rs` — `FILE_CHUNK` / `FileCancel` encode/decode
 
@@ -129,23 +137,25 @@ Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`).
 | Feature work (state/logic) | `client/src/app/chat_manager/` (state in `mod.rs`, events in `events.rs`) |
 | Shared types / conversation model | `core/src/types.rs` |
 | Protocol changes | `core/src/network/session.rs`, `core/src/core/crypto.rs`, `core/src/core/protocol.rs` |
-| egui / TUI changes | `client/src/gui/` / `client/src/tui/` |
+| TUI changes | `client/src/tui/` |
 | New web UI | `desktop/src/` (React) + `desktop/src-tauri/src/lib.rs` (bridge) |
 | Party/Community server | `server/src/` |
 | Identity / persistence | `core/src/identity/`, `client/src/app/persistence.rs` |
 
 ## Important Constants (`core/src/lib.rs`)
 
-`PORT_DEFAULT = 12345`, `MAX_PACKET_SIZE = 8 MiB`, `FILE_CHUNK_SIZE = 64 KiB`, `MAX_TEXT_MESSAGE_BYTES = 64 KiB`, `TEXT_CHUNK_BYTES = 48 KiB` (leaves metadata headroom), `AES_KEY_SIZE = 32`, `AES_NONCE_SIZE = 12`, `AES_GCM_TAG_SIZE = 16`, `REKEY_NONCE_SIZE = 16`, `RSA_KEY_BITS = 2048`, `HANDSHAKE_TIMEOUT_SECS = 15`, `MAX_FILE_SIZE = 10 GiB`.
+`PORT_DEFAULT = 12345`, `MAX_PACKET_SIZE = 8 MiB`, `FILE_CHUNK_SIZE = 64 KiB`, `MAX_TEXT_MESSAGE_BYTES = 64 KiB`, `TEXT_CHUNK_BYTES = 48 KiB` (leaves metadata headroom), `AES_KEY_SIZE = 32`, `AES_NONCE_SIZE = 12`, `AES_GCM_TAG_SIZE = 16`, `REKEY_NONCE_SIZE = 16`, `RSA_KEY_BITS = 2048`, `MIN_PASSWORD_LEN = 12`, `HANDSHAKE_TIMEOUT_SECS = 15`, `MAX_FILE_SIZE = 10 GiB`.
 
 ## Testing
 
 - Unit tests live in source files (e.g. `core/src/network/session.rs` has handshake tests); integration tests in each crate's `tests/`.
 - Async tests use `#[tokio::test]`. Handshake tests must verify derived keys match on both sides. Protocol changes require new (de)serialization tests. Adding `serde(default)` fields requires a back-compat test that loads old JSON.
+- The frontend has its own suite: `cd desktop && npm test` (vitest) over the pure modules — password policy, safety grid, unread accounting, theme registry, and design-token drift against `design/tokens.json`. It is a CI gate; run it alongside `cargo test --workspace`.
+- **Changing `MIN_PASSWORD_LEN` breaks the bridge tests** that call `set_password` — they use passwords that must clear the floor. That is the check working, not a nuisance.
 
 ## Non-obvious gotchas (learned the hard way)
 
-- **The three UIs are one app sharing one `ChatManager`.** The P2P protocol is UI-independent, so a connection bug is almost never in `session.rs` — it's config/wiring in the front-end. Distinct binaries (egui vs Tauri) **must** use distinct `ProjectDirs`; sharing one makes them the same identity/peer, so connecting them on one machine is a self-connection (the core completes it, but it's semantically broken and both apps race on one `history.json.enc`).
+- **Both UIs are one app sharing one `ChatManager`.** The P2P protocol is UI-independent, so a connection bug is almost never in `session.rs` — it's config/wiring in the front-end. The two binaries (terminal vs desktop) **must** keep distinct `ProjectDirs`; sharing one makes them the same identity/peer, so connecting them on one machine is a self-connection (the core completes it, but it's semantically broken and both apps race on one `history.json.enc`).
 - **`connection_password` is a field on `ChatManager`, not a per-call arg.** It's session-only (not persisted) and read inside `start_host`/`connect_to_host`. The `None` in `connect_to_host(host, port, None, pk)` is `existing_chat_id`, **not** the password — a common misread.
 - **The host creates a NEW chat per incoming connection**, keyed by the *client's* random `chat_id` (`chat_id_mapping` maps incoming→session). There is no persistent per-peer host chat, so returning peers are recognised by **fingerprint** across chats/contacts, not by chat id.
 - **`p2pem-desktop` bridge tests run over mock IPC** (`desktop/src-tauri/src/tests.rs`, via tauri's `test` feature): they drive the real command handlers with the exact payload keys `bridge.js` sends, so an arg-name mismatch (the silent-no-op footgun) fails `cargo nextest run -p p2pem-desktop` (or plain `cargo test -p p2pem-desktop` as fallback) instead of production. The command list is registered through the shared `invoke_handler()` in `lib.rs` — add new commands there, never inline in `run()`. Compiling the crate needs the GTK/webkit dev packages (CI installs them; see `ci.yml`). The suite is gated off Windows (a Rust test-harness exe linking tauri aborts at startup there — see the dev-dependencies note in `desktop/src-tauri/Cargo.toml`); Linux/macOS CI runs it. The webview GUI itself still can't be driven headlessly — visual behaviour is covered by `npm test` + `npm run build` in `desktop/` only.
@@ -179,3 +189,4 @@ Rules:
 - Update the canonical doc instead of adding a parallel explanation elsewhere.
 - Prefer deleting superseded docs after merging their useful content.
 - Keep this file short; it is an agent hint, not the main project manual.
+

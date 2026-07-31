@@ -14,9 +14,13 @@ pub(crate) struct ConvSummary {
     /// True once the peer's fingerprint has been confirmed (TOFU-verified). The
     /// UI must not claim "verified" for conversations that are still pending.
     verified: bool,
-    /// Total message count; the frontend derives unread badges from it (count
-    /// beyond what was on screen when the conversation was last open).
+    /// Total message count.
     messages: usize,
+    /// Messages from the peer the user has not seen yet. Computed from the read
+    /// mark persisted in the encrypted history, **not** from what happened to be
+    /// on screen this session — so anything that arrived while the app was
+    /// closed is still badged on the next launch.
+    unread: usize,
     /// RFC 3339 timestamp of the newest message, for "last activity" display.
     last_at: Option<String>,
 }
@@ -62,11 +66,44 @@ pub(crate) async fn list_conversations(
                 transport: transport_str(chat.transport),
                 verified: chat.peer_fingerprint.is_some(),
                 messages: chat.messages.len(),
+                unread: chat.unread_count(),
                 last_at: chat.messages.last().map(|m| m.timestamp.to_rfc3339()),
             });
         }
     }
     Ok(out)
+}
+
+/// Mark a conversation as read up to its newest message. The read mark lives in
+/// the encrypted history, so the badge stays cleared across restarts.
+#[tauri::command]
+pub(crate) async fn mark_read(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let chat_id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.mark_chat_read(chat_id);
+    }
+    persist_history(&state.manager, &state.history_path).await;
+    Ok(())
+}
+
+/// Report what the user can see: whether the window has focus, and which
+/// conversation is open. `ChatManager` owns no window handle, so the shell has
+/// to push this down — without it "notify when a message arrives in the
+/// background" fires for the thread the user is actively reading.
+#[tauri::command]
+pub(crate) async fn set_presence(
+    focused: bool,
+    chat: Option<String>,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    // An unparseable id means "no conversation open" rather than an error — the
+    // shell should never be able to break presence tracking with a bad string.
+    let active = chat.as_deref().and_then(|c| Uuid::parse_str(c).ok());
+    state.manager.lock().await.set_ui_presence(focused, active);
+    Ok(())
 }
 
 /// A live file transfer, for progress display in the chat pane.

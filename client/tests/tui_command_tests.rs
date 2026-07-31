@@ -1,4 +1,4 @@
-use egui_tracing::tracing::EventCollector;
+use p2pem_classic::logbuf::LogBuffer;
 use p2pem_classic::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use uuid::Uuid;
@@ -56,7 +56,7 @@ fn parse_command_errors_are_clear() {
 
 #[test]
 fn key_flow_enters_and_submits_command_mode() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     app.focus = TuiFocus::ChatList;
 
     app.handle_key_event(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
@@ -74,7 +74,7 @@ fn key_flow_enters_and_submits_command_mode() {
 
 #[test]
 fn focus_cycles_with_tab() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     app.focus = TuiFocus::ChatList;
 
     app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -87,7 +87,7 @@ fn focus_cycles_with_tab() {
 
 #[test]
 fn sync_chat_ids_preserves_selection_when_possible() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
     app.chat_manager

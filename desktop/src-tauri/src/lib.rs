@@ -53,12 +53,31 @@ struct Bridge {
     /// Pending TOFU fingerprint request, held as queryable state so a missed
     /// `fingerprint-request` event never strands a session awaiting verification.
     pending_fp: PendingFp,
+    /// Set when startup found an identity file it could not read. The app boots
+    /// into a dead state that only reports this, rather than generating a
+    /// replacement identity and quietly abandoning the user's history.
+    init_error: Option<String>,
 }
 
 impl Bridge {
     fn identity_save_path(&self) -> PathBuf {
         self.identity_path.clone()
     }
+}
+
+/// Lock the identity mutex, recovering from poisoning instead of panicking.
+///
+/// `Mutex::lock().unwrap()` turns one panic anywhere in the process into a
+/// permanent, cascading failure: every later access panics too, and in the poll
+/// loop that kills event processing entirely — the app looks frozen rather than
+/// reporting anything. The `Identity` behind this lock is only ever read or
+/// wholly replaced, so a poisoned lock does not imply torn state; carrying on is
+/// strictly better than dying.
+fn lock_identity(identity: &StdMutex<Identity>) -> std::sync::MutexGuard<'_, Identity> {
+    identity.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("identity mutex was poisoned by an earlier panic; recovering");
+        poisoned.into_inner()
+    })
 }
 
 /// Best-effort encrypted history save, mirroring what the egui app does on a
@@ -100,6 +119,9 @@ fn state_signature(mgr: &ChatManager) -> u64 {
                 .wrapping_mul(1_000_003)
                 .wrapping_add(c.messages.len() as u64)
                 .wrapping_add(delivered.wrapping_mul(65_537))
+                // The read mark is persisted state and drives the unread badge,
+                // so a change to it must both save and refresh the UI.
+                .wrapping_add((c.read_count as u64).wrapping_mul(31))
                 .wrapping_add(c.title.len() as u64);
         }
     }
@@ -111,7 +133,12 @@ fn state_signature(mgr: &ChatManager) -> u64 {
 /// the bridge must enforce the barrier itself so no command can mutate state or
 /// start a session before unlock/set-password completes.
 fn ensure_ready(state: &Bridge) -> Result<(), String> {
-    if state.identity.lock().unwrap().is_locked() {
+    // A broken identity blocks everything: any command that ran here would
+    // operate on the throwaway identity created just to render the error.
+    if let Some(err) = &state.init_error {
+        return Err(err.clone());
+    }
+    if lock_identity(&state.identity).is_locked() {
         return Err("Unlock required".to_string());
     }
     if *state.is_new.lock().unwrap() || *state.force_setup.lock().unwrap() {
@@ -144,6 +171,8 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::connect::set_locked,
         commands::chats::list_conversations,
         commands::chats::get_conversation,
+        commands::chats::mark_read,
+        commands::chats::set_presence,
         commands::chats::list_transfers,
         commands::chats::accept_transfer,
         commands::chats::decline_transfer,
@@ -267,17 +296,30 @@ fn init_bridge() -> Bridge {
                 .map(|dirs| dirs.data_dir().to_path_buf())
         });
 
+    // A failure to load an *existing* identity must never be papered over by
+    // generating a new one: the history key is derived from the private key, so
+    // a replacement identity silently makes every stored message unreadable and
+    // changes the fingerprint every contact verified. When that happens the app
+    // starts in an error state that the shell surfaces, and touches nothing.
+    let mut init_error: Option<String> = None;
     let (history_path, identity, is_new) = if let Some(data) = data_dir {
         std::fs::create_dir_all(&data).ok();
         tracing::info!(data_dir = %data.display(), "using data directory");
-        let (id, isnew) = Identity::get_or_create(&data, "User").unwrap_or_else(|e| {
-            tracing::error!("identity load/create failed: {e}; falling back to plaintext");
-            (
-                Identity::new_with_plaintext("User".to_string()).expect("identity"),
-                true,
-            )
-        });
-        (data.join("history.json.enc"), id, isnew)
+        match Identity::get_or_create(&data, "User") {
+            Ok((id, isnew)) => (data.join("history.json.enc"), id, isnew),
+            Err(e) => {
+                tracing::error!("identity load failed: {e}");
+                init_error = Some(e.to_string());
+                // A throwaway in-memory identity so the app can boot far enough
+                // to *show* the error. Every command is refused while
+                // `init_error` is set, so it is never saved or used on the wire.
+                (
+                    data.join("history.json.enc"),
+                    Identity::new_with_plaintext("User".to_string()).expect("identity"),
+                    true,
+                )
+            }
+        }
     } else {
         tracing::warn!("could not resolve a data directory; using a relative fallback");
         (
@@ -289,7 +331,7 @@ fn init_bridge() -> Bridge {
 
     let identity_path = history_path.with_file_name("identity.json");
     let parties_path = history_path.with_file_name("parties.json");
-    // Plaintext key in hand (no password) ⇒ force a set-password step, like egui.
+    // Plaintext key in hand (no password) ⇒ force a set-password step.
     let force_setup = !identity.is_locked();
 
     let manager = Arc::new(Mutex::new(ChatManager::new(Config::default())));
@@ -306,6 +348,7 @@ fn init_bridge() -> Bridge {
         is_new: StdMutex::new(is_new),
         force_setup: StdMutex::new(force_setup),
         pending_fp: Arc::new(StdMutex::new(None)),
+        init_error,
     }
 }
 

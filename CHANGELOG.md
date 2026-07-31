@@ -11,7 +11,122 @@ predate tagged releases.
 
 ## [Unreleased]
 
-Nothing yet.
+> **Breaking, and the point of the release: P2PEM ships one desktop app.**
+> The egui GUI is gone. Releases now lead with P2PEM Desktop (Tauri + React)
+> installers and a clearly-secondary tools archive, instead of two similar-looking
+> desktop apps with nothing saying which to install. The desktop app uses its own
+> data directory, so it does **not** inherit an identity from the retired GUI —
+> export a backup from the old app first if you want to keep that identity.
+
+### Removed
+
+- **The egui/eframe desktop GUI** (`client/src/gui/`), along with the
+  `eframe`, `egui`, `egui_commonmark`, and `egui_tracing` dependencies and the
+  now-unused `rfd`, `emojis`, and `windows-sys` entries. `cargo tree` shows no
+  egui anywhere in the workspace, which also removes the egui-winit/wayland half
+  of the Linux dependency and advisory surface.
+- The hand-rolled Windows packaging (`setup.iss`, `build-and-package.ps1`),
+  which hardcoded the retired binary.
+
+### Added
+
+- **Unread counts survive a restart.** `Chat::read_count` is persisted inside
+  the encrypted history, so a message that arrived while the app was closed is
+  still unread on the next launch. Previously the desktop app seeded "already
+  seen" from the current message totals on first load, quietly marking
+  everything you were away for as read.
+- **A boot screen that can explain itself.** A slow or failed startup used to
+  render a permanently blank window with no message and no recovery. It now
+  shows a spinner, then the actual error with a retry button, and retries
+  automatically with backoff.
+- **First-run identity backup.** After creating an identity the app offers to
+  save the (already encrypted) backup file, with the reason attached. Settings
+  now states whether a backup has ever been made and when.
+- **`P2PEM Tools` release artifact** — the terminal client and community server
+  in one archive per OS, for self-hosters.
+- **Design-token drift guards** replacing the one lost with the egui theming
+  module: `desktop/src/lib/tokens.test.js` checks the shipped CSS against
+  `design/tokens.json`, and a Rust test checks the TUI brand accent and the
+  frozen safety-grid palette.
+
+### Changed
+
+- **The release page tells you what to download.** The workflow composes a body
+  with a per-OS table before any artifact uploads.
+- The encrypted history is serialized compactly instead of pretty-printed. The
+  indentation was never read by anyone (the bytes are encrypted immediately) but
+  was paid for on every rewrite. The whole file is still re-encrypted whenever
+  the conversation surface changes — that cost is inherent to the current format
+  and is now documented as a known limit rather than left implicit.
+- **Password floor raised to 12 characters**, enforced in `Identity::encrypt` so
+  no front-end can set a weaker one — the screen used to coach "12+" while
+  accepting four. `decrypt` is deliberately unaffected, so existing identities
+  still open. The set-password screen now reads the floor from the backend and
+  names the specific problem instead of silently doing nothing.
+- **The client binary is the terminal client.** `--gui` exits with a pointer to
+  the desktop download rather than starting a different interface than asked
+  for. It is a console-subsystem binary now, so the Windows console juggling is
+  gone.
+- Desktop notifications are titled with the conversation name, and an incoming
+  file now raises one too.
+- The identity avatar in the rail opens Settings (it was a button with no
+  action).
+
+### Fixed
+
+- **An interrupted write can no longer destroy your identity and all your
+  history.** `identity.json` was written in place (truncate, then write), and any
+  failure to *read* it back — including the empty file a crash or power loss
+  could leave — was treated as a reason to silently generate a brand new
+  identity. Because the history key is derived from the private key, that one
+  cascade produced: unreadable message history, a changed fingerprint for every
+  contact who had verified you, and an app that looked freshly installed. Now
+  every identity write is atomic and `fsync`ed (temp file, same directory,
+  rename, `0600` from creation), and an identity file that exists but cannot be
+  read is a hard, explained error that leaves the file intact for restoration
+  from a backup. The encrypted history uses the same atomic write, which
+  previously renamed without ever flushing.
+- **A failed migration no longer leaves your messages readable on disk.**
+  Migrating a legacy plaintext history deleted the old file and, if the delete
+  failed, logged a warning and carried on — leaving every message in the clear
+  with no indication. It now truncates the file to remove the content when it
+  cannot be unlinked, and raises a visible error naming the file if even that
+  fails.
+- **Loading history replaces state instead of merging into it**, so a deleted
+  chat cannot reappear after a reload. Live host placeholders are preserved.
+- **The terminal client honours the notification focus gate too.** It reports
+  presence based on recent keyboard interaction, since a terminal cannot report
+  window focus portably; going idle restores notifications for every
+  conversation.
+- **Community unread counts survive a restart**, the same defect as the
+  direct-message counts and fixed the same way: read marks are remembered rather
+  than re-seeded from whatever the server replayed on rejoin.
+- Dangerous-path checks on a loaded config compare **path components** instead of
+  substrings, so `/usrdata` and a directory named `my..files` are no longer
+  rejected, while `/var`, `/root`, `/boot`, `/proc`, `/sys`, `/dev` and
+  `ProgramData` now are.
+- A panic elsewhere in the process can no longer freeze the desktop app: the
+  identity mutex recovers from poisoning instead of panicking on every
+  subsequent access, which previously killed the event loop outright.
+- **Desktop notifications no longer fire for the conversation you are reading.**
+  The setting promises "notify when a message arrives in the background", but
+  every received message raised a popup regardless of focus. The shell now
+  reports focus + open conversation to `ChatManager` via `set_ui_presence`, and
+  `should_notify_for` gates on it.
+
+### Documentation
+
+- `SECURITY.md` no longer claims the desktop crate has no automated tests (it
+  has 15, run by CI on Linux and macOS), states plainly that the "medium"
+  posture is a **self-assessment** rather than an audit, and lists the lack of
+  offline delivery for direct P2P as a real limitation.
+- `docs/platform_spec.md` no longer says the Tauri binary is absent from the
+  release pipeline; phases E and F are marked done, and §14 now lists the honest
+  remaining gaps (no mobile client, no offline P2P delivery, self-hosting
+  required for WAN, no third-party audit) in order of cost.
+- README rewritten around one download, with an explicit "honest limitations"
+  section. User guide, tutorial, architecture, developer guide, and `CLAUDE.md`
+  updated to the single-app world.
 
 ## [1.14.0] - 2026-07-24
 

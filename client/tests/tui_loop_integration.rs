@@ -1,6 +1,6 @@
-use egui_tracing::tracing::EventCollector;
 use p2pem_classic::app::chat_manager::SessionHandle;
 use p2pem_classic::core::ProtocolMessage;
+use p2pem_classic::logbuf::LogBuffer;
 use p2pem_classic::tui::app::{TuiApp, TuiCommand, TuiFocus};
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 #[test]
 fn input_flow_supports_multiline_and_send() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     let chat_id = Uuid::new_v4();
     app.chat_manager
         .create_local_chat_for_test(chat_id, "Integration".to_string());
@@ -41,7 +41,7 @@ fn input_flow_supports_multiline_and_send() {
 
 #[tokio::test]
 async fn quit_command_terminates_loop_flag() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     assert!(!app.should_quit);
 
     // :quit now asks for confirmation; the loop only exits after 'y'.
@@ -53,7 +53,7 @@ async fn quit_command_terminates_loop_flag() {
 
 #[tokio::test]
 async fn rename_command_updates_selected_chat() {
-    let mut app = TuiApp::new(EventCollector::new()).unwrap();
+    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
     let chat_id = Uuid::new_v4();
     app.chat_manager
         .create_local_chat_for_test(chat_id, "Old".to_string());

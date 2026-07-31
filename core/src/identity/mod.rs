@@ -8,7 +8,7 @@
 ///
 /// Identity is stored in a JSON file in the user's data directory.
 /// Keys are now encrypted with a password.
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -251,7 +251,20 @@ impl Identity {
     }
 
     /// Encrypt the private key with a password.
+    ///
+    /// Rejects anything shorter than [`crate::MIN_PASSWORD_LEN`]. The floor is
+    /// enforced here rather than in each front-end because this password is the
+    /// only thing standing between an attacker with the disk and the identity
+    /// key — a UI-only check would be advisory, and one front-end forgetting it
+    /// would silently weaken every user it onboards. `decrypt` has no such
+    /// check, so identities created under an older, weaker floor still open.
     pub fn encrypt(&mut self, password: &str) -> Result<()> {
+        if password.chars().count() < crate::MIN_PASSWORD_LEN {
+            bail!(
+                "Password must be at least {} characters",
+                crate::MIN_PASSWORD_LEN
+            );
+        }
         let plaintext_pem = self
             .private_key_pem_plaintext
             .as_ref()
@@ -594,9 +607,6 @@ impl Identity {
         Ok(identity)
     }
 
-    /// Save identity to file
-    ///
-    /// SECURITY: Enforces encryption and strictly secure file permissions (0600 on Unix).
     /// Change the display name (shown in invite links and the local UI).
     /// Validation only — persist with [`Identity::save`] afterwards.
     pub fn set_name(&mut self, name: &str) -> Result<()> {
@@ -611,6 +621,12 @@ impl Identity {
         Ok(())
     }
 
+    /// Persist the identity.
+    ///
+    /// SECURITY: enforces encryption and strictly secure file permissions (0600
+    /// on Unix). The write is **atomic** — see [`write_file_atomic`]. This file
+    /// is the only key to the user's message history, so a half-written one is
+    /// equivalent to destroying the account.
     pub fn save(&self, path: &Path) -> Result<()> {
         // Guard against saving unencrypted identities
         if self.encrypted_private_key.is_none() {
@@ -625,52 +641,55 @@ impl Identity {
         }
 
         let content = serde_json::to_string_pretty(&self)?;
-
-        // Secure file creation
-        #[cfg(unix)]
-        {
-            use std::fs::OpenOptions;
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let mut options = OpenOptions::new();
-            options.write(true).create(true).truncate(true).mode(0o600);
-
-            let mut file = options.open(path)?;
-            std::io::Write::write_all(&mut file, content.as_bytes())?;
-        }
-
-        // On Windows/Other, standard write for now (ACLs are complex in std)
-        #[cfg(not(unix))]
-        {
-            std::fs::write(path, content)?;
-        }
+        crate::util::write_file_atomic(path, content.as_bytes())?;
 
         tracing::info!("Saved identity: {} to {}", self.name, path.display());
         Ok(())
     }
 
-    /// Get or create identity from user data directory
+    /// Load the identity from `data_dir`, or create one if there is none.
+    ///
+    /// Returns `(identity, is_new)`.
+    ///
+    /// **A present-but-unreadable identity file is a hard error**, never a
+    /// reason to mint a new one. Generating a fresh keypair there looks like a
+    /// graceful fallback and is actually the worst outcome the app can produce:
+    /// the history key is derived from the private key
+    /// ([`Identity::history_key`]), so a new identity makes the existing
+    /// encrypted history permanently unreadable, and the new fingerprint breaks
+    /// TOFU trust with every contact who had verified the old one — all
+    /// presented to the user as a blank, freshly-installed app. Failing loudly
+    /// keeps the file intact so it can be restored from a backup.
     pub fn get_or_create(data_dir: &Path, default_name: &str) -> Result<(Self, bool)> {
         let identity_path = data_dir.join("identity.json");
 
-        if identity_path.exists() {
-            // Load existing identity
-            match Self::load(&identity_path) {
-                Ok(identity) => {
-                    tracing::info!("Using existing identity: {}", identity.name);
-                    Ok((identity, false))
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load identity, creating new one: {}", e);
-                    let identity = Self::new_with_plaintext(default_name.to_string())?;
-                    Ok((identity, true))
-                }
-            }
-        } else {
-            // Create new identity
+        if !identity_path.exists() {
             tracing::info!("No existing identity found, creating new one");
-            let identity = Self::new_with_plaintext(default_name.to_string())?;
-            Ok((identity, true))
+            return Ok((Self::new_with_plaintext(default_name.to_string())?, true));
+        }
+
+        match Self::load(&identity_path) {
+            Ok(identity) => {
+                tracing::info!("Using existing identity: {}", identity.name);
+                Ok((identity, false))
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %identity_path.display(),
+                    error = %e,
+                    "identity file exists but could not be read; refusing to create a new identity"
+                );
+                Err(anyhow!(
+                    "Your identity file at {} exists but could not be read: {e}\n\n\
+                     Refusing to create a new identity, because that would abandon this \
+                     one permanently: your encrypted message history would become \
+                     unreadable, and every contact who verified you would see a changed \
+                     fingerprint.\n\n\
+                     Restore the file from a backup (Settings > Identity backup), or move \
+                     it aside if you really do want to start over as a new identity.",
+                    identity_path.display()
+                ))
+            }
         }
     }
 
@@ -686,6 +705,11 @@ impl Identity {
 
     /// Derive a stable 32-byte history encryption key from the private key.
     /// Requires the identity to be unlocked (private key available).
+    ///
+    /// Note the coupling this creates: **the identity file is the only key to
+    /// the message history.** Losing or corrupting it is unrecoverable, which
+    /// is why [`Identity::save`] writes atomically and
+    /// [`Identity::get_or_create`] refuses to replace an unreadable one.
     pub fn history_key(&self) -> Result<[u8; 32]> {
         let privkey = self.private_key()?;
         let der = privkey.to_pkcs8_der()?;
@@ -715,6 +739,143 @@ mod tests {
         assert!(identity
             .public_key_pem
             .starts_with("-----BEGIN PUBLIC KEY-----"));
+    }
+
+    /// The single most destructive thing this app could do is replace an
+    /// identity it merely failed to *read*: the history key is derived from the
+    /// private key, so a new identity makes every stored message permanently
+    /// unreadable and breaks TOFU trust with every contact — while looking to
+    /// the user like a fresh install.
+    #[test]
+    fn unreadable_identity_is_an_error_never_a_new_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+
+        // A truncated file: exactly what an interrupted write used to leave.
+        std::fs::write(&path, b"").unwrap();
+        // `Identity` deliberately has no `Debug` (it holds key material), so
+        // unwrap the error by matching rather than with `expect_err`.
+        let msg = match Identity::get_or_create(dir.path(), "User") {
+            Ok(_) => panic!("an unreadable identity must not be silently replaced"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("could not be read"),
+            "error should explain the problem: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("backup"),
+            "error should point at recovery: {msg}"
+        );
+
+        // Critically, the unreadable file is left exactly as it was, so it can
+        // still be restored or inspected.
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        // Garbage that is not even JSON behaves the same way.
+        std::fs::write(&path, b"{\"partial\": tru").unwrap();
+        assert!(Identity::get_or_create(dir.path(), "User").is_err());
+    }
+
+    /// The no-file case is a genuinely new install and must still work.
+    #[test]
+    fn absent_identity_creates_a_new_one() {
+        let dir = tempdir().unwrap();
+        let (identity, is_new) = Identity::get_or_create(dir.path(), "Fresh").unwrap();
+        assert!(is_new);
+        assert_eq!(identity.name, "Fresh");
+    }
+
+    /// A saved identity round-trips and is reported as *not* new.
+    #[test]
+    fn existing_identity_is_loaded_not_recreated() {
+        let dir = tempdir().unwrap();
+        let mut identity = Identity::new_with_plaintext("Original".to_string()).unwrap();
+        identity.encrypt(&test_password()).unwrap();
+        let fingerprint = identity.fingerprint.clone();
+        identity.save(&dir.path().join("identity.json")).unwrap();
+
+        let (loaded, is_new) = Identity::get_or_create(dir.path(), "Should Not Be Used").unwrap();
+        assert!(!is_new);
+        assert_eq!(loaded.name, "Original");
+        assert_eq!(
+            loaded.fingerprint, fingerprint,
+            "the fingerprint contacts verified must be preserved"
+        );
+    }
+
+    /// `save` must never leave a half-written file behind, and must leave no
+    /// temporary files cluttering the data directory.
+    #[test]
+    fn save_replaces_atomically_and_leaves_no_temp_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+
+        let mut first = Identity::new_with_plaintext("First".to_string()).unwrap();
+        first.encrypt(&test_password()).unwrap();
+        first.save(&path).unwrap();
+
+        let mut second = Identity::new_with_plaintext("Second".to_string()).unwrap();
+        second.encrypt(&test_password()).unwrap();
+        second.save(&path).unwrap();
+
+        // Overwriting an existing identity yields exactly that identity...
+        let reloaded = Identity::load(&path).unwrap();
+        assert_eq!(reloaded.name, "Second");
+
+        // ...and exactly one file.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["identity.json".to_string()],
+            "stray temp file"
+        );
+    }
+
+    /// The password floor is a core-level invariant, not a UI suggestion: a
+    /// front-end that forgets to validate must still be unable to create a
+    /// weakly-protected keystore.
+    #[test]
+    fn encrypt_rejects_passwords_below_the_floor() {
+        let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
+        let short = "a".repeat(crate::MIN_PASSWORD_LEN - 1);
+        let err = identity
+            .encrypt(&short)
+            .expect_err("a short password must be rejected");
+        assert!(
+            err.to_string().contains("at least"),
+            "error should say what the floor is, got: {err}"
+        );
+        // Nothing was consumed on the rejected attempt: the identity is still
+        // usable and can be encrypted with an acceptable password.
+        assert!(identity.private_key_pem_plaintext.is_some());
+        identity
+            .encrypt(&"a".repeat(crate::MIN_PASSWORD_LEN))
+            .unwrap();
+        assert!(identity.encrypted_private_key.is_some());
+    }
+
+    /// Raising the floor must never lock out an identity created under an older,
+    /// weaker one, so `decrypt` deliberately carries no length check: a short
+    /// password reaches the KDF and fails (or succeeds) on the ciphertext alone,
+    /// never on policy.
+    #[test]
+    fn decrypt_applies_no_length_policy() {
+        let mut identity = Identity::new_with_plaintext("Legacy User".to_string()).unwrap();
+        identity.encrypt(&test_password()).unwrap();
+
+        let short = "a".repeat(crate::MIN_PASSWORD_LEN - 1);
+        let err = identity
+            .decrypt(&short)
+            .expect_err("a wrong password must fail");
+        assert!(
+            !err.to_string().contains("at least"),
+            "decrypt must fail on the ciphertext, not on the length floor: {err}"
+        );
     }
 
     #[test]

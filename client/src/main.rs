@@ -1,16 +1,22 @@
-#![cfg_attr(
-    all(target_os = "windows", not(debug_assertions)),
-    windows_subsystem = "windows"
-)]
+//! P2PEM terminal client.
+//!
+//! This binary is the ratatui terminal UI plus the relay-server mode. The
+//! desktop app is a separate product (`p2pem-desktop`, Tauri + React) built
+//! from `desktop/`; the egui GUI that used to live behind `--gui` was retired
+//! once that reached parity, so there is exactly one desktop app to install.
 use clap::Parser;
 
-use egui_tracing::tracing::EventCollector;
+use p2pem_classic::logbuf::LogBuffer;
 use p2pem_classic::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "P2P Encrypted Messaging Application")]
+#[command(
+    author,
+    version,
+    about = "P2PEM — encrypted peer-to-peer messaging (terminal client)"
+)]
 struct Args {
     /// Start as host (server mode)
     #[arg(short = 'H', long)]
@@ -40,32 +46,50 @@ struct Args {
     #[arg(short, long, default_value_t = PORT_DEFAULT)]
     port: u16,
 
-    /// Enable GUI mode (default unless --tui is used)
-    #[arg(long)]
+    /// Retired: the graphical app is now a separate download (see --help)
+    #[arg(long, hide = true)]
     gui: bool,
 
-    /// Enable Terminal UI mode
+    /// Run the terminal UI (the default for this binary)
     #[arg(long)]
     tui: bool,
 }
+
+/// Printed when someone passes the retired `--gui` flag, or launches a shortcut
+/// that still carries it. Failing with directions beats silently starting a
+/// different interface than the one that was asked for.
+const GUI_RETIRED_NOTICE: &str = "\
+`--gui` has been retired: this binary is the terminal client.
+
+The graphical app is P2PEM Desktop, a separate download:
+  https://github.com/fibo3090-code/secure-p2p-chat/releases/latest
+
+It uses its own identity and history, so installing it does not affect this one.
+To keep using the terminal interface, run without `--gui`.";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     support::install_panic_hook();
 
-    // Initialize logging
-    let event_collector = EventCollector::new();
+    // Retained in memory for the log overlay (Ctrl+L) and diagnostics bundles,
+    // in addition to whatever the environment's RUST_LOG selects.
+    let logs = LogBuffer::new();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,p2pem_classic=debug".into()),
         )
-        .with(event_collector.clone())
+        .with(logs.clone())
         .init();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Application starting");
-    let mut args = Args::parse();
+    let args = Args::parse();
     tracing::debug!(?args, "Parsed CLI arguments");
+
+    if args.gui {
+        eprintln!("{GUI_RETIRED_NOTICE}");
+        std::process::exit(2);
+    }
 
     if args.relay_server {
         tracing::info!("Starting relay server mode");
@@ -73,84 +97,25 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Default to GUI if no mode is specified
-    if !args.gui && !args.tui {
-        args.gui = true;
+    // No console juggling on Windows any more: this is a console-subsystem
+    // binary now that the GUI is gone, so Windows attaches (or creates) a
+    // console for it. The old build declared `windows_subsystem = "windows"`
+    // for the egui window and had to `AttachConsole`/`AllocConsole` by hand
+    // whenever the terminal UI was requested.
+    tracing::info!("Starting TUI mode");
+    let launch = tui::TuiLaunchConfig {
+        host: args.host,
+        connect: args.connect.clone(),
+        host_relay: args.host_relay.clone(),
+        relay_connect: args.connect_relay.clone(),
+        relay_token: args.relay_token.clone(),
+        port: args.port,
+    };
+    if let Err(e) = tui::run(logs, launch).await {
+        tracing::error!(error = %e, "TUI application exited with an error");
+        std::process::exit(1);
     }
-
-    // On Windows, if we are in TUI mode or explicitly requested console features,
-    // we need to attach to the parent console or allocate a new one.
-    #[cfg(target_os = "windows")]
-    if args.tui || args.host || args.connect.is_some() {
-        use std::io::IsTerminal;
-        if !std::io::stdout().is_terminal() {
-            // Try to attach to parent console (e.g. if launched from cmd/powershell)
-            if unsafe {
-                windows_sys::Win32::System::Console::AttachConsole(
-                    windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
-                )
-            } == 0
-            {
-                // If attaching failed (e.g. launched from Explorer), allocate a new console
-                unsafe { windows_sys::Win32::System::Console::AllocConsole() };
-            }
-        }
-    }
-
-    if args.tui {
-        // Launch TUI
-        tracing::info!("Starting TUI mode");
-        let launch = tui::TuiLaunchConfig {
-            host: args.host,
-            connect: args.connect.clone(),
-            host_relay: args.host_relay.clone(),
-            relay_connect: args.connect_relay.clone(),
-            relay_token: args.relay_token.clone(),
-            port: args.port,
-        };
-        if let Err(e) = tui::run(event_collector.clone(), launch).await {
-            tracing::error!(error = %e, "TUI application exited with an error");
-            std::process::exit(1);
-        }
-        tracing::info!("TUI application exited");
-    } else if args.gui {
-        // Launch GUI
-        tracing::info!("Starting GUI mode");
-
-        let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
-            .expect("bundled app icon must decode")
-            .into_rgba8();
-        let (icon_width, icon_height) = icon.dimensions();
-        let native_options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1200.0, 800.0])
-                .with_min_inner_size([800.0, 600.0])
-                .with_icon(egui::IconData {
-                    rgba: icon.into_raw(),
-                    width: icon_width,
-                    height: icon_height,
-                }),
-            ..Default::default()
-        };
-
-        tracing::debug!("Creating native window and launching eframe");
-        let run_result = eframe::run_native(
-            "Encrypted P2P Messenger",
-            native_options,
-            Box::new(|cc| match gui::App::new(cc, event_collector.clone()) {
-                Ok(app) => Ok(Box::new(app)),
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create app state");
-                    Err(e.into())
-                }
-            }),
-        );
-        if let Err(e) = run_result {
-            tracing::error!(error = %e, "Failed to start GUI application");
-            std::process::exit(1);
-        }
-        tracing::info!("GUI application exited");
-    }
+    tracing::info!("TUI application exited");
 
     Ok(())
 }

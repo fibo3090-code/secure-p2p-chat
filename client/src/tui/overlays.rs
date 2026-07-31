@@ -71,8 +71,8 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn ratatui_color(c: eframe::egui::Color32) -> Color {
-    Color::Rgb(c.r(), c.g(), c.b())
+fn ratatui_color(c: crate::colorgrid::Rgb) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
 }
 
 /// Brand-neutral chrome accent ("control teal-indigo", see design/tokens.json).
@@ -271,7 +271,8 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
         );
     }
 
-    // Color grid (matches the GUI's generate_color_grid palette exactly).
+    // Safety grid — the same frozen palette every front-end renders, so the
+    // shape a user compares is identical in the terminal and the desktop app.
     let grid = crate::colorgrid::generate_color_grid(fingerprint);
     let grid_lines: Vec<Line> = grid
         .iter()
@@ -594,5 +595,62 @@ pub fn toast_color(level: ToastLevel) -> Color {
         ToastLevel::Success => Color::Green,
         ToastLevel::Warning => Color::Yellow,
         ToastLevel::Error => Color::Red,
+    }
+}
+
+#[cfg(test)]
+mod token_drift_tests {
+    //! `design/tokens.json` is the source of record for brand colour, but
+    //! nothing generates code from it. This is the Rust half of the drift
+    //! guard (the desktop CSS half is `desktop/src/lib/tokens.test.js`); it
+    //! replaces the equivalent check that lived in the egui theming module
+    //! before that was retired.
+    use super::BRAND_ACCENT;
+    use ratatui::style::Color;
+    use std::path::Path;
+
+    fn tokens() -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../design/tokens.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "design/tokens.json must be readable ({}): {e}",
+                path.display()
+            )
+        });
+        serde_json::from_str(&raw).expect("design/tokens.json must be valid JSON")
+    }
+
+    fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
+        let h = hex.trim_start_matches('#');
+        assert_eq!(h.len(), 6, "expected #rrggbb, got {hex}");
+        (
+            u8::from_str_radix(&h[0..2], 16).expect("red"),
+            u8::from_str_radix(&h[2..4], 16).expect("green"),
+            u8::from_str_radix(&h[4..6], 16).expect("blue"),
+        )
+    }
+
+    #[test]
+    fn tui_brand_accent_matches_design_tokens() {
+        let hex = tokens()["brand"]["flatAccent"]
+            .as_str()
+            .expect("brand.flatAccent")
+            .to_string();
+        let (r, g, b) = hex_to_rgb(&hex);
+        assert_eq!(
+            BRAND_ACCENT,
+            Color::Rgb(r, g, b),
+            "TUI chrome accent drifted from design/tokens.json brand.flatAccent ({hex})"
+        );
+    }
+
+    /// The safety grid is a security signal users compare across devices, so
+    /// its palette must not depend on which front-end renders it.
+    #[test]
+    fn safety_grid_palette_is_shared_and_frozen() {
+        use crate::colorgrid::PALETTE;
+        assert_eq!(PALETTE.len(), 16, "the grid indexes bytes modulo 16");
+        assert_eq!(PALETTE[0], (230, 25, 75));
+        assert_eq!(PALETTE[15], (128, 128, 0));
     }
 }

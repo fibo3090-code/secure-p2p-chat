@@ -1,60 +1,57 @@
 # Tutorial
 
-This tutorial walks through a real first session with Encrypted P2P Messenger. It assumes two people, two devices, and a goal of getting from install to verified secure chat with the least confusion.
+This tutorial walks through a real first session with P2PEM. It assumes two people, two devices, and a goal of getting from install to verified secure chat with the least confusion.
 
 ## Goal
 
 By the end of this tutorial you will have:
 
 - installed the app
-- created and protected an identity
+- created an identity, protected it, and backed it up
 - connected to another person
-- verified fingerprints
+- verified the connection with a short code
 - exchanged messages
 - shared a file
 - exported diagnostics if something goes wrong
 
 ## 1. Install the app
 
-Use the latest release from GitHub:
+Download **P2PEM Desktop** from the [latest release](https://github.com/fibo3090-code/secure-p2p-chat/releases/latest):
 
-- Windows: download `P2PEM-Classic_<version>_x64-setup.exe`
-- macOS Intel: download `P2PEM-Classic_<version>_macos-x64.dmg`
-- macOS Apple Silicon: download `P2PEM-Classic_<version>_macos-aarch64.dmg`
-- Linux: download `P2PEM-Classic_<version>_linux-x64.tar.gz`
+- Windows: `P2PEM_<version>_x64-setup.exe`
+- macOS Apple silicon: `P2PEM_<version>_aarch64.dmg`
+- macOS Intel: `P2PEM_<version>_x64.dmg`
+- Linux: `p2pem_<version>_amd64.AppImage` or `.deb`
 
-(The `P2PEM_<version>_*` assets on the same page are the newer Tauri desktop
-app; see the [User Guide](USER_GUIDE.md#installation) for the full list.)
+The `P2PEM-Tools_*` archive on the same page is for running a server or working
+from a terminal — you don't need it here.
 
 If you prefer to build from source:
 
 ```bash
 git clone <repository-url>
-cd secure-p2p-chat
-cargo build --release
+cd secure-p2p-chat/desktop
+npm ci && npx tauri build
 ```
 
 ## 2. Launch and create your identity
 
-Start the GUI:
+Open the app. It creates a local identity and asks for a password, which
+encrypts the private key and your history on disk. Use at least 12 characters —
+that password is the only thing protecting your identity if someone gets the
+disk.
 
-```bash
-cargo run --release
-```
+**Then take the backup it offers.** This is the one step people skip and regret:
 
-Or launch the TUI:
+- there is no password reset and no account recovery
+- if you lose the identity file without a backup, you lose that identity, and
+  every contact who verified you has to verify a new one
 
-```bash
-cargo run --release -- --tui
-```
+You can redo it any time from Settings → Your identity → Identity backup, which
+also tells you whether you have ever made one.
 
-On first launch the app creates a local identity. Set a password immediately. That password protects the private key and encrypted history on disk.
-
-Important:
-
-- there is no password reset flow
-- removing password protection is not supported
-- if you lose the password, you lose access to that identity
+Prefer the terminal? `cargo run --release -p p2pem-classic` opens the TUI, which
+does everything the desktop app does.
 
 ## 3. Pick a connection method
 
@@ -67,10 +64,10 @@ Recommended for a first test on the same Wi-Fi or home network.
 1. One person starts hosting.
 2. The other person connects to that host’s address and port.
 
-GUI path:
+Desktop app:
 
-1. Host clicks `+` and chooses host mode.
-2. Connector clicks `+` and chooses connect mode.
+1. Host clicks **New connection** and chooses host mode.
+2. Connector clicks **New connection** and chooses connect mode.
 3. Connector enters the host address, for example `192.168.1.40:12345`.
 
 TUI path:
@@ -84,7 +81,7 @@ TUI path:
 
 Recommended when you want to avoid manually copying the fingerprint, public key, and address fields.
 
-1. Host generates an invite link from the GUI.
+1. Host generates an invite link from Contacts.
 2. Host sends that link through some other channel.
 3. Connector pastes it into the Invite Link flow.
 
@@ -147,10 +144,11 @@ After the connection is up and fingerprints are verified:
 
 Large text messages are chunked automatically by the transport and reassembled on the receiving side.
 
-GUI:
+Desktop app:
 
 - type in the message box
 - press `Enter` or click the send action
+- a ✓ next to your message means the peer's device confirmed receipt
 
 TUI:
 
@@ -204,10 +202,10 @@ Then accept the fingerprint overlay (`y`) on both sides and start chatting.
 
 If the app misbehaves, export diagnostics before reporting the bug.
 
-GUI:
+Desktop app:
 
-- open `Settings`
-- use the diagnostics export action
+- open **Settings** → **Support**
+- use **Export diagnostics**
 
 TUI:
 
@@ -225,6 +223,6 @@ Once the first session works, move on to:
 - [../SECURITY.md](../SECURITY.md) for the app’s actual security posture
 - [../THREAT_MODEL.md](../THREAT_MODEL.md) for assumptions and limits
 
-If you build from source, you can also try the in-development Tauri + React desktop
-app (the future replacement for the egui GUI) with `cd desktop && npx tauri dev` —
-see [USER_GUIDE.md](USER_GUIDE.md#tauri-desktop-app-preview).
+Prefer working in a terminal? The TUI is fully featured and drives the same core
+— see [USER_GUIDE.md](USER_GUIDE.md#tui-reference).
+

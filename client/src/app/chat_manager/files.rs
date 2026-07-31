@@ -526,6 +526,12 @@ impl ChatManager {
                         ToastLevel::Success,
                         format!("File received: {}", transfer.filename),
                     );
+                    // A file landing in a background conversation deserves the
+                    // same desktop notification a text message gets.
+                    self.notify_incoming_message(
+                        transfer.chat_id,
+                        &format!("📎 {}", transfer.filename),
+                    );
                 }
                 self.update_transfer_progress(transfer_id, bytes_received);
             }

@@ -38,18 +38,14 @@ hkdf = "0.12"
 hex = "0.4"
 base64 = "0.21"
 
-# Logging
+# Logging. The app keeps its own bounded in-process buffer for the log overlay
+# and diagnostics bundles (`client/src/logbuf.rs`) — that used to be
+# `egui_tracing`, dropped along with the egui GUI.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-egui_tracing = { version = "0.2.6", features = ["egui-default"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-
-# GUI
-eframe = "0.29.0"
-egui = "0.29.0"
-egui_commonmark = { version = "0.18", features = ["default"] }
 
 # TUI
 ratatui = { version = "0.30.0", features = ["crossterm_0_29", "underline-color", "all-widgets", "macros", "layout-cache"] }
@@ -76,9 +72,6 @@ open = "5"
 # Desktop notifications
 notify-rust = "4"
 
-# Emoji support
-emojis = "0.9"
-
 # QR code generation and scanning
 qrcode = "0.14.0"
 image = "0.25.9"
@@ -91,9 +84,6 @@ igd-next = { version = "0.17", features = ["aio_tokio"] }
 natpmp = "0.5"
 hostname = "0.4"
 unicode-width = "0.2"
-
-# Windows-specific
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 # Dev / testing
 tokio-test = "0.4"

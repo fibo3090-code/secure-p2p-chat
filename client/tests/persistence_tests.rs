@@ -30,6 +30,7 @@ fn sample_chat(title: &str) -> Chat {
         peer_typing: false,
         typing_since: None,
         is_host_placeholder: false,
+        read_count: 0,
     }
 }
 

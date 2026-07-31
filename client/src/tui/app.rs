@@ -10,6 +10,7 @@
 use crate::app::chat_manager::ChatManager;
 use crate::app::party_manager::PartyManager;
 use crate::identity::Identity;
+use crate::logbuf::LogBuffer;
 use crate::tui::command::{
     command_help, parse_command, parse_setting_bool, settings_keys, COMMANDS,
 };
@@ -17,10 +18,8 @@ use crate::tui::input::EditableField;
 use crate::tui::overlays::{PasswordMode, TuiOverlay};
 use crate::types::{Config, Theme, ToastLevel};
 use anyhow::Result;
-use egui_tracing::tracing::EventCollector;
 use ratatui::widgets::ListState;
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -50,6 +49,9 @@ pub enum TuiMode {
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 const REHOST_DEBOUNCE: Duration = Duration::from_millis(1500);
 const TYPING_IDLE: Duration = Duration::from_secs(4);
+/// How long after the last keypress the terminal still counts as "the user is
+/// here", for the desktop-notification focus gate. See `report_presence`.
+const PRESENCE_IDLE: Duration = Duration::from_secs(45);
 
 pub struct TuiApp {
     pub chat_manager: ChatManager,
@@ -65,7 +67,7 @@ pub struct TuiApp {
     pub message_scroll: u16,
     pub stick_to_bottom: bool,
     pub identity_name: String,
-    pub event_collector: EventCollector,
+    pub logs: LogBuffer,
     pub focus: TuiFocus,
     pub mode: TuiMode,
     pub status_line: String,
@@ -87,13 +89,13 @@ pub struct TuiApp {
     /// In-flight Party file downloads. `tick` polls them and writes finished
     /// downloads into the download directory.
     pending_party_downloads: Vec<PendingPartyDownload>,
-    /// Per-chat count of messages already seen (for unread detection).
-    seen_counts: HashMap<Uuid, usize>,
-    unread: HashSet<Uuid>,
     last_save: Option<Instant>,
     last_rehost: Option<Instant>,
     typing_active: bool,
     last_typing_activity: Option<Instant>,
+    /// Last keypress of any kind. Stands in for "the window has focus", which a
+    /// terminal cannot report portably — see `report_presence`.
+    last_interaction: Option<Instant>,
     /// Indices into `command::COMMANDS` matching the command word being typed.
     pub command_suggestions: Vec<usize>,
     /// Highlighted entry within `command_suggestions`.
@@ -103,7 +105,7 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    pub fn new(event_collector: EventCollector) -> Result<Self> {
+    pub fn new(logs: LogBuffer) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
 
         let proj_dirs = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
@@ -141,7 +143,7 @@ impl TuiApp {
             message_scroll: 0,
             stick_to_bottom: true,
             identity_name: identity.name.clone(),
-            event_collector,
+            logs,
             focus: TuiFocus::Input,
             mode: TuiMode::Normal,
             status_line: String::new(),
@@ -159,12 +161,11 @@ impl TuiApp {
             history_path,
             pending_command: None,
             pending_party_downloads: Vec::new(),
-            seen_counts: HashMap::new(),
-            unread: HashSet::new(),
             last_save: None,
             last_rehost: None,
             typing_active: false,
             last_typing_activity: None,
+            last_interaction: None,
             command_suggestions: Vec::new(),
             suggestion_index: 0,
             help_topic: None,
@@ -321,32 +322,45 @@ impl TuiApp {
 
         self.sync_chat_ids();
         self.update_unread();
+        self.report_presence();
         self.maybe_send_typing_stop();
         self.autosave();
         self.auto_rehost();
         self.refresh_status_line();
     }
 
+    /// Reading a conversation is a *persisted* fact (`Chat::read_count`, saved
+    /// inside the encrypted history), not per-session bookkeeping — so a message
+    /// that arrived while the app was closed is still unread on the next launch.
     fn update_unread(&mut self) {
-        let selected = self.selected_chat_id();
-        for chat in self.chat_manager.chats.values() {
-            let count = chat.messages.len();
-            let seen = self.seen_counts.get(&chat.id).copied().unwrap_or(0);
-            if Some(chat.id) == selected {
-                self.seen_counts.insert(chat.id, count);
-                self.unread.remove(&chat.id);
-            } else if count > seen {
-                self.unread.insert(chat.id);
-            }
+        if let Some(selected) = self.selected_chat_id() {
+            self.chat_manager.mark_chat_read(selected);
         }
-        self.seen_counts
-            .retain(|id, _| self.chat_manager.chats.contains_key(id));
-        self.unread
-            .retain(|id| self.chat_manager.chats.contains_key(id));
     }
 
     pub fn is_unread(&self, chat_id: &Uuid) -> bool {
-        self.unread.contains(chat_id)
+        self.chat_manager
+            .get_chat(*chat_id)
+            .is_some_and(|c| c.unread_count() > 0)
+    }
+
+    /// Tell `ChatManager` what the user can see, so a desktop notification does
+    /// not fire for the conversation they are reading right now.
+    ///
+    /// A terminal cannot reliably report window focus — crossterm's focus
+    /// events need terminal support that is far from universal, and enabling
+    /// them can emit stray escape sequences on terminals that lack it. So
+    /// "focused" is approximated by *recent interaction*: if the user pressed a
+    /// key within [`PRESENCE_IDLE`], they are at the terminal. Once they go
+    /// idle, presence drops and every conversation notifies again — which is
+    /// the correct direction to fail, because the cost of a missed notification
+    /// is higher than the cost of an extra one.
+    fn report_presence(&mut self) {
+        let active = self
+            .last_interaction
+            .is_some_and(|t| t.elapsed() < PRESENCE_IDLE);
+        self.chat_manager
+            .set_ui_presence(active, self.selected_chat_id());
     }
 
     fn autosave(&mut self) {
@@ -522,6 +536,9 @@ impl TuiApp {
     // ---------------------------------------------------------------- keys
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
+        // Any keystroke means the user is at the terminal; `report_presence`
+        // uses this to gate desktop notifications.
+        self.last_interaction = Some(Instant::now());
         if self.overlay.is_open() {
             self.handle_overlay_key(key);
             return;
@@ -1555,10 +1572,15 @@ impl TuiApp {
     }
 
     fn try_set_password(&mut self, password: &str) {
-        if password.len() < 6 {
+        // Mirrors the floor `Identity::encrypt` enforces, so the user gets a
+        // clear message here instead of a generic failure from the core.
+        if password.chars().count() < crate::MIN_PASSWORD_LEN {
             self.toast(
                 ToastLevel::Error,
-                "Password must be at least 6 characters".to_string(),
+                format!(
+                    "Password must be at least {} characters",
+                    crate::MIN_PASSWORD_LEN
+                ),
             );
             return;
         }
@@ -1755,7 +1777,7 @@ impl TuiApp {
     }
 
     pub fn copy_logs(&mut self) {
-        let log_text = crate::support::format_event_logs(&self.event_collector);
+        let log_text = crate::support::format_event_logs(&self.logs);
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => match clipboard.set_text(log_text) {
                 Ok(()) => self.toast(ToastLevel::Success, "Logs copied to clipboard".to_string()),
@@ -1786,7 +1808,7 @@ impl TuiApp {
             discovered_peers: 0,
             config: crate::support::DiagnosticsConfig::from(&self.chat_manager.config),
         };
-        let logs = crate::support::format_event_logs(&self.event_collector);
+        let logs = crate::support::format_event_logs(&self.logs);
         let base_dir = self
             .history_path
             .parent()
@@ -1843,7 +1865,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn app() -> TuiApp {
-        TuiApp::new(EventCollector::new()).unwrap()
+        TuiApp::new(LogBuffer::new()).unwrap()
     }
 
     fn key(c: char) -> KeyEvent {
