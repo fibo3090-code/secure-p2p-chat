@@ -111,12 +111,24 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   signatures to Ed25519 (the wire already negotiates a scheme field) would drop
   `rsa` from the security-critical path entirely.
 - `bincode` remains a tracked dependency migration concern
-- Known-accepted `cargo audit` findings beyond `rsa` above: `quick-xml`
-  (RUSTSEC-2026-0194/0195) is pinned transitively by Tauri below the fixed
-  release — the parsed XML there is build-time or local desktop-bus data,
-  never peer-controlled input — and the unmaintained GTK3-binding warnings
-  come with Tauri's Linux backend until it moves off GTK3. Retiring the egui
-  GUI removed the egui-winit/wayland half of this surface entirely.
+- Known-accepted `cargo audit` findings beyond `rsa` above, each with the exact
+  path that pulls it (verified with `cargo tree --target all -i`, since a
+  "transitively via Tauri" hand-wave was wrong here once already):
+  - **`quick-xml` 0.39.4** (RUSTSEC-2026-0194/0195, both DoS-on-hostile-XML):
+    reached **only** on Linux/Wayland via
+    `rfd → wayland-client/wayland-protocols → wayland-scanner`.
+    `wayland-scanner` is a **proc macro**: it parses the Wayland protocol XML
+    that ships inside the crate, at build time, and is never linked into the
+    shipped binary. The input is neither peer-controlled nor present at
+    runtime. The app's *own* Tauri path resolves `quick-xml` 0.41.0, which is
+    already fixed.
+  - **Unmaintained GTK3 bindings** (`gtk`, `gdk`, `atk`, `glib`, … 0.18):
+    Tauri's Linux backend (`muda`, `tao` → `tauri-runtime-wry`) until it moves
+    off GTK3. Not something this project can resolve independently.
+  - **`bincode` 1.3.3 unmaintained** (RUSTSEC-2025-0141): a direct `core`
+    dependency used for the relay control protocol. Migration is tracked; the
+    frames it decodes are length-bounded by `MAX_PACKET_SIZE` before parsing.
+
   Re-evaluate on every Tauri upgrade; everything else in the tree is kept
   current via in-semver `cargo update`.
 

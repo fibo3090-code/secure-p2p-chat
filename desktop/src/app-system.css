@@ -241,6 +241,33 @@ input,textarea{font-family:inherit;color:inherit}
   background:var(--s2);color:var(--accent)}
 .chat-empty-h{font-family:var(--display);font-weight:600;font-size:18px}
 .chat-empty-p{color:var(--dim);font-size:13px;margin-top:6px}
+
+/* ---- First-run "get started" panel ----
+   Shown instead of the empty chat pane when the user has no conversations at
+   all. Scrolls rather than clipping on a short window. */
+.chat-start{align-items:center;justify-content:center;overflow-y:auto;padding:32px 24px}
+.chat-start-inner{width:100%;max-width:560px;margin:auto;display:flex;flex-direction:column;gap:20px}
+.chat-start-head{display:flex;gap:16px;align-items:flex-start}
+.chat-start-head .chat-empty-ic{margin:0;flex:none;width:52px;height:52px}
+.chat-start-h{font-family:var(--display);font-weight:600;font-size:19px}
+.chat-start-p{color:var(--dim);font-size:13px;line-height:1.55;margin-top:6px}
+.chat-start-paths{display:flex;flex-direction:column;gap:10px}
+.start-card{display:flex;align-items:flex-start;gap:13px;width:100%;text-align:left;padding:14px 15px;
+  background:var(--s1);border:1px solid var(--border);border-radius:var(--r-lg);color:var(--text);
+  cursor:pointer;transition:.13s}
+.start-card:hover{background:var(--s2);border-color:var(--accent)}
+.start-card:focus-visible{outline:none;border-color:transparent;box-shadow:0 0 0 2px var(--accent)}
+.start-card-ic{flex:none;display:grid;place-items:center;width:34px;height:34px;border-radius:var(--radius);
+  background:var(--s3);color:var(--accent)}
+.start-card-txt{display:flex;flex-direction:column;gap:3px;min-width:0}
+.start-card-h{font-weight:600;font-size:14px}
+.start-card-b{color:var(--dim);font-size:12.5px;line-height:1.5}
+.start-card-hint{color:var(--faint);font-size:11.5px;margin-top:2px}
+.start-card-go{flex:none;align-self:center;color:var(--faint)}
+.start-card:hover .start-card-go{color:var(--accent)}
+.chat-start-foot{display:flex;gap:10px;align-items:flex-start;padding:13px 15px;border-radius:var(--r-lg);
+  background:color-mix(in oklab,var(--accent) 8%,transparent);color:var(--dim);font-size:12.5px;line-height:1.55}
+.chat-start-foot>svg{flex:none;margin-top:2px;color:var(--accent)}
 .chat-head{flex:none;display:flex;align-items:center;justify-content:space-between;padding:11px 18px;
   background:var(--s1);border-bottom:1px solid var(--border)}
 .chat-head-l{display:flex;align-items:center;gap:12px;min-width:0}

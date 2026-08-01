@@ -77,6 +77,9 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
   const [creatorOpen, setCreatorOpen] = useState(false);
+  // Which tab the connection dialog opens on, so the get-started suggestions
+  // land the user on the path they picked instead of a generic dialog.
+  const [creatorMode, setCreatorMode] = useState("connect");
   const [fpReq, setFpReq] = useState(null);
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
@@ -100,6 +103,10 @@ export default function App() {
   const [visible, setVisible] = useState(true);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
+  const openCreator = useCallback((mode = "connect") => {
+    setCreatorMode(mode);
+    setCreatorOpen(true);
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -333,7 +340,7 @@ export default function App() {
             }}>
             <Icon name={locked ? "lock" : "unlock"} size={16} />
           </button>
-          <button className="tb-btn" onClick={() => setCreatorOpen(true)}>
+          <button className="tb-btn" onClick={() => openCreator()}>
             <Icon name="plus" size={15} /> New connection
           </button>
           <ThemeMenu theme={theme} setTheme={setTheme} />
@@ -365,11 +372,15 @@ export default function App() {
           <>
             <aside className="col-list">
               <ConvList contacts={contacts} activeId={activeId} onSelect={openConv}
-                onAdd={() => setCreatorOpen(true)} query={query} setQuery={setQuery} />
+                onAdd={() => openCreator()} query={query} setQuery={setQuery} />
             </aside>
             <main className="col-main">
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
+                // A user with no conversations at all gets the get-started
+                // panel rather than "select a conversation" with nothing to select.
+                isFirstRun={convs.length === 0}
+                onStart={openCreator}
                 onCancelTransfer={(id) => api.cancelTransfer(id).catch(() => {})}
                 transfers={transfers.filter((t) =>
                   // done/cancelled rows can linger in the snapshot until the next
@@ -408,7 +419,7 @@ export default function App() {
         {nav === "relays" && <main className="col-full"><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}
       </div>
 
-      <Creator open={creatorOpen} onClose={() => setCreatorOpen(false)} />
+      <Creator open={creatorOpen} initialMode={creatorMode} onClose={() => setCreatorOpen(false)} />
       <Verify req={fpReq} onClose={() => setFpReq(null)} />
       <RenameDialog target={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={doRename} />
       <ConfirmDelete target={deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete} />

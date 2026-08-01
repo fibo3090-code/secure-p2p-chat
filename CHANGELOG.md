@@ -48,6 +48,13 @@ predate tagged releases.
   module: `desktop/src/lib/tokens.test.js` checks the shipped CSS against
   `design/tokens.json`, and a Rust test checks the TUI brand accent and the
   frozen safety-grid palette.
+- **A get-started panel on first run.** With no conversations, the chat pane
+  used to say "Select a conversation" — with nothing to select. It now explains
+  why the first connection needs a deliberate step (no accounts, no directory)
+  and offers the three real paths, each opening the connection dialog on the
+  right tab, plus what the six-digit verification code is for.
+- **A supply-chain CI gate** (`cargo deny --all-features check` + a secret
+  scan), so the accepted-risk list cannot quietly go stale.
 
 ### Changed
 
@@ -116,6 +123,14 @@ predate tagged releases.
 
 ### Documentation
 
+- **Every accepted advisory now names the path that reaches it**, verified with
+  `cargo tree --target all -i` rather than asserted. The `quick-xml` entry in
+  particular was wrong: the vulnerable version is reached only through
+  `rfd → wayland-scanner`, a build-time proc macro parsing XML vendored inside
+  the crate, never linked into the shipped binary — not "transitively via
+  Tauri", whose own path already resolves the fixed release. Stale entries left
+  over from the egui stack (`epaint` fonts, `ttf-parser`, the `image` AVIF
+  chain) were removed rather than left to suppress future findings.
 - `SECURITY.md` no longer claims the desktop crate has no automated tests (it
   has 15, run by CI on Linux and macOS), states plainly that the "medium"
   posture is a **self-assessment** rather than an audit, and lists the lack of

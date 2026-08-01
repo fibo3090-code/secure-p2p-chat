@@ -123,3 +123,34 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
+  # Supply chain: advisories, licences, and sources. The accepted-risk list lives
+  # in deny.toml, where each entry names the crate and the path that reaches it.
+  # Gating on this in CI is what stops that list from quietly going stale — a
+  # leftover entry suppresses findings on a crate we may now use differently.
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # `--all-features` so the check covers every target's dependency set, not
+      # just the default one for this runner.
+      - name: cargo-deny
+        run: cargo deny --all-features check
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

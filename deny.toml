@@ -6,14 +6,22 @@
 version = 2
 # Temporary risk acceptances tracked in GitHub issues and SECURITY.md.
 # Keep this list minimal and review regularly.
+# Every entry names the crate and the path that reaches it. A stale entry is
+# worse than no entry — it silently suppresses a future finding on a crate we
+# have since started using differently — so entries are removed as soon as the
+# dependency goes away. Retiring the egui GUI dropped `epaint`/`ttf-parser` and
+# the `image` AVIF chain, and those entries went with it.
+# Verify a claim before adding one: `cargo tree --workspace --target all -i <crate>`.
 ignore = [
-    "RUSTSEC-2023-0071", # rsa Marvin timing issue (no upstream fix yet)
-    "RUSTSEC-2024-0436", # paste unmaintained (transitive)
-    "RUSTSEC-2025-0141", # bincode unmaintained (direct, migration pending)
-    "RUSTSEC-2026-0105", # core2 unmaintained (transitive via image -> rav1e AVIF encoder; awaiting upstream)
-    # The gtk-rs GTK3 binding family is unmaintained. It reaches us only through
-    # the Tauri and eframe Linux stacks; the whole ecosystem is mid-migration to
-    # GTK4/newer wry. Nothing actionable on our side yet — review each release.
+    "RUSTSEC-2023-0071", # rsa Marvin timing issue. No upstream fix. Used for
+                         # RSA-PSS *signatures* only; this app performs no RSA
+                         # decryption, which is what the attack targets.
+    "RUSTSEC-2024-0436", # paste unmaintained (transitive, proc-macro/build-time)
+    "RUSTSEC-2025-0141", # bincode unmaintained (direct in core, migration pending)
+    # The gtk-rs GTK3 binding family is unmaintained. Reaches us only through
+    # Tauri's Linux backend (muda / tao -> tauri-runtime-wry); the ecosystem is
+    # mid-migration to GTK4. Nothing actionable on our side — review each Tauri
+    # release.
     "RUSTSEC-2024-0411",
     "RUSTSEC-2024-0412",
     "RUSTSEC-2024-0413",
@@ -25,16 +33,18 @@ ignore = [
     "RUSTSEC-2024-0419",
     "RUSTSEC-2024-0420",
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (transitive, build-time only)
-    "RUSTSEC-2026-0192", # ttf-parser unmaintained (transitive via eframe font stack)
     "RUSTSEC-2025-0075", # unic-* family unmaintained (transitive)
     "RUSTSEC-2025-0080",
     "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
     # quick-xml DoS-class issues (quadratic dup-attribute check / unbounded
-    # NsReader allocation). Reaches us transitively (Windows toast XML — app-
-    # generated, not attacker-controlled — and the Tauri/zbus stacks); no
-    # patched version is reachable within our dependents' semver ranges yet.
+    # NsReader allocation). The vulnerable 0.39.4 is reachable ONLY via
+    # rfd -> wayland-client/protocols -> wayland-scanner, which is a proc macro:
+    # it parses the Wayland protocol XML vendored inside the crate, at build
+    # time, and is never linked into the shipped binary. The input is neither
+    # attacker-controlled nor present at runtime. Our own Tauri path already
+    # resolves the fixed 0.41.0.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
@@ -52,19 +62,16 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
-    "CDLA-Permissive-2.0",
     "BSL-1.0",
     "Unlicense",
     "NCSA",
     "Apache-2.0 WITH LLVM-exception",
-    "OFL-1.1",
 ]
 
-# epaint's default fonts embed the Ubuntu Font License as a custom LicenseRef,
-# which can't be expressed in the allow list. Fonts only; permissive.
-exceptions = [
-    { allow = ["LicenseRef-UFL-1.0"], crate = "epaint_default_fonts" },
-]
+# No exceptions. The one that used to live here covered egui's bundled fonts
+# (`epaint_default_fonts`, Ubuntu Font License as a custom LicenseRef) and went
+# away with the egui GUI.
+exceptions = []
 
 [bans]
 multiple-versions = "warn"
