@@ -149,8 +149,17 @@ jobs:
       - name: cargo-deny
         run: cargo deny --all-features check
 
+      # The gitleaks binary directly, not gitleaks-action: that action exits 1
+      # even when its own SARIF reports `"results": []` (it gates on a licence
+      # key), which would make this job a permanent red herring. Running the
+      # scanner itself means the exit code means what it says.
+      - name: Install gitleaks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: gitleaks
+
+      # Full history: a secret that was committed and later removed is still
+      # published, so scanning only the diff would miss the case that matters.
       - name: Secret scan
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gitleaks detect --no-banner --redact --verbose
 
