@@ -189,8 +189,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           STAGE="P2PEM-Tools_${VERSION}_${{ matrix.label }}"
           mkdir -p "$STAGE"
+          # Binary names, not package names: the `messenger-server` package
+          # declares `[[bin]] name = "server"`.
           cp target/release/p2pem-classic "$STAGE/p2pem"
-          cp target/release/messenger-server "$STAGE/p2pem-server"
+          cp target/release/server "$STAGE/p2pem-server"
           cp README.md LICENSE.md "$STAGE/"
           cp docs/USER_GUIDE.md "$STAGE/" 2>/dev/null || true
           tar -czf "${STAGE}.tar.gz" "$STAGE"
@@ -203,7 +205,7 @@ jobs:
           $stage = "P2PEM-Tools_${version}_${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target/release/p2pem-classic.exe "$stage/p2pem.exe"
-          Copy-Item target/release/messenger-server.exe "$stage/p2pem-server.exe"
+          Copy-Item target/release/server.exe "$stage/p2pem-server.exe"
           Copy-Item README.md, LICENSE.md $stage
           if (Test-Path docs/USER_GUIDE.md) { Copy-Item docs/USER_GUIDE.md $stage }
           Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
