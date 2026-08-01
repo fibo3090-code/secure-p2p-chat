@@ -97,18 +97,71 @@ export function PasswordInput(props) {
   );
 }
 
-export function Modal({ open, onClose, children, width = 460, title, icon, sub }) {
+// Everything the browser will let a user Tab to. Used to keep focus inside an
+// open dialog — `aria-modal` tells assistive tech the rest of the page is inert
+// but does nothing to stop Tab actually leaving it.
+const FOCUSABLE =
+  'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+/// `dismissable={false}` removes Escape, the scrim click, and the close button.
+/// Reserve it for dialogs that represent a decision the app cannot make on the
+/// user's behalf — the TOFU prompt, where dismissing leaves a live session
+/// waiting and the peer hanging with no explanation.
+export function Modal({ open, onClose, children, width = 460, title, icon, sub, dismissable = true }) {
   // Per-instance ids: several Modals can be mounted at once (rename + verify,
   // etc.), so static ids would collide and break aria-labelledby/describedby.
   const titleId = useId();
   const subId = useId();
-  // Move focus into the dialog on open so the Escape handler is reachable for
-  // keyboard users and screen readers announce it.
   const ref = useRef(null);
-  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
+  // Whatever had focus before the dialog opened, so it can be handed back.
+  const returnTo = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    returnTo.current = document.activeElement;
+    // Focus the dialog itself rather than its first control: a confirmation
+    // dialog must not open with the destructive button already focused, one
+    // Space away from firing.
+    ref.current?.focus();
+    return () => {
+      // Hand focus back to what opened the dialog, so a keyboard user is not
+      // dumped at the top of the document.
+      const el = returnTo.current;
+      if (el && typeof el.focus === "function" && document.contains(el)) el.focus();
+    };
+  }, [open]);
+
+  // Keep Tab inside the dialog. Without this, tabbing past the last control
+  // walks into the app behind the scrim, where clicks are blocked but focus is
+  // not — the user ends up typing into something they cannot see.
+  function onKeyDown(e) {
+    if (e.key === "Escape") {
+      if (dismissable) onClose?.();
+      return;
+    }
+    if (e.key !== "Tab" || !ref.current) return;
+    const items = [...ref.current.querySelectorAll(FOCUSABLE)].filter(
+      (el) => el.offsetParent !== null || el === document.activeElement,
+    );
+    if (items.length === 0) {
+      e.preventDefault();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    // Focus sitting on the dialog container counts as "before the first item".
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === ref.current)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   if (!open) return null;
   return (
-    <div className="modal-scrim" onMouseDown={onClose}>
+    <div className="modal-scrim" onMouseDown={dismissable ? onClose : undefined}>
       <div
         ref={ref}
         className="modal"
@@ -118,7 +171,7 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub }
         aria-describedby={sub ? subId : undefined}
         tabIndex={-1}
         style={{ width }}
-        onKeyDown={(e) => { if (e.key === "Escape") onClose?.(); }}
+        onKeyDown={onKeyDown}
         onMouseDown={(e) => e.stopPropagation()}
       >
         {title && (
@@ -130,7 +183,9 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub }
                 {sub && <div id={subId} className="modal-sub">{sub}</div>}
               </div>
             </div>
-            <button className="icon-btn" onClick={onClose} aria-label="Close"><Icon name="x" size={18} /></button>
+            {dismissable && (
+              <button className="icon-btn" onClick={onClose} aria-label="Close"><Icon name="x" size={18} /></button>
+            )}
           </div>
         )}
         <div className="modal-body">{children}</div>

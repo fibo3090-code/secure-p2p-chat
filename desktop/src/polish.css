@@ -67,6 +67,11 @@
 .verify-hint { color: var(--dim); font-size: 12.5px; line-height: 1.5; max-width: 360px; }
 .verify-actions { display: flex; gap: 10px; width: 100%; }
 .verify-actions .btn { flex: 1; }
+/* Escape hatch after a failed decision — deliberately quiet, so it never reads
+   as a third way to answer the verification. */
+.verify-dismiss { align-self: center; margin-top: 2px; padding: 4px 6px; border-radius: var(--r-sm);
+  color: var(--dim); font-size: 12px; }
+.verify-dismiss:hover { color: var(--text); text-decoration: underline; }
 .verify-sas-label { color: var(--dim); font-size: 12.5px; }
 .verify-sas { font-family: var(--mono); font-size: 26px; font-weight: 700; letter-spacing: 1px;
   color: var(--text); background: var(--s2); border: 1px solid var(--border);

@@ -55,6 +55,10 @@ predate tagged releases.
   right tab, plus what the six-digit verification code is for.
 - **A supply-chain CI gate** (`cargo deny --all-features check` + a secret
   scan), so the accepted-risk list cannot quietly go stale.
+- Dialogs keep Tab inside them and hand focus back to whatever opened them.
+  `aria-modal` told assistive tech the page behind was inert but did nothing to
+  stop Tab walking into it, so a keyboard user could end up typing into
+  something hidden behind the scrim.
 
 ### Changed
 
@@ -115,6 +119,14 @@ predate tagged releases.
 - A panic elsewhere in the process can no longer freeze the desktop app: the
   identity mutex recovers from poisoning instead of panicking on every
   subsequent access, which previously killed the event loop outright.
+- **The fingerprint prompt can no longer be dismissed without answering it.**
+  Escape or a click outside cleared it while a live session sat waiting on the
+  decision — the peer hung with no explanation and the prompt reappeared on the
+  next poll, reading as a bug. Verify and Reject are now the only ways out, with
+  a quiet escape hatch that appears only if confirming actually fails (the
+  session went away), and closing that trusts nothing. Reject is also no longer
+  styled as an afterthought: refusing a connection you could not verify is the
+  correct action, not an edge case.
 - **Desktop notifications no longer fire for the conversation you are reading.**
   The setting promises "notify when a message arrives in the background", but
   every received message raised a popup regardless of focus. The shell now
