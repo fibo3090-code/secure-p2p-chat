@@ -153,10 +153,16 @@ jobs:
       # even when its own SARIF reports `"results": []` (it gates on a licence
       # key), which would make this job a permanent red herring. Running the
       # scanner itself means the exit code means what it says.
+      # Pinned to the version this was verified against, straight from the
+      # upstream release. (taiki-e/install-action does not carry gitleaks.)
       - name: Install gitleaks
-        uses: taiki-e/install-action@v2
-        with:
-          tool: gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
 
       # Full history: a secret that was committed and later removed is still
       # published, so scanning only the diff would miss the case that matters.
