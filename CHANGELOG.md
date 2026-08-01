@@ -152,7 +152,7 @@ Nothing yet.
   over from the egui stack (`epaint` fonts, `ttf-parser`, the `image` AVIF
   chain) were removed rather than left to suppress future findings.
 - `SECURITY.md` no longer claims the desktop crate has no automated tests (it
-  has 15, run by CI on Linux and macOS), states plainly that the "medium"
+  has 16, run by CI on Linux and macOS), states plainly that the "medium"
   posture is a **self-assessment** rather than an audit, and lists the lack of
   offline delivery for direct P2P as a real limitation.
 - `docs/platform_spec.md` no longer says the Tauri binary is absent from the

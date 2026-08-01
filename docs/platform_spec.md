@@ -771,7 +771,7 @@ onion routing / anonymity layer, post-quantum migration, hardware-backed identit
 ## 13. Verification & Test Coverage
 
 The workspace passes **360 automated tests** (`cargo nextest run --workspace`) on
-Windows, plus **15 desktop-bridge tests** that CI runs on Linux and macOS
+Windows, plus **16 desktop-bridge tests** that CI runs on Linux and macOS
 (skipped on Windows, where a Rust test harness linking Tauri aborts at startup),
 and **29 frontend tests** (`cd desktop && npm test`) — spanning unit,
 integration, and end-to-end suites:
@@ -860,3 +860,4 @@ The honest remaining gaps, in the order they cost the most:
 
 This document is the approved north star; each phase gets its own detailed plan
 before implementation.
+
