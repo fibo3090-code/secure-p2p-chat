@@ -434,9 +434,9 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ui, wrapped_rows};
+    use crate::logbuf::LogBuffer;
     use crate::tui::app::{TuiApp, TuiFocus};
     use crate::tui::overlays::{PasswordMode, TuiOverlay};
-    use egui_tracing::tracing::EventCollector;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use uuid::Uuid;
@@ -481,7 +481,7 @@ mod tests {
             TuiOverlay::ConfirmClearHistory,
         ];
         for ov in overlays {
-            let mut app = TuiApp::new(EventCollector::new()).expect("app");
+            let mut app = TuiApp::new(LogBuffer::new()).expect("app");
             app.overlay = ov;
             draw_once(&mut app);
         }
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_with_stale_chat_ids() {
-        let mut app = TuiApp::new(EventCollector::new()).expect("app");
+        let mut app = TuiApp::new(LogBuffer::new()).expect("app");
         let stale_id = Uuid::new_v4();
         app.chat_ids = vec![stale_id];
         app.chat_list_state.select(Some(0));
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_on_small_terminal_size() {
-        let mut app = TuiApp::new(EventCollector::new()).expect("app");
+        let mut app = TuiApp::new(LogBuffer::new()).expect("app");
         app.focus = TuiFocus::Input;
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");

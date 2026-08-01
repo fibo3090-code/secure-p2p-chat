@@ -1,7 +1,161 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
 use std::net::{SocketAddr, UdpSocket};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Write `bytes` to `path` so that the file is either the old content or the
+/// new content, never a truncated mix of the two.
+///
+/// Writes to a uniquely-named temporary file **in the same directory** (a
+/// rename is only atomic within one filesystem), `fsync`s it so the data is on
+/// disk before anything points at it, then renames over the destination. On
+/// Unix the containing directory is `fsync`ed too, so the rename itself
+/// survives a power loss; the file is created 0600 from the start rather than
+/// being widened and then narrowed.
+///
+/// This exists because the in-place `truncate + write` it replaced could leave
+/// `identity.json` empty after a crash, full disk, or power loss — and that
+/// file is the only key to the user's encrypted history, so a partial write is
+/// indistinguishable from destroying the account.
+pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create directory {}", dir.display()))?;
+
+    // Unique name: two processes writing the same file must not share a temp
+    // and corrupt each other's write.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let write_result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        // Durability before visibility: without this the rename can land while
+        // the data is still only in the page cache.
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", tmp.display()))?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // `rename` replaces the destination atomically on both Unix and Windows.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e)
+            .context(format!("failed to replace {} atomically", path.display())));
+    }
+
+    // Make the rename itself durable. Best-effort: some filesystems refuse to
+    // open a directory for sync, and a missing directory fsync is a much
+    // smaller risk than the partial write this function exists to prevent.
+    #[cfg(unix)]
+    {
+        if let Ok(d) = std::fs::File::open(&dir) {
+            let _ = d.sync_all();
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::write_file_atomic;
+
+    #[test]
+    fn writes_new_file_with_exact_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.json");
+        write_file_atomic(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn replaces_existing_file_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.json");
+        write_file_atomic(&path, b"old content that is long").unwrap();
+        write_file_atomic(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["f.json".to_string()],
+            "temp files must not survive a successful write"
+        );
+    }
+
+    #[test]
+    fn creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deeper").join("f.json");
+        write_file_atomic(&path, b"x").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+    }
+
+    /// The original file must survive a failed write, since it is the only copy
+    /// of the user's identity.
+    #[test]
+    fn a_failed_write_leaves_the_original_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        // A path whose "parent" is an existing regular file: creating the temp
+        // inside it cannot succeed.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"original").unwrap();
+        let doomed = blocker.join("child.json");
+
+        assert!(write_file_atomic(&doomed, b"never lands").is_err());
+        assert_eq!(
+            std::fs::read(&blocker).unwrap(),
+            b"original",
+            "an unrelated existing file must not be clobbered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.json");
+        write_file_atomic(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "identity files must not be world-readable"
+        );
+    }
+}
 
 /// Get current timestamp in milliseconds since Unix epoch
 pub fn current_timestamp_millis() -> u64 {

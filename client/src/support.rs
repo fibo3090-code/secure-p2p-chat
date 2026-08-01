@@ -1,6 +1,6 @@
+use crate::logbuf::LogBuffer;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use egui_tracing::tracing::EventCollector;
 use serde::Serialize;
 use std::backtrace::Backtrace;
 use std::path::{Path, PathBuf};
@@ -67,18 +67,18 @@ pub struct DiagnosticsReport {
     pub config: DiagnosticsConfig,
 }
 
-pub fn format_event_logs(event_collector: &EventCollector) -> String {
+/// Render the retained log events as plain text for the clipboard and the
+/// diagnostics bundle.
+pub fn format_event_logs(logs: &LogBuffer) -> String {
     let mut log_text = String::new();
-    for event in event_collector.events() {
-        let level = event.level.as_str();
-        let target = event.target.as_str();
-        let msg = event
-            .fields
-            .get("message")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let timestamp = event.time.to_rfc3339();
-        log_text.push_str(&format!("[{}] {} [{}] {}\n", timestamp, level, target, msg));
+    for event in logs.events() {
+        log_text.push_str(&format!(
+            "[{}] {} [{}] {}\n",
+            event.time.to_rfc3339(),
+            event.level,
+            event.target,
+            event.message
+        ));
     }
     log_text
 }

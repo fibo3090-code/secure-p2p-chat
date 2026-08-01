@@ -226,7 +226,7 @@ pub(crate) async fn confirm_fingerprint(
     if result.is_ok() {
         *state.pending_fp.lock().unwrap() = None;
         // An accepted fingerprint is persisted onto the chat; save so trust survives a restart.
-        persist_history(&state.manager, &state.history_path).await;
+        persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     }
     result
 }

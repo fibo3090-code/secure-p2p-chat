@@ -53,6 +53,13 @@ struct Bridge {
     /// Pending TOFU fingerprint request, held as queryable state so a missed
     /// `fingerprint-request` event never strands a session awaiting verification.
     pending_fp: PendingFp,
+    /// Set when startup found an identity file it could not read. The app boots
+    /// into a dead state that only reports this, rather than generating a
+    /// replacement identity and quietly abandoning the user's history.
+    init_error: Option<String>,
+    /// Shared with the poll loop so a command's save and the loop's save do not
+    /// both write the same bytes. See [`SavedSig`].
+    saved_sig: SavedSig,
 }
 
 impl Bridge {
@@ -61,24 +68,57 @@ impl Bridge {
     }
 }
 
-/// Best-effort encrypted history save, mirroring what the egui app does on a
-/// timer. A no-op while the identity is still locked (no history key) or when
-/// there is nothing to persist. Errors are logged, never propagated — a
-/// transient disk failure must not break a live command.
+/// Lock the identity mutex, recovering from poisoning instead of panicking.
+///
+/// `Mutex::lock().unwrap()` turns one panic anywhere in the process into a
+/// permanent, cascading failure: every later access panics too, and in the poll
+/// loop that kills event processing entirely — the app looks frozen rather than
+/// reporting anything. The `Identity` behind this lock is only ever read or
+/// wholly replaced, so a poisoned lock does not imply torn state; carrying on is
+/// strictly better than dying.
+fn lock_identity(identity: &StdMutex<Identity>) -> std::sync::MutexGuard<'_, Identity> {
+    identity.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("identity mutex was poisoned by an earlier panic; recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Signature of the state as of the last successful save, shared between the
+/// poll loop and the commands. Both write the *whole* encrypted history, so
+/// without a shared marker every user action cost two full rewrites: the command
+/// saved, then the next poll tick saw a signature it had not recorded and saved
+/// the identical bytes again. That write is O(total history) and fsynced.
+type SavedSig = Arc<StdMutex<Option<u64>>>;
+
+/// Best-effort encrypted history save. A no-op while the identity is still
+/// locked (no history key) or when there is nothing to persist. Errors are
+/// logged, never propagated — a transient disk failure must not break a live
+/// command.
 ///
 /// Without this the desktop app never wrote history back: `unlock` loaded it,
 /// but every message sent or received in a session was lost on restart.
-async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path) {
+///
+/// On success the signature of exactly what was written is recorded in
+/// `saved_sig`. It is captured under the same lock as the snapshot, so it
+/// describes the bytes that actually went to disk even if state changes while
+/// the encrypt+write runs off-thread. A failed save deliberately leaves the
+/// marker alone, so the poll loop retries.
+async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path, saved_sig: &SavedSig) {
     // `history_snapshot()` fails only when the identity is still locked (no
     // history key); in that state there is nothing to persist. An unlocked but
     // empty history IS saved on purpose, so deleting the last chat sticks.
-    let snapshot = manager.lock().await.history_snapshot();
+    let (snapshot, sig) = {
+        let m = manager.lock().await;
+        (m.history_snapshot(), state_signature(&m))
+    };
     let Ok((history, key)) = snapshot else {
         return;
     };
     let path = path.to_path_buf();
     match tokio::task::spawn_blocking(move || history.save_encrypted(&path, &key)).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            *saved_sig.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
+        }
         Ok(Err(e)) => tracing::warn!("desktop history save failed: {e}"),
         Err(e) => tracing::warn!("desktop history save task join failed: {e}"),
     }
@@ -100,6 +140,9 @@ fn state_signature(mgr: &ChatManager) -> u64 {
                 .wrapping_mul(1_000_003)
                 .wrapping_add(c.messages.len() as u64)
                 .wrapping_add(delivered.wrapping_mul(65_537))
+                // The read mark is persisted state and drives the unread badge,
+                // so a change to it must both save and refresh the UI.
+                .wrapping_add((c.read_count as u64).wrapping_mul(31))
                 .wrapping_add(c.title.len() as u64);
         }
     }
@@ -111,7 +154,12 @@ fn state_signature(mgr: &ChatManager) -> u64 {
 /// the bridge must enforce the barrier itself so no command can mutate state or
 /// start a session before unlock/set-password completes.
 fn ensure_ready(state: &Bridge) -> Result<(), String> {
-    if state.identity.lock().unwrap().is_locked() {
+    // A broken identity blocks everything: any command that ran here would
+    // operate on the throwaway identity created just to render the error.
+    if let Some(err) = &state.init_error {
+        return Err(err.clone());
+    }
+    if lock_identity(&state.identity).is_locked() {
         return Err("Unlock required".to_string());
     }
     if *state.is_new.lock().unwrap() || *state.force_setup.lock().unwrap() {
@@ -144,6 +192,8 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::connect::set_locked,
         commands::chats::list_conversations,
         commands::chats::get_conversation,
+        commands::chats::mark_read,
+        commands::chats::set_presence,
         commands::chats::list_transfers,
         commands::chats::accept_transfer,
         commands::chats::decline_transfer,
@@ -223,15 +273,7 @@ pub fn run() {
         .invoke_handler(invoke_handler())
         .setup(|app| {
             let b = app.state::<Bridge>();
-            spawn_poll_loop(
-                app.handle().clone(),
-                b.manager.clone(),
-                b.party.clone(),
-                b.identity.clone(),
-                b.history_path.clone(),
-                b.parties_path.clone(),
-                b.pending_fp.clone(),
-            );
+            spawn_poll_loop(app.handle().clone(), PollContext::from_bridge(&b));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -241,7 +283,8 @@ pub fn run() {
                 let bridge = window.state::<Bridge>();
                 let manager = bridge.manager.clone();
                 let path = bridge.history_path.clone();
-                tauri::async_runtime::block_on(persist_history(&manager, &path));
+                let sig = bridge.saved_sig.clone();
+                tauri::async_runtime::block_on(persist_history(&manager, &path, &sig));
             }
         })
         .run(tauri::generate_context!())
@@ -267,17 +310,30 @@ fn init_bridge() -> Bridge {
                 .map(|dirs| dirs.data_dir().to_path_buf())
         });
 
+    // A failure to load an *existing* identity must never be papered over by
+    // generating a new one: the history key is derived from the private key, so
+    // a replacement identity silently makes every stored message unreadable and
+    // changes the fingerprint every contact verified. When that happens the app
+    // starts in an error state that the shell surfaces, and touches nothing.
+    let mut init_error: Option<String> = None;
     let (history_path, identity, is_new) = if let Some(data) = data_dir {
         std::fs::create_dir_all(&data).ok();
         tracing::info!(data_dir = %data.display(), "using data directory");
-        let (id, isnew) = Identity::get_or_create(&data, "User").unwrap_or_else(|e| {
-            tracing::error!("identity load/create failed: {e}; falling back to plaintext");
-            (
-                Identity::new_with_plaintext("User".to_string()).expect("identity"),
-                true,
-            )
-        });
-        (data.join("history.json.enc"), id, isnew)
+        match Identity::get_or_create(&data, "User") {
+            Ok((id, isnew)) => (data.join("history.json.enc"), id, isnew),
+            Err(e) => {
+                tracing::error!("identity load failed: {e}");
+                init_error = Some(e.to_string());
+                // A throwaway in-memory identity so the app can boot far enough
+                // to *show* the error. Every command is refused while
+                // `init_error` is set, so it is never saved or used on the wire.
+                (
+                    data.join("history.json.enc"),
+                    Identity::new_with_plaintext("User".to_string()).expect("identity"),
+                    true,
+                )
+            }
+        }
     } else {
         tracing::warn!("could not resolve a data directory; using a relative fallback");
         (
@@ -289,7 +345,7 @@ fn init_bridge() -> Bridge {
 
     let identity_path = history_path.with_file_name("identity.json");
     let parties_path = history_path.with_file_name("parties.json");
-    // Plaintext key in hand (no password) ⇒ force a set-password step, like egui.
+    // Plaintext key in hand (no password) ⇒ force a set-password step.
     let force_setup = !identity.is_locked();
 
     let manager = Arc::new(Mutex::new(ChatManager::new(Config::default())));
@@ -306,6 +362,8 @@ fn init_bridge() -> Bridge {
         is_new: StdMutex::new(is_new),
         force_setup: StdMutex::new(force_setup),
         pending_fp: Arc::new(StdMutex::new(None)),
+        init_error,
+        saved_sig: Arc::new(StdMutex::new(None)),
     }
 }
 
@@ -370,22 +428,45 @@ fn toast_level_str(l: ToastLevel) -> &'static str {
     }
 }
 
-/// Periodically drain network events and notify the webview to refresh.
-fn spawn_poll_loop(
-    app: tauri::AppHandle,
+/// Everything the poll loop needs from the [`Bridge`], cloned once at startup so
+/// the loop owns its handles rather than borrowing Tauri state on every tick.
+struct PollContext {
     manager: Arc<Mutex<ChatManager>>,
     party: Arc<Mutex<PartyManager>>,
     identity: Arc<StdMutex<Identity>>,
     history_path: PathBuf,
     parties_path: PathBuf,
     pending_fp: PendingFp,
-) {
+    saved_sig: SavedSig,
+}
+
+impl PollContext {
+    fn from_bridge(b: &Bridge) -> Self {
+        Self {
+            manager: b.manager.clone(),
+            party: b.party.clone(),
+            identity: b.identity.clone(),
+            history_path: b.history_path.clone(),
+            parties_path: b.parties_path.clone(),
+            pending_fp: b.pending_fp.clone(),
+            saved_sig: b.saved_sig.clone(),
+        }
+    }
+}
+
+/// Periodically drain network events and notify the webview to refresh.
+fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
+    let PollContext {
+        manager,
+        party,
+        identity,
+        history_path,
+        parties_path,
+        pending_fp,
+        saved_sig,
+    } = ctx;
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
-        // Seeded from the first observed state so an unchanged session never
-        // triggers a spurious write; only real changes (notably peer messages
-        // arriving via poll_session_events) are persisted.
-        let mut last_saved_sig: Option<u64> = None;
         // Change-only event emission: the webview refetches on `state-updated`
         // and `party-updated`, so an idle tick must not fire them.
         let mut last_ui_sig: Option<u64> = None;
@@ -469,10 +550,12 @@ fn spawn_poll_loop(
                 (req, toasts, sig, ui_sig)
             };
             // Persist when the conversation surface changed (e.g. a received
-            // message). User-initiated commands save themselves immediately.
-            if last_saved_sig != Some(sig) {
-                persist_history(&manager, &history_path).await;
-                last_saved_sig = Some(sig);
+            // message). The marker is shared with the commands, which also save
+            // immediately — so a user action no longer costs a second identical
+            // rewrite of the whole encrypted history on the next tick.
+            let already_saved = *saved_sig.lock().unwrap_or_else(|e| e.into_inner()) == Some(sig);
+            if !already_saved {
+                persist_history(&manager, &history_path, &saved_sig).await;
             }
             for (level, message) in toasts {
                 let _ = app.emit(

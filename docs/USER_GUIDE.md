@@ -8,71 +8,71 @@ If you want the fastest onboarding path instead of the full reference, start wit
 
 ### Pre-built binaries
 
-Download the latest platform asset from the [GitHub Releases](https://github.com/fibo3090-code/secure-p2p-chat/releases) page.
+Download the latest asset from the [GitHub Releases](https://github.com/fibo3090-code/secure-p2p-chat/releases) page.
 
-Classic egui app:
-
-- Windows: `P2PEM-Classic_<version>_x64-setup.exe`
-- macOS Intel: `P2PEM-Classic_<version>_macos-x64.dmg`
-- macOS Apple Silicon: `P2PEM-Classic_<version>_macos-aarch64.dmg`
-- Linux: `P2PEM-Classic_<version>_linux-x64.tar.gz`
-
-New Tauri desktop app (P2PEM):
+**P2PEM Desktop — this is the app.**
 
 - Windows: `P2PEM_<version>_x64-setup.exe` (NSIS) or `P2PEM_<version>_x64_en-US.msi`
-- macOS: `P2PEM_<version>_aarch64.dmg` or `P2PEM_<version>_x64.dmg`
-- Linux: `P2PEM_<version>_amd64.deb`, `P2PEM_<version>_amd64.AppImage`, or `P2PEM-<version>-1.x86_64.rpm`
+- macOS Apple silicon: `P2PEM_<version>_aarch64.dmg`
+- macOS Intel: `P2PEM_<version>_x64.dmg`
+- Linux: `p2pem_<version>_amd64.AppImage` (portable) or `p2pem_<version>_amd64.deb`
 
-Releases older than 1.13 used different asset names (`Messenger-Setup-v*.exe`,
-`messenger-*.dmg`, `messenger-linux-v*.tar.gz`) for the classic app.
+**P2PEM Tools** — only if you are running a server or prefer a terminal:
+`P2PEM-Tools_<version>_<os>.tar.gz` (`.zip` on Windows) contains the terminal
+client `p2pem` (which also runs a relay) and the community server `p2pem-server`.
+
+Releases before 1.15.0 also shipped a second desktop GUI under
+`P2PEM-Classic_*`. That app has been retired; install P2PEM Desktop instead.
+It does **not** upgrade the old one in place, and it uses a different data
+directory, so it starts with a fresh identity — export your old identity from
+the classic app first if you want to keep it, then uninstall it.
 
 ### Build from source
 
 ```bash
 git clone <repository-url>
 cd secure-p2p-chat
-cargo build --release
+
+# The desktop app (needs Node 20+ and the Tauri prerequisites)
+cd desktop && npm ci && npx tauri build
+
+# The terminal client + relay
+cargo build --release -p p2pem-classic     # target/release/p2pem-classic[.exe]
+
+# The community server
+cargo build --release -p messenger-server  # target/release/messenger-server[.exe]
 ```
-
-Binary location:
-
-- Windows: `target\release\p2pem-classic.exe`
-- Linux/macOS: `target/release/p2pem-classic`
 
 ### Linux build prerequisites
 
-The GUI build may require system libraries such as:
+Only the desktop app needs system libraries (WebKitGTK, for the webview):
 
 ```bash
-sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev
+sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev patchelf
 ```
+
+The terminal client and the server need none of these.
 
 ## Launch Modes
 
-### GUI
+### Desktop app
 
-```bash
-cargo run --release
-```
-
-### TUI
-
-```bash
-cargo run --release -- --tui
-```
-
-### Tauri desktop app (preview)
-
-A newer desktop app (Tauri 2 + React) is in development and will replace the egui
-GUI. It is not yet published in releases, so run it from source:
+Launch it from your applications menu, or from source:
 
 ```bash
 cd desktop && npx tauri dev
 ```
 
-It drives the same core as the GUI/TUI (same identity, history, and P2P/Party
-behavior) but uses its own data directory, so it appears as a distinct peer/identity
-from the egui app on the same machine.
+### Terminal UI
+
+```bash
+cargo run --release -p p2pem-classic
+```
+
+It drives the same core as the desktop app (same protocol, same behaviour) but
+uses its own data directory, so on one machine the two are distinct peers — which
+is what lets you connect them to each other for testing.
 
 ### Relay server
 
@@ -132,9 +132,9 @@ Use this when both devices can reach each other directly.
 3. Both sides verify fingerprints.
 4. Chat normally.
 
-GUI:
+Desktop app:
 
-- use `+` to host or connect
+- click **New connection** in the title bar to host or connect
 
 TUI:
 
@@ -240,7 +240,7 @@ Joining from the app:
   password if one is set. Rejoining later is one click (communities are
   remembered).
 - **TUI**: `:party-connect <host[:port]> <username> [password]`
-- **GUI (egui)**: the Party window → join form.
+- **Desktop app**: Communities → join form.
 
 Operator notes:
 
@@ -293,24 +293,30 @@ If you see transfer problems:
 - check read permission on the source path
 - check write permission on the destination directory
 
-## GUI Reference
+## Desktop App Reference
 
 ### Main areas
 
-- Sidebar: select chats and open connection actions
-- Chat view: read history, send messages, transfer files
-- Contacts and invite flows: add peers manually or by invite link
-- Settings: preferences, auto-host, diagnostics export, log terminal
-- Help: in-app FAQ and troubleshooting
+- **Rail** (left edge): Chats, Communities, Relays, Contacts, Settings. Unread
+  counts badge here, and survive a restart — anything that arrived while the app
+  was closed is still marked unread.
+- **List pane**: conversations, with connection state, trust badge, and last
+  activity. Search filters it.
+- **Chat pane**: history, composer, file transfers with progress and cancel,
+  delivery receipts (a ✓ means the peer's device confirmed receipt).
+- **Your avatar** (bottom of the rail): opens Settings, including the identity
+  backup.
 
-### Useful GUI actions
+### Useful actions
 
-- create or paste invite links
-- export diagnostics
-- change download directory
-- enable auto-host on startup
-- enable auto-connect to known contacts
-- toggle the log terminal
+- **New connection** (title bar): host, connect, or open a relay session
+- **Lock** (title bar): stop accepting new peers; existing sessions keep running
+- create or paste invite links (Contacts)
+- export an identity backup (Settings → Your identity) — the row tells you
+  whether you have ever made one
+- export diagnostics, open the data folder (Settings → Support)
+- change the download directory, toggle auto-accept for files
+- enable auto-host on startup, auto-connect to known contacts, LAN discovery
 
 ## TUI Reference
 
@@ -505,8 +511,10 @@ The app also supports panic/crash logging to help support and debugging.
 
 ### Linux
 
-- published tarball releases are available
-- GUI builds may require GTK and Wayland/XKB packages
+- `.AppImage` (portable) and `.deb` releases are published
+- building the desktop app from source needs the WebKitGTK packages listed under
+  [Linux build prerequisites](#linux-build-prerequisites); the terminal client
+  and server need none
 - `avahi-daemon` may be required for mDNS discovery workflows
 
 ### macOS

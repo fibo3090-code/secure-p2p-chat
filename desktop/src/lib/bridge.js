@@ -4,8 +4,8 @@
 //
 // When NOT running inside Tauri (e.g. opened in a plain browser for UI work),
 // `api`/`onBridge` fall back to an in-memory mock so the whole UI is navigable
-// without the Rust backend. Append `?mock=unlock` / `?mock=set_password` to the
-// URL to preview the auth screens.
+// without the Rust backend. Append `?mock=unlock`, `?mock=set_password`, or
+// `?mock=error` to the URL to preview the auth and startup-failure screens.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -23,6 +23,10 @@ const realApi = {
   setLocked: (locked) => invoke("set_locked", { locked }),
   listConversations: () => invoke("list_conversations"),
   getConversation: (id) => invoke("get_conversation", { id }),
+  markRead: (id) => invoke("mark_read", { id }),
+  // Window focus + open conversation, so the backend can tell a background
+  // message from one the user is reading. Single-word params by convention.
+  setPresence: (focused, chat) => invoke("set_presence", { focused, chat: chat || null }),
   sendMessage: (id, text) => invoke("send_message", { id, text }),
   sendFile: (id) => invoke("send_file", { id }),
   // File cards: open with the default app (reveal=false) or show in folder.
@@ -105,11 +109,17 @@ function makeMock() {
     { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f6", address: "192.168.1.21:12345", trust: "verified" },
     { id: "c2", name: "Carol", fingerprint: "deadbeef0102", address: "10.0.0.5:12345", trust: "unverified" },
   ];
+  // Mirrors the real bridge: unread is derived from a persisted read mark, not
+  // from what the UI happened to see this session.
+  const readMarks = {};
   const summaries = () => Object.values(chats).map((c) => ({
     id: c.id, title: c.title,
     last: c.messages.length ? (c.messages.at(-1).content.text || "") : null,
     connected: !!connected[c.id], placeholder: c.is_host_placeholder,
     verified: !!c.peer_fingerprint,
+    messages: c.messages.length,
+    unread: c.messages.slice(readMarks[c.id] ?? 0).filter((m) => !m.from_me).length,
+    last_at: c.messages.length ? c.messages.at(-1).timestamp : null,
   }));
   const ok = async () => {};
   // ── Party (Communities) mock — a single joinable server with two channels ──
@@ -136,7 +146,12 @@ function makeMock() {
     partyState.msgs[`${sid}|${rnd}`] = [];
   }
   return {
-    authStatus: async () => ({ state: authState, name: "Maya", fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
+    // `?mock=error` previews the unrecoverable-startup screen.
+    authStatus: async () => ({
+      state: authState, name: "Maya", min_password_len: 12,
+      error: authState === "error" ? "Your identity file at C:\\…\\identity.json exists but could not be read." : null,
+      fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+    }),
     unlock: async () => { authState = "ready"; },
     setPassword: async () => { authState = "ready"; },
     setDisplayName: async (name) => ({ state: authState, name, fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
@@ -147,6 +162,8 @@ function makeMock() {
     setLocked: async (locked) => { mockSettings._locked = locked; },
     listConversations: async () => summaries(),
     getConversation: async (id) => chats[id],
+    markRead: async (id) => { if (chats[id]) readMarks[id] = chats[id].messages.length; },
+    setPresence: async () => {},
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000, path: "/mock/example.pdf" }, timestamp: new Date().toISOString() }); },
     openFile: async () => {},

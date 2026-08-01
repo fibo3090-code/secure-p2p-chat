@@ -1,8 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { computeUnread, markRead } from "./partyUnread.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 
-// The module keeps one process-wide store, so every test uses its own server
-// id to stay independent of the others.
+// The module reads localStorage at import time, so the stub has to exist first.
+const store = new Map();
+vi.stubGlobal("localStorage", {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => store.set(k, String(v)),
+  removeItem: (k) => store.delete(k),
+});
+
+const { computeUnread, markRead, pruneTo, _resetForTests } = await import("./partyUnread.js");
+
 let nextId = 0;
 const sid = () => `srv-${nextId++}`;
 
@@ -18,17 +25,22 @@ const server = (id, channelCount, dmCount = undefined) => ({
         ],
 });
 
+beforeEach(() => _resetForTests());
+
 describe("computeUnread", () => {
-  it("seeds the baseline on first sighting so old history is not unread", () => {
+  it("treats an unseen thread as fully unread", () => {
+    // Community servers replay history on rejoin. Seeding the baseline to the
+    // current count on first sighting — the old behaviour — silently marked
+    // everything that arrived while the app was closed as already read.
     const id = sid();
     const { total, byKey } = computeUnread([server(id, 40)]);
-    expect(total).toBe(0);
-    expect(byKey).toEqual({});
+    expect(total).toBe(40);
+    expect(byKey[`${id}|general`]).toBe(40);
   });
 
-  it("counts growth beyond the baseline", () => {
+  it("counts only growth beyond the read mark", () => {
     const id = sid();
-    computeUnread([server(id, 10)]);
+    markRead(id, "general", 10);
     const { total, byKey } = computeUnread([server(id, 13)]);
     expect(total).toBe(3);
     expect(byKey[`${id}|general`]).toBe(3);
@@ -36,14 +48,13 @@ describe("computeUnread", () => {
 
   it("never reports negative unread when counts shrink", () => {
     const id = sid();
-    computeUnread([server(id, 10)]);
-    const { total } = computeUnread([server(id, 4)]);
-    expect(total).toBe(0);
+    markRead(id, "general", 10);
+    expect(computeUnread([server(id, 4)]).total).toBe(0);
   });
 
   it("tracks DM threads but skips the local member", () => {
     const id = sid();
-    computeUnread([server(id, 0, 5)]);
+    markRead(id, "dm-peer", 5);
     const { total, byKey } = computeUnread([server(id, 0, 7)]);
     expect(total).toBe(2);
     expect(byKey[`${id}|dm-peer`]).toBe(2);
@@ -52,10 +63,41 @@ describe("computeUnread", () => {
 
   it("markRead clears a thread's unread count", () => {
     const id = sid();
-    computeUnread([server(id, 10)]);
-    computeUnread([server(id, 15)]);
+    expect(computeUnread([server(id, 15)]).total).toBe(15);
     markRead(id, "general", 15);
-    const { total } = computeUnread([server(id, 15)]);
-    expect(total).toBe(0);
+    expect(computeUnread([server(id, 15)]).total).toBe(0);
+  });
+});
+
+describe("persistence", () => {
+  it("survives a reload of the module's backing store", async () => {
+    const id = sid();
+    markRead(id, "general", 12);
+    // A fresh import reads the same localStorage, standing in for a restart.
+    vi.resetModules();
+    const reloaded = await import("./partyUnread.js");
+    expect(reloaded.computeUnread([server(id, 12)]).total).toBe(0);
+    expect(reloaded.computeUnread([server(id, 15)]).total).toBe(3);
+  });
+
+  it("survives corrupt storage without breaking the pane", async () => {
+    store.set("p2pem.party.read", "{not json");
+    vi.resetModules();
+    const reloaded = await import("./partyUnread.js");
+    // Falls back to "everything unread", which is the safe direction.
+    expect(() => reloaded.computeUnread([server(sid(), 3)])).not.toThrow();
+  });
+});
+
+describe("pruneTo", () => {
+  it("drops marks for servers the user has left", () => {
+    const kept = sid();
+    const left = sid();
+    markRead(kept, "general", 5);
+    markRead(left, "general", 5);
+    pruneTo([server(kept, 5)]);
+    expect(computeUnread([server(kept, 5)]).total).toBe(0);
+    // The departed server's mark is gone, so its threads read as fully unread.
+    expect(computeUnread([server(left, 5)]).total).toBe(5);
   });
 });

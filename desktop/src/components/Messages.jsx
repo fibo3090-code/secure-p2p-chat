@@ -225,12 +225,83 @@ function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
   );
 }
 
+// The three real ways to reach someone for the first time. There is no account
+// system and no directory, so a user arriving from a mainstream messenger has
+// no working mental model — spelling the options out here is the difference
+// between "this app is broken" and a first successful connection.
+const START_PATHS = [
+  {
+    mode: "invite",
+    icon: "user",
+    title: "Send them an invite link",
+    body: "Copy your link and send it however you already talk — chat, email, a message. They paste it in and connect.",
+    hint: "Easiest if you can reach them somewhere else already",
+  },
+  {
+    mode: "connect",
+    icon: "send",
+    title: "Dial their address",
+    body: "If they are already hosting, enter the address they gave you (like 192.168.1.40:12345) and connect.",
+    hint: "Works on the same network with no setup",
+  },
+  {
+    mode: "host",
+    icon: "server",
+    title: "Let them come to you",
+    body: "Start listening and share the address the app shows you. They dial it from their side.",
+    hint: "Across the internet this needs a port forward or a relay",
+  },
+];
+
+function GetStarted({ onStart }) {
+  return (
+    <div className="chat-pane chat-start">
+      <div className="chat-start-inner">
+        <div className="chat-start-head">
+          <span className="chat-empty-ic"><Icon name="shieldCheck" size={26} /></span>
+          <div>
+            <div className="chat-start-h">Let’s get you connected</div>
+            <div className="chat-start-p">
+              There are no accounts here and no directory to search — your messages
+              go straight to the other person. That means the first connection
+              takes one deliberate step. Pick whichever is easiest:
+            </div>
+          </div>
+        </div>
+
+        <div className="chat-start-paths">
+          {START_PATHS.map((p) => (
+            <button key={p.mode} className="start-card" onClick={() => onStart(p.mode)}>
+              <span className="start-card-ic"><Icon name={p.icon} size={18} /></span>
+              <span className="start-card-txt">
+                <span className="start-card-h">{p.title}</span>
+                <span className="start-card-b">{p.body}</span>
+                <span className="start-card-hint">{p.hint}</span>
+              </span>
+              <span className="start-card-go"><Icon name="chevronRight" size={16} /></span>
+            </button>
+          ))}
+        </div>
+
+        <div className="chat-start-foot">
+          <Icon name="fingerprint" size={14} />
+          <span>
+            When you connect, both of you will see the same six digits and three
+            emoji. Read them out over a call — if they match, nobody is in the
+            middle. That check is what makes the encryption mean something.
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // How many messages render at once. Long histories only mount their tail, so a
 // 10k-message thread doesn't re-render thousands of nodes on every poll tick;
 // "Show earlier messages" widens the window on demand.
 const MSG_WINDOW = 150;
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer }) {
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
   // Inline previews for image files, fetched once per message id (null =
@@ -277,12 +348,17 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   const revealFile = (m) => api.openFile(contact.id, m.id, true).catch(() => {});
 
   if (!contact) {
+    // With nothing to select, "Select a conversation" is a dead end — and this
+    // is exactly the moment a new user decides whether the app works. There are
+    // no accounts and no directory here, so the first connection genuinely needs
+    // explaining; show the three real paths instead of a shrug.
+    if (isFirstRun) return <GetStarted onStart={onStart} />;
     return (
       <div className="chat-pane chat-empty">
         <div className="chat-empty-inner">
           <span className="chat-empty-ic"><Icon name="message" size={28} /></span>
           <div className="chat-empty-h">Select a conversation</div>
-          <div className="chat-empty-p">Encrypted peer-to-peer messaging. Pick a conversation, or start a new connection.</div>
+          <div className="chat-empty-p">Pick a conversation on the left, or start a new connection.</div>
         </div>
       </div>
     );

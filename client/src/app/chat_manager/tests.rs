@@ -25,6 +25,98 @@ fn parse_invite_placeholder_is_ignored() {
     );
 }
 
+// ── Desktop notifications: the focus gate ───────────────────────────────────
+
+/// The setting promises "notify when a message arrives in the background". An
+/// OS popup for the conversation on screen is the fastest way to make a user
+/// switch notifications off for good, so the gate has to hold.
+#[test]
+fn notifications_are_suppressed_only_for_the_visible_conversation() {
+    let mut mgr = ChatManager::new(Config::default());
+    let open = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    mgr.create_local_chat_for_test(open, "Open".into());
+    mgr.create_local_chat_for_test(other, "Other".into());
+    assert!(
+        mgr.config.enable_notifications,
+        "test assumes notifications default to on"
+    );
+
+    // Window focused, `open` on screen: only that conversation is silent.
+    mgr.set_ui_presence(true, Some(open));
+    assert!(!mgr.should_notify_for(open));
+    assert!(mgr.should_notify_for(other));
+
+    // Window in the background: everything notifies, including the conversation
+    // that is still nominally "open".
+    mgr.set_ui_presence(false, Some(open));
+    assert!(mgr.should_notify_for(open));
+    assert!(mgr.should_notify_for(other));
+
+    // The user's setting still wins over any presence state.
+    mgr.config.enable_notifications = false;
+    mgr.set_ui_presence(false, None);
+    assert!(!mgr.should_notify_for(open));
+}
+
+/// A host stores an incoming peer's messages under the *client's* chat id while
+/// the session has its own id. Presence is reported with the displayed id, so
+/// the gate has to resolve the session id back to it — otherwise every message
+/// on an incoming connection notifies even while you are reading it.
+#[test]
+fn notification_gate_resolves_incoming_session_ids() {
+    let mut mgr = ChatManager::new(Config::default());
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+
+    mgr.set_ui_presence(true, Some(incoming));
+    assert!(
+        !mgr.should_notify_for(session_id),
+        "a message on the session backing the open chat must stay silent"
+    );
+}
+
+/// A front-end that never reports presence must keep notifying — silently
+/// disabling notifications for it would be the worse failure.
+#[test]
+fn unreported_presence_defaults_to_notifying() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    assert!(mgr.should_notify_for(chat));
+}
+
+// ── Read marks ──────────────────────────────────────────────────────────────
+
+#[test]
+fn marking_read_clears_unread_and_resolves_session_ids() {
+    let mut mgr = ChatManager::new(Config::default());
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+    if let Some(chat) = mgr.get_chat_mut(incoming) {
+        for _ in 0..4 {
+            chat.messages.push(Message {
+                id: Uuid::new_v4(),
+                from_me: false,
+                content: MessageContent::Text { text: "hi".into() },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            });
+        }
+    }
+    assert_eq!(mgr.unread_count(incoming), 4);
+    assert_eq!(mgr.total_unread(), 4);
+
+    // Marking via the *session* id must clear the displayed conversation.
+    mgr.mark_chat_read(session_id);
+    assert_eq!(mgr.unread_count(incoming), 0);
+    assert_eq!(mgr.total_unread(), 0);
+}
+
 #[test]
 fn host_prompts_for_an_unknown_incoming_fingerprint() {
     // Simulate an incoming connection: a fresh chat (no stored fingerprint)
@@ -292,6 +384,7 @@ fn placeholder_detection_works() {
         send_seq: 0,
         recv_seq: 0,
         is_host_placeholder: true,
+        read_count: 0,
     };
     let id = chat.id;
     mgr.chats.insert(id, chat);
@@ -321,6 +414,7 @@ fn test_tofu_logic() {
         send_seq: 0,
         recv_seq: 0,
         is_host_placeholder: false,
+        read_count: 0,
     };
     // Add a dummy confirmation sender for the test
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -413,6 +507,7 @@ fn test_regression_auto_trust_default_off() {
         send_seq: 0,
         recv_seq: 0,
         is_host_placeholder: false,
+        read_count: 0,
     };
 
     let (tx, _rx) = mpsc::unbounded_channel();

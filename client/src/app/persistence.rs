@@ -7,7 +7,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::types::{Chat, Config};
+use crate::types::{Chat, Config, ToastLevel};
 use uuid::Uuid;
 
 const CURRENT_HISTORY_VERSION: &str = "1.1";
@@ -16,35 +16,67 @@ fn history_version_supported(version: &str) -> bool {
     matches!(version, "1.0" | "1.1")
 }
 
+/// System locations a history file must never be able to redirect writes into.
+/// Compared **per path component**, case-insensitively, against the leading
+/// components of the candidate path.
+#[cfg(unix)]
+const PROTECTED_ROOTS: &[&[&str]] = &[
+    &["etc"],
+    &["usr"],
+    &["bin"],
+    &["sbin"],
+    &["lib"],
+    &["boot"],
+    &["dev"],
+    &["proc"],
+    &["sys"],
+    &["var"],
+    &["root"],
+];
+#[cfg(windows)]
+const PROTECTED_ROOTS: &[&[&str]] = &[
+    &["windows"],
+    &["program files"],
+    &["program files (x86)"],
+    &["programdata"],
+];
+/// Traversal is still rejected on any other target; there is no meaningful
+/// system-directory list to apply.
+#[cfg(not(any(unix, windows)))]
+const PROTECTED_ROOTS: &[&[&str]] = &[];
+
 /// Returns true if the path is considered dangerous (traversal or system dir).
 /// Used to prevent malicious history files from redirecting writes to system paths.
+///
+/// Matching is done on **normalized path components**, not substrings. Substring
+/// matching was both too loose and too strict: `starts_with("/usr")` also caught
+/// `/usrdata`, while `contains("..")` rejected a perfectly ordinary directory
+/// named `my..files`. Only a `..` component is real traversal, and only a
+/// leading `usr` component is really `/usr`.
 fn is_dangerous_path(p: &Path) -> bool {
-    let s = p.to_string_lossy();
-    if s.contains("..") {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        let lower: std::string::String = s.chars().flat_map(|c| c.to_lowercase()).collect();
-        if lower.contains("\\windows\\")
-            || lower.contains("\\program files")
-            || lower.contains("\\system32")
-            || lower.contains("\\program files (x86)")
-        {
-            return true;
+    use std::path::Component;
+
+    let mut normal: Vec<String> = Vec::new();
+    for component in p.components() {
+        match component {
+            // Genuine traversal — a literal `..` component, not the two
+            // characters appearing somewhere in a name.
+            Component::ParentDir => return true,
+            Component::Normal(part) => {
+                normal.push(part.to_string_lossy().to_lowercase());
+            }
+            // Root/prefix/current-dir carry no name to compare.
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
         }
     }
-    #[cfg(unix)]
-    {
-        if s.starts_with("/etc")
-            || s.starts_with("/usr")
-            || s.starts_with("/bin")
-            || s.starts_with("/sbin")
-        {
-            return true;
-        }
-    }
-    false
+
+    PROTECTED_ROOTS.iter().any(|protected| {
+        normal.len() >= protected.len()
+            && protected
+                .iter()
+                .zip(normal.iter())
+                .all(|(want, got)| want == got)
+    })
 }
 
 /// Sanitize loaded config: replace dangerous paths with defaults, and upgrade
@@ -147,12 +179,11 @@ impl HistoryFile {
 
     /// Save encrypted history to file (RECOMMENDED)
     pub fn save_encrypted(&self, path: &Path, key: &[u8; 32]) -> Result<()> {
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let json = serde_json::to_string_pretty(&self)?;
+        // Compact, not pretty: this JSON is encrypted immediately and never read
+        // by a human, so the indentation was pure cost — it inflated the
+        // plaintext, the ciphertext, and every rewrite of the file. The whole
+        // history is re-serialized on each change, so the saving compounds.
+        let json = serde_json::to_string(&self)?;
 
         let cipher = ChaCha20Poly1305::new(key.into());
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -164,17 +195,10 @@ impl HistoryFile {
         let mut output = nonce.to_vec();
         output.extend_from_slice(&ciphertext);
 
-        let temp_path = path.with_extension("tmp");
-        std::fs::write(&temp_path, output)?;
-
-        // Set restrictive file permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-
-        std::fs::rename(&temp_path, path)?;
+        // Atomic + fsynced, with 0600 from creation on Unix. The old path wrote
+        // a temp file and renamed but never flushed it, so a power loss could
+        // land the rename with the data still in the page cache.
+        crate::util::write_file_atomic(path, &output)?;
 
         tracing::info!("Saved {} chats to encrypted history", self.chats.len());
         Ok(())
@@ -220,10 +244,7 @@ impl ChatManager {
             // Immediately save as encrypted
             self.save_history(encrypted_path)?;
 
-            // Remove the plaintext file to prevent future confusion
-            if let Err(e) = std::fs::remove_file(&plaintext_path) {
-                tracing::warn!("Could not delete plaintext history after migration: {}", e);
-            }
+            self.remove_migrated_plaintext_history(&plaintext_path);
 
             tracing::info!("Successfully migrated to encrypted history");
             return Ok(true);
@@ -232,6 +253,61 @@ impl ChatManager {
         // No history found
         tracing::info!("No history file found (new or first load)");
         Ok(false)
+    }
+
+    /// Dispose of the legacy plaintext history once it has been migrated into
+    /// the encrypted file.
+    ///
+    /// The product's core promise is that messages are encrypted at rest, so
+    /// "couldn't delete it, carry on" is the wrong outcome — it leaves every
+    /// message readable in the clear and says so only in a log line nobody
+    /// reads. Escalating:
+    ///
+    /// 1. delete it (the normal path);
+    /// 2. if the file cannot be unlinked (locked by antivirus, indexer, or a
+    ///    permission quirk), **truncate it to zero bytes** so the plaintext is
+    ///    gone even though the file remains, then try the delete again;
+    /// 3. if even that fails, tell the user where the readable copy is, with an
+    ///    error toast — not a silent warning.
+    fn remove_migrated_plaintext_history(&mut self, plaintext_path: &Path) {
+        match std::fs::remove_file(plaintext_path) {
+            Ok(()) => return,
+            Err(e) => tracing::warn!(
+                path = %plaintext_path.display(),
+                error = %e,
+                "could not delete legacy plaintext history; emptying it instead"
+            ),
+        }
+
+        // Emptying the file removes the readable content even when the
+        // directory entry itself is pinned.
+        let emptied = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(plaintext_path)
+            .is_ok();
+        if emptied {
+            // Now that it holds nothing, a second delete attempt is worth it.
+            let _ = std::fs::remove_file(plaintext_path);
+            tracing::warn!(
+                path = %plaintext_path.display(),
+                "legacy plaintext history could not be deleted, but was emptied"
+            );
+            return;
+        }
+
+        tracing::error!(
+            path = %plaintext_path.display(),
+            "legacy plaintext history could NOT be removed or emptied; messages remain readable on disk"
+        );
+        self.add_toast(
+            ToastLevel::Error,
+            format!(
+                "Your old unencrypted history at {} could not be removed. \
+                 Your messages are still readable in that file — delete it manually.",
+                plaintext_path.display()
+            ),
+        );
     }
 
     /// Load encrypted chat history from file
@@ -265,9 +341,34 @@ impl ChatManager {
         Ok((history, key))
     }
 
+    /// Replace the in-memory conversation state with what was loaded.
+    ///
+    /// This *replaces* rather than merges. Merging looked harmless while load
+    /// only ever ran once at startup, but it meant a deleted chat would come
+    /// back the moment a second load happened — the loaded file would be layered
+    /// on top of current state instead of becoming it. Any future reload,
+    /// import, or account-switch would have inherited that bug silently.
+    ///
+    /// Live sessions are unaffected: those live in `sessions`/`chat_id_mapping`,
+    /// not here. Placeholder host chats are preserved for the same reason —
+    /// they represent a live listener, not persisted history.
     fn apply_history(&mut self, history: HistoryFile) {
+        let placeholders: Vec<Chat> = self
+            .chats
+            .values()
+            .filter(|c| c.is_host_placeholder)
+            .cloned()
+            .collect();
+
+        self.chats.clear();
+        self.contacts.clear();
+        self.contact_to_chat.clear();
+
         for chat in history.chats {
             self.chats.insert(chat.id, chat);
+        }
+        for placeholder in placeholders {
+            self.chats.entry(placeholder.id).or_insert(placeholder);
         }
 
         for contact in history.contacts {
@@ -292,6 +393,118 @@ mod tests {
     use tempfile::NamedTempFile;
     use uuid::Uuid;
 
+    /// Loading history must *replace* in-memory state, not merge into it.
+    /// Merging meant a deleted chat came back the moment a second load ran.
+    #[test]
+    fn loading_history_replaces_rather_than_merges() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut manager = ChatManager::new(Config::default());
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        manager.set_history_key(key);
+
+        let kept = Uuid::new_v4();
+        manager.create_local_chat_for_test(kept, "Kept".into());
+        manager.save_history(temp_file.path()).unwrap();
+
+        // A chat created (or resurrected) after that save must not survive a
+        // reload — the file is the truth.
+        let stale = Uuid::new_v4();
+        manager.create_local_chat_for_test(stale, "Deleted elsewhere".into());
+        manager
+            .load_history_encrypted(temp_file.path(), &key)
+            .unwrap();
+
+        assert!(manager.get_chat(kept).is_some());
+        assert!(
+            manager.get_chat(stale).is_none(),
+            "a chat absent from the loaded history must not linger"
+        );
+    }
+
+    /// A live listener is not persisted history, so a reload must not drop it
+    /// out from under the running session.
+    #[test]
+    fn loading_history_preserves_a_live_host_placeholder() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut manager = ChatManager::new(Config::default());
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        manager.set_history_key(key);
+        manager.save_history(temp_file.path()).unwrap();
+
+        let placeholder_id = Uuid::new_v4();
+        manager.create_local_chat_for_test(placeholder_id, "Listening".into());
+        manager
+            .get_chat_mut(placeholder_id)
+            .unwrap()
+            .is_host_placeholder = true;
+
+        manager
+            .load_history_encrypted(temp_file.path(), &key)
+            .unwrap();
+        assert!(
+            manager.get_chat(placeholder_id).is_some(),
+            "the live listener must survive a history load"
+        );
+    }
+
+    #[test]
+    fn dangerous_paths_match_components_not_substrings() {
+        // Real traversal is rejected.
+        assert!(is_dangerous_path(Path::new("../../etc")));
+        assert!(is_dangerous_path(Path::new("/home/me/../../etc")));
+        // A name that merely contains ".." is a perfectly ordinary directory.
+        assert!(!is_dangerous_path(Path::new("/home/me/my..files")));
+        assert!(!is_dangerous_path(Path::new("/home/me/archive..2024")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_roots_are_rejected_without_false_positives() {
+        for bad in [
+            "/etc/x", "/usr/lib", "/bin", "/sbin/x", "/var/lib", "/root", "/proc/1",
+        ] {
+            assert!(
+                is_dangerous_path(Path::new(bad)),
+                "{bad} should be rejected"
+            );
+        }
+        // A prefix match on the *string* would wrongly catch these.
+        for ok in [
+            "/usrdata/files",
+            "/etcetera",
+            "/home/user/binaries",
+            "/rootfs-backup",
+        ] {
+            assert!(!is_dangerous_path(Path::new(ok)), "{ok} should be allowed");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_roots_are_rejected_without_false_positives() {
+        for bad in [
+            r"C:\Windows\System32",
+            r"C:\windows",
+            r"C:\Program Files\App",
+            r"C:\Program Files (x86)\App",
+            r"C:\ProgramData\x",
+        ] {
+            assert!(
+                is_dangerous_path(Path::new(bad)),
+                "{bad} should be rejected"
+            );
+        }
+        for ok in [
+            r"C:\Users\me\Downloads",
+            r"C:\WindowsApps-backup",
+            r"D:\Program Files Backup",
+        ] {
+            assert!(!is_dangerous_path(Path::new(ok)), "{ok} should be allowed");
+        }
+    }
+
     #[test]
     fn test_history_roundtrip() {
         let temp_file = NamedTempFile::new().unwrap();
@@ -310,6 +523,7 @@ mod tests {
             send_seq: 0,
             recv_seq: 0,
             is_host_placeholder: false,
+            read_count: 0,
         };
 
         let history = HistoryFile::new(vec![chat.clone()]);
@@ -353,6 +567,7 @@ mod tests {
                 send_seq: 0,
                 recv_seq: 0,
                 is_host_placeholder: false,
+                read_count: 0,
             },
         );
 
@@ -451,6 +666,7 @@ mod tests {
                 send_seq: 0,
                 recv_seq: 0,
                 is_host_placeholder: false,
+                read_count: 0,
             },
         );
 

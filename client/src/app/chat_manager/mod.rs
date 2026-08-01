@@ -156,6 +156,36 @@ pub struct ChatManager {
     /// then unmaps the router port. `Some` while a UPnP/NAT-PMP mapping is
     /// being maintained for the current hosting session.
     upnp_cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    /// What the user can currently see, pushed down by the UI shell.
+    /// `ChatManager` is deliberately UI-agnostic and owns no window handle, so
+    /// a front-end that knows about focus must report it here — otherwise
+    /// "notify when a message arrives in the background" fires for the
+    /// conversation the user is reading right now.
+    presence: UiPresence,
+}
+
+/// What the user is currently looking at. Reported by the UI shell via
+/// [`ChatManager::set_ui_presence`]; used to decide whether an arriving message
+/// is "in the background" and therefore worth a desktop notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiPresence {
+    /// The app window has OS focus and is visible.
+    pub focused: bool,
+    /// The conversation currently on screen, if any.
+    pub active_chat: Option<Uuid>,
+}
+
+impl Default for UiPresence {
+    /// A front-end that never reports presence behaves like an unfocused shell:
+    /// every message notifies. That is the safe default — missing a
+    /// notification is worse than one extra, and the alternative (assume
+    /// focused) would silently disable notifications for such a front-end.
+    fn default() -> Self {
+        Self {
+            focused: false,
+            active_chat: None,
+        }
+    }
 }
 
 impl ChatManager {
@@ -187,7 +217,74 @@ impl ChatManager {
             external_address: None,
             pending_upnp: None,
             upnp_cancel: None,
+            presence: UiPresence::default(),
         }
+    }
+
+    /// Report what the user can see. Call this from the UI shell whenever the
+    /// window gains/loses focus or the open conversation changes.
+    pub fn set_ui_presence(&mut self, focused: bool, active_chat: Option<Uuid>) {
+        self.presence = UiPresence {
+            focused,
+            active_chat,
+        };
+    }
+
+    /// The last reported UI presence.
+    pub fn ui_presence(&self) -> UiPresence {
+        self.presence
+    }
+
+    /// Whether an arriving message in `chat_id` warrants a desktop
+    /// notification: notifications must be enabled, and the message must not be
+    /// landing in the conversation the user is looking at right now.
+    ///
+    /// Public so the gate itself is testable without firing an OS popup.
+    pub fn should_notify_for(&self, chat_id: Uuid) -> bool {
+        if !self.config.enable_notifications {
+            return false;
+        }
+        let id = self.resolve_display_chat_id(chat_id);
+        !(self.presence.focused && self.presence.active_chat == Some(id))
+    }
+
+    /// Mark every message currently in a conversation as seen. The read mark
+    /// lives on the `Chat` and is persisted with the encrypted history, so
+    /// unread badges survive a restart.
+    pub fn mark_chat_read(&mut self, chat_id: Uuid) {
+        // Incoming connections are tracked under the *incoming* chat id; accept
+        // either that or the session id so callers do not have to know which.
+        let id = self.resolve_display_chat_id(chat_id);
+        if let Some(chat) = self.chats.get_mut(&id) {
+            chat.mark_read();
+        }
+    }
+
+    /// Unseen messages from the peer in a conversation.
+    pub fn unread_count(&self, chat_id: Uuid) -> usize {
+        self.chats
+            .get(&self.resolve_display_chat_id(chat_id))
+            .map(|c| c.unread_count())
+            .unwrap_or(0)
+    }
+
+    /// Total unseen messages across every conversation (rail badge / tray).
+    pub fn total_unread(&self) -> usize {
+        self.chats.values().map(|c| c.unread_count()).sum()
+    }
+
+    /// Map a session id back to the chat the UI actually displays. For an
+    /// incoming connection the host stores messages under the client's chat id,
+    /// so the session id alone would resolve to nothing.
+    fn resolve_display_chat_id(&self, chat_id: Uuid) -> Uuid {
+        if self.chats.contains_key(&chat_id) {
+            return chat_id;
+        }
+        self.chat_id_mapping
+            .iter()
+            .find(|(_, &session_id)| session_id == chat_id)
+            .map(|(&incoming_id, _)| incoming_id)
+            .unwrap_or(chat_id)
     }
 
     /// Set the optional P2P connection password. When hosting, peers must present
@@ -273,6 +370,7 @@ impl ChatManager {
             send_seq: 0,
             recv_seq: 0,
             is_host_placeholder: false,
+            read_count: 0,
         };
         self.chats.insert(id, chat);
     }
@@ -323,6 +421,27 @@ impl ChatManager {
         let now = std::time::Instant::now();
         self.toasts
             .retain(|toast| now.duration_since(toast.created_at) < toast.duration);
+    }
+
+    /// Desktop notification for a message that arrived in `chat_id`, titled
+    /// with the conversation name so the user knows who it is from without
+    /// opening the app.
+    ///
+    /// Suppressed when the user is already looking at that conversation — the
+    /// setting promises "notify when a message arrives in the background", and
+    /// an OS popup for the thread on screen is the fastest way to make a user
+    /// turn notifications off for good.
+    pub(super) fn notify_incoming_message(&self, chat_id: Uuid, body: &str) {
+        if !self.should_notify_for(chat_id) {
+            return;
+        }
+        let title = self
+            .chats
+            .get(&chat_id)
+            .map(|c| c.title.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("New message");
+        self.show_notification(title, body);
     }
 
     /// Show desktop notification

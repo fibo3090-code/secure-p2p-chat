@@ -38,17 +38,14 @@ chacha20poly1305 = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-egui_tracing = { workspace = true }
 
 # CLI
 clap = { workspace = true }
 
-# GUI
-eframe = { workspace = true }
-egui = { workspace = true }
-egui_commonmark = { workspace = true }
-
-# TUI
+# TUI. There is deliberately no GUI toolkit here: the egui desktop GUI was
+# retired in favour of the Tauri app in `desktop/`, so this crate is the app
+# core plus a terminal interface, and the desktop bridge no longer compiles a
+# windowing stack it never uses.
 ratatui = { workspace = true }
 ratatui-crossterm = { workspace = true }
 
@@ -58,21 +55,16 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
 
-# File dialogs / shell integration
-rfd = { workspace = true }
-open = { workspace = true }
+# Desktop notifications (the manager raises them; the shell decides when)
 notify-rust = { workspace = true }
 
-# Emoji + QR
-emojis = { workspace = true }
+# QR codes for invite links, rendered to a PNG
 qrcode = { workspace = true }
 image = { workspace = true }
+
+# Terminal clipboard + width-correct rendering
 arboard = { workspace = true }
-
 unicode-width = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

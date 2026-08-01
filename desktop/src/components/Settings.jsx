@@ -68,6 +68,8 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
     if (port !== s.listen_port) apply({ listen_port: port });
   }
 
+  const backedUp = !!s?.identity_backed_up_at;
+
   async function changeDownloadDir() {
     try {
       const dir = await api.pickDownloadDir();
@@ -101,18 +103,33 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
             </div>
           </div>
           <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
-          <div className="set-row">
+          {/* Losing the identity file is the one failure this app cannot undo,
+              so the row states plainly whether a backup exists rather than
+              offering an Export button with no indication either way. */}
+          <div className={cx("set-row", !backedUp && "is-warn")}>
             <span className="set-row-txt">
-              <span className="set-row-label">Identity backup</span>
-              <span className="set-row-hint">Save an encrypted copy of your identity file. Without it (and your password), a lost disk means a lost identity.</span>
+              <span className="set-row-label">
+                Identity backup
+                {s && (backedUp
+                  ? <span className="set-badge is-ok">Backed up</span>
+                  : <span className="set-badge is-warn">Never backed up</span>)}
+              </span>
+              <span className="set-row-hint">
+                {backedUp
+                  ? `Last saved ${new Date(s.identity_backed_up_at).toLocaleString()}. Save a fresh copy if you have changed devices.`
+                  : "Save an encrypted copy of your identity file. Without it (and your password), a lost disk means a lost identity — there is no reset."}
+              </span>
             </span>
             <button className="set-change" onClick={async () => {
               try {
                 const dest = await api.exportIdentity();
-                if (dest) toast(`Backup saved to ${dest}`, "success");
+                if (dest) {
+                  toast(`Backup saved to ${dest}`, "success");
+                  api.getSettings().then(setS).catch(() => {});
+                }
               } catch (e) { toast(String(e), "error"); }
             }}>
-              <Icon name="copy" size={14} /> Export
+              <Icon name="copy" size={14} /> {backedUp ? "Export again" : "Export now"}
             </button>
           </div>
         </section>

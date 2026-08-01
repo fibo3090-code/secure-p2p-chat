@@ -273,6 +273,7 @@ impl ChatManager {
                         send_seq: 0,
                         recv_seq: 0,
                         is_host_placeholder: false,
+                        read_count: 0,
                     });
 
                 // If this connection consumes a placeholder host chat, remove the placeholder
@@ -334,9 +335,10 @@ impl ChatManager {
                                 chat.typing_since = None;
                                 // Delivery receipt for the sender.
                                 self.send_ack_for_chat(actual_chat_id, seq);
-                                // Show desktop notification
+                                // Desktop notification — suppressed when this
+                                // conversation is already on screen and focused.
                                 let preview = Self::preview_text_for_notification(&text);
-                                self.show_notification("New message", &preview);
+                                self.notify_incoming_message(actual_chat_id, &preview);
 
                                 tracing::info!("Added received message to chat {}", actual_chat_id);
                             } else {
@@ -397,7 +399,7 @@ impl ChatManager {
                                 self.send_ack_for_chat(actual_chat_id, seq);
 
                                 let preview = Self::preview_text_for_notification(&text);
-                                self.show_notification("New message", &preview);
+                                self.notify_incoming_message(actual_chat_id, &preview);
                                 tracing::info!(
                                     "Reassembled large text message {} for chat {}",
                                     message_id,

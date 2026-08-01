@@ -24,12 +24,25 @@ Only the latest released version receives security fixes.
 
 Current overall risk assessment: **medium**.
 
+> This is a **self-assessment**, not an audit. No independent third party has
+> reviewed this code. Treat the rating as the maintainers' honest read of their
+> own work, which is exactly the kind of claim you should discount. If your
+> threat model involves a well-resourced adversary, use something that has been
+> audited. Independent review is welcome — see [Responsible Disclosure](#responsible-disclosure).
+
 Reasoning:
 
 - strong modern transport/session primitives are in place
-- identity and history are encrypted at rest
+- identity and history are encrypted at rest, behind an Argon2id-stretched
+  password with an enforced minimum length (`MIN_PASSWORD_LEN`, checked in
+  `Identity::encrypt` so no front-end can set a weaker one)
 - protocol correctness and replay protection have been hardened
 - some product-grade gaps remain, especially around discovery privacy, relay operational hardening, and dependency posture
+- there is **no offline delivery for direct peer-to-peer conversations**: if
+  both peers are not online at the same time (or connected through a relay),
+  a message is not delivered. Only the community server buffers history. This
+  is a consequence of having no always-on infrastructure holding your
+  messages, and it is a real product limitation, not just a design note
 
 ## Implemented Protections
 
@@ -37,14 +50,24 @@ In transit, sessions are established with X25519 ECDH and HKDF-SHA256 (providing
 
 Operational hardening includes handshake timeouts, rate limiting, DoS-hardened framing (bounded length prefix, chunked reads, oversized-packet rejection), signed invite links, a self-hosted relay mode that forwards only already-encrypted session traffic, and server-side access checks on Party file downloads (`blob_bytes_for`: only channel members or DM participants can fetch a blob). CI enforces formatting, lints, cross-platform tests, and locked build verification.
 
+### At-rest durability
+
+The identity file is the **only** key to the message history (`history_key` is derived from the private key), so losing or corrupting it is unrecoverable by design. Two rules protect it:
+
+- **Every write is atomic** (`messenger_core::util::write_file_atomic`): the content goes to a uniquely-named temporary file in the same directory, is `fsync`ed, and is then renamed over the destination; on Unix the directory is `fsync`ed too, and the file is created `0600` rather than widened and narrowed. An interrupted write therefore leaves the *old* identity, never a truncated one. The same path is used for the encrypted history.
+- **An unreadable identity is a hard error, never replaced.** If `identity.json` exists but cannot be parsed, the app refuses to start and says so, leaving the file untouched for restoration from a backup. Generating a replacement would look like a graceful fallback while silently making all stored messages undecryptable and changing the fingerprint every contact had verified — presented to the user as a blank, freshly-installed app. Absence of the file is still a normal first run.
+
+Migrating a legacy plaintext history escalates rather than shrugs: the plaintext file is deleted; if it cannot be unlinked it is truncated to zero bytes so the content is gone anyway; and if even that fails the user gets an error naming the file, instead of a log line saying their messages are still readable on disk.
+
 ### Desktop app (Tauri) attack surface
 
 The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 
 - all cryptography stays in Rust; the React webview only calls `#[tauri::command]`s and never handles key material
 - `tauri.conf.json` sets a restrictive **CSP** (`default-src 'self'`; no external hosts, scripts, or fonts) and disables the global Tauri injection (`withGlobalTauri: false`)
-- the desktop app uses its **own** data directory (`ProjectDirs "P2PEM"`), separate from the egui app, so the two are distinct identities rather than sharing one keystore
-- the desktop crate has no automated tests; it is verified by `cargo check` + `npm run build`, so treat its UI logic as build-verified rather than test-covered
+- the desktop app uses its **own** data directory (`ProjectDirs "P2PEM"`), distinct from the terminal client's, so the two are separate identities rather than sharing one keystore
+- the bridge is covered by an IPC-level integration suite (`desktop/src-tauri/src/tests.rs`, 16 tests) that drives the real command handlers through Tauri's mock runtime. It asserts the **auth barrier** holds — no state-mutating command runs before unlock/set-password — that the password floor is enforced by the core rather than the UI, and that every frontend payload key still binds to its command parameter. CI runs it on Linux and macOS; it is skipped on Windows, where a Rust test-harness executable linking Tauri aborts at startup (`STATUS_ENTRYPOINT_NOT_FOUND`), not because the suite is platform-specific
+- the React layer is covered by unit tests (`npm test`) over its pure logic — password policy, safety-grid rendering, unread accounting, design-token drift. Behaviour that only exists inside a live webview is **not** automatically tested; treat rendering as build-verified rather than test-covered
 
 ## Current Limits and Open Risks
 
@@ -88,14 +111,26 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   signatures to Ed25519 (the wire already negotiates a scheme field) would drop
   `rsa` from the security-critical path entirely.
 - `bincode` remains a tracked dependency migration concern
-- Known-accepted `cargo audit` findings beyond `rsa` above: `quick-xml`
-  (RUSTSEC-2026-0194/0195) is pinned transitively by the GUI stacks
-  (egui-winit accessibility, wayland build tooling, Tauri) below the fixed
-  release — the parsed XML there is build-time or local desktop-bus data,
-  never peer-controlled input — and the unmaintained GTK3-binding warnings
-  come with Tauri's Linux backend until it moves off GTK3. Re-evaluate on
-  every GUI-stack upgrade; everything else in the tree is kept current via
-  in-semver `cargo update`.
+- Known-accepted `cargo audit` findings beyond `rsa` above, each with the exact
+  path that pulls it (verified with `cargo tree --target all -i`, since a
+  "transitively via Tauri" hand-wave was wrong here once already):
+  - **`quick-xml` 0.39.4** (RUSTSEC-2026-0194/0195, both DoS-on-hostile-XML):
+    reached **only** on Linux/Wayland via
+    `rfd → wayland-client/wayland-protocols → wayland-scanner`.
+    `wayland-scanner` is a **proc macro**: it parses the Wayland protocol XML
+    that ships inside the crate, at build time, and is never linked into the
+    shipped binary. The input is neither peer-controlled nor present at
+    runtime. The app's *own* Tauri path resolves `quick-xml` 0.41.0, which is
+    already fixed.
+  - **Unmaintained GTK3 bindings** (`gtk`, `gdk`, `atk`, `glib`, … 0.18):
+    Tauri's Linux backend (`muda`, `tao` → `tauri-runtime-wry`) until it moves
+    off GTK3. Not something this project can resolve independently.
+  - **`bincode` 1.3.3 unmaintained** (RUSTSEC-2025-0141): a direct `core`
+    dependency used for the relay control protocol. Migration is tracked; the
+    frames it decodes are length-bounded by `MAX_PACKET_SIZE` before parsing.
+
+  Re-evaluate on every Tauri upgrade; everything else in the tree is kept
+  current via in-semver `cargo update`.
 
 ## Trust Model
 

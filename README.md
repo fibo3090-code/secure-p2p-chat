@@ -1,100 +1,125 @@
-# Encrypted P2P Messenger
+# P2PEM — Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.14.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.15.0-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE.md)
-[![Security](https://img.shields.io/badge/security-medium-yellow)](SECURITY.md)
+[![Security](https://img.shields.io/badge/security-self--assessed-yellow)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
 
-Secure peer-to-peer messaging for desktop, built with Rust. The app provides encrypted messaging, encrypted local storage, forward secrecy, signed invite links, and three frontends: an egui desktop GUI, a ratatui terminal UI, and a newer Tauri + React desktop app.
+Messages that go straight from your device to your friend's, end-to-end
+encrypted, with no account and no server holding your history. Built in Rust.
 
-## What It Does
+## Install
 
-- End-to-end encrypted messaging over direct peer connections
-- X25519 + HKDF session establishment with RSA-PSS identity proofs
-- Encrypted local identity and encrypted chat history at rest
-- Large text messages are chunked automatically, plus file transfer, typing indicators, invite links, QR generation, and optional LAN discovery
-- Diagnostics bundle export and on-disk panic/crash logs for support
-- GUI built with `egui`, terminal interface built with `ratatui`, and a Tauri 2 + React desktop app (in `desktop/`) that drives the same core — meant to replace the egui GUI over time
-- Five UI themes (Light, Dark, Midnight, Forest, Rose) driven by a shared design-token source (`design/tokens.json`)
+**[Download P2PEM Desktop](https://github.com/fibo3090-code/secure-p2p-chat/releases/latest)** — Windows, macOS, or Linux.
 
-## Current Status
+| System | File |
+|---|---|
+| Windows | `P2PEM_<version>_x64-setup.exe` |
+| macOS (Apple silicon) | `P2PEM_<version>_aarch64.dmg` |
+| macOS (Intel) | `P2PEM_<version>_x64.dmg` |
+| Linux | `p2pem_<version>_amd64.AppImage` or `.deb` |
 
-The project is functional and actively maintained, but it is not a “finished product” in every area.
+That is the app. There is exactly one — earlier releases also shipped a second,
+older desktop GUI, which has been retired so nobody has to guess which to
+install.
 
-- Security posture: medium. See [SECURITY.md](SECURITY.md).
-- Internet connectivity: relay-assisted WAN connectivity is available for self-hosted deployments. Direct TCP is still the default.
-- LAN discovery: optional and privacy-sensitive. Disabled by default.
-- Packaging: Windows, Linux, and macOS release artifacts are published through GitHub Releases. The release pipeline also builds Tauri desktop installers; the egui binary remains the primary shipped artifact while the desktop app matures.
+Running a headless box? `P2PEM-Tools_<version>_<os>` contains the terminal
+client (which also runs a relay) and the community server. You do not need it
+to use the desktop app.
 
-## Quick Start
+## What you get
 
-### Build
+- **End-to-end encryption** on every conversation — X25519 key agreement with
+  forward secrecy, AES-256-GCM, RSA-PSS identity proofs, automatic key rotation.
+- **Verification you can actually do.** On first contact both sides see the same
+  six digits and three emoji. Read them aloud over a call; if they match, nobody
+  is in the middle. (The 64-character fingerprint and a colour grid are there
+  too, one click away, for people who want them.)
+- **Nothing stored anywhere but your device.** No account, no sign-up, no server
+  copy of your messages. Identity and history are encrypted at rest with
+  Argon2id + ChaCha20-Poly1305.
+- **Direct connections**, with an optional self-hosted relay when NATs get in
+  the way. The relay coordinates a hole punch first and only forwards bytes as a
+  fallback — and it only ever sees ciphertext.
+- **Files, large messages, delivery receipts, typing indicators**, and optional
+  LAN peer discovery (off by default — it announces your presence).
+- **Communities**: a self-hosted server for channels, DMs, and shared files when
+  you want a group that works while people are offline.
+
+## Honest limitations
+
+Worth knowing before you switch to it:
+
+- **No mobile client.** Desktop only.
+- **Direct conversations have no offline delivery.** Both people have to be
+  online at the same time. Only the community server buffers messages.
+- **Reaching someone across the internet needs setup** — a port forward, UPnP,
+  or someone running a relay. There is no infrastructure operated for you.
+- **No third-party security audit.** The "medium" posture in
+  [SECURITY.md](SECURITY.md) is a self-assessment.
+- **Your password cannot be reset.** It is what decrypts your identity. The app
+  offers a backup at first run; take it.
+
+## First launch
+
+The app creates an identity and asks for a password that encrypts it (minimum 12
+characters — that password is the whole at-rest story). It then offers to save a
+backup of your identity file, which is worth doing immediately: there is no
+account recovery, so a lost disk without a backup means a lost identity.
+
+Then connect: one side hosts (or opens a relay session) and shares an address,
+invite link, or relay token; the other dials it. Compare the six-digit code, and
+you're talking.
+
+## Build from source
 
 ```bash
-cargo build --release
+# Desktop app (needs Node 20+ and the Tauri prerequisites)
+cd desktop && npm ci && npx tauri build
+
+# Terminal client / relay
+cargo build --release -p p2pem-classic
+
+# Community server
+cargo build --release -p messenger-server
+
+# Everything, with tests
+cargo test --workspace && (cd desktop && npm test)
 ```
 
-### Run GUI
+The terminal UI is fully featured and keyboard-driven: press `:` for an
+autocomplete command menu, or `:help` for the full reference. Every action —
+connecting, verification, contacts, invites, file transfer, settings — is
+reachable without leaving the terminal. See
+[docs/USER_GUIDE.md](docs/USER_GUIDE.md#tui-reference).
 
-```bash
-cargo run --release
-```
+## Platform notes
 
-### Run TUI
-
-```bash
-cargo run --release -- --tui
-```
-
-### Run the Tauri desktop app (preview)
-
-```bash
-cd desktop && npx tauri dev     # native window + React UI (needs Node + the Tauri prereqs)
-```
-
-This is the in-development replacement for the egui GUI. The release pipeline builds its installers alongside the egui artifacts, but the egui GUI remains the primary supported interface for now.
-
-The terminal UI is fully featured and keyboard-driven: press `:` and start typing for an autocomplete command menu, or `:help` for the full command and keybinding reference. Every action — connecting, fingerprint verification, contacts, invites, file transfer, settings — is reachable without leaving the terminal. See [docs/USER_GUIDE.md](docs/USER_GUIDE.md#tui-reference) for the command list.
-
-### First Launch
-
-On first launch, the app creates an identity and requires password protection before normal use. The unlock/set-password screen is blocking by design (a password overlay in the TUI, a blocking screen in the GUI).
-
-### Trust Model
-
-The app uses TOFU: trust on first use.
-
-1. Connect to a peer.
-2. Verify the displayed fingerprint over a separate trusted channel.
-3. Accept only if it matches exactly.
-
-## Platform Notes
-
-| Platform | Status | Notes |
-|---|---|---|
-| Windows | Supported | Installer releases are published. Bonjour may be needed for mDNS discovery. The uninstaller can remove local identity/history data for a true reset. |
-| Linux | Supported | Release tarballs are published; `avahi-daemon` and GUI system libraries may be required. |
-| macOS | Supported | Intel and Apple Silicon DMGs are published; Native Bonjour works. |
+| Platform | Notes |
+|---|---|
+| Windows | Installer (`.exe`/`.msi`). Bonjour may be needed for mDNS discovery. |
+| Linux | `.AppImage` (portable) and `.deb`. `avahi-daemon` for mDNS discovery. |
+| macOS | Universal coverage via separate Intel and Apple-silicon DMGs. Native Bonjour works. |
 
 ## Documentation
 
 Start with [docs/README.md](docs/README.md).
 
-- [docs/TUTORIAL.md](docs/TUTORIAL.md): step-by-step first session tutorial for GUI, TUI, and relay-assisted setup
-- [docs/USER_GUIDE.md](docs/USER_GUIDE.md): installation, usage, GUI/TUI flows, troubleshooting
-- [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md): contributor workflow, build/test/release process
-- [docs/architecture.md](docs/architecture.md): codebase architecture and runtime responsibilities
-- [docs/protocol.md](docs/protocol.md): wire protocol and handshake details
-- [SECURITY.md](SECURITY.md): security posture, controls, open risks, disclosure
-- [THREAT_MODEL.md](THREAT_MODEL.md): assumptions, assets, attack surfaces, limitations
-- [docs/platform_spec.md](docs/platform_spec.md): platform plan, roadmap, and backlog
-- [docs/AUDITS.md](docs/AUDITS.md): consolidated audit history and findings
-- [DESIGN_NOTES.md](DESIGN_NOTES.md): UI/UX principles, brand, and theming
+- [docs/TUTORIAL.md](docs/TUTORIAL.md): step-by-step first session
+- [docs/USER_GUIDE.md](docs/USER_GUIDE.md): installation, usage, troubleshooting
+- [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md): contributor workflow, build/test/release
+- [docs/architecture.md](docs/architecture.md): codebase architecture
+- [docs/protocol.md](docs/protocol.md): wire protocol and handshake
+- [SECURITY.md](SECURITY.md): posture, controls, open risks, disclosure
+- [THREAT_MODEL.md](THREAT_MODEL.md): assumptions, assets, attack surfaces
+- [docs/platform_spec.md](docs/platform_spec.md): platform plan and roadmap
+- [docs/AUDITS.md](docs/AUDITS.md): audit history and findings
+- [DESIGN_NOTES.md](DESIGN_NOTES.md): UI/UX principles, brand, theming
 - [CHANGELOG.md](CHANGELOG.md): release history
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution process and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 

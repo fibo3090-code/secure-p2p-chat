@@ -4,9 +4,9 @@ pub mod input;
 pub mod overlays;
 pub mod ui;
 
+use crate::logbuf::LogBuffer;
 use crate::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
 use anyhow::Result;
-use egui_tracing::tracing::EventCollector;
 use ratatui::prelude::*;
 use ratatui_crossterm::crossterm::{
     event::{self, Event, KeyEventKind},
@@ -28,7 +28,7 @@ pub struct TuiLaunchConfig {
 }
 
 /// Main entry point for the TUI.
-pub async fn run(event_collector: EventCollector, launch: TuiLaunchConfig) -> Result<()> {
+pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
     enable_raw_mode()?;
 
     // NOTE: mouse capture is intentionally NOT enabled — we handle no mouse
@@ -38,7 +38,7 @@ pub async fn run(event_collector: EventCollector, launch: TuiLaunchConfig) -> Re
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(event_collector)?;
+    let mut app = TuiApp::new(logs)?;
     app.prompt_auth_if_needed();
     apply_launch_config(&mut app, &launch).await;
 

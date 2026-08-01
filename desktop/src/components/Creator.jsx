@@ -29,8 +29,8 @@ const TRANSPORTS = [
   { id: "relay", icon: "satellite", label: "Via relay" },
 ];
 
-export function Creator({ open, onClose }) {
-  const [mode, setMode] = useState("connect");
+export function Creator({ open, onClose, initialMode }) {
+  const [mode, setMode] = useState(initialMode || "connect");
   const [transport, setTransport] = useState("direct");
   const [addr, setAddr] = useState("");
   const [port, setPort] = useState("12345");
@@ -45,6 +45,13 @@ export function Creator({ open, onClose }) {
   const [err, setErr] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Open on the tab the caller asked for. The get-started panel routes each of
+  // its three suggestions straight to the matching path, so the user is never
+  // dropped on a generic dialog and left to find the right tab themselves.
+  useEffect(() => {
+    if (open && initialMode) setMode(initialMode);
+  }, [open, initialMode]);
 
   useEffect(() => {
     if (open && mode === "invite" && !myLink) {
