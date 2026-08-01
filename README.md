@@ -17,7 +17,7 @@ encrypted, with no account and no server holding your history. Built in Rust.
 | Windows | `P2PEM_<version>_x64-setup.exe` |
 | macOS (Apple silicon) | `P2PEM_<version>_aarch64.dmg` |
 | macOS (Intel) | `P2PEM_<version>_x64.dmg` |
-| Linux | `p2pem_<version>_amd64.AppImage` or `.deb` |
+| Linux | `P2PEM_<version>_amd64.AppImage` or `.deb` |
 
 That is the app. There is exactly one — earlier releases also shipped a second,
 older desktop GUI, which has been retired so nobody has to guess which to
@@ -124,3 +124,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.
 ## License
 
 MIT. See [LICENSE.md](LICENSE.md).
+

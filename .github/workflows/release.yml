@@ -46,7 +46,7 @@ jobs:
             echo "| Windows | \`P2PEM_${VERSION}_x64-setup.exe\` (or the \`.msi\`) |"
             echo "| macOS (Apple silicon) | \`P2PEM_${VERSION}_aarch64.dmg\` |"
             echo "| macOS (Intel) | \`P2PEM_${VERSION}_x64.dmg\` |"
-            echo "| Linux | \`p2pem_${VERSION}_amd64.AppImage\` (portable) or \`.deb\` |"
+            echo "| Linux | \`P2PEM_${VERSION}_amd64.AppImage\` (portable) or \`.deb\` |"
             echo
             echo "Not sure? Take the Windows \`.exe\`, the macOS \`.dmg\` matching your chip, or the Linux \`.AppImage\`."
             echo
@@ -54,7 +54,7 @@ jobs:
             echo
             echo "\`P2PEM-Tools_${VERSION}_<os>.tar.gz\` contains the terminal client (\`p2pem\`,"
             echo "which also runs a relay with \`--relay-server\`) and the community server"
-            echo "(\`messenger-server\`). You do **not** need these to use the desktop app."
+            echo "(\`p2pem-server\`). You do **not** need these to use the desktop app."
             echo
             echo "</details>"
             echo
@@ -216,3 +216,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
         shell: bash
+

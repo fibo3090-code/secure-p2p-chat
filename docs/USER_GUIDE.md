@@ -15,7 +15,7 @@ Download the latest asset from the [GitHub Releases](https://github.com/fibo3090
 - Windows: `P2PEM_<version>_x64-setup.exe` (NSIS) or `P2PEM_<version>_x64_en-US.msi`
 - macOS Apple silicon: `P2PEM_<version>_aarch64.dmg`
 - macOS Intel: `P2PEM_<version>_x64.dmg`
-- Linux: `p2pem_<version>_amd64.AppImage` (portable) or `p2pem_<version>_amd64.deb`
+- Linux: `P2PEM_<version>_amd64.AppImage` (portable) or `P2PEM_<version>_amd64.deb`
 
 **P2PEM Tools** — only if you are running a server or prefer a terminal:
 `P2PEM-Tools_<version>_<os>.tar.gz` (`.zip` on Windows) contains the terminal
@@ -522,3 +522,4 @@ The app also supports panic/crash logging to help support and debugging.
 - separate Intel and Apple Silicon DMGs are published
 - Bonjour is built in
 - Gatekeeper and local macOS trust prompts may still apply depending on how the app is distributed and opened
+

@@ -21,7 +21,7 @@ Download **P2PEM Desktop** from the [latest release](https://github.com/fibo3090
 - Windows: `P2PEM_<version>_x64-setup.exe`
 - macOS Apple silicon: `P2PEM_<version>_aarch64.dmg`
 - macOS Intel: `P2PEM_<version>_x64.dmg`
-- Linux: `p2pem_<version>_amd64.AppImage` or `.deb`
+- Linux: `P2PEM_<version>_amd64.AppImage` or `.deb`
 
 The `P2PEM-Tools_*` archive on the same page is for running a server or working
 from a terminal — you don't need it here.
@@ -225,4 +225,5 @@ Once the first session works, move on to:
 
 Prefer working in a terminal? The TUI is fully featured and drives the same core
 — see [USER_GUIDE.md](USER_GUIDE.md#tui-reference).
+
 
