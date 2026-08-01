@@ -93,7 +93,7 @@ pub(crate) async fn remove_contact(
     ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     state.manager.lock().await.remove_contact(uuid);
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -112,7 +112,7 @@ pub(crate) async fn block_contact(
         .await
         .block_contact(uuid)
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -131,7 +131,7 @@ pub(crate) async fn unblock_contact(
         .await
         .unblock_contact(uuid)
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 

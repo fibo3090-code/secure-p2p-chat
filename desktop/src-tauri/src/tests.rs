@@ -50,6 +50,7 @@ fn fresh_bridge(dir: &std::path::Path) -> Bridge {
         force_setup: StdMutex::new(true),
         pending_fp: Arc::new(StdMutex::new(None)),
         init_error: None,
+        saved_sig: Arc::new(StdMutex::new(None)),
     }
 }
 

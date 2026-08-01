@@ -199,7 +199,7 @@ pub(crate) async fn export_identity(
         let mut mgr = state.manager.lock().await;
         mgr.config.identity_backed_up_at = Some(chrono::Utc::now().to_rfc3339());
     }
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(Some(dest.display().to_string()))
 }
 
@@ -344,7 +344,7 @@ pub(crate) async fn update_settings(
         mgr.config.auto_connect = settings.auto_connect;
         mgr.config.enable_mdns = settings.enable_mdns;
     }
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -365,6 +365,6 @@ pub(crate) async fn pick_download_dir(
         let mut mgr = state.manager.lock().await;
         mgr.config.download_dir = dir.clone();
     }
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(Some(dir.display().to_string()))
 }

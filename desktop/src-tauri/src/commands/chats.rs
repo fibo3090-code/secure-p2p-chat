@@ -84,7 +84,7 @@ pub(crate) async fn mark_read(id: String, state: tauri::State<'_, Bridge>) -> Re
         let mut mgr = state.manager.lock().await;
         mgr.mark_chat_read(chat_id);
     }
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -212,7 +212,7 @@ pub(crate) async fn send_message(
         .await
         .send_message(uuid, text)
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -236,7 +236,7 @@ pub(crate) async fn send_file(id: String, state: tauri::State<'_, Bridge>) -> Re
         .send_file(uuid, path)
         .await
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -254,7 +254,7 @@ pub(crate) async fn accept_transfer(
         .await
         .accept_incoming_file(uuid)
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -426,7 +426,7 @@ pub(crate) async fn rename_chat(
         .await
         .rename_chat(uuid, title)
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }
 
@@ -435,6 +435,6 @@ pub(crate) async fn delete_chat(id: String, state: tauri::State<'_, Bridge>) -> 
     ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     state.manager.lock().await.delete_chat(uuid);
-    persist_history(&state.manager, &state.history_path).await;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
 }

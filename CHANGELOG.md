@@ -64,11 +64,15 @@ predate tagged releases.
 
 - **The release page tells you what to download.** The workflow composes a body
   with a per-OS table before any artifact uploads.
-- The encrypted history is serialized compactly instead of pretty-printed. The
-  indentation was never read by anyone (the bytes are encrypted immediately) but
-  was paid for on every rewrite. The whole file is still re-encrypted whenever
-  the conversation surface changes — that cost is inherent to the current format
-  and is now documented as a known limit rather than left implicit.
+- **History writes are halved.** Every mutating command saved immediately, then
+  the poll loop saw a signature it had not recorded and wrote the identical
+  bytes again — two full, fsynced, O(total-history) rewrites per user action.
+  The save marker is now shared between them. On top of that the encrypted
+  history is serialized compactly instead of pretty-printed; the indentation was
+  never read by anyone (the bytes are encrypted immediately) but was paid for on
+  every rewrite. The whole file is still re-encrypted whenever the conversation
+  surface changes — that cost is inherent to the current format and is now
+  documented as a known limit rather than left implicit.
 - **Password floor raised to 12 characters**, enforced in `Identity::encrypt` so
   no front-end can set a weaker one — the screen used to coach "12+" while
   accepting four. `decrypt` is deliberately unaffected, so existing identities
