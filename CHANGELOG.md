@@ -11,6 +11,10 @@ predate tagged releases.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.15.0] - 2026-08-01
+
 > **Breaking, and the point of the release: P2PEM ships one desktop app.**
 > The egui GUI is gone. Releases now lead with P2PEM Desktop (Tauri + React)
 > installers and a clearly-secondary tools archive, instead of two similar-looking
@@ -981,7 +985,8 @@ predate tagged releases.
 - Basic chat functionality, end-to-end encryption (RSA + AES-GCM), file
   transfer, a simple GUI, and message history persistence.
 
-[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.14.0...HEAD
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.15.0...HEAD
+[1.15.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.1...v1.13.0
 [1.12.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.0...v1.12.1

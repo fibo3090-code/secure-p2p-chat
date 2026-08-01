@@ -573,9 +573,9 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   crate with P2P, Party, Relay, Contacts, and Settings at parity; egui deleted
   (E) and the release pipeline rebuilt around it (F), so there is one desktop
   app. Full plan and stack notes in §10. Remaining: the TUI 3-pane redesign (G).
-  A `2.0.0` tag is warranted for the packaging change (owner authorizes it) —
-  the shipped desktop artifact changes name and installer, so existing
-  installations of the retired GUI will not upgrade in place.
+  Shipped in **1.15.0**. The owner chose a minor bump; note that the shipped
+  desktop artifact changed name and installer, so existing installations of the
+  retired GUI do not upgrade in place and have to be replaced manually.
 - **Phase 2 — Drive / files. ◐ slice 1 done + desktop client wiring.** Inline
   (≤4 MiB) content-addressed file sharing in channels & DMs with hash dedup +
   reference counting and on-disk blobs landed (see §8), and the **desktop app can

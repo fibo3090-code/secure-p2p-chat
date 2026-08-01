@@ -21,10 +21,11 @@ Download the latest asset from the [GitHub Releases](https://github.com/fibo3090
 `P2PEM-Tools_<version>_<os>.tar.gz` (`.zip` on Windows) contains the terminal
 client `p2pem` (which also runs a relay) and the community server `p2pem-server`.
 
-Releases before 2.0 also shipped a second desktop GUI under
-`P2PEM-Classic_*`. That app has been retired; install P2PEM Desktop instead. It
-uses a different data directory, so it starts with a fresh identity — export
-your old one first if you want to keep it.
+Releases before 1.15.0 also shipped a second desktop GUI under
+`P2PEM-Classic_*`. That app has been retired; install P2PEM Desktop instead.
+It does **not** upgrade the old one in place, and it uses a different data
+directory, so it starts with a fresh identity — export your old identity from
+the classic app first if you want to keep it, then uninstall it.
 
 ### Build from source
 

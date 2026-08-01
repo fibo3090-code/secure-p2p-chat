@@ -1,6 +1,6 @@
 # P2PEM — Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.14.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.15.0-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE.md)
 [![Security](https://img.shields.io/badge/security-self--assessed-yellow)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
