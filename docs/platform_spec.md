@@ -41,23 +41,27 @@ Guiding decisions:
 
 ## 2. Current State
 
-An accurate audit of what exists today (verified against the codebase).
+An accurate audit of what exists today (last verified against the codebase at
+**1.15.0**, 2026-08-03).
 
 ### P2P — mature
 
 Protocol v3 handshake (X25519 ECDH → HKDF-SHA256 → AES-256-GCM), TOFU fingerprint
-verification, forward secrecy, replay protection, rekeying, 1:1 text + file
-transfer up to 10 GiB, typing indicators, encrypted local history, and signed
-invite links. "Group chat" today is only client-side fan-out over multiple 1:1
-sessions — there is no server-backed group.
+verification with a transcript-bound SAS, forward secrecy, replay protection,
+automatic rekeying, 1:1 text (chunked past 48 KiB, hard-capped at 64 KiB) + file
+transfer up to 10 GiB with an acceptance gate and either-side cancellation,
+delivery receipts (`Ack`), typing indicators, encrypted local history with a
+persisted read mark, opt-in mDNS LAN peer discovery, and signed invite links
+(multi-address, 30-day expiry). "Group chat" today is only client-side fan-out
+over multiple 1:1 sessions — there is no server-backed group.
 
 ### Independent P2P hardening — done
 
 An optional **connection password** (verified inside the established v3 tunnel,
 after identity verification and before TOFU, with a constant-time compare) and a
 **conversation lock** (the host refuses new connections) ship today. Both are
-reachable from the GUI (Host/Connect dialogs + a lock toggle) and the TUI
-(`:connection-password`, `:lock`).
+reachable from the desktop app (the Host/Connect panes + a lock toggle) and the
+TUI (`:connection-password`, `:lock`).
 
 ### Relay — stateless 1:1 rendezvous with hole punching
 
@@ -79,8 +83,10 @@ In short: `core::party` defines the application protocol; `messenger-server` run
 real TCP listener with a persistent owner-only identity, applies requests to an
 in-memory `PartyState`, fans out live broadcasts across connections, serves
 channels and server-routed DMs with offline history catch-up, and persists state
-to an embedded SQLite database. A client can join, chat in channels, DM, and create
-channels via TUI commands and a GUI Party window.
+to an embedded SQLite database (with file bytes in a content-addressed blob store
+on disk). A client can join, chat in channels, DM, create channels, and — from the
+desktop app — share and download files, via the desktop **Communities** tab or TUI
+commands.
 
 ### Current UI — one desktop app (Tauri/React) plus a ratatui TUI
 
@@ -138,6 +144,12 @@ One app, one identity, a left **tab rail** (Discord-like):
 Identity/keys/local vault fold into **settings** rather than being a headline tab.
 Advanced surfaces sit behind an "advanced" affordance.
 
+As shipped, the desktop rail reads **Chats · Communities · Relays · Contacts ·
+Settings** — "Party" survived only as the protocol/code name (`core::party`,
+`party_*` commands), and Contacts earned a rail slot of its own. This document
+keeps saying "Party" for the protocol and server; the user-facing word is
+"Communities".
+
 ---
 
 ## 4. Architecture
@@ -151,7 +163,7 @@ core/             crypto, protocol/wire types, framing, identity, transport, sha
 client/           app core (ChatManager, PartyManager, persistence, diagnostics) + the
                   ratatui TUI. No GUI toolkit: the desktop app links this as a library.
 server/           the Party server: TCP listener, PartyState, dispatcher, broadcast hub,
-                  persistent identity, SQLite store.
+                  persistent identity, SQLite store, content-addressed blob store.
 desktop/src-tauri the Tauri 2 shell (p2pem-desktop): #[tauri::command] bridge + event
                   pump over client's managers, wrapping the React/Vite UI in desktop/src/.
 ```
@@ -234,7 +246,8 @@ and server, riding on top of the v3 encrypted tunnel.
 - **`core::party`** — the application protocol: `TrustTier`, `Envelope`,
   `MessagePayload`, `MemberInfo`, `ChannelInfo`, `ChannelKind`; the
   `PartyRequest` / `PartyResponse` enums (Join, ListMembers, ListChannels,
-  PostMessage, FetchHistory, SendDm, FetchDmHistory, CreateChannel); a
+  PostMessage, FetchHistory, SendDm, FetchDmHistory, CreateChannel, and the
+  Phase 2 file trio PostFile, SendFileDm, DownloadFile); a
   deterministic `dm_thread_id(a, b)` (SHA-256 of the sorted member ids); framed
   send/recv over the tunnel (`send_framed`/`recv_framed`); and a `PartyClient`
   with a split reader/writer. All bincode-serialized with round-trip tests.
@@ -261,8 +274,10 @@ and server, riding on top of the v3 encrypted tunnel.
   (per-connection read/write task, directory/channel/history tracking, optimistic
   post, DM send/fetch, channel creation, error surfacing); TUI commands
   (`:party-connect`, `:party-post`, `:party-dm`, `:party-create-channel`,
-  `:party-status`); and a GUI Party window (`gui::party_view`) with join form,
-  server selector, channel + member lists, DM/channel views, and a post box.
+  `:party-status`); and the desktop **Communities** surface
+  (`desktop/src/components/Parties.jsx` over the `party_*` bridge commands) with
+  join form, server selector, channel + member lists, DM/channel views, a post
+  box, and fingerprint pinning per saved community.
 
 ### Server data model (MVP)
 
@@ -270,22 +285,27 @@ In memory (authoritative at runtime), mirrored row-by-row to SQLite:
 
 ```text
 PartyState { name, password: Option<String>, tier, members, channels, dm_threads,
-             db: Option<Connection> }
+             blobs, max_blob_bytes, db: Option<Connection>, blob_dir: Option<PathBuf> }
 Member  { id, username, fingerprint: Option<String>, online }
 Channel { id, name, kind, messages: Vec<Envelope> }   # messages = durable history
 ```
 
 SQLite tables: `members`, `channels` (with a `position` column for stable
-ordering), `messages`, `dm_threads`, `dm_messages` (envelopes stored as JSON).
+ordering), `messages`, `dm_threads`, `dm_messages` (envelopes stored as JSON),
+and `blobs` (`hash, size, mime, refcount`; the bytes themselves live under
+`<data_dir>/blobs/<hash>`).
 
 ### What remains
 
-- The filesystem **blob store** for files (Phase 2) — the SQLite metadata store is
-  now in place (see §9).
-- A dedicated **TUI Party pane** (beyond command output) and **server-identity
-  TOFU** confirmation UI in the GUI.
+- A dedicated **TUI Party pane** (beyond command output) and Party **file**
+  commands in the TUI — today only the desktop app can upload/download.
+- **First-join server-identity TOFU confirmation UI.** The desktop app pins the
+  server fingerprint on first join and hard-fails a later mismatch with an
+  explanation, but the first join itself is silent — there is no "is this the
+  right server?" prompt like the P2P SAS flow.
 - Roles/permissions, governance/audit, lock/password gating per channel (Phase 3);
-  files (Phase 2); the E2EE tier (Phase 4).
+  the rest of files — chunked transfer, per-user quotas, the Drive panel (Phase 2);
+  the E2EE tier (Phase 4).
 
 ---
 
@@ -298,13 +318,18 @@ history; `PartyRequest::PostFile` / `SendFileDm` upload bytes inline (bounded by
 text message; `DownloadFile { hash }` returns the bytes. The server stores each
 blob once, keyed by SHA-256, reference-counted, with the bytes on disk under
 `<data_dir>/blobs/<hash>` and metadata (`hash, size, mime, refcount`) in the
-`blobs` SQLite table. **Client wiring (done):** the desktop app can now share a
+`blobs` SQLite table. Downloads are access-checked
+(`PartyState::blob_bytes_for(member, hash)` — channel members or DM participants
+only), and total blob bytes are capped by an operator-adjustable server-wide
+ceiling (`MAX_TOTAL_BLOB_BYTES`, 1 GiB by default) as a stand-in until real
+quotas land. **Client wiring (done):** the desktop app can now share a
 file into a channel or DM (a paperclip in the composer → `PartyManager::send_file`
 / `send_file_dm`, size-checked against `MAX_INLINE_FILE_BYTES`) and download a
 received file (a file card → `PartyManager::request_download`, which correlates the
 async `FileData` response by content hash and saves via a native dialog).
-**Remaining:** chunked transfer for large files; the permission matrix, quotas,
-provenance, and the Drive UI panel below; the same wiring in egui/TUI.
+**Remaining:** chunked transfer for large files; the permission matrix,
+per-user/logical quotas, provenance, and the Drive UI panel below; delete UX;
+the same wiring in the TUI.
 
 Target data model — content-addressable, deduplicated storage:
 
@@ -332,9 +357,13 @@ Target data model — content-addressable, deduplicated storage:
 `PermissionMatrix`, `FileReference`, `Quota`, `Role`, `Policy`, `AuditLog`.
 
 **Server persistence:** embedded **SQLite** (`party.db`) for metadata under the
-operator's data dir, with a filesystem blob store still to come for files
-(Phase 2), chosen for zero-ops single-host hosting with room to swap later. The
-former interim JSON snapshot is imported once on first load, then superseded.
+operator's data dir, plus a content-addressed filesystem blob store
+(`<data_dir>/blobs/<hash>`) for file bytes — chosen for zero-ops single-host
+hosting with room to swap later. The former interim JSON snapshot is imported
+once on first load, then superseded. Of the objects listed above, `Blob`,
+`FileEntry` (as `MessagePayload::File`), and a coarse `Quota` (a server-wide
+byte ceiling) exist; `PermissionMatrix`, `FileReference`, `Role`, `Policy`, and
+`AuditLog` are still design-only.
 
 ---
 
@@ -373,8 +402,8 @@ a designed UI.
 - **Overlays only for genuinely interruptive flows**: fingerprint verification,
   password/unlock, consent-or-leave. Settings, Contacts, Connect, Host become
   inline pages.
-- **Party stops being a floating window** and becomes the Party tab, sharing the
-  same list+content layout as P2P. One mental model.
+- **Party stops being a floating window** and becomes the Communities tab, sharing
+  the same list+content layout as chats. One mental model.
 
 ### Stack (as shipped)
 
@@ -399,14 +428,15 @@ egui is deleted — so there is one desktop app, not two.
 
 ### The Rust↔web bridge
 
-The business logic is already view-agnostic — the existing TUI proves it by
-driving the same managers as the GUI. The rewrite keeps the managers in Rust and
+The business logic is already view-agnostic — the TUI proves it by driving the
+same managers as the desktop app. The rewrite keeps the managers in Rust and
 exposes them to the web UI:
 
 - **Commands** (`#[tauri::command]`): each manager method the UI calls becomes a
-  command (`connect`, `host`, `send_message`, `set_connection_password`,
-  `confirm_fingerprint`, `party_join`, `party_post`, `party_send_dm`,
-  `party_create_channel`, `party_fetch_history`, …).
+  command — as shipped, `start_host` / `connect_peer` (both taking the optional
+  connection password), `send_message`, `confirm_fingerprint`, `party_join`,
+  `party_post`, `party_send_dm`, `party_create_channel`, `party_history`, … all
+  registered through the shared `invoke_handler()` in `lib.rs`.
 - **Events** (`app_handle.emit`): the existing `SessionEvent` / party-event mpsc
   streams map almost 1:1 onto Tauri's event channel. A background task drains
   them and emits typed events the React frontend subscribes to (via `onBridge` in
@@ -551,7 +581,7 @@ Each phase gets its own detailed plan before code lands.
 Phase 0  Workspace refactor                         ✅ done
 Phase 1  Party Server MVP (Administered)            ✅ core + SQLite done · UI polish remains
 UI       Tauri + React desktop app (§10)            ✅ shipped (A–F) · TUI redesign (G) remains
-Phase 2  Drive / files                              ◐ slice 1 (inline file sharing) done
+Phase 2  Drive / files                              ◐ inline sharing + blob store + desktop wiring done
 Phase 3  Governance & roles
 Phase 4  E2EE server tier
 Phase 5  Per-server identities
@@ -565,10 +595,11 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
 - **Phase 1 — Party Server MVP (Administered). ✅ core complete.** Server binary,
   join-by-address (+ optional password) + username, member directory + presence,
   channels, server-routed group + DM messaging, offline buffering via history
-  catch-up, channel creation, the GUI Party window + TUI commands, server-identity
-  TOFU on the wire, and SQLite-backed durable state (`party.db`). **Remaining:**
-  the filesystem blob store for files (Phase 2); TUI Party pane; GUI
-  server-TOFU/error polish (see §7).
+  catch-up, channel creation, the desktop Communities surface + TUI commands,
+  server-identity TOFU on the wire (pinned per saved community in the desktop
+  app), and SQLite-backed durable state (`party.db`). **Remaining:** a TUI Party
+  pane and TUI file commands; a first-join server-TOFU confirmation UI and error
+  polish (see §7).
 - **UI rewrite — Tauri + React. ✅ shipped (A–F).** Landed as the `desktop/`
   crate with P2P, Party, Relay, Contacts, and Settings at parity; egui deleted
   (E) and the release pipeline rebuilt around it (F), so there is one desktop
@@ -578,10 +609,10 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   retired GUI do not upgrade in place and have to be replaced manually.
 - **Phase 2 — Drive / files. ◐ slice 1 done + desktop client wiring.** Inline
   (≤4 MiB) content-addressed file sharing in channels & DMs with hash dedup +
-  reference counting and on-disk blobs landed (see §8), and the **desktop app can
-  now upload and download** community files. Remaining: chunked transfer for large
-  files, delete UX, logical + physical quotas, the Drive panel, and egui/TUI
-  parity.
+  reference counting, access-checked downloads, and on-disk blobs landed (see
+  §8), and the **desktop app can now upload and download** community files.
+  Remaining: chunked transfer for large files, delete UX, per-user/logical quotas
+  (only a server-wide byte ceiling exists today), the Drive panel, and TUI parity.
 - **Phase 3 — Governance & roles.** Trust-tier labeling, transparency panel,
   consent-or-leave, audit log, roles/permissions, visibility & contact policies,
   channel lock/password.
@@ -603,9 +634,17 @@ update the canonical doc — `architecture.md`/`protocol.md` — in the same cha
 
 - Reduce UI-thread blocking and responsiveness issues (largely addressed by the
   §10 rewrite's push-based event model).
-- Tighten persistence, migration, and recovery behavior.
-- Improve diagnostics and failure visibility for users; better diagnostic export
-  for support/bug reporting.
+- Tighten persistence, migration, and recovery behavior. **Partly done in
+  1.15.0:** identity and history writes are atomic + `fsync`ed, an unreadable
+  identity is a hard explained error instead of a silent regeneration, a failed
+  plaintext-history migration no longer leaves messages in the clear, and the
+  desktop app offers a first-run identity backup. Still open: the
+  whole-file re-encrypt on every history change, and a real schema/migration
+  story for the history format.
+- Improve diagnostics and failure visibility for users. **Partly done:**
+  `export_diagnostics` writes a bundle from the desktop app, and the boot screen
+  reports startup failures with retry. Still open: making the bundle easy to
+  attach to a bug report, and TUI parity.
 
 **Security & privacy**
 
@@ -705,7 +744,7 @@ users skip. Incremental, independently shippable improvements:
 - **Short Authentication String (SAS) / verified-session flow. ✅** A
   transcript-bound SAS (six digits + three emoji, `derive_sas` in
   `core/src/core/crypto.rs`) rides the TOFU confirmation events and leads the
-  verification prompt in all three UIs, so users compare a short code instead
+  verification prompt in both UIs, so users compare a short code instead
   of 64 hex chars; an active MITM's two handshakes yield two different codes.
   Still open: promoting a compared SAS to a persisted "verified" trust state
   (the trust-state field already exists).
@@ -754,14 +793,14 @@ long-horizon gaps (see below), not scheduled.
 - Accessibility pass over interactions and color usage.
 - Settings IA cleanup / tabbed organization (folds into the §10 settings page).
 - Better contact management UX and trust-state workflows.
-- File-transfer **progress** shows in all three UIs, and **cancellation is
+- File-transfer **progress** shows in both UIs, and **cancellation is
   shipped ✅**: a `ProtocolMessage::FileCancel` wire frame (binary tag 12,
   replay-protected) lets either side abort. Sends now stream from a background
   task (so a multi-gigabyte send neither blocks the manager lock nor buffers
   eagerly) and stop mid-flight on cancel; the receiver discards its partial
   temp file. Both directions are tracked (`TransferDirection`) and cancellable
-  from the egui transfer bar, the TUI Transfers overlay (↑/↓ select, `c`
-  cancel), and the desktop transfer cards.
+  from the TUI Transfers overlay (↑/↓ select, `c` cancel) and the desktop
+  transfer cards.
 
 **Tracked long-horizon gaps** (intentionally not described as "done" anywhere):
 onion routing / anonymity layer, post-quantum migration, hardware-backed identity.
@@ -770,11 +809,14 @@ onion routing / anonymity layer, post-quantum migration, hardware-backed identit
 
 ## 13. Verification & Test Coverage
 
-The workspace passes **360 automated tests** (`cargo nextest run --workspace`) on
-Windows, plus **16 desktop-bridge tests** that CI runs on Linux and macOS
-(skipped on Windows, where a Rust test harness linking Tauri aborts at startup),
-and **29 frontend tests** (`cd desktop && npm test`) — spanning unit,
-integration, and end-to-end suites:
+The `core` + `client` + `server` crates pass **374 automated tests**
+(`cargo nextest run -p messenger-core -p p2pem-classic -p messenger-server`).
+`--workspace` adds the **16 desktop-bridge tests**, which CI runs on Linux and
+macOS only (skipped on Windows, where a Rust test harness linking Tauri aborts at
+startup, and unbuildable without the GTK/WebKit dev packages). The frontend adds
+**32 tests** (`cd desktop && npm test`). Together they span unit, integration,
+and end-to-end suites. Counts drift with every change; re-measure rather than
+trusting these numbers:
 
 - **Protocol** (`core/src/core/protocol.rs`): round-trip symmetry for every
   `ProtocolMessage` variant, edge values (empty/unicode/max-size), malformed and
@@ -791,6 +833,9 @@ integration, and end-to-end suites:
   in-memory `PartyState` (join/password/channels/history/DMs/persistence), the
   request dispatcher, and connection/broadcast end-to-end over the reused v3
   tunnel.
+- **Party files** (`server/src/state.rs`): content dedup, the storage ceiling,
+  filename sanitization against path traversal, download access control (channel
+  member vs DM participant), and blobs + file messages surviving a reload.
 - **Relay** (`core/tests/relay_e2e.rs` + in-file): hole-punched direct sessions
   and bridged fallback end-to-end (full handshake + message on both paths), the
   punch engine (loopback punch, token-mismatch rejection, candidate filtering),
@@ -802,8 +847,11 @@ integration, and end-to-end suites:
   round-trip, wrong-key rejection, corrupt-file handling, format auto-detection.
 - **ChatManager** (`client/tests/feature_coverage_tests.rs` + in-file): group
   chats, rename/delete, history clearing, toast lifecycle, file-transfer state,
-  typing indicators, contact import/association, invites (v1/v2/v3 + tamper
-  rejection), invite-QR generation.
+  typing indicators, contact import/association, invites (v1–v4 + expiry and
+  tamper rejection), invite-QR generation.
+- **Transfers & receipts** (`client/src/app/chat_manager`): the acceptance gate
+  (`AwaitingAcceptance` → accept/reject), either-direction cancellation, and a
+  sent message marked delivered by the peer's `Ack`.
 - **TUI**: command parsing, focus cycling, message round-trip, multi-chat
   isolation, typing flow.
 - **Unread & notifications** (`core/src/types.rs`, `client/src/app/chat_manager`):
@@ -830,8 +878,10 @@ Per-phase verification targets:
   and Party flows work end-to-end through the new UI; **no `egui`/`eframe`
   symbols remain anywhere in the workspace** (`cargo tree` is the check);
   `tauri build` produces installers on all three OSes via `tauri-action`.
-- **Later phases**: dedup/refcount/quota tests; governance consent-flow tests;
-  E2EE group-key rotation tests; render-no-panic tests for new UI.
+- **Phase 2**: dedup, the storage ceiling, and download access control are
+  covered (above); still to write — refcount-on-delete and per-user quota tests.
+- **Later phases**: governance consent-flow tests; E2EE group-key rotation tests;
+  render-no-panic tests for new UI.
 
 ---
 
