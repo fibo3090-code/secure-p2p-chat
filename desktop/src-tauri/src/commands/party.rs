@@ -139,53 +139,82 @@ fn message_dto(
     }
 }
 
-/// Connect to a community server, verify (TOFU) its fingerprint out of band, and
-/// join with a username. Returns the local server id.
+/// What `party_join` did. `status: "joined"` means the credentials went out and
+/// the join is in flight; `status: "verify"` means nothing was sent yet and the
+/// user has to confirm the server's identity first.
+#[derive(Serialize)]
+pub(crate) struct PartyJoinDto {
+    status: &'static str,
+    server: Option<String>,
+    fingerprint: String,
+    sas: Option<String>,
+}
+
+/// Connect to a community server and join with a username.
+///
+/// Two-step on purpose. The `Join` frame carries the community username *and
+/// password*, so it must not be written to a server whose identity the user has
+/// not accepted. If this address has a pin, it is compared before the frame goes
+/// out. If it has none — a first join — the connection is made far enough to
+/// learn the server's fingerprint and SAS, then dropped, and the UI is asked to
+/// show them. Calling again with `trust: true` completes it. Previously the
+/// first join handed the credentials to whatever key answered and pinned it
+/// afterwards, which is trust-on-first-use without the trust step.
 #[tauri::command]
 pub(crate) async fn party_join(
     address: String,
     username: String,
     password: String,
+    trust: Option<bool>,
     state: tauri::State<'_, Bridge>,
-) -> Result<String, String> {
+) -> Result<PartyJoinDto, String> {
     ensure_ready(&state)?;
     let address = address.trim().to_string();
     let username = username.trim().to_string();
     let pk = {
-        let id = state.identity.lock().unwrap();
+        let id = crate::lock_identity(&state.identity);
         id.private_key().map_err(|e| e.to_string())?
     };
     let password = Some(password).filter(|p| !p.trim().is_empty());
+
+    // TOFU pinning: if we've joined this address before, its identity must not
+    // have changed. Look the pin up BEFORE connecting and hand it down, so the
+    // comparison happens inside `connect_and_join` while the tunnel is up but
+    // before the `Join` frame carrying the username and password is written.
+    let saved = load_saved_parties(&state.parties_path)?;
+    let pinned = saved
+        .into_iter()
+        .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
+        .map(|p| p.fingerprint);
+
     let mut party = state.party.lock().await;
-    let sid = party
-        .connect_and_join(&address, &username, password, &pk)
+    let outcome = party
+        .connect_and_join(
+            &address,
+            &username,
+            password,
+            &pk,
+            pinned.as_deref(),
+            trust.unwrap_or(false),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
-    // TOFU pinning: if we've joined this address before, its identity must not
-    // have changed. A mismatch is either a redeployed server or an active MITM —
-    // refuse and tell the user, never silently trust the new key.
-    let fingerprint = party
-        .server(sid)
-        .map(|c| c.server_fingerprint.clone())
-        .unwrap_or_default();
-    let saved = load_saved_parties(&state.parties_path);
-    if let Some(pinned) = saved
-        .iter()
-        .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
-    {
-        if pinned.fingerprint != fingerprint {
-            party.remove_server(sid);
-            return Err(format!(
-                "SECURITY: this server's identity changed since you last joined \
-                 (expected {}…, got {}…). If the operator redeployed the server this \
-                 may be expected — leave the saved community and rejoin to trust the \
-                 new identity. Otherwise, do not proceed.",
-                &pinned.fingerprint[..16.min(pinned.fingerprint.len())],
-                &fingerprint[..16.min(fingerprint.len())]
-            ));
+    let (sid, fingerprint) = match outcome {
+        PartyJoinOutcome::NeedsVerification { fingerprint, sas } => {
+            return Ok(PartyJoinDto {
+                status: "verify",
+                server: None,
+                fingerprint,
+                sas: Some(sas),
+            });
         }
-    }
+        PartyJoinOutcome::Joining {
+            server_id,
+            fingerprint,
+        } => (server_id, fingerprint),
+    };
+
     // Rejoin replaces: drop any older entry for the same address (e.g. a
     // disconnected or join-rejected zombie) so the list never shows duplicates.
     let stale: Vec<Uuid> = party
@@ -203,16 +232,16 @@ pub(crate) async fn party_join(
     }
     drop(party);
 
-    upsert_saved_party(
-        &state.parties_path,
-        SavedParty {
-            address,
-            username,
-            name: String::new(),
-            fingerprint,
-        },
-    );
-    Ok(sid.to_string())
+    // The saved entry (and with it the pin) is written by the poll loop once the
+    // server actually accepts us. Saving here would pin a community the user
+    // never got into — a typo'd address or a wrong password would leave a
+    // permanent entry behind.
+    Ok(PartyJoinDto {
+        status: "joined",
+        server: Some(sid.to_string()),
+        fingerprint,
+        sas: None,
+    })
 }
 
 /// The joined community servers with their channels and member directories.
@@ -321,7 +350,7 @@ pub(crate) async fn party_dm_history(
     ensure_ready(&state)?;
     let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
     let peer = Uuid::parse_str(&peer).map_err(|e| e.to_string())?;
-    let party = state.party.lock().await;
+    let mut party = state.party.lock().await;
     let _ = party.fetch_dm_history(sid, peer);
     let conn = party
         .server(sid)
@@ -360,20 +389,50 @@ pub(crate) struct SavedParty {
     pub(crate) fingerprint: String,
 }
 
-/// Load the saved-communities list; missing or unreadable files are an empty list
-/// (never an error — this is convenience state, not critical data).
-fn load_saved_parties(path: &Path) -> Vec<SavedParty> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// Load the saved-communities list.
+///
+/// A missing file is an empty list — that is a first run. An *unreadable* one is
+/// an error, deliberately. This file holds the pinned fingerprint of every
+/// community the user has joined, and that pin is the only thing standing
+/// between them and a server that swapped its key. Swallowing a parse failure
+/// silently discarded every pin and turned the next join back into an
+/// unverified first contact, which is exactly the situation the pin exists to
+/// prevent — a corrupt file must stop the join, not quietly downgrade it.
+fn load_saved_parties(path: &Path) -> Result<Vec<SavedParty>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "Could not read your saved communities ({}): {e}. \
+                 Not joining, because the fingerprints that protect those \
+                 connections are stored there.",
+                path.display()
+            ))
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "Your saved communities file ({}) is damaged: {e}. \
+             It holds the fingerprints that protect those connections, so \
+             joining is refused until it is repaired or removed.",
+            path.display()
+        )
+    })
 }
 
-/// Best-effort save of the saved-communities list; errors are logged, not fatal.
+/// Save the saved-communities list.
+///
+/// Written through `write_file_atomic` — temp file, fsync, rename, 0600 from
+/// creation — for the same reason `identity.json` is: a half-written file after
+/// a crash is indistinguishable from a file with no pins in it.
 fn save_saved_parties(path: &Path, list: &[SavedParty]) {
     match serde_json::to_string_pretty(list) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
+            if let Err(e) = messenger_core::util::write_file_atomic(path, json.as_bytes()) {
                 tracing::warn!("saving communities list failed: {e}");
             }
         }
@@ -382,8 +441,17 @@ fn save_saved_parties(path: &Path, list: &[SavedParty]) {
 }
 
 /// Insert or update the entry for `address` (matched case-insensitively).
+///
+/// A load failure aborts the write: rewriting the file from an empty list would
+/// destroy every other community's pin.
 pub(crate) fn upsert_saved_party(path: &Path, entry: SavedParty) {
-    let mut list = load_saved_parties(path);
+    let mut list = match load_saved_parties(path) {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::error!("{e}");
+            return;
+        }
+    };
     match list
         .iter_mut()
         .find(|p| p.address.eq_ignore_ascii_case(&entry.address))
@@ -408,7 +476,7 @@ pub(crate) async fn party_saved(
     state: tauri::State<'_, Bridge>,
 ) -> Result<Vec<SavedParty>, String> {
     ensure_ready(&state)?;
-    Ok(load_saved_parties(&state.parties_path))
+    load_saved_parties(&state.parties_path)
 }
 
 /// Leave a community: drop the connection, forget its local state, and remove it
@@ -428,19 +496,28 @@ pub(crate) async fn party_leave(
     }
     drop(party);
     if let Some(addr) = address {
-        let mut list = load_saved_parties(&state.parties_path);
+        let mut list = load_saved_parties(&state.parties_path)?;
         list.retain(|p| !p.address.eq_ignore_ascii_case(&addr));
         save_saved_parties(&state.parties_path, &list);
     }
     Ok(())
 }
 
-/// Open the native file picker (on a blocking thread) and read the chosen file's
-/// bytes, returning `(name, mime, data)`. `Ok(None)` if the user cancelled.
-async fn pick_upload() -> Result<Option<(String, String, Vec<u8>)>, String> {
-    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_file())
-        .await
-        .map_err(|e| e.to_string())?;
+/// Open the native file picker (parented to the app window) and read the chosen
+/// file's bytes, returning `(name, mime, data)`. `Ok(None)` if the user
+/// cancelled.
+///
+/// A community upload is sent inline, so the whole file is held in memory by
+/// definition — which is exactly why the size is checked against
+/// [`messenger_core::party::MAX_INLINE_FILE_BYTES`] *before* reading rather than
+/// after. Reading first meant picking a 4 GB file allocated 4 GB only to be
+/// rejected. The read is async: the previous blocking `std::fs::read` ran on the
+/// async runtime and stalled every other task on that worker for its duration.
+async fn pick_upload<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+) -> Result<Option<(String, String, Vec<u8>)>, String> {
+    let picked =
+        crate::native_file_dialog(window, |d| d.set_title("Share a file").pick_file()).await?;
     let Some(path) = picked else {
         return Ok(None);
     };
@@ -449,22 +526,38 @@ async fn pick_upload() -> Result<Option<(String, String, Vec<u8>)>, String> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
     let mime = messenger_core::util::guess_mime(&path).to_string();
-    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let size = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("Could not read {}: {e}", path.display()))?
+        .len();
+    let cap = messenger_core::party::MAX_INLINE_FILE_BYTES as u64;
+    if size > cap {
+        return Err(format!(
+            "{} is {} — community files are limited to {}.",
+            name,
+            messenger_core::util::format_size(size),
+            messenger_core::util::format_size(cap)
+        ));
+    }
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
     Ok(Some((name, mime, data)))
 }
 
 /// Pick a file and post it to a community channel. The picker runs on a blocking
-/// thread; a cancelled dialog is a successful no-op.
+/// thread, parented to the app window; a cancelled dialog is a successful no-op.
 #[tauri::command]
-pub(crate) async fn party_send_file(
+pub(crate) async fn party_send_file<R: tauri::Runtime>(
     server: String,
     channel: String,
+    window: tauri::WebviewWindow<R>,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
     let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
-    let Some((name, mime, data)) = pick_upload().await? else {
+    let Some((name, mime, data)) = pick_upload(window).await? else {
         return Ok(());
     };
     state
@@ -477,15 +570,16 @@ pub(crate) async fn party_send_file(
 
 /// Pick a file and send it as a direct message to another community member.
 #[tauri::command]
-pub(crate) async fn party_send_file_dm(
+pub(crate) async fn party_send_file_dm<R: tauri::Runtime>(
     server: String,
     to: String,
+    window: tauri::WebviewWindow<R>,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
     let peer = Uuid::parse_str(&to).map_err(|e| e.to_string())?;
-    let Some((name, mime, data)) = pick_upload().await? else {
+    let Some((name, mime, data)) = pick_upload(window).await? else {
         return Ok(());
     };
     state
@@ -496,14 +590,21 @@ pub(crate) async fn party_send_file_dm(
         .map_err(|e| e.to_string())
 }
 
+/// How long to wait for a community server to deliver a requested file before
+/// giving up. Generous enough for a large blob on a slow link, short enough that
+/// a server which simply never answers produces an error instead of a click that
+/// does nothing forever.
+const PARTY_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Download a community file by content hash and save it via the native dialog.
 /// `name` seeds the save dialog. The server only returns bytes the caller is
 /// allowed to see (access-checked there). A cancelled save dialog is a no-op.
 #[tauri::command]
-pub(crate) async fn party_download_file(
+pub(crate) async fn party_download_file<R: tauri::Runtime>(
     server: String,
     hash: String,
     name: String,
+    window: tauri::WebviewWindow<R>,
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
@@ -516,22 +617,35 @@ pub(crate) async fn party_download_file(
         .await
         .request_download(sid, hash)
         .map_err(|e| e.to_string())?;
-    // Outer error: the sender was dropped (connection torn down). Inner error: the
-    // server refused (file gone / not permitted). Either way, surface a message
-    // rather than hang.
-    let data = match rx.await {
-        Ok(Ok(data)) => data,
-        Ok(Err(reason)) => return Err(reason),
-        Err(_) => return Err("download failed: the connection closed".to_string()),
+    // Bounded wait. A bare `rx.await` hangs forever if the server accepts the
+    // request and then never answers (or the response is lost): the click does
+    // nothing, with no error and no way to tell it apart from a slow link.
+    // Outer error: the sender was dropped (connection torn down). Inner error:
+    // the server refused (file gone / not permitted).
+    let data = match tokio::time::timeout(PARTY_DOWNLOAD_TIMEOUT, rx).await {
+        Ok(Ok(Ok(data))) => data,
+        Ok(Ok(Err(reason))) => return Err(reason),
+        Ok(Err(_)) => return Err("download failed: the connection closed".to_string()),
+        Err(_) => {
+            return Err(format!(
+                "download timed out after {}s — the community server did not send the file",
+                PARTY_DOWNLOAD_TIMEOUT.as_secs()
+            ))
+        }
     };
     let suggested = name;
-    let picked = tokio::task::spawn_blocking(move || {
-        rfd::FileDialog::new().set_file_name(suggested).save_file()
+    let picked = crate::native_file_dialog(window, move |d| {
+        d.set_title("Save file")
+            .set_file_name(suggested)
+            .save_file()
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     let Some(path) = picked else {
         return Ok(()); // user cancelled the save dialog
     };
-    std::fs::write(&path, &data).map_err(|e| e.to_string())
+    // Async: this runs on the shared runtime, and a blocking write of a
+    // multi-megabyte blob stalls every other task on that worker.
+    tokio::fs::write(&path, &data)
+        .await
+        .map_err(|e| e.to_string())
 }

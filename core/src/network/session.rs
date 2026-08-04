@@ -78,10 +78,24 @@ fn labeled_aad(label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
     aad
 }
 
-/// Run host session: listen, accept, handshake (v3), message loop
+/// Bind the host listener on `port` (all interfaces).
+///
+/// Separate from [`run_host_session`] on purpose: the caller must learn that a
+/// bind failed (port already in use) **before** it creates any chat or session
+/// state. When the bind lived inside the spawned session task its failure was
+/// only logged, and the app was left showing a "Host on :port" conversation
+/// that reported itself connected while nothing was listening at all.
+pub async fn bind_host_listener(port: u16) -> Result<TcpListener> {
+    TcpListener::bind(("0.0.0.0", port))
+        .await
+        .map_err(|e| anyhow!("Could not listen on port {}: {}", port, e))
+}
+
+/// Run host session on an already-bound listener: accept, handshake (v3),
+/// message loop. Use [`bind_host_listener`] to obtain the listener.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session(
-    port: u16,
+    listener: TcpListener,
     privkey: RsaPrivateKey,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
@@ -90,8 +104,8 @@ pub async fn run_host_session(
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()> {
-    // 1. Bind listener (bind to all interfaces for now, could be configurable)
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    // 1. Report the port we actually bound (the caller may have asked for 0).
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     tracing::info!("Host listening on port {}", port);
 
     to_app_tx
@@ -100,6 +114,13 @@ pub async fn run_host_session(
 
     // 2. Accept connection with rate limiting
     let (mut stream, peer_addr) = listener.accept().await?;
+
+    // Release the port the instant we have our peer. A session serves exactly
+    // one connection, so holding the listener for the whole conversation only
+    // ever did one thing: make the auto-rehost's bind fail with EADDRINUSE, so
+    // the app silently stopped accepting anyone after the first peer while
+    // still advertising the address as reachable.
+    drop(listener);
 
     // Check rate limit
     if is_rate_limited(peer_addr.ip()) {

@@ -1,11 +1,19 @@
 // Rename / delete / info dialogs for a conversation.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Modal, Button, Input } from "./ui.jsx";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
 
 export function RenameDialog({ target, onClose, onSubmit }) {
-  const [name, setName] = useState(target ? target.name : "");
+  const [name, setName] = useState("");
+  // This component is always mounted (App renders it with target=null when
+  // closed), so a `useState(target?.name)` initializer only ever ran once —
+  // while target was still null. The field opened empty, and on the second
+  // open it showed whatever was typed the previous time, for a different
+  // conversation. Sync on every open instead.
+  useEffect(() => {
+    if (target) setName(target.name || "");
+  }, [target && target.id, target && target.name]);
   if (!target) return null;
   return (
     <Modal open onClose={onClose} width={400} title="Rename conversation" icon="edit">

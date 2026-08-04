@@ -524,6 +524,7 @@ mod tests {
             recv_seq: 0,
             is_host_placeholder: false,
             read_count: 0,
+            title_is_custom: false,
         };
 
         let history = HistoryFile::new(vec![chat.clone()]);
@@ -568,6 +569,7 @@ mod tests {
                 recv_seq: 0,
                 is_host_placeholder: false,
                 read_count: 0,
+                title_is_custom: false,
             },
         );
 
@@ -667,6 +669,7 @@ mod tests {
                 recv_seq: 0,
                 is_host_placeholder: false,
                 read_count: 0,
+                title_is_custom: false,
             },
         );
 

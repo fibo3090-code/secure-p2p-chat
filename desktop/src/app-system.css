@@ -43,6 +43,26 @@ body{font-family:var(--font);font-size:var(--fs);color:var(--text);background:va
 #root{height:100vh}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
 input,textarea{font-family:inherit;color:inherit}
+
+/* ============ KEYBOARD FOCUS ============
+   One visible ring for everything focusable. The app had exactly one
+   :focus-visible rule, so a keyboard user tabbing through the conversation
+   list, the rail, dialog buttons or the composer had no idea where they were —
+   and `outline:none` on individual components made it worse. :focus-visible
+   (not :focus) means mouse clicks stay clean while keyboard navigation is
+   always visible. */
+:where(button, a[href], input, textarea, select, summary, [tabindex]):focus-visible{
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+  border-radius:var(--r-sm);
+}
+/* The scrim-level dialog container gets the ring on its inner controls, not on
+   itself — it is focused programmatically on open purely to anchor the tab trap. */
+.modal:focus-visible{outline:none}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;scroll-behavior:auto !important}
+}
 .mono,code{font-family:var(--mono)}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:9px;border:2px solid transparent;background-clip:padding-box}
@@ -388,6 +408,12 @@ input,textarea{font-family:inherit;color:inherit}
   padding:0;border:none;border-radius:5px;background:transparent;color:var(--faint);cursor:pointer}
 .transfer-cancel:hover{background:var(--s3,rgba(127,127,127,.15));color:var(--danger,#e5484d)}
 /* composer */
+/* Why the composer is disabled. Sits directly above it so the explanation and
+   the dead input are read as one thing. */
+.composer-notice{flex:none;display:flex;align-items:flex-start;gap:8px;padding:9px 18px;
+  background:color-mix(in oklab,var(--warning) 9%,var(--s1));border-top:1px solid var(--border);
+  color:var(--dim);font-size:12.5px;line-height:1.45}
+.composer-notice svg{flex:none;margin-top:2px;color:var(--warning)}
 .composer{flex:none;display:flex;align-items:flex-end;gap:9px;padding:13px 18px;background:var(--s1);
   border-top:1px solid var(--border)}
 .composer-clip{flex:none;display:grid;place-items:center;width:40px;height:40px;border-radius:var(--r-sm);color:var(--dim)}
@@ -396,8 +422,10 @@ input,textarea{font-family:inherit;color:inherit}
 .composer-input{flex:1;resize:none;background:var(--s2);border:1px solid var(--border);border-radius:var(--radius);
   padding:11px 14px;font-size:var(--fs);max-height:140px;outline:none;line-height:1.45}
 .composer-input:focus{border-color:transparent;box-shadow:0 0 0 1.5px var(--accent)}
+.composer-input:disabled{opacity:.55;cursor:not-allowed}
 .composer-send{flex:none;display:grid;place-items:center;width:40px;height:40px;border-radius:var(--r-sm);
   background:var(--s3);color:var(--faint);transition:.13s}
+.composer-send:disabled{opacity:.4;cursor:not-allowed}
 .composer-send.is-ready{background:var(--accent);color:var(--accent-ink)}
 .composer-send.is-ready:hover{filter:brightness(1.1)}
 

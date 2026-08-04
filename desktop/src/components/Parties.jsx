@@ -28,12 +28,20 @@ function JoinForm({ onJoined, onCancel, initial }) {
   const [saved, setSaved] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // A server whose identity has never been seen before. Nothing has been sent
+  // to it yet — not the username, not the password — until the user confirms
+  // the code below.
+  const [verify, setVerify] = useState(null);
 
   useEffect(() => {
-    api.partySaved().then((s) => setSaved(s || [])).catch(() => {});
+    // A failure here is not cosmetic: parties.json holds the pinned fingerprint
+    // of every community, and the bridge refuses to join when it cannot be read.
+    api.partySaved()
+      .then((s) => setSaved(s || []))
+      .catch((e) => { setSaved([]); setErr(String(e)); });
   }, []);
 
-  async function joinWith(addr, user, pass) {
+  async function joinWith(addr, user, pass, trust = false) {
     setErr("");
     if (!addr.trim()) return setErr("Enter the server address.");
     if (!user.trim()) return setErr("Choose a username.");
@@ -41,14 +49,50 @@ function JoinForm({ onJoined, onCancel, initial }) {
       return setErr(`Username must be ${MAX_USERNAME_CHARS} characters or fewer.`);
     setBusy(true);
     try {
-      await api.partyJoin(addr.trim(), user.trim(), pass);
-      toast(`Joining ${addr.trim()}…`, "success");
+      const res = await api.partyJoin(addr.trim(), user.trim(), pass, trust);
+      if (res?.status === "verify") {
+        setVerify({ address: addr.trim(), username: user.trim(), password: pass, ...res });
+        return;
+      }
+      toast(`Connecting to ${addr.trim()}…`, "success");
+      setVerify(null);
       onJoined && onJoined();
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(String(e)); setVerify(null); }
     finally { setBusy(false); }
   }
 
   const join = () => joinWith(address, username, password);
+
+  if (verify) {
+    return (
+      <div className="chat-pane chat-empty">
+        <div className="chat-empty-inner" style={{ maxWidth: 460 }}>
+          <span className="chat-empty-ic"><Icon name="lock" size={28} /></span>
+          <div className="chat-empty-h">Verify this community server</div>
+          <div className="chat-empty-p">
+            You have never joined <code>{verify.address}</code> before. Your username and
+            password have <strong>not</strong> been sent yet. Ask the operator to read out
+            their code and check it matches:
+          </div>
+          <div className="verify-sas">{verify.sas}</div>
+          <details className="party-verify-adv">
+            <summary>Advanced: full fingerprint</summary>
+            <code className="vf-fp-code">{verify.fingerprint}</code>
+          </details>
+          <div className="party-join">
+            <Button icon="check" disabled={busy} full
+              onClick={() => joinWith(verify.address, verify.username, verify.password, true)}>
+              The code matches — join
+            </Button>
+            <Button variant="ghost" full disabled={busy}
+              onClick={() => { setVerify(null); setBusy(false); }}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="chat-pane chat-empty">
@@ -57,15 +101,20 @@ function JoinForm({ onJoined, onCancel, initial }) {
         <div className="chat-empty-h">Join a community</div>
         <div className="chat-empty-p">
           Communities are administered, multi-channel rooms that keep history, served by the
-          <code> messenger-server</code> crate. Verify the server's fingerprint out of band after joining.
+          <code> messenger-server</code> crate. The first time you join one you will be asked to
+          check its code with the operator before anything is sent.
         </div>
         {saved.length > 0 && (
           <div className="party-saved">
             <div className="party-saved-h">Your communities</div>
             {saved.map((p) => (
+              // Selecting a saved community fills the form; it does not join.
+              // Joining straight from the card sent whatever happened to be in
+              // the shared password box — so a password typed for one
+              // community went to whichever card was clicked next.
               <button key={p.address} className="party-saved-card" disabled={busy}
-                title={`Rejoin as ${p.username}`}
-                onClick={() => { setAddress(p.address); setUsername(p.username); joinWith(p.address, p.username, password); }}>
+                title={`Fill in ${p.username}@${p.address}`}
+                onClick={() => { setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); }}>
                 <Avatar name={p.name || p.address} size={28} party />
                 <span className="party-saved-txt">
                   <span className="party-saved-name">{p.name || p.address}</span>
@@ -75,7 +124,8 @@ function JoinForm({ onJoined, onCancel, initial }) {
               </button>
             ))}
             <div className="party-saved-hint">
-              Joining a password-protected community? Type the password below first, then click it.
+              Pick one to fill the form below, then add its password if it has one and press
+              Connect &amp; join.
             </div>
           </div>
         )}
@@ -103,7 +153,7 @@ function fmtBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function MessageRow({ m, onDownload }) {
+function MessageRow({ m, onDownload, downloading }) {
   const mine = m.from_me;
   const isFile = m.kind === "file";
   return (
@@ -111,12 +161,16 @@ function MessageRow({ m, onDownload }) {
       <div className="msg-bubble">
         {!mine && <span className="msg-author">{m.sender_name}</span>}
         {isFile ? (
-          <button className="msg-file" title={`Download ${m.text}`}
-            onClick={() => onDownload(m)} disabled={!m.hash}>
+          // A download is a round trip to the community server, so the click
+          // must visibly do something — without this the button looked inert
+          // and invited repeat clicks that each queued another request.
+          <button className="msg-file"
+            title={downloading ? "Downloading…" : `Download ${m.text}`}
+            onClick={() => onDownload(m)} disabled={!m.hash || downloading}>
             <Icon name="file" size={14} />
             <span className="msg-file-name">{m.text}</span>
             {m.size != null && <span className="msg-file-size">{fmtBytes(m.size)}</span>}
-            <Icon name="download" size={14} />
+            <Icon name={downloading ? "clock" : "download"} size={14} />
           </button>
         ) : (
           <span className="msg-text">{m.text}</span>
@@ -140,6 +194,7 @@ export function Parties() {
   const [confirmLeave, setConfirmLeave] = useState(false); // two-click leave confirmation
   const [unread, setUnread] = useState({});          // thread key -> unread count
   const [shown, setShown] = useState(150);           // message window (see Messages.jsx)
+  const [downloading, setDownloading] = useState({}); // content hash -> in-flight download
   const scrollRef = useRef(null);
   useEffect(() => setShown(150), [sid, cid, dm]);
 
@@ -231,10 +286,21 @@ export function Parties() {
   }
 
   // Download a file message's bytes and save them via the native dialog.
+  // Tracked per content hash so the card shows it is working: the request can
+  // take as long as the server takes to answer, and a click with no feedback
+  // is indistinguishable from a broken button.
   async function downloadFile(m) {
-    if (!server || !m.hash) return;
+    if (!server || !m.hash || downloading[m.hash]) return;
+    setDownloading((d) => ({ ...d, [m.hash]: true }));
     try { await api.partyDownloadFile(server.id, m.hash, m.text); }
     catch (e) { toast(String(e), "error"); }
+    finally {
+      setDownloading((d) => {
+        const next = { ...d };
+        delete next[m.hash];
+        return next;
+      });
+    }
   }
 
   async function createChannel() {
@@ -258,6 +324,8 @@ export function Parties() {
   // locally. The server keeps the membership, so rejoining later resumes it.
   async function leave() {
     if (!server) return;
+    // The first click arms it; the label switches to spell out that the pinned
+    // fingerprint goes with it.
     if (!confirmLeave) { setConfirmLeave(true); return; }
     setConfirmLeave(false);
     try {
@@ -277,9 +345,13 @@ export function Parties() {
     setAdding(true);
   }
 
-  // Remove a dead entry without rejoining.
+  // Remove a dead entry without rejoining. Two-click like `leave`: this also
+  // discards the community's pinned fingerprint, so rejoining afterwards is an
+  // unverified first contact again.
   async function removeServer() {
     if (!server) return;
+    if (!confirmLeave) { setConfirmLeave(true); return; }
+    setConfirmLeave(false);
     try {
       await api.partyLeave(server.id);
       setDm(null); setCid(null);
@@ -366,7 +438,9 @@ export function Parties() {
               <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
             </div>
             <button className={cx("party-leave", confirmLeave && "is-confirm")}
-              title={confirmLeave ? "Click again to confirm leaving" : "Leave this community"}
+              title={confirmLeave
+                ? "Click again to leave. This also forgets the server's verified fingerprint, so rejoining means checking its code again."
+                : "Leave this community"}
               onClick={leave} onBlur={() => setConfirmLeave(false)}>
               <Icon name="x" size={14} /> {confirmLeave ? "Leave?" : "Leave"}
             </button>
@@ -401,7 +475,10 @@ export function Parties() {
                 Show earlier messages ({msgs.length - shown} more)
               </button>
             )}
-            {msgs.slice(-shown).map((m, i) => <MessageRow key={i} m={m} onDownload={downloadFile} />)}
+            {msgs.slice(-shown).map((m, i) => (
+              <MessageRow key={i} m={m} onDownload={downloadFile}
+                downloading={!!(m.hash && downloading[m.hash])} />
+            ))}
           </div>
         </div>
 

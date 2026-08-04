@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use messenger_core::party::{
     blob_hash, ChannelInfo, ChannelKind, Envelope, FileMeta, MemberInfo, MessagePayload, TrustTier,
-    MAX_INLINE_FILE_BYTES,
+    MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
@@ -42,6 +42,10 @@ const BLOB_DIR: &str = "blobs";
 /// bounding memory/disk growth from uploads. A safety cap until the Phase 3 quota
 /// system lands; operators can adjust it via [`PartyState::set_max_blob_bytes`].
 const MAX_TOTAL_BLOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Most channels one server will hold. Channel creation is open to every joined
+/// member and there is no admin role, so this is the only thing standing between
+/// a bored member and unbounded server state.
+const MAX_CHANNELS: usize = 128;
 /// Filename of the legacy JSON snapshot, imported once into SQLite if present.
 const LEGACY_SNAPSHOT_FILE: &str = "party_state.json";
 
@@ -75,6 +79,29 @@ impl JoinError {
             JoinError::EmptyUsername => "username must not be empty",
             JoinError::UsernameTooLong => "username is too long (max 32 characters)",
         }
+    }
+}
+
+/// Compare a join attempt's password against the server's in constant time.
+///
+/// `Option<&str> != Option<&str>` short-circuits on the first differing byte, so
+/// how long the comparison takes leaks how much of the password was right. A
+/// remote attacker can measure that across many attempts and recover the secret
+/// a character at a time — which is exactly what a join endpoint invites.
+///
+/// The length itself is not secret (it is visible from the response timing of
+/// any implementation), so an early length check is fine; the *content* compare
+/// is the part that must not branch.
+fn password_matches(expected: Option<&str>, supplied: Option<&str>) -> bool {
+    use subtle::ConstantTimeEq;
+    match (expected, supplied) {
+        (None, None) => true,
+        (Some(expected), Some(supplied)) => {
+            expected.len() == supplied.len()
+                && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+        }
+        // An open server handed a password, or a protected one handed none.
+        _ => false,
     }
 }
 
@@ -118,7 +145,11 @@ struct DmThread {
 struct BlobRecord {
     size: u64,
     mime: String,
-    data: Vec<u8>,
+    /// The bytes, held in memory **only** when there is no blob directory to
+    /// read them back from (the in-memory `PartyState::new` mode used by tests).
+    /// A disk-backed server keeps `None` here and reads on demand: otherwise the
+    /// 1 GiB storage ceiling is also a 1 GiB resident-memory cost.
+    data: Option<Vec<u8>>,
     refcount: u32,
 }
 
@@ -281,7 +312,7 @@ impl PartyState {
         if username.chars().count() > MAX_USERNAME_CHARS {
             return Err(JoinError::UsernameTooLong);
         }
-        if self.password.as_deref() != password {
+        if !password_matches(self.password.as_deref(), password) {
             return Err(JoinError::WrongPassword);
         }
 
@@ -378,6 +409,15 @@ impl PartyState {
         {
             return Err("a channel with that name already exists".to_string());
         }
+        // Any joined member may create a channel and there is no admin role, so
+        // without a ceiling one member can mint channels without bound — each
+        // one held in memory, persisted, and broadcast as a refreshed channel
+        // list to every other connection.
+        if self.channels.len() >= MAX_CHANNELS {
+            return Err(format!(
+                "this server already has the maximum of {MAX_CHANNELS} channels"
+            ));
+        }
         let position = self.channels.len();
         let channel = Channel {
             id: Uuid::new_v4(),
@@ -403,6 +443,44 @@ impl PartyState {
         self.channels.iter().find(|c| c.id == id)
     }
 
+    /// Whether a member may *read* `channel` (its history, and the files it
+    /// references).
+    ///
+    /// [`ChannelKind`] was stored, persisted, shipped to clients, and enforced
+    /// nowhere: `Private` channels were readable by every joined member, and
+    /// posting to a `Locked` or `Announce` channel worked. There is no
+    /// per-channel membership list to consult yet, so the honest behaviour is to
+    /// fail **closed** — a kind whose access rule cannot be evaluated denies
+    /// rather than allows. `create_channel` only ever makes `Public` channels,
+    /// so this changes nothing today; it means the type stops promising an
+    /// access control it does not have, and the first per-channel ACL cannot
+    /// ship silently open.
+    fn member_can_read_channel(&self, channel: Uuid) -> bool {
+        match self.channel(channel).map(|c| c.kind) {
+            Some(ChannelKind::Public) | Some(ChannelKind::Locked) | Some(ChannelKind::Announce) => {
+                true
+            }
+            // No membership model exists for these yet: deny.
+            Some(ChannelKind::Private) => false,
+            None => false,
+        }
+    }
+
+    /// Whether a member may *post* to `channel`. `Locked` and `Announce`
+    /// channels are readable but not writable by ordinary members, and there is
+    /// no administrator role yet, so nobody may post to them.
+    fn member_can_post_to_channel(&self, channel: Uuid) -> Result<(), String> {
+        match self.channel(channel).map(|c| c.kind) {
+            Some(ChannelKind::Public) => Ok(()),
+            Some(ChannelKind::Locked) => Err("this channel is locked".to_string()),
+            Some(ChannelKind::Announce) => {
+                Err("only announcements may be posted to this channel".to_string())
+            }
+            Some(ChannelKind::Private) => Err("you are not a member of this channel".to_string()),
+            None => Err("unknown channel".to_string()),
+        }
+    }
+
     /// Append a text message from `sender` to `channel`, assigning the next
     /// per-channel sequence number. The message is stored durably (offline
     /// buffering) and the assigned envelope is returned for broadcast.
@@ -418,6 +496,7 @@ impl PartyState {
             return Err("sender is not a member of this server".to_string());
         }
         validate_message_text(&text)?;
+        self.member_can_post_to_channel(channel)?;
         let tier = self.tier;
         let chan = self
             .channel_mut(channel)
@@ -436,14 +515,29 @@ impl PartyState {
         Ok(envelope)
     }
 
-    /// Channel history strictly after `since_seq` (offline catch-up).
-    /// `since_seq = 0` returns the entire channel. Unknown channels yield `[]`.
-    pub fn history_since(&self, channel: Uuid, since_seq: u64) -> Vec<Envelope> {
+    /// Channel history strictly after `since_seq` (offline catch-up), capped at
+    /// [`MAX_HISTORY_BATCH`] envelopes per call so the reply always fits in one
+    /// frame. The caller asks again with the last `seq` it received to page
+    /// through the rest.
+    ///
+    /// Returning a whole channel at once meant that once its history exceeded
+    /// `MAX_PACKET_SIZE` the response could not be sent at all: the send failed,
+    /// the connection dropped, and the community became unjoinable with nothing
+    /// on screen to explain it.
+    ///
+    /// Channels the member may not read (see [`Self::member_can_read_channel`])
+    /// yield `[]` — the same as an unknown channel, so the reply does not reveal
+    /// that the channel exists.
+    pub fn history_since(&self, member: Uuid, channel: Uuid, since_seq: u64) -> Vec<Envelope> {
+        if !self.is_member(member) || !self.member_can_read_channel(channel) {
+            return Vec::new();
+        }
         match self.channel(channel) {
             Some(c) => c
                 .messages
                 .iter()
                 .filter(|m| m.seq > since_seq)
+                .take(MAX_HISTORY_BATCH)
                 .cloned()
                 .collect(),
             None => Vec::new(),
@@ -485,13 +579,15 @@ impl PartyState {
         Ok(envelope)
     }
 
-    /// Direct-message history for a thread strictly after `since_seq`.
+    /// Direct-message history for a thread strictly after `since_seq`, paged the
+    /// same way as [`Self::history_since`] and for the same reason.
     pub fn dm_history(&self, thread_id: Uuid, since_seq: u64) -> Vec<Envelope> {
         match self.dm_threads.get(&thread_id) {
             Some(t) => t
                 .messages
                 .iter()
                 .filter(|m| m.seq > since_seq)
+                .take(MAX_HISTORY_BATCH)
                 .cloned()
                 .collect(),
             None => Vec::new(),
@@ -521,12 +617,19 @@ impl PartyState {
             }
             self.write_blob_file(&hash, &data);
             self.persist_blob_row(&hash, size, mime, 1);
+            // Only keep the bytes resident when there is nowhere to read them
+            // back from; a disk-backed store reads on demand.
+            let resident = if self.blob_dir.is_some() {
+                None
+            } else {
+                Some(data)
+            };
             self.blobs.insert(
                 hash.clone(),
                 BlobRecord {
                     size,
                     mime: mime.to_string(),
-                    data,
+                    data: resident,
                     refcount: 1,
                 },
             );
@@ -571,9 +674,7 @@ impl PartyState {
         if !self.is_member(sender) {
             return Err("sender is not a member of this server".to_string());
         }
-        if self.channel(channel).is_none() {
-            return Err("unknown channel".to_string());
-        }
+        self.member_can_post_to_channel(channel)?;
         let data = Self::check_inline_size(data)?;
         let tier = self.tier;
         let meta = self.store_blob(&name, &mime, data)?;
@@ -637,23 +738,42 @@ impl PartyState {
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.
+    ///
+    /// When the store is disk-backed the bytes are read on demand rather than
+    /// kept resident: holding every blob in memory made the storage ceiling
+    /// (1 GiB by default) a *memory* ceiling too, which is how a small VPS gets
+    /// OOM-killed by a community that is merely using the feature.
     pub fn blob_bytes(&self, hash: &str) -> Option<Vec<u8>> {
-        self.blobs.get(hash).map(|r| r.data.clone())
+        let record = self.blobs.get(hash)?;
+        if let Some(resident) = &record.data {
+            return Some(resident.clone());
+        }
+        let dir = self.blob_dir.as_ref()?;
+        match std::fs::read(dir.join(hash)) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::error!(hash, error = %e, "blob is recorded but its file could not be read");
+                None
+            }
+        }
     }
 
     /// Whether `member` may download the blob `hash`. A file is accessible only if
-    /// it is referenced by a message in a public channel (every member can read
-    /// those) or in a DM thread the member is a party to. Without this, any joined
-    /// member who learned a content hash could fetch a file shared privately in a
-    /// DM between two *other* members — content-addressed storage is shared, but
-    /// the download endpoint must still enforce who can see what.
+    /// it is referenced by a message in a channel the member may **read** or in a
+    /// DM thread the member is a party to. Without this, any joined member who
+    /// learned a content hash could fetch a file shared privately in a DM between
+    /// two *other* members — content-addressed storage is shared, but the
+    /// download endpoint must still enforce who can see what.
     fn member_can_access_blob(&self, member: Uuid, hash: &str) -> bool {
         let references =
             |env: &Envelope| matches!(&env.payload, MessagePayload::File(f) if f.hash == hash);
-        // Public channels are readable by every member.
+        // Channels the member is allowed to read. This used to scan *every*
+        // channel while claiming to check only public ones, so a file posted in
+        // a non-public channel was downloadable by anyone who knew its hash.
         if self
             .channels
             .iter()
+            .filter(|c| self.member_can_read_channel(c.id))
             .any(|c| c.messages.iter().any(references))
         {
             return true;
@@ -821,22 +941,22 @@ impl PartyState {
                 .as_ref()
                 .expect("reload_from_db requires a blob directory");
             for (hash, size, mime, refcount) in raw {
-                match std::fs::read(blob_dir.join(&hash)) {
-                    Ok(data) => {
-                        blobs.insert(
-                            hash,
-                            BlobRecord {
-                                size: size as u64,
-                                mime,
-                                data,
-                                refcount: refcount as u32,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, hash = %hash, "blob bytes missing on disk; skipping")
-                    }
+                // Presence check only: the bytes are read on demand by
+                // `blob_bytes`, so a restart no longer pulls the entire blob
+                // store into memory.
+                if !blob_dir.join(&hash).is_file() {
+                    tracing::error!(hash = %hash, "blob bytes missing on disk; skipping");
+                    continue;
                 }
+                blobs.insert(
+                    hash,
+                    BlobRecord {
+                        size: size as u64,
+                        mime,
+                        data: None,
+                        refcount: refcount as u32,
+                    },
+                );
             }
         }
 
@@ -1034,6 +1154,36 @@ mod tests {
         assert!(members[0].online);
     }
 
+    /// The comparison must accept exactly the right password and nothing else —
+    /// including the cases the `Option` equality it replaced got right, so
+    /// switching to a constant-time compare changed only the timing.
+    #[test]
+    fn password_matches_covers_every_combination() {
+        assert!(
+            password_matches(None, None),
+            "open server, no password given"
+        );
+        assert!(
+            !password_matches(None, Some("anything")),
+            "an open server must not accept a password as if it were configured"
+        );
+        assert!(
+            !password_matches(Some("s3cret"), None),
+            "a protected server must not accept a missing password"
+        );
+        assert!(password_matches(Some("s3cret"), Some("s3cret")));
+        assert!(!password_matches(Some("s3cret"), Some("s3crey")));
+        assert!(
+            !password_matches(Some("s3cret"), Some("s3cre")),
+            "a correct prefix is not a match"
+        );
+        assert!(
+            !password_matches(Some("s3cret"), Some("s3cretx")),
+            "a correct prefix plus extra is not a match"
+        );
+        assert!(password_matches(Some(""), Some("")));
+    }
+
     #[test]
     fn password_protected_join_enforced() {
         let mut state = PartyState::new("Locked", Some("s3cret".to_string()));
@@ -1141,7 +1291,7 @@ mod tests {
             "an oversized DM must be rejected"
         );
         // Nothing oversized was persisted to the channel.
-        assert!(state.history_since(chan, 0).is_empty());
+        assert!(state.history_since(alice, chan, 0).is_empty());
 
         // A message exactly at the cap is still accepted.
         let at_cap = "y".repeat(MAX_MESSAGE_TEXT_BYTES);
@@ -1227,16 +1377,16 @@ mod tests {
         }
 
         // Whole channel.
-        assert_eq!(state.history_since(chan, 0).len(), 5);
+        assert_eq!(state.history_since(alice, chan, 0).len(), 5);
         // A member who last saw seq=3 gets only 4 and 5.
-        let missed = state.history_since(chan, 3);
+        let missed = state.history_since(alice, chan, 3);
         assert_eq!(missed.len(), 2);
         assert_eq!(missed[0].seq, 4);
         assert_eq!(missed[1].seq, 5);
         // Caught up: nothing new.
-        assert!(state.history_since(chan, 5).is_empty());
+        assert!(state.history_since(alice, chan, 5).is_empty());
         // Unknown channel.
-        assert!(state.history_since(Uuid::new_v4(), 0).is_empty());
+        assert!(state.history_since(alice, Uuid::new_v4(), 0).is_empty());
     }
 
     #[test]
@@ -1272,7 +1422,8 @@ mod tests {
         assert!(!members[0].online, "presence must reset to offline on load");
         // Channel identity + history survived.
         assert_eq!(reloaded.default_channel(), channel);
-        let history = reloaded.history_since(channel, 0);
+        let member = reloaded.members()[0].id;
+        let history = reloaded.history_since(member, channel, 0);
         assert_eq!(history.len(), 1);
         assert_eq!(
             history[0].payload,
@@ -1365,7 +1516,8 @@ mod tests {
         assert_eq!(channels[0].id, general);
         assert_eq!(channels[1].id, random_id);
         // History of the created channel survived.
-        let history = s.history_since(random_id, 0);
+        let member = s.members()[0].id;
+        let history = s.history_since(member, random_id, 0);
         assert_eq!(history.len(), 1);
         assert_eq!(
             history[0].payload,
@@ -1414,7 +1566,8 @@ mod tests {
         assert_eq!(state.members().len(), 1);
         assert_eq!(state.members()[0].username, "legacy_user");
         assert_eq!(state.default_channel(), channel_id);
-        let history = state.history_since(channel_id, 0);
+        let member = state.members()[0].id;
+        let history = state.history_since(member, channel_id, 0);
         assert_eq!(history.len(), 1);
         assert_eq!(
             history[0].payload,
@@ -1430,7 +1583,8 @@ mod tests {
         drop(state);
         let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
         assert_eq!(reloaded.members().len(), 1);
-        assert_eq!(reloaded.history_since(channel_id, 0).len(), 1);
+        let member = reloaded.members()[0].id;
+        assert_eq!(reloaded.history_since(member, channel_id, 0).len(), 1);
     }
 
     fn file_payload(env: &Envelope) -> &FileMeta {
@@ -1463,7 +1617,7 @@ mod tests {
 
         // The bytes are retrievable by hash, and the message is in channel history.
         assert_eq!(state.blob_bytes(&meta.hash), Some(b"hello".to_vec()));
-        assert_eq!(state.history_since(chan, 0).len(), 1);
+        assert_eq!(state.history_since(alice, chan, 0).len(), 1);
     }
 
     #[test]
@@ -1495,7 +1649,7 @@ mod tests {
         assert_eq!(file_payload(&a).hash, file_payload(&b).hash);
         assert_eq!(state.blobs.len(), 1);
         assert_eq!(state.blobs[&file_payload(&a).hash].refcount, 2);
-        assert_eq!(state.history_since(chan, 0).len(), 2);
+        assert_eq!(state.history_since(alice, chan, 0).len(), 2);
     }
 
     #[test]
@@ -1519,7 +1673,7 @@ mod tests {
             .is_err());
         // Nothing was stored.
         assert!(state.blobs.is_empty());
-        assert!(state.history_since(chan, 0).is_empty());
+        assert!(state.history_since(alice, chan, 0).is_empty());
     }
 
     #[test]
@@ -1606,7 +1760,7 @@ mod tests {
         assert!(err.contains("storage"), "error should say why: {err}");
         assert_eq!(state.blobs.len(), 1, "the rejected blob must not be stored");
         assert_eq!(
-            state.history_since(chan, 0).len(),
+            state.history_since(alice, chan, 0).len(),
             1,
             "no message is posted for a rejected upload"
         );
@@ -1706,9 +1860,182 @@ mod tests {
         let s = PartyState::load("Srv", None, dir.path()).unwrap();
         // The blob bytes and the file message both survived.
         assert_eq!(s.blob_bytes(&hash), Some(b"durable".to_vec()));
-        let history = s.history_since(chan, 0);
+        let member = s.members()[0].id;
+        let history = s.history_since(member, chan, 0);
         assert_eq!(history.len(), 1);
         assert_eq!(file_payload(&history[0]).name, "doc.txt");
         assert_eq!(s.blobs[&hash].refcount, 1);
+    }
+
+    /// A disk-backed server must not hold every blob's bytes in memory: the
+    /// storage ceiling would double as a resident-memory ceiling.
+    #[test]
+    fn disk_backed_blobs_are_not_held_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = s.join("alice", None, None).unwrap();
+        let chan = s.default_channel();
+        let env = s
+            .post_file(
+                alice,
+                chan,
+                "doc.txt".into(),
+                "text/plain".into(),
+                b"durable".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        assert!(
+            s.blobs[&hash].data.is_none(),
+            "a disk-backed blob must not keep its bytes resident"
+        );
+        // …and is still served correctly, read back from disk on demand.
+        assert_eq!(s.blob_bytes(&hash), Some(b"durable".to_vec()));
+    }
+
+    /// `ChannelKind` was stored, shipped to clients, and enforced nowhere.
+    /// Anything that is not `Public` now fails closed until a real per-channel
+    /// membership model exists.
+    #[test]
+    fn non_public_channels_are_enforced_rather_than_decorative() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let public = state.default_channel();
+
+        for (kind, label) in [
+            (ChannelKind::Private, "private"),
+            (ChannelKind::Locked, "locked"),
+            (ChannelKind::Announce, "announce"),
+        ] {
+            let id = Uuid::new_v4();
+            state.channels.push(Channel {
+                id,
+                name: label.to_string(),
+                kind,
+                messages: Vec::new(),
+            });
+            assert!(
+                state.post_message(alice, id, "hi".to_string()).is_err(),
+                "{label}: an ordinary member must not be able to post"
+            );
+            assert!(
+                state
+                    .post_file(alice, id, "f".into(), "text/plain".into(), b"x".to_vec())
+                    .is_err(),
+                "{label}: an ordinary member must not be able to upload"
+            );
+        }
+
+        // Private channels are not readable either, and say nothing about
+        // whether they exist.
+        let private = state
+            .channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Private)
+            .unwrap()
+            .id;
+        assert!(state.history_since(alice, private, 0).is_empty());
+        // The public channel is unaffected.
+        assert!(state.post_message(alice, public, "hi".to_string()).is_ok());
+        assert_eq!(state.history_since(alice, public, 0).len(), 1);
+    }
+
+    /// A file posted in a channel the member cannot read must not be reachable
+    /// by content hash either — the download endpoint is where access is
+    /// enforced, because blob storage is shared across the whole server.
+    #[test]
+    fn blobs_in_unreadable_channels_are_not_downloadable() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+        let env = state
+            .post_file(
+                alice,
+                chan,
+                "secret.txt".into(),
+                "text/plain".into(),
+                b"classified".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+        assert!(state.blob_bytes_for(alice, &hash).is_some());
+
+        // Flip the channel to Private: the same member can no longer reach it.
+        state.channel_mut(chan).unwrap().kind = ChannelKind::Private;
+        assert!(
+            state.blob_bytes_for(alice, &hash).is_none(),
+            "a file in an unreadable channel must not be downloadable by hash"
+        );
+    }
+
+    /// A whole channel in one frame stopped fitting once history grew past
+    /// `MAX_PACKET_SIZE`, and the send failure dropped the connection. History
+    /// is paged instead.
+    #[test]
+    fn history_is_paged_so_a_reply_always_fits_in_one_frame() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+        for i in 0..(MAX_HISTORY_BATCH + 25) {
+            state.post_message(alice, chan, format!("m{i}")).unwrap();
+        }
+
+        let first = state.history_since(alice, chan, 0);
+        assert_eq!(first.len(), MAX_HISTORY_BATCH, "the batch is capped");
+        assert_eq!(first[0].seq, 1);
+
+        // Paging with the last seq seen returns the remainder.
+        let last_seq = first.last().unwrap().seq;
+        let second = state.history_since(alice, chan, last_seq);
+        assert_eq!(second.len(), 25);
+        assert_eq!(second[0].seq, last_seq + 1);
+
+        // And the page after the end is empty, which is how a client stops.
+        let done = state.history_since(alice, chan, second.last().unwrap().seq);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn dm_history_is_paged_too() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        for i in 0..(MAX_HISTORY_BATCH + 5) {
+            state.post_dm(alice, bob, format!("m{i}")).unwrap();
+        }
+        let thread = messenger_core::party::dm_thread_id(alice, bob);
+        assert_eq!(state.dm_history(thread, 0).len(), MAX_HISTORY_BATCH);
+        assert_eq!(state.dm_history(thread, MAX_HISTORY_BATCH as u64).len(), 5);
+    }
+
+    /// Channel creation is open to every member with no admin role, so the cap
+    /// is the only thing bounding server state.
+    #[test]
+    fn channel_creation_is_capped() {
+        let mut state = PartyState::new("Open", None);
+        // `general` already exists.
+        for i in 1..MAX_CHANNELS {
+            state
+                .create_channel(&format!("chan{i}"))
+                .unwrap_or_else(|e| panic!("channel {i} should be allowed: {e}"));
+        }
+        let err = state
+            .create_channel("one-too-many")
+            .expect_err("past the cap");
+        assert!(err.contains("maximum"), "error should say why: {err}");
+        assert_eq!(state.channels.len(), MAX_CHANNELS);
+    }
+
+    /// A non-member must not be able to read history by guessing a channel id.
+    #[test]
+    fn history_requires_membership() {
+        let mut state = PartyState::new("Open", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let chan = state.default_channel();
+        state.post_message(alice, chan, "hi".to_string()).unwrap();
+
+        let stranger = Uuid::new_v4();
+        assert!(state.history_since(stranger, chan, 0).is_empty());
     }
 }

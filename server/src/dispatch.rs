@@ -37,6 +37,16 @@ impl Dispatch {
     }
 }
 
+/// How many rejected `Join` attempts a single connection may make before it is
+/// refused outright.
+///
+/// Password guessing is the attack this bounds. Without a limit one TCP
+/// connection can carry an unlimited stream of `Join` frames, so an attacker
+/// pays for one RSA handshake and then guesses as fast as the link allows. With
+/// it they must redo the full v3 handshake every three guesses — and the accept
+/// loop's per-IP limiter bounds how often they may do *that*.
+pub const MAX_JOIN_ATTEMPTS: u32 = 3;
+
 /// Per-connection session state. A connection must `Join` before any other
 /// request is honoured; once joined it carries the member's id. `peer_fingerprint`
 /// is the identity verified during the v3 handshake, bound to the member on join.
@@ -44,6 +54,8 @@ impl Dispatch {
 pub struct ConnState {
     member: Option<Uuid>,
     peer_fingerprint: Option<String>,
+    /// Rejected join attempts on this connection (see [`MAX_JOIN_ATTEMPTS`]).
+    join_failures: u32,
 }
 
 impl ConnState {
@@ -52,6 +64,7 @@ impl ConnState {
         Self {
             member: None,
             peer_fingerprint: Some(fingerprint),
+            join_failures: 0,
         }
     }
 
@@ -72,6 +85,15 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     "already joined on this connection".to_string(),
                 ));
             }
+            // Rate limit: a connection gets a small number of rejected attempts
+            // and is then done. Otherwise one handshake buys unlimited password
+            // guesses down the same socket.
+            if conn.join_failures >= MAX_JOIN_ATTEMPTS {
+                return Dispatch::reply(PartyResponse::JoinRejected {
+                    reason: "too many failed attempts on this connection — reconnect to try again"
+                        .to_string(),
+                });
+            }
             match state.join(
                 &username,
                 password.as_deref(),
@@ -85,9 +107,12 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         tier: state.tier(),
                     })
                 }
-                Err(e) => Dispatch::reply(PartyResponse::JoinRejected {
-                    reason: e.reason().to_string(),
-                }),
+                Err(e) => {
+                    conn.join_failures = conn.join_failures.saturating_add(1);
+                    Dispatch::reply(PartyResponse::JoinRejected {
+                        reason: e.reason().to_string(),
+                    })
+                }
             }
         }
 
@@ -115,11 +140,16 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                             broadcast: vec![PartyResponse::Message(env)],
                             directed: Vec::new(),
                         },
-                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                        // `ActionFailed`, not `Error`: the client already put
+                        // this message on screen and must be able to tell that
+                        // *this* send was refused so it can take it back.
+                        Err(e) => {
+                            Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e })
+                        }
                     }
                 }
                 PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
-                    PartyResponse::History(state.history_since(channel, since_seq)),
+                    PartyResponse::History(state.history_since(member, channel, since_seq)),
                 ),
                 PartyRequest::CreateChannel { name } => match state.create_channel(&name) {
                     // Refresh everyone's channel list (reply to creator + broadcast).
@@ -140,7 +170,10 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         broadcast: Vec::new(),
                         directed: vec![(to, PartyResponse::Message(env))],
                     },
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
+                        channel: messenger_core::party::dm_thread_id(member, to),
+                        reason: e,
+                    }),
                 },
                 PartyRequest::FetchDmHistory { with, since_seq } => {
                     let thread = messenger_core::party::dm_thread_id(member, with);
@@ -161,7 +194,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         broadcast: vec![PartyResponse::Message(env)],
                         directed: Vec::new(),
                     },
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    Err(e) => Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e }),
                 },
                 PartyRequest::SendFileDm {
                     to,
@@ -178,7 +211,10 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         broadcast: Vec::new(),
                         directed: vec![(to, PartyResponse::Message(env))],
                     },
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
+                        channel: messenger_core::party::dm_thread_id(member, to),
+                        reason: e,
+                    }),
                 },
                 PartyRequest::DownloadFile { hash } => match state.blob_bytes_for(member, &hash) {
                     Some(data) => Dispatch::reply(PartyResponse::FileData { hash, data }),
@@ -229,6 +265,41 @@ mod tests {
             }
             other => panic!("expected Joined, got {other:?}"),
         }
+    }
+
+    /// One handshake must not buy unlimited password guesses: after a few
+    /// rejections the connection is finished, forcing an attacker back through
+    /// the RSA handshake (and the accept loop's per-IP limiter).
+    #[test]
+    fn repeated_wrong_passwords_exhaust_the_connection() {
+        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut conn = ConnState::default();
+        for _ in 0..MAX_JOIN_ATTEMPTS {
+            let resp = join(&mut state, &mut conn, "alice", Some("nope"));
+            assert!(matches!(resp[..], [PartyResponse::JoinRejected { .. }]));
+        }
+        // Past the cap the correct password is refused too — the connection
+        // itself is spent, which is what makes reconnecting the only way on.
+        let resp = join(&mut state, &mut conn, "alice", Some("pw"));
+        match &resp[..] {
+            [PartyResponse::JoinRejected { reason }] => {
+                assert!(reason.contains("too many failed attempts"), "got: {reason}");
+            }
+            other => panic!("expected a rate-limited rejection, got {other:?}"),
+        }
+        assert_eq!(conn.member(), None);
+    }
+
+    /// The cap counts *failures*, so an honest user who mistypes once and then
+    /// gets it right is not punished.
+    #[test]
+    fn a_successful_join_is_unaffected_by_an_earlier_mistake() {
+        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut conn = ConnState::default();
+        join(&mut state, &mut conn, "alice", Some("nope"));
+        let resp = join(&mut state, &mut conn, "alice", Some("pw"));
+        assert!(matches!(resp[..], [PartyResponse::Joined { .. }]));
+        assert!(conn.member().is_some());
     }
 
     #[test]

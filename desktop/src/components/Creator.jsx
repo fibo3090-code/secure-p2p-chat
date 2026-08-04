@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Modal, Button, Input, PasswordInput } from "./ui.jsx";
 import { api } from "../lib/bridge.js";
+import { parsePort } from "../lib/parse.js";
 import { toast } from "../lib/toast.js";
 
 const MODES = [
@@ -14,12 +15,24 @@ const MODES = [
 
 function CopyLine({ value }) {
   const [done, setDone] = useState(false);
+  // writeText returns a promise, so a sync try/catch never sees a rejection and
+  // "Copied ✓" appeared even when nothing reached the clipboard — the user then
+  // pastes stale content into a chat and wonders why their peer can't connect.
+  async function copy() {
+    if (!value) return;
+    try {
+      await navigator.clipboard?.writeText(value);
+      setDone(true);
+      setTimeout(() => setDone(false), 1200);
+    } catch {
+      toast("Could not copy — select the text and copy it manually.", "error");
+    }
+  }
   return (
     <div className="copy-line">
       <code>{value || "…"}</code>
-      <button className="icon-btn" title="Copy" onClick={() => {
-        try { navigator.clipboard.writeText(value); setDone(true); setTimeout(() => setDone(false), 1200); } catch { /* */ }
-      }}><Icon name={done ? "check" : "copy"} size={15} /></button>
+      <button className="icon-btn" title={done ? "Copied" : "Copy"} aria-label={done ? "Copied" : "Copy"}
+        onClick={copy}><Icon name={done ? "check" : "copy"} size={15} /></button>
     </div>
   );
 }
@@ -28,6 +41,8 @@ const TRANSPORTS = [
   { id: "direct", icon: "plug", label: "Direct" },
   { id: "relay", icon: "satellite", label: "Via relay" },
 ];
+
+const DEFAULT_PORT = 12345;
 
 export function Creator({ open, onClose, initialMode }) {
   const [mode, setMode] = useState(initialMode || "connect");
@@ -52,6 +67,23 @@ export function Creator({ open, onClose, initialMode }) {
   useEffect(() => {
     if (open && initialMode) setMode(initialMode);
   }, [open, initialMode]);
+
+  // Clear per-attempt state when the dialog closes. This component stays
+  // mounted, so everything typed for one peer survived into the next open: a
+  // connection password meant for host A was then silently sent to host B, and
+  // a stale error sat above a fresh, unrelated form. Addresses and tokens are
+  // cleared for the same reason — they belong to the attempt, not to the app.
+  useEffect(() => {
+    if (open) return;
+    setPassword("");
+    setErr("");
+    setNote("");
+    setAddr("");
+    setRelayToken("");
+    setHostToken("");
+    setImportLink("");
+    setHostAddr(null);
+  }, [open]);
 
   useEffect(() => {
     if (open && mode === "invite" && !myLink) {
@@ -103,14 +135,22 @@ export function Creator({ open, onClose, initialMode }) {
     if (!raw) return setErr("Enter a peer address.");
     const i = raw.lastIndexOf(":");
     const h = i > -1 ? raw.slice(0, i) : raw;
-    const p = i > -1 ? parseInt(raw.slice(i + 1), 10) || 12345 : 12345;
+    // A typo'd port used to fall back to 12345 silently, so the app dialled a
+    // different machine's port than the one on screen and reported a plain
+    // "connection refused". Say what is wrong instead of guessing.
+    let p = DEFAULT_PORT;
+    if (i > -1) {
+      p = parsePort(raw.slice(i + 1));
+      if (p === null) return setErr(`"${raw.slice(i + 1)}" is not a valid port (1–65535).`);
+    }
     await run(async () => {
       try { await api.connectPeer(h, p, password.trim()); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(String(e)); }
     });
   }
   async function host() {
     reset();
-    const p = parseInt(port, 10) || 12345;
+    const p = parsePort(port);
+    if (p === null) return setErr(`"${port.trim()}" is not a valid port (1–65535).`);
     await run(async () => {
       try {
         await api.startHost(p, password.trim());

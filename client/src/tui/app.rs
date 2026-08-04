@@ -8,7 +8,16 @@
 //! autosave, auto-rehost, unread/typing bookkeeping).
 
 use crate::app::chat_manager::ChatManager;
-use crate::app::party_manager::PartyManager;
+use crate::app::party_manager::{PartyJoinOutcome, PartyManager};
+
+/// A community join held at the verification step: the address and credentials
+/// the user typed, kept locally until they confirm the server's identity. They
+/// are not on the wire — that is the whole point of holding them.
+struct PendingPartyJoin {
+    address: String,
+    username: String,
+    password: Option<String>,
+}
 use crate::identity::Identity;
 use crate::logbuf::LogBuffer;
 use crate::tui::command::{
@@ -59,6 +68,10 @@ pub struct TuiApp {
     pub party_manager: PartyManager,
     /// The server most recently joined, used as the target for `:party-post`.
     current_party: Option<Uuid>,
+    /// A community server whose identity the user has been shown but not yet
+    /// accepted. Its credentials are held here — deliberately not sent — until
+    /// `:party-trust` confirms the fingerprint.
+    pending_party_join: Option<PendingPartyJoin>,
     pub chat_list_state: ListState,
     pub chat_ids: Vec<Uuid>,
     pub input_field: EditableField,
@@ -121,6 +134,9 @@ impl TuiApp {
             (PathBuf::from("history.json.enc"), identity, true)
         };
         let identity_path = history_path.with_file_name("identity.json");
+        // So the manager can recognise this device's own invite link and refuse
+        // to add the user to their own contacts.
+        chat_manager.set_my_fingerprint(identity.fingerprint.clone());
 
         if !identity.is_locked() {
             if let Ok(key) = identity.history_key() {
@@ -135,6 +151,7 @@ impl TuiApp {
             chat_manager,
             party_manager: PartyManager::new(),
             current_party: None,
+            pending_party_join: None,
             chat_list_state: ListState::default(),
             chat_ids: Vec::new(),
             input_field: EditableField::new(true),
@@ -308,9 +325,13 @@ impl TuiApp {
         self.poll_party_downloads();
         self.chat_manager.cleanup_expired_toasts();
 
-        // Surface a pending fingerprint verification as an overlay.
+        // Surface the oldest pending fingerprint verification as an overlay.
+        // Peeked, not taken: the prompt stays queued until the user answers it
+        // (`confirm_fingerprint` removes it), so closing the overlay or a redraw
+        // can't quietly discard a verification a peer is still blocked on. Any
+        // further peers waiting behind it get their turn on a later tick.
         if !self.overlay.is_open() {
-            if let Some(pending) = self.chat_manager.fingerprint_verification_request.take() {
+            if let Some(pending) = self.chat_manager.pending_fingerprint().cloned() {
                 self.overlay = TuiOverlay::FingerprintVerify {
                     fingerprint: pending.fingerprint,
                     peer_name: pending.peer_name,
@@ -387,9 +408,11 @@ impl TuiApp {
     }
 
     fn auto_rehost(&mut self) {
-        if !self.chat_manager.config.auto_host_on_startup {
-            return;
-        }
+        // Deliberately NOT gated on `auto_host_on_startup`: that setting decides
+        // whether hosting begins at launch, not whether hosting the user asked
+        // for survives its first peer. `check_rehost_needed()` already requires
+        // `is_hosting` and an unlocked conversation, so `:stophost` and the lock
+        // remain the way to stop.
         if !self.chat_manager.check_rehost_needed() {
             return;
         }
@@ -404,7 +427,13 @@ impl TuiApp {
             return;
         }
         self.last_rehost = Some(Instant::now());
-        let port = self.chat_manager.config.listen_port;
+        // Rebind the port actually in use, not the settings default — the user
+        // may have hosted on another one, and rehosting elsewhere silently
+        // invalidates the address they already shared.
+        let port = self
+            .chat_manager
+            .hosting_port
+            .unwrap_or(self.chat_manager.config.listen_port);
         self.pending_command = Some(TuiCommand::Host(Some(port)));
         tracing::info!(port, "Auto-rehost scheduled");
     }
@@ -1116,7 +1145,10 @@ impl TuiApp {
             TuiCommand::Import(link) => match self.chat_manager.parse_invite_link(&link) {
                 Ok(contact) => {
                     let name = contact.name.clone();
-                    self.chat_manager.import_contact(contact);
+                    if let Err(e) = self.chat_manager.import_contact(contact) {
+                        self.toast(ToastLevel::Error, e.to_string());
+                        return;
+                    }
                     self.sync_contact_ids();
                     self.toast(
                         ToastLevel::Success,
@@ -1154,10 +1186,17 @@ impl TuiApp {
                 };
                 match self
                     .party_manager
-                    .connect_and_join(&address, &username, password, &privkey)
+                    // No pin: the TUI has no saved-communities file (that is a
+                    // desktop feature), so it shows the server fingerprint for
+                    // the user to check by eye instead of comparing it to a
+                    // stored one. Passing None is honest about that; it must
+                    // never be a placeholder fingerprint that would "match".
+                    // `false` stops before the credentials are sent so the user
+                    // can compare the code first.
+                    .connect_and_join(&address, &username, password.clone(), &privkey, None, false)
                     .await
                 {
-                    Ok(server_id) => {
+                    Ok(PartyJoinOutcome::Joining { server_id, .. }) => {
                         self.current_party = Some(server_id);
                         let fp = self
                             .party_manager
@@ -1170,6 +1209,60 @@ impl TuiApp {
                             format!("Joining Party {address} as {username} (server fp {short}…)"),
                         );
                     }
+                    Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas }) => {
+                        let short = &fingerprint[..fingerprint.len().min(16)];
+                        self.toast(
+                            ToastLevel::Warning,
+                            format!(
+                                "Verify {address} before joining — code {sas} (fp {short}…). \
+                                 Compare it with the operator, then run :party-trust. \
+                                 Nothing has been sent yet."
+                            ),
+                        );
+                        self.pending_party_join = Some(PendingPartyJoin {
+                            address,
+                            username,
+                            password,
+                        });
+                    }
+                    Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
+                }
+            }
+            TuiCommand::PartyTrust => {
+                if !self.require_unlocked() {
+                    return;
+                }
+                let Some(pending) = self.pending_party_join.take() else {
+                    self.toast(
+                        ToastLevel::Error,
+                        "No community server is waiting to be verified.".to_string(),
+                    );
+                    return;
+                };
+                let Some(privkey) = self.private_key() else {
+                    return;
+                };
+                match self
+                    .party_manager
+                    .connect_and_join(
+                        &pending.address,
+                        &pending.username,
+                        pending.password,
+                        &privkey,
+                        None,
+                        true,
+                    )
+                    .await
+                {
+                    Ok(PartyJoinOutcome::Joining { server_id, .. }) => {
+                        self.current_party = Some(server_id);
+                        self.toast(
+                            ToastLevel::Info,
+                            format!("Joining Party {} as {}", pending.address, pending.username),
+                        );
+                    }
+                    // `trust_new_identity: true` cannot ask again.
+                    Ok(PartyJoinOutcome::NeedsVerification { .. }) => unreachable!(),
                     Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
                 }
             }

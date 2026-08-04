@@ -42,6 +42,11 @@ pub struct SessionHandle {
     pub file_tx: mpsc::Sender<ProtocolMessage>,
 }
 
+/// How many consecutive failed binds before the manager gives up on hosting.
+/// Auto-rehost is a timer, so without a limit a port owned by another process
+/// is retried every tick forever while the user is told nothing.
+pub(crate) const MAX_CONSECUTIVE_REHOST_FAILURES: u32 = 3;
+
 /// Capacity (in chunks) of the bounded outgoing file-data lane. At
 /// `FILE_CHUNK_SIZE` (64 KiB) this caps in-flight outbound file data at a few
 /// hundred KiB regardless of file size, providing real backpressure.
@@ -98,6 +103,12 @@ pub struct ChatManager {
     /// Map contact_id -> one-to-one chat id (if any). Used to find session/chat for a contact.
     pub contact_to_chat: HashMap<Uuid, Uuid>,
     sessions: HashMap<Uuid, SessionHandle>,
+    /// The spawned task driving each session, so tearing a session down actually
+    /// stops it. Dropping the [`SessionHandle`] only closes the outbound
+    /// channels: a host still parked in `accept()` keeps the listening port
+    /// bound (so every later rehost fails with EADDRINUSE), and a connected
+    /// session keeps its socket open until the peer happens to send something.
+    session_tasks: HashMap<Uuid, tokio::task::JoinHandle<()>>,
     session_events: HashMap<Uuid, Arc<Mutex<mpsc::UnboundedReceiver<SessionEvent>>>>,
     /// Channels used to confirm fingerprint verification with the running session task
     fingerprint_confirm_senders: HashMap<Uuid, mpsc::UnboundedSender<bool>>,
@@ -132,11 +143,27 @@ pub struct ChatManager {
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
-    pub fingerprint_verification_request: Option<PendingFingerprint>,
+    /// TOFU prompts waiting on the user, oldest first.
+    ///
+    /// A queue, not a single slot: a host can have several peers mid-handshake
+    /// at once, and with one slot the second peer's prompt simply overwrote the
+    /// first. The overwritten session then sat blocked until its 30-minute
+    /// confirmation timeout with nothing on screen to explain why.
+    ///
+    /// Entries are removed by [`ChatManager::confirm_fingerprint`] (the user
+    /// decided) or by [`ChatManager::drop_fingerprint_requests_for_session`]
+    /// (the session died) — never by merely reading them, so a UI that polls
+    /// cannot consume a prompt it has not yet answered.
+    fingerprint_verification_requests: VecDeque<PendingFingerprint>,
     pub history_key: Option<[u8; 32]>,
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
+    /// Consecutive failed attempts to bind the listening port. Auto-rehost runs
+    /// on a timer, so a port something else owns would otherwise be retried
+    /// forever — logging every time and telling the user nothing. After
+    /// [`MAX_CONSECUTIVE_REHOST_FAILURES`] the manager stops claiming to host.
+    rehost_failures: u32,
     /// The port the live listener actually bound (which can differ from
     /// `config.listen_port` when the user typed another one in the Host
     /// dialog). This is what "share this address" displays must use.
@@ -162,6 +189,12 @@ pub struct ChatManager {
     /// "notify when a message arrives in the background" fires for the
     /// conversation the user is reading right now.
     presence: UiPresence,
+    /// This device's own identity fingerprint, pushed down by the shell that
+    /// owns the [`Identity`](messenger_core::identity::Identity). Used to
+    /// recognise the user's own invite link so importing it cannot add the user
+    /// to their own contacts (where it would then look like a peer they could
+    /// dial). `None` until the shell reports it.
+    my_fingerprint: Option<String>,
 }
 
 /// What the user is currently looking at. Reported by the UI shell via
@@ -195,6 +228,7 @@ impl ChatManager {
             contacts: HashMap::new(),
             contact_to_chat: HashMap::new(),
             sessions: HashMap::new(),
+            session_tasks: HashMap::new(),
             session_events: HashMap::new(),
             chat_id_mapping: HashMap::new(),
             active_transfers: HashMap::new(),
@@ -207,10 +241,11 @@ impl ChatManager {
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
-            fingerprint_verification_request: None,
+            fingerprint_verification_requests: VecDeque::new(),
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
             is_hosting: false,
+            rehost_failures: 0,
             hosting_port: None,
             connection_password: None,
             conversation_locked: false,
@@ -218,7 +253,15 @@ impl ChatManager {
             pending_upnp: None,
             upnp_cancel: None,
             presence: UiPresence::default(),
+            my_fingerprint: None,
         }
+    }
+
+    /// Tell the manager which identity this device runs as. The shell owns the
+    /// `Identity`, so it has to push the fingerprint down — without it, pasting
+    /// your own invite link adds you to your own contact list.
+    pub fn set_my_fingerprint(&mut self, fingerprint: impl Into<String>) {
+        self.my_fingerprint = Some(fingerprint.into());
     }
 
     /// Report what the user can see. Call this from the UI shell whenever the
@@ -287,6 +330,57 @@ impl ChatManager {
             .unwrap_or(chat_id)
     }
 
+    /// The TOFU prompt the user should answer next (oldest first), or `None`.
+    ///
+    /// Peeks — it does not consume. A prompt is only removed once it is actually
+    /// resolved, so a front-end that polls this (the desktop bridge does) cannot
+    /// swallow a verification it never showed, and `confirm_fingerprint` can
+    /// still find the fingerprint it needs to persist.
+    pub fn pending_fingerprint(&self) -> Option<&PendingFingerprint> {
+        self.fingerprint_verification_requests.front()
+    }
+
+    /// How many peers are waiting on a TOFU decision.
+    pub fn pending_fingerprint_count(&self) -> usize {
+        self.fingerprint_verification_requests.len()
+    }
+
+    /// Queue a TOFU prompt for the user. A newer prompt for the same session
+    /// replaces the older one (a re-handshake supersedes it) rather than
+    /// queueing a duplicate the user would have to dismiss twice.
+    pub(super) fn queue_fingerprint_request(&mut self, request: PendingFingerprint) {
+        if let Some(slot) = self
+            .fingerprint_verification_requests
+            .iter_mut()
+            .find(|p| p.session_id == request.session_id)
+        {
+            *slot = request;
+            return;
+        }
+        self.fingerprint_verification_requests.push_back(request);
+    }
+
+    /// Remove (and return) the queued prompt for a session, e.g. once the user
+    /// has decided.
+    pub(super) fn take_fingerprint_request(
+        &mut self,
+        session_id: Uuid,
+    ) -> Option<PendingFingerprint> {
+        let idx = self
+            .fingerprint_verification_requests
+            .iter()
+            .position(|p| p.session_id == session_id)?;
+        self.fingerprint_verification_requests.remove(idx)
+    }
+
+    /// Drop any queued prompt belonging to a session that is gone. Without this
+    /// a dead session's prompt sits at the head of the queue forever and hides
+    /// the next peer's, which is the single-slot bug in another shape.
+    pub(super) fn drop_fingerprint_requests_for_session(&mut self, session_id: Uuid) {
+        self.fingerprint_verification_requests
+            .retain(|p| p.session_id != session_id);
+    }
+
     /// Set the optional P2P connection password. When hosting, peers must present
     /// it; when connecting, it is the password supplied to the host. Set this
     /// before calling `start_host` / `connect_to_host`.
@@ -315,6 +409,14 @@ impl ChatManager {
         if !self.is_hosting || self.conversation_locked {
             return false;
         }
+        // Only a *direct* listener is auto-rehosted. `hosting_port` is set by
+        // `start_host` and never by `start_host_via_relay`, so a relay
+        // rendezvous that ended is not silently replaced by a TCP listener:
+        // that would leave the token the user shared dead while making them
+        // reachable by a route they never chose.
+        if self.hosting_port.is_none() {
+            return false;
+        }
         // If we want to host, but no chat is a placeholder host, we need to restart.
         !self.chats.values().any(|c| c.is_host_placeholder)
     }
@@ -322,6 +424,7 @@ impl ChatManager {
     /// Stop hosting (user action).
     pub fn stop_hosting(&mut self) {
         self.is_hosting = false;
+        self.rehost_failures = 0;
         self.hosting_port = None;
         // Cancel the UPnP renewal task (it unmaps the router port on drop) and
         // forget the external address so invites revert to the LAN address.
@@ -343,9 +446,14 @@ impl ChatManager {
                 duration: Duration::from_secs(3),
             });
             self.chats.remove(&id);
+            // Abort first: the task is parked in `accept()` and would otherwise
+            // hold the listening port for the life of the process, so "stop
+            // hosting then start again" would fail to rebind.
+            self.abort_session_task(id);
             self.sessions.remove(&id);
             self.session_events.remove(&id);
             self.fingerprint_confirm_senders.remove(&id);
+            self.drop_fingerprint_requests_for_session(id);
         }
     }
 
@@ -371,6 +479,7 @@ impl ChatManager {
             recv_seq: 0,
             is_host_placeholder: false,
             read_count: 0,
+            title_is_custom: false,
         };
         self.chats.insert(id, chat);
     }
@@ -398,6 +507,9 @@ impl ChatManager {
 
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.title = title;
+            // Remember that this name is the user's, so a later `Connected`
+            // event does not relabel it with the peer address it reached.
+            chat.title_is_custom = true;
             Ok(())
         } else {
             tracing::error!("Chat not found for rename: {}", chat_id);
@@ -525,13 +637,96 @@ impl ChatManager {
         v
     }
 
-    /// Delete a chat and its associated session
+    /// Reset a conversation's replay-protection counters because a **new**
+    /// session is about to serve it.
+    ///
+    /// The wire sequence is per session and restarts at 1, but `recv_seq` lives
+    /// on the `Chat` and survives reconnects. Left alone, every frame the peer
+    /// sends after a reconnect is at or below the previous session's high-water
+    /// mark and is discarded as a replay — the peer's first N messages vanish
+    /// with only a log line, and they see them as sent.
+    ///
+    /// This does not weaken replay protection: it is enforced per session at the
+    /// transport layer (`last_valid_seq` in `run_message_loop`), on a key that
+    /// is itself unique per session. The chat-level counter is a second layer
+    /// that must be aligned with the session it is checking.
+    pub(super) fn reset_chat_sequences(&mut self, chat_id: Uuid) {
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.recv_seq = 0;
+            chat.send_seq = 0;
+        }
+    }
+
+    /// Stop the task driving a session, if one is still registered.
+    ///
+    /// Aborting is deliberate rather than "drop the handle and let it notice":
+    /// a host session parked in `accept()` never notices, and until it exits it
+    /// keeps the listening port bound — which is what turned "the user deleted a
+    /// conversation" into "hosting is dead until the app restarts".
+    fn abort_session_task(&mut self, session_id: Uuid) {
+        if let Some(task) = self.session_tasks.remove(&session_id) {
+            task.abort();
+        }
+    }
+
+    /// Register the task driving a session so it can be aborted on teardown.
+    pub(super) fn register_session_task(
+        &mut self,
+        session_id: Uuid,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        if let Some(previous) = self.session_tasks.insert(session_id, task) {
+            previous.abort();
+        }
+    }
+
+    /// Delete a chat and close the session behind it.
+    ///
+    /// The session is keyed by *session* id, which for an incoming (host-side)
+    /// conversation is not the chat's own id — it is the placeholder the peer
+    /// connected through. Removing only `chats[chat_id]` therefore left the
+    /// socket open and `chat_id_mapping` intact: the peer's later messages
+    /// arrived, found no chat, and were dropped with nothing but a log line
+    /// while their client still showed them as sent.
     pub fn delete_chat(&mut self, chat_id: Uuid) {
         tracing::info!(chat_id = %chat_id, "Deleting chat");
+        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        // Callers may name either end of the mapping. The TUI's fingerprint
+        // rejection passes the *session* id, so the incoming conversation that
+        // session created has to go with it — otherwise rejecting a peer leaves
+        // their conversation on screen with a dead session under it.
+        let incoming: Vec<Uuid> = self
+            .chat_id_mapping
+            .iter()
+            .filter(|(incoming, session)| **session == session_id && **incoming != chat_id)
+            .map(|(incoming, _)| *incoming)
+            .collect();
+
+        // In-flight transfers on these conversations have nowhere to land.
+        self.fail_incoming_transfers(chat_id, "conversation deleted");
+        for id in &incoming {
+            self.fail_incoming_transfers(*id, "conversation deleted");
+            for transfer_id in self.transfer_ids_for_chat(*id) {
+                self.clear_transfer_bookkeeping(transfer_id);
+            }
+            self.chats.remove(id);
+        }
+        for transfer_id in self.transfer_ids_for_chat(chat_id) {
+            self.clear_transfer_bookkeeping(transfer_id);
+        }
+
         self.chats.remove(&chat_id);
-        self.sessions.remove(&chat_id);
-        self.session_events.remove(&chat_id);
-        self.fingerprint_confirm_senders.remove(&chat_id);
+        self.abort_session_task(session_id);
+        self.sessions.remove(&session_id);
+        self.session_events.remove(&session_id);
+        self.fingerprint_confirm_senders.remove(&session_id);
+        self.drop_fingerprint_requests_for_session(session_id);
+        self.chat_id_mapping
+            .retain(|incoming, session| *incoming != chat_id && *session != session_id);
+        self.pending_text_sends.remove(&session_id);
+        self.pending_file_sends.remove(&session_id);
+        self.awaiting_ack.retain(|(sid, _), _| *sid != session_id);
+
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
         tracing::debug!(remaining_chats = %self.chats.len(), remaining_sessions = %self.sessions.len(), "Chat deleted");
     }
@@ -547,8 +742,12 @@ impl ChatManager {
         self.chats.clear();
         self.contacts.clear();
         self.contact_to_chat.clear();
+        for (_, task) in self.session_tasks.drain() {
+            task.abort();
+        }
         self.sessions.clear();
         self.session_events.clear();
+        self.chat_id_mapping.clear();
         self.fingerprint_confirm_senders.clear();
         // Signal any streaming send tasks to stop, then drop all transfer state.
         for handle in self.outgoing_transfers.values() {
@@ -565,7 +764,7 @@ impl ChatManager {
         self.awaiting_ack.clear();
         self.incoming_text_messages.clear();
         self.toasts.clear();
-        self.fingerprint_verification_request = None;
+        self.fingerprint_verification_requests.clear();
 
         if !history_path.as_os_str().is_empty() && self.history_key.is_some() {
             let _ = self.save_history(history_path);

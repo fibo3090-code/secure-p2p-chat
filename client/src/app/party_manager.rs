@@ -9,19 +9,45 @@
 //! Message handling: the server broadcasts a post to every member *except* the
 //! sender, so the manager appends the sender's own message optimistically when
 //! `post` is called, and appends others' messages as `Message` broadcasts arrive.
-//! A one-time `FetchHistory` on join seeds the channel from durable history.
+//! Every optimistic append is tracked in `pending_sends` so the server's ordered
+//! `MessagePosted` / `ActionFailed` reply can confirm or retract exactly that
+//! message.
+//!
+//! History: durable channel history is requested once per channel, when the
+//! channel list arrives — **not** when `Joined` arrives. The client pipelines
+//! `Join`, `ListChannels`, `ListMembers`, so the server answers `Joined` first,
+//! while the channel list is still empty; seeding there meant the loop had
+//! nothing to iterate and no channel history was ever fetched at all. Responses
+//! are paged ([`MAX_HISTORY_BATCH`]), so a full page triggers a request for the
+//! next one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use messenger_core::party::{
     blob_hash, dm_thread_id, ChannelInfo, Envelope, FileMeta, MemberInfo, MessagePayload,
-    PartyRequest, PartyResponse, TrustTier, MAX_INLINE_FILE_BYTES,
+    PartyRequest, PartyResponse, TrustTier, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
 use rsa::RsaPrivateKey;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+
+/// What happened when the client tried to join a community server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartyJoinOutcome {
+    /// The server's identity was already pinned (or has just been confirmed by
+    /// the user), the credentials have been sent, and the join is in flight.
+    /// Watch `PartyServerConn::status` for the result.
+    Joining {
+        server_id: Uuid,
+        fingerprint: String,
+    },
+    /// This address has never been joined before. Nothing was sent — not the
+    /// username, not the password. Show the fingerprint and SAS for an
+    /// out-of-band comparison, then call again with `trust_new_identity: true`.
+    NeedsVerification { fingerprint: String, sas: String },
+}
 
 /// Connection lifecycle status for a joined server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +82,18 @@ pub struct PartyServerConn {
     /// surfaced in the UI until superseded. Without this, server errors were
     /// silently dropped and a failed action looked like it simply did nothing.
     pub last_error: Option<String>,
+    /// Channels (and DM threads) whose durable history has been requested since
+    /// this connection joined, so a refreshed channel list does not re-fetch
+    /// everything on every broadcast.
+    history_requested: HashSet<Uuid>,
+    /// Outgoing messages appended locally but not yet acknowledged by the
+    /// server, oldest first, as `(thread, message index)`.
+    ///
+    /// The server answers each send with exactly one `MessagePosted` or
+    /// `ActionFailed`, in order, so the head of this queue identifies which
+    /// optimistic message a reply belongs to. Without the correlation a refused
+    /// post simply stayed on screen looking delivered.
+    pending_sends: VecDeque<(Uuid, usize)>,
     outgoing_tx: mpsc::UnboundedSender<PartyRequest>,
     incoming_rx: mpsc::UnboundedReceiver<Incoming>,
     /// In-flight file downloads, keyed by content hash. A `DownloadFile` request
@@ -72,6 +110,72 @@ impl PartyServerConn {
         self.outgoing_tx
             .send(req)
             .map_err(|_| anyhow!("connection to server is closed"))
+    }
+
+    /// Append an outgoing message locally and remember where it landed, so the
+    /// server's ordered reply can either stamp it with its real sequence or
+    /// take it back off the screen.
+    fn append_pending(&mut self, thread: Uuid, envelope: Envelope) {
+        let list = self.messages.entry(thread).or_default();
+        list.push(envelope);
+        self.pending_sends.push_back((thread, list.len() - 1));
+    }
+
+    /// The server acknowledged the oldest unconfirmed send: stamp the real
+    /// sequence onto it so a later history page merges cleanly instead of
+    /// duplicating it.
+    fn confirm_oldest_pending(&mut self, seq: u64) {
+        let Some((thread, index)) = self.pending_sends.pop_front() else {
+            return;
+        };
+        if let Some(env) = self
+            .messages
+            .get_mut(&thread)
+            .and_then(|v| v.get_mut(index))
+        {
+            env.seq = seq;
+        }
+    }
+
+    /// The server refused the oldest unconfirmed send: remove it. Leaving it on
+    /// screen is the failure this exists to prevent — the user believes a
+    /// message was delivered that the server never stored, and nothing later
+    /// corrects them.
+    fn retract_oldest_pending(&mut self) -> bool {
+        let Some((thread, index)) = self.pending_sends.pop_front() else {
+            return false;
+        };
+        let Some(list) = self.messages.get_mut(&thread) else {
+            return false;
+        };
+        if index >= list.len() {
+            return false;
+        }
+        list.remove(index);
+        // Every later pending index in the same thread shifts down by one.
+        for (t, i) in self.pending_sends.iter_mut() {
+            if *t == thread && *i > index {
+                *i -= 1;
+            }
+        }
+        true
+    }
+
+    /// Ask for a thread's durable history once. Returns false if it was already
+    /// requested on this connection.
+    fn request_history_once(&mut self, thread: Uuid, is_dm_peer: Option<Uuid>) -> bool {
+        if !self.history_requested.insert(thread) {
+            return false;
+        }
+        let req = match is_dm_peer {
+            Some(with) => PartyRequest::FetchDmHistory { with, since_seq: 0 },
+            None => PartyRequest::FetchHistory {
+                channel: thread,
+                since_seq: 0,
+            },
+        };
+        let _ = self.send(req);
+        true
     }
 }
 
@@ -107,13 +211,33 @@ impl PartyManager {
     /// an initial directory + history fetch. Returns the local server id. The
     /// server fingerprint is captured for TOFU display; the caller is responsible
     /// for surfacing it for verification.
+    ///
+    /// `expected_fingerprint` is the identity this address was pinned to on a
+    /// previous join. It is checked **before the `Join` frame is written**,
+    /// because that frame carries the user's community username and password:
+    /// verifying afterwards means a server that swapped its key — a redeploy, or
+    /// someone who took over the address — has already been handed the
+    /// credentials it was supposed to prove it deserved. The handshake is
+    /// authenticated, so a mismatch here is the whole point of pinning.
+    ///
+    /// When there is **no** pin — the first time this address is used —
+    /// `trust_new_identity` decides what happens. `false` (the default the UI
+    /// starts with) connects far enough to learn the server's fingerprint and
+    /// SAS, then hangs up without sending anything and returns
+    /// [`PartyJoinOutcome::NeedsVerification`]. A peer-to-peer first contact has
+    /// always stopped for the SAS prompt here; a community first contact used to
+    /// hand over the username and password to whatever key answered the address
+    /// and pin it afterwards, which is trust-on-first-use with the "trust" step
+    /// left out.
     pub async fn connect_and_join(
         &mut self,
         address: &str,
         username: &str,
         password: Option<String>,
         privkey: &RsaPrivateKey,
-    ) -> Result<Uuid> {
+        expected_fingerprint: Option<&str>,
+        trust_new_identity: bool,
+    ) -> Result<PartyJoinOutcome> {
         use messenger_core::party::PartyClient;
 
         self.last_error = None;
@@ -121,6 +245,30 @@ impl PartyManager {
         let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
         let client = PartyClient::connect(stream, privkey, Uuid::new_v4()).await?;
         let fingerprint = client.server_fingerprint().to_string();
+        match expected_fingerprint.filter(|p| !p.is_empty()) {
+            Some(pinned) if pinned != fingerprint => {
+                // Drop the connection without sending anything. `client` owns the
+                // stream, so returning here closes it.
+                bail!(
+                    "SECURITY: this server's identity changed since you last joined \
+                     (expected {}…, got {}…). Your username and password were NOT sent. \
+                     If the operator redeployed the server this may be expected — leave \
+                     the saved community and rejoin to trust the new identity. \
+                     Otherwise, do not proceed.",
+                    &pinned[..16.min(pinned.len())],
+                    &fingerprint[..16.min(fingerprint.len())]
+                );
+            }
+            Some(_) => {} // pinned and matching: proceed
+            None if !trust_new_identity => {
+                // First contact with this address. Hang up before the `Join`
+                // frame — it carries the credentials — and let the shell show
+                // the SAS for an out-of-band check.
+                let sas = client.sas().to_string();
+                return Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas });
+            }
+            None => {} // the user has just confirmed this identity
+        }
         let (mut reader, mut writer) = client.split();
 
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<PartyRequest>();
@@ -155,13 +303,15 @@ impl PartyManager {
             address: address.to_string(),
             username: username.to_string(),
             server_name: String::new(),
-            server_fingerprint: fingerprint,
+            server_fingerprint: fingerprint.clone(),
             member_id: None,
             status: PartyStatus::Connecting,
             channels: Vec::new(),
             members: Vec::new(),
             messages: HashMap::new(),
             last_error: None,
+            history_requested: HashSet::new(),
+            pending_sends: VecDeque::new(),
             outgoing_tx,
             incoming_rx,
             pending_downloads: HashMap::new(),
@@ -177,7 +327,10 @@ impl PartyManager {
 
         let server_id = Uuid::new_v4();
         self.servers.insert(server_id, conn);
-        Ok(server_id)
+        Ok(PartyJoinOutcome::Joining {
+            server_id,
+            fingerprint,
+        })
     }
 
     /// Post a message to a channel. The message is appended locally right away
@@ -188,14 +341,17 @@ impl PartyManager {
             .get_mut(&server_id)
             .ok_or_else(|| anyhow!("unknown server"))?;
         let sender = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
-        conn.messages.entry(channel).or_default().push(Envelope {
-            tier: TrustTier::Administered,
-            sender,
+        conn.append_pending(
             channel,
-            seq: 0, // provisional; ordering is by arrival
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::Text(text.clone()),
-        });
+            Envelope {
+                tier: TrustTier::Administered,
+                sender,
+                channel,
+                seq: 0, // provisional; ordering is by arrival
+                timestamp: current_timestamp_millis(),
+                payload: MessagePayload::Text(text.clone()),
+            },
+        );
         conn.send(PartyRequest::PostMessage { channel, text })
     }
 
@@ -208,24 +364,30 @@ impl PartyManager {
             .ok_or_else(|| anyhow!("unknown server"))?;
         let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
         let thread = dm_thread_id(me, to);
-        conn.messages.entry(thread).or_default().push(Envelope {
-            tier: TrustTier::Administered,
-            sender: me,
-            channel: thread,
-            seq: 0,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::Text(text.clone()),
-        });
+        conn.append_pending(
+            thread,
+            Envelope {
+                tier: TrustTier::Administered,
+                sender: me,
+                channel: thread,
+                seq: 0,
+                timestamp: current_timestamp_millis(),
+                payload: MessagePayload::Text(text.clone()),
+            },
+        );
         conn.send(PartyRequest::SendDm { to, text })
     }
 
-    /// Request DM history with another member (offline catch-up).
-    pub fn fetch_dm_history(&self, server_id: Uuid, with: Uuid) -> Result<()> {
+    /// Request DM history with another member (offline catch-up). Idempotent
+    /// per connection: opening the thread repeatedly does not re-fetch it.
+    pub fn fetch_dm_history(&mut self, server_id: Uuid, with: Uuid) -> Result<()> {
         let conn = self
             .servers
-            .get(&server_id)
+            .get_mut(&server_id)
             .ok_or_else(|| anyhow!("unknown server"))?;
-        conn.send(PartyRequest::FetchDmHistory { with, since_seq: 0 })
+        let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
+        conn.request_history_once(dm_thread_id(me, with), Some(with));
+        Ok(())
     }
 
     /// Messages in the DM thread with `peer` on a given server (empty if none).
@@ -271,14 +433,17 @@ impl PartyManager {
             .ok_or_else(|| anyhow!("unknown server"))?;
         let sender = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
         let meta = file_meta(&name, &mime, &data)?;
-        conn.messages.entry(channel).or_default().push(Envelope {
-            tier: TrustTier::Administered,
-            sender,
+        conn.append_pending(
             channel,
-            seq: 0,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::File(meta),
-        });
+            Envelope {
+                tier: TrustTier::Administered,
+                sender,
+                channel,
+                seq: 0,
+                timestamp: current_timestamp_millis(),
+                payload: MessagePayload::File(meta),
+            },
+        );
         conn.send(PartyRequest::PostFile {
             channel,
             name,
@@ -304,14 +469,17 @@ impl PartyManager {
         let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
         let thread = dm_thread_id(me, to);
         let meta = file_meta(&name, &mime, &data)?;
-        conn.messages.entry(thread).or_default().push(Envelope {
-            tier: TrustTier::Administered,
-            sender: me,
-            channel: thread,
-            seq: 0,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::File(meta),
-        });
+        conn.append_pending(
+            thread,
+            Envelope {
+                tier: TrustTier::Administered,
+                sender: me,
+                channel: thread,
+                seq: 0,
+                timestamp: current_timestamp_millis(),
+                payload: MessagePayload::File(meta),
+            },
+        );
         conn.send(PartyRequest::SendFileDm {
             to,
             name,
@@ -339,16 +507,16 @@ impl PartyManager {
         Ok(rx)
     }
 
-    /// Request a channel's full history (offline catch-up).
-    pub fn fetch_history(&self, server_id: Uuid, channel: Uuid) -> Result<()> {
+    /// Request a channel's durable history (offline catch-up). Idempotent per
+    /// connection — `seed_history` already asks for every visible channel when
+    /// the directory arrives, so this is the explicit "open this channel" path.
+    pub fn fetch_history(&mut self, server_id: Uuid, channel: Uuid) -> Result<()> {
         let conn = self
             .servers
-            .get(&server_id)
+            .get_mut(&server_id)
             .ok_or_else(|| anyhow!("unknown server"))?;
-        conn.send(PartyRequest::FetchHistory {
-            channel,
-            since_seq: 0,
-        })
+        conn.request_history_once(channel, None);
+        Ok(())
     }
 
     /// Drain incoming events from every connection and update state. Call this from
@@ -429,6 +597,33 @@ fn fail_pending_downloads(conn: &mut PartyServerConn, reason: &str) {
     }
 }
 
+/// Request durable history for every thread this connection can see and has not
+/// asked about yet.
+///
+/// Called after `Joined`, `Channels` and `Members` because any of the three can
+/// be the one that completes the picture: the channel list decides which
+/// channels exist, the member list decides which DM threads do, and neither is
+/// known when `Joined` arrives.
+fn seed_history(conn: &mut PartyServerConn) {
+    if conn.member_id.is_none() {
+        return; // the server refuses history until we have joined
+    }
+    let channels: Vec<Uuid> = conn.channels.iter().map(|c| c.id).collect();
+    for ch in channels {
+        conn.request_history_once(ch, None);
+    }
+    let Some(me) = conn.member_id else { return };
+    let peers: Vec<Uuid> = conn
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| *id != me)
+        .collect();
+    for peer in peers {
+        conn.request_history_once(dm_thread_id(me, peer), Some(peer));
+    }
+}
+
 /// Apply one server response to a connection's state.
 fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
     match resp {
@@ -440,38 +635,103 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             conn.member_id = Some(member_id);
             conn.server_name = server_name;
             conn.status = PartyStatus::Joined;
-            // Seed each known channel's history once we're in.
-            let channels: Vec<Uuid> = conn.channels.iter().map(|c| c.id).collect();
-            for ch in channels {
-                let _ = conn.send(PartyRequest::FetchHistory {
-                    channel: ch,
-                    since_seq: 0,
-                });
-            }
+            // History is *not* seeded here. `Joined` arrives before `Channels`
+            // (the requests are pipelined in that order), so `conn.channels` is
+            // still empty — which is exactly why channel history was never
+            // fetched at all. It is requested when the channel list lands.
+            seed_history(conn);
         }
         PartyResponse::JoinRejected { reason } => conn.status = PartyStatus::Rejected(reason),
-        PartyResponse::Members(members) => conn.members = members,
-        PartyResponse::Channels(channels) => conn.channels = channels,
-        PartyResponse::Message(env) => {
-            conn.messages.entry(env.channel).or_default().push(env);
+        PartyResponse::Members(members) => {
+            conn.members = members;
+            seed_history(conn);
         }
-        PartyResponse::History(items) => {
-            // Replace each referenced channel's history with the authoritative set.
-            let channels: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
-            for ch in channels {
-                let history: Vec<Envelope> =
-                    items.iter().filter(|e| e.channel == ch).cloned().collect();
-                conn.messages.insert(ch, history);
+        PartyResponse::Channels(channels) => {
+            conn.channels = channels;
+            seed_history(conn);
+        }
+        PartyResponse::Message(env) => {
+            let thread = conn.messages.entry(env.channel).or_default();
+            // A live broadcast can race a history page carrying the same
+            // envelope; both are keyed by the server-assigned sequence.
+            if env.seq == 0 || !thread.iter().any(|e| e.seq == env.seq) {
+                thread.push(env);
             }
         }
-        // Ack carries no content; the optimistic local append already happened.
-        PartyResponse::MessagePosted { .. } => {}
+        PartyResponse::History(items) => {
+            let page_was_full = items.len() >= MAX_HISTORY_BATCH;
+            let threads: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
+            for th in threads {
+                let page: Vec<Envelope> =
+                    items.iter().filter(|e| e.channel == th).cloned().collect();
+                let existing = conn.messages.entry(th).or_default();
+                // Merge rather than replace: history is paged now, so a later
+                // page must not throw away the earlier one. Server-assigned
+                // sequences are the identity; unconfirmed local sends (seq 0)
+                // are kept so a message in flight does not blink out.
+                for env in page {
+                    if !existing.iter().any(|e| e.seq == env.seq) {
+                        existing.push(env);
+                    }
+                }
+                existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
+
+                // A full page means there is probably more behind it.
+                if page_was_full {
+                    if let Some(last) = existing.iter().rfind(|e| e.seq > 0) {
+                        let since_seq = last.seq;
+                        let dm_peer = conn.member_id.and_then(|me| {
+                            conn.members
+                                .iter()
+                                .map(|m| m.id)
+                                .find(|other| dm_thread_id(me, *other) == th)
+                        });
+                        let _ = conn.send(match dm_peer {
+                            Some(with) => PartyRequest::FetchDmHistory { with, since_seq },
+                            None => PartyRequest::FetchHistory {
+                                channel: th,
+                                since_seq,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        // The server stored it: stamp the real sequence onto the message we
+        // already put on screen.
+        PartyResponse::MessagePosted { seq, .. } => conn.confirm_oldest_pending(seq),
+        // The server refused a send. Take the message back off the screen —
+        // leaving it there tells the user it was delivered when it never was.
+        PartyResponse::ActionFailed { reason, .. } => {
+            let retracted = conn.retract_oldest_pending();
+            conn.last_error = Some(if retracted {
+                format!("Not sent: {reason}")
+            } else {
+                reason
+            });
+        }
         // Downloaded file bytes: hand them to the awaiting `request_download` caller
         // (keyed by content hash). Unsolicited/duplicate data has no waiter and is
         // dropped.
         PartyResponse::FileData { hash, data } => {
             if let Some(tx) = conn.pending_downloads.remove(&hash) {
-                let _ = tx.send(Ok(data));
+                // The hash *is* the integrity check — that is the whole point of
+                // content addressing, and it costs one SHA-256 to use. Matching
+                // on the hash the server echoed back proves nothing about the
+                // bytes it attached to it.
+                let actual = blob_hash(&data);
+                let _ = if actual == hash {
+                    tx.send(Ok(data))
+                } else {
+                    tracing::error!(
+                        expected = %hash,
+                        actual = %actual,
+                        "community server returned bytes that do not match the requested content hash"
+                    );
+                    tx.send(Err(
+                        "The server sent a file that does not match the one that was requested. It was not saved.".to_string(),
+                    ))
+                };
             }
         }
         // Surface server-side failures (rejected post, unknown channel, …) so a
@@ -512,6 +772,8 @@ mod tests {
             members: Vec::new(),
             messages: HashMap::new(),
             last_error: None,
+            history_requested: HashSet::new(),
+            pending_sends: VecDeque::new(),
             outgoing_tx,
             incoming_rx,
             pending_downloads: HashMap::new(),
@@ -852,5 +1114,195 @@ mod tests {
         assert_eq!(mgr.last_error(), Some("connect failed"));
         mgr.clear_last_error();
         assert!(mgr.last_error().is_none());
+    }
+
+    /// The client pipelines Join → ListChannels → ListMembers, so `Joined`
+    /// arrives while the channel list is still empty. Seeding history there
+    /// iterated nothing, and durable channel history was never fetched at all —
+    /// every channel came up empty after a restart even though the server had
+    /// it all in SQLite.
+    #[test]
+    fn history_is_requested_once_the_channel_list_arrives() {
+        let (mut mgr, _id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let peer = Uuid::new_v4();
+
+        // Exactly the order the server answers in.
+        tx.send(Incoming::Response(PartyResponse::Joined {
+            member_id: me,
+            server_name: "Srv".to_string(),
+            tier: TrustTier::Administered,
+        }))
+        .unwrap();
+        tx.send(Incoming::Response(PartyResponse::Channels(vec![
+            ChannelInfo {
+                id: channel,
+                name: "general".to_string(),
+                kind: ChannelKind::Public,
+            },
+        ])))
+        .unwrap();
+        tx.send(Incoming::Response(PartyResponse::Members(vec![
+            MemberInfo {
+                id: me,
+                username: "alice".to_string(),
+                online: true,
+            },
+            MemberInfo {
+                id: peer,
+                username: "bob".to_string(),
+                online: true,
+            },
+        ])))
+        .unwrap();
+        mgr.poll_events();
+
+        let mut requested_channel = false;
+        let mut requested_dm = false;
+        while let Ok(req) = out.try_recv() {
+            match req {
+                PartyRequest::FetchHistory { channel: c, .. } if c == channel => {
+                    requested_channel = true
+                }
+                PartyRequest::FetchDmHistory { with, .. } if with == peer => requested_dm = true,
+                _ => {}
+            }
+        }
+        assert!(requested_channel, "channel history must be fetched on join");
+        assert!(requested_dm, "DM history must be fetched on join");
+
+        // Idempotent: a re-broadcast channel list (someone created a channel)
+        // must not refetch everything.
+        tx.send(Incoming::Response(PartyResponse::Channels(vec![
+            ChannelInfo {
+                id: channel,
+                name: "general".to_string(),
+                kind: ChannelKind::Public,
+            },
+        ])))
+        .unwrap();
+        mgr.poll_events();
+        assert!(
+            out.try_recv().is_err(),
+            "already-seeded threads must not be re-requested"
+        );
+    }
+
+    /// History is paged now, so a later page must merge into the earlier one
+    /// rather than replace it — and a full page asks for the next.
+    #[test]
+    fn history_pages_are_merged_and_continued() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        let page: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
+            .map(|seq| envelope(channel, me, seq, &format!("m{seq}")))
+            .collect();
+        tx.send(Incoming::Response(PartyResponse::History(page)))
+            .unwrap();
+        mgr.poll_events();
+
+        assert_eq!(
+            mgr.server(id).unwrap().messages[&channel].len(),
+            MAX_HISTORY_BATCH
+        );
+        let asked_again = std::iter::from_fn(|| out.try_recv().ok()).any(|r| {
+            matches!(r, PartyRequest::FetchHistory { channel: c, since_seq }
+                if c == channel && since_seq == MAX_HISTORY_BATCH as u64)
+        });
+        assert!(asked_again, "a full page must be followed by the next one");
+
+        // The next page appends rather than replacing.
+        tx.send(Incoming::Response(PartyResponse::History(vec![envelope(
+            channel,
+            me,
+            MAX_HISTORY_BATCH as u64 + 1,
+            "tail",
+        )])))
+        .unwrap();
+        mgr.poll_events();
+        assert_eq!(
+            mgr.server(id).unwrap().messages[&channel].len(),
+            MAX_HISTORY_BATCH + 1,
+            "a later page must not throw away the earlier one"
+        );
+    }
+
+    /// A post the server refuses used to stay on screen looking delivered: the
+    /// error arrived uncorrelated and nothing ever took the message back.
+    #[test]
+    fn a_refused_send_is_taken_back_off_the_screen() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        mgr.post(id, channel, "first".to_string()).unwrap();
+        mgr.post(id, channel, "second".to_string()).unwrap();
+        assert_eq!(mgr.server(id).unwrap().messages[&channel].len(), 2);
+
+        // The server accepts the first and refuses the second, in order.
+        tx.send(Incoming::Response(PartyResponse::MessagePosted {
+            channel,
+            seq: 7,
+        }))
+        .unwrap();
+        tx.send(Incoming::Response(PartyResponse::ActionFailed {
+            channel,
+            reason: "this channel is locked".to_string(),
+        }))
+        .unwrap();
+        mgr.poll_events();
+
+        let conn = mgr.server(id).unwrap();
+        let msgs = &conn.messages[&channel];
+        assert_eq!(msgs.len(), 1, "the refused message must be removed");
+        assert_eq!(msgs[0].seq, 7, "the accepted one keeps its real sequence");
+        assert!(conn
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("locked")));
+    }
+
+    /// Content addressing is the integrity check. Matching on the hash the
+    /// server echoed back proves nothing about the bytes attached to it.
+    #[tokio::test]
+    async fn a_download_whose_bytes_do_not_match_its_hash_is_refused() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let hash = blob_hash(b"the real file");
+        let rx = mgr.request_download(id, hash.clone()).unwrap();
+
+        tx.send(Incoming::Response(PartyResponse::FileData {
+            hash,
+            data: b"something else entirely".to_vec(),
+        }))
+        .unwrap();
+        mgr.poll_events();
+
+        let err = rx
+            .await
+            .expect("the waiter is completed")
+            .expect_err("mismatched bytes must not be handed to the caller");
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_download_whose_bytes_match_is_delivered() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let data = b"the real file".to_vec();
+        let hash = blob_hash(&data);
+        let rx = mgr.request_download(id, hash.clone()).unwrap();
+
+        tx.send(Incoming::Response(PartyResponse::FileData {
+            hash,
+            data: data.clone(),
+        }))
+        .unwrap();
+        mgr.poll_events();
+
+        assert_eq!(rx.await.unwrap().unwrap(), data);
     }
 }

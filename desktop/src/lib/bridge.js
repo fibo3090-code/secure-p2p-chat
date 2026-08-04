@@ -8,6 +8,7 @@
 // `?mock=error` to the URL to preview the auth and startup-failure screens.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { folderOf } from "./parse.js";
 
 const inTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 
@@ -15,6 +16,7 @@ const realApi = {
   authStatus: () => invoke("auth_status"),
   unlock: (password) => invoke("unlock", { password }),
   setPassword: (password) => invoke("set_password", { password }),
+  changePassword: (current, next) => invoke("change_password", { current, new: next }),
   setDisplayName: (name) => invoke("set_display_name", { name }),
   exportIdentity: () => invoke("export_identity"),
   exportDiagnostics: () => invoke("export_diagnostics"),
@@ -31,7 +33,11 @@ const realApi = {
   sendFile: (id) => invoke("send_file", { id }),
   // File cards: open with the default app (reveal=false) or show in folder.
   // Only (chat id, message id) cross the bridge — never filesystem paths.
-  openFile: (id, msg, reveal = false) => invoke("open_file", { id, msg, reveal }),
+  // Resolves to { opened, blocked, filename }. `blocked` is set when the file
+  // came from the peer and opening it would execute code — pass confirm:true
+  // to go ahead once the user has been told what it is.
+  openFile: (id, msg, reveal = false, confirm = false) =>
+    invoke("open_file", { id, msg, reveal, confirm }),
   filePreview: (id, msg) => invoke("file_preview", { id, msg }),
   openUrl: (url) => invoke("open_url", { url }),
   listTransfers: () => invoke("list_transfers"),
@@ -59,7 +65,11 @@ const realApi = {
   importInvite: (link) => invoke("import_invite", { link }),
   connectContact: (id) => invoke("connect_contact", { id }),
   // Communities (Party servers). Single-word command params by convention.
-  partyJoin: (address, username, password) => invoke("party_join", { address, username, password }),
+  // `trust` is the second step of first-join verification: false asks the
+  // bridge to stop and report the server fingerprint + SAS without sending
+  // the credentials; true proceeds after the user has compared them.
+  partyJoin: (address, username, password, trust = false) =>
+    invoke("party_join", { address, username, password, trust }),
   partyList: () => invoke("party_list"),
   partyHistory: (server, channel) => invoke("party_history", { server, channel }),
   partyPost: (server, channel, text) => invoke("party_post", { server, channel, text }),
@@ -154,6 +164,11 @@ function makeMock() {
     }),
     unlock: async () => { authState = "ready"; },
     setPassword: async () => { authState = "ready"; },
+    changePassword: async (current) => {
+      // The mock has no key material; reject an obviously-empty current password
+      // so the dialog's error path is exercisable in a plain browser.
+      if (!current) throw new Error("Current password is incorrect");
+    },
     setDisplayName: async (name) => ({ state: authState, name, fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
     exportIdentity: async () => "C:\\Users\\you\\p2pem-identity-backup.json",
     exportDiagnostics: async () => "C:\\Users\\you\\AppData\\P2PEM\\diagnostics\\bundle-mock",
@@ -166,7 +181,7 @@ function makeMock() {
     setPresence: async () => {},
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000, path: "/mock/example.pdf" }, timestamp: new Date().toISOString() }); },
-    openFile: async () => {},
+    openFile: async () => ({ opened: true, blocked: null, filename: null }),
     filePreview: async () => null,
     openUrl: async (url) => { window.open(url, "_blank", "noopener"); },
     listTransfers: async () => [],
@@ -191,9 +206,16 @@ function makeMock() {
     blockContact: async (id) => { const c = contacts.find((x) => x.id === id); if (c) c.trust = "blocked"; },
     unblockContact: async (id) => { const c = contacts.find((x) => x.id === id); if (c) c.trust = "unverified"; },
     myInviteLink: async () => "chat-p2p://invite/eyJuYW1lIjoiTWF5YSIsImFkZHJlc3MiOiIxOTIuMTY4LjEuOToxMjM0NSJ9",
-    importInvite: async () => ({ id: "c3", name: "Imported", fingerprint: "abc", address: "1.2.3.4:12345", trust: "unverified" }),
+    importInvite: async () => ({
+      contact: { id: "c3", name: "Imported", fingerprint: "abc", address: "1.2.3.4:12345", trust: "unverified", reachable: true, relay_only: false, blocked: false },
+      signed: true,
+    }),
     connectContact: ok,
-    partyJoin: async (address, username) => { seedParty(address, username); return partyState.servers[0].id; },
+    partyJoin: async (address, username, password, trust = false) => {
+      if (!trust) return { status: "verify", fingerprint: "aa".repeat(32), sas: "123456 🎃🎈🎁" };
+      seedParty(address, username);
+      return { status: "joined", server: partyState.servers[0].id, fingerprint: "aa".repeat(32) };
+    },
     partyList: async () => partyState.servers,
     partyHistory: async (server, channel) => partyState.msgs[`${server}|${channel}`] || [],
     partyPost: async (server, channel, text) => {
@@ -312,7 +334,7 @@ export function chatToContact(chat, connected) {
       if (c.type === "file") {
         // hasPath gates the open/reveal actions — a file whose location was
         // never recorded (old history) renders as a plain card.
-        return { kind: "file", id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), hasPath: !!c.path, delivered: !!m.delivered };
+        return { kind: "file", id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), hasPath: !!c.path, path: c.path ? String(c.path) : "", dir: folderOf(c.path), delivered: !!m.delivered };
       }
       return { id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp), delivered: !!m.delivered };
     }),

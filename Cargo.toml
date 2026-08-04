@@ -27,6 +27,9 @@ bincode = "1"
 # Cryptography (RustCrypto)
 rsa = "0.9.10"
 sha2 = "0.10"
+# Constant-time primitives (used for secret comparisons that must not leak
+# their match length through timing).
+subtle = "2.6"
 aes-gcm = "0.11.0"
 rand = "0.8.6"
 getrandom = "0.4"

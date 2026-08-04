@@ -46,7 +46,7 @@ fn delete_chat_removes_it() {
 fn clear_history_in_memory_wipes_all_state() {
     let mut mgr = ChatManager::default();
     mgr.create_local_chat_for_test(Uuid::new_v4(), "A".to_string());
-    mgr.import_contact(sample_contact("Carol"));
+    mgr.import_contact(sample_contact("Carol")).unwrap();
     mgr.add_toast(ToastLevel::Info, "hi".to_string());
 
     // Empty path + no key => in-memory clear only (no file written).
@@ -138,7 +138,7 @@ fn typing_indicators_disabled_is_a_noop_ok() {
 #[test]
 fn contact_import_get_associate_remove() {
     let mut mgr = ChatManager::default();
-    let id = mgr.import_contact(sample_contact("Dave"));
+    let id = mgr.import_contact(sample_contact("Dave")).unwrap();
     assert_eq!(mgr.get_contact(id).unwrap().name, "Dave");
 
     let chat = Uuid::new_v4();
@@ -194,6 +194,9 @@ fn connection_password_setter_ignores_empty() {
 fn conversation_lock_pauses_rehost() {
     let mut mgr = ChatManager::default();
     mgr.is_hosting = true;
+    // A *direct* listener: `hosting_port` records the port `start_host` bound,
+    // and is what tells auto-rehost there is a TCP listener to rebuild.
+    mgr.hosting_port = Some(12345);
     // Hosting with no live placeholder => a rehost would normally be needed.
     assert!(mgr.check_rehost_needed());
     mgr.set_conversation_locked(true);
@@ -204,4 +207,19 @@ fn conversation_lock_pauses_rehost() {
     );
     mgr.set_conversation_locked(false);
     assert!(mgr.check_rehost_needed());
+}
+
+/// Relay hosting must never be "resumed" as a direct TCP listener: the token
+/// the user shared would be dead while they became reachable by a route they
+/// never chose. `start_host_via_relay` leaves `hosting_port` unset, and that is
+/// what marks the difference.
+#[test]
+fn relay_hosting_is_not_auto_rehosted_as_a_direct_listener() {
+    let mut mgr = ChatManager::default();
+    mgr.is_hosting = true;
+    mgr.hosting_port = None;
+    assert!(
+        !mgr.check_rehost_needed(),
+        "a relay rendezvous must not be replaced by a TCP listener"
+    );
 }

@@ -37,8 +37,13 @@ use crate::{invoke_handler, Bridge};
 fn fresh_bridge(dir: &std::path::Path) -> Bridge {
     let identity = Identity::new_with_plaintext("Tester".to_string()).expect("identity");
     let history_path = dir.join("history.json.enc");
+    // Same wiring the real bridge does: without it the manager cannot recognise
+    // the user's own invite link, so a harness would silently exercise a
+    // different code path from production.
+    let mut manager = ChatManager::new(Config::default());
+    manager.set_my_fingerprint(identity.fingerprint.clone());
     Bridge {
-        manager: Arc::new(Mutex::new(ChatManager::new(Config::default()))),
+        manager: Arc::new(Mutex::new(manager)),
         party: Arc::new(Mutex::new(PartyManager::new())),
         identity: Arc::new(StdMutex::new(identity)),
         discovery: Arc::new(StdMutex::new(None)),
@@ -207,6 +212,10 @@ fn fresh_identity_requires_password_setup() {
         ("get_settings", json!({})),
         ("list_conversations", json!({})),
         ("mark_read", json!({ "id": "x" })),
+        (
+            "change_password",
+            json!({ "current": "a", "new": "bridge-test-passphrase-2" }),
+        ),
         ("set_presence", json!({ "focused": true, "chat": null })),
         ("list_contacts", json!({})),
         ("start_host", json!({ "port": 0, "password": null })),
@@ -494,6 +503,66 @@ fn settings_roundtrip_and_validation() {
     assert_eq!(s["listen_port"], 23456);
 }
 
+/// Changing the password must re-encrypt the identity file and nothing else.
+/// The history key is derived from the private key, which a rotation does not
+/// touch — so if this ever started losing history it would be silent and total.
+#[test]
+fn change_password_rotates_the_file_and_keeps_history_readable() {
+    let h = ready_harness();
+    let id = h.seed_chat_with_incoming("Alice", 2);
+    let before = h
+        .ipc("get_conversation", json!({ "id": id.to_string() }))
+        .expect("conversation before the change");
+
+    let wrong = h
+        .ipc(
+            "change_password",
+            json!({ "current": "not-the-password", "new": "bridge-test-passphrase-2" }),
+        )
+        .expect_err("a wrong current password must be refused");
+    assert!(
+        err_text(&wrong).contains("Current password is incorrect"),
+        "got: {}",
+        err_text(&wrong)
+    );
+
+    let too_short = h
+        .ipc(
+            "change_password",
+            json!({ "current": "bridge-test-passphrase", "new": "short" }),
+        )
+        .expect_err("the length floor applies to a changed password too");
+    assert!(
+        err_text(&too_short).contains("at least"),
+        "got: {}",
+        err_text(&too_short)
+    );
+
+    h.ipc(
+        "change_password",
+        json!({ "current": "bridge-test-passphrase", "new": "bridge-test-passphrase-2" }),
+    )
+    .expect("change_password");
+
+    // Still unlocked, same identity, same conversation.
+    let status = h.ipc("auth_status", json!({})).unwrap();
+    assert_eq!(status["state"], "ready");
+    let after = h
+        .ipc("get_conversation", json!({ "id": id.to_string() }))
+        .expect("conversation after the change");
+    assert_eq!(before, after, "a password change must not touch history");
+
+    // The rotation reached the shared identity, not just a temporary copy: the
+    // old password is no longer the current one. (That the *new* one opens the
+    // re-wrapped file is proved in core's `identity` tests, which do not pay for
+    // a Tauri harness — Argon2 at 64 MiB is ~1s per call.)
+    h.ipc(
+        "change_password",
+        json!({ "current": "bridge-test-passphrase", "new": "bridge-test-passphrase-3" }),
+    )
+    .expect_err("the old password must no longer be accepted");
+}
+
 #[test]
 fn display_name_changes_are_persisted_and_validated() {
     let h = ready_harness();
@@ -565,16 +634,38 @@ fn no_pending_fingerprint_on_fresh_session() {
 #[test]
 fn invite_link_roundtrip_creates_contact() {
     let h = ready_harness();
-    let link = h.ipc("my_invite_link", json!({})).expect("my_invite_link");
-    let link = link.as_str().expect("invite link is a string").to_string();
-    assert!(!link.is_empty());
 
-    let contact = h
-        .ipc("import_invite", json!({ "link": link }))
-        .expect("import own invite");
-    assert_eq!(contact["name"], "Tester");
+    // A link from somebody else imports as a contact.
+    let peer = messenger_core::identity::Identity::new_with_plaintext("Peer".to_string())
+        .expect("peer identity");
+    let link = peer
+        .generate_signed_invite_link_with_addresses(vec!["10.0.0.2:12345".to_string()], None, None)
+        .expect("peer invite");
+
+    let imported = h
+        .ipc("import_invite", json!({ "link": link.clone() }))
+        .expect("import a peer's invite");
+    assert_eq!(imported["contact"]["name"], "Peer");
+    assert_eq!(imported["signed"], true);
+    // An invite carries a fingerprint but no verification: the contact is
+    // Unverified until the safety code is compared on first connection.
+    assert_eq!(imported["contact"]["trust"], "unverified");
     let contacts = h.ipc("list_contacts", json!({})).unwrap();
     assert_eq!(contacts.as_array().map(Vec::len), Some(1));
+
+    // Importing the same link again refreshes that contact rather than adding
+    // a duplicate card for the same peer.
+    h.ipc("import_invite", json!({ "link": link }))
+        .expect("re-import is not an error");
+    let contacts = h.ipc("list_contacts", json!({})).unwrap();
+    assert_eq!(contacts.as_array().map(Vec::len), Some(1));
+
+    // Your own link is not a contact.
+    let mine = h.ipc("my_invite_link", json!({})).expect("my_invite_link");
+    let mine = mine.as_str().expect("invite link is a string").to_string();
+    assert!(!mine.is_empty());
+    h.ipc("import_invite", json!({ "link": mine }))
+        .expect_err("imported my own invite link as a contact");
 
     // Garbage links are rejected with a real error, not a panic.
     h.ipc("import_invite", json!({ "link": "p2pem://garbage" }))
@@ -594,11 +685,18 @@ fn conversation_commands_reject_unknown_ids() {
         .ipc("get_conversation", json!({ "id": bogus }))
         .expect_err("got a nonexistent conversation");
     assert_eq!(err_text(&err), "No such conversation");
-    // send_message without a live session is deliberately Ok: the manager
-    // reports "not delivered / connecting" through a toast instead of an
-    // error, so the UI keeps its optimistic-send flow.
-    h.ipc("send_message", json!({ "id": bogus, "text": "hi" }))
-        .expect("send_message surfaces session problems via toasts, not errors");
+    // send_message with no live session MUST fail. It used to return Ok and
+    // only push a toast, which the frontend reads as "sent": it cleared the
+    // composer and added no message row, so the user's text was destroyed with
+    // a four-second toast as its only trace.
+    let err = h
+        .ipc("send_message", json!({ "id": bogus, "text": "hi" }))
+        .expect_err("a send with no session must not report success");
+    assert!(
+        err_text(&err).to_lowercase().contains("not connected"),
+        "the error must say why nothing was sent, got: {}",
+        err_text(&err)
+    );
     h.ipc("accept_transfer", json!({ "id": bogus }))
         .expect_err("accepted a nonexistent transfer");
     h.ipc("decline_transfer", json!({ "id": bogus }))

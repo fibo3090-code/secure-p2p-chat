@@ -79,11 +79,14 @@ mod diagnostics {
     #[test]
     fn invite_link_with_address_autofills() {
         let manager = ChatManager::new(Config::default());
+        // The fingerprint must be the one that belongs to the key in the link:
+        // `parse_invite_link` refuses an invite whose two halves disagree.
+        const PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----";
         let payload = serde_json::json!({
             "name": "Diag",
             "address": "172.20.0.5:6000",
-            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----"
+            "fingerprint": messenger_core::core::crypto::fingerprint_pubkey(PEM.as_bytes()),
+            "public_key": PEM
         });
         let encoded = base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_string(&payload).unwrap());
