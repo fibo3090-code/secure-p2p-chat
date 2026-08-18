@@ -8,7 +8,7 @@
 //! a request off the v3 tunnel, calls [`handle_request`], encrypts the replies, and
 //! separately broadcasts newly posted messages to other online members.
 
-use messenger_core::party::{Envelope, PartyRequest, PartyResponse};
+use messenger_core::party::{ChannelKind, Envelope, PartyRequest, PartyResponse};
 use uuid::Uuid;
 
 use crate::state::PartyState;
@@ -91,6 +91,21 @@ fn dm_delivery(from: Uuid, to: Uuid, env: Envelope) -> Vec<(Uuid, PartyResponse)
     ]
 }
 
+/// Reply with the requester's own filtered channel list, and nudge everyone else
+/// to re-fetch theirs.
+///
+/// The list cannot simply be broadcast any more: `channels_for` filters private
+/// channels per member, while the hub sends one identical frame to every
+/// connection. Broadcasting one member's view would either leak the private
+/// channels to everyone or hide them from the people who are in them.
+fn channel_list_refresh(state: &PartyState, member: Uuid) -> Dispatch {
+    Dispatch {
+        replies: vec![PartyResponse::Channels(state.channels_for(member))],
+        broadcast: vec![PartyResponse::DirectoryChanged],
+        directed: Vec::new(),
+    }
+}
+
 /// Apply `req` to `state` for the connection `conn`, returning the responses to
 /// send back to that client. Newly posted messages are stored in `state`; the
 /// runtime is responsible for broadcasting them to other connections.
@@ -152,8 +167,10 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 PartyRequest::ListMembers => {
                     Dispatch::reply(PartyResponse::Members(state.members()))
                 }
+                // Filtered: a private channel does not advertise its existence to
+                // somebody who is not in it.
                 PartyRequest::ListChannels => {
-                    Dispatch::reply(PartyResponse::Channels(state.channels()))
+                    Dispatch::reply(PartyResponse::Channels(state.channels_for(member)))
                 }
                 PartyRequest::PostMessage { channel, text } => {
                     match state.post_message(member, channel, text) {
@@ -177,15 +194,12 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
                     PartyResponse::History(state.history_since(member, channel, since_seq)),
                 ),
-                PartyRequest::CreateChannel { name } => match state.create_channel(&name) {
-                    // Refresh everyone's channel list (reply to creator + broadcast).
-                    Ok(_) => Dispatch {
-                        replies: vec![PartyResponse::Channels(state.channels())],
-                        broadcast: vec![PartyResponse::Channels(state.channels())],
-                        directed: Vec::new(),
-                    },
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                },
+                PartyRequest::CreateChannel { name } => {
+                    match state.create_channel_of_kind(member, &name, ChannelKind::Public, vec![]) {
+                        Ok(_) => channel_list_refresh(state, member),
+                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    }
+                }
                 PartyRequest::SendDm { to, text } => match state.post_dm(member, to, text) {
                     // Ack the sender (who appends locally); deliver to the recipient
                     // and to the sender's *other* devices.
@@ -250,6 +264,75 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     // never reveals a file the member isn't allowed to see.
                     None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
                 },
+
+                // --- Governance and file management ---------------------------
+                PartyRequest::CreateChannelOfKind {
+                    name,
+                    kind,
+                    members,
+                } => match state.create_channel_of_kind(member, &name, kind, members) {
+                    // A new channel changes what everyone may see, and private
+                    // channels are filtered per member, so each connection needs
+                    // its *own* view rather than one shared list.
+                    Ok(_) => channel_list_refresh(state, member),
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::DeleteChannel { channel } => {
+                    match state.delete_channel(member, channel) {
+                        Ok(msg) => {
+                            let mut out = channel_list_refresh(state, member);
+                            out.replies.push(PartyResponse::Ok(msg));
+                            out
+                        }
+                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    }
+                }
+                PartyRequest::SetChannelAccess {
+                    channel,
+                    kind,
+                    members,
+                } => match state.set_channel_access(member, channel, kind, members) {
+                    Ok(msg) => {
+                        let mut out = channel_list_refresh(state, member);
+                        out.replies.push(PartyResponse::Ok(msg));
+                        out
+                    }
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::SetRole {
+                    member: target,
+                    role,
+                } => match state.set_role(member, target, role) {
+                    Ok(msg) => Dispatch {
+                        // A role change alters what the member may do, so their
+                        // directory entry — and everyone's view of it — refreshes.
+                        replies: vec![
+                            PartyResponse::Members(state.members()),
+                            PartyResponse::Ok(msg),
+                        ],
+                        broadcast: vec![PartyResponse::Members(state.members())],
+                        directed: Vec::new(),
+                    },
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
+                PartyRequest::ListFiles => {
+                    Dispatch::reply(PartyResponse::Files(state.files_for(member)))
+                }
+                PartyRequest::DeleteFile { hash, channel } => {
+                    match state.delete_file(member, &hash, channel) {
+                        Ok(msg) => Dispatch::reply(PartyResponse::Ok(msg)),
+                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    }
+                }
+                PartyRequest::FetchAuditLog { limit } => {
+                    match state.audit_log(member, limit.clamp(1, 1000) as usize) {
+                        Ok(entries) => Dispatch::reply(PartyResponse::AuditLog(entries)),
+                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                    }
+                }
+                PartyRequest::FetchQuota => {
+                    Dispatch::reply(PartyResponse::Quota(state.quota_for(member)))
+                }
             }
         }
     }
@@ -548,9 +631,15 @@ mod tests {
                 name: "random".to_string(),
             },
         );
-        // Creator gets the refreshed list, and others get it broadcast.
+        // The creator gets their own filtered list. Everyone else is nudged to
+        // re-fetch theirs rather than being handed this one: the list is per
+        // member now, so broadcasting one member's view would either leak
+        // private channels or hide them from the people who are in them.
         assert!(matches!(&out.replies[..], [PartyResponse::Channels(c)] if c.len() == 2));
-        assert!(matches!(&out.broadcast[..], [PartyResponse::Channels(c)] if c.len() == 2));
+        assert!(matches!(
+            &out.broadcast[..],
+            [PartyResponse::DirectoryChanged]
+        ));
     }
 
     #[test]

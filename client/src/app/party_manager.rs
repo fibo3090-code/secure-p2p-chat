@@ -25,8 +25,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, bail, Result};
 use messenger_core::party::{
-    blob_hash, dm_thread_id, ChannelInfo, Envelope, FileMeta, MemberInfo, MessagePayload,
-    PartyRequest, PartyResponse, TrustTier, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
+    blob_hash, dm_thread_id, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
+    MemberInfo, MessagePayload, PartyRequest, PartyResponse, QuotaInfo, Role, TrustTier,
+    MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
 use rsa::RsaPrivateKey;
@@ -82,6 +83,15 @@ pub struct PartyServerConn {
     /// surfaced in the UI until superseded. Without this, server errors were
     /// silently dropped and a failed action looked like it simply did nothing.
     pub last_error: Option<String>,
+    /// The most recent successful governance action, for a confirmation toast.
+    pub last_notice: Option<String>,
+    /// Files shared here that this member may see (the Drive panel), refreshed
+    /// by `ListFiles`.
+    pub files: Vec<FileEntry>,
+    /// This member's storage usage, refreshed by `FetchQuota`.
+    pub quota: Option<QuotaInfo>,
+    /// The server's audit log, newest first. Only ever populated for admins.
+    pub audit: Vec<AuditEntry>,
     /// Channels (and DM threads) whose durable history has been requested since
     /// this connection joined, so a refreshed channel list does not re-fetch
     /// everything on every broadcast.
@@ -310,6 +320,10 @@ impl PartyManager {
             members: Vec::new(),
             messages: HashMap::new(),
             last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
             history_requested: HashSet::new(),
             pending_sends: VecDeque::new(),
             outgoing_tx,
@@ -413,6 +427,92 @@ impl PartyManager {
             .get(&server_id)
             .ok_or_else(|| anyhow!("unknown server"))?;
         conn.send(PartyRequest::CreateChannel { name })
+    }
+
+    /// Create a channel of a specific kind. `members` seeds a private channel's
+    /// membership and is ignored for every other kind.
+    pub fn create_channel_of_kind(
+        &self,
+        server_id: Uuid,
+        name: String,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
+    ) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::CreateChannelOfKind {
+                name,
+                kind,
+                members,
+            })
+    }
+
+    /// Delete a channel and its history (admins only, enforced by the server).
+    pub fn delete_channel(&self, server_id: Uuid, channel: Uuid) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::DeleteChannel { channel })
+    }
+
+    /// Change a channel's kind and private membership (admins only).
+    pub fn set_channel_access(
+        &self,
+        server_id: Uuid,
+        channel: Uuid,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
+    ) -> Result<()> {
+        self.conn(server_id)?.send(PartyRequest::SetChannelAccess {
+            channel,
+            kind,
+            members,
+        })
+    }
+
+    /// Change another member's role (admins only).
+    pub fn set_role(&self, server_id: Uuid, member: Uuid, role: Role) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::SetRole { member, role })
+    }
+
+    /// Ask for the files this member may see; the answer lands in
+    /// `PartyServerConn::files`.
+    pub fn refresh_files(&self, server_id: Uuid) -> Result<()> {
+        let conn = self.conn(server_id)?;
+        conn.send(PartyRequest::ListFiles)?;
+        conn.send(PartyRequest::FetchQuota)
+    }
+
+    /// Delete one share of a file (its uploader, or an admin).
+    pub fn delete_file(&self, server_id: Uuid, hash: String, location: Uuid) -> Result<()> {
+        self.conn(server_id)?.send(PartyRequest::DeleteFile {
+            hash,
+            channel: location,
+        })
+    }
+
+    /// Ask for the audit log; the answer lands in `PartyServerConn::audit`.
+    pub fn refresh_audit(&self, server_id: Uuid, limit: u32) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::FetchAuditLog { limit })
+    }
+
+    /// This client's role on a server, or `None` before the directory arrives.
+    pub fn my_role(&self, server_id: Uuid) -> Option<Role> {
+        let conn = self.servers.get(&server_id)?;
+        let me = conn.member_id?;
+        conn.members.iter().find(|m| m.id == me).map(|m| m.role)
+    }
+
+    /// Clear the last governance notice once the UI has shown it.
+    pub fn clear_notice(&mut self, server_id: Uuid) {
+        if let Some(conn) = self.servers.get_mut(&server_id) {
+            conn.last_notice = None;
+        }
+    }
+
+    fn conn(&self, server_id: Uuid) -> Result<&PartyServerConn> {
+        self.servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))
     }
 
     /// Upload a file to a channel: append it optimistically (so the sender sees it
@@ -742,6 +842,17 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             fail_pending_downloads(conn, &message);
             conn.last_error = Some(message);
         }
+        // The channel list is per member now (private channels are filtered), so
+        // the server nudges instead of broadcasting a list that would be wrong
+        // for somebody. Ask for our own.
+        PartyResponse::DirectoryChanged => {
+            let _ = conn.send(PartyRequest::ListChannels);
+            let _ = conn.send(PartyRequest::ListMembers);
+        }
+        PartyResponse::Files(files) => conn.files = files,
+        PartyResponse::Quota(quota) => conn.quota = Some(quota),
+        PartyResponse::AuditLog(entries) => conn.audit = entries,
+        PartyResponse::Ok(message) => conn.last_notice = Some(message),
     }
 }
 
@@ -772,6 +883,10 @@ mod tests {
             members: Vec::new(),
             messages: HashMap::new(),
             last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
             history_requested: HashSet::new(),
             pending_sends: VecDeque::new(),
             outgoing_tx,
@@ -806,6 +921,7 @@ mod tests {
                 id: channel,
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             },
         ])))
         .unwrap();
@@ -820,6 +936,7 @@ mod tests {
                 id: me,
                 username: "alice".to_string(),
                 online: true,
+                role: Role::Member,
             },
         ])))
         .unwrap();
@@ -1140,6 +1257,7 @@ mod tests {
                 id: channel,
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             },
         ])))
         .unwrap();
@@ -1148,11 +1266,13 @@ mod tests {
                 id: me,
                 username: "alice".to_string(),
                 online: true,
+                role: Role::Member,
             },
             MemberInfo {
                 id: peer,
                 username: "bob".to_string(),
                 online: true,
+                role: Role::Member,
             },
         ])))
         .unwrap();
@@ -1179,6 +1299,7 @@ mod tests {
                 id: channel,
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             },
         ])))
         .unwrap();
