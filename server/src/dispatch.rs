@@ -8,7 +8,7 @@
 //! a request off the v3 tunnel, calls [`handle_request`], encrypts the replies, and
 //! separately broadcasts newly posted messages to other online members.
 
-use messenger_core::party::{PartyRequest, PartyResponse};
+use messenger_core::party::{Envelope, PartyRequest, PartyResponse};
 use uuid::Uuid;
 
 use crate::state::PartyState;
@@ -74,6 +74,23 @@ impl ConnState {
     }
 }
 
+/// Where a stored DM envelope has to be delivered: to the recipient, and to the
+/// sender's *other* connections.
+///
+/// The runtime excludes the originating connection when it fans `directed` out,
+/// so the sender's own client is not sent a duplicate of the message it already
+/// appended optimistically — but its other devices, which know nothing about the
+/// send, are. A self-DM collapses to a single entry so it is not delivered twice.
+fn dm_delivery(from: Uuid, to: Uuid, env: Envelope) -> Vec<(Uuid, PartyResponse)> {
+    if from == to {
+        return vec![(to, PartyResponse::Message(env))];
+    }
+    vec![
+        (to, PartyResponse::Message(env.clone())),
+        (from, PartyResponse::Message(env)),
+    ]
+}
+
 /// Apply `req` to `state` for the connection `conn`, returning the responses to
 /// send back to that client. Newly posted messages are stored in `state`; the
 /// runtime is responsible for broadcasting them to other connections.
@@ -101,11 +118,20 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
             ) {
                 Ok(id) => {
                     conn.member = Some(id);
-                    Dispatch::reply(PartyResponse::Joined {
-                        member_id: id,
-                        server_name: state.name().to_string(),
-                        tier: state.tier(),
-                    })
+                    Dispatch {
+                        replies: vec![PartyResponse::Joined {
+                            member_id: id,
+                            server_name: state.name().to_string(),
+                            tier: state.tier(),
+                        }],
+                        // Everyone else's directory just went stale: either a new
+                        // member appeared or a returning one came back online.
+                        // Nothing used to announce this, so every client's member
+                        // list was frozen at the moment *it* joined — new members
+                        // never showed up and the online dots never changed.
+                        broadcast: vec![PartyResponse::Members(state.members())],
+                        directed: Vec::new(),
+                    }
                 }
                 Err(e) => {
                     conn.join_failures = conn.join_failures.saturating_add(1);
@@ -161,14 +187,15 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                 },
                 PartyRequest::SendDm { to, text } => match state.post_dm(member, to, text) {
-                    // Ack the sender (who appends locally); deliver to the recipient.
+                    // Ack the sender (who appends locally); deliver to the recipient
+                    // and to the sender's *other* devices.
                     Ok(env) => Dispatch {
                         replies: vec![PartyResponse::MessagePosted {
                             channel: env.channel,
                             seq: env.seq,
                         }],
                         broadcast: Vec::new(),
-                        directed: vec![(to, PartyResponse::Message(env))],
+                        directed: dm_delivery(member, to, env),
                     },
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                         channel: messenger_core::party::dm_thread_id(member, to),
@@ -202,14 +229,15 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     mime,
                     data,
                 } => match state.post_file_dm(member, to, name, mime, data) {
-                    // Like SendDm: ack the sender, deliver to the recipient.
+                    // Like SendDm: ack the sender, deliver to the recipient and to
+                    // the sender's other devices.
                     Ok(env) => Dispatch {
                         replies: vec![PartyResponse::MessagePosted {
                             channel: env.channel,
                             seq: env.seq,
                         }],
                         broadcast: Vec::new(),
-                        directed: vec![(to, PartyResponse::Message(env))],
+                        directed: dm_delivery(member, to, env),
                     },
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                         channel: messenger_core::party::dm_thread_id(member, to),
@@ -288,6 +316,106 @@ mod tests {
             other => panic!("expected a rate-limited rejection, got {other:?}"),
         }
         assert_eq!(conn.member(), None);
+    }
+
+    /// Everyone already connected has to be told the directory changed, or their
+    /// member list stays frozen at the moment they themselves joined — new
+    /// members never appear and the online dots never move.
+    #[test]
+    fn joining_broadcasts_the_refreshed_directory() {
+        let mut state = PartyState::new("Srv", None);
+        let mut alice = ConnState::default();
+        handle_request(
+            &mut state,
+            &mut alice,
+            PartyRequest::Join {
+                username: "alice".to_string(),
+                password: None,
+            },
+        );
+
+        let mut bob = ConnState::default();
+        let out = handle_request(
+            &mut state,
+            &mut bob,
+            PartyRequest::Join {
+                username: "bob".to_string(),
+                password: None,
+            },
+        );
+
+        assert!(matches!(out.replies[..], [PartyResponse::Joined { .. }]));
+        match &out.broadcast[..] {
+            [PartyResponse::Members(members)] => {
+                let names: Vec<&str> = members.iter().map(|m| m.username.as_str()).collect();
+                assert_eq!(names, vec!["alice", "bob"]);
+                assert!(members.iter().all(|m| m.online));
+            }
+            other => panic!("expected a Members broadcast, got {other:?}"),
+        }
+    }
+
+    /// A DM must be delivered to the recipient *and* echoed to the sender's other
+    /// devices. The runtime excludes the originating connection, so the echo
+    /// cannot duplicate the message on the client that sent it.
+    #[test]
+    fn a_dm_is_directed_to_both_participants() {
+        let mut state = PartyState::new("Srv", None);
+        let mut alice_conn = ConnState::default();
+        let alice = match &join(&mut state, &mut alice_conn, "alice", None)[..] {
+            [PartyResponse::Joined { member_id, .. }] => *member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        };
+        let mut bob_conn = ConnState::default();
+        let bob = match &join(&mut state, &mut bob_conn, "bob", None)[..] {
+            [PartyResponse::Joined { member_id, .. }] => *member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        };
+
+        let out = handle_request(
+            &mut state,
+            &mut alice_conn,
+            PartyRequest::SendDm {
+                to: bob,
+                text: "hello".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            out.replies[..],
+            [PartyResponse::MessagePosted { .. }]
+        ));
+        let targets: Vec<Uuid> = out.directed.iter().map(|(m, _)| *m).collect();
+        assert_eq!(
+            targets,
+            vec![bob, alice],
+            "the recipient and the sender's other devices both need this DM"
+        );
+        assert!(out
+            .directed
+            .iter()
+            .all(|(_, r)| matches!(r, PartyResponse::Message(_))));
+    }
+
+    /// A DM addressed to yourself must not be delivered twice.
+    #[test]
+    fn a_self_dm_is_delivered_once() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        let me = match &join(&mut state, &mut conn, "alice", None)[..] {
+            [PartyResponse::Joined { member_id, .. }] => *member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        };
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::SendDm {
+                to: me,
+                text: "note to self".to_string(),
+            },
+        );
+        assert_eq!(out.directed.len(), 1);
+        assert_eq!(out.directed[0].0, me);
     }
 
     /// The cap counts *failures*, so an honest user who mistypes once and then

@@ -735,10 +735,8 @@ impl TuiApp {
                 let count = self.chat_manager.active_transfers_sorted().len();
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if count > 0 {
-                            self.transfer_sel = (self.transfer_sel + 1).min(count - 1);
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                        self.transfer_sel = (self.transfer_sel + 1).min(count - 1);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.transfer_sel = self.transfer_sel.saturating_sub(1);

@@ -71,18 +71,47 @@ impl Hub {
         }
     }
 
-    /// Push `resp` to every connection belonging to `member` (DM delivery).
-    pub fn send_to_member(&self, member: Uuid, resp: PartyResponse) {
+    /// Push `resp` to every connection belonging to `member` *except* `except`
+    /// (DM delivery). Pass [`Uuid::nil`] to reach all of them — no real
+    /// connection id is nil.
+    ///
+    /// The exclusion is what makes a DM show up on the sender's other devices.
+    /// The originating connection already appended the message optimistically and
+    /// gets a `MessagePosted` ack, so echoing to it too would duplicate the
+    /// message; every *other* connection of the same member has no idea the send
+    /// happened and would otherwise never learn about it — which is why a DM sent
+    /// from one device used to be invisible on that member's second device, while
+    /// a channel post (fanned out by connection, not by member) was not.
+    pub fn send_to_member_except(&self, member: Uuid, except: Uuid, resp: PartyResponse) {
         let mut conns = self.conns.lock().unwrap();
         let mut stuck: Vec<Uuid> = Vec::new();
         for (id, conn) in conns.iter() {
-            if conn.member == member {
+            if conn.member == member && *id != except {
                 Self::push(*id, conn, resp.clone(), &mut stuck);
             }
         }
         for id in stuck {
             conns.remove(&id);
         }
+    }
+
+    /// Push `resp` to every registered connection, including the originator.
+    /// Used for directory refreshes, where the originating connection is gone
+    /// (a disconnect) or is not special (a presence change).
+    pub fn broadcast_all(&self, resp: PartyResponse) {
+        self.broadcast_except(Uuid::nil(), resp);
+    }
+
+    /// Whether `member` still has at least one registered connection.
+    ///
+    /// Presence is per-member but connections are per-device, so a member with
+    /// two clients open must not be marked offline when the first one closes.
+    pub fn member_is_connected(&self, member: Uuid) -> bool {
+        self.conns
+            .lock()
+            .unwrap()
+            .values()
+            .any(|c| c.member == member)
     }
 
     /// Non-blocking send. The critical section holds a `std::sync::Mutex` and
@@ -150,12 +179,61 @@ mod tests {
         hub.register(Uuid::new_v4(), member_a, a_tx);
         hub.register(Uuid::new_v4(), member_b, b_tx);
 
-        hub.send_to_member(member_b, PartyResponse::Error("dm".to_string()));
+        hub.send_to_member_except(
+            member_b,
+            Uuid::nil(),
+            PartyResponse::Error("dm".to_string()),
+        );
         assert!(a_rx.try_recv().is_err(), "member A must not receive B's DM");
         assert!(matches!(
             b_rx.try_recv(),
             Ok(PartyResponse::Error(ref m)) if m == "dm"
         ));
+    }
+
+    /// A DM has to reach the sender's *other* devices without being duplicated
+    /// on the one that sent it (which already showed it optimistically).
+    #[test]
+    fn send_to_member_except_reaches_other_devices_but_not_the_sending_one() {
+        let hub = Hub::new();
+        let member = Uuid::new_v4();
+        let (phone, laptop) = (Uuid::new_v4(), Uuid::new_v4());
+        let (phone_tx, mut phone_rx) = tokio::sync::mpsc::channel(BROADCAST_QUEUE_DEPTH);
+        let (laptop_tx, mut laptop_rx) = tokio::sync::mpsc::channel(BROADCAST_QUEUE_DEPTH);
+        hub.register(phone, member, phone_tx);
+        hub.register(laptop, member, laptop_tx);
+
+        // The phone sent the DM, so only the laptop should be told about it.
+        hub.send_to_member_except(member, phone, PartyResponse::Error("dm".to_string()));
+        assert!(
+            phone_rx.try_recv().is_err(),
+            "the sending device already has this message"
+        );
+        assert!(matches!(
+            laptop_rx.try_recv(),
+            Ok(PartyResponse::Error(ref m)) if m == "dm"
+        ));
+    }
+
+    /// Presence is per-member, connections are per-device: a member with two
+    /// clients open is still connected after one of them closes.
+    #[test]
+    fn a_member_stays_connected_while_any_of_their_devices_remains() {
+        let hub = Hub::new();
+        let member = Uuid::new_v4();
+        let (phone, laptop) = (Uuid::new_v4(), Uuid::new_v4());
+        let (phone_tx, _p) = tokio::sync::mpsc::channel(BROADCAST_QUEUE_DEPTH);
+        let (laptop_tx, _l) = tokio::sync::mpsc::channel(BROADCAST_QUEUE_DEPTH);
+        hub.register(phone, member, phone_tx);
+        hub.register(laptop, member, laptop_tx);
+
+        hub.unregister(phone);
+        assert!(
+            hub.member_is_connected(member),
+            "the laptop is still connected, so the member is not offline"
+        );
+        hub.unregister(laptop);
+        assert!(!hub.member_is_connected(member));
     }
 
     /// A joined client that stops reading its socket must not be able to grow

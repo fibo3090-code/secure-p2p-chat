@@ -615,7 +615,10 @@ impl PartyState {
             if stored.saturating_add(size) > self.max_blob_bytes {
                 return Err("server file storage is full".to_string());
             }
-            self.write_blob_file(&hash, &data);
+            // Store the bytes before recording the blob: if this fails there must
+            // be no row and no in-memory record, so the upload is refused cleanly
+            // rather than leaving a message pointing at a file nobody can fetch.
+            self.write_blob_file(&hash, &data)?;
             self.persist_blob_row(&hash, size, mime, 1);
             // Only keep the bytes resident when there is nowhere to read them
             // back from; a disk-backed store reads on demand.
@@ -829,12 +832,24 @@ impl PartyState {
         }
     }
 
-    fn write_blob_file(&self, hash: &str, data: &[u8]) {
-        let Some(dir) = &self.blob_dir else { return };
+    /// Write a blob's bytes to the on-disk store.
+    ///
+    /// Unlike the other persistence helpers this one **propagates** its error.
+    /// The rest are mirrors of state that is already correct in memory, so a
+    /// failed write costs durability and nothing else. These bytes are different:
+    /// when the store is disk-backed nothing keeps them resident, so a write that
+    /// failed silently left a blob recorded but unreadable — the upload was
+    /// acknowledged, the file message was broadcast to the whole channel, and
+    /// every download of it answered "unknown file" forever.
+    fn write_blob_file(&self, hash: &str, data: &[u8]) -> Result<(), String> {
+        let Some(dir) = &self.blob_dir else {
+            return Ok(()); // memory-only store: the bytes stay resident instead
+        };
         let path = dir.join(hash);
-        if let Err(e) = std::fs::write(&path, data) {
+        std::fs::write(&path, data).map_err(|e| {
             tracing::error!(error = %e, path = %path.display(), "failed to write file blob");
-        }
+            "the server could not store this file".to_string()
+        })
     }
 
     fn persist_blob_row(&self, hash: &str, size: u64, mime: &str, refcount: u32) {
@@ -1494,6 +1509,44 @@ mod tests {
         }
         let s = PartyState::load("Srv", None, dir.path()).unwrap();
         assert_eq!(s.dm_history(thread, 0).len(), 1);
+    }
+
+    /// A blob whose bytes cannot be written must fail the upload outright.
+    ///
+    /// The failure this guards is silent and permanent: the write error used to
+    /// be logged and swallowed, so the blob was recorded, the file message was
+    /// posted and broadcast to the whole channel, and every download of it
+    /// answered "unknown file" from then on — with the sender told it worked.
+    #[test]
+    fn an_unwritable_blob_store_refuses_the_upload_instead_of_posting_a_dead_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let channel = state.default_channel();
+
+        // Replace the blob directory with a regular file, so writing any blob
+        // path inside it fails at the filesystem level.
+        let blob_dir = dir.path().join(BLOB_DIR);
+        std::fs::remove_dir_all(&blob_dir).unwrap();
+        std::fs::write(&blob_dir, b"not a directory").unwrap();
+
+        let err = state
+            .post_file(
+                alice,
+                channel,
+                "report.pdf".to_string(),
+                "application/pdf".to_string(),
+                b"payload".to_vec(),
+            )
+            .expect_err("an upload whose bytes cannot be stored must fail");
+        assert!(
+            err.contains("could not store"),
+            "expected a storage error, got: {err}"
+        );
+
+        // Nothing was recorded: no message in the channel, and no blob to serve.
+        assert!(state.history_since(alice, channel, 0).is_empty());
+        assert!(state.blob_bytes(&blob_hash(b"payload")).is_none());
     }
 
     #[test]

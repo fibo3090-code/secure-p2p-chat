@@ -92,7 +92,10 @@ where
                     hub.broadcast_except(conn_id, resp);
                 }
                 for (member, resp) in outcome.directed {
-                    hub.send_to_member(member, resp);
+                    // Excluding this connection lets a DM be delivered to the
+                    // sender's *other* devices without duplicating it on the one
+                    // that sent it (which already appended it optimistically).
+                    hub.send_to_member_except(member, conn_id, resp);
                 }
             }
         }
@@ -100,7 +103,19 @@ where
 
     hub.unregister(conn_id);
     if let Some(member) = conn.member() {
-        state.lock().await.set_online(member, false);
+        // Presence is per-member but connections are per-device: only go offline
+        // once this member's *last* connection is gone, or closing one of two
+        // open clients would report them as offline while they are still here.
+        if !hub.member_is_connected(member) {
+            let directory = {
+                let mut st = state.lock().await;
+                st.set_online(member, false);
+                st.members()
+            };
+            // Tell everyone still connected. Without this the online dots only
+            // ever moved when a client happened to re-request the directory.
+            hub.broadcast_all(PartyResponse::Members(directory));
+        }
     }
     Ok(())
 }
@@ -116,11 +131,21 @@ mod tests {
 
     type TestClient = PartyClient<DuplexStream>;
 
-    /// Send a request and read the next response. Valid in these tests because no
-    /// broadcast interleaves during a single-stepped exchange.
+    /// Send a request and read the reply, skipping pushed directory refreshes.
+    ///
+    /// A member joining broadcasts the updated directory to everyone already
+    /// connected, so a client that was online first has a `Members` frame waiting
+    /// ahead of its own next reply. Real clients apply pushes and replies from one
+    /// interleaved stream (`PartyManager::apply` does); these single-stepped tests
+    /// skip the pushes so they can assert on the reply they asked for.
     async fn request(client: &mut TestClient, req: PartyRequest) -> PartyResponse {
         client.send(&req).await.unwrap();
-        client.recv().await.unwrap()
+        loop {
+            match client.recv().await.unwrap() {
+                PartyResponse::Members(_) => continue,
+                other => return other,
+            }
+        }
     }
 
     /// Spawn a `serve_connection` task and connect a real `PartyClient` to it.
@@ -342,5 +367,57 @@ mod tests {
         drop(bob);
         alice_srv.abort();
         bob_srv.abort();
+    }
+
+    /// When a member's last connection goes away, everyone still connected must
+    /// be told. Nothing announced this before, so a member who left showed as
+    /// online in every other client until something else happened to refresh the
+    /// directory — which, since nothing refreshed it either, meant forever.
+    #[tokio::test]
+    async fn leaving_broadcasts_the_member_as_offline() {
+        let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let server_priv_b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+
+        let (mut alice, alice_srv) =
+            connect(server_priv_a, &alice_priv, state.clone(), hub.clone()).await;
+        let (mut bob, bob_srv) =
+            connect(server_priv_b, &bob_priv, state.clone(), hub.clone()).await;
+
+        alice.join("alice", None).await.unwrap();
+        bob.join("bob", None).await.unwrap();
+
+        // Alice sees the directory push from Bob's join: both online.
+        match alice.recv().await.unwrap() {
+            PartyResponse::Members(members) => {
+                assert_eq!(members.len(), 2);
+                assert!(members.iter().all(|m| m.online), "both are connected");
+            }
+            other => panic!("expected a Members push after Bob joined, got {other:?}"),
+        }
+
+        // Bob's connection ends.
+        drop(bob);
+        bob_srv.await.ok();
+
+        // Alice is told, without having asked.
+        match alice.recv().await.unwrap() {
+            PartyResponse::Members(members) => {
+                let bob = members
+                    .iter()
+                    .find(|m| m.username == "bob")
+                    .expect("bob is still a member, just offline");
+                assert!(!bob.online, "bob disconnected and must show as offline");
+                let alice_entry = members.iter().find(|m| m.username == "alice").unwrap();
+                assert!(alice_entry.online, "alice is still connected");
+            }
+            other => panic!("expected an offline directory push, got {other:?}"),
+        }
+
+        drop(alice);
+        alice_srv.abort();
     }
 }

@@ -474,11 +474,31 @@ fn party_signature(p: &PartyManager) -> u64 {
         if let Some(conn) = p.server(sid) {
             format!("{:?}", conn.status).hash(&mut h);
             conn.server_name.hash(&mut h);
-            conn.channels.len().hash(&mut h);
-            conn.members.len().hash(&mut h);
-            conn.last_error.is_some().hash(&mut h);
-            let total_msgs: usize = conn.messages.values().map(|v| v.len()).sum();
-            total_msgs.hash(&mut h);
+            // Hash what is actually *shown*, not how many rows there are. Hashing
+            // the counts meant a member going online or offline — the count is
+            // unchanged — produced an identical signature, so `party-updated`
+            // never fired and the presence dots sat stale until something else
+            // happened to change a count.
+            for c in &conn.channels {
+                c.id.hash(&mut h);
+                c.name.hash(&mut h);
+                format!("{:?}", c.kind).hash(&mut h);
+            }
+            for m in &conn.members {
+                m.id.hash(&mut h);
+                m.username.hash(&mut h);
+                m.online.hash(&mut h);
+            }
+            conn.last_error.hash(&mut h);
+            // Per thread, the length *and* the last sequence: a retraction paired
+            // with an arrival leaves the total unchanged but is a real change.
+            let mut threads: Vec<_> = conn.messages.iter().collect();
+            threads.sort_by_key(|(id, _)| **id);
+            for (thread, msgs) in threads {
+                thread.hash(&mut h);
+                msgs.len().hash(&mut h);
+                msgs.last().map(|e| (e.seq, e.timestamp)).hash(&mut h);
+            }
         }
     }
     h.finish()
