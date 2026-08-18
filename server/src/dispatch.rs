@@ -8,7 +8,9 @@
 //! a request off the v3 tunnel, calls [`handle_request`], encrypts the replies, and
 //! separately broadcasts newly posted messages to other online members.
 
-use messenger_core::party::{ChannelKind, Envelope, PartyRequest, PartyResponse};
+use messenger_core::party::{
+    ChannelKind, Envelope, PartyRequest, PartyResponse, UploadTarget, PARTY_CHUNK_BYTES,
+};
 use uuid::Uuid;
 
 use crate::state::PartyState;
@@ -56,6 +58,10 @@ pub struct ConnState {
     peer_fingerprint: Option<String>,
     /// Rejected join attempts on this connection (see [`MAX_JOIN_ATTEMPTS`]).
     join_failures: u32,
+    /// Chunked uploads this connection started and has not finished. Tracked
+    /// here so they can be discarded when the connection ends, and so the
+    /// per-connection concurrency cap has something to count.
+    uploads: Vec<Uuid>,
 }
 
 impl ConnState {
@@ -65,7 +71,13 @@ impl ConnState {
             member: None,
             peer_fingerprint: Some(fingerprint),
             join_failures: 0,
+            uploads: Vec::new(),
         }
+    }
+
+    /// Uploads this connection left in flight, for cleanup on disconnect.
+    pub fn open_uploads(&self) -> &[Uuid] {
+        &self.uploads
     }
 
     /// The joined member's id, if this connection has completed `Join`.
@@ -89,6 +101,15 @@ fn dm_delivery(from: Uuid, to: Uuid, env: Envelope) -> Vec<(Uuid, PartyResponse)
         (to, PartyResponse::Message(env.clone())),
         (from, PartyResponse::Message(env)),
     ]
+}
+
+/// The thread a failed upload belongs to, so `ActionFailed` can be correlated
+/// with the message the client is already showing.
+fn upload_thread(member: Uuid, target: UploadTarget) -> Uuid {
+    match target {
+        UploadTarget::Channel(id) => id,
+        UploadTarget::Dm(to) => messenger_core::party::dm_thread_id(member, to),
+    }
 }
 
 /// Reply with the requester's own filtered channel list, and nudge everyone else
@@ -332,6 +353,81 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 }
                 PartyRequest::FetchQuota => {
                     Dispatch::reply(PartyResponse::Quota(state.quota_for(member)))
+                }
+
+                // --- Chunked upload / download ------------------------------
+                PartyRequest::StartUpload {
+                    name,
+                    mime,
+                    size,
+                    target,
+                } => {
+                    match state.start_upload(member, name, mime, size, target, conn.uploads.len()) {
+                        Ok(upload) => {
+                            conn.uploads.push(upload);
+                            Dispatch::reply(PartyResponse::UploadReady {
+                                upload,
+                                chunk_size: PARTY_CHUNK_BYTES as u32,
+                            })
+                        }
+                        // `ActionFailed`, not `Error`: the client shows the file
+                        // optimistically the moment it starts sending, so a
+                        // refusal has to be attributable to that message.
+                        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
+                            channel: upload_thread(member, target),
+                            reason,
+                        }),
+                    }
+                }
+                PartyRequest::UploadChunk { upload, data } => {
+                    match state.upload_chunk(member, upload, &data) {
+                        Ok(()) => Dispatch::default(),
+                        Err(reason) => {
+                            conn.uploads.retain(|u| *u != upload);
+                            Dispatch::reply(PartyResponse::Error(reason))
+                        }
+                    }
+                }
+                PartyRequest::FinishUpload { upload } => {
+                    conn.uploads.retain(|u| *u != upload);
+                    match state.finish_upload(member, upload) {
+                        Ok((env, UploadTarget::Channel(_))) => Dispatch {
+                            replies: vec![PartyResponse::MessagePosted {
+                                channel: env.channel,
+                                seq: env.seq,
+                            }],
+                            broadcast: vec![PartyResponse::Message(env)],
+                            directed: Vec::new(),
+                        },
+                        Ok((env, UploadTarget::Dm(to))) => Dispatch {
+                            replies: vec![PartyResponse::MessagePosted {
+                                channel: env.channel,
+                                seq: env.seq,
+                            }],
+                            broadcast: Vec::new(),
+                            directed: dm_delivery(member, to, env),
+                        },
+                        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
+                            channel: Uuid::nil(),
+                            reason,
+                        }),
+                    }
+                }
+                PartyRequest::CancelUpload { upload } => {
+                    conn.uploads.retain(|u| *u != upload);
+                    state.cancel_upload(member, upload);
+                    Dispatch::default()
+                }
+                PartyRequest::DownloadChunk { hash, offset } => {
+                    match state.blob_chunk_for(member, &hash, offset) {
+                        Some((data, total)) => Dispatch::reply(PartyResponse::FileChunk {
+                            hash,
+                            offset,
+                            total,
+                            data,
+                        }),
+                        None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
+                    }
                 }
             }
         }

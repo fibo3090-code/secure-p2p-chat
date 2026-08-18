@@ -31,10 +31,34 @@ pub enum TrustTier {
     E2EE,
 }
 
-/// Maximum size of a file uploaded inline in a single Party request (Phase 2,
-/// slice 1). Larger files will use chunked transfer in a later slice. Kept well
-/// under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
+/// Maximum size of a file uploaded inline in a single Party request. Anything
+/// larger goes through the chunked path ([`PartyRequest::StartUpload`]). Kept
+/// well under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
 pub const MAX_INLINE_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Bytes of file data carried by one [`PartyRequest::UploadChunk`] or
+/// [`PartyResponse::FileChunk`].
+///
+/// Small enough that a chunk plus its framing is nowhere near
+/// [`crate::MAX_PACKET_SIZE`], and small enough that a cancelled transfer wastes
+/// little; large enough that a 100 MiB file is a few hundred round trips rather
+/// than tens of thousands.
+pub const PARTY_CHUNK_BYTES: usize = 256 * 1024; // 256 KiB
+
+/// Largest file a community server will accept at all, inline or chunked.
+///
+/// Distinct from the per-member quota: the quota bounds what one member may
+/// *hold*, this bounds what a single transfer may cost the server in spool
+/// space and time before it is either committed or thrown away.
+pub const MAX_PARTY_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
+/// Where a chunked upload will be posted once it completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UploadTarget {
+    Channel(Uuid),
+    /// A direct message to this member.
+    Dm(Uuid),
+}
 
 /// Metadata describing a file shared in a channel or DM. The file's bytes are
 /// stored content-addressed by `hash` (lowercase hex SHA-256); `name` is the
@@ -309,6 +333,28 @@ pub enum PartyRequest {
     FetchAuditLog { limit: u32 },
     /// Storage the caller has used and is allowed to use.
     FetchQuota,
+
+    // --- Chunked file transfer (appended; keep the order stable) --------------
+    /// Begin a chunked upload. `size` is declared up front so the server can
+    /// refuse — quota, ceiling, unknown channel — before any bytes move rather
+    /// than after spooling a hundred megabytes.
+    StartUpload {
+        name: String,
+        mime: String,
+        size: u64,
+        target: UploadTarget,
+    },
+    /// One chunk of an in-progress upload, in order. At most
+    /// [`PARTY_CHUNK_BYTES`].
+    UploadChunk { upload: Uuid, data: Vec<u8> },
+    /// All chunks sent: verify the assembled length, store the blob, and post
+    /// the file message.
+    FinishUpload { upload: Uuid },
+    /// Abandon an upload and discard its spool.
+    CancelUpload { upload: Uuid },
+    /// Fetch one chunk of a stored file, starting at `offset`. The reply carries
+    /// the total size, so the caller knows when it is done.
+    DownloadChunk { hash: String, offset: u64 },
 }
 
 /// One shared file as shown in the Drive panel: the blob plus the provenance the
@@ -436,6 +482,20 @@ pub enum PartyResponse {
     /// identical frame out to every connection. Broadcasting the channels
     /// directly would hand everyone the private ones.
     DirectoryChanged,
+    /// A chunked upload was accepted; send [`PartyRequest::UploadChunk`]s of at
+    /// most `chunk_size` bytes, then [`PartyRequest::FinishUpload`].
+    UploadReady {
+        upload: Uuid,
+        chunk_size: u32,
+    },
+    /// One chunk of a requested file. `total` is the whole file's size, so the
+    /// caller knows whether to ask for more; a short final chunk is normal.
+    FileChunk {
+        hash: String,
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// Most envelopes the server will put in one `History` response.

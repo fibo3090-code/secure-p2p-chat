@@ -359,10 +359,19 @@ async `FileData` response by content hash and saves via a native dialog).
   size, uploader, location and date, a per-member quota bar, download, and a
   two-click delete on the files the server says you may delete.
 
-**Remaining:** chunked transfer for large files (the 4 MiB inline cap stands
-until then); a full permission matrix (today's rules are role + channel-kind, not
-per-file grants); Party file commands in the TUI beyond `:party-send-file` /
-`:party-download`.
+**Chunked transfer (shipped):** files past `MAX_INLINE_FILE_BYTES` are offered
+with `StartUpload` (declaring their size, so the server refuses on quota,
+ceiling or permission *before* any bytes move), streamed as `UploadChunk`s of
+`PARTY_CHUNK_BYTES` (256 KiB), then committed with `FinishUpload`, which
+verifies the assembled length before storing. Downloads mirror it with
+`DownloadChunk`/`FileChunk` and are reassembled in order and checked against the
+requested hash. `MAX_PARTY_FILE_BYTES` (100 MiB) is the hard ceiling;
+`MAX_CONCURRENT_UPLOADS` bounds what one connection can hold, and a disconnect
+discards its spools. Both front-ends pick inline or chunked by size — nothing in
+the UI changes.
+
+**Remaining:** a full permission matrix (today's rules are role + channel-kind,
+not per-file grants).
 
 Target data model — content-addressable, deduplicated storage:
 
@@ -609,9 +618,10 @@ Each phase gets its own detailed plan before code lands.
 Phase 0  Workspace refactor                         ✅ done
 Phase 1  Party Server MVP (Administered)            ✅ core + SQLite done · UI polish remains
 UI       Tauri + React desktop app (§10)            ✅ shipped (A–F) · TUI redesign (G) remains
-Phase 2  Drive / files                              ◐ sharing, deletion, quotas,
-                                                      provenance + Drive panel done ·
-                                                      chunked transfer remains
+Phase 2  Drive / files                              ◐ sharing, chunked transfer,
+                                                      deletion, quotas, provenance +
+                                                      Drive panel done ·
+                                                      permission matrix remains
 Phase 3  Governance & roles                         ◐ roles, channel access, audit
                                                       log done · policies remain
 Phase 4  E2EE server tier
@@ -636,12 +646,12 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   Shipped in **1.15.0**. The owner chose a minor bump; note that the shipped
   desktop artifact changed name and installer, so existing installations of the
   retired GUI do not upgrade in place and have to be replaced manually.
-- **Phase 2 — Drive / files. ◐ everything but chunked transfer.** Inline (≤4 MiB)
-  content-addressed sharing in channels & DMs, working reference counting with
-  deletion and reclamation, `file_refs` provenance, physical + per-member logical
-  quotas, and the desktop Drive panel have all landed (see §8). **Remaining:**
-  chunked transfer for files past the inline cap, a per-file permission matrix,
-  and TUI parity for the file commands.
+- **Phase 2 — Drive / files. ◐ all but the permission matrix.** Content-addressed
+  sharing in channels & DMs (inline below 4 MiB, chunked above it up to 100 MiB),
+  working reference counting with deletion and reclamation, `file_refs`
+  provenance, physical + per-member logical quotas, and the Drive panel in both
+  front-ends have all landed (see §8). **Remaining:** a per-file permission
+  matrix.
 - **Phase 3 — Governance & roles. ◐ roles and audit done.** `Role`
   (Guest/Member/Admin/Owner) is enforced server-side, `ChannelKind` is a real
   access rule rather than a stored decoration, and an admin-only audit log

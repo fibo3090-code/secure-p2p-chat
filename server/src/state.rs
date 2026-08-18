@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use messenger_core::party::{
     blob_hash, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta, MemberInfo,
-    MessagePayload, QuotaInfo, Role, TrustTier, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
+    MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget, MAX_HISTORY_BATCH,
+    MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
@@ -165,6 +166,26 @@ struct FileRef {
     shared_at: u64,
 }
 
+/// A chunked upload in flight: bytes accumulate here until `FinishUpload`.
+///
+/// Spooled in memory rather than to disk because [`MAX_PARTY_FILE_BYTES`] and
+/// [`MAX_CONCURRENT_UPLOADS`] together bound what one connection can hold, and
+/// a temp file would need the same cleanup on every disconnect path anyway.
+struct PendingUpload {
+    uploader: Uuid,
+    name: String,
+    mime: String,
+    /// Size the uploader declared, checked before a byte was accepted.
+    declared: u64,
+    target: UploadTarget,
+    data: Vec<u8>,
+}
+
+/// Uploads one connection may have in flight at once. Each one can hold up to
+/// [`MAX_PARTY_FILE_BYTES`], so without a cap a single client could pin
+/// arbitrary server memory by starting uploads it never finishes.
+pub const MAX_CONCURRENT_UPLOADS: usize = 4;
+
 /// One recorded governance action.
 #[derive(Clone)]
 struct AuditRecord {
@@ -241,6 +262,8 @@ pub struct PartyState {
     file_refs: Vec<FileRef>,
     /// Governance actions, oldest first.
     audit: Vec<AuditRecord>,
+    /// Chunked uploads in flight, keyed by the id handed to the uploader.
+    uploads: HashMap<Uuid, PendingUpload>,
     /// Per-member ceiling on distinct uploaded bytes. Admins are exempt.
     max_member_blob_bytes: u64,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
@@ -272,6 +295,7 @@ impl PartyState {
             blobs: HashMap::new(),
             file_refs: Vec::new(),
             audit: Vec::new(),
+            uploads: HashMap::new(),
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             db: None,
@@ -1168,6 +1192,175 @@ impl PartyState {
         "Direct message".to_string()
     }
 
+    // --- Chunked upload (Phase 2, slice 2) --------------------------------------
+
+    /// Accept a chunked upload, or refuse it before a single byte moves.
+    ///
+    /// Everything checkable up front is checked here — the declared size against
+    /// the hard ceiling and the uploader's remaining allowance, and the target
+    /// against the permission rules — because the alternative is spooling a
+    /// hundred megabytes and then saying no.
+    pub fn start_upload(
+        &mut self,
+        uploader: Uuid,
+        name: String,
+        mime: String,
+        size: u64,
+        target: UploadTarget,
+        in_flight: usize,
+    ) -> Result<Uuid, String> {
+        if !self.is_member(uploader) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if in_flight >= MAX_CONCURRENT_UPLOADS {
+            return Err(format!(
+                "you already have {MAX_CONCURRENT_UPLOADS} uploads in progress"
+            ));
+        }
+        if size == 0 {
+            return Err("file is empty".to_string());
+        }
+        if size > MAX_PARTY_FILE_BYTES {
+            return Err(format!(
+                "file is larger than the {} limit for this server",
+                messenger_core::util::format_size(MAX_PARTY_FILE_BYTES)
+            ));
+        }
+        match target {
+            UploadTarget::Channel(channel) => self.member_can_post_to_channel(uploader, channel)?,
+            UploadTarget::Dm(to) => {
+                if !self.role_of(uploader).can_write() {
+                    return Err("your role on this server is read-only".to_string());
+                }
+                if !self.is_member(to) {
+                    return Err("recipient is not a member of this server".to_string());
+                }
+            }
+        }
+        // The quota check is provisional: content the server already holds costs
+        // nothing, but that is only knowable once the bytes have arrived, so the
+        // pessimistic answer is the one to give before accepting them.
+        if let Some(limit) = self.member_blob_limit(uploader) {
+            let used = self.member_blob_bytes(uploader);
+            if used.saturating_add(size) > limit {
+                return Err(format!(
+                    "this would exceed your {} file storage allowance ({} of it already used)",
+                    messenger_core::util::format_size(limit),
+                    messenger_core::util::format_size(used)
+                ));
+            }
+        }
+        let id = Uuid::new_v4();
+        self.uploads.insert(
+            id,
+            PendingUpload {
+                uploader,
+                name,
+                mime,
+                declared: size,
+                target,
+                data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Append one chunk. Refuses anything that would take the upload past the
+    /// size it declared — checking after the write would still have put the
+    /// excess in memory, which is the whole thing being bounded.
+    pub fn upload_chunk(
+        &mut self,
+        uploader: Uuid,
+        upload: Uuid,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if data.len() > PARTY_CHUNK_BYTES {
+            return Err("chunk is too large".to_string());
+        }
+        let Some(pending) = self.uploads.get_mut(&upload) else {
+            return Err("no such upload".to_string());
+        };
+        if pending.uploader != uploader {
+            return Err("no such upload".to_string());
+        }
+        let would_be = pending.data.len() as u64 + data.len() as u64;
+        if would_be > pending.declared {
+            let name = pending.name.clone();
+            self.uploads.remove(&upload);
+            return Err(format!("{name} sent more data than it declared"));
+        }
+        pending.data.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Complete an upload: store the assembled bytes and post the file message.
+    /// Returns the envelope to deliver, and whether it was a DM.
+    pub fn finish_upload(
+        &mut self,
+        uploader: Uuid,
+        upload: Uuid,
+    ) -> Result<(Envelope, UploadTarget), String> {
+        let Some(pending) = self.uploads.get(&upload) else {
+            return Err("no such upload".to_string());
+        };
+        if pending.uploader != uploader {
+            return Err("no such upload".to_string());
+        }
+        if (pending.data.len() as u64) != pending.declared {
+            let short = pending.declared - pending.data.len() as u64;
+            return Err(format!(
+                "upload is incomplete — {} still missing",
+                messenger_core::util::format_size(short)
+            ));
+        }
+        let pending = self.uploads.remove(&upload).expect("checked above");
+        let target = pending.target;
+        let envelope = match target {
+            UploadTarget::Channel(channel) => {
+                self.post_file_bytes(uploader, channel, pending.name, pending.mime, pending.data)?
+            }
+            UploadTarget::Dm(to) => {
+                self.post_file_dm_bytes(uploader, to, pending.name, pending.mime, pending.data)?
+            }
+        };
+        Ok((envelope, target))
+    }
+
+    /// Discard an in-flight upload. Called on an explicit cancel and on
+    /// disconnect, so a client that vanishes mid-transfer does not pin its spool
+    /// for the lifetime of the process.
+    pub fn cancel_upload(&mut self, uploader: Uuid, upload: Uuid) {
+        if self
+            .uploads
+            .get(&upload)
+            .is_some_and(|p| p.uploader == uploader)
+        {
+            self.uploads.remove(&upload);
+        }
+    }
+
+    /// Drop every upload belonging to `member` (their connection went away).
+    pub fn cancel_uploads_for(&mut self, member: Uuid) {
+        self.uploads.retain(|_, p| p.uploader != member);
+    }
+
+    /// One chunk of a stored blob, plus the file's total size, for a member who
+    /// is allowed to see it. `None` when unknown or not permitted — the same
+    /// answer either way, so the endpoint never reveals a file's existence.
+    pub fn blob_chunk_for(&self, member: Uuid, hash: &str, offset: u64) -> Option<(Vec<u8>, u64)> {
+        if !self.member_can_access_blob(member, hash) {
+            return None;
+        }
+        let bytes = self.blob_bytes(hash)?;
+        let total = bytes.len() as u64;
+        if offset >= total {
+            return Some((Vec::new(), total));
+        }
+        let start = offset as usize;
+        let end = (start + PARTY_CHUNK_BYTES).min(bytes.len());
+        Some((bytes[start..end].to_vec(), total))
+    }
+
     /// Validate an inline upload's size, returning the data on success.
     fn check_inline_size(data: Vec<u8>) -> Result<Vec<u8>, String> {
         if data.is_empty() {
@@ -1197,6 +1390,24 @@ impl PartyState {
         }
         self.member_can_post_to_channel(sender, channel)?;
         let data = Self::check_inline_size(data)?;
+        self.post_file_bytes(sender, channel, name, mime, data)
+    }
+
+    /// Store already-validated bytes and post them as a file message to
+    /// `channel`. Shared by the inline path and the chunked one, which has
+    /// checked the size against its own (much larger) ceiling instead.
+    fn post_file_bytes(
+        &mut self,
+        sender: Uuid,
+        channel: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Envelope, String> {
+        if !self.is_member(sender) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        self.member_can_post_to_channel(sender, channel)?;
         let tier = self.tier;
         let meta = self.store_blob(sender, &name, &mime, data)?;
         self.record_file_ref(sender, &meta, channel, false);
@@ -1235,6 +1446,28 @@ impl PartyState {
             return Err("recipient is not a member of this server".to_string());
         }
         let data = Self::check_inline_size(data)?;
+        self.post_file_dm_bytes(from, to, name, mime, data)
+    }
+
+    /// Store already-validated bytes and send them as a file DM. Shared by the
+    /// inline and chunked paths, like [`Self::post_file_bytes`].
+    fn post_file_dm_bytes(
+        &mut self,
+        from: Uuid,
+        to: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Envelope, String> {
+        if !self.is_member(from) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if !self.is_member(to) {
+            return Err("recipient is not a member of this server".to_string());
+        }
+        if !self.role_of(from).can_write() {
+            return Err("your role on this server is read-only".to_string());
+        }
         let thread_id = messenger_core::party::dm_thread_id(from, to);
         let tier = self.tier;
         let meta = self.store_blob(from, &name, &mime, data)?;
@@ -3224,6 +3457,224 @@ mod tests {
         // The last channel cannot go: `default_channel` needs one to exist.
         let last = state.default_channel();
         assert!(state.delete_channel(owner, last).is_err());
+    }
+
+    /// A file too large to fit in one frame goes up in chunks and comes back
+    /// down the same way, and the result is indistinguishable from an inline
+    /// upload once it lands.
+    #[test]
+    fn a_chunked_upload_round_trips_and_posts_a_file_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+
+        // Deliberately not a multiple of the chunk size, so the last chunk is
+        // short — the case an off-by-one gets wrong.
+        let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 77))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let upload = state
+            .start_upload(
+                owner,
+                "big.bin".into(),
+                "application/octet-stream".into(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        for chunk in payload.chunks(PARTY_CHUNK_BYTES) {
+            state.upload_chunk(owner, upload, chunk).unwrap();
+        }
+        let (env, target) = state.finish_upload(owner, upload).unwrap();
+        assert_eq!(target, UploadTarget::Channel(channel));
+        let meta = file_payload(&env);
+        assert_eq!(meta.size, payload.len() as u64);
+        assert_eq!(meta.hash, blob_hash(&payload));
+
+        // It is a normal file message in the channel, and a normal blob.
+        assert_eq!(state.history_since(owner, channel, 0).len(), 1);
+        assert_eq!(
+            state.blob_bytes_for(owner, &meta.hash),
+            Some(payload.clone())
+        );
+
+        // And it comes back down in order, in chunks, with the total attached.
+        let mut got = Vec::new();
+        loop {
+            let (data, total) = state
+                .blob_chunk_for(owner, &meta.hash, got.len() as u64)
+                .unwrap();
+            assert_eq!(total, payload.len() as u64);
+            if data.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&data);
+            if got.len() as u64 >= total {
+                break;
+            }
+        }
+        assert_eq!(got, payload);
+    }
+
+    /// The declared size is the contract: a client that sends more than it said
+    /// it would is cut off rather than allowed to grow the server's memory.
+    #[test]
+    fn an_upload_that_exceeds_its_declared_size_is_dropped() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+        let upload = state
+            .start_upload(
+                owner,
+                "x.bin".into(),
+                "application/octet-stream".into(),
+                4,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(owner, upload, b"abcd").unwrap();
+        assert!(state.upload_chunk(owner, upload, b"more").is_err());
+        // The upload is gone, so finishing it fails too.
+        assert!(state.finish_upload(owner, upload).is_err());
+    }
+
+    /// Finishing early must not store a truncated file under a hash that claims
+    /// to be the whole thing.
+    #[test]
+    fn an_incomplete_upload_cannot_be_finished() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+        let upload = state
+            .start_upload(
+                owner,
+                "x.bin".into(),
+                "application/octet-stream".into(),
+                10,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(owner, upload, b"abc").unwrap();
+        let err = state.finish_upload(owner, upload).unwrap_err();
+        assert!(err.contains("incomplete"), "got: {err}");
+    }
+
+    /// Everything checkable is checked before a byte moves — otherwise the
+    /// server spools a hundred megabytes and only then says no.
+    #[test]
+    fn uploads_are_refused_up_front_on_size_quota_and_permission() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        let octet = || "application/octet-stream".to_string();
+
+        // Past the server's hard ceiling.
+        assert!(state
+            .start_upload(
+                bob,
+                "huge".into(),
+                octet(),
+                MAX_PARTY_FILE_BYTES + 1,
+                UploadTarget::Channel(channel),
+                0
+            )
+            .is_err());
+        // Empty.
+        assert!(state
+            .start_upload(
+                bob,
+                "e".into(),
+                octet(),
+                0,
+                UploadTarget::Channel(channel),
+                0
+            )
+            .is_err());
+        // Past the member's allowance.
+        state.set_max_member_blob_bytes(1024);
+        let err = state
+            .start_upload(
+                bob,
+                "big".into(),
+                octet(),
+                4096,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap_err();
+        assert!(err.contains("allowance"), "got: {err}");
+        state.set_max_member_blob_bytes(MAX_MEMBER_BLOB_BYTES);
+        // Too many at once.
+        let err = state
+            .start_upload(
+                bob,
+                "n".into(),
+                octet(),
+                16,
+                UploadTarget::Channel(channel),
+                MAX_CONCURRENT_UPLOADS,
+            )
+            .unwrap_err();
+        assert!(err.contains("in progress"), "got: {err}");
+        // A channel they may not post to.
+        let locked = state
+            .create_channel_of_kind(owner, "locked", ChannelKind::Locked, vec![])
+            .unwrap()
+            .id;
+        assert!(state
+            .start_upload(
+                bob,
+                "l".into(),
+                octet(),
+                16,
+                UploadTarget::Channel(locked),
+                0
+            )
+            .is_err());
+        // A guest cannot upload at all, DM included.
+        state.set_role(owner, bob, Role::Guest).unwrap();
+        assert!(state
+            .start_upload(bob, "g".into(), octet(), 16, UploadTarget::Dm(owner), 0)
+            .is_err());
+    }
+
+    /// One member's upload id must be useless to anyone else, and a disconnect
+    /// must not leave the spool pinned for the life of the process.
+    #[test]
+    fn uploads_are_owned_by_their_uploader_and_cleaned_up() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        let upload = state
+            .start_upload(
+                bob,
+                "x".into(),
+                "application/octet-stream".into(),
+                8,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+
+        // Someone else's id gets the same answer as a made-up one.
+        assert!(state.upload_chunk(owner, upload, b"abcd").is_err());
+        assert!(state.finish_upload(owner, upload).is_err());
+        state.cancel_upload(owner, upload);
+        assert!(
+            state.upload_chunk(bob, upload, b"abcd").is_ok(),
+            "still bob's"
+        );
+
+        // Bob's connection goes away.
+        state.cancel_uploads_for(bob);
+        assert!(state.upload_chunk(bob, upload, b"abcd").is_err());
     }
 
     /// A whole channel in one frame stopped fitting once history grew past

@@ -103,6 +103,12 @@ where
 
     hub.unregister(conn_id);
     if let Some(member) = conn.member() {
+        // A client that vanished mid-transfer must not pin its spool for the
+        // life of the process. Each pending upload can hold up to
+        // MAX_PARTY_FILE_BYTES, so this is memory, not just tidiness.
+        if !conn.open_uploads().is_empty() {
+            state.lock().await.cancel_uploads_for(member);
+        }
         // Presence is per-member but connections are per-device: only go offline
         // once this member's *last* connection is gone, or closing one of two
         // open clients would report them as offline while they are still here.

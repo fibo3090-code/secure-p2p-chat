@@ -800,10 +800,13 @@ fn parse_ids(ids: &[String]) -> Result<Vec<Uuid>, String> {
 ///
 /// A community upload is sent inline, so the whole file is held in memory by
 /// definition — which is exactly why the size is checked against
-/// [`messenger_core::party::MAX_INLINE_FILE_BYTES`] *before* reading rather than
+/// [`messenger_core::party::MAX_PARTY_FILE_BYTES`] *before* reading rather than
 /// after. Reading first meant picking a 4 GB file allocated 4 GB only to be
 /// rejected. The read is async: the previous blocking `std::fs::read` ran on the
 /// async runtime and stalled every other task on that worker for its duration.
+///
+/// Files past `MAX_INLINE_FILE_BYTES` are not refused — `PartyManager` streams
+/// them in chunks — so the only hard limit here is the server's ceiling.
 async fn pick_upload<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
 ) -> Result<Option<(String, String, Vec<u8>)>, String> {
@@ -821,7 +824,7 @@ async fn pick_upload<R: tauri::Runtime>(
         .await
         .map_err(|e| format!("Could not read {}: {e}", path.display()))?
         .len();
-    let cap = messenger_core::party::MAX_INLINE_FILE_BYTES as u64;
+    let cap = messenger_core::party::MAX_PARTY_FILE_BYTES;
     if size > cap {
         return Err(format!(
             "{} is {} — community files are limited to {}.",
