@@ -11,7 +11,60 @@ predate tagged releases.
 
 ## [Unreleased]
 
-Nothing yet.
+> **Breaking for Communities.** `MemberInfo` gained a role and `ChannelInfo` a
+> member list, so community clients and servers must ship together. Anyone
+> self-hosting a community server has to restart it on the matching version.
+
+### Added
+
+- **Roles on community servers.** Guest, Member, Admin and Owner, enforced by
+  the server. The first identity to join owns the server — the operator starts
+  it and then joins it, which is the only bootstrap that does not need an admin
+  to already exist. A role can only ever be granted below your own and the owner
+  can never be demoted, so an admin cannot take a community from the person
+  running it. Admins get an inline role picker in the member list.
+- **Channel kinds that actually do something.** Private channels are limited to
+  the members you pick and are not even listed to anyone else; locked and
+  announce channels are readable by everyone and writable by admins. A new
+  dialog creates channels of a chosen kind and changes an existing channel's
+  access; admins can delete channels.
+- **A Drive panel** listing every file shared in a community you can see, with
+  who shared it, where, when, and how large, plus a bar showing how much of your
+  storage allowance you have used.
+- **Deleting shared files.** Both the person who shared a file and an admin can
+  remove it; the storage it occupied is genuinely reclaimed once nothing else
+  references it. Deleting a channel releases the files shared in it.
+- **Storage allowances.** Each member gets 128 MiB by default alongside the
+  existing 1 GiB server-wide ceiling, because a single ceiling let whoever
+  filled it first deny file sharing to everyone else. Admins are exempt. Sharing
+  one file into several channels counts once.
+- **An activity log** for admins, recording role changes, channel changes and
+  file deletions.
+
+### Fixed
+
+- **The member list is live again.** Nothing announced a join or a disconnect,
+  so your view of who was in a community was frozen at the moment *you* joined:
+  people who arrived later never appeared, and the online dots never moved.
+- **Closing one window no longer shows you as offline** when you have the
+  community open somewhere else.
+- **A direct message sent from one device now appears on your others.** Channel
+  messages always did; DMs were delivered only to the recipient, so the copy on
+  your second device never arrived.
+- **A file the server failed to store is no longer offered as if it worked.**
+  The write error was logged and swallowed, so the upload was acknowledged, the
+  file appeared in the channel for everyone, and every attempt to download it
+  answered "unknown file" — permanently.
+- **Presence and role changes reach the screen.** The desktop app decided
+  whether the Communities view had changed by counting members and channels, so
+  anything that changed a member without changing the count — going offline,
+  being promoted — never triggered a refresh.
+
+### Documentation
+
+- `docs/protocol.md` now documents the Party wire contract: framing and replay
+  protection, the authorization model, the request/response sets, history
+  paging, and the file rules.
 
 ## [1.15.0] - 2026-08-01
 

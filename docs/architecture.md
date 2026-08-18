@@ -112,7 +112,8 @@ client/tests/      integration tests (link against the client lib)
 
 server/src/
   main.rs         TCP accept loop + server bootstrap
-  state.rs        PartyState: members, channels, DM threads, history, persistence
+  state.rs        PartyState: members + roles, channels + access, DM threads,
+                  history, file blobs/references, quotas, audit log, persistence
   dispatch.rs     request → response/broadcast routing
   hub.rs          cross-connection broadcast fan-out
   connection.rs   per-connection handshake + serve loop
@@ -223,18 +224,24 @@ desktop/
 ### `core/src/party/mod.rs`
 
 - the Party application protocol (requests/responses, envelopes, member/channel
-  types) shared by the client and server, framed over the v3 tunnel
+  types, `Role`, `ChannelKind` access rules, file/quota/audit types) shared by
+  the client and server, framed over the v3 tunnel with a per-direction sequence
+  number inside the AEAD
 
 ### `server/src/`
 
-- the Party server: TCP accept loop, `PartyState` (members/channels/DM
-  threads/history + embedded-SQLite persistence), request dispatcher, cross-connection
-  broadcast hub, per-connection serve loop, and a persistent owner-only identity
+- the Party server: TCP accept loop, `PartyState` (members + roles, channels +
+  per-channel access, DM threads, history, content-addressed file blobs with
+  reference counting and quotas, an audit log, all mirrored to embedded SQLite),
+  request dispatcher, cross-connection broadcast hub, per-connection serve loop,
+  and a persistent owner-only identity
 
 ### `client/src/app/party_manager.rs`
 
-- client-side Party state: connect/join, post, DMs, channel creation, history
-  fetch, and event polling for the Communities surfaces
+- client-side Party state: connect/join (two-step, with server-identity
+  verification before credentials are sent), post, DMs, channel creation and
+  administration, roles, the file/Drive listing with quotas, the audit log,
+  history fetch, and event polling for the Communities surfaces
 
 ### `client/src/tui/`
 
