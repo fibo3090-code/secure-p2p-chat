@@ -7,6 +7,9 @@ import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
 import { api, onBridge, fmtTime } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
+import {
+  DrivePanel, AuditPanel, ChannelAccessDialog, ROLES, kindIcon,
+} from "./PartyAdmin.jsx";
 
 const STATUS_LABEL = {
   connecting: "Connecting…",
@@ -195,8 +198,13 @@ export function Parties() {
   const [unread, setUnread] = useState({});          // thread key -> unread count
   const [shown, setShown] = useState(150);           // message window (see Messages.jsx)
   const [downloading, setDownloading] = useState({}); // content hash -> in-flight download
+  const [view, setView] = useState("chat");          // chat | drive | audit
+  const [accessFor, setAccessFor] = useState(null);  // channel being edited, or "new"
+  const [confirmDelCh, setConfirmDelCh] = useState(null); // channel id armed for deletion
   const scrollRef = useRef(null);
   useEffect(() => setShown(150), [sid, cid, dm]);
+  // Leaving a community must not strand you on its Drive.
+  useEffect(() => { setView("chat"); setConfirmDelCh(null); }, [sid]);
 
   const server = useMemo(() => servers.find((s) => s.id === sid) || null, [servers, sid]);
 
@@ -225,6 +233,22 @@ export function Parties() {
       else setMsgs([]);
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
+
+  // Opening the Drive or the log asks the server for it; the answer arrives
+  // asynchronously and lands in the next `party-updated` tick.
+  useEffect(() => {
+    if (!sid || view === "chat") return;
+    const ask = view === "drive" ? api.partyRefreshFiles : api.partyRefreshAudit;
+    ask(sid).catch(() => {});
+  }, [sid, view]);
+
+  // Surface a completed governance action once, then clear it so it does not
+  // re-toast on every poll.
+  useEffect(() => {
+    if (!server?.last_notice) return;
+    toast(server.last_notice, "success");
+    api.partyClearNotice(server.id).catch(() => {});
+  }, [server?.last_notice, server?.id]);
 
   // Initial load + live refresh on every poll tick.
   useEffect(() => { loadServers(); }, [loadServers]);
@@ -259,8 +283,24 @@ export function Parties() {
   }
 
   const peer = dm ? server?.members.find((m) => m.id === dm) : null;
-  const threadName = dm ? `✉ ${peer?.username || "member"}` : `# ${server?.channels.find((c) => c.id === cid)?.name || ""}`;
+  const channel = !dm ? server?.channels.find((c) => c.id === cid) : null;
+  const threadName = dm ? `✉ ${peer?.username || "member"}` : `# ${channel?.name || ""}`;
   const connected = server?.status === "joined";
+  const isAdmin = server?.my_role === "admin" || server?.my_role === "owner";
+  // A guest is read-only everywhere; a channel's kind can also refuse an
+  // ordinary member. The server decides either way — this only means the
+  // composer explains itself instead of accepting a message that gets refused.
+  const readOnly = server?.my_role === "guest";
+  const canSend = connected && !readOnly && (dm ? true : channel?.can_post !== false);
+  const composerHint = !connected
+    ? "Not connected"
+    : readOnly
+      ? "Your role on this server is read-only"
+      : !dm && channel?.can_post === false
+        ? channel.kind === "announce"
+          ? "Only admins can post to an announcement channel"
+          : "This channel is locked"
+        : `Message ${threadName}`;
 
   async function send() {
     const text = draft.trim();
@@ -313,6 +353,46 @@ export function Parties() {
     setNewChannel("");
     try { await api.partyCreateChannel(server.id, name); loadServers(); }
     catch (e) { toast(String(e), "error"); }
+  }
+
+  // Create a channel of a chosen kind, or change an existing one's access.
+  async function submitAccess({ name, kind, members }) {
+    if (!server) return;
+    try {
+      if (accessFor === "new") {
+        await api.partyCreateChannelKind(server.id, name, kind, members);
+      } else {
+        await api.partySetChannelAccess(server.id, accessFor.id, kind, members);
+      }
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  // Delete a channel and its history (two-click, admins only).
+  async function deleteChannel(channel) {
+    if (!server) return;
+    if (confirmDelCh !== channel.id) { setConfirmDelCh(channel.id); return; }
+    setConfirmDelCh(null);
+    try {
+      await api.partyDeleteChannel(server.id, channel.id);
+      if (cid === channel.id) setCid(null);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  async function setRole(member, role) {
+    if (!server) return;
+    try { await api.partySetRole(server.id, member.id, role); loadServers(); }
+    catch (e) { toast(String(e), "error"); }
+  }
+
+  async function deleteFile(f) {
+    if (!server) return;
+    try {
+      await api.partyDeleteFile(server.id, f.hash, f.location);
+      await api.partyRefreshFiles(server.id);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
   }
 
   async function dismissError() {
@@ -383,13 +463,35 @@ export function Parties() {
         <div className="party-side-h">Channels</div>
         <div className="party-list">
           {server?.channels.map((c) => (
-            <button key={c.id} className={cx("party-item", !dm && c.id === cid && "is-active")}
-              onClick={() => { setDm(null); setCid(c.id); markRead(server.id, c.id, c.messages); }}>
-              <span className="party-hash">#</span> {c.name}
-              {unread[`${server.id}|${c.id}`] > 0 && (
-                <span className="party-unread">{unread[`${server.id}|${c.id}`]}</span>
+            <div key={c.id} className="party-row">
+              <button className={cx("party-item", view === "chat" && !dm && c.id === cid && "is-active")}
+                title={c.kind === "public" ? `#${c.name}` : `#${c.name} — ${c.kind}`}
+                onClick={() => {
+                  setView("chat"); setDm(null); setCid(c.id);
+                  markRead(server.id, c.id, c.messages);
+                }}>
+                <span className="party-hash"><Icon name={kindIcon(c.kind)} size={12} /></span> {c.name}
+                {unread[`${server.id}|${c.id}`] > 0 && (
+                  <span className="party-unread">{unread[`${server.id}|${c.id}`]}</span>
+                )}
+              </button>
+              {isAdmin && (
+                <span className="party-rowacts">
+                  <button title={`Change who can use #${c.name}`} onClick={() => setAccessFor(c)}>
+                    <Icon name="settings" size={13} />
+                  </button>
+                  <button
+                    className={cx(confirmDelCh === c.id && "is-confirm")}
+                    title={confirmDelCh === c.id
+                      ? `Click again to delete #${c.name} and all of its history.`
+                      : `Delete #${c.name}`}
+                    onBlur={() => setConfirmDelCh(null)}
+                    onClick={() => deleteChannel(c)}>
+                    <Icon name="trash" size={13} />
+                  </button>
+                </span>
               )}
-            </button>
+            </div>
           ))}
         </div>
         <div className="party-newch">
@@ -397,21 +499,43 @@ export function Parties() {
             onChange={(e) => setNewChannel(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && createChannel()} />
           <button title="Create channel" onClick={createChannel}><Icon name="plus" size={15} /></button>
+          {isAdmin && (
+            <button title="New channel with a specific kind" onClick={() => setAccessFor("new")}>
+              <Icon name="settings" size={15} />
+            </button>
+          )}
         </div>
 
         <div className="party-side-h">Members ({server?.members.length || 0})</div>
         <div className="party-list">
           {server?.members.map((m) => (
-            <button key={m.id} disabled={m.is_me}
-              className={cx("party-item", "party-member", dm === m.id && "is-active")}
-              onClick={() => { if (!m.is_me) { setDm(m.id); markRead(server.id, `dm-${m.id}`, m.dm_messages); } }}
-              title={m.is_me ? "You" : `Direct message ${m.username}`}>
-              <span className={cx("party-dot", m.online ? "is-online" : "is-offline")} />
-              {m.is_me ? <>{m.username} <span className="party-you">you</span></> : <><Icon name="user" size={12} /> {m.username}</>}
-              {!m.is_me && unread[`${server.id}|dm-${m.id}`] > 0 && (
-                <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
+            <div key={m.id} className="party-row">
+              <button disabled={m.is_me}
+                className={cx("party-item", "party-member", view === "chat" && dm === m.id && "is-active")}
+                onClick={() => {
+                  if (m.is_me) return;
+                  setView("chat"); setDm(m.id);
+                  markRead(server.id, `dm-${m.id}`, m.dm_messages);
+                }}
+                title={m.is_me ? "You" : `Direct message ${m.username}`}>
+                <span className={cx("party-dot", m.online ? "is-online" : "is-offline")} />
+                {m.is_me ? <>{m.username} <span className="party-you">you</span></> : <><Icon name="user" size={12} /> {m.username}</>}
+                {m.role !== "member" && (
+                  <span className={cx("party-role", "role-" + m.role)}>{m.role}</span>
+                )}
+                {!m.is_me && unread[`${server.id}|dm-${m.id}`] > 0 && (
+                  <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
+                )}
+              </button>
+              {/* The owner's role is fixed, and you cannot change your own. */}
+              {isAdmin && !m.is_me && m.role !== "owner" && (
+                <select className="party-rolesel" value={m.role}
+                  title={`Role for ${m.username}`}
+                  onChange={(e) => setRole(m, e.target.value)}>
+                  {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                </select>
               )}
-            </button>
+            </div>
           ))}
         </div>
       </aside>
@@ -433,6 +557,25 @@ export function Parties() {
             </div>
           </div>
           <div className="party-head-r">
+            <div className="party-views" role="tablist" aria-label="Community view">
+              <button role="tab" aria-selected={view === "chat"}
+                className={cx("party-view", view === "chat" && "is-active")}
+                onClick={() => setView("chat")} title="Conversation">
+                <Icon name="message" size={14} />
+              </button>
+              <button role="tab" aria-selected={view === "drive"}
+                className={cx("party-view", view === "drive" && "is-active")}
+                onClick={() => setView("drive")} title="Shared files">
+                <Icon name="folder" size={14} />
+              </button>
+              {isAdmin && (
+                <button role="tab" aria-selected={view === "audit"}
+                  className={cx("party-view", view === "audit" && "is-active")}
+                  onClick={() => setView("audit")} title="Activity log">
+                  <Icon name="clock" size={14} />
+                </button>
+              )}
+            </div>
             <div className="party-fp" title="Verify this out of band">
               <Icon name="fingerprint" size={13} />
               <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
@@ -467,35 +610,54 @@ export function Parties() {
           </div>
         )}
 
-        <div className="chat-scroll" ref={scrollRef}>
-          <div className="chat-thread">
-            {msgs.length === 0 && <div className="conv-empty">No messages yet.</div>}
-            {msgs.length > shown && (
-              <button className="thread-more" onClick={() => setShown((s) => s + 150)}>
-                Show earlier messages ({msgs.length - shown} more)
-              </button>
-            )}
-            {msgs.slice(-shown).map((m, i) => (
-              <MessageRow key={i} m={m} onDownload={downloadFile}
-                downloading={!!(m.hash && downloading[m.hash])} />
-            ))}
-          </div>
-        </div>
+        {view === "drive" && (
+          <DrivePanel server={server} downloading={downloading}
+            onDownload={downloadFile} onDelete={deleteFile} />
+        )}
+        {view === "audit" && <AuditPanel server={server} />}
 
-        <div className="composer">
-          <button className="composer-clip" onClick={sendFile} title="Share a file" disabled={!connected}>
-            <Icon name="paperclip" size={18} />
-          </button>
-          <textarea className="composer-input" rows={1}
-            placeholder={connected ? `Message ${threadName}` : "Not connected"}
-            disabled={!connected}
-            value={draft} onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }} />
-          <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={send} title="Send" disabled={!connected}>
-            <Icon name="send" size={18} />
-          </button>
-        </div>
+        {view === "chat" && (
+          <>
+            <div className="chat-scroll" ref={scrollRef}>
+              <div className="chat-thread">
+                {msgs.length === 0 && <div className="conv-empty">No messages yet.</div>}
+                {msgs.length > shown && (
+                  <button className="thread-more" onClick={() => setShown((s) => s + 150)}>
+                    Show earlier messages ({msgs.length - shown} more)
+                  </button>
+                )}
+                {msgs.slice(-shown).map((m, i) => (
+                  <MessageRow key={i} m={m} onDownload={downloadFile}
+                    downloading={!!(m.hash && downloading[m.hash])} />
+                ))}
+              </div>
+            </div>
+
+            <div className="composer">
+              <button className="composer-clip" onClick={sendFile} title="Share a file"
+                disabled={!canSend}>
+                <Icon name="paperclip" size={18} />
+              </button>
+              <textarea className="composer-input" rows={1}
+                placeholder={composerHint}
+                disabled={!canSend}
+                value={draft} onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }} />
+              <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={send}
+                title="Send" disabled={!canSend}>
+                <Icon name="send" size={18} />
+              </button>
+            </div>
+          </>
+        )}
       </main>
+
+      {accessFor && (
+        <ChannelAccessDialog server={server}
+          channel={accessFor === "new" ? null : accessFor}
+          onClose={() => setAccessFor(null)}
+          onSubmit={submitAccess} />
+      )}
     </div>
   );
 }

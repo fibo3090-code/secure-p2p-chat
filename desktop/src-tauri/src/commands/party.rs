@@ -1,6 +1,7 @@
 //! Communities (Party servers): join/leave, channels, DMs, file sharing,
 //! and the saved-communities file (parties.json) with fingerprint pinning.
 use crate::*;
+use messenger_core::party::{ChannelKind, Role};
 
 // ── Communities (Party servers) ─────────────────────────────────────────────
 //
@@ -17,6 +18,8 @@ pub(crate) struct PartyMemberDto {
     /// Message count in my DM thread with this member (0 when not joined yet).
     /// The frontend derives DM unread badges from it.
     dm_messages: usize,
+    /// Lowercase role name (`guest`/`member`/`admin`/`owner`).
+    role: &'static str,
 }
 
 #[derive(Serialize)]
@@ -25,6 +28,84 @@ pub(crate) struct PartyChannelDto {
     name: String,
     /// Message count in this channel; the frontend derives unread badges from it.
     messages: usize,
+    /// Lowercase channel kind (`public`/`private`/`locked`/`announce`).
+    kind: &'static str,
+    /// Member ids on a private channel's list; empty for every other kind.
+    members: Vec<String>,
+    /// Whether *this* client may post here, so the composer can say why not
+    /// instead of letting the user type into a channel that will refuse them.
+    can_post: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PartyFileDto {
+    hash: String,
+    name: String,
+    size: u64,
+    mime: String,
+    uploader: String,
+    uploader_name: String,
+    location: String,
+    location_name: String,
+    is_dm: bool,
+    shared_at: u64,
+    can_delete: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PartyQuotaDto {
+    used: u64,
+    limit: Option<u64>,
+    server_used: u64,
+    server_limit: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PartyAuditDto {
+    at: u64,
+    actor_name: String,
+    action: String,
+    detail: String,
+}
+
+/// Wire name for a role, in both directions.
+fn role_str(r: Role) -> &'static str {
+    match r {
+        Role::Guest => "guest",
+        Role::Member => "member",
+        Role::Admin => "admin",
+        Role::Owner => "owner",
+    }
+}
+
+fn parse_role(s: &str) -> Result<Role, String> {
+    match s {
+        "guest" => Ok(Role::Guest),
+        "member" => Ok(Role::Member),
+        "admin" => Ok(Role::Admin),
+        // The owner is the first member to join and is never assigned, so it is
+        // deliberately not parseable here.
+        other => Err(format!("unknown role: {other}")),
+    }
+}
+
+fn kind_str(k: ChannelKind) -> &'static str {
+    match k {
+        ChannelKind::Public => "public",
+        ChannelKind::Private => "private",
+        ChannelKind::Locked => "locked",
+        ChannelKind::Announce => "announce",
+    }
+}
+
+fn parse_kind(s: &str) -> Result<ChannelKind, String> {
+    match s {
+        "public" => Ok(ChannelKind::Public),
+        "private" => Ok(ChannelKind::Private),
+        "locked" => Ok(ChannelKind::Locked),
+        "announce" => Ok(ChannelKind::Announce),
+        other => Err(format!("unknown channel kind: {other}")),
+    }
 }
 
 #[derive(Serialize)]
@@ -41,6 +122,15 @@ pub(crate) struct PartyServerDto {
     channels: Vec<PartyChannelDto>,
     members: Vec<PartyMemberDto>,
     last_error: Option<String>,
+    /// This client's own role, so the UI shows admin controls only to admins.
+    /// The server enforces regardless; this is about not offering a button that
+    /// will be refused.
+    my_role: &'static str,
+    /// Most recent successful governance action, shown once then cleared.
+    last_notice: Option<String>,
+    files: Vec<PartyFileDto>,
+    quota: Option<PartyQuotaDto>,
+    audit: Vec<PartyAuditDto>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +160,11 @@ fn server_dto(
     conn: &p2pem_classic::app::party_manager::PartyServerConn,
 ) -> PartyServerDto {
     let (status, status_detail) = party_status_parts(&conn.status);
+    let my_role = conn
+        .member_id
+        .and_then(|me| conn.members.iter().find(|m| m.id == me))
+        .map(|m| m.role)
+        .unwrap_or_default();
     let members = conn
         .members
         .iter()
@@ -85,6 +180,7 @@ fn server_dto(
                     conn.messages.get(&thread).map_or(0, |v| v.len())
                 })
                 .unwrap_or(0),
+            role: role_str(m.role),
         })
         .collect();
     let channels = conn
@@ -94,6 +190,13 @@ fn server_dto(
             id: c.id.to_string(),
             name: c.name.clone(),
             messages: conn.messages.get(&c.id).map_or(0, |v| v.len()),
+            kind: kind_str(c.kind),
+            members: c.members.iter().map(|m| m.to_string()).collect(),
+            // Mirrors the server's rule so the composer can explain itself
+            // rather than accepting a message the server will refuse.
+            can_post: conn
+                .member_id
+                .is_some_and(|me| c.kind.may_post(my_role, c.members.contains(&me)).is_ok()),
         })
         .collect();
     PartyServerDto {
@@ -108,6 +211,41 @@ fn server_dto(
         channels,
         members,
         last_error: conn.last_error.clone(),
+        my_role: role_str(my_role),
+        last_notice: conn.last_notice.clone(),
+        files: conn
+            .files
+            .iter()
+            .map(|f| PartyFileDto {
+                hash: f.hash.clone(),
+                name: f.name.clone(),
+                size: f.size,
+                mime: f.mime.clone(),
+                uploader: f.uploader.to_string(),
+                uploader_name: f.uploader_name.clone(),
+                location: f.location.to_string(),
+                location_name: f.location_name.clone(),
+                is_dm: f.is_dm,
+                shared_at: f.shared_at,
+                can_delete: f.can_delete,
+            })
+            .collect(),
+        quota: conn.quota.map(|q| PartyQuotaDto {
+            used: q.used,
+            limit: q.limit,
+            server_used: q.server_used,
+            server_limit: q.server_limit,
+        }),
+        audit: conn
+            .audit
+            .iter()
+            .map(|a| PartyAuditDto {
+                at: a.at,
+                actor_name: a.actor_name.clone(),
+                action: a.action.clone(),
+                detail: a.detail.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -501,6 +639,159 @@ pub(crate) async fn party_leave(
         save_saved_parties(&state.parties_path, &list);
     }
     Ok(())
+}
+
+/// Create a channel of a given kind. `members` seeds a private channel and is
+/// ignored otherwise. Only admins may create the restricted kinds; the server
+/// enforces that regardless of what the UI offers.
+#[tauri::command]
+pub(crate) async fn party_create_channel_kind(
+    server: String,
+    name: String,
+    kind: String,
+    members: Vec<String>,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let kind = parse_kind(&kind)?;
+    let members = parse_ids(&members)?;
+    state
+        .party
+        .lock()
+        .await
+        .create_channel_of_kind(sid, name, kind, members)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a channel and its history (admins only).
+#[tauri::command]
+pub(crate) async fn party_delete_channel(
+    server: String,
+    channel: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .delete_channel(sid, cid)
+        .map_err(|e| e.to_string())
+}
+
+/// Change a channel's kind and private membership (admins only).
+#[tauri::command]
+pub(crate) async fn party_set_channel_access(
+    server: String,
+    channel: String,
+    kind: String,
+    members: Vec<String>,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let kind = parse_kind(&kind)?;
+    let members = parse_ids(&members)?;
+    state
+        .party
+        .lock()
+        .await
+        .set_channel_access(sid, cid, kind, members)
+        .map_err(|e| e.to_string())
+}
+
+/// Change another member's role (admins only).
+#[tauri::command]
+pub(crate) async fn party_set_role(
+    server: String,
+    member: String,
+    role: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let mid = Uuid::parse_str(&member).map_err(|e| e.to_string())?;
+    let role = parse_role(&role)?;
+    state
+        .party
+        .lock()
+        .await
+        .set_role(sid, mid, role)
+        .map_err(|e| e.to_string())
+}
+
+/// Ask the server for the Drive listing and this member's quota. The answers
+/// arrive asynchronously and land in the next `party-updated` event.
+#[tauri::command]
+pub(crate) async fn party_refresh_files(
+    server: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .refresh_files(sid)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete one share of a file (its uploader, or an admin).
+#[tauri::command]
+pub(crate) async fn party_delete_file(
+    server: String,
+    hash: String,
+    location: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let loc = Uuid::parse_str(&location).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .delete_file(sid, hash, loc)
+        .map_err(|e| e.to_string())
+}
+
+/// Ask for the audit log (admins only). Lands in the next `party-updated`.
+#[tauri::command]
+pub(crate) async fn party_refresh_audit(
+    server: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    state
+        .party
+        .lock()
+        .await
+        .refresh_audit(sid, 200)
+        .map_err(|e| e.to_string())
+}
+
+/// Clear the last governance notice once the UI has shown it.
+#[tauri::command]
+pub(crate) async fn party_clear_notice(
+    server: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    state.party.lock().await.clear_notice(sid);
+    Ok(())
+}
+
+fn parse_ids(ids: &[String]) -> Result<Vec<Uuid>, String> {
+    ids.iter()
+        .map(|s| Uuid::parse_str(s).map_err(|e| e.to_string()))
+        .collect()
 }
 
 /// Open the native file picker (parented to the app window) and read the chosen

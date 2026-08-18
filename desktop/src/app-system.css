@@ -802,3 +802,81 @@ input,textarea{font-family:inherit;color:inherit}
   .col-list{width:268px}
   .vf-grids{flex-direction:column}
 }
+
+/* ── Communities: governance, Drive panel, and activity log ────────────────── */
+
+/* A sidebar entry plus the admin controls that sit beside it. The controls stay
+   hidden until the row is hovered or something inside it has focus, so an
+   ordinary browse is not a wall of icons — but a keyboard user still reaches
+   them, which `display:none until :hover` would prevent. */
+.party-row{display:flex;align-items:center;gap:2px}
+.party-row>.party-item{flex:1;min-width:0}
+.party-rowacts{flex:none;display:flex;gap:1px;opacity:0;transition:opacity .12s ease}
+.party-row:hover .party-rowacts,.party-row:focus-within .party-rowacts{opacity:1}
+.party-rowacts button{display:grid;place-items:center;width:24px;height:24px;border-radius:var(--r-sm);color:var(--faint)}
+.party-rowacts button:hover{background:var(--s3);color:var(--text)}
+.party-rowacts button.is-confirm{background:var(--danger,#e5484d);color:#fff;opacity:1}
+.party-rolesel{flex:none;opacity:0;transition:opacity .12s ease;background:var(--s2);color:var(--dim);
+  border:1px solid var(--border);border-radius:var(--r-sm);font-size:11px;padding:2px 3px;max-width:74px}
+.party-row:hover .party-rolesel,.party-row:focus-within .party-rolesel{opacity:1}
+
+.party-role{margin-left:auto;flex:none;font-size:9.5px;font-weight:700;letter-spacing:.04em;
+  text-transform:uppercase;padding:1px 5px;border-radius:6px;background:var(--s4);color:var(--faint)}
+.party-role.role-owner{background:var(--accent);color:var(--accent-ink,#fff)}
+.party-role.role-admin{background:var(--s4);color:var(--accent)}
+.party-role.role-guest{background:transparent;border:1px solid var(--border)}
+
+/* Conversation / files / log switch in the community header. */
+.party-views{display:flex;gap:2px;padding:2px;background:var(--s2);border-radius:var(--r-sm)}
+.party-view{display:grid;place-items:center;width:28px;height:24px;border-radius:calc(var(--r-sm) - 2px);color:var(--faint)}
+.party-view:hover{color:var(--text)}
+.party-view.is-active{background:var(--s4);color:var(--text)}
+
+/* Drive + activity log share a scrolling pane in the main column. */
+.drive-pane{flex:1;min-height:0;overflow-y:auto;padding:18px}
+.drive-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;margin-bottom:14px}
+.drive-title{font-weight:600;font-size:15px}
+.drive-sub{font-size:12.5px;color:var(--dim);margin-top:2px}
+.drive-quota{min-width:190px;text-align:right}
+.drive-quota-l{font-size:12px;color:var(--dim)}
+.drive-quota-s{font-size:11px;color:var(--faint);margin-top:3px}
+.drive-bar{height:5px;margin-top:5px;border-radius:3px;background:var(--s3);overflow:hidden}
+.drive-bar>span{display:block;height:100%;background:var(--accent);border-radius:3px}
+
+.drive-list{display:flex;flex-direction:column;gap:3px}
+.drive-row{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:var(--r-sm);background:var(--s2)}
+.drive-row:hover{background:var(--s3)}
+.drive-ic{flex:none;display:grid;place-items:center;width:32px;height:32px;border-radius:var(--r-sm);
+  background:var(--s4);color:var(--dim)}
+.drive-meta{flex:1;min-width:0}
+.drive-name{font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drive-sub2{font-size:11.5px;color:var(--faint);display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:1px}
+.drive-act{flex:none;display:grid;place-items:center;width:30px;height:30px;border-radius:var(--r-sm);color:var(--faint)}
+.drive-act:hover:not(:disabled){background:var(--s4);color:var(--text)}
+.drive-act:disabled{opacity:.5;cursor:default}
+.drive-del:hover{background:rgba(229,72,77,.16);color:var(--danger,#e5484d)}
+.drive-del.is-confirm{background:var(--danger,#e5484d);color:#fff}
+
+.audit-row{display:flex;align-items:baseline;gap:10px;padding:8px 11px;border-radius:var(--r-sm);
+  background:var(--s2);font-size:12.5px;flex-wrap:wrap}
+.audit-when{flex:none;color:var(--faint);font-size:11px}
+.audit-who{flex:none;font-weight:600}
+.audit-what{flex:1;min-width:0;color:var(--dim)}
+.audit-tag{flex:none;font-size:10.5px;color:var(--faint);background:var(--s4);border-radius:5px;padding:1px 6px}
+
+/* Channel-access dialog. */
+.fld{display:block;margin-bottom:15px}
+.fld-l{display:block;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:6px}
+.fld-hint{font-size:11.5px;color:var(--faint);margin-top:6px;line-height:1.45}
+.kind-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
+.kind-opt{display:flex;align-items:center;gap:7px;padding:9px 11px;border-radius:var(--r-sm);
+  background:var(--s2);border:1px solid var(--border);color:var(--dim);font-size:13px;text-align:left}
+.kind-opt:hover{color:var(--text);background:var(--s3)}
+.kind-opt.is-active{border-color:var(--accent);color:var(--text);background:var(--s3)}
+.member-pick{display:flex;flex-wrap:wrap;gap:6px}
+.pick-opt{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
+  background:var(--s2);border:1px solid var(--border);color:var(--dim);font-size:12.5px}
+.pick-opt:hover{color:var(--text)}
+.pick-opt.is-active{border-color:var(--accent);color:var(--text);background:var(--s3)}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:4px}
