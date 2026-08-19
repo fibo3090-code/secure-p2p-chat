@@ -200,8 +200,16 @@ fn test_rekey_bidirectional_peers() {
 
 #[test]
 fn test_rekey_timing_performance() {
-    // Ensure rekeying operations are fast (< 100ms for 1000 operations in debug mode)
-    // Use cryptographically secure random values
+    // Guards against rekeying accidentally becoming an expensive operation —
+    // swapping the HKDF for a password-hashing KDF, say, which would stall the
+    // message loop every REKEY_MESSAGE_COUNT messages.
+    //
+    // The bound is deliberately enormous. 1000 HKDF-SHA256 derivations take
+    // single-digit milliseconds even unoptimised, so anything near this ceiling
+    // is a change of algorithm rather than a slow machine. It used to assert
+    // 100ms, which is within the noise of a loaded CI runner sharing cores with
+    // a dozen other test binaries — the test failed for reasons that had
+    // nothing to do with the code it was guarding.
     let key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
     let nonce: [u8; 16] = rand::thread_rng().r#gen();
 
@@ -211,11 +219,9 @@ fn test_rekey_timing_performance() {
     }
     let elapsed = start.elapsed();
 
-    // Should be reasonably fast (< 100ms for 1000 operations, even in debug mode)
-    // In release mode, this should be < 10ms
     assert!(
-        elapsed.as_millis() < 100,
-        "1000 rekeys took {}ms",
+        elapsed.as_secs() < 5,
+        "1000 rekeys took {}ms — that is not a slow machine, that is a different KDF",
         elapsed.as_millis()
     );
 }
