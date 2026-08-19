@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use messenger_core::network::host_handshake;
-use messenger_core::party::{recv_framed, send_framed, PartyRequest, PartyResponse};
+use messenger_core::party::{recv_framed, send_framed, FrameSeq, PartyRequest, PartyResponse};
 use rsa::RsaPrivateKey;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
@@ -38,9 +38,15 @@ where
     let cipher = tunnel.cipher;
     let aad = tunnel.transport_aad;
     let conn_id = Uuid::new_v4();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<PartyResponse>();
+    // Bounded: an unbounded lane let a client that stopped reading its socket
+    // accumulate every broadcast on our heap. See `hub::BROADCAST_QUEUE_DEPTH`.
+    let (out_tx, mut out_rx) = mpsc::channel::<PartyResponse>(crate::hub::BROADCAST_QUEUE_DEPTH);
     let mut conn = ConnState::with_fingerprint(tunnel.peer_fingerprint);
     let mut registered = false;
+    // Per-direction frame counters: every Party frame carries a sequence inside
+    // the AEAD so a replayed frame cannot be accepted twice.
+    let mut send_seq = FrameSeq::new();
+    let mut recv_seq = FrameSeq::new();
 
     // Split so reads (incoming requests) and writes (replies + pushed broadcasts)
     // can be driven independently inside the select loop.
@@ -50,10 +56,10 @@ where
         tokio::select! {
             // A broadcast pushed to us by another connection.
             Some(push) = out_rx.recv() => {
-                send_framed(&mut wr, &cipher, &aad, &push.to_bytes()).await?;
+                send_framed(&mut wr, &cipher, &aad, &mut send_seq, &push.to_bytes()).await?;
             }
             // An incoming request from this client.
-            incoming = recv_framed(&mut rd, &cipher, &aad) => {
+            incoming = recv_framed(&mut rd, &cipher, &aad, &mut recv_seq) => {
                 let req_bytes = match incoming {
                     Ok(bytes) => bytes,
                     Err(_) => break, // peer closed, or a frame failed to authenticate
@@ -80,7 +86,7 @@ where
                 }
 
                 for resp in outcome.replies {
-                    send_framed(&mut wr, &cipher, &aad, &resp.to_bytes()).await?;
+                    send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await?;
                 }
                 for resp in outcome.broadcast {
                     hub.broadcast_except(conn_id, resp);
@@ -186,7 +192,10 @@ mod tests {
             other => panic!("expected History, got {other:?}"),
         }
 
-        assert_eq!(state.lock().await.history_since(channel, 0).len(), 1);
+        let guard = state.lock().await;
+        let member = guard.members()[0].id;
+        assert_eq!(guard.history_since(member, channel, 0).len(), 1);
+        drop(guard);
         drop(client);
         server.abort();
     }

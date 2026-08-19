@@ -69,7 +69,7 @@ pub(crate) async fn unlock(
 ) -> Result<(), String> {
     ensure_identity_loaded(&state)?;
     let key = {
-        let mut id = state.identity.lock().unwrap();
+        let mut id = crate::lock_identity(&state.identity);
         id.decrypt(&password)
             .map_err(|_| "Wrong password".to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
@@ -91,7 +91,7 @@ pub(crate) async fn unlock(
 /// and be reachable / reconnected", matching the egui/TUI apps. Failures are
 /// logged, never fatal to the unlock.
 async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
-    let pk_result = state.identity.lock().unwrap().private_key();
+    let pk_result = crate::lock_identity(&state.identity).private_key();
     let pk = match pk_result {
         Ok(pk) => pk,
         Err(e) => {
@@ -144,6 +144,42 @@ pub(crate) async fn set_password(
     Ok(())
 }
 
+/// Change the password protecting the identity file.
+///
+/// The private key — and therefore the history key derived from it — is
+/// unchanged, so every stored message stays readable and the fingerprint every
+/// contact verified stays the same. Only the Argon2/ChaCha20 wrapper around the
+/// key is replaced.
+///
+/// The re-wrap is done on a **copy** and only swapped into the shared identity
+/// once the new file is safely on disk. Mutating in place first would, on a
+/// failed write, leave the running app wanting the new password while the file
+/// on disk still wanted the old one — and the next attempt would then report
+/// "current password is incorrect" for the password the user just set.
+#[tauri::command]
+pub(crate) async fn change_password(
+    current: String,
+    new: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let path = state.identity_save_path();
+    // Argon2 at 64 MiB × 3 passes runs twice here (verify + re-wrap), which is
+    // ~1s of CPU — off the async runtime so the UI keeps painting.
+    let mut candidate = crate::lock_identity(&state.identity).clone();
+    let candidate = tokio::task::spawn_blocking(move || -> Result<Identity, String> {
+        candidate
+            .change_password(&current, &new)
+            .map_err(|e| e.to_string())?;
+        candidate.save(&path).map_err(|e| e.to_string())?;
+        Ok(candidate)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *crate::lock_identity(&state.identity) = candidate;
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
     auth_status(state)
@@ -158,7 +194,7 @@ pub(crate) fn set_display_name(
 ) -> Result<AuthStatus, String> {
     ensure_ready(&state)?;
     {
-        let mut id = state.identity.lock().unwrap();
+        let mut id = crate::lock_identity(&state.identity);
         id.set_name(&name).map_err(|e| e.to_string())?;
         id.save(&state.identity_save_path())
             .map_err(|e| e.to_string())?;
@@ -172,7 +208,8 @@ pub(crate) fn set_display_name(
 /// identity: losing it (and the password) means losing the account.
 /// Returns the destination path, or None if the dialog was cancelled.
 #[tauri::command]
-pub(crate) async fn export_identity(
+pub(crate) async fn export_identity<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
     state: tauri::State<'_, Bridge>,
 ) -> Result<Option<String>, String> {
     ensure_ready(&state)?;
@@ -180,13 +217,12 @@ pub(crate) async fn export_identity(
     if !source.exists() {
         return Err("No identity file to back up yet".to_string());
     }
-    let picked = tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
+    let picked = crate::native_file_dialog(window, |d| {
+        d.set_title("Save identity backup")
             .set_file_name("p2pem-identity-backup.json")
             .save_file()
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     let Some(dest) = picked else {
         return Ok(None); // cancelled
     };
@@ -210,7 +246,7 @@ pub(crate) async fn export_identity(
 pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
     let (identity_locked, identity_name, fp_prefix) = {
-        let id = state.identity.lock().unwrap();
+        let id = crate::lock_identity(&state.identity);
         (
             id.is_locked(),
             id.name.clone(),
@@ -351,13 +387,15 @@ pub(crate) async fn update_settings(
 /// Pick a new download directory with the native folder dialog (on a blocking
 /// thread) and persist it. Returns the new path, or `None` if cancelled.
 #[tauri::command]
-pub(crate) async fn pick_download_dir(
+pub(crate) async fn pick_download_dir<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
     state: tauri::State<'_, Bridge>,
 ) -> Result<Option<String>, String> {
     ensure_ready(&state)?;
-    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_folder())
-        .await
-        .map_err(|e| e.to_string())?;
+    let picked = crate::native_file_dialog(window, |d| {
+        d.set_title("Choose download folder").pick_folder()
+    })
+    .await?;
     let Some(dir) = picked else {
         return Ok(None);
     };

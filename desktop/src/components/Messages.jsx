@@ -3,7 +3,8 @@
 import { useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { api, fmtDay } from "../lib/bridge.js";
-import { cx, Avatar, IconButton, Button, TrustBadge, TransportBadge } from "./ui.jsx";
+import { toast } from "../lib/toast.js";
+import { cx, Avatar, IconButton, Button, Modal, TrustBadge, TransportBadge } from "./ui.jsx";
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const isImageName = (name) => IMAGE_RE.test(name || "");
@@ -63,6 +64,15 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
 }
 
 const STATE_LABEL = { connected: "Connected", hosting: "Hosting", offline: "Offline", connecting: "Connecting" };
+
+// Shown above a disabled composer. Messages only exist once a session carries
+// them, so say which situation this is and what would fix it — the alternative
+// (accept the text and drop it) is how a typed paragraph disappears.
+const OFFLINE_NOTICE = {
+  offline: "Not connected — messages can't be sent yet. Reconnect to this peer, or ask them to connect to you.",
+  hosting: "Waiting for a peer to connect. Share your address, then you can start the conversation.",
+  connecting: "Connecting… you'll be able to send as soon as the peer answers.",
+};
 
 export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery }) {
   const filtered = contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
@@ -131,9 +141,12 @@ function MessageItem({ m, preview, onOpen, onReveal }) {
   if (m.kind === "file") {
     const mine = m.from === "me";
     const done = m.progress >= 100;
-    // Received files are auto-saved to the configured download directory, so a
-    // completed card shows a "saved" state rather than a dead download button.
-    const sub = done ? (mine ? "sent" : "saved to Downloads") : m.progress + "%";
+    // Name the folder the file actually went to. Hardcoding "Downloads" was
+    // wrong for anyone who picked a different download folder — and this card
+    // is the only place the app ever says where a received file landed.
+    const sub = done
+      ? (mine ? "sent" : m.dir ? `saved to ${m.dir}` : "saved")
+      : m.progress + "%";
     const canOpen = done && m.hasPath;
     const open = canOpen && onOpen ? () => onOpen(m) : undefined;
     return (
@@ -148,7 +161,7 @@ function MessageItem({ m, preview, onOpen, onReveal }) {
             <button className="file-ic" onClick={open} disabled={!canOpen}
               title={canOpen ? "Open file" : undefined}><Icon name="file" size={20} /></button>
             <button className="file-meta" onClick={open} disabled={!canOpen}
-              title={canOpen ? "Open file" : undefined}>
+              title={m.path || (canOpen ? "Open file" : undefined)}>
               <div className="file-name">{m.name}</div>
               <div className="file-sub">{m.size} · {sub} · {m.t}</div>
             </button>
@@ -301,12 +314,31 @@ function GetStarted({ onStart }) {
 // "Show earlier messages" widens the window on demand.
 const MSG_WINDOW = 150;
 
+// How many image previews are held as `data:` URLs at once. Each is a
+// base64-encoded copy of the file in webview memory (up to the bridge's 4 MiB
+// cap), so an image-heavy thread could otherwise pin hundreds of megabytes just
+// by being scrolled through. Keeping the most recent handful covers what is on
+// screen; anything older is re-fetched if the user scrolls back.
+const MAX_CACHED_PREVIEWS = 24;
+
+/// Keep only the newest `MAX_CACHED_PREVIEWS` entries, preserving insertion
+/// order (JS objects keep string-key insertion order for non-numeric keys, and
+/// message ids are UUIDs).
+function trimPreviews(map) {
+  const keys = Object.keys(map);
+  if (keys.length <= MAX_CACHED_PREVIEWS) return map;
+  const keep = keys.slice(-MAX_CACHED_PREVIEWS);
+  return Object.fromEntries(keep.map((k) => [k, map[k]]));
+}
+
 export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
   // Inline previews for image files, fetched once per message id (null =
   // asked, not previewable) so the poll-driven re-renders never refetch.
   const [previews, setPreviews] = useState({});
+  // A peer-sent file the OS would execute, held for the user's confirmation.
+  const [riskyOpen, setRiskyOpen] = useState(null);
   const requested = useRef(new Set());
   useEffect(() => {
     setShown(MSG_WINDOW);
@@ -339,13 +371,50 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         try { updates[m.id] = await api.filePreview(contact.id, m.id); }
         catch { updates[m.id] = null; }
       }
-      if (!cancelled) setPreviews((p) => ({ ...p, ...updates }));
+      // Bounded: `requested` still remembers what was asked for, so an evicted
+      // preview is not re-fetched in a loop — it simply renders as a plain card
+      // until the conversation is reopened.
+      if (!cancelled) setPreviews((p) => trimPreviews({ ...p, ...updates }));
     })();
     return () => { cancelled = true; };
   }, [contact && contact.id, previewKey, shown]);
 
-  const openFile = (m) => api.openFile(contact.id, m.id, false).catch(() => {});
-  const revealFile = (m) => api.openFile(contact.id, m.id, true).catch(() => {});
+  // Opening a peer's file can mean running their code. The bridge refuses
+  // those unless confirmed and tells us what it is, so the click turns into a
+  // question instead of an execution.
+  const openFile = async (m) => {
+    try {
+      const r = await api.openFile(contact.id, m.id, false);
+      if (r && r.blocked) setRiskyOpen({ msg: m, kind: r.blocked, filename: r.filename || m.name });
+    } catch (e) { toast(String(e), "error"); }
+  };
+  const confirmRiskyOpen = async () => {
+    const target = riskyOpen;
+    setRiskyOpen(null);
+    if (!target) return;
+    try { await api.openFile(contact.id, target.msg.id, false, true); }
+    catch (e) { toast(String(e), "error"); }
+  };
+  // Revealing never launches anything, so it is never gated.
+  const revealFile = (m) =>
+    api.openFile(contact.id, m.id, true)
+      .catch((e) => toast(`Could not show the file: ${e}`, "error"));
+
+  // Sending needs a live session. Without this the composer accepted a whole
+  // paragraph, the bridge reported success, and the text vanished.
+  const online = contact ? contact.state === "connected" : false;
+  // One outgoing file at a time per conversation: `FileChunk` carries no
+  // transfer id, so two concurrent sends interleave on the wire and corrupt
+  // both files. The backend refuses the second send; the button must not
+  // pretend otherwise.
+  const sending = (transfers || []).some(
+    (t) => t.direction === "outgoing" && (t.status === "pending" || t.status === "active"),
+  );
+  const clipTitle = !online
+    ? "Not connected"
+    : sending
+      ? "Already sending a file in this conversation"
+      : "Send file";
 
   if (!contact) {
     // With nothing to select, "Select a conversation" is a dead end — and this
@@ -412,17 +481,57 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
 
       <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
+      {!online && (
+        <div className="composer-notice" role="status">
+          <Icon name="alert" size={14} />
+          <span>{OFFLINE_NOTICE[contact.state] || OFFLINE_NOTICE.offline}</span>
+        </div>
+      )}
+
       <div className="composer">
-        <button className="composer-clip" title="Send file"
-          disabled={contact.state !== "connected"}
+        <button className="composer-clip"
+          title={clipTitle}
+          disabled={!online || sending}
           onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
-        <textarea className="composer-input" rows={1} placeholder={`Message ${contact.name.split(" ")[0]}…`}
+        <textarea className="composer-input" rows={1}
+          placeholder={online ? `Message ${contact.name.split(" ")[0]}…` : "Not connected — reconnect to send"}
+          // Typing into a conversation with no session used to look like it
+          // worked: the send reported success, the box cleared, and the message
+          // simply never existed. Better to refuse the keystroke than to eat a
+          // paragraph.
+          disabled={!online}
           value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); onSend(); } }} />
-        <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={onSend} title="Send">
+        <button className={cx("composer-send", online && draft.trim() && "is-ready")}
+          onClick={onSend} disabled={!online} title={online ? "Send" : "Not connected"}>
           <Icon name="send" size={18} />
         </button>
       </div>
+
+      {riskyOpen && (
+        <Modal open onClose={() => setRiskyOpen(null)} width={440}
+          title="This file will run as a program" icon="alert">
+          <div className="creator-pane">
+            <p className="creator-lead">
+              <strong>{riskyOpen.filename}</strong> is a{" "}
+              <code>.{riskyOpen.kind}</code> file. Opening it doesn't show you
+              anything — it hands it to your system to <strong>execute</strong>,
+              with your account's access to your files.
+            </p>
+            <p className="creator-lead">
+              It came from <strong>{contact.name}</strong>. Only continue if you
+              were expecting a program from them and you trust it. If you're not
+              sure, close this and ask them on a call.
+            </p>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <Button icon="x" onClick={() => setRiskyOpen(null)}>Don't open</Button>
+              <Button variant="danger" icon="alert" onClick={confirmRiskyOpen}>
+                Run it anyway
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

@@ -52,18 +52,23 @@ impl IncomingFile {
         })
     }
 
-    /// Append a chunk to the file
+    /// Append a chunk to the file.
+    ///
+    /// The overflow check runs **before** the write: checking afterwards still
+    /// let a peer put the excess bytes on our disk, which is the thing the cap
+    /// exists to prevent.
     pub async fn append_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        self.file.write_all(chunk).await?;
-        self.received += chunk.len() as u64;
-
-        if self.received > self.expected {
+        let would_be = self.received.saturating_add(chunk.len() as u64);
+        if would_be > self.expected {
             anyhow::bail!(
                 "received more data than expected: {} > {}",
-                self.received,
+                would_be,
                 self.expected
             );
         }
+
+        self.file.write_all(chunk).await?;
+        self.received = would_be;
 
         tracing::trace!("Received chunk ({}/{} bytes)", self.received, self.expected);
 
@@ -192,18 +197,20 @@ impl IncomingFileSync {
         })
     }
 
-    /// Write a chunk to the file
+    /// Write a chunk to the file. The cap is enforced *before* the write — see
+    /// [`IncomingFile::append_chunk`].
     pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        self.file.write_all(chunk)?;
-        self.received += chunk.len() as u64;
-
-        if self.received > self.expected {
+        let would_be = self.received.saturating_add(chunk.len() as u64);
+        if would_be > self.expected {
             anyhow::bail!(
                 "Received more data than expected: {} > {}",
-                self.received,
+                would_be,
                 self.expected
             );
         }
+
+        self.file.write_all(chunk)?;
+        self.received = would_be;
 
         Ok(())
     }
@@ -369,5 +376,42 @@ mod tests {
             .write_chunk(b"hello")
             .expect_err("should reject oversize chunk");
         assert!(err.to_string().contains("Received more data than expected"));
+        assert_eq!(
+            incoming.bytes_received(),
+            0,
+            "a rejected chunk must not be counted"
+        );
+    }
+
+    /// A peer that keeps sending past the size it declared must not get those
+    /// bytes onto our disk — the check has to precede the write.
+    #[tokio::test]
+    async fn overflowing_chunks_are_rejected_before_they_are_written() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut incoming = IncomingFile::start_meta("test.txt", 4, temp_dir.path())
+            .await
+            .unwrap();
+
+        incoming.append_chunk(b"abcd").await.unwrap();
+        let err = incoming
+            .append_chunk(b"more")
+            .await
+            .expect_err("past the declared size");
+        assert!(err.to_string().contains("more data than expected"));
+        assert_eq!(
+            incoming.received(),
+            4,
+            "a rejected chunk must not be counted"
+        );
+
+        // The rejected bytes were never handed to the file, so what lands on
+        // disk is exactly what was declared.
+        let dest = temp_dir.path().join("out");
+        let final_path = incoming.finalize(&dest).await.expect("finalizes cleanly");
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"abcd",
+            "the excess bytes must never reach the disk"
+        );
     }
 }

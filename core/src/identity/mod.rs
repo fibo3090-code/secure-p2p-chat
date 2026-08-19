@@ -310,6 +310,38 @@ impl Identity {
         Ok(())
     }
 
+    /// Re-wrap the private key under a new password.
+    ///
+    /// `current` is verified against the stored wrapper first. That check is not
+    /// a formality: without it anyone who reaches an unlocked machine could
+    /// rotate the password and lock the owner out of the identity — and the
+    /// identity is the only key to their message history.
+    ///
+    /// The **history stays readable**: [`Identity::history_key`] is derived from
+    /// the private key, which a password change does not touch. Only the wrapper
+    /// around that key is replaced (fresh Argon2 salt, fresh nonce).
+    ///
+    /// On success the identity is left *unlocked* under the new password. On any
+    /// failure it is untouched and still opens with `current`, so a rejected new
+    /// password (too short) or a mistyped current one costs nothing. Callers must
+    /// still persist it — see [`Identity::save`] — and should not swap a shared
+    /// identity for the re-wrapped one until that save has succeeded, or memory
+    /// and disk end up wanting different passwords.
+    pub fn change_password(&mut self, current: &str, new: &str) -> Result<()> {
+        if !self.is_encrypted() {
+            bail!("This identity has no password yet — set one instead of changing it");
+        }
+        // Verify against the stored wrapper, not against "are we unlocked".
+        self.decrypt(current)
+            .map_err(|_| anyhow!("Current password is incorrect"))?;
+        // `encrypt` enforces the length floor and consumes the plaintext key.
+        self.encrypt(new)?;
+        // Re-open under the new password: proves the new wrapper works before
+        // the caller writes it to disk, and keeps this session unlocked.
+        self.decrypt(new)
+            .map_err(|e| anyhow!("Re-encrypted identity did not open with the new password: {e}"))
+    }
+
     /// Derive the wrapping key with `argon` and open the encrypted private key.
     /// `None` means these parameters do not open it — a wrong password, or the
     /// wrong configuration for this file. The two are deliberately
@@ -895,6 +927,83 @@ mod tests {
         identity.decrypt(&password).unwrap();
         assert!(identity.private_key_pem_plaintext.is_some());
         assert_eq!(identity.private_key_pem_plaintext.unwrap(), original_pem);
+    }
+
+    /// The whole point of a password change: the wrapper changes, the key does
+    /// not — so every stored message stays readable afterwards.
+    #[test]
+    fn change_password_rewraps_the_same_key_and_keeps_the_history_key() {
+        let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
+        let old = test_password();
+        let new = test_password();
+        identity.encrypt(&old).unwrap();
+        identity.decrypt(&old).unwrap();
+        let history_key_before = identity.history_key().unwrap();
+        let pem_before = identity.private_key_pem_plaintext.clone().unwrap();
+
+        identity.change_password(&old, &new).unwrap();
+
+        // Still unlocked, same private key, same history key.
+        assert!(!identity.is_locked());
+        assert_eq!(
+            identity.private_key_pem_plaintext.clone().unwrap(),
+            pem_before
+        );
+        assert_eq!(
+            identity.history_key().unwrap(),
+            history_key_before,
+            "a password change must never make the stored history unreadable"
+        );
+
+        // The new password opens it; the old one no longer does.
+        let mut reopened = identity.clone();
+        reopened.private_key_pem_plaintext = None;
+        assert!(reopened.decrypt(&new).is_ok());
+        let mut stale = identity.clone();
+        stale.private_key_pem_plaintext = None;
+        assert!(stale.decrypt(&old).is_err());
+    }
+
+    /// A wrong current password must not rotate anything — otherwise anyone at
+    /// an unlocked machine could lock the owner out of their own identity.
+    #[test]
+    fn change_password_rejects_a_wrong_current_password() {
+        let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
+        let old = test_password();
+        identity.encrypt(&old).unwrap();
+        identity.decrypt(&old).unwrap();
+
+        let err = identity
+            .change_password("not-the-password", &test_password())
+            .expect_err("a wrong current password must be refused");
+        assert!(err.to_string().contains("Current password is incorrect"));
+
+        // Untouched: the old password still opens it.
+        let mut check = identity.clone();
+        check.private_key_pem_plaintext = None;
+        assert!(check.decrypt(&old).is_ok());
+    }
+
+    /// The length floor applies to a changed password exactly as it does to a
+    /// new one, and a rejected change leaves the old wrapper in place.
+    #[test]
+    fn change_password_enforces_the_length_floor_without_destroying_the_old() {
+        let mut identity = Identity::new_with_plaintext("Test User".to_string()).unwrap();
+        let old = test_password();
+        identity.encrypt(&old).unwrap();
+        identity.decrypt(&old).unwrap();
+
+        let err = identity
+            .change_password(&old, "short")
+            .expect_err("a too-short new password must be refused");
+        assert!(err.to_string().contains("at least"));
+
+        let mut check = identity.clone();
+        check.private_key_pem_plaintext = None;
+        assert!(
+            check.decrypt(&old).is_ok(),
+            "a refused change must leave the identity openable with the old password"
+        );
     }
 
     #[test]

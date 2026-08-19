@@ -76,6 +76,10 @@ pub enum TuiCommand {
         username: String,
         password: Option<String>,
     },
+    /// Accept the community server identity shown by the last `:party-connect`
+    /// and finish joining. Separate command because the credentials are only
+    /// sent once the user has confirmed the fingerprint out of band.
+    PartyTrust,
     PartyPost(String),
     /// Send a direct message to a member (by username or `#index`) on the current
     /// Party server.
@@ -172,6 +176,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "party-connect",
         ":party-connect <host[:port]> <username> [password]",
         "Join a Party server",
+    ),
+    (
+        "party-trust",
+        ":party-trust",
+        "Accept the community server identity shown by :party-connect and join",
     ),
     (
         "party-post",
@@ -435,6 +444,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
                 password,
             })
         }
+        "party-trust" => Ok(TuiCommand::PartyTrust),
         "party-post" => {
             if rest.is_empty() {
                 return Err("Usage: :party-post <message>".to_string());

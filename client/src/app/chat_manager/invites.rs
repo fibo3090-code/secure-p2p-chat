@@ -3,6 +3,33 @@
 use super::*;
 
 impl ChatManager {
+    /// Whether a link is the **signed** (v2+) invite format. An unsigned v1
+    /// link carries no proof of who made it — anyone can mint one naming
+    /// anybody — so callers surface that difference to the user instead of
+    /// importing both silently.
+    pub fn invite_link_is_signed(link: &str) -> bool {
+        link.contains("/v2/")
+    }
+
+    /// Reject an invite whose `fingerprint` field does not match the key it
+    /// ships. The two are separate fields on the wire and only the key is
+    /// self-attesting; the fingerprint is what every trust decision in the app
+    /// is made against, so a mismatch means one of them is a lie.
+    fn check_fingerprint_binding(claimed: &str, public_key_pem: &str) -> Result<()> {
+        let derived = crate::core::crypto::fingerprint_pubkey(public_key_pem.as_bytes());
+        if !derived.eq_ignore_ascii_case(claimed.trim()) {
+            tracing::warn!(
+                claimed = %claimed,
+                derived = %derived,
+                "rejecting invite: fingerprint does not match its public key"
+            );
+            anyhow::bail!(
+                "This invite is inconsistent: the fingerprint it shows does not belong to the key it carries. Ask the sender for a fresh link."
+            );
+        }
+        Ok(())
+    }
+
     /// Generate an invite link for sharing contact information
     /// Format: chat-p2p://invite/<base64_json>
     pub fn generate_invite_link(
@@ -124,6 +151,13 @@ impl ChatManager {
                 tracing::warn!(error = %e, "v2 invite signature verification failed");
                 anyhow::anyhow!("Invite signature verification failed: {}", e)
             })?;
+
+            // The signature only proves that whoever built this invite holds the
+            // private key for the `public_key` *inside it*. `fingerprint` is a
+            // separate field, and it is the one that decides trust everywhere
+            // else in the app — so if the two disagree, the invite is lying and
+            // nothing downstream would ever notice. Bind them here.
+            Self::check_fingerprint_binding(&signed_invite.payload.fingerprint, pubkey_pem)?;
 
             tracing::debug!(
                 timestamp = signed_invite.payload.timestamp,
@@ -250,6 +284,12 @@ impl ChatManager {
                 tracing::warn!(error = %e, "Invalid invite data JSON");
                 anyhow::anyhow!("Invalid invite data: {}", e)
             })?;
+
+            // Nothing signs a v1 invite, so this check does not make it
+            // trustworthy — it only rejects a link that is internally
+            // inconsistent. A v1 contact is imported Unverified and still has
+            // to pass the SAS prompt on first connection.
+            Self::check_fingerprint_binding(&payload.fingerprint, &payload.public_key)?;
 
             // Sanitize address: ignore placeholder or clearly invalid addresses like "YOUR_IP:PORT"
             let address = payload.address.as_ref().and_then(|addr| {

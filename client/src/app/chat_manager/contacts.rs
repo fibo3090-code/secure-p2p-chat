@@ -44,20 +44,89 @@ impl ChatManager {
         id
     }
 
-    pub fn import_contact(&mut self, mut contact: Contact) -> Uuid {
+    /// Save a contact parsed from an invite link.
+    ///
+    /// Importing the same link twice used to add a second identical card, and
+    /// importing your *own* link added you to your own contacts. Both are
+    /// resolved by identity, not by name: an invite for a fingerprint we already
+    /// have refreshes that contact instead of duplicating it.
+    pub fn import_contact(&mut self, mut contact: Contact) -> Result<Uuid> {
+        if let Some(fp) = contact.fingerprint.as_deref() {
+            if self
+                .my_fingerprint
+                .as_deref()
+                .is_some_and(|mine| mine.eq_ignore_ascii_case(fp))
+            {
+                anyhow::bail!("That invite link is your own — share it with someone else instead.");
+            }
+            if let Some(existing) = self
+                .contacts
+                .values()
+                .find(|c| c.fingerprint.as_deref() == Some(fp))
+                .map(|c| c.id)
+            {
+                // Same peer, possibly a fresher address or relay token. Update
+                // the reachability details and keep everything trust-related.
+                let name = contact.name.clone();
+                if let Some(current) = self.contacts.get_mut(&existing) {
+                    current.name = name;
+                    current.address = contact.address;
+                    current.addresses = contact.addresses;
+                    current.relay_server = contact.relay_server;
+                    current.relay_token = contact.relay_token;
+                }
+                tracing::info!(contact = %existing, "invite refreshed an existing contact");
+                return Ok(existing);
+            }
+        }
         let id = Uuid::new_v4();
         contact.id = id;
         contact.created_at = chrono::Utc::now();
         self.contacts.insert(id, contact);
-        id
+        Ok(id)
     }
 
-    /// Remove a contact
+    /// Remove a contact **and the trust that came with it**.
+    ///
+    /// Deleting used to drop the contact record only, leaving the fingerprint on
+    /// any chat that had verified it — so the peer still connected with no
+    /// prompt, and a *blocked* contact silently became unblocked because the
+    /// block lived nowhere else. Both of those made the confirmation dialog's
+    /// promise ("you would have to compare the safety code again") untrue.
+    /// Clearing the stored fingerprint restores it: the next connection from
+    /// that peer is a first contact again.
     pub fn remove_contact(&mut self, contact_id: Uuid) {
         tracing::info!(contact_id = %contact_id, "Removing contact");
-        self.contacts.remove(&contact_id);
+        let removed = self.contacts.remove(&contact_id);
         self.contact_to_chat.remove(&contact_id);
+
+        if let Some(fp) = removed.as_ref().and_then(|c| c.fingerprint.clone()) {
+            // Only if no *other* contact still vouches for this fingerprint.
+            let still_known = self
+                .contacts
+                .values()
+                .any(|c| c.fingerprint.as_deref() == Some(fp.as_str()));
+            if !still_known {
+                for chat in self.chats.values_mut() {
+                    if chat.peer_fingerprint.as_deref() == Some(fp.as_str()) {
+                        chat.peer_fingerprint = None;
+                    }
+                }
+                tracing::info!(
+                    "cleared the stored fingerprint of the deleted contact; \
+                     their next connection will need verification again"
+                );
+            }
+        }
         tracing::debug!(remaining_contacts = %self.contacts.len(), "Contact removed");
+    }
+
+    /// Whether deleting this contact would also lift a block on that peer, so
+    /// the UI can say so before the user commits to it.
+    pub fn deleting_contact_would_unblock(&self, contact_id: Uuid) -> bool {
+        self.contacts
+            .get(&contact_id)
+            .is_some_and(|c| c.trust_state == TrustState::Blocked)
     }
 
     /// Get a contact
@@ -91,10 +160,23 @@ impl ChatManager {
                 .map(|c| *self.chat_id_mapping.get(&c.id).unwrap_or(&c.id))
                 .collect();
             for sid in session_ids {
+                // An in-flight receive from this peer must be failed *before*
+                // the mapping is dropped — that mapping is how a session id
+                // resolves back to its conversation. Otherwise blocking someone
+                // mid-transfer leaves a progress row that never finishes and an
+                // orphaned temp spool, exactly as a mid-receive disconnect used
+                // to.
+                self.fail_incoming_transfers(sid, "blocked this contact");
                 let had_session = self.sessions.remove(&sid).is_some();
                 self.session_events.remove(&sid);
                 self.fingerprint_confirm_senders.remove(&sid);
+                self.drop_fingerprint_requests_for_session(sid);
                 self.chat_id_mapping.retain(|_, v| *v != sid);
+                // Dropping the handle and the event receiver is not enough on
+                // its own: a task parked on a socket read has nothing to send,
+                // so it never notices and keeps the connection open for the
+                // life of the process. Abort it.
+                self.abort_session_task(sid);
                 if had_session {
                     tracing::info!(session = %sid, "Disconnected session of blocked contact");
                 }

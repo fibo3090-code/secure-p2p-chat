@@ -4,43 +4,37 @@
 use super::*;
 
 impl ChatManager {
-    /// Send the user's accept/reject decision for a fingerprint verification to the session task
+    /// Send the user's accept/reject decision for a fingerprint verification to
+    /// the session task. `chat_id` is the SESSION id the prompt carried.
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");
         if self.fingerprint_confirm_senders.contains_key(&chat_id) {
-            // If the user accepted and we have a pending verification request matching this chat,
-            // persist the fingerprint in the chat record before confirming the session.
-            if accept {
-                if let Some((fp, req_chat_id)) = self
-                    .fingerprint_verification_request
-                    .as_ref()
-                    .map(|p| (p.fingerprint.clone(), p.session_id))
-                {
-                    // IMPORTANT: In host mode, req_chat_id is the session ID (the host placeholder ID)
-                    // but the fingerprint should be stored in the actual chat (the client's ID).
-                    // However, confirm_fingerprint is called with the session ID.
-                    if req_chat_id == chat_id {
-                        // Resolve the actual chat ID if this is a mapped session
-                        let target_chat_id = self
-                            .chat_id_mapping
-                            .iter()
-                            .find(|(_, &session_id)| session_id == chat_id)
-                            .map(|(&incoming_id, _)| incoming_id)
-                            .unwrap_or(chat_id);
+            // Take *this session's* prompt out of the queue — matching by
+            // session id, not "whatever is pending", so answering one peer never
+            // resolves or discards another's. A rejected prompt is removed too:
+            // that session is about to die and its entry must not block the
+            // queue behind it.
+            let pending = self.take_fingerprint_request(chat_id);
 
-                        if let Some(chat) = self.chats.get_mut(&target_chat_id) {
-                            tracing::debug!(
-                                "Storing verified fingerprint for chat {}",
-                                target_chat_id
-                            );
-                            chat.peer_fingerprint = Some(fp.clone());
-                        }
-                        // A user-confirmed fingerprint also verifies the
-                        // matching contact.
-                        self.promote_contact_verified(target_chat_id, &fp);
-                        // Clear the pending request now that we've stored it
-                        self.fingerprint_verification_request = None;
+            // On accept, persist the fingerprint before confirming the session.
+            if accept {
+                if let Some(fp) = pending.map(|p| p.fingerprint) {
+                    // In host mode the session id is the placeholder's, while the
+                    // fingerprint belongs on the incoming chat the peer created.
+                    let target_chat_id = self
+                        .chat_id_mapping
+                        .iter()
+                        .find(|(_, &session_id)| session_id == chat_id)
+                        .map(|(&incoming_id, _)| incoming_id)
+                        .unwrap_or(chat_id);
+
+                    if let Some(chat) = self.chats.get_mut(&target_chat_id) {
+                        tracing::debug!("Storing verified fingerprint for chat {}", target_chat_id);
+                        chat.peer_fingerprint = Some(fp.clone());
                     }
+                    // A user-confirmed fingerprint also verifies the
+                    // matching contact.
+                    self.promote_contact_verified(target_chat_id, &fp);
                 }
             }
 
@@ -68,9 +62,13 @@ impl ChatManager {
             if !self.sessions.contains_key(&existing_host.id) {
                 let id_to_remove = existing_host.id;
                 self.chats.remove(&id_to_remove);
+                // Abort its task too, or a listener still parked in `accept()`
+                // keeps the port and the bind below fails with EADDRINUSE.
+                self.abort_session_task(id_to_remove);
                 self.sessions.remove(&id_to_remove);
                 self.session_events.remove(&id_to_remove);
                 self.fingerprint_confirm_senders.remove(&id_to_remove);
+                self.drop_fingerprint_requests_for_session(id_to_remove);
                 tracing::warn!(port = %port, "Removed stale placeholder host before restarting");
             } else {
                 self.add_toast(
@@ -85,6 +83,34 @@ impl ChatManager {
         let chat_id = Uuid::new_v4();
         tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
 
+        // Bind BEFORE any state is created. A bind that failed inside the
+        // spawned task was only logged, while the chat and session handle below
+        // had already been inserted — leaving a "Host on :port" conversation
+        // that `is_connected()` reported as Connected, `is_hosting` stuck true,
+        // and `my_addresses` advertising a port nothing was listening on.
+        let listener = match crate::network::bind_host_listener(port).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::error!(port = %port, error = %e, "Could not bind host listener");
+                // Auto-rehost is a timer. Retrying a port another process owns,
+                // forever, logs every tick and tells the user nothing — so after
+                // a few attempts stop claiming to host and say why, once.
+                self.rehost_failures = self.rehost_failures.saturating_add(1);
+                if self.rehost_failures >= MAX_CONSECUTIVE_REHOST_FAILURES {
+                    self.stop_hosting();
+                    self.add_toast(ToastLevel::Error, format!("Stopped hosting — {}", e));
+                }
+                return Err(e);
+            }
+        };
+        self.rehost_failures = 0;
+        // The port actually bound, which is not the requested one when the
+        // caller asked for 0 (OS-assigned). Everything downstream — the chat
+        // title, "share this address", the UPnP mapping, and the port
+        // auto-rehost rebinds — must use this, or the app advertises `:0` and
+        // every rehost lands somewhere new.
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+
         // Create channels
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
@@ -96,9 +122,10 @@ impl ChatManager {
         let connection_password = self.connection_password.clone();
 
         // Spawn session task
-        tokio::spawn(async move {
+        let failure_tx = to_app_tx.clone();
+        let task = tokio::spawn(async move {
             if let Err(e) = run_host_session(
-                port,
+                listener,
                 privkey,
                 to_app_tx,
                 from_app_rx,
@@ -110,6 +137,15 @@ impl ChatManager {
             .await
             {
                 tracing::error!("Host session error: {}", e);
+                // A host session that dies before accepting anyone (rate limit,
+                // failed handshake, refused password) leaves its placeholder
+                // chat behind, and `check_rehost_needed()` then reports "already
+                // hosting" forever. Report it so the app can drop the
+                // placeholder and rebind. `Disconnected` is the signal that
+                // clears session state; the message loop already sends its own
+                // on the normal path, so this only fires when it never got there.
+                let _ = failure_tx.send(SessionEvent::Error(format!("Hosting stopped: {}", e)));
+                let _ = failure_tx.send(SessionEvent::Disconnected);
             }
         });
 
@@ -129,6 +165,7 @@ impl ChatManager {
             recv_seq: 0,
             is_host_placeholder: true,
             read_count: 0,
+            title_is_custom: false,
         };
 
         self.chats.insert(chat_id, chat);
@@ -139,6 +176,7 @@ impl ChatManager {
                 file_tx,
             },
         );
+        self.register_session_task(chat_id, task);
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -227,7 +265,8 @@ impl ChatManager {
         let relay_server_owned = relay_server.to_string();
         let relay_token_owned = relay_token.clone();
 
-        tokio::spawn(async move {
+        let failure_tx = to_app_tx.clone();
+        let task = tokio::spawn(async move {
             if let Err(e) = run_host_session_via_relay(
                 &relay_server_owned,
                 &relay_token_owned,
@@ -241,6 +280,12 @@ impl ChatManager {
             .await
             {
                 tracing::error!("Relay host session error: {}", e);
+                // Same reasoning as the direct host path: a rendezvous that
+                // never produced a peer must still clear its placeholder, or
+                // the app looks like it is hosting when it is not.
+                let _ =
+                    failure_tx.send(SessionEvent::Error(format!("Relay hosting stopped: {}", e)));
+                let _ = failure_tx.send(SessionEvent::Disconnected);
             }
         });
 
@@ -261,6 +306,7 @@ impl ChatManager {
                 recv_seq: 0,
                 is_host_placeholder: true,
                 read_count: 0,
+                title_is_custom: false,
             },
         );
         self.sessions.insert(
@@ -270,6 +316,7 @@ impl ChatManager {
                 file_tx,
             },
         );
+        self.register_session_task(chat_id, task);
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -320,7 +367,8 @@ impl ChatManager {
         let connection_password = self.connection_password.clone();
 
         let targets_copy = targets.clone();
-        tokio::spawn(async move {
+        let failure_tx = to_app_tx.clone();
+        let task = tokio::spawn(async move {
             if let Err(e) = run_client_session_multi(
                 &targets_copy,
                 privkey,
@@ -334,6 +382,13 @@ impl ChatManager {
             .await
             {
                 tracing::error!("Client session error: {}", e);
+                // The chat and session handle were registered before the dial,
+                // so a failure that only logged left the conversation reporting
+                // itself connected forever — and any queued TOFU prompt sitting
+                // at the head of the queue, blocking the next peer's. Reporting
+                // it is what lets the app clean both up.
+                let _ = failure_tx.send(SessionEvent::Error(format!("Connection failed: {}", e)));
+                let _ = failure_tx.send(SessionEvent::Disconnected);
             }
         });
 
@@ -353,10 +408,15 @@ impl ChatManager {
                 recv_seq: 0,
                 is_host_placeholder: false,
                 read_count: 0,
+                title_is_custom: false,
             };
             e.insert(chat);
             tracing::debug!(chat_id = %chat_id, "Created local chat entry for client session");
         }
+        // Reconnecting onto an existing conversation: the new session's wire
+        // sequence restarts at 1, so the previous session's high-water mark
+        // would reject the peer's first messages as replays.
+        self.reset_chat_sequences(chat_id);
 
         self.sessions.insert(
             chat_id,
@@ -365,6 +425,7 @@ impl ChatManager {
                 file_tx,
             },
         );
+        self.register_session_task(chat_id, task);
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -391,7 +452,8 @@ impl ChatManager {
         let relay_server_owned = relay_server.to_string();
         let relay_token_owned = token.to_string();
 
-        tokio::spawn(async move {
+        let failure_tx = to_app_tx.clone();
+        let task = tokio::spawn(async move {
             if let Err(e) = run_client_session_via_relay(
                 &relay_server_owned,
                 &relay_token_owned,
@@ -405,6 +467,13 @@ impl ChatManager {
             .await
             {
                 tracing::error!("Relay client session error: {}", e);
+                // See connect_to_host_candidates: a silent failure leaves a
+                // chat that claims to be connected and a stuck TOFU prompt.
+                let _ = failure_tx.send(SessionEvent::Error(format!(
+                    "Relay connection failed: {}",
+                    e
+                )));
+                let _ = failure_tx.send(SessionEvent::Disconnected);
             }
         });
 
@@ -425,6 +494,7 @@ impl ChatManager {
                     recv_seq: 0,
                     is_host_placeholder: false,
                     read_count: 0,
+                    title_is_custom: false,
                 });
             }
             // Reconnecting or a chat pre-created elsewhere (e.g. the contacts
@@ -434,6 +504,9 @@ impl ChatManager {
                 e.get_mut().transport = Transport::Relay;
             }
         }
+        // See connect_to_host_candidates: a fresh session restarts the wire
+        // sequence, so the old high-water mark must not survive it.
+        self.reset_chat_sequences(chat_id);
 
         self.sessions.insert(
             chat_id,
@@ -442,6 +515,7 @@ impl ChatManager {
                 file_tx,
             },
         );
+        self.register_session_task(chat_id, task);
         self.session_events
             .insert(chat_id, Arc::new(Mutex::new(to_app_rx)));
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
@@ -478,6 +552,29 @@ impl ChatManager {
             .iter()
             .filter_map(|a| Self::parse_address(a).ok())
             .collect();
+
+        // Reconnecting must land in the conversation this contact already has.
+        // `contact_to_chat` is the fast path, but it is only populated once a
+        // connection has been associated — a contact imported from an invite,
+        // or one whose association was never recorded, would otherwise start a
+        // brand-new chat every time and fragment the history. The contact's
+        // fingerprint identifies the same peer across chats, which is how
+        // returning peers are recognised everywhere else in the manager.
+        let existing_chat_id = existing_chat_id.or_else(|| {
+            let fp = contact.fingerprint.as_deref()?;
+            let found = self
+                .chats
+                .iter()
+                .find(|(_, c)| c.peer_fingerprint.as_deref() == Some(fp) && !c.is_host_placeholder)
+                .map(|(id, _)| *id)?;
+            tracing::info!(
+                contact = %contact_id,
+                chat = %found,
+                "reusing this contact's existing conversation (matched by fingerprint)"
+            );
+            Some(found)
+        });
+
         // If we already have a mapped chat for this contact, ensure it has a session; otherwise try to establish one
         if let Some(mapped) = self.contact_to_chat.get(&contact_id).copied() {
             let has_session = self.sessions.contains_key(&mapped);
@@ -590,8 +687,11 @@ impl ChatManager {
                 "Contact {} has no address and no active session found by fingerprint",
                 contact_id
             );
+            // Do not point at a contact editor: there isn't one. Telling
+            // someone to use a feature that does not exist is worse than
+            // telling them nothing.
             Err(anyhow::anyhow!(
-                "Contact has no address. Edit the contact to set IP:PORT, or connect first so we can match by fingerprint."
+                "This contact has no address or relay token to dial. Ask them for a fresh invite link, or have them connect to you first."
             ))
         }
     }

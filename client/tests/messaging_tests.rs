@@ -4,29 +4,44 @@ use p2pem_classic::types::Config;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Sending with no session must FAIL, not succeed-and-toast.
+///
+/// A front-end reads `Ok(())` as "sent": it clears the composer and adds no
+/// message row, so the text is destroyed and a four-second toast is the only
+/// trace. Returning an error is what lets every caller keep the draft.
 #[test]
-fn test_send_message_without_session_returns_ok_and_toasts() {
+fn test_send_message_without_session_errors_instead_of_dropping_text() {
     let mut manager = ChatManager::new(Config::default());
     let chat_id = Uuid::new_v4();
     manager.create_local_chat_for_test(chat_id, "Test".to_string());
 
-    let initial_toasts = manager.toasts.len();
-
-    // No session added, so it should warn and return Ok() (silently skipping send)
     let result = manager.send_message(chat_id, "Hello".to_string());
 
-    assert!(result.is_ok());
-    assert_eq!(manager.toasts.len(), initial_toasts + 1);
-    assert!(manager
-        .toasts
-        .last()
-        .unwrap()
-        .message
-        .contains("Connecting"));
+    let err = result.expect_err("a send with no session must not report success");
+    assert!(
+        err.to_string().to_lowercase().contains("not connected"),
+        "the error must say why nothing was sent, got: {err}"
+    );
 
-    // Message should NOT be in history because session was missing
+    // Nothing was queued, so nothing may be recorded as sent either.
     let chat = manager.chats.get(&chat_id).unwrap();
     assert!(chat.messages.is_empty());
+}
+
+/// The same, for a conversation that was established and then dropped: the
+/// error must say the peer is gone rather than "still connecting".
+#[test]
+fn test_send_message_to_disconnected_peer_reports_the_disconnect() {
+    let mut manager = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    manager.create_local_chat_for_test(chat_id, "Test".to_string());
+    manager.chats.get_mut(&chat_id).unwrap().peer_fingerprint = Some("a".repeat(64));
+
+    let err = manager
+        .send_message(chat_id, "Hello".to_string())
+        .expect_err("a send to a dropped peer must not report success");
+    assert!(err.to_string().contains("disconnected"), "got: {err}");
+    assert!(manager.chats.get(&chat_id).unwrap().messages.is_empty());
 }
 
 #[test]

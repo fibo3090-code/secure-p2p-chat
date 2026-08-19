@@ -198,7 +198,25 @@ pub enum PartyResponse {
     },
     /// A non-fatal application error.
     Error(String),
+    /// A *send* was refused (post, DM, or file upload). Distinct from `Error`
+    /// because the client appends outgoing messages optimistically — it has to
+    /// know that the refusal belongs to the message it is still showing, so it
+    /// can take it back rather than leave the user believing it was delivered.
+    /// Appended variant: bincode encodes the index, so this must stay last.
+    ActionFailed {
+        channel: Uuid,
+        reason: String,
+    },
 }
+
+/// Most envelopes the server will put in one `History` response.
+///
+/// A whole channel used to be returned in a single frame, so once its history
+/// passed [`crate::MAX_PACKET_SIZE`] the reply could not be sent at all: the
+/// send failed, the connection dropped, and the community became unjoinable
+/// with no error the user could see. History is paged instead — the client asks
+/// again with `since_seq` set to the last envelope it received.
+pub const MAX_HISTORY_BATCH: usize = 200;
 
 impl PartyRequest {
     /// Serialize to bytes for transport inside the encrypted tunnel.
@@ -224,37 +242,90 @@ impl PartyResponse {
     }
 }
 
-/// Send a serialized Party message over an established v3 tunnel: encrypt it with
-/// the session `cipher` (bound to `transport_aad`) and length-prefix the result.
-/// Used by both the client and the server for every Party request/response.
+/// Width of the per-frame sequence number prefixed to every Party payload
+/// *inside* the encryption, so it is covered by the AEAD tag.
+const PARTY_SEQ_BYTES: usize = 8;
+
+/// Monotonic per-direction frame counter. One lives on each end of each
+/// direction of a Party tunnel.
+///
+/// Party frames used to carry nothing but the ciphertext, which meant an
+/// attacker positioned on the TCP stream could replay a captured frame — a
+/// `PostMessage`, or a server's `Message` broadcast — and both ends would
+/// accept it as new. The P2P message loop has enforced a per-session sequence
+/// against exactly this since v3; this brings the Party tunnel in line.
+#[derive(Debug, Default, Clone)]
+pub struct FrameSeq(u64);
+
+impl FrameSeq {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.saturating_add(1);
+        self.0
+    }
+
+    /// Accept `seq` only if it advances the counter, rejecting replays and
+    /// reordering.
+    fn accept(&mut self, seq: u64) -> bool {
+        if seq > self.0 {
+            self.0 = seq;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Send a serialized Party message over an established v3 tunnel: prefix the
+/// next frame sequence, encrypt the result with the session `cipher` (bound to
+/// `transport_aad`), and length-prefix it. Used by both the client and the
+/// server for every Party request/response.
 pub async fn send_framed<S>(
     stream: &mut S,
     cipher: &AesCipher,
     transport_aad: &[u8],
+    seq: &mut FrameSeq,
     payload: &[u8],
 ) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let ciphertext = cipher.encrypt(payload, Some(transport_aad));
+    let mut framed = Vec::with_capacity(PARTY_SEQ_BYTES + payload.len());
+    framed.extend_from_slice(&seq.next().to_be_bytes());
+    framed.extend_from_slice(payload);
+    let ciphertext = cipher.encrypt(&framed, Some(transport_aad));
     send_packet(stream, &ciphertext).await?;
     Ok(())
 }
 
 /// Receive and decrypt the next Party message from an established v3 tunnel.
-/// Returns an error if the frame fails to authenticate/decrypt.
+/// Returns an error if the frame fails to authenticate/decrypt, or if its
+/// sequence number does not advance (a replayed or reordered frame).
 pub async fn recv_framed<S>(
     stream: &mut S,
     cipher: &AesCipher,
     transport_aad: &[u8],
+    seq: &mut FrameSeq,
 ) -> anyhow::Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
     let ciphertext = recv_packet(stream).await?;
-    cipher
+    let plaintext = cipher
         .decrypt(&ciphertext, Some(transport_aad))
-        .ok_or_else(|| anyhow::anyhow!("failed to decrypt Party frame"))
+        .ok_or_else(|| anyhow::anyhow!("failed to decrypt Party frame"))?;
+    if plaintext.len() < PARTY_SEQ_BYTES {
+        anyhow::bail!("Party frame is too short to carry a sequence number");
+    }
+    let (head, body) = plaintext.split_at(PARTY_SEQ_BYTES);
+    let frame_seq = u64::from_be_bytes(head.try_into().expect("checked length"));
+    if !seq.accept(frame_seq) {
+        anyhow::bail!("replayed or out-of-order Party frame (seq {frame_seq})");
+    }
+    Ok(body.to_vec())
 }
 
 /// Client-side handle to a Party server over an established Protocol v3 tunnel.
@@ -267,8 +338,11 @@ where
 pub struct PartyClient<S> {
     stream: S,
     server_fingerprint: String,
+    sas: String,
     cipher: AesCipher,
     transport_aad: Vec<u8>,
+    send_seq: FrameSeq,
+    recv_seq: FrameSeq,
 }
 
 /// Read half of a split [`PartyClient`].
@@ -276,6 +350,7 @@ pub struct PartyReader<R> {
     rd: R,
     cipher: AesCipher,
     transport_aad: Vec<u8>,
+    recv_seq: FrameSeq,
 }
 
 /// Write half of a split [`PartyClient`].
@@ -283,6 +358,7 @@ pub struct PartyWriter<W> {
     wr: W,
     cipher: AesCipher,
     transport_aad: Vec<u8>,
+    send_seq: FrameSeq,
 }
 
 impl<R> PartyReader<R>
@@ -291,7 +367,13 @@ where
 {
     /// Receive the next message from the server (reply or pushed broadcast).
     pub async fn recv(&mut self) -> anyhow::Result<PartyResponse> {
-        let bytes = recv_framed(&mut self.rd, &self.cipher, &self.transport_aad).await?;
+        let bytes = recv_framed(
+            &mut self.rd,
+            &self.cipher,
+            &self.transport_aad,
+            &mut self.recv_seq,
+        )
+        .await?;
         PartyResponse::from_bytes(&bytes)
             .ok_or_else(|| anyhow::anyhow!("malformed server response"))
     }
@@ -307,6 +389,7 @@ where
             &mut self.wr,
             &self.cipher,
             &self.transport_aad,
+            &mut self.send_seq,
             &req.to_bytes(),
         )
         .await
@@ -325,17 +408,29 @@ where
         chat_id: Uuid,
     ) -> anyhow::Result<Self> {
         let tunnel = client_handshake(&mut stream, privkey, chat_id).await?;
+        let sas = crate::core::crypto::derive_sas(&tunnel.transport_aad);
         Ok(Self {
             stream,
             server_fingerprint: tunnel.peer_fingerprint,
+            sas,
             cipher: tunnel.cipher,
             transport_aad: tunnel.transport_aad,
+            send_seq: FrameSeq::new(),
+            recv_seq: FrameSeq::new(),
         })
     }
 
     /// The server's handshake-verified identity fingerprint, for TOFU pinning.
     pub fn server_fingerprint(&self) -> &str {
         &self.server_fingerprint
+    }
+
+    /// The short authentication string for this tunnel (six digits + three
+    /// emoji), derived from the handshake transcript exactly as it is for a
+    /// peer-to-peer session. Shown to the user when a community server's
+    /// identity is being trusted for the first time.
+    pub fn sas(&self) -> &str {
+        &self.sas
     }
 
     /// Split into independent read and write halves so an application can run a
@@ -347,11 +442,13 @@ where
                 rd,
                 cipher: self.cipher.clone(),
                 transport_aad: self.transport_aad.clone(),
+                recv_seq: self.recv_seq,
             },
             PartyWriter {
                 wr,
                 cipher: self.cipher,
                 transport_aad: self.transport_aad,
+                send_seq: self.send_seq,
             },
         )
     }
@@ -362,6 +459,7 @@ where
             &mut self.stream,
             &self.cipher,
             &self.transport_aad,
+            &mut self.send_seq,
             &req.to_bytes(),
         )
         .await
@@ -369,7 +467,13 @@ where
 
     /// Receive the next message from the server (a reply or a pushed broadcast).
     pub async fn recv(&mut self) -> anyhow::Result<PartyResponse> {
-        let bytes = recv_framed(&mut self.stream, &self.cipher, &self.transport_aad).await?;
+        let bytes = recv_framed(
+            &mut self.stream,
+            &self.cipher,
+            &self.transport_aad,
+            &mut self.recv_seq,
+        )
+        .await?;
         PartyResponse::from_bytes(&bytes)
             .ok_or_else(|| anyhow::anyhow!("malformed server response"))
     }
@@ -540,6 +644,10 @@ mod tests {
                 data: b"bytes".to_vec(),
             },
             PartyResponse::Error("boom".to_string()),
+            PartyResponse::ActionFailed {
+                channel: Uuid::new_v4(),
+                reason: "message is too long".to_string(),
+            },
         ];
         for resp in responses {
             let bytes = resp.to_bytes();
@@ -564,22 +672,79 @@ mod tests {
         let cipher = AesCipher::new(&[3u8; 32]).unwrap();
         let aad = b"transport|party-test";
         let (mut a, mut b) = tokio::io::duplex(4096);
+        let mut tx_seq = FrameSeq::new();
+        let mut rx_seq = FrameSeq::new();
 
         let req = PartyRequest::PostMessage {
             channel: Uuid::new_v4(),
             text: "hi".to_string(),
         };
-        send_framed(&mut a, &cipher, aad, &req.to_bytes())
+        send_framed(&mut a, &cipher, aad, &mut tx_seq, &req.to_bytes())
             .await
             .unwrap();
-        let bytes = recv_framed(&mut b, &cipher, aad).await.unwrap();
+        let bytes = recv_framed(&mut b, &cipher, aad, &mut rx_seq)
+            .await
+            .unwrap();
         assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
 
         // A frame decrypted under the wrong AAD must fail to authenticate.
-        send_framed(&mut a, &cipher, aad, &PartyRequest::ListMembers.to_bytes())
+        send_framed(
+            &mut a,
+            &cipher,
+            aad,
+            &mut tx_seq,
+            &PartyRequest::ListMembers.to_bytes(),
+        )
+        .await
+        .unwrap();
+        assert!(recv_framed(&mut b, &cipher, b"wrong-aad", &mut rx_seq)
             .await
-            .unwrap();
-        assert!(recv_framed(&mut b, &cipher, b"wrong-aad").await.is_err());
+            .is_err());
+    }
+
+    /// An attacker on the stream must not be able to make a captured frame
+    /// count twice — the P2P loop has enforced this per session since v3, and
+    /// the Party tunnel now does too.
+    #[tokio::test]
+    async fn a_replayed_party_frame_is_rejected() {
+        let cipher = AesCipher::new(&[7u8; 32]).unwrap();
+        let aad = b"transport|replay-test";
+        let mut tx_seq = FrameSeq::new();
+
+        // Capture the exact bytes of one frame by writing into a buffer.
+        let mut captured: Vec<u8> = Vec::new();
+        send_framed(
+            &mut captured,
+            &cipher,
+            aad,
+            &mut tx_seq,
+            &PartyRequest::ListMembers.to_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let mut rx_seq = FrameSeq::new();
+        let mut once = captured.as_slice();
+        recv_framed(&mut once, &cipher, aad, &mut rx_seq)
+            .await
+            .expect("the first delivery is accepted");
+
+        // Same bytes again: authenticates fine, but the sequence has not moved.
+        let mut again = captured.as_slice();
+        let err = recv_framed(&mut again, &cipher, aad, &mut rx_seq)
+            .await
+            .expect_err("a replayed frame must be refused");
+        assert!(err.to_string().contains("replayed or out-of-order"));
+    }
+
+    #[test]
+    fn frame_sequence_only_moves_forward() {
+        let mut seq = FrameSeq::new();
+        assert!(seq.accept(1));
+        assert!(seq.accept(2));
+        assert!(!seq.accept(2), "a repeat must be refused");
+        assert!(!seq.accept(1), "going backwards must be refused");
+        assert!(seq.accept(9), "a gap is allowed; only regression is not");
     }
 
     #[tokio::test]
@@ -597,9 +762,16 @@ mod tests {
             let tunnel = host_handshake(&mut server_stream, &server_priv, Uuid::new_v4())
                 .await
                 .unwrap();
-            let bytes = recv_framed(&mut server_stream, &tunnel.cipher, &tunnel.transport_aad)
-                .await
-                .unwrap();
+            let mut send_seq = FrameSeq::new();
+            let mut recv_seq = FrameSeq::new();
+            let bytes = recv_framed(
+                &mut server_stream,
+                &tunnel.cipher,
+                &tunnel.transport_aad,
+                &mut recv_seq,
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 PartyRequest::from_bytes(&bytes),
                 Some(PartyRequest::ListMembers)
@@ -608,6 +780,7 @@ mod tests {
                 &mut server_stream,
                 &tunnel.cipher,
                 &tunnel.transport_aad,
+                &mut send_seq,
                 &PartyResponse::Members(Vec::new()).to_bytes(),
             )
             .await
@@ -618,6 +791,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!client.server_fingerprint().is_empty());
+        // Both sides derive the same SAS from the transcript; the join screen
+        // shows it before any credential is sent.
+        assert!(!client.sas().is_empty());
 
         let (mut reader, mut writer) = client.split();
         writer.send(&PartyRequest::ListMembers).await.unwrap();

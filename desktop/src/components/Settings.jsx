@@ -3,7 +3,7 @@
 // immediately (config persists inside the encrypted history file).
 import { useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { cx, Avatar } from "./ui.jsx";
+import { cx, Avatar, Button, Modal, PasswordInput } from "./ui.jsx";
 import { THEMES } from "../lib/themes.js";
 import { api } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
@@ -20,10 +20,82 @@ function Toggle({ on, onChange, label, hint }) {
   );
 }
 
+// Rotate the password protecting the identity file. The key inside is
+// untouched, so history stays readable and contacts keep seeing the same
+// fingerprint — the copy says so, because "change password" in a messenger is
+// exactly the kind of action people expect to cost them their history.
+function ChangePasswordDialog({ open, onClose, minLength }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // Clear on every close: this component stays mounted, and leaving a typed
+  // password sitting in state (and in the DOM) until the next open is exactly
+  // what a password field must not do.
+  useEffect(() => {
+    if (open) return;
+    setCurrent(""); setNext(""); setConfirm(""); setErr(""); setBusy(false);
+  }, [open]);
+
+  if (!open) return null;
+
+  const tooShort = next.length > 0 && [...next].length < minLength;
+  const mismatch = confirm.length > 0 && next !== confirm;
+  const ready = current && next && next === confirm && !tooShort && !busy;
+
+  async function submit() {
+    if (!ready) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await api.changePassword(current, next);
+      toast("Password changed. Use the new one next time you unlock.", "success");
+      onClose();
+    } catch (e) {
+      setErr(String(e));
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <Modal open onClose={onClose} width={440} title="Change password" icon="lock"
+      sub="Re-encrypts the identity file on this device">
+      <div className="creator-pane">
+        <p className="creator-lead">
+          Your messages, contacts and fingerprint stay exactly as they are — only
+          the password that unlocks this device changes. There is still no reset:
+          if you forget the new one, the identity is gone.
+        </p>
+        <PasswordInput value={current} autoFocus placeholder="Current password"
+          autoComplete="current-password"
+          onChange={(e) => setCurrent(e.target.value)} />
+        <PasswordInput value={next} placeholder={`New password (at least ${minLength} characters)`}
+          autoComplete="new-password"
+          onChange={(e) => setNext(e.target.value)} />
+        <PasswordInput value={confirm} placeholder="Repeat the new password"
+          autoComplete="new-password"
+          onChange={(e) => setConfirm(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()} />
+        {tooShort && <div className="onb-err"><Icon name="alert" size={13} /> At least {minLength} characters.</div>}
+        {mismatch && <div className="onb-err"><Icon name="alert" size={13} /> The two new passwords don't match.</div>}
+        {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button icon="check" onClick={submit} disabled={!ready}>
+            {busy ? "Re-encrypting…" : "Change password"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
   const [s, setS] = useState(null);
   const [portDraft, setPortDraft] = useState("");
   const [nameDraft, setNameDraft] = useState(identity?.name || "");
+  const [pwOpen, setPwOpen] = useState(false);
 
   useEffect(() => {
     api.getSettings().then((v) => { setS(v); setPortDraft(String(v.listen_port)); }).catch(() => {});
@@ -132,7 +204,25 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               <Icon name="copy" size={14} /> {backedUp ? "Export again" : "Export now"}
             </button>
           </div>
+          {/* A security product with no way to rotate its one password is a gap
+              users notice — and a leaked or shoulder-surfed password is exactly
+              the moment someone goes looking for this. */}
+          <div className="set-row">
+            <span className="set-row-txt">
+              <span className="set-row-label">Password</span>
+              <span className="set-row-hint">
+                Unlocks this device's identity file. Changing it re-encrypts the
+                file — your messages, contacts and fingerprint are unaffected.
+              </span>
+            </span>
+            <button className="set-change" onClick={() => setPwOpen(true)}>
+              <Icon name="lock" size={14} /> Change
+            </button>
+          </div>
         </section>
+
+        <ChangePasswordDialog open={pwOpen} onClose={() => setPwOpen(false)}
+          minLength={identity?.min_password_len ?? 12} />
 
         {s && (
           <>
