@@ -131,14 +131,19 @@ One app, one identity, a left **tab rail** (Discord-like):
 - **Party** — the servers you've joined; each has channels, server-DMs, members,
   and (later) files.
 
+The rail below is the original plan. As shipped it reads **Chats · Communities ·
+Relays · Contacts · Settings** — Contacts earned a slot of its own, and "Party"
+survived only as the protocol and code name.
+
 ```text
-┌──────┬─────────────────────────────────────────┐
-│ P2P  │                                          │
-│ Relay│   (active tab's content)                 │
-│ Party│   Party: servers → channels · DMs ·      │
-│ ───  │          members · files · (governance)  │
-│ ⚙    │                                          │
-└──────┴─────────────────────────────────────────┘
+┌───────────┬────────────────────────────────────┐
+│ Chats     │                                     │
+│ Communit. │   (active tab's content)            │
+│ Relays    │   Communities: servers → channels · │
+│ Contacts  │     DMs · members · files · roles   │
+│ ───       │                                     │
+│ ⚙         │                                     │
+└───────────┴────────────────────────────────────┘
 ```
 
 Identity/keys/local vault fold into **settings** rather than being a headline tab.
@@ -423,9 +428,10 @@ operator's data dir, plus a content-addressed filesystem blob store
 (`<data_dir>/blobs/<hash>`) for file bytes — chosen for zero-ops single-host
 hosting with room to swap later. The former interim JSON snapshot is imported
 once on first load, then superseded. Of the objects listed above, `Blob`,
-`FileEntry` (as `MessagePayload::File`), and a coarse `Quota` (a server-wide
-byte ceiling) exist; `PermissionMatrix`, `FileReference`, `Role`, `Policy`, and
-`AuditLog` are still design-only.
+`FileEntry` (as `MessagePayload::File`), `FileReference` (the `file_refs` table),
+`Quota` (server-wide *and* per-member), `Role`, and `AuditLog` (the `audit`
+table) all exist. `PermissionMatrix` and `Policy` are still design-only — access
+is decided today by role plus channel kind, not by per-file grants.
 
 ---
 
@@ -453,11 +459,12 @@ a designed UI.
 │ l│  members /    │   page — no floating modals)│
 │  │  relay sess.) │                             │
 └──┴───────────────┴─────────────────────────────┘
- icon rail (top→bottom): P2P · Relay · Party · … · identity/lock/settings
+ icon rail (top→bottom): Chats · Communities · Relays · Contacts · settings
 ```
 
-- The **icon rail** replaces the menu bar and switches mode (P2P / Relay / Party);
-  identity, lock, and settings dock at the bottom.
+- The **icon rail** replaces the menu bar and switches mode (Chats /
+  Communities / Relays / Contacts); identity, lock, and settings dock at the
+  bottom.
 - The **list pane** is contextual to the mode.
 - The **content pane** holds the conversation *or* a full-pane page for directory
   and settings — eliminating most modal dialogs.
