@@ -89,6 +89,30 @@ describe("persistence", () => {
   });
 });
 
+describe("stored marks", () => {
+  it("keeps marks written before the entry was checksummed", async () => {
+    store.set("p2pem.party.read", JSON.stringify({ "srv-legacy|general": 3 }));
+    vi.resetModules();
+    const reloaded = await import("./partyUnread.js");
+    const s = { id: "srv-legacy", channels: [{ id: "general", messages: 5 }], members: [] };
+    expect(reloaded.computeUnread([s]).total).toBe(2);
+  });
+
+  it("discards a mark blob that has been tampered with", async () => {
+    store.set("p2pem.party.read", JSON.stringify({
+      v: 1,
+      d: { "srv-x|general": 5 },
+      c: "00000000",
+    }));
+    vi.resetModules();
+    const reloaded = await import("./partyUnread.js");
+    const s = { id: "srv-x", channels: [{ id: "general", messages: 5 }], members: [] };
+    // Rejected, so everything reads as unread — the safe direction. Trusting it
+    // would let an edited file hide messages that were never read.
+    expect(reloaded.computeUnread([s]).total).toBe(5);
+  });
+});
+
 describe("pruneTo", () => {
   it("drops marks for servers the user has left", () => {
     const kept = sid();
