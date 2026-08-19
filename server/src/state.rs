@@ -26,9 +26,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use messenger_core::party::{
-    blob_hash, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta, MemberInfo,
-    MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget, MAX_HISTORY_BATCH,
-    MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
+    blob_hash, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
+    FilePermissions, MemberInfo, MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget,
+    MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
@@ -172,6 +172,10 @@ struct FileRef {
     location: Uuid,
     is_dm: bool,
     shared_at: u64,
+    /// What everyone who can reach this location gets by default.
+    default_perms: FilePermissions,
+    /// Per-member overrides of `default_perms`, for this share only.
+    grants: HashMap<Uuid, FilePermissions>,
 }
 
 /// A chunked upload in flight: bytes accumulate here until `FinishUpload`.
@@ -1117,6 +1121,8 @@ impl PartyState {
     fn record_file_ref(&mut self, uploader: Uuid, meta: &FileMeta, location: Uuid, is_dm: bool) {
         let entry = FileRef {
             id: Uuid::new_v4(),
+            default_perms: FilePermissions::default(),
+            grants: HashMap::new(),
             hash: meta.hash.clone(),
             name: meta.name.clone(),
             uploader,
@@ -1126,6 +1132,230 @@ impl PartyState {
         };
         self.persist_file_ref(&entry);
         self.file_refs.push(entry);
+    }
+
+    /// What `member` may do with the share `r`.
+    ///
+    /// Resolution order: an admin holds everything; anyone who cannot reach the
+    /// location holds nothing; within a location they can reach, the uploader
+    /// holds everything, an explicit grant overrides the location default, and
+    /// otherwise the default applies. A guest never holds a write right,
+    /// whatever they were granted.
+    fn effective_perms(&self, member: Uuid, r: &FileRef) -> FilePermissions {
+        if self.role_of(member).is_admin() {
+            return FilePermissions::all();
+        }
+        // Reachability gates everything below it, uploaders included. Having
+        // once shared a file into a channel does not survive being shut out of
+        // that channel — otherwise making a channel private would leave its
+        // files reachable by exactly the people just excluded from it.
+        if !self.can_reach_location(member, r) {
+            return FilePermissions::none();
+        }
+        if r.uploader == member {
+            return FilePermissions::all();
+        }
+        // A guest is read-only everywhere, and that outranks any grant: the
+        // rest of the server refuses their writes, so a `delete` grant here
+        // would be the one place it did not.
+        let granted = r
+            .grants
+            .get(&member)
+            .copied()
+            .unwrap_or(r.default_perms)
+            .normalized();
+        if self.role_of(member).can_write() {
+            granted
+        } else {
+            FilePermissions {
+                delete: false,
+                share: false,
+                ..granted
+            }
+        }
+    }
+
+    /// Whether `member` can reach the place this file was shared — the channel
+    /// they may read, or their own DM thread.
+    fn can_reach_location(&self, member: Uuid, r: &FileRef) -> bool {
+        if r.is_dm {
+            self.members
+                .keys()
+                .any(|o| messenger_core::party::dm_thread_id(member, *o) == r.location)
+        } else {
+            self.member_can_read_channel(member, r.location)
+        }
+    }
+
+    /// Re-share a file the caller already holds into another channel or DM,
+    /// without moving the bytes again.
+    ///
+    /// `from` names the reference the caller's rights come from: one blob can
+    /// sit in several places under different grants, so "may I share this?" is
+    /// only answerable against a specific share. The new reference starts at the
+    /// default grant, not at the source's — re-sharing passes on the file, not
+    /// the sharer's authority over it.
+    pub fn share_file(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        from: Uuid,
+        target: UploadTarget,
+    ) -> Result<Envelope, String> {
+        let Some(source) = self
+            .file_refs
+            .iter()
+            .find(|r| r.hash == hash && r.location == from)
+            .cloned()
+        else {
+            return Err("that file is not shared there".to_string());
+        };
+        if !self.effective_perms(actor, &source).share {
+            return Err("you do not have permission to share this file".to_string());
+        }
+        let (location, is_dm) = match target {
+            UploadTarget::Channel(channel) => {
+                self.member_can_post_to_channel(actor, channel)?;
+                (channel, false)
+            }
+            UploadTarget::Dm(to) => {
+                if !self.is_member(to) {
+                    return Err("recipient is not a member of this server".to_string());
+                }
+                if !self.role_of(actor).can_write() {
+                    return Err("your role on this server is read-only".to_string());
+                }
+                (messenger_core::party::dm_thread_id(actor, to), true)
+            }
+        };
+        if self
+            .file_refs
+            .iter()
+            .any(|r| r.hash == hash && r.location == location)
+        {
+            return Err("that file is already shared there".to_string());
+        }
+
+        // The bytes exist already, so this is a reference and a message — it
+        // costs the sharer a refcount, and it counts against *their* quota,
+        // because they are now one of the people holding it here.
+        let meta = {
+            let Some(rec) = self.blobs.get_mut(hash) else {
+                return Err("that file is no longer stored here".to_string());
+            };
+            rec.refcount += 1;
+            let refcount = rec.refcount;
+            let (size, mime) = (rec.size, rec.mime.clone());
+            self.persist_blob_refcount(hash, refcount);
+            FileMeta {
+                hash: hash.to_string(),
+                name: source.name.clone(),
+                size,
+                mime,
+            }
+        };
+        self.record_file_ref(actor, &meta, location, is_dm);
+
+        let tier = self.tier;
+        let envelope = if is_dm {
+            let thread = self.dm_threads.entry(location).or_insert_with(|| DmThread {
+                id: location,
+                messages: Vec::new(),
+            });
+            let seq = thread.messages.len() as u64 + 1;
+            let env = Envelope {
+                tier,
+                sender: actor,
+                channel: location,
+                seq,
+                timestamp: current_timestamp_millis(),
+                payload: MessagePayload::File(meta),
+            };
+            thread.messages.push(env.clone());
+            self.persist_dm(location, &env);
+            env
+        } else {
+            let chan = self.channel_mut(location).expect("checked above");
+            let seq = chan.messages.len() as u64 + 1;
+            let env = Envelope {
+                tier,
+                sender: actor,
+                channel: location,
+                seq,
+                timestamp: current_timestamp_millis(),
+                payload: MessagePayload::File(meta),
+            };
+            chan.messages.push(env.clone());
+            self.persist_message(&env);
+            env
+        };
+        let detail = format!("shared {} again", source.name);
+        self.record_audit(actor, "file.share", &detail);
+        Ok(envelope)
+    }
+
+    /// Change what a share grants, either by default or for one member.
+    ///
+    /// Refused unless the caller's own effective rights cover what they are
+    /// handing out — the "you can only delegate rights you hold" rule. Only the
+    /// uploader or an admin may change a share's permissions at all; holding
+    /// `share` lets you spread a file, not re-write who else may do what.
+    pub fn set_file_permissions(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        location: Uuid,
+        member: Option<Uuid>,
+        perms: FilePermissions,
+    ) -> Result<String, String> {
+        let Some(index) = self
+            .file_refs
+            .iter()
+            .position(|r| r.hash == hash && r.location == location)
+        else {
+            return Err("that file is not shared here".to_string());
+        };
+        let entry = self.file_refs[index].clone();
+        let is_admin = self.role_of(actor).is_admin();
+        if entry.uploader != actor && !is_admin {
+            return Err(
+                "only the member who shared a file, or an admin, may change what it grants"
+                    .to_string(),
+            );
+        }
+        let perms = perms.normalized();
+        if !self.effective_perms(actor, &entry).covers(perms) {
+            return Err("you cannot grant a right you do not hold yourself".to_string());
+        }
+        if let Some(target) = member {
+            if !self.is_member(target) {
+                return Err("unknown member".to_string());
+            }
+        }
+
+        let name = entry.name.clone();
+        let detail = {
+            let r = &mut self.file_refs[index];
+            match member {
+                Some(target) => {
+                    r.grants.insert(target, perms);
+                    format!("changed what {name} grants {}", self.member_label(target))
+                }
+                None => {
+                    r.default_perms = perms;
+                    format!("changed what {name} grants by default")
+                }
+            }
+        };
+        let updated = self.file_refs[index].clone();
+        self.persist_file_ref(&updated);
+        self.record_audit(actor, "file.permissions", &detail);
+        Ok(detail)
+    }
+
+    /// A member's display name, for audit detail.
+    fn member_label(&self, id: Uuid) -> String {
+        self.username_of(id)
     }
 
     /// Drop one reference to a blob, deleting the bytes when the last one goes.
@@ -1177,23 +1407,11 @@ impl PartyState {
             return Err("that file is not shared here".to_string());
         };
         let entry = self.file_refs[index].clone();
-        let is_admin = self.role_of(actor).is_admin();
-        if entry.uploader != actor && !is_admin {
-            return Err(
-                "only the member who shared a file, or an admin, may delete it".to_string(),
-            );
-        }
-        // Deleting from a place you cannot see is not a thing you may do.
-        if entry.is_dm {
-            let mine = self
-                .members
-                .keys()
-                .any(|other| messenger_core::party::dm_thread_id(actor, *other) == entry.location);
-            if !mine && !is_admin {
-                return Err("that file is not shared here".to_string());
-            }
-        } else if !self.member_can_read_channel(actor, entry.location) {
-            return Err("that file is not shared here".to_string());
+        // One check now covers who may delete *and* whether they can see where
+        // it was shared: `effective_perms` returns nothing at all for a
+        // location the member cannot reach.
+        if !self.effective_perms(actor, &entry).delete {
+            return Err("you do not have permission to delete this file".to_string());
         }
         self.file_refs.remove(index);
         self.delete_file_ref_row(entry.id);
@@ -1208,19 +1426,10 @@ impl PartyState {
     /// Access follows the same rule as downloading: files shared in channels they
     /// can read, and in their own DM threads.
     pub fn files_for(&self, member: Uuid) -> Vec<FileEntry> {
-        let is_admin = self.role_of(member).is_admin();
         let mut out: Vec<FileEntry> = self
             .file_refs
             .iter()
-            .filter(|r| {
-                if r.is_dm {
-                    self.members
-                        .keys()
-                        .any(|o| messenger_core::party::dm_thread_id(member, *o) == r.location)
-                } else {
-                    self.member_can_read_channel(member, r.location)
-                }
-            })
+            .filter(|r| self.effective_perms(member, r).view)
             .map(|r| {
                 let (location_name, is_dm) = if r.is_dm {
                     (self.dm_location_name(member, r.location), true)
@@ -1247,7 +1456,8 @@ impl PartyState {
                     location_name,
                     is_dm,
                     shared_at: r.shared_at,
-                    can_delete: is_admin || r.uploader == member,
+                    can_delete: self.effective_perms(member, r).delete,
+                    perms: self.effective_perms(member, r),
                 }
             })
             .collect();
@@ -1597,15 +1807,13 @@ impl PartyState {
     /// in every channel: the references *are* the record of where a file was
     /// shared, and a deleted reference has to stop granting access immediately.
     fn member_can_access_blob(&self, member: Uuid, hash: &str) -> bool {
-        self.file_refs.iter().filter(|r| r.hash == hash).any(|r| {
-            if r.is_dm {
-                self.members
-                    .keys()
-                    .any(|o| messenger_core::party::dm_thread_id(member, *o) == r.location)
-            } else {
-                self.member_can_read_channel(member, r.location)
-            }
-        })
+        // Any *one* share that grants download is enough: the same bytes can sit
+        // in several places under different grants, and being allowed to fetch
+        // them anywhere means being allowed to fetch them.
+        self.file_refs
+            .iter()
+            .filter(|r| r.hash == hash)
+            .any(|r| self.effective_perms(member, r).download)
     }
 
     /// The bytes of a stored blob, but only when `member` is permitted to see it.
@@ -1632,8 +1840,9 @@ impl PartyState {
     fn persist_file_ref(&self, r: &FileRef) {
         let Some(conn) = &self.db else { return };
         if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO file_refs (id, hash, name, uploader, location, is_dm, shared_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO file_refs
+                (id, hash, name, uploader, location, is_dm, shared_at, default_perms, grants)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 r.id.to_string(),
                 r.hash,
@@ -1641,7 +1850,15 @@ impl PartyState {
                 r.uploader.to_string(),
                 r.location.to_string(),
                 r.is_dm as i64,
-                r.shared_at as i64
+                r.shared_at as i64,
+                serde_json::to_string(&r.default_perms).expect("FilePermissions serializes"),
+                serde_json::to_string(
+                    &r.grants
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), *v))
+                        .collect::<HashMap<String, FilePermissions>>()
+                )
+                .expect("grants serialize")
             ],
         ) {
             tracing::error!(error = %e, "failed to persist file reference");
@@ -1870,7 +2087,8 @@ impl PartyState {
         let mut file_refs = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT id, hash, name, uploader, location, is_dm, shared_at
+                "SELECT id, hash, name, uploader, location, is_dm, shared_at,
+                        default_perms, grants
                  FROM file_refs ORDER BY shared_at ASC",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -1882,10 +2100,13 @@ impl PartyState {
                     r.get::<_, String>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             })?;
             for row in rows {
-                let (id, hash, name, uploader, location, is_dm, shared_at) = row?;
+                let (id, hash, name, uploader, location, is_dm, shared_at, default_perms, grants) =
+                    row?;
                 // A reference to a blob that is gone grants access to nothing and
                 // would only inflate the owner's quota, so drop it.
                 if !blobs.contains_key(&hash) {
@@ -1893,6 +2114,15 @@ impl PartyState {
                 }
                 file_refs.push(FileRef {
                     id: Uuid::parse_str(&id)?,
+                    // A row that will not parse falls back to the default
+                    // grant rather than failing the load: a damaged value
+                    // must not hand out rights nobody granted.
+                    default_perms: serde_json::from_str(&default_perms).unwrap_or_default(),
+                    grants: serde_json::from_str::<HashMap<String, FilePermissions>>(&grants)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(k, v)| Uuid::parse_str(&k).ok().map(|id| (id, v)))
+                        .collect(),
                     hash,
                     name,
                     uploader: Uuid::parse_str(&uploader)?,
@@ -1976,13 +2206,17 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              refcount INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS file_refs (
-             id        TEXT PRIMARY KEY,
-             hash      TEXT NOT NULL,
-             name      TEXT NOT NULL,
-             uploader  TEXT NOT NULL,
-             location  TEXT NOT NULL,
-             is_dm     INTEGER NOT NULL,
-             shared_at INTEGER NOT NULL
+             id            TEXT PRIMARY KEY,
+             hash          TEXT NOT NULL,
+             name          TEXT NOT NULL,
+             uploader      TEXT NOT NULL,
+             location      TEXT NOT NULL,
+             is_dm         INTEGER NOT NULL,
+             shared_at     INTEGER NOT NULL,
+             -- No DEFAULT needed here: every insert writes both. The ALTER
+             -- below carries one, because that is what existing rows need.
+             default_perms TEXT NOT NULL,
+             grants        TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS audit (
              id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2003,6 +2237,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // id; `randomblob` is evaluated per row, so each gets a distinct one,
         // and 32 undashed hex characters parse as a UUID.
         "ALTER TABLE file_refs ADD COLUMN id TEXT",
+        // Per-file permissions. Existing shares keep the previous behaviour,
+        // which is exactly `FilePermissions::default()` — visible and
+        // downloadable to whoever can reach the location, nothing more.
+        "ALTER TABLE file_refs ADD COLUMN default_perms TEXT NOT NULL          DEFAULT '{\"view\":true,\"download\":true,\"delete\":false,\"share\":false}'",
+        "ALTER TABLE file_refs ADD COLUMN grants TEXT NOT NULL DEFAULT '{}'",
     ] {
         if let Err(e) = conn.execute(sql, []) {
             let msg = e.to_string();
@@ -3867,6 +4106,315 @@ mod tests {
         // Bob's connection goes away.
         state.cancel_uploads_for(bob);
         assert!(state.upload_chunk(bob, upload, b"abcd").is_err());
+    }
+
+    /// The rights are separate on purpose: seeing that a file exists is not the
+    /// same as being able to fetch it.
+    #[test]
+    fn view_and_download_are_separate_rights() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let chan = state.default_channel();
+        let env = state
+            .post_file(
+                owner,
+                chan,
+                "d.txt".into(),
+                "text/plain".into(),
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        // The default: bob can see it and fetch it.
+        assert_eq!(state.files_for(bob).len(), 1);
+        assert!(state.blob_bytes_for(bob, &hash).is_some());
+
+        // Downgrade to view-only, for everyone.
+        state
+            .set_file_permissions(
+                owner,
+                &hash,
+                chan,
+                None,
+                FilePermissions {
+                    view: true,
+                    download: false,
+                    delete: false,
+                    share: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.files_for(bob).len(), 1, "he can still see it");
+        assert!(
+            state.blob_bytes_for(bob, &hash).is_none(),
+            "but not fetch it"
+        );
+
+        // Take view away too and it disappears from his listing entirely.
+        state
+            .set_file_permissions(owner, &hash, chan, None, FilePermissions::none())
+            .unwrap();
+        assert!(state.files_for(bob).is_empty());
+        // The uploader is unaffected by the grant they handed out.
+        assert!(state.blob_bytes_for(owner, &hash).is_some());
+    }
+
+    /// A per-member grant overrides the default for that member and nobody else.
+    #[test]
+    fn a_member_grant_overrides_the_default() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let carol = state.join("carol", None, None).unwrap();
+        let chan = state.default_channel();
+        let env = state
+            .post_file(
+                owner,
+                chan,
+                "d.txt".into(),
+                "text/plain".into(),
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        state
+            .set_file_permissions(owner, &hash, chan, None, FilePermissions::none())
+            .unwrap();
+        state
+            .set_file_permissions(
+                owner,
+                &hash,
+                chan,
+                Some(bob),
+                FilePermissions {
+                    view: true,
+                    download: true,
+                    delete: false,
+                    share: true,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            state.blob_bytes_for(bob, &hash).is_some(),
+            "bob was granted"
+        );
+        assert!(
+            state.blob_bytes_for(carol, &hash).is_none(),
+            "carol still has the default, which is nothing"
+        );
+    }
+
+    /// You can only hand out rights you hold — otherwise a grant is a way to
+    /// mint authority rather than pass it on.
+    #[test]
+    fn a_grant_cannot_exceed_what_the_granter_holds() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let carol = state.join("carol", None, None).unwrap();
+        let chan = state.default_channel();
+
+        // Bob shares a file, so he is its uploader and holds everything.
+        let env = state
+            .post_file(
+                bob,
+                chan,
+                "b.txt".into(),
+                "text/plain".into(),
+                b"bobs".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+        assert!(state
+            .set_file_permissions(bob, &hash, chan, Some(carol), FilePermissions::all())
+            .is_ok());
+
+        // Carol holds everything now, but she is not the uploader and not an
+        // admin, so she may not rewrite who else may do what.
+        let err = state
+            .set_file_permissions(carol, &hash, chan, Some(owner), FilePermissions::all())
+            .unwrap_err();
+        assert!(err.contains("only the member who shared"), "got: {err}");
+    }
+
+    /// Re-sharing spends a reference on content the server already holds, and
+    /// the new share starts at the default rather than inheriting the sharer's
+    /// authority over it.
+    #[test]
+    fn sharing_a_file_elsewhere_costs_a_reference_not_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let first = state.default_channel();
+        let second = state
+            .create_channel_of_kind(owner, "second", ChannelKind::Public, vec![])
+            .unwrap()
+            .id;
+
+        let env = state
+            .post_file(
+                owner,
+                first,
+                "d.txt".into(),
+                "text/plain".into(),
+                b"shared".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        // Bob has only the default grant, which does not include share.
+        let err = state
+            .share_file(bob, &hash, first, UploadTarget::Channel(second))
+            .unwrap_err();
+        assert!(err.contains("permission to share"), "got: {err}");
+
+        // Granted, he can — and it is a reference, not a second upload.
+        state
+            .set_file_permissions(
+                owner,
+                &hash,
+                first,
+                Some(bob),
+                FilePermissions {
+                    view: true,
+                    download: true,
+                    delete: false,
+                    share: true,
+                },
+            )
+            .unwrap();
+        let shared = state
+            .share_file(bob, &hash, first, UploadTarget::Channel(second))
+            .unwrap();
+        assert_eq!(file_payload(&shared).hash, hash);
+        assert_eq!(state.blobs[&hash].refcount, 2, "one blob, two references");
+        assert_eq!(
+            state.blob_bytes(&hash),
+            Some(b"shared".to_vec()),
+            "the bytes were never moved again"
+        );
+
+        // The new share starts at the default: bob passed on the file, not his
+        // own right to spread it further.
+        let there = state
+            .file_refs
+            .iter()
+            .find(|r| r.location == second)
+            .unwrap();
+        assert_eq!(there.default_perms, FilePermissions::default());
+        assert_eq!(there.uploader, bob, "he is who put it there");
+
+        // Sharing it into the same place twice is refused rather than
+        // silently inflating the reference count.
+        assert!(state
+            .share_file(bob, &hash, first, UploadTarget::Channel(second))
+            .is_err());
+
+        // Deleting one reference leaves the other holding the bytes.
+        state.delete_file(bob, &hash, second).unwrap();
+        assert_eq!(state.blobs[&hash].refcount, 1);
+        assert!(state.blob_bytes(&hash).is_some());
+    }
+
+    /// A guest is read-only everywhere, and that outranks any grant — otherwise
+    /// this would be the one place a guest could write.
+    #[test]
+    fn a_grant_cannot_give_a_guest_write_rights() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let chan = state.default_channel();
+        let env = state
+            .post_file(
+                owner,
+                chan,
+                "d.txt".into(),
+                "text/plain".into(),
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        state
+            .set_file_permissions(owner, &hash, chan, Some(bob), FilePermissions::all())
+            .unwrap();
+        state.set_role(owner, bob, Role::Guest).unwrap();
+
+        // He kept view and download, and lost the two that are writes.
+        let listing = state.files_for(bob);
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].perms.view && listing[0].perms.download);
+        assert!(!listing[0].perms.delete && !listing[0].perms.share);
+        assert!(state.delete_file(bob, &hash, chan).is_err());
+    }
+
+    /// Permissions have to survive a restart, or a grant quietly evaporates.
+    #[test]
+    fn file_permissions_survive_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, bob, chan, hash);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            owner = s.join("owner", None, None).unwrap();
+            bob = s.join("bob", None, None).unwrap();
+            chan = s.default_channel();
+            let env = s
+                .post_file(
+                    owner,
+                    chan,
+                    "d.txt".into(),
+                    "text/plain".into(),
+                    b"bytes".to_vec(),
+                )
+                .unwrap();
+            hash = file_payload(&env).hash.clone();
+            s.set_file_permissions(owner, &hash, chan, None, FilePermissions::none())
+                .unwrap();
+            s.set_file_permissions(
+                owner,
+                &hash,
+                chan,
+                Some(bob),
+                FilePermissions {
+                    view: true,
+                    download: true,
+                    delete: true,
+                    share: false,
+                },
+            )
+            .unwrap();
+        }
+
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        let r = s.file_refs.iter().find(|r| r.hash == hash).unwrap();
+        assert_eq!(r.default_perms, FilePermissions::none());
+        assert!(r.grants.get(&bob).copied().unwrap().delete);
+        assert!(s.blob_bytes_for(bob, &hash).is_some(), "his grant survived");
+    }
+
+    /// Incoherent grants are normalised rather than stored as written:
+    /// downloading what you cannot see, or sharing what you cannot download, is
+    /// not a thing to represent.
+    #[test]
+    fn grants_are_normalised() {
+        let odd = FilePermissions {
+            view: false,
+            download: true,
+            delete: false,
+            share: true,
+        }
+        .normalized();
+        assert!(odd.view, "downloading implies seeing");
+        assert!(odd.download, "sharing implies downloading");
+
+        assert!(FilePermissions::all().covers(FilePermissions::default()));
+        assert!(!FilePermissions::default().covers(FilePermissions::all()));
+        assert!(FilePermissions::none().covers(FilePermissions::none()));
     }
 
     /// A whole channel in one frame stopped fitting once history grew past

@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use anyhow::{anyhow, bail, Result};
 use messenger_core::party::{
     blob_hash, dm_thread_id, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
-    MemberInfo, MessagePayload, PartyRequest, PartyResponse, QuotaInfo, Role, TrustTier,
-    UploadTarget, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES,
+    FilePermissions, MemberInfo, MessagePayload, PartyRequest, PartyResponse, QuotaInfo, Role,
+    TrustTier, UploadTarget, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES,
     PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
@@ -534,6 +534,39 @@ impl PartyManager {
             hash,
             channel: location,
         })
+    }
+
+    /// Post a file you already hold into another channel or DM, without
+    /// re-uploading it. `from` is the location you are sharing it *from*, which
+    /// is where your right to do so comes from.
+    pub fn share_file(
+        &self,
+        server_id: Uuid,
+        hash: String,
+        from: Uuid,
+        target: UploadTarget,
+    ) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::ShareFile { hash, from, target })
+    }
+
+    /// Change what a shared file grants — by default (`member: None`) or for one
+    /// member. The server refuses anything the caller does not hold themselves.
+    pub fn set_file_permissions(
+        &self,
+        server_id: Uuid,
+        hash: String,
+        location: Uuid,
+        member: Option<Uuid>,
+        perms: FilePermissions,
+    ) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::SetFilePermissions {
+                hash,
+                location,
+                member,
+                perms,
+            })
     }
 
     /// Ask for the audit log; the answer lands in `PartyServerConn::audit`.

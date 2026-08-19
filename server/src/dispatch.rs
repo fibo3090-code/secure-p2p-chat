@@ -438,6 +438,36 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     state.cancel_upload(member, upload);
                     Dispatch::default()
                 }
+                // Re-sharing a file is an ordinary post that happens to reuse
+                // bytes the server already holds, so it fans out like one.
+                PartyRequest::ShareFile { hash, from, target } => {
+                    match state.share_file(member, &hash, from, target) {
+                        Ok(env) => match target {
+                            UploadTarget::Channel(_) => channel_fanout(state, env),
+                            UploadTarget::Dm(to) => Dispatch {
+                                replies: vec![PartyResponse::MessagePosted {
+                                    channel: env.channel,
+                                    seq: env.seq,
+                                }],
+                                broadcast: Vec::new(),
+                                directed: dm_delivery(member, to, env),
+                            },
+                        },
+                        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
+                            channel: upload_thread(member, target),
+                            reason,
+                        }),
+                    }
+                }
+                PartyRequest::SetFilePermissions {
+                    hash,
+                    location,
+                    member: target,
+                    perms,
+                } => match state.set_file_permissions(member, &hash, location, target, perms) {
+                    Ok(msg) => Dispatch::reply(PartyResponse::Ok(msg)),
+                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                },
                 PartyRequest::DownloadChunk { hash, offset } => {
                     match state.blob_chunk_for(member, &hash, offset) {
                         Some((data, total)) => Dispatch::reply(PartyResponse::FileChunk {
