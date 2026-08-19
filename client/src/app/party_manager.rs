@@ -25,8 +25,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, bail, Result};
 use messenger_core::party::{
-    blob_hash, dm_thread_id, ChannelInfo, Envelope, FileMeta, MemberInfo, MessagePayload,
-    PartyRequest, PartyResponse, TrustTier, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
+    blob_hash, dm_thread_id, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
+    MemberInfo, MessagePayload, PartyRequest, PartyResponse, QuotaInfo, Role, TrustTier,
+    UploadTarget, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES,
+    PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
 use rsa::RsaPrivateKey;
@@ -64,6 +66,19 @@ enum Incoming {
     Disconnected,
 }
 
+/// A chunked upload the client has offered but the server has not yet accepted.
+/// Once `UploadReady` arrives the bytes are streamed and this is dropped.
+struct PendingUpload {
+    data: Vec<u8>,
+}
+
+/// A chunked download in progress: the bytes received so far and the caller
+/// waiting for the whole file.
+struct ChunkedDownload {
+    data: Vec<u8>,
+    tx: oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
 /// Per-server connection state shown in the Party tab.
 pub struct PartyServerConn {
     pub address: String,
@@ -82,6 +97,15 @@ pub struct PartyServerConn {
     /// surfaced in the UI until superseded. Without this, server errors were
     /// silently dropped and a failed action looked like it simply did nothing.
     pub last_error: Option<String>,
+    /// The most recent successful governance action, for a confirmation toast.
+    pub last_notice: Option<String>,
+    /// Files shared here that this member may see (the Drive panel), refreshed
+    /// by `ListFiles`.
+    pub files: Vec<FileEntry>,
+    /// This member's storage usage, refreshed by `FetchQuota`.
+    pub quota: Option<QuotaInfo>,
+    /// The server's audit log, newest first. Only ever populated for admins.
+    pub audit: Vec<AuditEntry>,
     /// Channels (and DM threads) whose durable history has been requested since
     /// this connection joined, so a refreshed channel list does not re-fetch
     /// everything on every broadcast.
@@ -96,6 +120,14 @@ pub struct PartyServerConn {
     pending_sends: VecDeque<(Uuid, usize)>,
     outgoing_tx: mpsc::UnboundedSender<PartyRequest>,
     incoming_rx: mpsc::UnboundedReceiver<Incoming>,
+    /// Chunked uploads waiting for the server to accept them, in the order they
+    /// were started. `UploadReady` carries an id the client has never seen, so
+    /// the only correlation available is arrival order — which is exact,
+    /// because the server answers one request at a time down one connection.
+    pending_uploads: VecDeque<PendingUpload>,
+    /// Chunked downloads in progress, keyed by content hash: the bytes so far,
+    /// plus the one-shot waiting for the whole file.
+    chunked_downloads: HashMap<String, ChunkedDownload>,
     /// In-flight file downloads, keyed by content hash. A `DownloadFile` request
     /// registers a one-shot here; the matching `FileData` response (drained by
     /// `poll_events`) completes it with the bytes. A server `Error` (e.g. the file
@@ -159,6 +191,29 @@ impl PartyServerConn {
             }
         }
         true
+    }
+
+    /// Offer a chunked upload and hold its bytes until the server accepts.
+    ///
+    /// Nothing is streamed yet: the server checks the declared size against the
+    /// hard ceiling and the uploader's allowance first, so a file that will be
+    /// refused costs one round trip instead of a full transfer.
+    fn start_chunked_upload(
+        &mut self,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        target: UploadTarget,
+    ) -> Result<()> {
+        let size = data.len() as u64;
+        self.send(PartyRequest::StartUpload {
+            name,
+            mime,
+            size,
+            target,
+        })?;
+        self.pending_uploads.push_back(PendingUpload { data });
+        Ok(())
     }
 
     /// Ask for a thread's durable history once. Returns false if it was already
@@ -310,11 +365,17 @@ impl PartyManager {
             members: Vec::new(),
             messages: HashMap::new(),
             last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
             history_requested: HashSet::new(),
             pending_sends: VecDeque::new(),
             outgoing_tx,
             incoming_rx,
             pending_downloads: HashMap::new(),
+            pending_uploads: VecDeque::new(),
+            chunked_downloads: HashMap::new(),
         };
 
         // Join, then load the directory.
@@ -415,6 +476,92 @@ impl PartyManager {
         conn.send(PartyRequest::CreateChannel { name })
     }
 
+    /// Create a channel of a specific kind. `members` seeds a private channel's
+    /// membership and is ignored for every other kind.
+    pub fn create_channel_of_kind(
+        &self,
+        server_id: Uuid,
+        name: String,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
+    ) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::CreateChannelOfKind {
+                name,
+                kind,
+                members,
+            })
+    }
+
+    /// Delete a channel and its history (admins only, enforced by the server).
+    pub fn delete_channel(&self, server_id: Uuid, channel: Uuid) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::DeleteChannel { channel })
+    }
+
+    /// Change a channel's kind and private membership (admins only).
+    pub fn set_channel_access(
+        &self,
+        server_id: Uuid,
+        channel: Uuid,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
+    ) -> Result<()> {
+        self.conn(server_id)?.send(PartyRequest::SetChannelAccess {
+            channel,
+            kind,
+            members,
+        })
+    }
+
+    /// Change another member's role (admins only).
+    pub fn set_role(&self, server_id: Uuid, member: Uuid, role: Role) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::SetRole { member, role })
+    }
+
+    /// Ask for the files this member may see; the answer lands in
+    /// `PartyServerConn::files`.
+    pub fn refresh_files(&self, server_id: Uuid) -> Result<()> {
+        let conn = self.conn(server_id)?;
+        conn.send(PartyRequest::ListFiles)?;
+        conn.send(PartyRequest::FetchQuota)
+    }
+
+    /// Delete one share of a file (its uploader, or an admin).
+    pub fn delete_file(&self, server_id: Uuid, hash: String, location: Uuid) -> Result<()> {
+        self.conn(server_id)?.send(PartyRequest::DeleteFile {
+            hash,
+            channel: location,
+        })
+    }
+
+    /// Ask for the audit log; the answer lands in `PartyServerConn::audit`.
+    pub fn refresh_audit(&self, server_id: Uuid, limit: u32) -> Result<()> {
+        self.conn(server_id)?
+            .send(PartyRequest::FetchAuditLog { limit })
+    }
+
+    /// This client's role on a server, or `None` before the directory arrives.
+    pub fn my_role(&self, server_id: Uuid) -> Option<Role> {
+        let conn = self.servers.get(&server_id)?;
+        let me = conn.member_id?;
+        conn.members.iter().find(|m| m.id == me).map(|m| m.role)
+    }
+
+    /// Clear the last governance notice once the UI has shown it.
+    pub fn clear_notice(&mut self, server_id: Uuid) {
+        if let Some(conn) = self.servers.get_mut(&server_id) {
+            conn.last_notice = None;
+        }
+    }
+
+    fn conn(&self, server_id: Uuid) -> Result<&PartyServerConn> {
+        self.servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))
+    }
+
     /// Upload a file to a channel: append it optimistically (so the sender sees it
     /// immediately, since the server won't echo their own broadcast) and send a
     /// `PostFile`. `name`/`mime` describe the file; `data` is its bytes. Errors if
@@ -444,12 +591,17 @@ impl PartyManager {
                 payload: MessagePayload::File(meta),
             },
         );
-        conn.send(PartyRequest::PostFile {
-            channel,
-            name,
-            mime,
-            data,
-        })
+        // Small files go inline in one request; anything larger is streamed,
+        // because a single frame is bounded by MAX_PACKET_SIZE.
+        if data.len() <= MAX_INLINE_FILE_BYTES {
+            return conn.send(PartyRequest::PostFile {
+                channel,
+                name,
+                mime,
+                data,
+            });
+        }
+        conn.start_chunked_upload(name, mime, data, UploadTarget::Channel(channel))
     }
 
     /// Upload a file as a direct message to another member. Mirrors [`send_file`]
@@ -480,12 +632,15 @@ impl PartyManager {
                 payload: MessagePayload::File(meta),
             },
         );
-        conn.send(PartyRequest::SendFileDm {
-            to,
-            name,
-            mime,
-            data,
-        })
+        if data.len() <= MAX_INLINE_FILE_BYTES {
+            return conn.send(PartyRequest::SendFileDm {
+                to,
+                name,
+                mime,
+                data,
+            });
+        }
+        conn.start_chunked_upload(name, mime, data, UploadTarget::Dm(to))
     }
 
     /// Request a stored file's bytes by content hash. Returns a receiver that
@@ -502,6 +657,36 @@ impl PartyManager {
             .get_mut(&server_id)
             .ok_or_else(|| anyhow!("unknown server"))?;
         let (tx, rx) = oneshot::channel();
+        // Ask for the size the listing reports, when it knows it: a file past
+        // the inline limit cannot come back in one frame, so it has to be
+        // streamed. Anything unknown takes the single-frame path, which the
+        // server answers for everything it can fit.
+        let size = conn
+            .files
+            .iter()
+            .find(|f| f.hash == hash)
+            .map(|f| f.size)
+            .or_else(|| {
+                conn.messages
+                    .values()
+                    .flatten()
+                    .find_map(|env| match &env.payload {
+                        MessagePayload::File(f) if f.hash == hash => Some(f.size),
+                        _ => None,
+                    })
+            })
+            .unwrap_or(0);
+        if size > MAX_INLINE_FILE_BYTES as u64 {
+            conn.chunked_downloads.insert(
+                hash.clone(),
+                ChunkedDownload {
+                    data: Vec::with_capacity(size.min(1 << 20) as usize),
+                    tx,
+                },
+            );
+            conn.send(PartyRequest::DownloadChunk { hash, offset: 0 })?;
+            return Ok(rx);
+        }
         conn.pending_downloads.insert(hash.clone(), tx);
         conn.send(PartyRequest::DownloadFile { hash })?;
         Ok(rx)
@@ -575,10 +760,12 @@ impl PartyManager {
 /// rejecting payloads the server would refuse (`> MAX_INLINE_FILE_BYTES`) so the
 /// user gets a clear error instead of a silent server-side rejection.
 fn file_meta(name: &str, mime: &str, data: &[u8]) -> Result<FileMeta> {
-    if data.len() > MAX_INLINE_FILE_BYTES {
+    // Files past the inline limit are streamed rather than refused; only the
+    // server's hard ceiling is a real "no".
+    if data.len() as u64 > MAX_PARTY_FILE_BYTES {
         return Err(anyhow!(
-            "file is too large to share here (max {} MiB)",
-            MAX_INLINE_FILE_BYTES / (1024 * 1024)
+            "file is too large to share here (max {})",
+            messenger_core::util::format_size(MAX_PARTY_FILE_BYTES)
         ));
     }
     Ok(FileMeta {
@@ -594,6 +781,11 @@ fn file_meta(name: &str, mime: &str, data: &[u8]) -> Result<FileMeta> {
 fn fail_pending_downloads(conn: &mut PartyServerConn, reason: &str) {
     for (_, tx) in conn.pending_downloads.drain() {
         let _ = tx.send(Err(reason.to_string()));
+    }
+    // Chunked downloads wait across many round trips, so they are the ones most
+    // likely to be in flight when something goes wrong.
+    for (_, state) in conn.chunked_downloads.drain() {
+        let _ = state.tx.send(Err(reason.to_string()));
     }
 }
 
@@ -742,6 +934,84 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             fail_pending_downloads(conn, &message);
             conn.last_error = Some(message);
         }
+        // The channel list is per member now (private channels are filtered), so
+        // the server nudges instead of broadcasting a list that would be wrong
+        // for somebody. Ask for our own.
+        PartyResponse::DirectoryChanged => {
+            let _ = conn.send(PartyRequest::ListChannels);
+            let _ = conn.send(PartyRequest::ListMembers);
+        }
+        // The server accepted a chunked upload: stream the bytes it is now
+        // waiting for. Correlated by arrival order — the id is the server's,
+        // so the client has nothing else to match on, and the server answers
+        // one request at a time down one connection.
+        PartyResponse::UploadReady { upload, chunk_size } => {
+            let Some(pending) = conn.pending_uploads.pop_front() else {
+                let _ = conn.send(PartyRequest::CancelUpload { upload });
+                return;
+            };
+            let chunk = (chunk_size as usize).clamp(1, PARTY_CHUNK_BYTES);
+            for part in pending.data.chunks(chunk) {
+                if conn
+                    .send(PartyRequest::UploadChunk {
+                        upload,
+                        data: part.to_vec(),
+                    })
+                    .is_err()
+                {
+                    return; // the connection went away; nothing to clean up here
+                }
+            }
+            let _ = conn.send(PartyRequest::FinishUpload { upload });
+        }
+        // One chunk of a chunked download. Ask for the next until the file is
+        // whole, then hand it over — verified against the hash we asked for.
+        PartyResponse::FileChunk {
+            hash,
+            offset,
+            total,
+            data,
+        } => {
+            let Some(state) = conn.chunked_downloads.get_mut(&hash) else {
+                return; // unsolicited, or already completed/failed
+            };
+            // Out-of-order or duplicated chunk: the stream is no longer
+            // reconstructible, so fail rather than assemble something wrong.
+            if offset != state.data.len() as u64 {
+                if let Some(state) = conn.chunked_downloads.remove(&hash) {
+                    let _ = state
+                        .tx
+                        .send(Err("the server sent file data out of order".to_string()));
+                }
+                return;
+            }
+            state.data.extend_from_slice(&data);
+            let received = state.data.len() as u64;
+            if received < total && !data.is_empty() {
+                let _ = conn.send(PartyRequest::DownloadChunk {
+                    hash: hash.clone(),
+                    offset: received,
+                });
+                return;
+            }
+            let Some(state) = conn.chunked_downloads.remove(&hash) else {
+                return;
+            };
+            // The hash is the integrity check, and it costs one SHA-256 to use.
+            let actual = blob_hash(&state.data);
+            let _ = if actual == hash {
+                state.tx.send(Ok(state.data))
+            } else {
+                tracing::error!(expected = %hash, actual = %actual, "community server returned chunks that do not match the requested content hash");
+                state.tx.send(Err(
+                    "The server sent a file that does not match the one that was requested. It was not saved.".to_string(),
+                ))
+            };
+        }
+        PartyResponse::Files(files) => conn.files = files,
+        PartyResponse::Quota(quota) => conn.quota = Some(quota),
+        PartyResponse::AuditLog(entries) => conn.audit = entries,
+        PartyResponse::Ok(message) => conn.last_notice = Some(message),
     }
 }
 
@@ -772,11 +1042,17 @@ mod tests {
             members: Vec::new(),
             messages: HashMap::new(),
             last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
             history_requested: HashSet::new(),
             pending_sends: VecDeque::new(),
             outgoing_tx,
             incoming_rx,
             pending_downloads: HashMap::new(),
+            pending_uploads: VecDeque::new(),
+            chunked_downloads: HashMap::new(),
         };
         let mut mgr = PartyManager::new();
         let id = Uuid::new_v4();
@@ -806,6 +1082,7 @@ mod tests {
                 id: channel,
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             },
         ])))
         .unwrap();
@@ -820,6 +1097,7 @@ mod tests {
                 id: me,
                 username: "alice".to_string(),
                 online: true,
+                role: Role::Member,
             },
         ])))
         .unwrap();
@@ -951,6 +1229,173 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Ok(data));
     }
 
+    /// A file too large for one frame is offered first and streamed only once
+    /// the server accepts it, so a refusal costs a round trip instead of the
+    /// whole transfer.
+    #[test]
+    fn a_large_file_is_offered_first_then_streamed_in_chunks() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let channel = Uuid::new_v4();
+        let payload: Vec<u8> = (0..(MAX_INLINE_FILE_BYTES + 1234))
+            .map(|i| (i % 253) as u8)
+            .collect();
+
+        mgr.send_file(
+            id,
+            channel,
+            "big.bin".into(),
+            "application/octet-stream".into(),
+            payload.clone(),
+        )
+        .unwrap();
+
+        // Offered, not sent: the bytes are still held client-side.
+        match out.try_recv().unwrap() {
+            PartyRequest::StartUpload { size, target, .. } => {
+                assert_eq!(size, payload.len() as u64);
+                assert_eq!(target, UploadTarget::Channel(channel));
+            }
+            other => panic!("expected StartUpload, got {other:?}"),
+        }
+        assert!(out.try_recv().is_err(), "nothing streams before acceptance");
+        // …and it is already on screen, so the user sees it immediately.
+        assert_eq!(mgr.servers[&id].messages[&channel].len(), 1);
+
+        // The server accepts; the client streams and finishes.
+        let upload = Uuid::new_v4();
+        tx.send(Incoming::Response(PartyResponse::UploadReady {
+            upload,
+            chunk_size: PARTY_CHUNK_BYTES as u32,
+        }))
+        .unwrap();
+        mgr.poll_events();
+
+        let mut streamed = Vec::new();
+        let mut finished = false;
+        while let Ok(req) = out.try_recv() {
+            match req {
+                PartyRequest::UploadChunk { upload: u, data } => {
+                    assert_eq!(u, upload);
+                    assert!(data.len() <= PARTY_CHUNK_BYTES);
+                    streamed.extend_from_slice(&data);
+                }
+                PartyRequest::FinishUpload { upload: u } => {
+                    assert_eq!(u, upload);
+                    finished = true;
+                }
+                other => panic!("unexpected request during streaming: {other:?}"),
+            }
+        }
+        assert_eq!(streamed, payload, "every byte arrives, in order");
+        assert!(finished, "the upload is finished, not left open");
+    }
+
+    /// A large download is reassembled across chunks and checked against the
+    /// hash that was asked for.
+    #[test]
+    fn a_large_download_is_reassembled_from_chunks() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let channel = Uuid::new_v4();
+        // Past the inline limit, which is what makes this a chunked download.
+        let payload: Vec<u8> = (0..(MAX_INLINE_FILE_BYTES + 500))
+            .map(|i| (i % 199) as u8)
+            .collect();
+        let hash = blob_hash(&payload);
+
+        // The client learns the size from a file message in history, which is
+        // what tells it this cannot arrive in a single frame.
+        mgr.servers
+            .get_mut(&id)
+            .unwrap()
+            .messages
+            .entry(channel)
+            .or_default()
+            .push(Envelope {
+                tier: TrustTier::Administered,
+                sender: me,
+                channel,
+                seq: 1,
+                timestamp: 0,
+                payload: MessagePayload::File(FileMeta {
+                    hash: hash.clone(),
+                    name: "big.bin".into(),
+                    size: payload.len() as u64,
+                    mime: "application/octet-stream".into(),
+                }),
+            });
+
+        let mut rx = mgr.request_download(id, hash.clone()).unwrap();
+        match out.try_recv().unwrap() {
+            PartyRequest::DownloadChunk { hash: h, offset } => {
+                assert_eq!(h, hash);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected DownloadChunk, got {other:?}"),
+        }
+
+        // Feed it back one chunk at a time, following the offsets it asks for.
+        let total = payload.len() as u64;
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            let end = (offset + PARTY_CHUNK_BYTES).min(payload.len());
+            tx.send(Incoming::Response(PartyResponse::FileChunk {
+                hash: hash.clone(),
+                offset: offset as u64,
+                total,
+                data: payload[offset..end].to_vec(),
+            }))
+            .unwrap();
+            mgr.poll_events();
+            offset = end;
+            if offset < payload.len() {
+                match out.try_recv().unwrap() {
+                    PartyRequest::DownloadChunk { offset: next, .. } => {
+                        assert_eq!(next, offset as u64, "asks for exactly what it is missing");
+                    }
+                    other => panic!("expected the next DownloadChunk, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(rx.try_recv().unwrap(), Ok(payload));
+    }
+
+    /// A chunk that does not continue where the last one stopped means the
+    /// stream is no longer reconstructible — fail rather than assemble
+    /// something that is not the file.
+    #[test]
+    fn an_out_of_order_chunk_fails_the_download() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let me = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let hash = "abc123".to_string();
+        let (otx, mut rx) = oneshot::channel();
+        mgr.servers.get_mut(&id).unwrap().chunked_downloads.insert(
+            hash.clone(),
+            ChunkedDownload {
+                data: Vec::new(),
+                tx: otx,
+            },
+        );
+
+        tx.send(Incoming::Response(PartyResponse::FileChunk {
+            hash: hash.clone(),
+            offset: 999, // not where we are
+            total: 4096,
+            data: vec![1, 2, 3],
+        }))
+        .unwrap();
+        mgr.poll_events();
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Err("the server sent file data out of order".to_string())
+        );
+    }
+
     #[test]
     fn request_download_fails_when_the_server_reports_an_error() {
         let (mut mgr, id, tx, _out) = manager_with_server();
@@ -996,7 +1441,9 @@ mod tests {
         let me = Uuid::new_v4();
         mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
         let channel = Uuid::new_v4();
-        let too_big = vec![0u8; MAX_INLINE_FILE_BYTES + 1];
+        // Past the *server's ceiling*, not merely past the inline limit —
+        // anything between the two is streamed rather than refused.
+        let too_big = vec![0u8; MAX_PARTY_FILE_BYTES as usize + 1];
 
         assert!(
             mgr.send_file(
@@ -1007,7 +1454,7 @@ mod tests {
                 too_big
             )
             .is_err(),
-            "an oversized upload must be rejected"
+            "a file past the server ceiling must be rejected"
         );
         // Nothing was appended locally and no request was emitted.
         assert!(!mgr.server(id).unwrap().messages.contains_key(&channel));
@@ -1140,6 +1587,7 @@ mod tests {
                 id: channel,
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             },
         ])))
         .unwrap();
@@ -1148,11 +1596,13 @@ mod tests {
                 id: me,
                 username: "alice".to_string(),
                 online: true,
+                role: Role::Member,
             },
             MemberInfo {
                 id: peer,
                 username: "bob".to_string(),
                 online: true,
+                role: Role::Member,
             },
         ])))
         .unwrap();
@@ -1179,6 +1629,7 @@ mod tests {
                 id: channel,
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             },
         ])))
         .unwrap();

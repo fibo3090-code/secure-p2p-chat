@@ -31,10 +31,34 @@ pub enum TrustTier {
     E2EE,
 }
 
-/// Maximum size of a file uploaded inline in a single Party request (Phase 2,
-/// slice 1). Larger files will use chunked transfer in a later slice. Kept well
-/// under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
+/// Maximum size of a file uploaded inline in a single Party request. Anything
+/// larger goes through the chunked path ([`PartyRequest::StartUpload`]). Kept
+/// well under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
 pub const MAX_INLINE_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Bytes of file data carried by one [`PartyRequest::UploadChunk`] or
+/// [`PartyResponse::FileChunk`].
+///
+/// Small enough that a chunk plus its framing is nowhere near
+/// [`crate::MAX_PACKET_SIZE`], and small enough that a cancelled transfer wastes
+/// little; large enough that a 100 MiB file is a few hundred round trips rather
+/// than tens of thousands.
+pub const PARTY_CHUNK_BYTES: usize = 256 * 1024; // 256 KiB
+
+/// Largest file a community server will accept at all, inline or chunked.
+///
+/// Distinct from the per-member quota: the quota bounds what one member may
+/// *hold*, this bounds what a single transfer may cost the server in spool
+/// space and time before it is either committed or thrown away.
+pub const MAX_PARTY_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
+/// Where a chunked upload will be posted once it completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UploadTarget {
+    Channel(Uuid),
+    /// A direct message to this member.
+    Dm(Uuid),
+}
 
 /// Metadata describing a file shared in a channel or DM. The file's bytes are
 /// stored content-addressed by `hash` (lowercase hex SHA-256); `name` is the
@@ -82,22 +106,152 @@ pub struct Envelope {
     pub payload: MessagePayload,
 }
 
+/// A member's authority on a community server.
+///
+/// Ordered least- to most-privileged, so `>=` is the permission test: `role >=
+/// Role::Admin` reads as "at least an admin". Every check in the server is
+/// written that way.
+///
+/// The server has exactly one [`Role::Owner`]: the first identity to join, which
+/// is the operator (they start the server, then join it). The owner cannot be
+/// demoted — otherwise an admin could strip the operator of their own server —
+/// and a second owner is never created.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Hash,
+)]
+pub enum Role {
+    /// Read-only. May read the channels they can see; may not post or upload.
+    Guest,
+    /// The default. Post, share files, download, create channels.
+    #[default]
+    Member,
+    /// Manage channels, files anyone uploaded, and the roles below their own.
+    Admin,
+    /// The operator. Everything an admin can do, plus managing admins.
+    Owner,
+}
+
+impl Role {
+    /// Human label, used by both front-ends and the audit log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Guest => "Guest",
+            Role::Member => "Member",
+            Role::Admin => "Admin",
+            Role::Owner => "Owner",
+        }
+    }
+
+    /// Whether this role may post messages and upload files at all. A guest is
+    /// read-only everywhere, before any per-channel rule is consulted.
+    pub fn can_write(self) -> bool {
+        self >= Role::Member
+    }
+
+    /// Whether this role may create channels.
+    pub fn can_create_channel(self) -> bool {
+        self >= Role::Member
+    }
+
+    /// Whether this role administers the server: channel kinds and membership,
+    /// deleting channels, deleting anyone's files, posting to restricted
+    /// channels, and changing roles.
+    pub fn is_admin(self) -> bool {
+        self >= Role::Admin
+    }
+
+    /// Whether `self` may assign `target` role to somebody else.
+    ///
+    /// You can only grant a role strictly below your own, so an admin cannot
+    /// mint another admin (or an owner) and lock the operator out of their own
+    /// community. The owner is the only one who can appoint admins.
+    pub fn may_assign(self, target: Role) -> bool {
+        self.is_admin() && target < self
+    }
+}
+
 /// Public information about a member, as shown in the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub id: Uuid,
     pub username: String,
     pub online: bool,
+    /// Appended field: bincode is positional, so this must stay last.
+    pub role: Role,
 }
 
-/// Channel kind. The MVP ships `Public`; the rest are reserved for Phase 3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Channel kind — the per-channel access rule.
+///
+/// These used to be stored, persisted, and shipped to clients while being
+/// enforced nowhere, then (when that was found) made to fail closed, which left
+/// three of the four kinds unusable. They are now real: see
+/// [`ChannelKind::may_read`] / [`ChannelKind::may_post`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
 pub enum ChannelKind {
+    /// Everyone who has joined the server may read and post.
     #[default]
     Public,
+    /// Only members on the channel's own membership list may read or post.
     Private,
+    /// Everyone may read; nobody may post except an admin. Used to freeze a
+    /// channel without deleting its history.
     Locked,
+    /// Everyone may read; only admins may post. Used for announcements.
     Announce,
+}
+
+impl ChannelKind {
+    /// Whether a member with `role`, who is `is_channel_member` of this channel,
+    /// may read it. `is_channel_member` is only consulted for [`Self::Private`];
+    /// every other kind is server-wide.
+    pub fn may_read(self, role: Role, is_channel_member: bool) -> bool {
+        match self {
+            ChannelKind::Public | ChannelKind::Locked | ChannelKind::Announce => true,
+            // An admin can always see a private channel — they administer it,
+            // and pretending otherwise only means they cannot moderate it.
+            ChannelKind::Private => is_channel_member || role.is_admin(),
+        }
+    }
+
+    /// Whether a member with `role` may post here. A guest never may.
+    pub fn may_post(self, role: Role, is_channel_member: bool) -> Result<(), &'static str> {
+        if !role.can_write() {
+            return Err("your role on this server is read-only");
+        }
+        match self {
+            ChannelKind::Public => Ok(()),
+            ChannelKind::Private => {
+                if is_channel_member || role.is_admin() {
+                    Ok(())
+                } else {
+                    Err("you are not a member of this channel")
+                }
+            }
+            ChannelKind::Locked => {
+                if role.is_admin() {
+                    Ok(())
+                } else {
+                    Err("this channel is locked")
+                }
+            }
+            ChannelKind::Announce => {
+                if role.is_admin() {
+                    Ok(())
+                } else {
+                    Err("only admins may post to an announcement channel")
+                }
+            }
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChannelKind::Public => "Public",
+            ChannelKind::Private => "Private",
+            ChannelKind::Locked => "Locked",
+            ChannelKind::Announce => "Announce",
+        }
+    }
 }
 
 /// Public information about a channel.
@@ -106,6 +260,9 @@ pub struct ChannelInfo {
     pub id: Uuid,
     pub name: String,
     pub kind: ChannelKind,
+    /// Members of a [`ChannelKind::Private`] channel. Empty for every other kind,
+    /// where membership is server-wide. Appended field: keep it last.
+    pub members: Vec<Uuid>,
 }
 
 /// Client → server messages.
@@ -148,6 +305,106 @@ pub enum PartyRequest {
     },
     /// Fetch a stored file's bytes by its content hash.
     DownloadFile { hash: String },
+
+    // --- Governance and file management (appended; keep the order stable) ------
+    /// Create a channel of a specific kind. `members` seeds a
+    /// [`ChannelKind::Private`] channel's membership and is ignored otherwise.
+    CreateChannelOfKind {
+        name: String,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
+    },
+    /// Delete a channel and its history (admins only).
+    DeleteChannel { channel: Uuid },
+    /// Change a channel's kind and/or private membership (admins only).
+    SetChannelAccess {
+        channel: Uuid,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
+    },
+    /// Change another member's role (admins only; never above your own).
+    SetRole { member: Uuid, role: Role },
+    /// List every file the caller is allowed to see, for the Drive panel.
+    ListFiles,
+    /// Delete a shared file: removes its reference, and the blob once nothing
+    /// holds it. Allowed for the uploader or an admin.
+    DeleteFile { hash: String, channel: Uuid },
+    /// Fetch the server's audit log (admins only), newest first.
+    FetchAuditLog { limit: u32 },
+    /// Storage the caller has used and is allowed to use.
+    FetchQuota,
+
+    // --- Chunked file transfer (appended; keep the order stable) --------------
+    /// Begin a chunked upload. `size` is declared up front so the server can
+    /// refuse — quota, ceiling, unknown channel — before any bytes move rather
+    /// than after spooling a hundred megabytes.
+    StartUpload {
+        name: String,
+        mime: String,
+        size: u64,
+        target: UploadTarget,
+    },
+    /// One chunk of an in-progress upload, in order. At most
+    /// [`PARTY_CHUNK_BYTES`].
+    UploadChunk { upload: Uuid, data: Vec<u8> },
+    /// All chunks sent: verify the assembled length, store the blob, and post
+    /// the file message.
+    FinishUpload { upload: Uuid },
+    /// Abandon an upload and discard its spool.
+    CancelUpload { upload: Uuid },
+    /// Fetch one chunk of a stored file, starting at `offset`. The reply carries
+    /// the total size, so the caller knows when it is done.
+    DownloadChunk { hash: String, offset: u64 },
+}
+
+/// One shared file as shown in the Drive panel: the blob plus the provenance the
+/// server records for it — who shared it, where, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub hash: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    /// Member who shared it here.
+    pub uploader: Uuid,
+    pub uploader_name: String,
+    /// Channel this reference lives in, or the DM thread id.
+    pub location: Uuid,
+    /// Display name of the location (`#general`, or the other member's name).
+    pub location_name: String,
+    /// True when the location is a DM thread rather than a channel.
+    pub is_dm: bool,
+    /// Unix milliseconds when it was shared.
+    pub shared_at: u64,
+    /// Whether the *requesting* member may delete this reference.
+    pub can_delete: bool,
+}
+
+/// A member's storage usage against their allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaInfo {
+    /// Bytes of distinct content this member has uploaded and still holds.
+    pub used: u64,
+    /// Per-member ceiling, or `None` when unlimited (admins).
+    pub limit: Option<u64>,
+    /// Bytes stored server-wide across all members.
+    pub server_used: u64,
+    /// Server-wide ceiling.
+    pub server_limit: u64,
+}
+
+/// One recorded governance action, newest first in a [`PartyResponse::AuditLog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Unix milliseconds.
+    pub at: u64,
+    /// Member who performed the action.
+    pub actor: Uuid,
+    pub actor_name: String,
+    /// Machine-readable action, e.g. `role.set`, `channel.delete`, `file.delete`.
+    pub action: String,
+    /// Human-readable detail, already resolved to names by the server.
+    pub detail: String,
 }
 
 /// Deterministic, order-independent id for the 1:1 DM thread between two members,
@@ -206,6 +463,38 @@ pub enum PartyResponse {
     ActionFailed {
         channel: Uuid,
         reason: String,
+    },
+
+    // --- Governance and file management (appended; keep the order stable) ------
+    /// Every file the caller may see (response to [`PartyRequest::ListFiles`]).
+    Files(Vec<FileEntry>),
+    /// The caller's storage usage (response to [`PartyRequest::FetchQuota`]).
+    Quota(QuotaInfo),
+    /// The server's audit log, newest first (admins only).
+    AuditLog(Vec<AuditEntry>),
+    /// A governance action succeeded, with a message worth showing the user.
+    Ok(String),
+    /// The channel list changed; re-request it with
+    /// [`PartyRequest::ListChannels`].
+    ///
+    /// A nudge rather than the list itself, because the list is now *per member*:
+    /// a private channel is only visible to those in it, and the hub fans one
+    /// identical frame out to every connection. Broadcasting the channels
+    /// directly would hand everyone the private ones.
+    DirectoryChanged,
+    /// A chunked upload was accepted; send [`PartyRequest::UploadChunk`]s of at
+    /// most `chunk_size` bytes, then [`PartyRequest::FinishUpload`].
+    UploadReady {
+        upload: Uuid,
+        chunk_size: u32,
+    },
+    /// One chunk of a requested file. `total` is the whole file's size, so the
+    /// caller knows whether to ask for more; a short final chunk is normal.
+    FileChunk {
+        hash: String,
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
     },
 }
 
@@ -627,11 +916,13 @@ mod tests {
                 id: Uuid::new_v4(),
                 username: "alice".to_string(),
                 online: true,
+                role: Role::Member,
             }]),
             PartyResponse::Channels(vec![ChannelInfo {
                 id: Uuid::new_v4(),
                 name: "general".to_string(),
                 kind: ChannelKind::Public,
+                members: Vec::new(),
             }]),
             PartyResponse::MessagePosted {
                 channel: Uuid::new_v4(),

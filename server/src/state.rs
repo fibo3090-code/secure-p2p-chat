@@ -26,8 +26,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use messenger_core::party::{
-    blob_hash, ChannelInfo, ChannelKind, Envelope, FileMeta, MemberInfo, MessagePayload, TrustTier,
-    MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES,
+    blob_hash, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta, MemberInfo,
+    MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget, MAX_HISTORY_BATCH,
+    MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
@@ -42,6 +43,14 @@ const BLOB_DIR: &str = "blobs";
 /// bounding memory/disk growth from uploads. A safety cap until the Phase 3 quota
 /// system lands; operators can adjust it via [`PartyState::set_max_blob_bytes`].
 const MAX_TOTAL_BLOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Default per-member ceiling on distinct uploaded bytes (the logical quota).
+///
+/// The server-wide ceiling alone means the first member to fill it denies the
+/// feature to everyone else, so storage is also budgeted per member. Admins are
+/// exempt — they are the ones who clean up when it fills.
+const MAX_MEMBER_BLOB_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+/// Most audit entries retained in memory and returned to an admin.
+const MAX_AUDIT_ENTRIES: usize = 1000;
 /// Most channels one server will hold. Channel creation is open to every joined
 /// member and there is no admin role, so this is the only thing standing between
 /// a bored member and unbounded server state.
@@ -123,14 +132,75 @@ struct Member {
     fingerprint: Option<String>,
     /// Presence is runtime-only and not persisted; members start offline on load.
     online: bool,
+    /// Authority on this server. The first member to join becomes [`Role::Owner`]
+    /// — that is the operator, who starts the server and then joins it.
+    role: Role,
 }
 
 struct Channel {
     id: Uuid,
     name: String,
     kind: ChannelKind,
+    /// Explicit membership, consulted only for [`ChannelKind::Private`].
+    members: Vec<Uuid>,
     /// Durable history; index order is delivery order. `seq` is `index + 1`.
     messages: Vec<Envelope>,
+}
+
+/// One share of a file into a channel or DM thread — the provenance record the
+/// Drive panel lists and `DeleteFile` removes.
+///
+/// This is deliberately separate from the message that references the blob.
+/// Deleting a file must not rewrite history: sequence numbers are the identity
+/// clients merge on, so removing an envelope would renumber everything after it
+/// and desynchronise every client that had already fetched the channel. The
+/// message stays where it is; the reference and the bytes are what go away.
+#[derive(Clone)]
+struct FileRef {
+    /// Identity of this *share*, not of the content.
+    ///
+    /// Keying persistence on `(hash, location)` collapsed repeated shares of the
+    /// same bytes into one row while the blob's refcount counted them all, so a
+    /// restart reloaded fewer references than the count claimed and the last
+    /// visible one could never release the blob — storage leaked with nothing
+    /// left that could delete it.
+    id: Uuid,
+    hash: String,
+    name: String,
+    uploader: Uuid,
+    /// Channel id, or DM thread id when `is_dm`.
+    location: Uuid,
+    is_dm: bool,
+    shared_at: u64,
+}
+
+/// A chunked upload in flight: bytes accumulate here until `FinishUpload`.
+///
+/// Spooled in memory rather than to disk because [`MAX_PARTY_FILE_BYTES`] and
+/// [`MAX_CONCURRENT_UPLOADS`] together bound what one connection can hold, and
+/// a temp file would need the same cleanup on every disconnect path anyway.
+struct PendingUpload {
+    uploader: Uuid,
+    name: String,
+    mime: String,
+    /// Size the uploader declared, checked before a byte was accepted.
+    declared: u64,
+    target: UploadTarget,
+    data: Vec<u8>,
+}
+
+/// Uploads one connection may have in flight at once. Each one can hold up to
+/// [`MAX_PARTY_FILE_BYTES`], so without a cap a single client could pin
+/// arbitrary server memory by starting uploads it never finishes.
+pub const MAX_CONCURRENT_UPLOADS: usize = 4;
+
+/// One recorded governance action.
+#[derive(Clone)]
+struct AuditRecord {
+    at: u64,
+    actor: Uuid,
+    action: String,
+    detail: String,
 }
 
 /// A 1:1 direct-message thread, keyed by `messenger_core::party::dm_thread_id`.
@@ -196,6 +266,14 @@ pub struct PartyState {
     dm_threads: HashMap<Uuid, DmThread>,
     /// Content-addressed file blobs, keyed by hex SHA-256 of their bytes.
     blobs: HashMap<String, BlobRecord>,
+    /// Every share of a file into a channel or DM, in share order.
+    file_refs: Vec<FileRef>,
+    /// Governance actions, oldest first.
+    audit: Vec<AuditRecord>,
+    /// Chunked uploads in flight, keyed by the id handed to the uploader.
+    uploads: HashMap<Uuid, PendingUpload>,
+    /// Per-member ceiling on distinct uploaded bytes. Admins are exempt.
+    max_member_blob_bytes: u64,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
     max_blob_bytes: u64,
     /// When present, mutations are mirrored to this database.
@@ -212,6 +290,7 @@ impl PartyState {
             id: Uuid::new_v4(),
             name: "general".to_string(),
             kind: ChannelKind::Public,
+            members: Vec::new(),
             messages: Vec::new(),
         };
         Self {
@@ -222,10 +301,19 @@ impl PartyState {
             channels: vec![general],
             dm_threads: HashMap::new(),
             blobs: HashMap::new(),
+            file_refs: Vec::new(),
+            audit: Vec::new(),
+            uploads: HashMap::new(),
+            max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             db: None,
             blob_dir: None,
         }
+    }
+
+    /// Override the per-member storage allowance (bytes of distinct content).
+    pub fn set_max_member_blob_bytes(&mut self, bytes: u64) {
+        self.max_member_blob_bytes = bytes;
     }
 
     /// Override the total-blob-storage ceiling (bytes of distinct content). Used
@@ -268,6 +356,10 @@ impl PartyState {
         if state.count_channels()? > 0 {
             // The database is authoritative; rebuild the in-memory model from it.
             state.reload_from_db()?;
+            // A community that predates roles reloads with nobody able to
+            // administer it; give it an owner rather than leaving governance
+            // permanently unreachable.
+            state.ensure_owner();
         } else {
             // Fresh database: persist the seeded default `general` channel.
             let general = &state.channels[0];
@@ -276,6 +368,7 @@ impl PartyState {
                 general.id,
                 &general.name,
                 general.kind,
+                &general.members,
                 0,
             )?;
         }
@@ -341,15 +434,112 @@ impl PartyState {
         }
 
         let id = Uuid::new_v4();
+        // The first identity through the door is the operator: they started the
+        // server, so they are the one who owns it. Everyone after is a member.
+        // Without this bootstrap nobody could ever administer anything, because
+        // only an admin can promote an admin.
+        let role = if self.members.is_empty() {
+            Role::Owner
+        } else {
+            Role::Member
+        };
         let member = Member {
             id,
             username: username.to_string(),
             fingerprint,
             online: true,
+            role,
         };
         self.persist_member(&member);
         self.members.insert(id, member);
         Ok(id)
+    }
+
+    /// Make sure a populated server has somebody who can administer it.
+    ///
+    /// `join` only appoints an owner when the member table is empty, which is
+    /// right for a fresh server and wrong for every existing one: a community
+    /// that predates roles reloads with every member defaulted to `Member`, and
+    /// since `set_role` requires an admin, nobody could ever be promoted. The
+    /// operator would be locked out of governance on their own server,
+    /// permanently, with no way back short of editing the database by hand.
+    ///
+    /// The choice has to be deterministic across restarts, and registration
+    /// order is not recorded, so the lowest member id wins. It is recorded in
+    /// the audit log, because silently handing someone ownership is exactly the
+    /// sort of thing an operator should be able to see happened.
+    fn ensure_owner(&mut self) {
+        if self.members.is_empty() || self.members.values().any(|m| m.role.is_admin()) {
+            return;
+        }
+        let Some(&chosen) = self.members.keys().min() else {
+            return;
+        };
+        let name = {
+            let m = self.members.get_mut(&chosen).expect("just selected");
+            m.role = Role::Owner;
+            m.username.clone()
+        };
+        if let Some(m) = self.members.get(&chosen) {
+            self.persist_member(m);
+        }
+        tracing::info!(
+            member = %chosen,
+            username = %name,
+            "this community had no admin (it predates roles); promoting its first member to owner"
+        );
+        let detail = format!("{name} became Owner (no administrator existed)");
+        self.record_audit(chosen, "role.bootstrap", &detail);
+    }
+
+    /// A member's role, or [`Role::Guest`] for an unknown id (fail closed).
+    pub fn role_of(&self, member: Uuid) -> Role {
+        self.members.get(&member).map_or(Role::Guest, |m| m.role)
+    }
+
+    /// Change `target`'s role on `actor`'s authority.
+    ///
+    /// Refuses when the actor may not assign that role (you can only grant one
+    /// strictly below your own), and always refuses to change the owner's — an
+    /// admin who could demote the owner would own the server.
+    pub fn set_role(&mut self, actor: Uuid, target: Uuid, role: Role) -> Result<String, String> {
+        let actor_role = self.role_of(actor);
+        if !actor_role.is_admin() {
+            return Err("only admins may change roles".to_string());
+        }
+        if actor == target {
+            return Err("you cannot change your own role".to_string());
+        }
+        let Some(current) = self.members.get(&target).map(|m| m.role) else {
+            return Err("unknown member".to_string());
+        };
+        if current == Role::Owner {
+            return Err("the owner's role cannot be changed".to_string());
+        }
+        if role == Role::Owner {
+            return Err("a server has exactly one owner".to_string());
+        }
+        if !actor_role.may_assign(role) {
+            return Err(format!(
+                "you may only assign roles below your own ({})",
+                actor_role.label()
+            ));
+        }
+        // Demoting a peer admin needs the same authority as appointing one.
+        if current >= actor_role {
+            return Err("you cannot change the role of someone at or above your own".to_string());
+        }
+        let name = {
+            let m = self.members.get_mut(&target).expect("checked above");
+            m.role = role;
+            m.username.clone()
+        };
+        if let Some(m) = self.members.get(&target) {
+            self.persist_member(m);
+        }
+        let detail = format!("{name} is now {}", role.label());
+        self.record_audit(actor, "role.set", &detail);
+        Ok(detail)
     }
 
     /// Mark a member's presence. Used when a connection drops or reconnects.
@@ -364,6 +554,53 @@ impl PartyState {
         self.members.contains_key(&member)
     }
 
+    /// Record a governance action. Kept bounded so a long-lived server does not
+    /// accumulate an unbounded log in memory.
+    fn record_audit(&mut self, actor: Uuid, action: &str, detail: &str) {
+        let record = AuditRecord {
+            at: current_timestamp_millis(),
+            actor,
+            action: action.to_string(),
+            detail: detail.to_string(),
+        };
+        self.persist_audit(&record);
+        self.audit.push(record);
+        if self.audit.len() > MAX_AUDIT_ENTRIES {
+            let overflow = self.audit.len() - MAX_AUDIT_ENTRIES;
+            self.audit.drain(..overflow);
+        }
+    }
+
+    /// The audit log, newest first, for an admin. Non-admins get nothing: the log
+    /// records who did what to whom, which is exactly the sort of thing an
+    /// ordinary member should not be able to enumerate.
+    pub fn audit_log(&self, member: Uuid, limit: usize) -> Result<Vec<AuditEntry>, String> {
+        if !self.role_of(member).is_admin() {
+            return Err("only admins may read the audit log".to_string());
+        }
+        Ok(self
+            .audit
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|r| AuditEntry {
+                at: r.at,
+                actor: r.actor,
+                actor_name: self.username_of(r.actor),
+                action: r.action.clone(),
+                detail: r.detail.clone(),
+            })
+            .collect())
+    }
+
+    /// Display name for a member id, falling back for one who no longer exists.
+    fn username_of(&self, id: Uuid) -> String {
+        self.members
+            .get(&id)
+            .map(|m| m.username.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     /// The member directory, sorted by username for stable output.
     pub fn members(&self) -> Vec<MemberInfo> {
         let mut list: Vec<MemberInfo> = self
@@ -373,12 +610,54 @@ impl PartyState {
                 id: m.id,
                 username: m.username.clone(),
                 online: m.online,
+                role: m.role,
             })
             .collect();
         list.sort_by(|a, b| a.username.cmp(&b.username));
         list
     }
 
+    /// The channel list as `member` may see it: channels they cannot read are
+    /// omitted entirely, so a private channel does not even advertise its
+    /// existence to somebody who is not in it.
+    pub fn channels_for(&self, member: Uuid) -> Vec<ChannelInfo> {
+        let role = self.role_of(member);
+        self.channels
+            .iter()
+            .filter(|c| c.kind.may_read(role, c.members.contains(&member)))
+            .map(|c| ChannelInfo {
+                id: c.id,
+                name: c.name.clone(),
+                kind: c.kind,
+                members: c.members.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether every joined member may read `channel` — true for the kinds whose
+    /// access is server-wide, false for `Private`, which has its own list.
+    ///
+    /// This decides how a post to it may be fanned out: a channel everyone can
+    /// read may be broadcast, and one that is not must be delivered only to the
+    /// members who may see it.
+    pub fn channel_is_open_to_all(&self, channel: Uuid) -> bool {
+        !matches!(
+            self.channel(channel).map(|c| c.kind),
+            Some(ChannelKind::Private) | None
+        )
+    }
+
+    /// The members allowed to read `channel`. Used to fan a restricted channel's
+    /// messages out by member instead of broadcasting them to every connection.
+    pub fn members_who_can_read(&self, channel: Uuid) -> Vec<Uuid> {
+        self.members
+            .keys()
+            .copied()
+            .filter(|m| self.member_can_read_channel(*m, channel))
+            .collect()
+    }
+
+    /// Every channel, regardless of access. Used by persistence and tests.
     pub fn channels(&self) -> Vec<ChannelInfo> {
         self.channels
             .iter()
@@ -386,6 +665,7 @@ impl PartyState {
                 id: c.id,
                 name: c.name.clone(),
                 kind: c.kind,
+                members: c.members.clone(),
             })
             .collect()
     }
@@ -423,16 +703,147 @@ impl PartyState {
             id: Uuid::new_v4(),
             name: name.to_string(),
             kind: ChannelKind::Public,
+            members: Vec::new(),
             messages: Vec::new(),
         };
         let info = ChannelInfo {
             id: channel.id,
             name: channel.name.clone(),
             kind: channel.kind,
+            members: Vec::new(),
         };
         self.persist_channel(&channel, position);
         self.channels.push(channel);
         Ok(info)
+    }
+
+    /// Create a channel of a given kind on `creator`'s authority.
+    ///
+    /// Anyone who may write can make a `Public` channel; the restricted kinds
+    /// (`Private`, `Locked`, `Announce`) are administrative, because each of them
+    /// is a way to control what other members may see or say. The creator of a
+    /// private channel is always in it — otherwise they could lock themselves out
+    /// of the channel they just made.
+    pub fn create_channel_of_kind(
+        &mut self,
+        creator: Uuid,
+        name: &str,
+        kind: ChannelKind,
+        mut members: Vec<Uuid>,
+    ) -> Result<ChannelInfo, String> {
+        let role = self.role_of(creator);
+        if !role.can_create_channel() {
+            return Err("your role on this server is read-only".to_string());
+        }
+        if kind != ChannelKind::Public && !role.is_admin() {
+            return Err(format!(
+                "only admins may create a {} channel",
+                kind.label().to_lowercase()
+            ));
+        }
+        let info = self.create_channel(name)?;
+        if kind != ChannelKind::Public {
+            if kind == ChannelKind::Private {
+                members.retain(|m| self.members.contains_key(m));
+                if !members.contains(&creator) {
+                    members.push(creator);
+                }
+            } else {
+                members.clear();
+            }
+            let position = self
+                .channels
+                .iter()
+                .position(|c| c.id == info.id)
+                .expect("just created");
+            {
+                let c = &mut self.channels[position];
+                c.kind = kind;
+                c.members = members.clone();
+            }
+            let c = &self.channels[position];
+            self.persist_channel(c, position);
+        }
+        let detail = format!("created {} channel #{}", kind.label().to_lowercase(), name);
+        self.record_audit(creator, "channel.create", &detail);
+        Ok(ChannelInfo {
+            kind,
+            members,
+            ..info
+        })
+    }
+
+    /// Change a channel's kind and private membership (admins only).
+    pub fn set_channel_access(
+        &mut self,
+        actor: Uuid,
+        channel: Uuid,
+        kind: ChannelKind,
+        mut members: Vec<Uuid>,
+    ) -> Result<String, String> {
+        if !self.role_of(actor).is_admin() {
+            return Err("only admins may change channel access".to_string());
+        }
+        if kind == ChannelKind::Private {
+            members.retain(|m| self.members.contains_key(m));
+            if !members.contains(&actor) {
+                members.push(actor);
+            }
+        } else {
+            members.clear();
+        }
+        let Some(position) = self.channels.iter().position(|c| c.id == channel) else {
+            return Err("unknown channel".to_string());
+        };
+        let name = {
+            let c = &mut self.channels[position];
+            c.kind = kind;
+            c.members = members;
+            c.name.clone()
+        };
+        let c = &self.channels[position];
+        self.persist_channel(c, position);
+        let detail = format!("#{name} is now {}", kind.label().to_lowercase());
+        self.record_audit(actor, "channel.access", &detail);
+        Ok(detail)
+    }
+
+    /// Delete a channel and its history (admins only).
+    ///
+    /// The last channel cannot be deleted: `default_channel` indexes
+    /// `channels[0]`, and a server with no channels has nowhere to post.
+    pub fn delete_channel(&mut self, actor: Uuid, channel: Uuid) -> Result<String, String> {
+        if !self.role_of(actor).is_admin() {
+            return Err("only admins may delete channels".to_string());
+        }
+        if self.channels.len() <= 1 {
+            return Err("a server must keep at least one channel".to_string());
+        }
+        let Some(position) = self.channels.iter().position(|c| c.id == channel) else {
+            return Err("unknown channel".to_string());
+        };
+        let removed = self.channels.remove(position);
+        // Release every file shared here before the references disappear with
+        // the channel, or their bytes would be stranded with nothing holding a
+        // count and nothing able to reach them.
+        let stranded: Vec<String> = self
+            .file_refs
+            .iter()
+            .filter(|r| !r.is_dm && r.location == channel)
+            .map(|r| r.hash.clone())
+            .collect();
+        self.file_refs.retain(|r| r.is_dm || r.location != channel);
+        for hash in stranded {
+            self.release_blob(&hash);
+        }
+        self.delete_channel_rows(channel);
+        // Positions are an index, so everything after the hole has to move up.
+        for (i, c) in self.channels.iter().enumerate().skip(position) {
+            self.persist_channel(c, i);
+        }
+        let detail = format!("deleted channel #{}", removed.name);
+        self.record_audit(actor, "channel.delete", &detail);
+        Ok(detail)
     }
 
     fn channel_mut(&mut self, id: Uuid) -> Option<&mut Channel> {
@@ -455,28 +866,23 @@ impl PartyState {
     /// so this changes nothing today; it means the type stops promising an
     /// access control it does not have, and the first per-channel ACL cannot
     /// ship silently open.
-    fn member_can_read_channel(&self, channel: Uuid) -> bool {
-        match self.channel(channel).map(|c| c.kind) {
-            Some(ChannelKind::Public) | Some(ChannelKind::Locked) | Some(ChannelKind::Announce) => {
-                true
-            }
-            // No membership model exists for these yet: deny.
-            Some(ChannelKind::Private) => false,
+    fn member_can_read_channel(&self, member: Uuid, channel: Uuid) -> bool {
+        let role = self.role_of(member);
+        match self.channel(channel) {
+            Some(c) => c.kind.may_read(role, c.members.contains(&member)),
             None => false,
         }
     }
 
-    /// Whether a member may *post* to `channel`. `Locked` and `Announce`
-    /// channels are readable but not writable by ordinary members, and there is
-    /// no administrator role yet, so nobody may post to them.
-    fn member_can_post_to_channel(&self, channel: Uuid) -> Result<(), String> {
-        match self.channel(channel).map(|c| c.kind) {
-            Some(ChannelKind::Public) => Ok(()),
-            Some(ChannelKind::Locked) => Err("this channel is locked".to_string()),
-            Some(ChannelKind::Announce) => {
-                Err("only announcements may be posted to this channel".to_string())
-            }
-            Some(ChannelKind::Private) => Err("you are not a member of this channel".to_string()),
+    /// Whether `member` may *post* to `channel`, per their role and the channel's
+    /// kind (see [`ChannelKind::may_post`]).
+    fn member_can_post_to_channel(&self, member: Uuid, channel: Uuid) -> Result<(), String> {
+        let role = self.role_of(member);
+        match self.channel(channel) {
+            Some(c) => c
+                .kind
+                .may_post(role, c.members.contains(&member))
+                .map_err(str::to_string),
             None => Err("unknown channel".to_string()),
         }
     }
@@ -496,7 +902,7 @@ impl PartyState {
             return Err("sender is not a member of this server".to_string());
         }
         validate_message_text(&text)?;
-        self.member_can_post_to_channel(channel)?;
+        self.member_can_post_to_channel(sender, channel)?;
         let tier = self.tier;
         let chan = self
             .channel_mut(channel)
@@ -529,7 +935,7 @@ impl PartyState {
     /// yield `[]` — the same as an unknown channel, so the reply does not reveal
     /// that the channel exists.
     pub fn history_since(&self, member: Uuid, channel: Uuid, since_seq: u64) -> Vec<Envelope> {
-        if !self.is_member(member) || !self.member_can_read_channel(channel) {
+        if !self.is_member(member) || !self.member_can_read_channel(member, channel) {
             return Vec::new();
         }
         match self.channel(channel) {
@@ -601,7 +1007,13 @@ impl PartyState {
     /// same content reuses the existing blob and bumps its reference count. A new,
     /// distinct blob is rejected if it would push total stored bytes past the
     /// configured ceiling.
-    fn store_blob(&mut self, name: &str, mime: &str, data: Vec<u8>) -> Result<FileMeta, String> {
+    fn store_blob(
+        &mut self,
+        uploader: Uuid,
+        name: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> Result<FileMeta, String> {
         let hash = blob_hash(&data);
         let size = data.len() as u64;
         if let Some(rec) = self.blobs.get_mut(&hash) {
@@ -615,7 +1027,24 @@ impl PartyState {
             if stored.saturating_add(size) > self.max_blob_bytes {
                 return Err("server file storage is full".to_string());
             }
-            self.write_blob_file(&hash, &data);
+            // The server-wide ceiling alone lets the first member to reach it
+            // deny the feature to everyone else, so storage is budgeted per
+            // member too. Admins are exempt: they are who clears space when it
+            // does fill up.
+            if let Some(limit) = self.member_blob_limit(uploader) {
+                let used = self.member_blob_bytes(uploader);
+                if used.saturating_add(size) > limit {
+                    return Err(format!(
+                        "this would exceed your {} file storage allowance ({} of it already used)",
+                        messenger_core::util::format_size(limit),
+                        messenger_core::util::format_size(used)
+                    ));
+                }
+            }
+            // Store the bytes before recording the blob: if this fails there must
+            // be no row and no in-memory record, so the upload is refused cleanly
+            // rather than leaving a message pointing at a file nobody can fetch.
+            self.write_blob_file(&hash, &data)?;
             self.persist_blob_row(&hash, size, mime, 1);
             // Only keep the bytes resident when there is nowhere to read them
             // back from; a disk-backed store reads on demand.
@@ -647,6 +1076,364 @@ impl PartyState {
         })
     }
 
+    /// This member's storage allowance, or `None` when they are exempt.
+    fn member_blob_limit(&self, member: Uuid) -> Option<u64> {
+        if self.role_of(member).is_admin() {
+            None
+        } else {
+            Some(self.max_member_blob_bytes)
+        }
+    }
+
+    /// Distinct bytes this member currently holds.
+    ///
+    /// Counted over *distinct* blobs, so sharing one file into three channels
+    /// costs its size once — the same rule the server-wide ceiling uses. Freeing
+    /// it therefore requires deleting every reference, which is what makes the
+    /// number match what the store actually holds on their behalf.
+    fn member_blob_bytes(&self, member: Uuid) -> u64 {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for r in self.file_refs.iter().filter(|r| r.uploader == member) {
+            if seen.insert(r.hash.as_str()) {
+                total = total
+                    .saturating_add(self.blobs.get(&r.hash).map(|b| b.size).unwrap_or_default());
+            }
+        }
+        total
+    }
+
+    /// Storage usage for the Drive panel's quota readout.
+    pub fn quota_for(&self, member: Uuid) -> QuotaInfo {
+        QuotaInfo {
+            used: self.member_blob_bytes(member),
+            limit: self.member_blob_limit(member),
+            server_used: self.blobs.values().map(|r| r.size).sum(),
+            server_limit: self.max_blob_bytes,
+        }
+    }
+
+    /// Record that `uploader` shared `meta` into `location`.
+    fn record_file_ref(&mut self, uploader: Uuid, meta: &FileMeta, location: Uuid, is_dm: bool) {
+        let entry = FileRef {
+            id: Uuid::new_v4(),
+            hash: meta.hash.clone(),
+            name: meta.name.clone(),
+            uploader,
+            location,
+            is_dm,
+            shared_at: current_timestamp_millis(),
+        };
+        self.persist_file_ref(&entry);
+        self.file_refs.push(entry);
+    }
+
+    /// Drop one reference to a blob, deleting the bytes when the last one goes.
+    ///
+    /// This is the half of reference counting that never existed: uploads
+    /// incremented the count and nothing ever decremented it, so storage only
+    /// ever grew and the count was decorative.
+    fn release_blob(&mut self, hash: &str) {
+        let Some(rec) = self.blobs.get_mut(hash) else {
+            return;
+        };
+        rec.refcount = rec.refcount.saturating_sub(1);
+        if rec.refcount > 0 {
+            let refcount = rec.refcount;
+            self.persist_blob_refcount(hash, refcount);
+            return;
+        }
+        self.blobs.remove(hash);
+        self.delete_blob_row(hash);
+        if let Some(dir) = &self.blob_dir {
+            let path = dir.join(hash);
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(error = %e, path = %path.display(), "failed to delete blob bytes");
+                }
+            }
+        }
+    }
+
+    /// Delete one share of a file. The uploader may remove their own; an admin
+    /// may remove anyone's.
+    ///
+    /// The *message* referencing the file stays in history: sequence numbers are
+    /// what clients merge on, so removing an envelope would renumber the channel
+    /// and desynchronise everyone who had already fetched it. What goes away is
+    /// the reference and — once nothing else holds it — the bytes, after which
+    /// the file card reports that the file was deleted.
+    pub fn delete_file(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        location: Uuid,
+    ) -> Result<String, String> {
+        let Some(index) = self
+            .file_refs
+            .iter()
+            .position(|r| r.hash == hash && r.location == location)
+        else {
+            return Err("that file is not shared here".to_string());
+        };
+        let entry = self.file_refs[index].clone();
+        let is_admin = self.role_of(actor).is_admin();
+        if entry.uploader != actor && !is_admin {
+            return Err(
+                "only the member who shared a file, or an admin, may delete it".to_string(),
+            );
+        }
+        // Deleting from a place you cannot see is not a thing you may do.
+        if entry.is_dm {
+            let mine = self
+                .members
+                .keys()
+                .any(|other| messenger_core::party::dm_thread_id(actor, *other) == entry.location);
+            if !mine && !is_admin {
+                return Err("that file is not shared here".to_string());
+            }
+        } else if !self.member_can_read_channel(actor, entry.location) {
+            return Err("that file is not shared here".to_string());
+        }
+        self.file_refs.remove(index);
+        self.delete_file_ref_row(entry.id);
+        self.release_blob(hash);
+        let detail = format!("deleted file {}", entry.name);
+        self.record_audit(actor, "file.delete", &detail);
+        Ok(detail)
+    }
+
+    /// Every file `member` may see, newest first — the Drive panel's contents.
+    ///
+    /// Access follows the same rule as downloading: files shared in channels they
+    /// can read, and in their own DM threads.
+    pub fn files_for(&self, member: Uuid) -> Vec<FileEntry> {
+        let is_admin = self.role_of(member).is_admin();
+        let mut out: Vec<FileEntry> = self
+            .file_refs
+            .iter()
+            .filter(|r| {
+                if r.is_dm {
+                    self.members
+                        .keys()
+                        .any(|o| messenger_core::party::dm_thread_id(member, *o) == r.location)
+                } else {
+                    self.member_can_read_channel(member, r.location)
+                }
+            })
+            .map(|r| {
+                let (location_name, is_dm) = if r.is_dm {
+                    (self.dm_location_name(member, r.location), true)
+                } else {
+                    (
+                        self.channel(r.location)
+                            .map(|c| format!("#{}", c.name))
+                            .unwrap_or_else(|| "#unknown".to_string()),
+                        false,
+                    )
+                };
+                FileEntry {
+                    hash: r.hash.clone(),
+                    name: r.name.clone(),
+                    size: self.blobs.get(&r.hash).map(|b| b.size).unwrap_or_default(),
+                    mime: self
+                        .blobs
+                        .get(&r.hash)
+                        .map(|b| b.mime.clone())
+                        .unwrap_or_default(),
+                    uploader: r.uploader,
+                    uploader_name: self.username_of(r.uploader),
+                    location: r.location,
+                    location_name,
+                    is_dm,
+                    shared_at: r.shared_at,
+                    can_delete: is_admin || r.uploader == member,
+                }
+            })
+            .collect();
+        out.sort_by_key(|f| std::cmp::Reverse(f.shared_at));
+        out
+    }
+
+    /// Label a DM thread from `viewer`'s side: the other participant's name.
+    fn dm_location_name(&self, viewer: Uuid, thread: Uuid) -> String {
+        for other in self.members.keys() {
+            if messenger_core::party::dm_thread_id(viewer, *other) == thread {
+                return format!("DM with {}", self.username_of(*other));
+            }
+        }
+        "Direct message".to_string()
+    }
+
+    // --- Chunked upload (Phase 2, slice 2) --------------------------------------
+
+    /// Accept a chunked upload, or refuse it before a single byte moves.
+    ///
+    /// Everything checkable up front is checked here — the declared size against
+    /// the hard ceiling and the uploader's remaining allowance, and the target
+    /// against the permission rules — because the alternative is spooling a
+    /// hundred megabytes and then saying no.
+    pub fn start_upload(
+        &mut self,
+        uploader: Uuid,
+        name: String,
+        mime: String,
+        size: u64,
+        target: UploadTarget,
+        in_flight: usize,
+    ) -> Result<Uuid, String> {
+        if !self.is_member(uploader) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if in_flight >= MAX_CONCURRENT_UPLOADS {
+            return Err(format!(
+                "you already have {MAX_CONCURRENT_UPLOADS} uploads in progress"
+            ));
+        }
+        if size == 0 {
+            return Err("file is empty".to_string());
+        }
+        if size > MAX_PARTY_FILE_BYTES {
+            return Err(format!(
+                "file is larger than the {} limit for this server",
+                messenger_core::util::format_size(MAX_PARTY_FILE_BYTES)
+            ));
+        }
+        match target {
+            UploadTarget::Channel(channel) => self.member_can_post_to_channel(uploader, channel)?,
+            UploadTarget::Dm(to) => {
+                if !self.role_of(uploader).can_write() {
+                    return Err("your role on this server is read-only".to_string());
+                }
+                if !self.is_member(to) {
+                    return Err("recipient is not a member of this server".to_string());
+                }
+            }
+        }
+        // The quota check is provisional: content the server already holds costs
+        // nothing, but that is only knowable once the bytes have arrived, so the
+        // pessimistic answer is the one to give before accepting them.
+        if let Some(limit) = self.member_blob_limit(uploader) {
+            let used = self.member_blob_bytes(uploader);
+            if used.saturating_add(size) > limit {
+                return Err(format!(
+                    "this would exceed your {} file storage allowance ({} of it already used)",
+                    messenger_core::util::format_size(limit),
+                    messenger_core::util::format_size(used)
+                ));
+            }
+        }
+        let id = Uuid::new_v4();
+        self.uploads.insert(
+            id,
+            PendingUpload {
+                uploader,
+                name,
+                mime,
+                declared: size,
+                target,
+                data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Append one chunk. Refuses anything that would take the upload past the
+    /// size it declared — checking after the write would still have put the
+    /// excess in memory, which is the whole thing being bounded.
+    pub fn upload_chunk(
+        &mut self,
+        uploader: Uuid,
+        upload: Uuid,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if data.len() > PARTY_CHUNK_BYTES {
+            return Err("chunk is too large".to_string());
+        }
+        let Some(pending) = self.uploads.get_mut(&upload) else {
+            return Err("no such upload".to_string());
+        };
+        if pending.uploader != uploader {
+            return Err("no such upload".to_string());
+        }
+        let would_be = pending.data.len() as u64 + data.len() as u64;
+        if would_be > pending.declared {
+            let name = pending.name.clone();
+            self.uploads.remove(&upload);
+            return Err(format!("{name} sent more data than it declared"));
+        }
+        pending.data.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Complete an upload: store the assembled bytes and post the file message.
+    /// Returns the envelope to deliver, and whether it was a DM.
+    pub fn finish_upload(
+        &mut self,
+        uploader: Uuid,
+        upload: Uuid,
+    ) -> Result<(Envelope, UploadTarget), String> {
+        let Some(pending) = self.uploads.get(&upload) else {
+            return Err("no such upload".to_string());
+        };
+        if pending.uploader != uploader {
+            return Err("no such upload".to_string());
+        }
+        if (pending.data.len() as u64) != pending.declared {
+            let short = pending.declared - pending.data.len() as u64;
+            return Err(format!(
+                "upload is incomplete — {} still missing",
+                messenger_core::util::format_size(short)
+            ));
+        }
+        let pending = self.uploads.remove(&upload).expect("checked above");
+        let target = pending.target;
+        let envelope = match target {
+            UploadTarget::Channel(channel) => {
+                self.post_file_bytes(uploader, channel, pending.name, pending.mime, pending.data)?
+            }
+            UploadTarget::Dm(to) => {
+                self.post_file_dm_bytes(uploader, to, pending.name, pending.mime, pending.data)?
+            }
+        };
+        Ok((envelope, target))
+    }
+
+    /// Discard an in-flight upload. Called on an explicit cancel and on
+    /// disconnect, so a client that vanishes mid-transfer does not pin its spool
+    /// for the lifetime of the process.
+    pub fn cancel_upload(&mut self, uploader: Uuid, upload: Uuid) {
+        if self
+            .uploads
+            .get(&upload)
+            .is_some_and(|p| p.uploader == uploader)
+        {
+            self.uploads.remove(&upload);
+        }
+    }
+
+    /// Drop every upload belonging to `member` (their connection went away).
+    pub fn cancel_uploads_for(&mut self, member: Uuid) {
+        self.uploads.retain(|_, p| p.uploader != member);
+    }
+
+    /// One chunk of a stored blob, plus the file's total size, for a member who
+    /// is allowed to see it. `None` when unknown or not permitted — the same
+    /// answer either way, so the endpoint never reveals a file's existence.
+    pub fn blob_chunk_for(&self, member: Uuid, hash: &str, offset: u64) -> Option<(Vec<u8>, u64)> {
+        if !self.member_can_access_blob(member, hash) {
+            return None;
+        }
+        let bytes = self.blob_bytes(hash)?;
+        let total = bytes.len() as u64;
+        if offset >= total {
+            return Some((Vec::new(), total));
+        }
+        let start = offset as usize;
+        let end = (start + PARTY_CHUNK_BYTES).min(bytes.len());
+        Some((bytes[start..end].to_vec(), total))
+    }
+
     /// Validate an inline upload's size, returning the data on success.
     fn check_inline_size(data: Vec<u8>) -> Result<Vec<u8>, String> {
         if data.is_empty() {
@@ -674,10 +1461,29 @@ impl PartyState {
         if !self.is_member(sender) {
             return Err("sender is not a member of this server".to_string());
         }
-        self.member_can_post_to_channel(channel)?;
+        self.member_can_post_to_channel(sender, channel)?;
         let data = Self::check_inline_size(data)?;
+        self.post_file_bytes(sender, channel, name, mime, data)
+    }
+
+    /// Store already-validated bytes and post them as a file message to
+    /// `channel`. Shared by the inline path and the chunked one, which has
+    /// checked the size against its own (much larger) ceiling instead.
+    fn post_file_bytes(
+        &mut self,
+        sender: Uuid,
+        channel: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Envelope, String> {
+        if !self.is_member(sender) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        self.member_can_post_to_channel(sender, channel)?;
         let tier = self.tier;
-        let meta = self.store_blob(&name, &mime, data)?;
+        let meta = self.store_blob(sender, &name, &mime, data)?;
+        self.record_file_ref(sender, &meta, channel, false);
         // Re-borrow the channel after the blob store to append the message.
         let chan = self
             .channel_mut(channel)
@@ -713,9 +1519,32 @@ impl PartyState {
             return Err("recipient is not a member of this server".to_string());
         }
         let data = Self::check_inline_size(data)?;
+        self.post_file_dm_bytes(from, to, name, mime, data)
+    }
+
+    /// Store already-validated bytes and send them as a file DM. Shared by the
+    /// inline and chunked paths, like [`Self::post_file_bytes`].
+    fn post_file_dm_bytes(
+        &mut self,
+        from: Uuid,
+        to: Uuid,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<Envelope, String> {
+        if !self.is_member(from) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        if !self.is_member(to) {
+            return Err("recipient is not a member of this server".to_string());
+        }
+        if !self.role_of(from).can_write() {
+            return Err("your role on this server is read-only".to_string());
+        }
         let thread_id = messenger_core::party::dm_thread_id(from, to);
         let tier = self.tier;
-        let meta = self.store_blob(&name, &mime, data)?;
+        let meta = self.store_blob(from, &name, &mime, data)?;
+        self.record_file_ref(from, &meta, thread_id, true);
         let thread = self
             .dm_threads
             .entry(thread_id)
@@ -764,27 +1593,18 @@ impl PartyState {
     /// learned a content hash could fetch a file shared privately in a DM between
     /// two *other* members — content-addressed storage is shared, but the
     /// download endpoint must still enforce who can see what.
+    /// Decided over the reference table rather than by re-scanning every message
+    /// in every channel: the references *are* the record of where a file was
+    /// shared, and a deleted reference has to stop granting access immediately.
     fn member_can_access_blob(&self, member: Uuid, hash: &str) -> bool {
-        let references =
-            |env: &Envelope| matches!(&env.payload, MessagePayload::File(f) if f.hash == hash);
-        // Channels the member is allowed to read. This used to scan *every*
-        // channel while claiming to check only public ones, so a file posted in
-        // a non-public channel was downloadable by anyone who knew its hash.
-        if self
-            .channels
-            .iter()
-            .filter(|c| self.member_can_read_channel(c.id))
-            .any(|c| c.messages.iter().any(references))
-        {
-            return true;
-        }
-        // Otherwise only DM threads this member participates in (the thread id is
-        // derived from the two members' ids).
-        self.members.keys().any(|other| {
-            let tid = messenger_core::party::dm_thread_id(member, *other);
-            self.dm_threads
-                .get(&tid)
-                .is_some_and(|t| t.messages.iter().any(references))
+        self.file_refs.iter().filter(|r| r.hash == hash).any(|r| {
+            if r.is_dm {
+                self.members
+                    .keys()
+                    .any(|o| messenger_core::party::dm_thread_id(member, *o) == r.location)
+            } else {
+                self.member_can_read_channel(member, r.location)
+            }
         })
     }
 
@@ -803,14 +1623,77 @@ impl PartyState {
 
     fn persist_member(&self, m: &Member) {
         let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_member_row(conn, m.id, &m.username, m.fingerprint.as_deref()) {
+        if let Err(e) = insert_member_row(conn, m.id, &m.username, m.fingerprint.as_deref(), m.role)
+        {
             tracing::error!(error = %e, "failed to persist party member");
+        }
+    }
+
+    fn persist_file_ref(&self, r: &FileRef) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO file_refs (id, hash, name, uploader, location, is_dm, shared_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                r.id.to_string(),
+                r.hash,
+                r.name,
+                r.uploader.to_string(),
+                r.location.to_string(),
+                r.is_dm as i64,
+                r.shared_at as i64
+            ],
+        ) {
+            tracing::error!(error = %e, "failed to persist file reference");
+        }
+    }
+
+    /// Delete exactly one share. Deleting by `(hash, location)` would drop every
+    /// share of that content in that place while only one refcount was released.
+    fn delete_file_ref_row(&self, id: Uuid) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = conn.execute(
+            "DELETE FROM file_refs WHERE id = ?1",
+            params![id.to_string()],
+        ) {
+            tracing::error!(error = %e, "failed to delete file reference");
+        }
+    }
+
+    fn delete_blob_row(&self, hash: &str) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = conn.execute("DELETE FROM blobs WHERE hash = ?1", params![hash]) {
+            tracing::error!(error = %e, "failed to delete blob row");
+        }
+    }
+
+    fn delete_channel_rows(&self, channel: Uuid) {
+        let Some(conn) = &self.db else { return };
+        let id = channel.to_string();
+        for (sql, what) in [
+            ("DELETE FROM messages WHERE channel_id = ?1", "messages"),
+            ("DELETE FROM file_refs WHERE location = ?1", "file refs"),
+            ("DELETE FROM channels WHERE id = ?1", "channel"),
+        ] {
+            if let Err(e) = conn.execute(sql, params![id]) {
+                tracing::error!(error = %e, what, "failed to delete channel rows");
+            }
+        }
+    }
+
+    fn persist_audit(&self, r: &AuditRecord) {
+        let Some(conn) = &self.db else { return };
+        if let Err(e) = conn.execute(
+            "INSERT INTO audit (at, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![r.at as i64, r.actor.to_string(), r.action, r.detail],
+        ) {
+            tracing::error!(error = %e, "failed to persist audit entry");
         }
     }
 
     fn persist_channel(&self, c: &Channel, position: usize) {
         let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_channel_row(conn, c.id, &c.name, c.kind, position) {
+        if let Err(e) = insert_channel_row(conn, c.id, &c.name, c.kind, &c.members, position) {
             tracing::error!(error = %e, "failed to persist party channel");
         }
     }
@@ -829,12 +1712,24 @@ impl PartyState {
         }
     }
 
-    fn write_blob_file(&self, hash: &str, data: &[u8]) {
-        let Some(dir) = &self.blob_dir else { return };
+    /// Write a blob's bytes to the on-disk store.
+    ///
+    /// Unlike the other persistence helpers this one **propagates** its error.
+    /// The rest are mirrors of state that is already correct in memory, so a
+    /// failed write costs durability and nothing else. These bytes are different:
+    /// when the store is disk-backed nothing keeps them resident, so a write that
+    /// failed silently left a blob recorded but unreadable — the upload was
+    /// acknowledged, the file message was broadcast to the whole channel, and
+    /// every download of it answered "unknown file" forever.
+    fn write_blob_file(&self, hash: &str, data: &[u8]) -> Result<(), String> {
+        let Some(dir) = &self.blob_dir else {
+            return Ok(()); // memory-only store: the bytes stay resident instead
+        };
         let path = dir.join(hash);
-        if let Err(e) = std::fs::write(&path, data) {
+        std::fs::write(&path, data).map_err(|e| {
             tracing::error!(error = %e, path = %path.display(), "failed to write file blob");
-        }
+            "the server could not store this file".to_string()
+        })
     }
 
     fn persist_blob_row(&self, hash: &str, size: u64, mime: &str, refcount: u32) {
@@ -863,16 +1758,17 @@ impl PartyState {
 
         let mut members = HashMap::new();
         {
-            let mut stmt = conn.prepare("SELECT id, username, fingerprint FROM members")?;
+            let mut stmt = conn.prepare("SELECT id, username, fingerprint, role FROM members")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })?;
             for row in rows {
-                let (id, username, fingerprint) = row?;
+                let (id, username, fingerprint, role) = row?;
                 let id = Uuid::parse_str(&id)?;
                 members.insert(
                     id,
@@ -881,6 +1777,10 @@ impl PartyState {
                         username,
                         fingerprint,
                         online: false,
+                        // A role that will not parse falls back to the least
+                        // privileged value rather than failing the load: a
+                        // damaged row must not hand out authority.
+                        role: serde_json::from_str(&role).unwrap_or(Role::Guest),
                     },
                 );
             }
@@ -889,23 +1789,30 @@ impl PartyState {
         let mut channels = Vec::new();
         {
             let mut stmt =
-                conn.prepare("SELECT id, name, kind FROM channels ORDER BY position ASC")?;
+                conn.prepare("SELECT id, name, kind, members FROM channels ORDER BY position ASC")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })?;
-            let raw: Vec<(String, String, String)> = rows.collect::<Result<_, _>>()?;
-            for (id, name, kind) in raw {
+            let raw: Vec<(String, String, String, String)> = rows.collect::<Result<_, _>>()?;
+            for (id, name, kind, members) in raw {
                 let id = Uuid::parse_str(&id)?;
                 let kind: ChannelKind = serde_json::from_str(&kind)?;
+                let members: Vec<Uuid> = serde_json::from_str::<Vec<String>>(&members)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|s| Uuid::parse_str(s).ok())
+                    .collect();
                 let messages = load_messages(conn, "messages", "channel_id", id)?;
                 channels.push(Channel {
                     id,
                     name,
                     kind,
+                    members,
                     messages,
                 });
             }
@@ -960,10 +1867,73 @@ impl PartyState {
             }
         }
 
+        let mut file_refs = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, hash, name, uploader, location, is_dm, shared_at
+                 FROM file_refs ORDER BY shared_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, hash, name, uploader, location, is_dm, shared_at) = row?;
+                // A reference to a blob that is gone grants access to nothing and
+                // would only inflate the owner's quota, so drop it.
+                if !blobs.contains_key(&hash) {
+                    continue;
+                }
+                file_refs.push(FileRef {
+                    id: Uuid::parse_str(&id)?,
+                    hash,
+                    name,
+                    uploader: Uuid::parse_str(&uploader)?,
+                    location: Uuid::parse_str(&location)?,
+                    is_dm: is_dm != 0,
+                    shared_at: shared_at as u64,
+                });
+            }
+        }
+
+        let mut audit = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT at, actor, action, detail FROM audit ORDER BY id DESC LIMIT ?1")?;
+            let rows = stmt.query_map(params![MAX_AUDIT_ENTRIES as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (at, actor, action, detail) = row?;
+                audit.push(AuditRecord {
+                    at: at as u64,
+                    actor: Uuid::parse_str(&actor)?,
+                    action,
+                    detail,
+                });
+            }
+            // Read newest-first for the LIMIT; stored oldest-first.
+            audit.reverse();
+        }
+
         self.members = members;
         self.channels = channels;
         self.dm_threads = dm_threads;
         self.blobs = blobs;
+        self.file_refs = file_refs;
+        self.audit = audit;
         Ok(())
     }
 }
@@ -1004,8 +1974,52 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              size     INTEGER NOT NULL,
              mime     TEXT NOT NULL,
              refcount INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS file_refs (
+             id        TEXT PRIMARY KEY,
+             hash      TEXT NOT NULL,
+             name      TEXT NOT NULL,
+             uploader  TEXT NOT NULL,
+             location  TEXT NOT NULL,
+             is_dm     INTEGER NOT NULL,
+             shared_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS audit (
+             id     INTEGER PRIMARY KEY AUTOINCREMENT,
+             at     INTEGER NOT NULL,
+             actor  TEXT NOT NULL,
+             action TEXT NOT NULL,
+             detail TEXT NOT NULL
          );",
-    )
+    )?;
+    // Added after the first release: `ALTER TABLE` is how an existing party.db
+    // gains them, and "duplicate column" is the expected answer on a database
+    // that already has them.
+    for sql in [
+        "ALTER TABLE members ADD COLUMN role TEXT NOT NULL DEFAULT '\"Member\"'",
+        "ALTER TABLE channels ADD COLUMN members TEXT NOT NULL DEFAULT '[]'",
+        // `file_refs` was first keyed by (hash, location), which collapsed
+        // repeated shares of the same content. Give existing rows a per-share
+        // id; `randomblob` is evaluated per row, so each gets a distinct one,
+        // and 32 undashed hex characters parse as a UUID.
+        "ALTER TABLE file_refs ADD COLUMN id TEXT",
+    ] {
+        if let Err(e) = conn.execute(sql, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e);
+            }
+        }
+    }
+    conn.execute(
+        "UPDATE file_refs SET id = lower(hex(randomblob(16))) WHERE id IS NULL OR id = ''",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS file_refs_id ON file_refs (id)",
+        [],
+    )?;
+    Ok(())
 }
 
 fn insert_blob_row(
@@ -1048,10 +2062,12 @@ fn insert_member_row(
     id: Uuid,
     username: &str,
     fingerprint: Option<&str>,
+    role: Role,
 ) -> rusqlite::Result<()> {
+    let role = serde_json::to_string(&role).expect("Role serializes");
     conn.execute(
-        "INSERT OR REPLACE INTO members (id, username, fingerprint) VALUES (?1, ?2, ?3)",
-        params![id.to_string(), username, fingerprint],
+        "INSERT OR REPLACE INTO members (id, username, fingerprint, role) VALUES (?1, ?2, ?3, ?4)",
+        params![id.to_string(), username, fingerprint, role],
     )?;
     Ok(())
 }
@@ -1061,12 +2077,16 @@ fn insert_channel_row(
     id: Uuid,
     name: &str,
     kind: ChannelKind,
+    members: &[Uuid],
     position: usize,
 ) -> rusqlite::Result<()> {
     let kind = serde_json::to_string(&kind).expect("ChannelKind serializes");
+    let members = serde_json::to_string(&members.iter().map(|m| m.to_string()).collect::<Vec<_>>())
+        .expect("member list serializes");
     conn.execute(
-        "INSERT OR REPLACE INTO channels (id, name, kind, position) VALUES (?1, ?2, ?3, ?4)",
-        params![id.to_string(), name, kind, position as i64],
+        "INSERT OR REPLACE INTO channels (id, name, kind, members, position)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id.to_string(), name, kind, members, position as i64],
     )?;
     Ok(())
 }
@@ -1122,10 +2142,16 @@ fn import_legacy_snapshot(conn: &Connection, path: &Path) -> anyhow::Result<()> 
 
     let tx = conn.unchecked_transaction()?;
     for m in &snap.members {
-        insert_member_row(&tx, m.id, &m.username, m.fingerprint.as_deref())?;
+        insert_member_row(
+            &tx,
+            m.id,
+            &m.username,
+            m.fingerprint.as_deref(),
+            Role::Member,
+        )?;
     }
     for (position, c) in snap.channels.iter().enumerate() {
-        insert_channel_row(&tx, c.id, &c.name, c.kind, position)?;
+        insert_channel_row(&tx, c.id, &c.name, c.kind, &[], position)?;
         for e in &c.messages {
             insert_message_row(&tx, e)?;
         }
@@ -1494,6 +2520,44 @@ mod tests {
         }
         let s = PartyState::load("Srv", None, dir.path()).unwrap();
         assert_eq!(s.dm_history(thread, 0).len(), 1);
+    }
+
+    /// A blob whose bytes cannot be written must fail the upload outright.
+    ///
+    /// The failure this guards is silent and permanent: the write error used to
+    /// be logged and swallowed, so the blob was recorded, the file message was
+    /// posted and broadcast to the whole channel, and every download of it
+    /// answered "unknown file" from then on — with the sender told it worked.
+    #[test]
+    fn an_unwritable_blob_store_refuses_the_upload_instead_of_posting_a_dead_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let channel = state.default_channel();
+
+        // Replace the blob directory with a regular file, so writing any blob
+        // path inside it fails at the filesystem level.
+        let blob_dir = dir.path().join(BLOB_DIR);
+        std::fs::remove_dir_all(&blob_dir).unwrap();
+        std::fs::write(&blob_dir, b"not a directory").unwrap();
+
+        let err = state
+            .post_file(
+                alice,
+                channel,
+                "report.pdf".to_string(),
+                "application/pdf".to_string(),
+                b"payload".to_vec(),
+            )
+            .expect_err("an upload whose bytes cannot be stored must fail");
+        assert!(
+            err.contains("could not store"),
+            "expected a storage error, got: {err}"
+        );
+
+        // Nothing was recorded: no message in the channel, and no blob to serve.
+        assert!(state.history_since(alice, channel, 0).is_empty());
+        assert!(state.blob_bytes(&blob_hash(b"payload")).is_none());
     }
 
     #[test]
@@ -1894,13 +2958,16 @@ mod tests {
         assert_eq!(s.blob_bytes(&hash), Some(b"durable".to_vec()));
     }
 
-    /// `ChannelKind` was stored, shipped to clients, and enforced nowhere.
-    /// Anything that is not `Public` now fails closed until a real per-channel
-    /// membership model exists.
+    /// `ChannelKind` was stored, shipped to clients, and enforced nowhere; then
+    /// it was made to fail closed, which left three of the four kinds unusable.
+    /// Each kind now has a real rule, and an ordinary member is held to it.
     #[test]
     fn non_public_channels_are_enforced_rather_than_decorative() {
         let mut state = PartyState::new("Open", None);
-        let alice = state.join("alice", None, None).unwrap();
+        // The first member is the owner, so join a second one to test the
+        // ordinary-member path.
+        let _owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
         let public = state.default_channel();
 
         for (kind, label) in [
@@ -1913,32 +2980,115 @@ mod tests {
                 id,
                 name: label.to_string(),
                 kind,
+                members: Vec::new(),
                 messages: Vec::new(),
             });
             assert!(
-                state.post_message(alice, id, "hi".to_string()).is_err(),
+                state.post_message(bob, id, "hi".to_string()).is_err(),
                 "{label}: an ordinary member must not be able to post"
             );
             assert!(
                 state
-                    .post_file(alice, id, "f".into(), "text/plain".into(), b"x".to_vec())
+                    .post_file(bob, id, "f".into(), "text/plain".into(), b"x".to_vec())
                     .is_err(),
                 "{label}: an ordinary member must not be able to upload"
             );
         }
 
-        // Private channels are not readable either, and say nothing about
-        // whether they exist.
+        // A private channel they are not in is not readable, and says nothing
+        // about whether it exists.
         let private = state
             .channels
             .iter()
             .find(|c| c.kind == ChannelKind::Private)
             .unwrap()
             .id;
-        assert!(state.history_since(alice, private, 0).is_empty());
+        assert!(state.history_since(bob, private, 0).is_empty());
+        assert!(
+            !state.channels_for(bob).iter().any(|c| c.id == private),
+            "a private channel must not even be listed to a non-member"
+        );
         // The public channel is unaffected.
-        assert!(state.post_message(alice, public, "hi".to_string()).is_ok());
-        assert_eq!(state.history_since(alice, public, 0).len(), 1);
+        assert!(state.post_message(bob, public, "hi".to_string()).is_ok());
+        assert_eq!(state.history_since(bob, public, 0).len(), 1);
+    }
+
+    /// The kinds are restrictions on ordinary members, not on the people who
+    /// administer the server — otherwise nobody could post an announcement to an
+    /// announcement channel.
+    #[test]
+    fn admins_can_post_where_ordinary_members_cannot() {
+        let mut state = PartyState::new("Open", None);
+        let owner = state.join("owner", None, None).unwrap();
+        assert_eq!(state.role_of(owner), Role::Owner);
+
+        let announce = state
+            .create_channel_of_kind(owner, "news", ChannelKind::Announce, vec![])
+            .unwrap();
+        assert!(state
+            .post_message(owner, announce.id, "release day".to_string())
+            .is_ok());
+
+        let bob = state.join("bob", None, None).unwrap();
+        assert_eq!(state.role_of(bob), Role::Member);
+        assert!(state
+            .post_message(bob, announce.id, "me too".to_string())
+            .is_err());
+        // But bob can still read it — that is the point of an announce channel.
+        assert_eq!(state.history_since(bob, announce.id, 0).len(), 1);
+    }
+
+    /// A private channel is readable and postable by the members on its list.
+    #[test]
+    fn private_channel_membership_grants_access() {
+        let mut state = PartyState::new("Open", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let carol = state.join("carol", None, None).unwrap();
+
+        let private = state
+            .create_channel_of_kind(owner, "secret", ChannelKind::Private, vec![bob])
+            .unwrap();
+        // The creator is always added, so they cannot lock themselves out.
+        assert!(private.members.contains(&owner));
+        assert!(private.members.contains(&bob));
+
+        assert!(state
+            .post_message(bob, private.id, "in the club".to_string())
+            .is_ok());
+        assert_eq!(state.history_since(bob, private.id, 0).len(), 1);
+
+        // Carol is not on the list: she cannot post, read, or even see it.
+        assert!(state
+            .post_message(carol, private.id, "let me in".to_string())
+            .is_err());
+        assert!(state.history_since(carol, private.id, 0).is_empty());
+        assert!(!state.channels_for(carol).iter().any(|c| c.id == private.id));
+    }
+
+    /// Only admins may create the restricted kinds: each of them is a way to
+    /// control what other members can see or say.
+    #[test]
+    fn ordinary_members_may_only_create_public_channels() {
+        let mut state = PartyState::new("Open", None);
+        let _owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+
+        assert!(state
+            .create_channel_of_kind(bob, "chat", ChannelKind::Public, vec![])
+            .is_ok());
+        for kind in [
+            ChannelKind::Private,
+            ChannelKind::Locked,
+            ChannelKind::Announce,
+        ] {
+            assert!(
+                state
+                    .create_channel_of_kind(bob, "nope", kind, vec![])
+                    .is_err(),
+                "{kind:?} is administrative"
+            );
+        }
     }
 
     /// A file posted in a channel the member cannot read must not be reachable
@@ -1947,11 +3097,14 @@ mod tests {
     #[test]
     fn blobs_in_unreadable_channels_are_not_downloadable() {
         let mut state = PartyState::new("Open", None);
-        let alice = state.join("alice", None, None).unwrap();
+        // The first member owns the server, and an admin can read every channel,
+        // so the member under test has to be an ordinary one.
+        let _owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
         let chan = state.default_channel();
         let env = state
             .post_file(
-                alice,
+                bob,
                 chan,
                 "secret.txt".into(),
                 "text/plain".into(),
@@ -1959,14 +3112,761 @@ mod tests {
             )
             .unwrap();
         let hash = file_payload(&env).hash.clone();
-        assert!(state.blob_bytes_for(alice, &hash).is_some());
+        assert!(state.blob_bytes_for(bob, &hash).is_some());
 
-        // Flip the channel to Private: the same member can no longer reach it.
-        state.channel_mut(chan).unwrap().kind = ChannelKind::Private;
+        // Flip the channel to Private with bob off the list: he can no longer
+        // reach the file, even though he knows its hash and uploaded it.
+        {
+            let c = state.channel_mut(chan).unwrap();
+            c.kind = ChannelKind::Private;
+            c.members = Vec::new();
+        }
         assert!(
-            state.blob_bytes_for(alice, &hash).is_none(),
+            state.blob_bytes_for(bob, &hash).is_none(),
             "a file in an unreadable channel must not be downloadable by hash"
         );
+    }
+
+    /// The operator starts the server and then joins it, so the first identity
+    /// through the door owns it. Without this bootstrap nobody could administer
+    /// anything, because only an admin can appoint one.
+    #[test]
+    fn the_first_member_owns_the_server_and_the_rest_do_not() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        assert_eq!(state.role_of(owner), Role::Owner);
+        assert_eq!(state.role_of(bob), Role::Member);
+        assert_eq!(
+            state.role_of(Uuid::new_v4()),
+            Role::Guest,
+            "unknown ids fail closed"
+        );
+    }
+
+    /// An admin must not be able to mint a peer admin or unseat the operator —
+    /// either would let them take the community from the person who runs it.
+    #[test]
+    fn role_changes_cannot_escalate_past_the_actor() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let carol = state.join("carol", None, None).unwrap();
+
+        // The owner may appoint an admin.
+        state.set_role(owner, bob, Role::Admin).unwrap();
+        assert_eq!(state.role_of(bob), Role::Admin);
+
+        // That admin may demote an ordinary member to guest…
+        state.set_role(bob, carol, Role::Guest).unwrap();
+        assert_eq!(state.role_of(carol), Role::Guest);
+        // …but not appoint another admin, not take the owner's seat, and not
+        // touch the owner.
+        assert!(state.set_role(bob, carol, Role::Admin).is_err());
+        assert!(state.set_role(bob, carol, Role::Owner).is_err());
+        assert!(state.set_role(bob, owner, Role::Guest).is_err());
+        assert_eq!(state.role_of(owner), Role::Owner);
+
+        // An ordinary member may not change roles at all, including their own.
+        assert!(state.set_role(carol, carol, Role::Admin).is_err());
+        assert!(state.set_role(owner, owner, Role::Admin).is_err());
+    }
+
+    /// A guest is read-only everywhere, before any per-channel rule applies.
+    #[test]
+    fn a_guest_cannot_write_anywhere() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        state.set_role(owner, bob, Role::Guest).unwrap();
+        let chan = state.default_channel();
+
+        assert!(state.post_message(bob, chan, "hello".to_string()).is_err());
+        assert!(state
+            .post_file(bob, chan, "f".into(), "text/plain".into(), b"x".to_vec())
+            .is_err());
+        assert!(state
+            .create_channel_of_kind(bob, "mine", ChannelKind::Public, vec![])
+            .is_err());
+        // Reading is still allowed.
+        state
+            .post_message(owner, chan, "welcome".to_string())
+            .unwrap();
+        assert_eq!(state.history_since(bob, chan, 0).len(), 1);
+    }
+
+    /// Reference counting only ever counted up: uploads incremented it and
+    /// nothing decremented it, so deleting was impossible and storage only grew.
+    #[test]
+    fn deleting_the_last_reference_reclaims_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let a = state.default_channel();
+        let b = state
+            .create_channel_of_kind(owner, "second", ChannelKind::Public, vec![])
+            .unwrap()
+            .id;
+
+        // The same content shared twice is one blob with two references.
+        let env = state
+            .post_file(
+                owner,
+                a,
+                "d.txt".into(),
+                "text/plain".into(),
+                b"same".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+        state
+            .post_file(
+                owner,
+                b,
+                "d.txt".into(),
+                "text/plain".into(),
+                b"same".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(state.blobs[&hash].refcount, 2);
+        assert_eq!(state.quota_for(owner).used, 4, "dedup: counted once");
+
+        // Dropping one reference keeps the bytes for the other.
+        state.delete_file(owner, &hash, a).unwrap();
+        assert_eq!(state.blobs[&hash].refcount, 1);
+        assert!(state.blob_bytes(&hash).is_some());
+
+        // Dropping the last one reclaims them, on disk as well as in memory.
+        state.delete_file(owner, &hash, b).unwrap();
+        assert!(!state.blobs.contains_key(&hash));
+        assert!(!dir.path().join(BLOB_DIR).join(&hash).exists());
+        assert_eq!(state.quota_for(owner).used, 0);
+    }
+
+    /// Deleting is the uploader's right or an admin's, not everyone's.
+    #[test]
+    fn only_the_uploader_or_an_admin_may_delete_a_file() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let carol = state.join("carol", None, None).unwrap();
+        let chan = state.default_channel();
+
+        let env = state
+            .post_file(
+                bob,
+                chan,
+                "b.txt".into(),
+                "text/plain".into(),
+                b"bobs".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        assert!(
+            state.delete_file(carol, &hash, chan).is_err(),
+            "a bystander"
+        );
+        assert!(state.delete_file(owner, &hash, chan).is_ok(), "an admin");
+
+        // And the uploader can delete their own.
+        let env = state
+            .post_file(
+                bob,
+                chan,
+                "c.txt".into(),
+                "text/plain".into(),
+                b"more".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+        assert!(state.delete_file(bob, &hash, chan).is_ok());
+    }
+
+    /// A deleted file stops being downloadable immediately, while the message
+    /// that referenced it stays in history — removing the envelope would
+    /// renumber the channel and desynchronise every client that had it.
+    #[test]
+    fn deleting_a_file_revokes_access_but_keeps_history_intact() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let chan = state.default_channel();
+        state
+            .post_message(owner, chan, "before".to_string())
+            .unwrap();
+        let env = state
+            .post_file(
+                owner,
+                chan,
+                "x.txt".into(),
+                "text/plain".into(),
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+        state
+            .post_message(owner, chan, "after".to_string())
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        state.delete_file(owner, &hash, chan).unwrap();
+        assert!(state.blob_bytes_for(owner, &hash).is_none());
+
+        let history = state.history_since(owner, chan, 0);
+        assert_eq!(history.len(), 3, "history keeps its shape");
+        assert_eq!(
+            history.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "and its sequence numbers"
+        );
+    }
+
+    /// The server-wide ceiling alone lets the first member to reach it deny the
+    /// feature to everyone else, so storage is budgeted per member as well.
+    #[test]
+    fn a_member_cannot_exceed_their_own_storage_allowance() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        state.set_max_member_blob_bytes(10);
+        let chan = state.default_channel();
+
+        assert!(state
+            .post_file(
+                bob,
+                chan,
+                "a".into(),
+                "text/plain".into(),
+                b"12345678".to_vec()
+            )
+            .is_ok());
+        // Distinct content, so it is a new blob rather than a deduplicated
+        // re-share, and it would take him past the ceiling.
+        let err = state
+            .post_file(
+                bob,
+                chan,
+                "b".into(),
+                "text/plain".into(),
+                b"abcdefgh".to_vec(),
+            )
+            .expect_err("this would take bob past his allowance");
+        assert!(err.contains("allowance"), "got: {err}");
+        assert_eq!(state.quota_for(bob).used, 8);
+        assert_eq!(state.quota_for(bob).limit, Some(10));
+
+        // Admins are exempt: they are who clears space when it fills.
+        assert!(state
+            .post_file(
+                owner,
+                chan,
+                "c".into(),
+                "text/plain".into(),
+                b"abcdefghij!".to_vec()
+            )
+            .is_ok());
+        assert_eq!(state.quota_for(owner).limit, None);
+
+        // Freeing a reference frees the allowance again.
+        let hash = blob_hash(b"12345678");
+        state.delete_file(bob, &hash, chan).unwrap();
+        assert_eq!(state.quota_for(bob).used, 0);
+        assert!(state
+            .post_file(
+                bob,
+                chan,
+                "d".into(),
+                "text/plain".into(),
+                b"abcdefgh".to_vec()
+            )
+            .is_ok());
+    }
+
+    /// The Drive listing shows a member their own files and the ones shared
+    /// where they can see them — and nothing else.
+    #[test]
+    fn the_file_listing_respects_who_may_see_what() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let public = state.default_channel();
+
+        state
+            .post_file(
+                bob,
+                public,
+                "shared.txt".into(),
+                "text/plain".into(),
+                b"pub".to_vec(),
+            )
+            .unwrap();
+        // A DM between owner and bob.
+        state
+            .post_file_dm(
+                owner,
+                bob,
+                "dm.txt".into(),
+                "text/plain".into(),
+                b"dm".to_vec(),
+            )
+            .unwrap();
+        // A private channel bob is not in.
+        let secret = state
+            .create_channel_of_kind(owner, "secret", ChannelKind::Private, vec![])
+            .unwrap()
+            .id;
+        state
+            .post_file(
+                owner,
+                secret,
+                "hidden.txt".into(),
+                "text/plain".into(),
+                b"sec".to_vec(),
+            )
+            .unwrap();
+
+        let listing = state.files_for(bob);
+        let names: Vec<&str> = listing.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"shared.txt"));
+        assert!(names.contains(&"dm.txt"), "his own DM thread");
+        assert!(
+            !names.contains(&"hidden.txt"),
+            "a private channel he is not in"
+        );
+
+        // He may delete only what he uploaded.
+        let shared = listing.iter().find(|f| f.name == "shared.txt").unwrap();
+        assert!(shared.can_delete);
+        assert_eq!(shared.uploader_name, "bob");
+        let dm = listing.iter().find(|f| f.name == "dm.txt").unwrap();
+        assert!(!dm.can_delete, "the owner uploaded it");
+        assert!(dm.is_dm);
+    }
+
+    /// Governance actions are recorded, and the log is admin-only: it says who
+    /// did what to whom, which is not an ordinary member's to enumerate.
+    #[test]
+    fn governance_actions_are_audited_and_the_log_is_admin_only() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+
+        state.set_role(owner, bob, Role::Admin).unwrap();
+        state
+            .create_channel_of_kind(owner, "news", ChannelKind::Announce, vec![])
+            .unwrap();
+
+        let log = state.audit_log(owner, 50).unwrap();
+        assert!(log.len() >= 2);
+        // Newest first.
+        assert_eq!(log[0].action, "channel.create");
+        assert_eq!(log[1].action, "role.set");
+        assert_eq!(log[1].actor_name, "owner");
+        assert!(log[1].detail.contains("bob"));
+
+        // Bob is an admin now, so he may read it too.
+        assert!(state.audit_log(bob, 50).is_ok());
+        state.set_role(owner, bob, Role::Member).unwrap();
+        assert!(state.audit_log(bob, 50).is_err());
+    }
+
+    /// A community that predates roles must not reload with nobody able to
+    /// administer it.
+    ///
+    /// `join` only appoints an owner when the member table is empty, and the
+    /// migration defaults existing rows to `Member`. Without a bootstrap the
+    /// operator would be permanently locked out of governance on their own
+    /// server, because `set_role` requires an admin that does not exist.
+    #[test]
+    fn an_upgraded_server_with_no_admin_gets_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            alice = s.join("alice", None, None).unwrap();
+            bob = s.join("bob", None, None).unwrap();
+            // Simulate the pre-roles state: everybody an ordinary member.
+            for id in [alice, bob] {
+                let m = s.members.get_mut(&id).unwrap();
+                m.role = Role::Member;
+                let snapshot = s.members.get(&id).unwrap();
+                s.persist_member(snapshot);
+            }
+            assert!(!s.members.values().any(|m| m.role.is_admin()));
+        }
+
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owners: Vec<Uuid> = s
+            .members
+            .values()
+            .filter(|m| m.role == Role::Owner)
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(owners.len(), 1, "exactly one owner is appointed");
+        // Deterministic, so a restart does not shuffle ownership around.
+        assert_eq!(owners[0], alice.min(bob));
+        // And it is recorded, because silently handing somebody ownership is
+        // the sort of thing an operator should be able to see happened.
+        let log = s.audit_log(owners[0], 10).unwrap();
+        assert!(log.iter().any(|e| e.action == "role.bootstrap"));
+
+        // A server that already has an admin is left alone.
+        let again = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(
+            again
+                .members
+                .values()
+                .filter(|m| m.role == Role::Owner)
+                .count(),
+            1,
+            "the bootstrap does not run twice"
+        );
+    }
+
+    /// The same content shared twice in one place is two shares, and both have
+    /// to survive a restart — otherwise the blob's reference count outlives the
+    /// references, and the last visible one cannot release it.
+    #[test]
+    fn repeated_shares_of_one_file_survive_a_reload_individually() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, channel, hash);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            owner = s.join("owner", None, None).unwrap();
+            channel = s.default_channel();
+            let env = s
+                .post_file(
+                    owner,
+                    channel,
+                    "twice.txt".into(),
+                    "text/plain".into(),
+                    b"same bytes".to_vec(),
+                )
+                .unwrap();
+            hash = file_payload(&env).hash.clone();
+            s.post_file(
+                owner,
+                channel,
+                "twice.txt".into(),
+                "text/plain".into(),
+                b"same bytes".to_vec(),
+            )
+            .unwrap();
+            assert_eq!(s.blobs[&hash].refcount, 2);
+            assert_eq!(s.file_refs.len(), 2);
+        }
+
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(s.file_refs.len(), 2, "both shares came back");
+        assert_eq!(s.blobs[&hash].refcount, 2);
+
+        // Releasing them one at a time reclaims the bytes exactly once.
+        s.delete_file(owner, &hash, channel).unwrap();
+        assert!(
+            s.blob_bytes(&hash).is_some(),
+            "one reference still holds it"
+        );
+        s.delete_file(owner, &hash, channel).unwrap();
+        assert!(!s.blobs.contains_key(&hash));
+        assert!(!dir.path().join(BLOB_DIR).join(&hash).exists());
+    }
+
+    /// Roles, channel kinds, private membership, file provenance and the audit
+    /// log all have to survive a restart, or the server forgets who runs it.
+    #[test]
+    fn governance_state_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, bob, private_id, hash);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            owner = s.join("owner", None, None).unwrap();
+            bob = s.join("bob", None, None).unwrap();
+            s.set_role(owner, bob, Role::Admin).unwrap();
+            private_id = s
+                .create_channel_of_kind(owner, "secret", ChannelKind::Private, vec![bob])
+                .unwrap()
+                .id;
+            let env = s
+                .post_file(
+                    owner,
+                    private_id,
+                    "p.txt".into(),
+                    "text/plain".into(),
+                    b"private bytes".to_vec(),
+                )
+                .unwrap();
+            hash = file_payload(&env).hash.clone();
+        }
+
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(s.role_of(owner), Role::Owner);
+        assert_eq!(s.role_of(bob), Role::Admin);
+        let chan = s
+            .channels()
+            .into_iter()
+            .find(|c| c.id == private_id)
+            .unwrap();
+        assert_eq!(chan.kind, ChannelKind::Private);
+        assert!(chan.members.contains(&bob));
+        assert!(chan.members.contains(&owner));
+        // Provenance came back with it, so the Drive panel and quotas still work.
+        let files = s.files_for(owner);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].uploader, owner);
+        assert_eq!(files[0].location_name, "#secret");
+        assert_eq!(s.quota_for(owner).used, 13);
+        assert!(s.blob_bytes_for(bob, &hash).is_some());
+        assert!(!s.audit_log(owner, 50).unwrap().is_empty());
+    }
+
+    /// Deleting a channel has to release the files shared in it, or their bytes
+    /// are stranded with nothing holding a count and nothing able to reach them.
+    #[test]
+    fn deleting_a_channel_reclaims_the_files_shared_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let extra = state
+            .create_channel_of_kind(owner, "temp", ChannelKind::Public, vec![])
+            .unwrap()
+            .id;
+        let env = state
+            .post_file(
+                owner,
+                extra,
+                "t.txt".into(),
+                "text/plain".into(),
+                b"temp".to_vec(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        state.delete_channel(owner, extra).unwrap();
+        assert!(!state.blobs.contains_key(&hash));
+        assert!(!dir.path().join(BLOB_DIR).join(&hash).exists());
+        assert!(state.files_for(owner).is_empty());
+        assert_eq!(state.quota_for(owner).used, 0);
+
+        // The last channel cannot go: `default_channel` needs one to exist.
+        let last = state.default_channel();
+        assert!(state.delete_channel(owner, last).is_err());
+    }
+
+    /// A file too large to fit in one frame goes up in chunks and comes back
+    /// down the same way, and the result is indistinguishable from an inline
+    /// upload once it lands.
+    #[test]
+    fn a_chunked_upload_round_trips_and_posts_a_file_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+
+        // Deliberately not a multiple of the chunk size, so the last chunk is
+        // short — the case an off-by-one gets wrong.
+        let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 77))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let upload = state
+            .start_upload(
+                owner,
+                "big.bin".into(),
+                "application/octet-stream".into(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        for chunk in payload.chunks(PARTY_CHUNK_BYTES) {
+            state.upload_chunk(owner, upload, chunk).unwrap();
+        }
+        let (env, target) = state.finish_upload(owner, upload).unwrap();
+        assert_eq!(target, UploadTarget::Channel(channel));
+        let meta = file_payload(&env);
+        assert_eq!(meta.size, payload.len() as u64);
+        assert_eq!(meta.hash, blob_hash(&payload));
+
+        // It is a normal file message in the channel, and a normal blob.
+        assert_eq!(state.history_since(owner, channel, 0).len(), 1);
+        assert_eq!(
+            state.blob_bytes_for(owner, &meta.hash),
+            Some(payload.clone())
+        );
+
+        // And it comes back down in order, in chunks, with the total attached.
+        let mut got = Vec::new();
+        loop {
+            let (data, total) = state
+                .blob_chunk_for(owner, &meta.hash, got.len() as u64)
+                .unwrap();
+            assert_eq!(total, payload.len() as u64);
+            if data.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&data);
+            if got.len() as u64 >= total {
+                break;
+            }
+        }
+        assert_eq!(got, payload);
+    }
+
+    /// The declared size is the contract: a client that sends more than it said
+    /// it would is cut off rather than allowed to grow the server's memory.
+    #[test]
+    fn an_upload_that_exceeds_its_declared_size_is_dropped() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+        let upload = state
+            .start_upload(
+                owner,
+                "x.bin".into(),
+                "application/octet-stream".into(),
+                4,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(owner, upload, b"abcd").unwrap();
+        assert!(state.upload_chunk(owner, upload, b"more").is_err());
+        // The upload is gone, so finishing it fails too.
+        assert!(state.finish_upload(owner, upload).is_err());
+    }
+
+    /// Finishing early must not store a truncated file under a hash that claims
+    /// to be the whole thing.
+    #[test]
+    fn an_incomplete_upload_cannot_be_finished() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+        let upload = state
+            .start_upload(
+                owner,
+                "x.bin".into(),
+                "application/octet-stream".into(),
+                10,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(owner, upload, b"abc").unwrap();
+        let err = state.finish_upload(owner, upload).unwrap_err();
+        assert!(err.contains("incomplete"), "got: {err}");
+    }
+
+    /// Everything checkable is checked before a byte moves — otherwise the
+    /// server spools a hundred megabytes and only then says no.
+    #[test]
+    fn uploads_are_refused_up_front_on_size_quota_and_permission() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        let octet = || "application/octet-stream".to_string();
+
+        // Past the server's hard ceiling.
+        assert!(state
+            .start_upload(
+                bob,
+                "huge".into(),
+                octet(),
+                MAX_PARTY_FILE_BYTES + 1,
+                UploadTarget::Channel(channel),
+                0
+            )
+            .is_err());
+        // Empty.
+        assert!(state
+            .start_upload(
+                bob,
+                "e".into(),
+                octet(),
+                0,
+                UploadTarget::Channel(channel),
+                0
+            )
+            .is_err());
+        // Past the member's allowance.
+        state.set_max_member_blob_bytes(1024);
+        let err = state
+            .start_upload(
+                bob,
+                "big".into(),
+                octet(),
+                4096,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap_err();
+        assert!(err.contains("allowance"), "got: {err}");
+        state.set_max_member_blob_bytes(MAX_MEMBER_BLOB_BYTES);
+        // Too many at once.
+        let err = state
+            .start_upload(
+                bob,
+                "n".into(),
+                octet(),
+                16,
+                UploadTarget::Channel(channel),
+                MAX_CONCURRENT_UPLOADS,
+            )
+            .unwrap_err();
+        assert!(err.contains("in progress"), "got: {err}");
+        // A channel they may not post to.
+        let locked = state
+            .create_channel_of_kind(owner, "locked", ChannelKind::Locked, vec![])
+            .unwrap()
+            .id;
+        assert!(state
+            .start_upload(
+                bob,
+                "l".into(),
+                octet(),
+                16,
+                UploadTarget::Channel(locked),
+                0
+            )
+            .is_err());
+        // A guest cannot upload at all, DM included.
+        state.set_role(owner, bob, Role::Guest).unwrap();
+        assert!(state
+            .start_upload(bob, "g".into(), octet(), 16, UploadTarget::Dm(owner), 0)
+            .is_err());
+    }
+
+    /// One member's upload id must be useless to anyone else, and a disconnect
+    /// must not leave the spool pinned for the life of the process.
+    #[test]
+    fn uploads_are_owned_by_their_uploader_and_cleaned_up() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        let upload = state
+            .start_upload(
+                bob,
+                "x".into(),
+                "application/octet-stream".into(),
+                8,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+
+        // Someone else's id gets the same answer as a made-up one.
+        assert!(state.upload_chunk(owner, upload, b"abcd").is_err());
+        assert!(state.finish_upload(owner, upload).is_err());
+        state.cancel_upload(owner, upload);
+        assert!(
+            state.upload_chunk(bob, upload, b"abcd").is_ok(),
+            "still bob's"
+        );
+
+        // Bob's connection goes away.
+        state.cancel_uploads_for(bob);
+        assert!(state.upload_chunk(bob, upload, b"abcd").is_err());
     }
 
     /// A whole channel in one frame stopped fitting once history grew past

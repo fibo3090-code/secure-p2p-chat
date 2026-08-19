@@ -416,6 +416,47 @@ fn frontend_payload_keys_bind_to_command_args() {
                 "enable_mdns": false,
             }}),
         ),
+        // Communities governance. These fail on "unknown server" — after the
+        // args have bound, which is the whole point of this test.
+        ("party_leave", json!({ "server": uuid })),
+        (
+            "party_create_channel_kind",
+            json!({ "server": uuid, "name": "news", "kind": "announce", "members": [] }),
+        ),
+        (
+            "party_delete_channel",
+            json!({ "server": uuid, "channel": uuid }),
+        ),
+        (
+            "party_set_channel_access",
+            json!({ "server": uuid, "channel": uuid, "kind": "private", "members": [uuid] }),
+        ),
+        (
+            "party_set_role",
+            json!({ "server": uuid, "member": uuid, "role": "admin" }),
+        ),
+        ("party_refresh_files", json!({ "server": uuid })),
+        (
+            "party_delete_file",
+            json!({ "server": uuid, "hash": "abc", "location": uuid }),
+        ),
+        ("party_refresh_audit", json!({ "server": uuid })),
+        ("party_clear_notice", json!({ "server": uuid })),
+        ("party_clear_error", json!({ "server": uuid })),
+        ("party_history", json!({ "server": uuid, "channel": uuid })),
+        ("party_dm_history", json!({ "server": uuid, "peer": uuid })),
+        (
+            "party_post",
+            json!({ "server": uuid, "channel": uuid, "text": "hi" }),
+        ),
+        (
+            "party_send_dm",
+            json!({ "server": uuid, "to": uuid, "text": "hi" }),
+        ),
+        (
+            "party_create_channel",
+            json!({ "server": uuid, "name": "chat" }),
+        ),
     ];
     for (cmd, args) in calls {
         let _ = h.ipc_binds(cmd, args);

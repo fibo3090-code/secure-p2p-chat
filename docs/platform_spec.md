@@ -278,14 +278,43 @@ Channel { id, name, kind, messages: Vec<Envelope> }   # messages = durable histo
 SQLite tables: `members`, `channels` (with a `position` column for stable
 ordering), `messages`, `dm_threads`, `dm_messages` (envelopes stored as JSON).
 
+### Roles, channel access, and the audit log (Phase 3 — shipped)
+
+- **`Role`** (`core::party`) is ordered `Guest < Member < Admin < Owner`, so every
+  server-side check reads as `role >= Role::Admin`. A **guest** is read-only
+  everywhere; a **member** posts, uploads and creates public channels; an
+  **admin** manages channels, anyone's files, and the roles below their own; the
+  **owner** is the first identity to join — the operator starts the server and
+  then joins it, which is the only bootstrap that does not require an admin to
+  already exist. A role may only ever be granted *strictly below* the granter's
+  own, the owner cannot be demoted, and a second owner is never minted, so an
+  admin cannot take the community from the person running it.
+- **`ChannelKind` is enforced.** It was previously stored, persisted, shipped to
+  clients and checked nowhere; the interim fix made it fail closed, which left
+  three of its four values unusable. Now: `Public` is read/write for everyone,
+  `Locked` and `Announce` are readable by everyone and writable by admins, and
+  `Private` is limited to the channel's own membership list (admins included, so
+  they can moderate it). A private channel is filtered out of `ListChannels`
+  entirely, so it does not advertise its existence to a non-member.
+- **The channel list is therefore per member**, which is why it is no longer
+  broadcast: the hub sends one identical frame to every connection, so
+  broadcasting one member's view would either leak the private channels or hide
+  them from the people in them. The server pushes `DirectoryChanged` and each
+  client re-fetches its own.
+- **The directory is live.** `Join` and disconnect both broadcast the refreshed
+  member list; presence goes offline only when a member's *last* connection does,
+  so a second open client does not report them as gone.
+- **Audit log** — role changes, channel creation/deletion/access changes and file
+  deletions are recorded with actor, action and detail, readable by admins only
+  (the log says who did what to whom).
+
 ### What remains
 
-- The filesystem **blob store** for files (Phase 2) — the SQLite metadata store is
-  now in place (see §9).
-- A dedicated **TUI Party pane** (beyond command output) and **server-identity
-  TOFU** confirmation UI in the GUI.
-- Roles/permissions, governance/audit, lock/password gating per channel (Phase 3);
-  files (Phase 2); the E2EE tier (Phase 4).
+- A dedicated **TUI Party pane** (beyond command output).
+- Chunked transfer for large community files (§8); the E2EE tier (Phase 4);
+  per-server identities (Phase 5).
+- Governance breadth beyond roles: transparency panel, consent-or-leave,
+  visibility & contact policies, per-channel passwords.
 
 ---
 
@@ -303,8 +332,46 @@ file into a channel or DM (a paperclip in the composer → `PartyManager::send_f
 / `send_file_dm`, size-checked against `MAX_INLINE_FILE_BYTES`) and download a
 received file (a file card → `PartyManager::request_download`, which correlates the
 async `FileData` response by content hash and saves via a native dialog).
-**Remaining:** chunked transfer for large files; the permission matrix, quotas,
-provenance, and the Drive UI panel below; the same wiring in egui/TUI.
+**Deletion, provenance, quotas and the Drive panel (shipped):**
+
+- **`file_refs`** records every *share* of a blob — hash, display name, uploader,
+  location (channel id or DM thread id), and when. It is deliberately separate
+  from the message that references the blob: sequence numbers are what clients
+  merge history on, so deleting a file must not remove an envelope and renumber
+  the channel. `ListFiles` turns these rows into the Drive listing, filtered to
+  what the caller may see, and access to a blob is decided over this table rather
+  than by rescanning every message — so a deleted reference stops granting
+  access immediately.
+- **`DeleteFile`** drops one reference and reclaims the bytes (memory, row and
+  file) when the last one goes. This is the half of reference counting that never
+  existed: uploads incremented the count and nothing decremented it, so deleting
+  was impossible and storage only grew. Deleting a channel releases everything
+  shared in it, which would otherwise be stranded with nothing holding a count
+  and nothing able to reach it. Allowed for the uploader or an admin.
+- **Quotas are physical and logical.** `MAX_TOTAL_BLOB_BYTES` (1 GiB) bounds the
+  server; `MAX_MEMBER_BLOB_BYTES` (128 MiB) bounds each member, because the
+  server-wide ceiling alone lets the first member to reach it deny the feature to
+  everyone else. Both count *distinct* content, so sharing one file into three
+  channels costs its size once — and freeing it means deleting every reference.
+  Admins are exempt: they are who clears space when it fills. `FetchQuota`
+  reports used/limit for the Drive panel's readout.
+- **Drive UI** — the desktop app's folder tab lists every visible file with its
+  size, uploader, location and date, a per-member quota bar, download, and a
+  two-click delete on the files the server says you may delete.
+
+**Chunked transfer (shipped):** files past `MAX_INLINE_FILE_BYTES` are offered
+with `StartUpload` (declaring their size, so the server refuses on quota,
+ceiling or permission *before* any bytes move), streamed as `UploadChunk`s of
+`PARTY_CHUNK_BYTES` (256 KiB), then committed with `FinishUpload`, which
+verifies the assembled length before storing. Downloads mirror it with
+`DownloadChunk`/`FileChunk` and are reassembled in order and checked against the
+requested hash. `MAX_PARTY_FILE_BYTES` (100 MiB) is the hard ceiling;
+`MAX_CONCURRENT_UPLOADS` bounds what one connection can hold, and a disconnect
+discards its spools. Both front-ends pick inline or chunked by size — nothing in
+the UI changes.
+
+**Remaining:** a full permission matrix (today's rules are role + channel-kind,
+not per-file grants).
 
 Target data model — content-addressable, deduplicated storage:
 
@@ -551,8 +618,12 @@ Each phase gets its own detailed plan before code lands.
 Phase 0  Workspace refactor                         ✅ done
 Phase 1  Party Server MVP (Administered)            ✅ core + SQLite done · UI polish remains
 UI       Tauri + React desktop app (§10)            ✅ shipped (A–F) · TUI redesign (G) remains
-Phase 2  Drive / files                              ◐ slice 1 (inline file sharing) done
-Phase 3  Governance & roles
+Phase 2  Drive / files                              ◐ sharing, chunked transfer,
+                                                      deletion, quotas, provenance +
+                                                      Drive panel done ·
+                                                      permission matrix remains
+Phase 3  Governance & roles                         ◐ roles, channel access, audit
+                                                      log done · policies remain
 Phase 4  E2EE server tier
 Phase 5  Per-server identities
 
@@ -567,8 +638,7 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   channels, server-routed group + DM messaging, offline buffering via history
   catch-up, channel creation, the GUI Party window + TUI commands, server-identity
   TOFU on the wire, and SQLite-backed durable state (`party.db`). **Remaining:**
-  the filesystem blob store for files (Phase 2); TUI Party pane; GUI
-  server-TOFU/error polish (see §7).
+  a dedicated TUI Party pane (see §7).
 - **UI rewrite — Tauri + React. ✅ shipped (A–F).** Landed as the `desktop/`
   crate with P2P, Party, Relay, Contacts, and Settings at parity; egui deleted
   (E) and the release pipeline rebuilt around it (F), so there is one desktop
@@ -576,15 +646,18 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   Shipped in **1.15.0**. The owner chose a minor bump; note that the shipped
   desktop artifact changed name and installer, so existing installations of the
   retired GUI do not upgrade in place and have to be replaced manually.
-- **Phase 2 — Drive / files. ◐ slice 1 done + desktop client wiring.** Inline
-  (≤4 MiB) content-addressed file sharing in channels & DMs with hash dedup +
-  reference counting and on-disk blobs landed (see §8), and the **desktop app can
-  now upload and download** community files. Remaining: chunked transfer for large
-  files, delete UX, logical + physical quotas, the Drive panel, and egui/TUI
-  parity.
-- **Phase 3 — Governance & roles.** Trust-tier labeling, transparency panel,
-  consent-or-leave, audit log, roles/permissions, visibility & contact policies,
-  channel lock/password.
+- **Phase 2 — Drive / files. ◐ all but the permission matrix.** Content-addressed
+  sharing in channels & DMs (inline below 4 MiB, chunked above it up to 100 MiB),
+  working reference counting with deletion and reclamation, `file_refs`
+  provenance, physical + per-member logical quotas, and the Drive panel in both
+  front-ends have all landed (see §8). **Remaining:** a per-file permission
+  matrix.
+- **Phase 3 — Governance & roles. ◐ roles and audit done.** `Role`
+  (Guest/Member/Admin/Owner) is enforced server-side, `ChannelKind` is a real
+  access rule rather than a stored decoration, and an admin-only audit log
+  records role, channel and file actions (see §7). **Remaining:** trust-tier
+  labeling, transparency panel, consent-or-leave, visibility & contact policies,
+  per-channel passwords.
 - **Phase 4 — E2EE server tier.** Per-channel group keys, ciphertext-only storage,
   key rotation on membership change, encrypted offline blobs; admin-read disabled.
 - **Phase 5 — Per-server identities.** Distinct per-server profile/keys bound to

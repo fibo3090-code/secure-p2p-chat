@@ -89,6 +89,8 @@ pub struct TuiApp {
     pub overlay_scroll: u16,
     /// Selected row in the Transfers overlay (index into the id-sorted list).
     pub transfer_sel: usize,
+    /// Selected community in the Party pane.
+    pub party_sel: usize,
     pub contact_ids: Vec<Uuid>,
     pub contacts_list_state: ListState,
     pub settings_list_state: ListState,
@@ -168,6 +170,7 @@ impl TuiApp {
             overlay: TuiOverlay::None,
             overlay_scroll: 0,
             transfer_sel: 0,
+            party_sel: 0,
             contact_ids: Vec::new(),
             contacts_list_state: ListState::default(),
             settings_list_state: ListState::default(),
@@ -190,6 +193,22 @@ impl TuiApp {
         app.sync_chat_ids();
         app.refresh_status_line();
         Ok(app)
+    }
+
+    /// The community the Party commands act on, complaining if there is none.
+    /// Every governance command needs it, and "nothing happened" is a worse
+    /// answer than being told to join one first.
+    fn require_party(&mut self) -> Option<Uuid> {
+        match self.current_party {
+            Some(id) => Some(id),
+            None => {
+                self.toast(
+                    ToastLevel::Error,
+                    "No community joined. Use :party-connect <host> <username>".to_string(),
+                );
+                None
+            }
+        }
     }
 
     /// Drain finished Party file downloads: write the bytes into the download
@@ -742,6 +761,20 @@ impl TuiApp {
                         self.transfer_sel = self.transfer_sel.saturating_sub(1);
                     }
                     KeyCode::Char('c') => self.cancel_selected_transfer(),
+                    _ => {}
+                }
+            }
+            // Communities pane: switch between the servers you have joined.
+            TuiOverlay::Party => {
+                let count = self.party_manager.server_ids().len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
+                    KeyCode::Right | KeyCode::Char('l') if count > 0 => {
+                        self.party_sel = (self.party_sel + 1).min(count - 1);
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        self.party_sel = self.party_sel.saturating_sub(1);
+                    }
                     _ => {}
                 }
             }
@@ -1437,6 +1470,177 @@ impl TuiApp {
                                 s.members.len()
                             ),
                         );
+                    }
+                }
+            }
+            TuiCommand::PartyPane => {
+                // Ask for the file listing as the pane opens, so it is populated
+                // by the time the first redraw lands rather than after a manual
+                // refresh nobody would think to run.
+                if let Some(id) = self.current_party {
+                    let _ = self.party_manager.refresh_files(id);
+                }
+                self.overlay = TuiOverlay::Party;
+            }
+            TuiCommand::PartyFiles => {
+                if let Some(id) = self.require_party() {
+                    match self.party_manager.refresh_files(id) {
+                        Ok(()) => self.toast(
+                            ToastLevel::Info,
+                            "Refreshing shared files — see :party".to_string(),
+                        ),
+                        Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+                    }
+                }
+            }
+            TuiCommand::PartyAudit => {
+                if let Some(id) = self.require_party() {
+                    match self.party_manager.refresh_audit(id, 50) {
+                        Ok(()) => self.toast(
+                            ToastLevel::Info,
+                            "Requested the activity log (admins only)".to_string(),
+                        ),
+                        Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+                    }
+                }
+            }
+            TuiCommand::PartyDeleteFile(query) => {
+                if let Some(id) = self.require_party() {
+                    // Match against the Drive listing, which is the only place
+                    // that knows *where* a file was shared — a hash alone is not
+                    // enough, because one blob can be shared in several places.
+                    let q = query.to_ascii_lowercase();
+                    let found = self.party_manager.server(id).and_then(|s| {
+                        s.files
+                            .iter()
+                            .find(|f| {
+                                f.name.to_ascii_lowercase().contains(&q) || f.hash.starts_with(&q)
+                            })
+                            .map(|f| (f.hash.clone(), f.location, f.name.clone()))
+                    });
+                    match found {
+                        Some((hash, location, name)) => {
+                            match self.party_manager.delete_file(id, hash, location) {
+                                Ok(()) => self.toast(ToastLevel::Info, format!("Deleting {name}…")),
+                                Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+                            }
+                        }
+                        None => self.toast(
+                            ToastLevel::Error,
+                            format!("No shared file matches '{query}'. Run :party-files first."),
+                        ),
+                    }
+                }
+            }
+            TuiCommand::PartyRole { username, role } => {
+                if let Some(id) = self.require_party() {
+                    let parsed = match role.as_str() {
+                        "guest" => Some(messenger_core::party::Role::Guest),
+                        "member" => Some(messenger_core::party::Role::Member),
+                        "admin" => Some(messenger_core::party::Role::Admin),
+                        _ => None,
+                    };
+                    let Some(parsed) = parsed else {
+                        self.toast(
+                            ToastLevel::Error,
+                            format!("Unknown role '{role}' — use guest, member or admin"),
+                        );
+                        return;
+                    };
+                    let target = self.party_manager.server(id).and_then(|s| {
+                        s.members
+                            .iter()
+                            .find(|m| m.username.eq_ignore_ascii_case(&username))
+                            .map(|m| m.id)
+                    });
+                    match target {
+                        Some(member) => match self.party_manager.set_role(id, member, parsed) {
+                            Ok(()) => self.toast(
+                                ToastLevel::Info,
+                                format!("Setting {username} to {}…", parsed.label()),
+                            ),
+                            Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+                        },
+                        None => {
+                            self.toast(ToastLevel::Error, format!("No member called '{username}'"))
+                        }
+                    }
+                }
+            }
+            TuiCommand::PartyChannelAccess {
+                channel,
+                kind,
+                members,
+            } => {
+                if let Some(id) = self.require_party() {
+                    let parsed_kind = match kind.as_str() {
+                        "public" => Some(messenger_core::party::ChannelKind::Public),
+                        "private" => Some(messenger_core::party::ChannelKind::Private),
+                        "locked" => Some(messenger_core::party::ChannelKind::Locked),
+                        "announce" => Some(messenger_core::party::ChannelKind::Announce),
+                        _ => None,
+                    };
+                    let Some(parsed_kind) = parsed_kind else {
+                        self.toast(
+                            ToastLevel::Error,
+                            format!(
+                                "Unknown kind '{kind}' — use public, private, locked or announce"
+                            ),
+                        );
+                        return;
+                    };
+                    let resolved = self.party_manager.server(id).map(|s| {
+                        let chan = s
+                            .channels
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&channel))
+                            .map(|c| c.id);
+                        let ids: Vec<uuid::Uuid> = members
+                            .iter()
+                            .filter_map(|name| {
+                                s.members
+                                    .iter()
+                                    .find(|m| m.username.eq_ignore_ascii_case(name))
+                                    .map(|m| m.id)
+                            })
+                            .collect();
+                        (chan, ids)
+                    });
+                    match resolved {
+                        Some((Some(chan), ids)) => {
+                            match self
+                                .party_manager
+                                .set_channel_access(id, chan, parsed_kind, ids)
+                            {
+                                Ok(()) => self.toast(
+                                    ToastLevel::Info,
+                                    format!("Setting #{channel} to {}…", parsed_kind.label()),
+                                ),
+                                Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+                            }
+                        }
+                        _ => {
+                            self.toast(ToastLevel::Error, format!("No channel called '#{channel}'"))
+                        }
+                    }
+                }
+            }
+            TuiCommand::PartyDeleteChannel(channel) => {
+                if let Some(id) = self.require_party() {
+                    let chan = self.party_manager.server(id).and_then(|s| {
+                        s.channels
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&channel))
+                            .map(|c| c.id)
+                    });
+                    match chan {
+                        Some(chan) => match self.party_manager.delete_channel(id, chan) {
+                            Ok(()) => self.toast(ToastLevel::Info, format!("Deleting #{channel}…")),
+                            Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+                        },
+                        None => {
+                            self.toast(ToastLevel::Error, format!("No channel called '#{channel}'"))
+                        }
                     }
                 }
             }

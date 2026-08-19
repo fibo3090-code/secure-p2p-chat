@@ -82,6 +82,17 @@ const realApi = {
   partyDownloadFile: (server, hash, name) => invoke("party_download_file", { server, hash, name }),
   partySaved: () => invoke("party_saved"),
   partyLeave: (server) => invoke("party_leave", { server }),
+  partyCreateChannelKind: (server, name, kind, members = []) =>
+    invoke("party_create_channel_kind", { server, name, kind, members }),
+  partyDeleteChannel: (server, channel) => invoke("party_delete_channel", { server, channel }),
+  partySetChannelAccess: (server, channel, kind, members = []) =>
+    invoke("party_set_channel_access", { server, channel, kind, members }),
+  partySetRole: (server, member, role) => invoke("party_set_role", { server, member, role }),
+  partyRefreshFiles: (server) => invoke("party_refresh_files", { server }),
+  partyDeleteFile: (server, hash, location) =>
+    invoke("party_delete_file", { server, hash, location }),
+  partyRefreshAudit: (server) => invoke("party_refresh_audit", { server }),
+  partyClearNotice: (server) => invoke("party_clear_notice", { server }),
 };
 
 // ── Dev mock ────────────────────────────────────────────────────────────────
@@ -143,11 +154,28 @@ function makeMock() {
       username: username || "you",
       fingerprint: "5f3a9c2e7b1d4068aa22cc55ee88ff00112233445566778899aabbccddeeff11",
       status: "joined", status_detail: null, member_id: me, last_error: null,
-      channels: [{ id: gen, name: "general", messages: 0 }, { id: rnd, name: "random", messages: 0 }],
+      // The mock signs you in as the owner so the admin surfaces are reachable
+      // in a plain browser; the real server decides this, not the client.
+      my_role: "owner", last_notice: null,
+      channels: [
+        { id: gen, name: "general", messages: 0, kind: "public", members: [], can_post: true },
+        { id: rnd, name: "random", messages: 0, kind: "public", members: [], can_post: true },
+      ],
       members: [
-        { id: me, username: username || "you", online: true, is_me: true, dm_messages: 0 },
-        { id: "mem-nova", username: "nova", online: true, is_me: false, dm_messages: 0 },
-        { id: "mem-kite", username: "kite", online: false, is_me: false, dm_messages: 0 },
+        { id: me, username: username || "you", online: true, is_me: true, dm_messages: 0, role: "owner" },
+        { id: "mem-nova", username: "nova", online: true, is_me: false, dm_messages: 0, role: "member" },
+        { id: "mem-kite", username: "kite", online: false, is_me: false, dm_messages: 0, role: "guest" },
+      ],
+      files: [
+        {
+          hash: "mockhash", name: "roadmap.pdf", size: 284134, mime: "application/pdf",
+          uploader: "mem-nova", uploader_name: "nova", location: gen, location_name: "#general",
+          is_dm: false, shared_at: Date.now() - 3600000, can_delete: true,
+        },
+      ],
+      quota: { used: 284134, limit: 134217728, server_used: 284134, server_limit: 1073741824 },
+      audit: [
+        { at: Date.now() - 7200000, actor_name: username || "you", action: "channel.create", detail: "created public channel #random" },
       ],
     }];
     partyState.msgs[`${sid}|${gen}`] = [
@@ -223,7 +251,7 @@ function makeMock() {
     },
     partyCreateChannel: async (server, name) => {
       const s = partyState.servers.find((x) => x.id === server);
-      if (s) { const id = "ch-" + Math.random().toString(36).slice(2, 7); s.channels.push({ id, name }); partyState.msgs[`${server}|${id}`] = []; }
+      if (s) { const id = "ch-" + Math.random().toString(36).slice(2, 7); s.channels.push({ id, name, messages: 0, kind: "public", members: [], can_post: true }); partyState.msgs[`${server}|${id}`] = []; }
     },
     partySendDm: async (server, to, text) => {
       const key = `${server}|dm-${to}`;
@@ -240,6 +268,36 @@ function makeMock() {
     partyDownloadFile: async () => { console.log("[mock] party download only works in the desktop app"); },
     partySaved: async () => [{ address: "192.168.1.20:12345", username: "you", name: "Mock Community", fingerprint: "abc123" }],
     partyLeave: async (server) => { partyState.servers = partyState.servers.filter((s) => s.id !== server); },
+    partyCreateChannelKind: async (server, name, kind, members = []) => {
+      const s = partyState.servers.find((x) => x.id === server);
+      if (!s) return;
+      const id = "ch-" + Math.random().toString(36).slice(2, 7);
+      s.channels.push({ id, name, messages: 0, kind, members, can_post: true });
+      partyState.msgs[`${server}|${id}`] = [];
+    },
+    partyDeleteChannel: async (server, channel) => {
+      const s = partyState.servers.find((x) => x.id === server);
+      if (s) s.channels = s.channels.filter((c) => c.id !== channel);
+      delete partyState.msgs[`${server}|${channel}`];
+    },
+    partySetChannelAccess: async (server, channel, kind, members = []) => {
+      const c = partyState.servers.find((x) => x.id === server)?.channels.find((c) => c.id === channel);
+      if (c) { c.kind = kind; c.members = members; }
+    },
+    partySetRole: async (server, member, role) => {
+      const m = partyState.servers.find((x) => x.id === server)?.members.find((m) => m.id === member);
+      if (m) m.role = role;
+    },
+    partyRefreshFiles: ok,
+    partyDeleteFile: async (server, hash, location) => {
+      const s = partyState.servers.find((x) => x.id === server);
+      if (s) s.files = s.files.filter((f) => !(f.hash === hash && f.location === location));
+    },
+    partyRefreshAudit: ok,
+    partyClearNotice: async (server) => {
+      const s = partyState.servers.find((x) => x.id === server);
+      if (s) s.last_notice = null;
+    },
   };
 }
 
