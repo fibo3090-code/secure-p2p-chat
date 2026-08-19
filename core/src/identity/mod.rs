@@ -742,6 +742,23 @@ impl Identity {
     /// the message history.** Losing or corrupting it is unrecoverable, which
     /// is why [`Identity::save`] writes atomically and
     /// [`Identity::get_or_create`] refuses to replace an unreadable one.
+    ///
+    /// ## This derivation is frozen
+    ///
+    /// The key is `SHA-256` over the PKCS#8 DER encoding of the private key.
+    /// That means it depends on the *encoding* an external crate produces, not
+    /// just on the key: if a future `rsa` release re-orders an optional field or
+    /// changes how it writes the algorithm parameters, the same private key
+    /// derives a different history key and every stored message silently stops
+    /// decrypting — the same total loss as a replaced identity, arriving as a
+    /// routine dependency bump.
+    ///
+    /// The derivation therefore cannot be changed, and it is pinned by a
+    /// known-answer test (`history_key_derivation_is_frozen`) over a fixed key
+    /// with a fixed expected output. A dependency that changes the encoding
+    /// fails that test in CI instead of failing users' histories in the field.
+    /// If it ever does fail, the fix is a migration that re-encrypts existing
+    /// history under the new key — never a quiet change to this function.
     pub fn history_key(&self) -> Result<[u8; 32]> {
         let privkey = self.private_key()?;
         let der = privkey.to_pkcs8_der()?;
@@ -759,6 +776,94 @@ mod tests {
 
     fn test_password() -> String {
         format!("pw-{}", Uuid::new_v4())
+    }
+
+    /// The RSA key the history-key known-answer test is pinned to, given as raw
+    /// components rather than a PEM blob: this is a published test vector, and
+    /// writing it as one avoids putting something shaped like a real private key
+    /// in the repository. 1024-bit because the test only needs a stable
+    /// encoding, not security.
+    const EXPECTED_HISTORY_KEY: &str =
+        "7ed689da4592916beda567f25fa36d746b2e2cccfa313ba8e08d0c2dbbdaa9f3";
+
+    const KAT_N: &str = "bad7050643ee4c36bfa78df11a6c606b3bdf97f0889cd8e547a4a4c6b1c4d4a6a88b250ca40e836aaa0fdf03c4057af6192ccad1bb07d0b88ec1d0a74a457d0700160c36ff210ad27b2f6646e8eca14b5ec45c949d8cb78ee7bd69a3b36c56d738f0635247facf33cc2841666381a2a442607a3201c1b70ac8fbf6f436720ce7";
+    const KAT_E: &str = "10001";
+    const KAT_D: &str = "6dc05aaa3883256fcf9afc0d11c971c5ebf0c6cebb60ef2397b70637d53adaf35ef4057a6c703e100cffafb0059876875378755747b72a8b0f0898a97c3e5f5717bec35db9609ade4e98238c39ddac14895384c9635850e48d6284e185059a542e6c915aa6cd24bcddf87f7b7269520ab2dc5645a8c79b29eb873da9714e7761";
+    const KAT_P: &str = "f529b9b1287b23fab001ce11821ae25e5c9e996c5362802a777541a2e6c4675c50ca7255352f604e9e7a8cdcc1a7f6cf4685418d867e3768acbff9c697bc1a11";
+    const KAT_Q: &str = "c3194ed799ae0bd2cd9d9aa0711b7adb3b07b5f8a7e3df5b08a9c2e28cc1b025efbb10eede467df86cd2c15a2fa5a0574315350d35be821a7eb2a7954c5bff77";
+
+    fn kat_identity() -> Identity {
+        use rsa::traits::PublicKeyParts;
+        use rsa::BigUint;
+
+        let big = |h: &str| BigUint::parse_bytes(h.as_bytes(), 16).unwrap();
+        let key = RsaPrivateKey::from_components(
+            big(KAT_N),
+            big(KAT_E),
+            big(KAT_D),
+            vec![big(KAT_P), big(KAT_Q)],
+        )
+        .unwrap();
+        assert_eq!(key.size() * 8, 1024, "test vector key must parse intact");
+
+        let public_key_pem = RsaPublicKey::from(&key)
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let fingerprint = Identity::calculate_fingerprint(&public_key_pem);
+        Identity {
+            id: Uuid::nil(),
+            name: "KAT".to_string(),
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            encrypted_private_key: None,
+            salt: None,
+            nonce: None,
+            argon_params: None,
+            public_key_pem,
+            fingerprint,
+            private_key_pem_plaintext: Some(Zeroizing::new(
+                key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string(),
+            )),
+        }
+    }
+
+    /// `history_key` hashes the PKCS#8 DER encoding of the private key, so its
+    /// output is hostage to how the `rsa` crate serialises. If that encoding
+    /// ever shifts, every existing history becomes undecryptable — and it would
+    /// do so silently, on a dependency bump, looking exactly like data loss.
+    ///
+    /// This pins the derivation to a fixed answer. A failure here is not a test
+    /// to update: it means shipping that dependency change would destroy users'
+    /// message history, and it needs a migration.
+    #[test]
+    fn history_key_derivation_is_frozen() {
+        let identity = kat_identity();
+        let key = identity.history_key().unwrap();
+        assert_eq!(
+            hex::encode(key),
+            EXPECTED_HISTORY_KEY,
+            "the history-key derivation changed: existing encrypted histories \
+             would no longer decrypt. This needs a migration, not a new expectation."
+        );
+    }
+
+    /// The same key must derive the same history key every time it is asked —
+    /// the property the encrypted history depends on across restarts.
+    #[test]
+    fn history_key_is_stable_across_calls() {
+        let identity = kat_identity();
+        assert_eq!(
+            identity.history_key().unwrap(),
+            identity.history_key().unwrap()
+        );
+    }
+
+    /// Two identities must not share a history key, or one user's identity file
+    /// would open another's history.
+    #[test]
+    fn history_key_differs_between_identities() {
+        let a = Identity::new_with_plaintext("A".to_string()).unwrap();
+        let b = Identity::new_with_plaintext("B".to_string()).unwrap();
+        assert_ne!(a.history_key().unwrap(), b.history_key().unwrap());
     }
 
     #[test]
