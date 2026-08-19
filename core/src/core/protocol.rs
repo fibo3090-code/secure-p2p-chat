@@ -166,23 +166,37 @@ pub struct IdentityProof {
     pub chat_id: uuid::Uuid,
     /// Signature scheme used (RSA-PSS or Ed25519)
     /// Default: RSA-PSS for v3.0 compatibility
+    ///
+    /// ⚠️ Do **not** add fields to this struct expecting `#[serde(default)]` to
+    /// keep it readable by older peers. bincode is not self-describing: it
+    /// decodes positionally, so a peer built before the new field runs off the
+    /// end of the buffer and the handshake dies with "unexpected end of file".
+    /// Scheme-specific material belongs inside [`Self::signature`], whose
+    /// meaning already depends on `signature_scheme` — see [`Ed25519Proof`].
     #[serde(default = "default_signature_scheme")]
     pub signature_scheme: SignatureScheme,
-    /// Ed25519 signing subkey (32 raw bytes), present when `signature_scheme`
-    /// is `Ed25519`. Absent on proofs from peers that only do RSA-PSS, which is
-    /// why it defaults to `None` rather than being required.
-    #[serde(default)]
-    pub ed25519_public: Option<Vec<u8>>,
-    /// RSA-PSS signature over the Ed25519 subkey, made by the identity in
-    /// `public_key_pem`.
+}
+
+/// What [`IdentityProof::signature`] carries when the negotiated scheme is
+/// Ed25519: the signature itself, the subkey that made it, and that subkey's
+/// binding to the RSA identity in `public_key_pem`.
+///
+/// Packed into the existing `signature` field rather than added as new struct
+/// fields, so `IdentityProof` stays byte-identical on the wire for peers that
+/// only speak RSA-PSS. They never negotiate Ed25519, so they never have to
+/// parse this.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Ed25519Proof {
+    /// Ed25519 signature over the identity-proof digest (64 bytes).
+    pub signature: Vec<u8>,
+    /// The Ed25519 signing subkey (32 bytes).
+    pub public: Vec<u8>,
+    /// RSA-PSS signature by the identity over the subkey.
     ///
-    /// This is what lets a peer accept an Ed25519 proof from a fingerprint they
-    /// already trust: the fingerprint is derived from the RSA key, so the
-    /// binding says "that identity vouches for this signing key". Without it an
-    /// attacker replaying somebody's `public_key_pem` could sign the proof with
-    /// a key of their own choosing.
-    #[serde(default)]
-    pub ed25519_binding: Option<Vec<u8>>,
+    /// Without it the subkey proves only that somebody holds *some* Ed25519
+    /// key, which is not an identity: an attacker replaying a victim's
+    /// `public_key_pem` could sign with a key of their own choosing.
+    pub binding: Vec<u8>,
 }
 
 /// Default signature scheme for backward compatibility
@@ -914,8 +928,6 @@ mod tests {
             version: PROTOCOL_VERSION as u32,
             chat_id: Uuid::new_v4(),
             signature_scheme: SignatureScheme::RsaPss,
-            ed25519_public: None,
-            ed25519_binding: None,
         };
         let bytes = bincode::serialize(&proof).unwrap();
         let decoded: IdentityProof = bincode::deserialize(&bytes).unwrap();

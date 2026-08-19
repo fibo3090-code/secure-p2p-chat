@@ -18,7 +18,7 @@ use crate::core::{
     ed25519_signature_from_bytes, fingerprint_pubkey, generate_ephemeral_keypair,
     negotiate_signature_scheme, parse_x25519_public, pem_decode_public, pem_encode_public,
     recv_packet, send_packet, sign_ed25519, verify_ed25519, verify_ed25519_binding, AesCipher,
-    IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
+    Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -230,11 +230,7 @@ pub async fn run_host_session(
 
     // 9. Create Identity Proof (using negotiated scheme)
     // We sign our own ephemeral key to bind it to our identity (prevent MITM)
-    let IdentitySignature {
-        signature,
-        ed25519_public,
-        ed25519_binding,
-    } = build_identity_signature(selected_scheme, &privkey, host_ephemeral_bytes)?;
+    let signature = build_identity_signature(selected_scheme, &privkey, host_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
@@ -242,8 +238,6 @@ pub async fn run_host_session(
         version: PROTOCOL_VERSION as u32,
         chat_id,
         signature_scheme: selected_scheme,
-        ed25519_public,
-        ed25519_binding,
     };
 
     // Serialize & Encrypt Proof
@@ -555,11 +549,7 @@ pub async fn run_client_session_multi(
     tracing::debug!("Verified host identity: {}...", &host_fingerprint[..8]);
 
     // 10. Create Identity Proof (using negotiated scheme)
-    let IdentitySignature {
-        signature,
-        ed25519_public,
-        ed25519_binding,
-    } = build_identity_signature(selected_scheme, &privkey, client_ephemeral_bytes)?;
+    let signature = build_identity_signature(selected_scheme, &privkey, client_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
@@ -567,8 +557,6 @@ pub async fn run_client_session_multi(
         version: PROTOCOL_VERSION as u32,
         chat_id,
         signature_scheme: selected_scheme,
-        ed25519_public,
-        ed25519_binding,
     };
 
     // Serialize & Encrypt Proof
@@ -659,21 +647,15 @@ pub struct EstablishedTunnel {
 
 /// Sign our ephemeral key for the identity proof under the negotiated scheme.
 ///
-/// Returns the signature plus the Ed25519 material that has to travel with it
-/// (the subkey and its binding to this RSA identity), which is `None` for
-/// RSA-PSS. Shared by every handshake variant so all four sign identically.
-struct IdentitySignature {
-    signature: Vec<u8>,
-    /// Present only for Ed25519 proofs.
-    ed25519_public: Option<Vec<u8>>,
-    ed25519_binding: Option<Vec<u8>>,
-}
-
+/// Returns the bytes for [`IdentityProof::signature`]. For RSA-PSS that is the
+/// signature; for Ed25519 it is a serialized [`Ed25519Proof`] carrying the
+/// signature, the subkey, and the subkey's binding to this RSA identity.
+/// Shared by every handshake variant so all four sign identically.
 fn build_identity_signature(
     scheme: SignatureScheme,
     privkey: &RsaPrivateKey,
     ephemeral_bytes: &[u8],
-) -> Result<IdentitySignature> {
+) -> Result<Vec<u8>> {
     let mut hasher = Sha256::new();
     hasher.update(b"IDENTITY_PROOF");
     hasher.update(ephemeral_bytes);
@@ -682,20 +664,18 @@ fn build_identity_signature(
         SignatureScheme::RsaPss => {
             let signing_key = SigningKey::<Sha256>::new(privkey.clone());
             let mut rng = OsRng;
-            Ok(IdentitySignature {
-                signature: signing_key.sign_with_rng(&mut rng, &digest).to_vec(),
-                ed25519_public: None,
-                ed25519_binding: None,
-            })
+            Ok(signing_key.sign_with_rng(&mut rng, &digest).to_vec())
         }
         SignatureScheme::Ed25519 => {
             let signing_key = derive_ed25519_subkey(privkey)?;
             let verifying = signing_key.verifying_key();
-            Ok(IdentitySignature {
+            // Packed into the signature field so `IdentityProof` keeps the
+            // exact shape older peers expect.
+            Ok(bincode::serialize(&Ed25519Proof {
                 signature: sign_ed25519(&signing_key, &digest).to_bytes().to_vec(),
-                ed25519_public: Some(verifying.to_bytes().to_vec()),
-                ed25519_binding: Some(cross_sign_ed25519(privkey, &verifying)?),
-            })
+                public: verifying.to_bytes().to_vec(),
+                binding: cross_sign_ed25519(privkey, &verifying)?,
+            })?)
         }
     }
 }
@@ -725,17 +705,13 @@ fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> 
                 .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
         }
         SignatureScheme::Ed25519 => {
-            let (Some(ed_public), Some(binding)) = (&proof.ed25519_public, &proof.ed25519_binding)
-            else {
-                return Err(anyhow!(
-                    "Ed25519 proof arrived without its subkey or its binding to the identity"
-                ));
-            };
-            let ed_public = ed25519_public_from_bytes(ed_public)?;
+            let blob: Ed25519Proof = bincode::deserialize(&proof.signature)
+                .map_err(|e| anyhow!("Ed25519 proof is malformed or missing its subkey: {}", e))?;
+            let ed_public = ed25519_public_from_bytes(&blob.public)?;
             // Bind first: an unbound subkey proves only that somebody holds
             // *some* Ed25519 key, which is not an identity.
-            verify_ed25519_binding(&peer_pubkey, &ed_public, binding)?;
-            let signature = ed25519_signature_from_bytes(&proof.signature)?;
+            verify_ed25519_binding(&peer_pubkey, &ed_public, &blob.binding)?;
+            let signature = ed25519_signature_from_bytes(&blob.signature)?;
             verify_ed25519(&ed_public, &digest, &signature)
                 .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
         }
@@ -823,11 +799,7 @@ where
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
     let transport_aad = labeled_aad(b"transport", transcript_hash);
 
-    let IdentitySignature {
-        signature,
-        ed25519_public,
-        ed25519_binding,
-    } = build_identity_signature(selected_scheme, privkey, host_ephemeral_bytes)?;
+    let signature = build_identity_signature(selected_scheme, privkey, host_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
@@ -835,8 +807,6 @@ where
         version: PROTOCOL_VERSION as u32,
         chat_id,
         signature_scheme: selected_scheme,
-        ed25519_public,
-        ed25519_binding,
     };
 
     let my_proof_bytes = bincode::serialize(&my_proof)?;
@@ -971,11 +941,7 @@ where
 
     let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
 
-    let IdentitySignature {
-        signature,
-        ed25519_public,
-        ed25519_binding,
-    } = build_identity_signature(selected_scheme, privkey, client_ephemeral_bytes)?;
+    let signature = build_identity_signature(selected_scheme, privkey, client_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
@@ -983,8 +949,6 @@ where
         version: PROTOCOL_VERSION as u32,
         chat_id,
         signature_scheme: selected_scheme,
-        ed25519_public,
-        ed25519_binding,
     };
     let my_proof_bytes = bincode::serialize(&my_proof)?;
     let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
@@ -1960,8 +1924,6 @@ mod tests {
                 version: PROTOCOL_VERSION as u32,
                 chat_id: uuid::Uuid::new_v4(),
                 signature_scheme: SignatureScheme::RsaPss,
-                ed25519_public: None,
-                ed25519_binding: None,
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
             let identity_proof_aad = labeled_aad(b"identity-proof", salt.as_slice());
@@ -2033,8 +1995,6 @@ mod tests {
                 version: PROTOCOL_VERSION as u32,
                 chat_id: uuid::Uuid::new_v4(),
                 signature_scheme: SignatureScheme::RsaPss,
-                ed25519_public: None,
-                ed25519_binding: None,
             };
             let my_proof_bytes = bincode::serialize(&my_proof)?;
             let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
@@ -2095,58 +2055,100 @@ mod tests {
     /// `public_key_pem` — and therefore a trusted fingerprint — with a signing
     /// key of their own.
     #[test]
-    fn an_ed25519_proof_without_its_binding_is_rejected() {
+    fn an_ed25519_proof_without_a_valid_binding_is_rejected() {
         let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let ephemeral = [7u8; 32];
-        let IdentitySignature {
-            signature,
-            ed25519_public,
-            ed25519_binding,
-        } = build_identity_signature(SignatureScheme::Ed25519, &identity, &ephemeral).unwrap();
+        let signature =
+            build_identity_signature(SignatureScheme::Ed25519, &identity, &ephemeral).unwrap();
         let pem = pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap();
-
-        let good = IdentityProof {
+        let proof = |sig: Vec<u8>| IdentityProof {
             public_key_pem: pem.clone(),
-            signature: signature.clone(),
+            signature: sig,
             version: PROTOCOL_VERSION as u32,
             chat_id: uuid::Uuid::new_v4(),
             signature_scheme: SignatureScheme::Ed25519,
-            ed25519_public: ed25519_public.clone(),
-            ed25519_binding: ed25519_binding.clone(),
         };
+
+        let good = proof(signature.clone());
         assert!(verify_identity_proof(&good, &ephemeral).is_ok());
 
-        // Stripped binding.
-        let mut stripped = good.clone();
-        stripped.ed25519_binding = None;
-        assert!(verify_identity_proof(&stripped, &ephemeral).is_err());
+        let blob: Ed25519Proof = bincode::deserialize(&signature).unwrap();
 
-        // Stripped subkey.
-        let mut no_key = good.clone();
-        no_key.ed25519_public = None;
-        assert!(verify_identity_proof(&no_key, &ephemeral).is_err());
+        // Binding removed.
+        let mut stripped = blob.clone();
+        stripped.binding = Vec::new();
+        assert!(
+            verify_identity_proof(&proof(bincode::serialize(&stripped).unwrap()), &ephemeral)
+                .is_err()
+        );
 
         // A subkey swapped for the attacker's, keeping the victim's identity
         // and their binding — the attack the binding exists to stop.
         let attacker = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let attacker_key = derive_ed25519_subkey(&attacker).unwrap();
-        let mut swapped = good.clone();
-        swapped.ed25519_public = Some(attacker_key.verifying_key().to_bytes().to_vec());
-        swapped.signature = sign_ed25519(&attacker_key, &{
-            let mut h = Sha256::new();
-            h.update(b"IDENTITY_PROOF");
-            h.update(ephemeral);
-            h.finalize()
-        })
-        .to_bytes()
-        .to_vec();
+        let mut digest = Sha256::new();
+        digest.update(b"IDENTITY_PROOF");
+        digest.update(ephemeral);
+        let mut swapped = blob.clone();
+        swapped.public = attacker_key.verifying_key().to_bytes().to_vec();
+        swapped.signature = sign_ed25519(&attacker_key, &digest.finalize())
+            .to_bytes()
+            .to_vec();
         assert!(
-            verify_identity_proof(&swapped, &ephemeral).is_err(),
+            verify_identity_proof(&proof(bincode::serialize(&swapped).unwrap()), &ephemeral)
+                .is_err(),
             "a subkey the identity never vouched for must be refused"
+        );
+
+        // A binding made by somebody else's identity.
+        let mut foreign = blob.clone();
+        foreign.binding = cross_sign_ed25519(&attacker, &attacker_key.verifying_key()).unwrap();
+        assert!(
+            verify_identity_proof(&proof(bincode::serialize(&foreign).unwrap()), &ephemeral)
+                .is_err()
         );
 
         // Signing a different ephemeral key is still caught.
         assert!(verify_identity_proof(&good, &[8u8; 32]).is_err());
+    }
+
+    /// The wire shape of `IdentityProof` must not have changed, or peers built
+    /// before Ed25519 cannot decode it.
+    ///
+    /// bincode is not self-describing: it decodes positionally, so a field
+    /// appended to this struct makes an older peer read past the end of the
+    /// buffer and fail the handshake with "unexpected end of file" —
+    /// `#[serde(default)]` does nothing about it. This caught exactly that
+    /// against a released 1.16.0 server, which is why the Ed25519 material
+    /// travels inside `signature` instead.
+    #[test]
+    fn the_identity_proof_wire_shape_is_unchanged_for_older_peers() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct AsOlderPeersSeeIt {
+            public_key_pem: String,
+            signature: Vec<u8>,
+            version: u32,
+            chat_id: uuid::Uuid,
+            signature_scheme: SignatureScheme,
+        }
+
+        for scheme in [SignatureScheme::RsaPss, SignatureScheme::Ed25519] {
+            let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+            let signature = build_identity_signature(scheme, &identity, &[3u8; 32]).unwrap();
+            let bytes = bincode::serialize(&IdentityProof {
+                public_key_pem: pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap(),
+                signature,
+                version: PROTOCOL_VERSION as u32,
+                chat_id: uuid::Uuid::new_v4(),
+                signature_scheme: scheme,
+            })
+            .unwrap();
+            assert!(
+                bincode::deserialize::<AsOlderPeersSeeIt>(&bytes).is_ok(),
+                "{scheme} proof no longer decodes against the released field layout"
+            );
+        }
     }
 
     #[test]
@@ -2157,8 +2159,6 @@ mod tests {
             version: PROTOCOL_VERSION as u32,
             chat_id: uuid::Uuid::new_v4(),
             signature_scheme: SignatureScheme::RsaPss,
-            ed25519_public: None,
-            ed25519_binding: None,
         };
         let proof_bytes = bincode::serialize(&proof).unwrap();
         let cipher = test_cipher();
