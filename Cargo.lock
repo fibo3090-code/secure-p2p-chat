@@ -3348,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-core"
-version = "1.15.0"
+version = "1.16.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3382,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-server"
-version = "1.15.0"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "p2pem-classic"
-version = "1.15.0"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4049,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "p2pem-desktop"
-version = "1.15.0"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",

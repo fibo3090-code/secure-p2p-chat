@@ -11,6 +11,10 @@ predate tagged releases.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.16.0] - 2026-08-19
+
 > **Breaking for Communities.** `MemberInfo` gained a role and `ChannelInfo` a
 > member list, so community clients and servers must ship together. Anyone
 > self-hosting a community server has to restart it on the matching version.
@@ -40,8 +44,33 @@ predate tagged releases.
   one file into several channels counts once.
 - **An activity log** for admins, recording role changes, channel changes and
   file deletions.
+- **Large files in communities.** Sharing was capped at 4 MiB — the most that
+  fits in one message — and anything bigger was simply refused. Files up to
+  100 MiB now stream in chunks. The server is told the size first and can refuse
+  on space, allowance or permission before a byte moves, so a file that will be
+  rejected costs a moment instead of the whole upload. Nothing changes in the
+  UI: picking a big file just works now.
+- **A Communities pane in the terminal client** (`:party`), showing each
+  community's channels and their access rule, its members with roles and
+  presence, the files you can see, and your storage use. With commands to match:
+  `:party-files`, `:party-role`, `:party-channel-access`,
+  `:party-delete-channel`, `:party-delete-file` and `:party-audit`.
 
 ### Fixed
+
+- **A private channel's messages were sent to everyone.** Members who were
+  correctly denied the channel — it did not appear in their channel list, and
+  its history was refused — still received every message posted to it as it
+  arrived. Restricted channels are now delivered only to the people allowed to
+  read them.
+- **A community that predates roles could not be administered.** Upgrading left
+  every existing member an ordinary member, and since only an admin can promote
+  anyone, the operator was locked out of their own server's governance
+  permanently. Such a server now appoints an owner on first load and records it
+  in the activity log.
+- **Sharing the same file twice in one place leaked storage.** Only one of the
+  two shares survived a restart, while the file still counted both, so deleting
+  the visible one could never free the space.
 
 - **The member list is live again.** Nothing announced a join or a disconnect,
   so your view of who was in a community was frozen at the moment *you* joined:
@@ -59,6 +88,17 @@ predate tagged releases.
   whether the Communities view had changed by counting members and channels, so
   anything that changed a member without changing the count — going offline,
   being promoted — never triggered a refresh.
+- **Saving a file from the Drive panel** proposed `undefined` as its name.
+- **Returning from the Drive or activity log** left the conversation scrolled up
+  instead of at the newest message.
+- The role picker offered choices the server refuses (an admin could select
+  `admin` for another admin); it now offers only what will be accepted.
+
+### Security
+
+- **`h2` updated for RUSTSEC-2026-0258** — before 0.4.16 it queues empty DATA
+  frames without limit, which can exhaust memory or panic. It reaches the app
+  through UPnP NAT traversal and through Tauri's HTTP stack.
 
 ### Documentation
 
@@ -1038,7 +1078,8 @@ predate tagged releases.
 - Basic chat functionality, end-to-end encryption (RSA + AES-GCM), file
   transfer, a simple GUI, and message history persistence.
 
-[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.15.0...HEAD
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.0...HEAD
+[1.16.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.12.1...v1.13.0
