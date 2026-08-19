@@ -103,6 +103,38 @@ fn dm_delivery(from: Uuid, to: Uuid, env: Envelope) -> Vec<(Uuid, PartyResponse)
     ]
 }
 
+/// How a stored channel message reaches everyone else.
+///
+/// A channel every joined member may read can simply be broadcast. A `Private`
+/// one cannot: `broadcast_except` pushes to every registered connection, so a
+/// member who is not in the channel — and who is correctly not shown it in
+/// `ListChannels` — would still receive every live message posted to it. Those
+/// are delivered by member instead, to exactly the people allowed to read them.
+/// The runtime excludes the originating connection either way, so the poster is
+/// not sent a copy of what it already appended.
+fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
+    let ack = PartyResponse::MessagePosted {
+        channel: env.channel,
+        seq: env.seq,
+    };
+    if state.channel_is_open_to_all(env.channel) {
+        return Dispatch {
+            replies: vec![ack],
+            broadcast: vec![PartyResponse::Message(env)],
+            directed: Vec::new(),
+        };
+    }
+    let readers = state.members_who_can_read(env.channel);
+    Dispatch {
+        replies: vec![ack],
+        broadcast: Vec::new(),
+        directed: readers
+            .into_iter()
+            .map(|m| (m, PartyResponse::Message(env.clone())))
+            .collect(),
+    }
+}
+
 /// The thread a failed upload belongs to, so `ActionFailed` can be correlated
 /// with the message the client is already showing.
 fn upload_thread(member: Uuid, target: UploadTarget) -> Uuid {
@@ -195,15 +227,9 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 }
                 PartyRequest::PostMessage { channel, text } => {
                     match state.post_message(member, channel, text) {
-                        // Ack the poster, and broadcast the stored message to others.
-                        Ok(env) => Dispatch {
-                            replies: vec![PartyResponse::MessagePosted {
-                                channel: env.channel,
-                                seq: env.seq,
-                            }],
-                            broadcast: vec![PartyResponse::Message(env)],
-                            directed: Vec::new(),
-                        },
+                        // Ack the poster; deliver to everyone else who may read
+                        // the channel (see `channel_fanout`).
+                        Ok(env) => channel_fanout(state, env),
                         // `ActionFailed`, not `Error`: the client already put
                         // this message on screen and must be able to tell that
                         // *this* send was refused so it can take it back.
@@ -247,15 +273,8 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     mime,
                     data,
                 } => match state.post_file(member, channel, name, mime, data) {
-                    // Like PostMessage: ack the poster, broadcast the file message.
-                    Ok(env) => Dispatch {
-                        replies: vec![PartyResponse::MessagePosted {
-                            channel: env.channel,
-                            seq: env.seq,
-                        }],
-                        broadcast: vec![PartyResponse::Message(env)],
-                        directed: Vec::new(),
-                    },
+                    // Like PostMessage, including the private-channel rule.
+                    Ok(env) => channel_fanout(state, env),
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e }),
                 },
                 PartyRequest::SendFileDm {
@@ -325,13 +344,21 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     role,
                 } => match state.set_role(member, target, role) {
                     Ok(msg) => Dispatch {
-                        // A role change alters what the member may do, so their
-                        // directory entry — and everyone's view of it — refreshes.
+                        // A role change alters what the member may *do* and what
+                        // they may *see*: `channels_for` filters by role, so a
+                        // demoted admin would keep listing private channels
+                        // until something else happened to refresh them. The
+                        // server still refuses the reads, so that is stale UI
+                        // rather than a leak — but it is still wrong on screen.
                         replies: vec![
                             PartyResponse::Members(state.members()),
+                            PartyResponse::Channels(state.channels_for(member)),
                             PartyResponse::Ok(msg),
                         ],
-                        broadcast: vec![PartyResponse::Members(state.members())],
+                        broadcast: vec![
+                            PartyResponse::Members(state.members()),
+                            PartyResponse::DirectoryChanged,
+                        ],
                         directed: Vec::new(),
                     },
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
@@ -391,14 +418,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 PartyRequest::FinishUpload { upload } => {
                     conn.uploads.retain(|u| *u != upload);
                     match state.finish_upload(member, upload) {
-                        Ok((env, UploadTarget::Channel(_))) => Dispatch {
-                            replies: vec![PartyResponse::MessagePosted {
-                                channel: env.channel,
-                                seq: env.seq,
-                            }],
-                            broadcast: vec![PartyResponse::Message(env)],
-                            directed: Vec::new(),
-                        },
+                        Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
                         Ok((env, UploadTarget::Dm(to))) => Dispatch {
                             replies: vec![PartyResponse::MessagePosted {
                                 channel: env.channel,
@@ -438,6 +458,14 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
 mod tests {
     use super::*;
     use messenger_core::party::MessagePayload;
+
+    /// Join and return the assigned member id.
+    fn joined_id(state: &mut PartyState, conn: &mut ConnState, name: &str) -> Uuid {
+        match &join(state, conn, name, None)[..] {
+            [PartyResponse::Joined { member_id, .. }] => *member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        }
+    }
 
     fn join(
         state: &mut PartyState,
@@ -574,6 +602,69 @@ mod tests {
             .directed
             .iter()
             .all(|(_, r)| matches!(r, PartyResponse::Message(_))));
+    }
+
+    /// A private channel's messages must not be broadcast.
+    ///
+    /// `broadcast_except` pushes to every registered connection, so fanning a
+    /// private channel out that way handed its live traffic to members who are
+    /// correctly not shown the channel at all — they would not see it in
+    /// `ListChannels` and could not fetch its history, but every message posted
+    /// to it arrived on their socket anyway.
+    #[test]
+    fn a_private_channel_is_delivered_only_to_its_members() {
+        let mut state = PartyState::new("Srv", None);
+        let mut owner_conn = ConnState::default();
+        let owner = joined_id(&mut state, &mut owner_conn, "owner");
+        let mut bob_conn = ConnState::default();
+        let bob = joined_id(&mut state, &mut bob_conn, "bob");
+        let mut carol_conn = ConnState::default();
+        let carol = joined_id(&mut state, &mut carol_conn, "carol");
+
+        let private = state
+            .create_channel_of_kind(owner, "secret", ChannelKind::Private, vec![bob])
+            .unwrap()
+            .id;
+
+        let out = handle_request(
+            &mut state,
+            &mut owner_conn,
+            PartyRequest::PostMessage {
+                channel: private,
+                text: "members only".to_string(),
+            },
+        );
+
+        assert!(
+            out.broadcast.is_empty(),
+            "a private channel must not be broadcast to every connection"
+        );
+        let targets: Vec<Uuid> = out.directed.iter().map(|(m, _)| *m).collect();
+        assert!(targets.contains(&owner), "the poster's other devices");
+        assert!(targets.contains(&bob), "a channel member");
+        assert!(
+            !targets.contains(&carol),
+            "carol is not in the channel and must not receive its messages"
+        );
+    }
+
+    /// A public channel still takes the cheap path.
+    #[test]
+    fn a_public_channel_is_still_broadcast() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        let _owner = joined_id(&mut state, &mut conn, "owner");
+        let channel = state.default_channel();
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::PostMessage {
+                channel,
+                text: "hello all".to_string(),
+            },
+        );
+        assert!(matches!(&out.broadcast[..], [PartyResponse::Message(_)]));
+        assert!(out.directed.is_empty());
     }
 
     /// A DM addressed to yourself must not be delivered twice.

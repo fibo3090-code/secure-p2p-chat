@@ -13,8 +13,8 @@ export const ROLES = ["guest", "member", "admin"];
 export const KINDS = [
   { id: "public", label: "Public", hint: "Everyone who joined can read and post." },
   { id: "private", label: "Private", hint: "Only the members you pick can see it at all." },
-  { id: "locked", label: "Locked", hint: "Everyone can read; only admins can post." },
-  { id: "announce", label: "Announce", hint: "Everyone can read; only admins can post." },
+  { id: "locked", label: "Locked", hint: "Frozen: everyone can read the history, nobody but an admin can add to it." },
+  { id: "announce", label: "Announce", hint: "An announcement feed: everyone can read, only admins can post." },
 ];
 
 const KIND_ICON = { public: "hash", private: "lock", locked: "lock", announce: "megaphone" };

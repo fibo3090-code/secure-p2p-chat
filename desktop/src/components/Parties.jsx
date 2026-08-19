@@ -11,6 +11,20 @@ import {
   DrivePanel, AuditPanel, ChannelAccessDialog, ROLES, kindIcon,
 } from "./PartyAdmin.jsx";
 
+// Roles this viewer may actually assign to `member`, mirroring the server's rule
+// (`Role::may_assign` plus the "not at or above your own" check). Rendering the
+// full list meant an admin was offered `admin` for a peer admin — pre-selected,
+// even — and every attempt came back refused.
+function assignableRoles(myRole, member) {
+  if (member.is_me || member.role === "owner") return [];
+  const rank = { guest: 0, member: 1, admin: 2, owner: 3 };
+  const mine = rank[myRole] ?? 0;
+  if (mine < rank.admin) return [];
+  // You cannot touch somebody at or above your own level.
+  if ((rank[member.role] ?? 0) >= mine) return [];
+  return ROLES.filter((r) => rank[r] < mine);
+}
+
 const STATUS_LABEL = {
   connecting: "Connecting…",
   joined: "Joined",
@@ -272,7 +286,9 @@ export function Parties() {
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [msgs.length, cid, dm]);
+    // `view` matters: the chat pane unmounts for the Drive and log, so coming
+    // back mounts a fresh node at scrollTop 0 and the thread looks scrolled up.
+  }, [msgs.length, cid, dm, view]);
 
   if (!servers.length || adding) {
     return (
@@ -329,10 +345,13 @@ export function Parties() {
   // Tracked per content hash so the card shows it is working: the request can
   // take as long as the server takes to answer, and a click with no feedback
   // is indistinguishable from a broken button.
+  // Accepts both shapes: a message card names the file in `text`, a Drive row
+  // in `name`. Reading only one of them saved the file as `undefined`.
   async function downloadFile(m) {
     if (!server || !m.hash || downloading[m.hash]) return;
+    const filename = m.text || m.name || "file";
     setDownloading((d) => ({ ...d, [m.hash]: true }));
-    try { await api.partyDownloadFile(server.id, m.hash, m.text); }
+    try { await api.partyDownloadFile(server.id, m.hash, filename); }
     catch (e) { toast(String(e), "error"); }
     finally {
       setDownloading((d) => {
@@ -527,12 +546,16 @@ export function Parties() {
                   <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
                 )}
               </button>
-              {/* The owner's role is fixed, and you cannot change your own. */}
-              {isAdmin && !m.is_me && m.role !== "owner" && (
+              {/* Offered only where the server would actually agree: you cannot
+                  change your own role, the owner's, or that of a peer at your
+                  own level, and you can only grant roles below your own. */}
+              {assignableRoles(server?.my_role, m).length > 0 && (
                 <select className="party-rolesel" value={m.role}
                   title={`Role for ${m.username}`}
                   onChange={(e) => setRole(m, e.target.value)}>
-                  {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                  {assignableRoles(server?.my_role, m).map((r) => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
                 </select>
               )}
             </div>

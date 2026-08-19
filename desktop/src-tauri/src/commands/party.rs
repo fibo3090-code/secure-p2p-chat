@@ -160,11 +160,14 @@ fn server_dto(
     conn: &p2pem_classic::app::party_manager::PartyServerConn,
 ) -> PartyServerDto {
     let (status, status_detail) = party_status_parts(&conn.status);
+    // Fail closed. `Role::default()` is `Member`, and `Joined`/`Channels` arrive
+    // before `Members`, so defaulting would briefly hand a guest a member's
+    // permissions — offering them a composer the server then refuses.
     let my_role = conn
         .member_id
         .and_then(|me| conn.members.iter().find(|m| m.id == me))
         .map(|m| m.role)
-        .unwrap_or_default();
+        .unwrap_or(Role::Guest);
     let members = conn
         .members
         .iter()

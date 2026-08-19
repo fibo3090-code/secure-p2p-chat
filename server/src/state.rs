@@ -157,6 +157,14 @@ struct Channel {
 /// message stays where it is; the reference and the bytes are what go away.
 #[derive(Clone)]
 struct FileRef {
+    /// Identity of this *share*, not of the content.
+    ///
+    /// Keying persistence on `(hash, location)` collapsed repeated shares of the
+    /// same bytes into one row while the blob's refcount counted them all, so a
+    /// restart reloaded fewer references than the count claimed and the last
+    /// visible one could never release the blob — storage leaked with nothing
+    /// left that could delete it.
+    id: Uuid,
     hash: String,
     name: String,
     uploader: Uuid,
@@ -348,6 +356,10 @@ impl PartyState {
         if state.count_channels()? > 0 {
             // The database is authoritative; rebuild the in-memory model from it.
             state.reload_from_db()?;
+            // A community that predates roles reloads with nobody able to
+            // administer it; give it an owner rather than leaving governance
+            // permanently unreachable.
+            state.ensure_owner();
         } else {
             // Fresh database: persist the seeded default `general` channel.
             let general = &state.channels[0];
@@ -441,6 +453,43 @@ impl PartyState {
         self.persist_member(&member);
         self.members.insert(id, member);
         Ok(id)
+    }
+
+    /// Make sure a populated server has somebody who can administer it.
+    ///
+    /// `join` only appoints an owner when the member table is empty, which is
+    /// right for a fresh server and wrong for every existing one: a community
+    /// that predates roles reloads with every member defaulted to `Member`, and
+    /// since `set_role` requires an admin, nobody could ever be promoted. The
+    /// operator would be locked out of governance on their own server,
+    /// permanently, with no way back short of editing the database by hand.
+    ///
+    /// The choice has to be deterministic across restarts, and registration
+    /// order is not recorded, so the lowest member id wins. It is recorded in
+    /// the audit log, because silently handing someone ownership is exactly the
+    /// sort of thing an operator should be able to see happened.
+    fn ensure_owner(&mut self) {
+        if self.members.is_empty() || self.members.values().any(|m| m.role.is_admin()) {
+            return;
+        }
+        let Some(&chosen) = self.members.keys().min() else {
+            return;
+        };
+        let name = {
+            let m = self.members.get_mut(&chosen).expect("just selected");
+            m.role = Role::Owner;
+            m.username.clone()
+        };
+        if let Some(m) = self.members.get(&chosen) {
+            self.persist_member(m);
+        }
+        tracing::info!(
+            member = %chosen,
+            username = %name,
+            "this community had no admin (it predates roles); promoting its first member to owner"
+        );
+        let detail = format!("{name} became Owner (no administrator existed)");
+        self.record_audit(chosen, "role.bootstrap", &detail);
     }
 
     /// A member's role, or [`Role::Guest`] for an unknown id (fail closed).
@@ -582,6 +631,29 @@ impl PartyState {
                 kind: c.kind,
                 members: c.members.clone(),
             })
+            .collect()
+    }
+
+    /// Whether every joined member may read `channel` — true for the kinds whose
+    /// access is server-wide, false for `Private`, which has its own list.
+    ///
+    /// This decides how a post to it may be fanned out: a channel everyone can
+    /// read may be broadcast, and one that is not must be delivered only to the
+    /// members who may see it.
+    pub fn channel_is_open_to_all(&self, channel: Uuid) -> bool {
+        !matches!(
+            self.channel(channel).map(|c| c.kind),
+            Some(ChannelKind::Private) | None
+        )
+    }
+
+    /// The members allowed to read `channel`. Used to fan a restricted channel's
+    /// messages out by member instead of broadcasting them to every connection.
+    pub fn members_who_can_read(&self, channel: Uuid) -> Vec<Uuid> {
+        self.members
+            .keys()
+            .copied()
+            .filter(|m| self.member_can_read_channel(*m, channel))
             .collect()
     }
 
@@ -1044,6 +1116,7 @@ impl PartyState {
     /// Record that `uploader` shared `meta` into `location`.
     fn record_file_ref(&mut self, uploader: Uuid, meta: &FileMeta, location: Uuid, is_dm: bool) {
         let entry = FileRef {
+            id: Uuid::new_v4(),
             hash: meta.hash.clone(),
             name: meta.name.clone(),
             uploader,
@@ -1123,7 +1196,7 @@ impl PartyState {
             return Err("that file is not shared here".to_string());
         }
         self.file_refs.remove(index);
-        self.delete_file_ref_row(hash, location);
+        self.delete_file_ref_row(entry.id);
         self.release_blob(hash);
         let detail = format!("deleted file {}", entry.name);
         self.record_audit(actor, "file.delete", &detail);
@@ -1559,9 +1632,10 @@ impl PartyState {
     fn persist_file_ref(&self, r: &FileRef) {
         let Some(conn) = &self.db else { return };
         if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO file_refs (hash, name, uploader, location, is_dm, shared_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO file_refs (id, hash, name, uploader, location, is_dm, shared_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                r.id.to_string(),
                 r.hash,
                 r.name,
                 r.uploader.to_string(),
@@ -1574,11 +1648,13 @@ impl PartyState {
         }
     }
 
-    fn delete_file_ref_row(&self, hash: &str, location: Uuid) {
+    /// Delete exactly one share. Deleting by `(hash, location)` would drop every
+    /// share of that content in that place while only one refcount was released.
+    fn delete_file_ref_row(&self, id: Uuid) {
         let Some(conn) = &self.db else { return };
         if let Err(e) = conn.execute(
-            "DELETE FROM file_refs WHERE hash = ?1 AND location = ?2",
-            params![hash, location.to_string()],
+            "DELETE FROM file_refs WHERE id = ?1",
+            params![id.to_string()],
         ) {
             tracing::error!(error = %e, "failed to delete file reference");
         }
@@ -1794,7 +1870,7 @@ impl PartyState {
         let mut file_refs = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT hash, name, uploader, location, is_dm, shared_at
+                "SELECT id, hash, name, uploader, location, is_dm, shared_at
                  FROM file_refs ORDER BY shared_at ASC",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -1803,18 +1879,20 @@ impl PartyState {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             })?;
             for row in rows {
-                let (hash, name, uploader, location, is_dm, shared_at) = row?;
+                let (id, hash, name, uploader, location, is_dm, shared_at) = row?;
                 // A reference to a blob that is gone grants access to nothing and
                 // would only inflate the owner's quota, so drop it.
                 if !blobs.contains_key(&hash) {
                     continue;
                 }
                 file_refs.push(FileRef {
+                    id: Uuid::parse_str(&id)?,
                     hash,
                     name,
                     uploader: Uuid::parse_str(&uploader)?,
@@ -1898,13 +1976,13 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              refcount INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS file_refs (
+             id        TEXT PRIMARY KEY,
              hash      TEXT NOT NULL,
              name      TEXT NOT NULL,
              uploader  TEXT NOT NULL,
              location  TEXT NOT NULL,
              is_dm     INTEGER NOT NULL,
-             shared_at INTEGER NOT NULL,
-             PRIMARY KEY (hash, location)
+             shared_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS audit (
              id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1920,6 +1998,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     for sql in [
         "ALTER TABLE members ADD COLUMN role TEXT NOT NULL DEFAULT '\"Member\"'",
         "ALTER TABLE channels ADD COLUMN members TEXT NOT NULL DEFAULT '[]'",
+        // `file_refs` was first keyed by (hash, location), which collapsed
+        // repeated shares of the same content. Give existing rows a per-share
+        // id; `randomblob` is evaluated per row, so each gets a distinct one,
+        // and 32 undashed hex characters parse as a UUID.
+        "ALTER TABLE file_refs ADD COLUMN id TEXT",
     ] {
         if let Err(e) = conn.execute(sql, []) {
             let msg = e.to_string();
@@ -1928,6 +2011,14 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             }
         }
     }
+    conn.execute(
+        "UPDATE file_refs SET id = lower(hex(randomblob(16))) WHERE id IS NULL OR id = ''",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS file_refs_id ON file_refs (id)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -3376,6 +3467,107 @@ mod tests {
         assert!(state.audit_log(bob, 50).is_ok());
         state.set_role(owner, bob, Role::Member).unwrap();
         assert!(state.audit_log(bob, 50).is_err());
+    }
+
+    /// A community that predates roles must not reload with nobody able to
+    /// administer it.
+    ///
+    /// `join` only appoints an owner when the member table is empty, and the
+    /// migration defaults existing rows to `Member`. Without a bootstrap the
+    /// operator would be permanently locked out of governance on their own
+    /// server, because `set_role` requires an admin that does not exist.
+    #[test]
+    fn an_upgraded_server_with_no_admin_gets_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            alice = s.join("alice", None, None).unwrap();
+            bob = s.join("bob", None, None).unwrap();
+            // Simulate the pre-roles state: everybody an ordinary member.
+            for id in [alice, bob] {
+                let m = s.members.get_mut(&id).unwrap();
+                m.role = Role::Member;
+                let snapshot = s.members.get(&id).unwrap();
+                s.persist_member(snapshot);
+            }
+            assert!(!s.members.values().any(|m| m.role.is_admin()));
+        }
+
+        let s = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owners: Vec<Uuid> = s
+            .members
+            .values()
+            .filter(|m| m.role == Role::Owner)
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(owners.len(), 1, "exactly one owner is appointed");
+        // Deterministic, so a restart does not shuffle ownership around.
+        assert_eq!(owners[0], alice.min(bob));
+        // And it is recorded, because silently handing somebody ownership is
+        // the sort of thing an operator should be able to see happened.
+        let log = s.audit_log(owners[0], 10).unwrap();
+        assert!(log.iter().any(|e| e.action == "role.bootstrap"));
+
+        // A server that already has an admin is left alone.
+        let again = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(
+            again
+                .members
+                .values()
+                .filter(|m| m.role == Role::Owner)
+                .count(),
+            1,
+            "the bootstrap does not run twice"
+        );
+    }
+
+    /// The same content shared twice in one place is two shares, and both have
+    /// to survive a restart — otherwise the blob's reference count outlives the
+    /// references, and the last visible one cannot release it.
+    #[test]
+    fn repeated_shares_of_one_file_survive_a_reload_individually() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, channel, hash);
+        {
+            let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+            owner = s.join("owner", None, None).unwrap();
+            channel = s.default_channel();
+            let env = s
+                .post_file(
+                    owner,
+                    channel,
+                    "twice.txt".into(),
+                    "text/plain".into(),
+                    b"same bytes".to_vec(),
+                )
+                .unwrap();
+            hash = file_payload(&env).hash.clone();
+            s.post_file(
+                owner,
+                channel,
+                "twice.txt".into(),
+                "text/plain".into(),
+                b"same bytes".to_vec(),
+            )
+            .unwrap();
+            assert_eq!(s.blobs[&hash].refcount, 2);
+            assert_eq!(s.file_refs.len(), 2);
+        }
+
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        assert_eq!(s.file_refs.len(), 2, "both shares came back");
+        assert_eq!(s.blobs[&hash].refcount, 2);
+
+        // Releasing them one at a time reclaims the bytes exactly once.
+        s.delete_file(owner, &hash, channel).unwrap();
+        assert!(
+            s.blob_bytes(&hash).is_some(),
+            "one reference still holds it"
+        );
+        s.delete_file(owner, &hash, channel).unwrap();
+        assert!(!s.blobs.contains_key(&hash));
+        assert!(!dir.path().join(BLOB_DIR).join(&hash).exists());
     }
 
     /// Roles, channel kinds, private membership, file provenance and the audit
