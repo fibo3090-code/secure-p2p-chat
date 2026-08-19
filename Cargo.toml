@@ -6,7 +6,7 @@ members = ["core", "client", "server", "desktop/src-tauri"]
 default-members = ["client"]
 
 [workspace.package]
-version = "1.15.0"
+version = "1.16.0"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fibo3090 <fibo3090@example.com>"]
