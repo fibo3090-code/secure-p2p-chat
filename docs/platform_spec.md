@@ -395,8 +395,23 @@ requested hash. `MAX_PARTY_FILE_BYTES` (100 MiB) is the hard ceiling;
 discards its spools. Both front-ends pick inline or chunked by size — nothing in
 the UI changes.
 
-**Remaining:** a full permission matrix (today's rules are role + channel-kind,
-not per-file grants).
+**Per-file permissions (shipped):** each share carries a
+[`FilePermissions`] set — `view / download / delete / share` — kept genuinely
+separate, because seeing that a file exists is not being able to fetch it, and
+neither implies being allowed to put it somewhere else. Resolution is
+location-scoped: an admin holds everything; anyone who cannot reach the
+location holds nothing (uploaders included, so making a channel private does
+not leave its files reachable by the people just excluded from it); within a
+reachable location the uploader holds everything, an explicit per-member grant
+overrides the location default, and otherwise the default applies. A guest
+never holds a write right whatever they were granted. `SetFilePermissions` is
+refused unless the caller's own rights cover what they are handing out, and
+only the uploader or an admin may change a share's grants at all. `ShareFile`
+makes the `share` right real: because content is addressed by hash, re-posting
+a file you hold costs a reference rather than a transfer, and the new share
+starts at the default — you pass on the file, not your authority over it.
+
+**Remaining:** `Policy` (§9) — server-wide rules rather than per-file grants.
 
 Target data model — content-addressable, deduplicated storage:
 
@@ -429,9 +444,9 @@ operator's data dir, plus a content-addressed filesystem blob store
 hosting with room to swap later. The former interim JSON snapshot is imported
 once on first load, then superseded. Of the objects listed above, `Blob`,
 `FileEntry` (as `MessagePayload::File`), `FileReference` (the `file_refs` table),
-`Quota` (server-wide *and* per-member), `Role`, and `AuditLog` (the `audit`
-table) all exist. `PermissionMatrix` and `Policy` are still design-only — access
-is decided today by role plus channel kind, not by per-file grants.
+`Quota` (server-wide *and* per-member), `Role`, `AuditLog` (the `audit` table)
+and `PermissionMatrix` (`FilePermissions`, stored per share with per-member
+grants) all exist. `Policy` is the one that remains design-only.
 
 ---
 
@@ -650,10 +665,7 @@ Each phase gets its own detailed plan before code lands.
 Phase 0  Workspace refactor                         ✅ done
 UI       Tauri + React desktop app (§10)            ✅ shipped (A–F) · TUI redesign (G) remains
 Phase 1  Party Server MVP (Administered)            ✅ complete (Communities pane in both UIs)
-Phase 2  Drive / files                              ◐ sharing, chunked transfer,
-                                                      deletion, quotas, provenance +
-                                                      Drive panel done ·
-                                                      permission matrix remains
+Phase 2  Drive / files                              ✅ done
 Phase 3  Governance & roles                         ◐ roles, channel access, audit
                                                       log done · policies remain
 Phase 4  E2EE server tier
@@ -679,12 +691,11 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   Shipped in **1.15.0**. The owner chose a minor bump; note that the shipped
   desktop artifact changed name and installer, so existing installations of the
   retired GUI do not upgrade in place and have to be replaced manually.
-- **Phase 2 — Drive / files. ◐ all but the permission matrix.** Content-addressed
-  sharing in channels & DMs (inline below 4 MiB, chunked above it up to 100 MiB),
-  working reference counting with deletion and reclamation, `file_refs`
-  provenance, physical + per-member logical quotas, and the Drive panel in both
-  front-ends have all landed (see §8). **Remaining:** a per-file permission
-  matrix.
+- **Phase 2 — Drive / files. ✅** Content-addressed sharing in channels & DMs
+  (inline below 4 MiB, chunked above it up to 100 MiB), working reference
+  counting with deletion and reclamation, `file_refs` provenance, physical +
+  per-member logical quotas, the Drive panel in both front-ends, and per-file
+  permissions with re-sharing (see §8).
 - **Phase 3 — Governance & roles. ◐ roles and audit done.** `Role`
   (Guest/Member/Admin/Owner) is enforced server-side, `ChannelKind` is a real
   access rule rather than a stored decoration, and an admin-only audit log

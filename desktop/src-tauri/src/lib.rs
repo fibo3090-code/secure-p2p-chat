@@ -304,6 +304,8 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::party::party_delete_file,
         commands::party::party_refresh_audit,
         commands::party::party_clear_notice,
+        commands::party::party_share_file,
+        commands::party::party_set_file_permissions,
     ]
 }
 
@@ -509,6 +511,7 @@ fn party_signature(p: &PartyManager) -> u64 {
                 f.hash.hash(&mut h);
                 f.location.hash(&mut h);
                 f.name.hash(&mut h);
+                f.perms.hash(&mut h);
             }
             conn.quota.map(|q| (q.used, q.server_used)).hash(&mut h);
             conn.audit.len().hash(&mut h);

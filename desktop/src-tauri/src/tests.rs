@@ -442,6 +442,17 @@ fn frontend_payload_keys_bind_to_command_args() {
         ),
         ("party_refresh_audit", json!({ "server": uuid })),
         ("party_clear_notice", json!({ "server": uuid })),
+        (
+            "party_share_file",
+            json!({ "server": uuid, "hash": "abc", "from": uuid, "channel": uuid, "peer": null }),
+        ),
+        (
+            "party_set_file_permissions",
+            json!({
+                "server": uuid, "hash": "abc", "location": uuid, "member": null,
+                "perms": { "view": true, "download": true, "delete": false, "share": false }
+            }),
+        ),
         ("party_clear_error", json!({ "server": uuid })),
         ("party_history", json!({ "server": uuid, "channel": uuid })),
         ("party_dm_history", json!({ "server": uuid, "peer": uuid })),

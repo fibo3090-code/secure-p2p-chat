@@ -39,7 +39,7 @@ function fmtDate(ms) {
 }
 
 /// The Drive: every file the member may see, with who shared it and where.
-export function DrivePanel({ server, onDownload, onDelete, downloading }) {
+export function DrivePanel({ server, onDownload, onDelete, onShare, onPermissions, downloading }) {
   const [confirm, setConfirm] = useState(null); // `${hash}|${location}` armed for delete
   const files = server?.files || [];
   const quota = server?.quota;
@@ -99,11 +99,27 @@ export function DrivePanel({ server, onDownload, onDelete, downloading }) {
                     {fmtDate(f.shared_at)}
                   </div>
                 </div>
-                <button className="drive-act" title={`Download ${f.name}`}
-                  disabled={!!downloading?.[f.hash]}
-                  onClick={() => onDownload(f)}>
-                  <Icon name={downloading?.[f.hash] ? "clock" : "download"} size={15} />
-                </button>
+                {f.can_download && (
+                  <button className="drive-act" title={`Download ${f.name}`}
+                    disabled={!!downloading?.[f.hash]}
+                    onClick={() => onDownload(f)}>
+                    <Icon name={downloading?.[f.hash] ? "clock" : "download"} size={15} />
+                  </button>
+                )}
+                {f.can_share && (
+                  <button className="drive-act"
+                    title={`Share ${f.name} somewhere else — the file is stored once, so this costs nothing`}
+                    onClick={() => onShare(f)}>
+                    <Icon name="swap" size={15} />
+                  </button>
+                )}
+                {f.can_delete && (
+                  <button className="drive-act"
+                    title={`Choose who can use ${f.name}`}
+                    onClick={() => onPermissions(f)}>
+                    <Icon name="key" size={15} />
+                  </button>
+                )}
                 {f.can_delete && (
                   <button className={cx("drive-act", "drive-del", armed && "is-confirm")}
                     title={armed
@@ -251,6 +267,158 @@ export function ChannelAccessDialog({ server, channel, onClose, onSubmit }) {
           {editing ? "Save" : "Create channel"}
         </Button>
       </div>
+      </div>
+    </Modal>
+  );
+}
+/// Choose what a shared file grants, either to everyone who can reach it or to
+/// one member. The server refuses anything the caller does not hold themselves,
+/// so this is about not offering a switch that will be rejected.
+export function FilePermissionsDialog({ server, file, onClose, onSubmit }) {
+  const [scope, setScope] = useState("default"); // "default" | member id
+  const [perms, setPerms] = useState({
+    view: file.can_view !== false,
+    download: file.can_download !== false,
+    delete: false,
+    share: false,
+  });
+  const [busy, setBusy] = useState(false);
+
+  const others = useMemo(
+    () => (server?.members || []).filter((m) => !m.is_me),
+    [server],
+  );
+
+  // Downloading what you cannot see, and sharing what you cannot download, are
+  // not coherent — mirror the server's normalisation so the switches behave.
+  function toggle(key) {
+    setPerms((p) => {
+      const next = { ...p, [key]: !p[key] };
+      if (next.share) next.download = true;
+      if (next.download || next.delete || next.share) next.view = true;
+      if (!next.view) { next.download = false; next.delete = false; next.share = false; }
+      if (!next.download) next.share = false;
+      return next;
+    });
+  }
+
+  async function submit() {
+    setBusy(true);
+    try {
+      await onSubmit(scope === "default" ? null : scope, perms);
+      onClose();
+    } finally { setBusy(false); }
+  }
+
+  const RIGHTS = [
+    ["view", "See it", "It appears in their file list and in the conversation."],
+    ["download", "Download it", "They can save a copy of the actual file."],
+    ["delete", "Remove it", "They can take this share down."],
+    ["share", "Share it on", "They can post it in other channels or DMs."],
+  ];
+
+  return (
+    <Modal open onClose={onClose} width={470} icon="key"
+      title={`Who can use ${file.name}`}
+      sub="Applies to this share only — the same file elsewhere keeps its own settings.">
+      <div className="creator-pane">
+        <div className="fld">
+          <span className="fld-l">Applies to</span>
+          <div className="member-pick">
+            <button type="button"
+              className={cx("pick-opt", scope === "default" && "is-active")}
+              aria-pressed={scope === "default"}
+              onClick={() => setScope("default")}>
+              <Icon name="users" size={13} /> Everyone here
+            </button>
+            {others.map((m) => (
+              <button key={m.id} type="button"
+                className={cx("pick-opt", scope === m.id && "is-active")}
+                aria-pressed={scope === m.id}
+                onClick={() => setScope(m.id)}>
+                <Icon name="user" size={13} /> {m.username}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="fld">
+          <span className="fld-l">They can</span>
+          <div className="perm-list">
+            {RIGHTS.map(([key, label, hint]) => (
+              <button key={key} type="button"
+                className={cx("perm-opt", perms[key] && "is-active")}
+                aria-pressed={!!perms[key]}
+                onClick={() => toggle(key)}>
+                <Icon name={perms[key] ? "check" : "x"} size={14} />
+                <span className="perm-txt">
+                  <span className="perm-l">{label}</span>
+                  <span className="perm-h">{hint}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="fld-hint">
+            You can only pass on what you hold yourself, and you always keep full
+            control of a file you shared.
+          </div>
+        </div>
+
+        <div className="modal-actions">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button icon="check" onClick={submit} disabled={busy}>Save</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/// Pick a channel or member to re-share a file into.
+export function ShareFileDialog({ server, file, onClose, onSubmit }) {
+  const [busy, setBusy] = useState(false);
+  // Somewhere it already is, is not a destination.
+  const channels = (server?.channels || []).filter(
+    (c) => c.can_post !== false && c.id !== file.location,
+  );
+  const members = (server?.members || []).filter((m) => !m.is_me);
+
+  async function pick(dest) {
+    setBusy(true);
+    try { await onSubmit(dest); onClose(); } finally { setBusy(false); }
+  }
+
+  return (
+    <Modal open onClose={onClose} width={430} icon="swap"
+      title={`Share ${file.name}`}
+      sub="It is stored once, so this does not upload it again.">
+      <div className="creator-pane">
+        <div className="fld">
+          <span className="fld-l">Channels</span>
+          <div className="member-pick">
+            {channels.length === 0 && <div className="fld-hint">Nowhere else to post it.</div>}
+            {channels.map((c) => (
+              <button key={c.id} type="button" className="pick-opt" disabled={busy}
+                onClick={() => pick({ channel: c.id })}>
+                <Icon name={kindIcon(c.kind)} size={13} /> {c.name}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="fld">
+          <span className="fld-l">Direct message</span>
+          <div className="member-pick">
+            {members.length === 0 && <div className="fld-hint">Nobody else has joined yet.</div>}
+            {members.map((m) => (
+              <button key={m.id} type="button" className="pick-opt" disabled={busy}
+                onClick={() => pick({ peer: m.id })}>
+                <Icon name="user" size={13} /> {m.username}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="modal-actions">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+        </div>
       </div>
     </Modal>
   );
