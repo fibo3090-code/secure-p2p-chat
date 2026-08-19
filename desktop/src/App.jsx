@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, onBridge, summaryToConv, chatToContact } from "./lib/bridge.js";
+import { api, onBridge, summaryToConv, chatToContact, friendlyError } from "./lib/bridge.js";
 import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
 import { cx, Avatar } from "./components/ui.jsx";
@@ -17,11 +17,16 @@ import { toast } from "./lib/toast.js";
 import { THEMES, loadTheme, saveTheme } from "./lib/themes.js";
 
 function RailBtn({ icon, label, active, onClick, badge }) {
+  // The badge is a bare number next to an icon, so a reader announced "Chats"
+  // whether or not anything was waiting. Fold the count into the accessible
+  // name and hide the visual duplicate.
+  const unreadLabel = badge > 0 ? `, ${badge} unread` : "";
   return (
-    <button className={cx("rail-btn", active && "is-active")} onClick={onClick} title={label}>
+    <button className={cx("rail-btn", active && "is-active")} onClick={onClick} title={label}
+      aria-label={`${label}${unreadLabel}`} aria-current={active ? "page" : undefined}>
       <Icon name={icon} size={20} />
       <span className="rail-label">{label}</span>
-      {badge > 0 && <span className="rail-badge">{badge}</span>}
+      {badge > 0 && <span className="rail-badge" aria-hidden="true">{badge}</span>}
     </button>
   );
 }
@@ -251,7 +256,7 @@ export default function App() {
 
   if (auth.state === "unlock") {
     return <LockScreen onUnlock={async (pw) => {
-      try { await api.unlock(pw); await refreshAuth(); return ""; } catch (e) { return String(e); }
+      try { await api.unlock(pw); await refreshAuth(); return ""; } catch (e) { return friendlyError(e); }
     }} />;
   }
   if (auth.state === "set_password") {
@@ -265,7 +270,7 @@ export default function App() {
           // attached rather than only a warning that it can't be reset.
           setBackupPrompt(true);
           return "";
-        } catch (e) { return String(e); }
+        } catch (e) { return friendlyError(e); }
       }} />;
   }
   if (backupPrompt) {
@@ -300,19 +305,19 @@ export default function App() {
     // Restore the draft if the send fails, so a transient error doesn't lose
     // what the user typed — they can just press Enter again.
     try { await api.sendMessage(activeId, text); }
-    catch (e) { setDraft(text); toast(String(e), "error"); return; }
+    catch (e) { setDraft(text); toast(friendlyError(e), "error"); return; }
     refresh();
   }
 
   async function sendFile(c) {
     try { await api.sendFile(c.id); refresh(); }
-    catch (e) { toast(String(e), "error"); }
+    catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function doRename(id, title) {
     setRenameTarget(null);
     try { await api.renameChat(id, title); toast("Conversation renamed", "success"); refresh(); }
-    catch (e) { toast(String(e), "error"); }
+    catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function doDelete(id) {
@@ -322,11 +327,20 @@ export default function App() {
       if (activeId === id) { setActiveId(null); activeIdRef.current = null; setActive(null); }
       toast("Conversation deleted", "success");
       refresh();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   return (
     <div className="app-root">
+      {/* Skip links, first in the tab order. The window opens focused on the
+          titlebar, so a keyboard user reaching the message box crossed the lock
+          button, "New connection", the theme menu, five rail buttons and every
+          conversation in the list — twenty-plus stops before typing, every
+          launch. Hidden until focused (see .skip-link). */}
+      <a className="skip-link" href="#main-content">Skip to main content</a>
+      {nav === "chats" && activeId && (
+        <a className="skip-link" href="#composer-input">Skip to message box</a>
+      )}
       <div className="hex-bg" />
       <header className="titlebar">
         <div className="tb-left">
@@ -343,7 +357,7 @@ export default function App() {
               : "Lock the conversation: stop listening and refuse new peers."}
             onClick={async () => {
               try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Locked — no new peers can connect" : "Unlocked", "info"); }
-              catch (e) { toast(String(e), "error"); }
+              catch (e) { toast(friendlyError(e), "error"); }
             }}>
             <Icon name={locked ? "lock" : "unlock"} size={16} />
           </button>
@@ -355,7 +369,11 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        <nav className="rail">
+        {/* role + label are explicit: <nav> carries the landmark implicitly, but
+            an unlabelled one is announced only as "navigation", and this app has
+            more than one region a reader will call that. Naming it is what makes
+            the landmark list usable. */}
+        <nav className="rail" role="navigation" aria-label="Primary">
           <div className="rail-nav">
             <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}
               badge={convs.reduce((n, c) => n + (c.unread || 0), 0)} />
@@ -381,7 +399,7 @@ export default function App() {
               <ConvList contacts={contacts} activeId={activeId} onSelect={openConv}
                 onAdd={() => openCreator()} query={query} setQuery={setQuery} />
             </aside>
-            <main className="col-main">
+            <main className="col-main" id="main-content" tabIndex={-1}>
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
                 // A user with no conversations at all gets the get-started
@@ -391,17 +409,17 @@ export default function App() {
                 // A swallowed failure here is a cancel button that does
                 // nothing, on a transfer the user is actively trying to stop.
                 onCancelTransfer={(id) =>
-                  api.cancelTransfer(id).catch((e) => toast(`Could not cancel: ${e}`, "error"))}
+                  api.cancelTransfer(id).catch((e) => toast(`Could not cancel: ${friendlyError(e)}`, "error"))}
                 transfers={transfers.filter((t) =>
                   // done/cancelled rows can linger in the snapshot until the next
                   // transfer; the completed file already shows as a message, so
                   // only surface in-flight work and failures (with their reason).
                   t.chat_id === activeId && t.status !== "done" && t.status !== "cancelled")}
                 onAcceptTransfer={async (t) => {
-                  try { await api.acceptTransfer(t.id); refresh(); } catch (e) { toast(String(e), "error"); }
+                  try { await api.acceptTransfer(t.id); refresh(); } catch (e) { toast(friendlyError(e), "error"); }
                 }}
                 onDeclineTransfer={async (t) => {
-                  try { await api.declineTransfer(t.id); refresh(); } catch (e) { toast(String(e), "error"); }
+                  try { await api.declineTransfer(t.id); refresh(); } catch (e) { toast(friendlyError(e), "error"); }
                 }}
                 onVerify={async (c) => {
                   // Open the accept/reject dialog only when a real TOFU request
@@ -420,13 +438,13 @@ export default function App() {
           </>
         )}
         {nav === "contacts" && (
-          <main className="col-full"><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
         )}
         {nav === "settings" && (
-          <main className="col-full"><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
         )}
-        {nav === "parties" && <main className="col-full"><Parties /></main>}
-        {nav === "relays" && <main className="col-full"><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}
+        {nav === "parties" && <main className="col-full" id="main-content" tabIndex={-1}><Parties /></main>}
+        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}
       </div>
 
       <Creator open={creatorOpen} initialMode={creatorMode} onClose={() => setCreatorOpen(false)} />

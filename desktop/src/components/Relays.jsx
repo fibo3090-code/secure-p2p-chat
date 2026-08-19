@@ -9,7 +9,7 @@
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Button, Input } from "./ui.jsx";
-import { api } from "../lib/bridge.js";
+import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
 // The crate that actually provides `--relay-server` (see client/src/main.rs).
@@ -55,7 +55,7 @@ export function Relays({ onConnected }) {
       await api.connectViaRelay(host.trim(), token.trim());
       toast(`Connecting via relay ${host.trim()}…`, "success");
       onConnected && onConnected();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
     finally { setBusy(false); }
   }
 
@@ -68,7 +68,7 @@ export function Relays({ onConnected }) {
       const t = await api.hostViaRelay(host.trim());
       setHostToken(t);
       toast("Relay session open — share the token with your peer", "success");
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
     finally { setBusy(false); }
   }
 

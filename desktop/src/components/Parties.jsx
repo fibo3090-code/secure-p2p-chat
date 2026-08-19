@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
-import { api, onBridge, fmtTime } from "../lib/bridge.js";
+import { api, onBridge, fmtTime, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
 import {
@@ -56,7 +56,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
     // of every community, and the bridge refuses to join when it cannot be read.
     api.partySaved()
       .then((s) => setSaved(s || []))
-      .catch((e) => { setSaved([]); setErr(String(e)); });
+      .catch((e) => { setSaved([]); setErr(friendlyError(e)); });
   }, []);
 
   async function joinWith(addr, user, pass, trust = false) {
@@ -75,7 +75,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
       toast(`Connecting to ${addr.trim()}…`, "success");
       setVerify(null);
       onJoined && onJoined();
-    } catch (e) { setErr(String(e)); setVerify(null); }
+    } catch (e) { setErr(friendlyError(e)); setVerify(null); }
     finally { setBusy(false); }
   }
 
@@ -329,7 +329,7 @@ export function Parties() {
       if (dm) await api.partySendDm(server.id, dm, text);
       else if (cid) await api.partyPost(server.id, cid, text);
       loadMsgs();
-    } catch (e) { setDraft(text); toast(String(e), "error"); }
+    } catch (e) { setDraft(text); toast(friendlyError(e), "error"); }
   }
 
   // Share a file into the active channel or DM. The native picker opens in the
@@ -341,7 +341,7 @@ export function Parties() {
       else if (cid) await api.partySendFile(server.id, cid);
       else return;
       loadMsgs();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   // Download a file message's bytes and save them via the native dialog.
@@ -355,7 +355,7 @@ export function Parties() {
     const filename = m.text || m.name || "file";
     setDownloading((d) => ({ ...d, [m.hash]: true }));
     try { await api.partyDownloadFile(server.id, m.hash, filename); }
-    catch (e) { toast(String(e), "error"); }
+    catch (e) { toast(friendlyError(e), "error"); }
     finally {
       setDownloading((d) => {
         const next = { ...d };
@@ -374,7 +374,7 @@ export function Parties() {
     }
     setNewChannel("");
     try { await api.partyCreateChannel(server.id, name); loadServers(); }
-    catch (e) { toast(String(e), "error"); }
+    catch (e) { toast(friendlyError(e), "error"); }
   }
 
   // Create a channel of a chosen kind, or change an existing one's access.
@@ -387,7 +387,7 @@ export function Parties() {
         await api.partySetChannelAccess(server.id, accessFor.id, kind, members);
       }
       loadServers();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   // Delete a channel and its history (two-click, admins only).
@@ -399,13 +399,13 @@ export function Parties() {
       await api.partyDeleteChannel(server.id, channel.id);
       if (cid === channel.id) setCid(null);
       loadServers();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function setRole(member, role) {
     if (!server) return;
     try { await api.partySetRole(server.id, member.id, role); loadServers(); }
-    catch (e) { toast(String(e), "error"); }
+    catch (e) { toast(friendlyError(e), "error"); }
   }
 
   // Re-share a file into another channel or DM. The bytes are already on the
@@ -416,7 +416,7 @@ export function Parties() {
       await api.partyShareFile(server.id, f.hash, f.location, dest);
       await api.partyRefreshFiles(server.id);
       loadServers(); loadMsgs();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function setFilePerms(f, member, perms) {
@@ -425,7 +425,7 @@ export function Parties() {
       await api.partySetFilePermissions(server.id, f.hash, f.location, member, perms);
       await api.partyRefreshFiles(server.id);
       loadServers();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function deleteFile(f) {
@@ -434,7 +434,7 @@ export function Parties() {
       await api.partyDeleteFile(server.id, f.hash, f.location);
       await api.partyRefreshFiles(server.id);
       loadServers();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function dismissError() {
@@ -455,7 +455,7 @@ export function Parties() {
       toast(`Left ${server.name || server.address}.`, "success");
       setDm(null); setCid(null);
       loadServers();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   // Rejoin a dropped/rejected community: open the join form prefilled with the
@@ -478,7 +478,7 @@ export function Parties() {
       await api.partyLeave(server.id);
       setDm(null); setCid(null);
       loadServers();
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   return (
@@ -687,6 +687,9 @@ export function Parties() {
               </button>
               <textarea className="composer-input" rows={1}
                 placeholder={composerHint}
+                // The placeholder is the only thing that says *why* the box is
+                // disabled, and a placeholder is not an accessible name.
+                aria-label={composerHint}
                 disabled={!canSend}
                 value={draft} onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }} />

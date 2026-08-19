@@ -6,6 +6,7 @@ import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Button, PasswordInput } from "./ui.jsx";
 import { pwStrength, passwordFormError, FALLBACK_MIN_PASSWORD } from "../lib/password.js";
+import { friendlyError } from "../lib/bridge.js";
 
 function Brand({ sub }) {
   return (
@@ -195,7 +196,7 @@ export function BackupPrompt({ onExport, onSkip }) {
       const dest = await onExport();
       if (dest) setDone(dest);
     } catch (e) {
-      setErr(String(e));
+      setErr(friendlyError(e));
     } finally {
       setBusy(false);
     }
