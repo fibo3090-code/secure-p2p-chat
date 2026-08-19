@@ -66,8 +66,25 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # nextest runs each test in its own process, which is what the workspace
+      # is actually written for: the relay tests read a process-global
+      # environment variable (`P2PEM_NO_HOLEPUNCH`), and several bind loopback
+      # listeners. Under a shared-process runner those only behave because the
+      # tests take a mutex around them; here they are isolated by construction.
+      # It is also roughly twice as fast, and reports a hung test instead of
+      # blocking the job until the workflow timeout.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Run Tests
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
+
+      # nextest does not run doctests, so they get their own step rather than
+      # quietly disappearing from CI.
+      - name: Run Doctests
+        run: cargo test --workspace --doc
 
   frontend:
     name: Frontend Build

@@ -1,0 +1,26 @@
+# cargo-nextest configuration.
+#
+# The workspace's slowest tests are genuinely networked end-to-end ones — a
+# debug-build RSA handshake plus a real loopback socket — so the point of these
+# settings is not to make them fast, it is to make a *hung* one fail instead of
+# blocking the job until the workflow timeout. A test that stops making progress
+# against a socket will otherwise sit there forever.
+
+[profile.default]
+# Warn once a test passes this mark, so a newly-slow test is visible before it
+# becomes a timeout.
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+# One retry, for the genuinely environmental case: these tests bind ephemeral
+# loopback ports, and two of them can collide. It is deliberately not a way to
+# paper over a racy test — a retried test is reported as FLAKY, and that is a
+# defect to fix (usually by giving a wait step more headroom, never by raising
+# this number).
+retries = { backoff = "exponential", count = 1, delay = "2s", jitter = true }
+
+[profile.ci]
+# CI prints every test rather than only the failures, so a log from a failed run
+# says what else was running at the time.
+status-level = "all"
+final-status-level = "slow"
+fail-fast = false
