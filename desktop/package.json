@@ -12,14 +12,14 @@
   },
   "dependencies": {
     "@tauri-apps/api": "~2.11.0",
-    "lucide-react": "^1.25.0",
+    "lucide-react": "^1.28.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
     "@vitejs/plugin-react": "^6.0.3",
-    "vite": "^8.1.5",
+    "vite": "^8.2.0",
     "vitest": "^4.1.10"
   },
   "overrides": {

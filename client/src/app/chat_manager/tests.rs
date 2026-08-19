@@ -2,21 +2,51 @@ use super::*;
 use base64::Engine;
 use tempfile::tempdir;
 
+/// A stand-in public key for the v1 (unsigned) invite tests. Its exact contents
+/// do not matter — what matters is that the fingerprint in the link is derived
+/// from *this* key, because `parse_invite_link` now rejects an invite whose
+/// fingerprint does not belong to the key it carries.
+const TEST_PUBKEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkq...
+-----END PUBLIC KEY-----";
+
+/// A minimal contact, as an invite import would produce one.
+fn sample_contact_for_test(name: &str) -> Contact {
+    Contact {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        address: None,
+        addresses: Vec::new(),
+        relay_server: None,
+        relay_token: None,
+        fingerprint: None,
+        public_key: None,
+        created_at: chrono::Utc::now(),
+        trust_state: TrustState::Unverified,
+        notes: String::new(),
+        tags: Vec::new(),
+        last_seen: None,
+    }
+}
+
+/// Build a legacy v1 invite link whose fingerprint matches its public key.
+fn v1_invite_link(name: &str, address: &str) -> String {
+    let payload = serde_json::json!({
+        "name": name,
+        "address": address,
+        "fingerprint": crate::core::crypto::fingerprint_pubkey(TEST_PUBKEY_PEM.as_bytes()),
+        "public_key": TEST_PUBKEY_PEM,
+    });
+    let json = serde_json::to_string(&payload).unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+    format!("chat-p2p://invite/{}", encoded)
+}
+
 #[test]
 fn parse_invite_placeholder_is_ignored() {
     let mgr = ChatManager::default();
 
-    let payload = serde_json::json!({
-        "name": "Alice",
-        "address": "YOUR_IP:PORT",
-        "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
-    });
-
-    let json = serde_json::to_string(&payload).unwrap();
-    use base64::engine::general_purpose;
-    let encoded = general_purpose::STANDARD.encode(json);
-    let link = format!("chat-p2p://invite/{}", encoded);
+    let link = v1_invite_link("Peer", "YOUR_IP:PORT");
 
     let contact = mgr.parse_invite_link(&link).expect("should parse invite");
     assert!(
@@ -133,7 +163,7 @@ fn host_prompts_for_an_unknown_incoming_fingerprint() {
 
     // The host must PROMPT for verification, not silently auto-trust.
     assert!(
-        mgr.fingerprint_verification_request.is_some(),
+        mgr.pending_fingerprint().is_some(),
         "host must prompt to verify an unknown incoming peer"
     );
     assert!(
@@ -161,7 +191,7 @@ fn host_auto_accepts_a_returning_known_fingerprint() {
 
     // Returning peer: auto-confirmed without re-prompting.
     assert!(
-        mgr.fingerprint_verification_request.is_none(),
+        mgr.pending_fingerprint().is_none(),
         "a known fingerprint must not trigger another prompt"
     );
     assert_eq!(
@@ -187,7 +217,7 @@ fn blocked_contact_fingerprint_is_auto_rejected() {
     mgr.handle_tofu_verification(session_id, "BLOCKED-FP", "Mallory", "");
 
     assert!(
-        mgr.fingerprint_verification_request.is_none(),
+        mgr.pending_fingerprint().is_none(),
         "a blocked fingerprint must not prompt the user"
     );
     assert_eq!(
@@ -249,7 +279,7 @@ fn tofu_accept_promotes_contact_to_verified() {
     mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
 
     mgr.handle_tofu_verification(session_id, "ALICE-FP", "Alice", "");
-    assert!(mgr.fingerprint_verification_request.is_some());
+    assert!(mgr.pending_fingerprint().is_some());
 
     mgr.confirm_fingerprint(session_id, true).unwrap();
 
@@ -303,17 +333,7 @@ async fn connect_to_blocked_contact_is_refused() {
 fn parse_invite_with_valid_address_keeps_it() {
     let mgr = ChatManager::default();
 
-    let payload = serde_json::json!({
-        "name": "Bob",
-        "address": "127.0.0.1:54321",
-        "fingerprint": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
-        "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
-    });
-
-    let json = serde_json::to_string(&payload).unwrap();
-    use base64::engine::general_purpose;
-    let encoded = general_purpose::STANDARD.encode(json);
-    let link = format!("chat-p2p://invite/{}", encoded);
+    let link = v1_invite_link("Peer", "127.0.0.1:54321");
 
     let contact = mgr.parse_invite_link(&link).expect("should parse invite");
     assert_eq!(contact.address, Some("127.0.0.1:54321".to_string()));
@@ -323,17 +343,7 @@ fn parse_invite_with_valid_address_keeps_it() {
 fn parse_invite_invalid_address_no_port() {
     let mgr = ChatManager::default();
 
-    let payload = serde_json::json!({
-        "name": "Charlie",
-        "address": "127.0.0.1",
-        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
-    });
-
-    let json = serde_json::to_string(&payload).unwrap();
-    use base64::engine::general_purpose;
-    let encoded = general_purpose::STANDARD.encode(json);
-    let link = format!("chat-p2p://invite/{}", encoded);
+    let link = v1_invite_link("Peer", "127.0.0.1");
 
     let contact = mgr.parse_invite_link(&link).expect("should parse invite");
     assert!(
@@ -346,17 +356,7 @@ fn parse_invite_invalid_address_no_port() {
 fn parse_invite_invalid_address_bad_port() {
     let mgr = ChatManager::default();
 
-    let payload = serde_json::json!({
-        "name": "Dana",
-        "address": "127.0.0.1:notaport",
-        "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
-    });
-
-    let json = serde_json::to_string(&payload).unwrap();
-    use base64::engine::general_purpose;
-    let encoded = general_purpose::STANDARD.encode(json);
-    let link = format!("chat-p2p://invite/{}", encoded);
+    let link = v1_invite_link("Peer", "127.0.0.1:notaport");
 
     let contact = mgr.parse_invite_link(&link).expect("should parse invite");
     assert!(
@@ -385,6 +385,7 @@ fn placeholder_detection_works() {
         recv_seq: 0,
         is_host_placeholder: true,
         read_count: 0,
+        title_is_custom: false,
     };
     let id = chat.id;
     mgr.chats.insert(id, chat);
@@ -415,6 +416,7 @@ fn test_tofu_logic() {
         recv_seq: 0,
         is_host_placeholder: false,
         read_count: 0,
+        title_is_custom: false,
     };
     // Add a dummy confirmation sender for the test
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -431,7 +433,7 @@ fn test_tofu_logic() {
 
     // Assert: No auto-storage, request pending, and no confirmation sent automatically.
     assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, None);
-    assert!(mgr.fingerprint_verification_request.is_some());
+    assert!(mgr.pending_fingerprint().is_some());
     assert!(rx.try_recv().is_err());
 
     // Simulate user accepting the fingerprint via UI
@@ -455,7 +457,7 @@ fn test_tofu_logic() {
     mgr.handle_session_event(chat_id, event2);
 
     // Assert: No UI request, and connection is confirmed automatically.
-    assert!(mgr.fingerprint_verification_request.is_none());
+    assert!(mgr.pending_fingerprint().is_none());
     assert_eq!(rx.try_recv(), Ok(true));
 
     // 3. Third Use: Mismatched fingerprint -> UI prompt, no auto-confirm
@@ -468,12 +470,8 @@ fn test_tofu_logic() {
     mgr.handle_session_event(chat_id, event3);
 
     // Assert: A UI request IS made, and no confirmation is sent automatically.
-    assert!(mgr.fingerprint_verification_request.is_some());
-    let fp = mgr
-        .fingerprint_verification_request
-        .clone()
-        .unwrap()
-        .fingerprint;
+    assert!(mgr.pending_fingerprint().is_some());
+    let fp = mgr.pending_fingerprint().unwrap().fingerprint.clone();
     assert_eq!(fp, fingerprint2);
     assert!(rx.try_recv().is_err());
 }
@@ -508,6 +506,7 @@ fn test_regression_auto_trust_default_off() {
         recv_seq: 0,
         is_host_placeholder: false,
         read_count: 0,
+        title_is_custom: false,
     };
 
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -528,7 +527,7 @@ fn test_regression_auto_trust_default_off() {
     assert_eq!(mgr.chats.get(&chat_id).unwrap().peer_fingerprint, None);
     // And a verification request should be pending
     assert!(
-        mgr.fingerprint_verification_request.is_some(),
+        mgr.pending_fingerprint().is_some(),
         "Should show fingerprint verification dialog when auto_trust_on_first_use=false"
     );
 }
@@ -817,17 +816,7 @@ fn parse_signed_invite_accepts_recent_timestamp_within_window() {
 #[test]
 fn parse_v1_invite_link_still_works_with_warning() {
     let mgr = ChatManager::default();
-
-    let payload = serde_json::json!({
-        "name": "Legacy User",
-        "address": "192.168.1.50:8001",
-        "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----",
-    });
-
-    let json = serde_json::to_string(&payload).unwrap();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(json);
-    let link = format!("chat-p2p://invite/{}", encoded);
+    let link = v1_invite_link("Legacy User", "192.168.1.50:8001");
 
     // Should still parse v1 unsigned invites (backward compatibility)
     let contact = mgr
@@ -837,7 +826,148 @@ fn parse_v1_invite_link_still_works_with_warning() {
     assert_eq!(contact.address, Some("192.168.1.50:8001".to_string()));
     assert_eq!(
         contact.fingerprint,
-        Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string())
+        Some(crate::core::crypto::fingerprint_pubkey(
+            TEST_PUBKEY_PEM.as_bytes()
+        ))
+    );
+    // …and it is *not* signed, which is what the UI warns about.
+    assert!(!ChatManager::invite_link_is_signed(&link));
+}
+
+/// The signature on a v2 invite only proves that whoever built it holds the
+/// private key for the key *inside* it. `fingerprint` is a separate field, and
+/// it is the one every trust decision is made against — so an invite whose two
+/// halves disagree must be refused rather than imported.
+#[test]
+fn an_invite_whose_fingerprint_does_not_match_its_key_is_rejected() {
+    let mgr = ChatManager::default();
+    let payload = serde_json::json!({
+        "name": "Impostor",
+        "address": "127.0.0.1:12345",
+        "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "public_key": TEST_PUBKEY_PEM,
+    });
+    let json = serde_json::to_string(&payload).unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+    let link = format!("chat-p2p://invite/{}", encoded);
+
+    let err = mgr
+        .parse_invite_link(&link)
+        .expect_err("a fingerprint that does not belong to the key must be refused");
+    assert!(
+        err.to_string().contains("inconsistent"),
+        "the error should say what is wrong: {err}"
+    );
+}
+
+/// Importing an invite must not pre-trust the fingerprint it names. It used to:
+/// any contact carrying the fingerprint made the peer "known", so they
+/// connected with no verification prompt at all.
+#[test]
+fn importing_an_invite_does_not_bypass_fingerprint_verification() {
+    let mut mgr = ChatManager::new(Config::default());
+    let fingerprint = "ab".repeat(32);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+
+    // A contact straight from an invite link: fingerprint known, but nobody has
+    // compared a safety code yet.
+    let mut contact = sample_contact_for_test("Mum");
+    contact.fingerprint = Some(fingerprint.clone());
+    contact.trust_state = TrustState::Unverified;
+    mgr.import_contact(contact).unwrap();
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.fingerprint_confirm_senders.insert(chat_id, tx);
+    mgr.handle_tofu_verification(chat_id, &fingerprint, "Mum", "123456 🎃🎈🎁");
+
+    assert!(
+        mgr.pending_fingerprint().is_some(),
+        "an unverified imported contact must still be verified on first contact"
+    );
+    assert!(
+        mgr.get_chat(chat_id).unwrap().peer_fingerprint.is_none(),
+        "trust must not be stored before the user accepts"
+    );
+
+    // Once that fingerprint *has* been verified, the peer is a returning one
+    // and is not prompted again in another conversation.
+    let second = Uuid::new_v4();
+    mgr.create_local_chat_for_test(second, "Mum (2)".into());
+    if let Some(c) = mgr.contacts.values_mut().next() {
+        c.trust_state = TrustState::Verified;
+    }
+    let (tx2, _rx2) = mpsc::unbounded_channel();
+    mgr.fingerprint_confirm_senders.insert(second, tx2);
+    mgr.handle_tofu_verification(second, &fingerprint, "Mum", "123456 🎃🎈🎁");
+    assert_eq!(
+        mgr.get_chat(second).unwrap().peer_fingerprint.as_deref(),
+        Some(fingerprint.as_str()),
+        "a verified contact is a returning peer and is auto-accepted"
+    );
+}
+
+/// Deleting a contact promised, in the confirmation dialog, that the peer would
+/// have to be verified again. It has to actually be true.
+#[test]
+fn deleting_a_contact_also_revokes_its_stored_trust() {
+    let mut mgr = ChatManager::new(Config::default());
+    let fingerprint = "cd".repeat(32);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    mgr.chats.get_mut(&chat_id).unwrap().peer_fingerprint = Some(fingerprint.clone());
+
+    let mut contact = sample_contact_for_test("Blocked Peer");
+    contact.fingerprint = Some(fingerprint.clone());
+    contact.trust_state = TrustState::Blocked;
+    let id = mgr.import_contact(contact).unwrap();
+
+    assert!(
+        mgr.deleting_contact_would_unblock(id),
+        "the UI must be able to warn"
+    );
+    mgr.remove_contact(id);
+
+    assert!(
+        mgr.get_chat(chat_id).unwrap().peer_fingerprint.is_none(),
+        "the verified fingerprint must go with the contact"
+    );
+    assert!(
+        !mgr.is_fingerprint_blocked(&fingerprint),
+        "deleting a blocked contact does lift the block — the dialog says so"
+    );
+}
+
+/// Pasting the same invite twice used to add a second identical card, and
+/// pasting your own added you to your own contacts.
+#[test]
+fn importing_an_invite_is_idempotent_and_refuses_your_own() {
+    let mut mgr = ChatManager::new(Config::default());
+    let fingerprint = "ef".repeat(32);
+
+    let mut first = sample_contact_for_test("Sam");
+    first.fingerprint = Some(fingerprint.clone());
+    let a = mgr.import_contact(first).unwrap();
+
+    let mut again = sample_contact_for_test("Sam (new address)");
+    again.fingerprint = Some(fingerprint.clone());
+    again.address = Some("10.0.0.9:12345".to_string());
+    let b = mgr.import_contact(again).unwrap();
+
+    assert_eq!(a, b, "the same peer must not become two contacts");
+    assert_eq!(mgr.contacts.len(), 1);
+    assert_eq!(
+        mgr.get_contact(a).unwrap().address.as_deref(),
+        Some("10.0.0.9:12345"),
+        "a re-import refreshes how to reach them"
+    );
+
+    mgr.set_my_fingerprint(fingerprint.clone());
+    let mut mine = sample_contact_for_test("Me");
+    mine.fingerprint = Some(fingerprint);
+    assert!(
+        mgr.import_contact(mine).is_err(),
+        "your own invite is not a contact"
     );
 }
 
@@ -1698,7 +1828,7 @@ fn delete_all_data_removes_files_and_clears_state() {
     );
     mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
     mgr.contact_to_chat.insert(contact_id, chat_id);
-    mgr.fingerprint_verification_request = Some(PendingFingerprint {
+    mgr.queue_fingerprint_request(PendingFingerprint {
         fingerprint: "fingerprint".to_string(),
         peer_name: "peer".to_string(),
         sas: String::new(),
@@ -1715,7 +1845,7 @@ fn delete_all_data_removes_files_and_clears_state() {
     assert!(mgr.chats.is_empty());
     assert!(mgr.contacts.is_empty());
     assert!(mgr.contact_to_chat.is_empty());
-    assert!(mgr.fingerprint_verification_request.is_none());
+    assert!(mgr.pending_fingerprint().is_none());
 }
 
 #[test]
@@ -1761,4 +1891,308 @@ fn register_incoming_text_chunk_caps_concurrent_partial_messages() {
         .expect("a partial message exists");
     mgr.register_incoming_text_chunk(existing.0, existing.1, 1, 2, "b".to_string(), 0)
         .expect("completing an existing message stays allowed");
+}
+
+// ── Regressions: session teardown, TOFU queueing, reconnect, transfers ──────
+
+/// Build a live session (handle + event receiver + confirm sender) for `id`.
+/// Returns the receiving end of the app→session control lane so a test can
+/// assert on the frames the manager queued.
+fn wire_session_for_test(
+    mgr: &mut ChatManager,
+    session_id: Uuid,
+) -> mpsc::UnboundedReceiver<ProtocolMessage> {
+    let (app_tx, app_rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(4);
+    mgr.add_session_for_test(
+        session_id,
+        SessionHandle {
+            from_app_tx: app_tx,
+            file_tx,
+        },
+    );
+    let (_event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    mgr.session_events
+        .insert(session_id, Arc::new(Mutex::new(event_rx)));
+    let (confirm_tx, _confirm_rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, confirm_tx);
+    app_rx
+}
+
+/// Deleting a host-side conversation must close the session serving it. That
+/// session is keyed by the *placeholder* id, not the chat's own — so removing
+/// only `chats[chat_id]` left the socket up and the mapping intact, and the
+/// peer's later messages were dropped with a log line while their client still
+/// showed them as sent.
+#[test]
+fn deleting_a_host_side_chat_closes_its_mapped_session() {
+    let mut mgr = ChatManager::default();
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+    let _app_rx = wire_session_for_test(&mut mgr, session_id);
+
+    mgr.delete_chat(incoming);
+
+    assert!(!mgr.chats.contains_key(&incoming));
+    assert!(
+        !mgr.sessions.contains_key(&session_id),
+        "the session behind the deleted chat must be closed"
+    );
+    assert!(!mgr.session_events.contains_key(&session_id));
+    assert!(!mgr.fingerprint_confirm_senders.contains_key(&session_id));
+    assert!(
+        mgr.chat_id_mapping.is_empty(),
+        "a stale mapping would keep routing the peer's frames to nothing"
+    );
+}
+
+/// Two peers mid-handshake at once must each get a prompt. With a single slot
+/// the second overwrote the first, and that session sat blocked until its
+/// 30-minute confirmation timeout with nothing on screen to explain it.
+#[test]
+fn concurrent_tofu_prompts_queue_instead_of_overwriting() {
+    let mut mgr = ChatManager::default();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    // Receivers must outlive the assertions: dropping one closes the channel
+    // and `confirm_fingerprint` would fail for reasons unrelated to the queue.
+    let mut confirm_rx = Vec::new();
+    for (session, name) in [(first, "Peer A"), (second, "Peer B")] {
+        mgr.create_local_chat_for_test(session, name.into());
+        let (tx, rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(session, tx);
+        confirm_rx.push(rx);
+    }
+
+    mgr.handle_tofu_verification(first, "FP-A", "Peer A", "11-11-11");
+    mgr.handle_tofu_verification(second, "FP-B", "Peer B", "22-22-22");
+
+    assert_eq!(mgr.pending_fingerprint_count(), 2);
+    assert_eq!(
+        mgr.pending_fingerprint().unwrap().session_id,
+        first,
+        "the first peer to arrive is answered first"
+    );
+
+    // Answering the first surfaces the second rather than losing it.
+    mgr.confirm_fingerprint(first, true).unwrap();
+    assert_eq!(mgr.pending_fingerprint_count(), 1);
+    assert_eq!(mgr.pending_fingerprint().unwrap().session_id, second);
+    assert_eq!(
+        mgr.get_chat(first).unwrap().peer_fingerprint.as_deref(),
+        Some("FP-A"),
+        "accepting must persist that peer's fingerprint"
+    );
+
+    // Rejecting the second clears the queue (that session is about to die).
+    mgr.confirm_fingerprint(second, false).unwrap();
+    assert_eq!(mgr.pending_fingerprint_count(), 0);
+    drop(confirm_rx);
+}
+
+/// A prompt for a session that died can never be answered; leaving it queued
+/// would block every peer behind it.
+#[test]
+fn a_dead_session_drops_its_queued_tofu_prompt() {
+    let mut mgr = ChatManager::default();
+    let session_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(session_id, "Peer".into());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+    mgr.handle_tofu_verification(session_id, "FP", "Peer", "");
+    assert_eq!(mgr.pending_fingerprint_count(), 1);
+
+    mgr.handle_session_event(session_id, SessionEvent::Disconnected);
+
+    assert_eq!(mgr.pending_fingerprint_count(), 0);
+}
+
+/// Reconnecting must not relabel a conversation the user named themselves.
+#[test]
+fn reconnect_keeps_a_user_chosen_title() {
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "192.168.1.20:12345".into());
+
+    mgr.rename_chat(chat_id, "Mum".into()).unwrap();
+    assert!(mgr.get_chat(chat_id).unwrap().title_is_custom);
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::Connected {
+            peer: "192.168.1.20:12345".into(),
+        },
+    );
+
+    assert_eq!(mgr.get_chat(chat_id).unwrap().title, "Mum");
+}
+
+/// A conversation the user has NOT renamed still gets the peer label, so the
+/// fix does not freeze auto-generated titles.
+#[test]
+fn reconnect_still_labels_an_unnamed_chat_with_the_peer() {
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "connecting".into());
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::Connected {
+            peer: "10.0.0.5:9000".into(),
+        },
+    );
+
+    assert_eq!(mgr.get_chat(chat_id).unwrap().title, "10.0.0.5:9000");
+}
+
+/// The wire sequence restarts at 1 for every session, but `recv_seq` lives on
+/// the Chat. Left alone, everything the peer sends after a reconnect is at or
+/// below the previous session's high-water mark and is discarded as a replay.
+#[test]
+fn reconnect_resets_the_replay_high_water_mark() {
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    mgr.get_chat_mut(chat_id).unwrap().recv_seq = 42;
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::Connected {
+            peer: "10.0.0.5:9000".into(),
+        },
+    );
+    assert_eq!(mgr.get_chat(chat_id).unwrap().recv_seq, 0);
+
+    // And the peer's first message on the new session is accepted.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::Text {
+            text: "first message after reconnect".into(),
+            timestamp: 0,
+            seq: 1,
+        }),
+    );
+    assert_eq!(mgr.get_chat(chat_id).unwrap().messages.len(), 1);
+}
+
+/// Same, host side: a returning peer reuses its chat id, so the entry already
+/// exists and its counter must be reset along with the new session.
+#[test]
+fn host_side_reconnect_resets_the_replay_high_water_mark() {
+    let mut mgr = ChatManager::default();
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.get_chat_mut(incoming).unwrap().recv_seq = 99;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+    mgr.handle_session_event(
+        session_id,
+        SessionEvent::NewConnection {
+            peer_addr: "10.0.0.5:40000".into(),
+            fingerprint: "FP".into(),
+            sas: String::new(),
+            chat_id: incoming,
+        },
+    );
+
+    assert_eq!(mgr.get_chat(incoming).unwrap().recv_seq, 0);
+}
+
+/// Declining an incoming file must tell the sender to stop. Without the
+/// FileCancel the decision only ever reached our own disk: a declined 5 GB
+/// offer still crossed the wire in full.
+#[test]
+fn declining_a_file_tells_the_sender_to_stop() {
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let mut app_rx = wire_session_for_test(&mut mgr, chat_id);
+    // auto_accept off (the default) holds the transfer for the user's decision.
+    let transfer_id = mgr
+        .start_receiving_file(chat_id, "huge.iso", 5_000_000_000)
+        .unwrap();
+
+    mgr.reject_incoming_file(transfer_id).unwrap();
+
+    let frame = app_rx.try_recv().expect("a FileCancel must be queued");
+    assert!(
+        matches!(frame, ProtocolMessage::FileCancel { .. }),
+        "expected FileCancel, got {:?}",
+        frame
+    );
+}
+
+/// A disconnect mid-receive must fail the transfer, not leave a progress row
+/// stuck at its last byte count with the chat's incoming slot still occupied.
+#[test]
+fn disconnect_fails_an_in_flight_incoming_transfer() {
+    let mut mgr = ChatManager::default();
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+    let _app_rx = wire_session_for_test(&mut mgr, session_id);
+    let transfer_id = mgr
+        .start_receiving_file(incoming, "big.bin", 1_000_000)
+        .unwrap();
+
+    mgr.handle_session_event(session_id, SessionEvent::Disconnected);
+
+    let state = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.id == transfer_id)
+        .expect("the transfer is still listed, so its state must be honest");
+    assert!(
+        matches!(state.status, TransferStatus::Failed(_)),
+        "expected Failed, got {:?}",
+        state.status
+    );
+    assert!(
+        mgr.active_incoming_transfer_id_for_chat(incoming).is_none(),
+        "the chat's incoming slot must be free so the peer can retry"
+    );
+}
+
+/// Two concurrent sends on one conversation interleave their chunks on the
+/// wire (`FileChunk` carries no transfer id) and corrupt both files, so the
+/// second must be refused rather than started.
+#[tokio::test]
+async fn a_second_concurrent_file_send_is_refused() {
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    std::fs::write(&a, vec![1u8; 4096]).unwrap();
+    std::fs::write(&b, vec![2u8; 4096]).unwrap();
+
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    // Keep the file lane's receiver alive so the first send can queue FileMeta.
+    let (file_tx, _file_rx) = mpsc::channel(FILE_LANE_CAPACITY);
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: app_tx,
+            file_tx,
+        },
+    );
+
+    mgr.send_file(chat_id, a)
+        .await
+        .expect("the first send starts");
+    let err = mgr
+        .send_file(chat_id, b)
+        .await
+        .expect_err("a second concurrent send must be refused, not interleaved");
+    assert!(
+        err.to_string().contains("Still sending"),
+        "the error must name the conflict, got: {}",
+        err
+    );
 }

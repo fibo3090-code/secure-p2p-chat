@@ -82,15 +82,24 @@ impl ChatManager {
             return;
         }
 
-        // Have we already confirmed this fingerprint elsewhere (another chat with
-        // this peer, or a saved contact)? Then it's a returning peer under TOFU and
-        // we accept without another prompt. Computed before the mutable borrow below.
+        // Have we already *confirmed* this fingerprint elsewhere — another chat
+        // with this peer, or a contact whose fingerprint we actually verified?
+        // Then it's a returning peer under TOFU and we accept without another
+        // prompt. Computed before the mutable borrow below.
+        //
+        // A contact only counts when its trust state says the fingerprint was
+        // confirmed. Matching *any* contact meant that pasting an invite link
+        // pre-trusted whatever fingerprint it named: the peer then connected
+        // with no SAS prompt at all, which is the one check the whole product
+        // is built around. An imported contact starts `Unverified`, so it now
+        // has to pass verification like anyone else — and becomes `Verified`
+        // through `promote_contact_verified` once it does.
         let known_trusted = self.chats.iter().any(|(id, c)| {
             *id != actual_chat_id && c.peer_fingerprint.as_deref() == Some(fingerprint)
-        }) || self
-            .contacts
-            .values()
-            .any(|c| c.fingerprint.as_deref() == Some(fingerprint));
+        }) || self.contacts.values().any(|c| {
+            c.fingerprint.as_deref() == Some(fingerprint)
+                && matches!(c.trust_state, TrustState::Verified | TrustState::Trusted)
+        });
 
         let chat = match self.chats.get_mut(&actual_chat_id) {
             Some(c) => c,
@@ -124,18 +133,26 @@ impl ChatManager {
                     // the matching contact (returning peer stays consistent).
                     self.promote_contact_verified(actual_chat_id, fingerprint);
                 } else {
-                    // Request explicit user verification via UI
-                    // Note: fingerprint_verification_request uses the SESSION ID
-                    // because confirmation (accept/reject) must be sent to that session's task.
-                    self.fingerprint_verification_request = Some(PendingFingerprint {
+                    // Request explicit user verification via UI.
+                    // Note: the prompt is keyed by SESSION ID because the
+                    // accept/reject decision must be sent to that session's task.
+                    // Queued, not assigned: two peers dialing a host at once
+                    // must each get their prompt rather than the second silently
+                    // replacing the first and stranding that session.
+                    self.queue_fingerprint_request(PendingFingerprint {
                         fingerprint: fingerprint.to_string(),
                         peer_name: peer_name.to_string(),
                         sas: sas.to_string(),
                         session_id,
                     });
+                    let waiting = self.pending_fingerprint_count();
                     self.add_toast(
                         ToastLevel::Warning,
-                        "Fingerprint verification required".to_string(),
+                        if waiting > 1 {
+                            format!("Fingerprint verification required ({} waiting)", waiting)
+                        } else {
+                            "Fingerprint verification required".to_string()
+                        },
                     );
                 }
             }
@@ -161,7 +178,7 @@ impl ChatManager {
                     fingerprint
                 );
                 // Trigger the UI dialog for manual verification using the session ID.
-                self.fingerprint_verification_request = Some(PendingFingerprint {
+                self.queue_fingerprint_request(PendingFingerprint {
                     fingerprint: fingerprint.to_string(),
                     peer_name: peer_name.to_string(),
                     sas: sas.to_string(),
@@ -200,11 +217,24 @@ impl ChatManager {
                 }
 
                 if let Some(chat) = self.chats.get_mut(&chat_id) {
-                    chat.title = peer;
+                    // Only re-derive the title from the peer label when the user
+                    // has not named this conversation themselves — otherwise a
+                    // reconnect silently replaced "Mum" with an IP:port.
+                    if !chat.title_is_custom {
+                        chat.title = peer;
+                    }
                     chat.is_host_placeholder = false;
                     if hole_punched {
                         chat.transport = Transport::Direct;
                     }
+                    // A fresh session restarts the wire sequence at 1, but this
+                    // chat's high-water mark is left over from the previous
+                    // one — everything at or below it would be rejected as a
+                    // replay, silently swallowing the peer's first messages.
+                    // Transport-layer replay protection is per session and
+                    // still enforced in `run_message_loop`.
+                    chat.recv_seq = 0;
+                    chat.send_seq = 0;
                 }
             }
 
@@ -220,6 +250,31 @@ impl ChatManager {
                     incoming_chat_id,
                     chat_id,
                 );
+
+                // A returning peer belongs in the conversation it already has.
+                //
+                // The host keys incoming chats by the *client's* chat id, which
+                // is fresh whenever the client hasn't kept its own mapping — so
+                // every reconnect used to open another "Peer ab12cd34" and the
+                // history fragmented into a pile of near-identical threads. The
+                // fingerprint arrives verified (the identity proof was checked
+                // before this event), so it is the right key: prefer an existing
+                // conversation with that fingerprint over the id we were handed.
+                //
+                // Only an idle one, though — a chat with a live session belongs
+                // to a connection that is still running, and merging a second
+                // peer into it would cross two conversations together.
+                let incoming_chat_id = self
+                    .chats
+                    .iter()
+                    .find(|(id, c)| {
+                        c.peer_fingerprint.as_deref() == Some(fingerprint.as_str())
+                            && !c.is_host_placeholder
+                            && **id != chat_id
+                            && !self.is_connected(id)
+                    })
+                    .map(|(id, _)| *id)
+                    .unwrap_or(incoming_chat_id);
 
                 // Map incoming_chat_id to the session's chat_id (the placeholder host chat)
                 // This allows messages sent to incoming_chat_id to be routed to the session
@@ -255,7 +310,15 @@ impl ChatManager {
                 // left as a stale Direct — the same fix applied in connect_via_relay.
                 self.chats
                     .entry(incoming_chat_id)
-                    .and_modify(|c| c.transport = inherited_transport)
+                    .and_modify(|c| {
+                        c.transport = inherited_transport;
+                        // Reconnect onto an existing conversation: the peer's
+                        // wire sequence restarts at 1 for the new session, so a
+                        // leftover high-water mark would reject everything it
+                        // sends until it climbs past the old one.
+                        c.recv_seq = 0;
+                        c.send_seq = 0;
+                    })
                     .or_insert_with(|| Chat {
                         id: incoming_chat_id,
                         title,
@@ -274,6 +337,7 @@ impl ChatManager {
                         recv_seq: 0,
                         is_host_placeholder: false,
                         read_count: 0,
+                        title_is_custom: false,
                     });
 
                 // If this connection consumes a placeholder host chat, remove the placeholder
@@ -499,6 +563,17 @@ impl ChatManager {
 
                         let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
                         if let Some(transfer_id) = transfer_id {
+                            // An offer the user has not accepted yet still
+                            // spools to disk, because the sender streams
+                            // without waiting for a decision. Uncapped, that
+                            // means a peer can put up to MAX_FILE_SIZE (10 GiB)
+                            // on the disk while the accept/decline prompt is
+                            // still on screen. Past the cap the offer is
+                            // declined for them.
+                            if self.unaccepted_spool_exceeded(transfer_id) {
+                                self.auto_decline_oversized_offer(transfer_id);
+                                return;
+                            }
                             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                                 transfer.seq += 1;
                                 tracing::debug!(
@@ -729,6 +804,11 @@ impl ChatManager {
                 tracing::warn!("Session {} disconnected", chat_id);
                 self.add_toast(ToastLevel::Warning, "Connection lost".to_string());
                 self.fail_pending_file_sends(chat_id, "connection lost");
+                // Receives die with the session too. This must run before the
+                // chat_id_mapping entries below are dropped — that mapping is
+                // how a host-side session id resolves to the conversation the
+                // transfer is tracked under.
+                self.fail_incoming_transfers(chat_id, "connection lost");
 
                 // Clean up session (unacked messages simply stay unmarked).
                 self.sessions.remove(&chat_id);
@@ -736,6 +816,24 @@ impl ChatManager {
                 self.chat_id_mapping.retain(|_, v| *v != chat_id);
                 self.pending_text_sends.remove(&chat_id);
                 self.awaiting_ack.retain(|(sid, _), _| *sid != chat_id);
+                self.fingerprint_confirm_senders.remove(&chat_id);
+
+                // A listener that died without ever accepting anyone leaves its
+                // placeholder chat behind, and `check_rehost_needed()` then
+                // reports "a placeholder exists, nothing to do" forever — so the
+                // app shows a Host conversation with no listener under it and
+                // never accepts another peer. Drop it and let auto-rehost rebind.
+                if self
+                    .chats
+                    .get(&chat_id)
+                    .is_some_and(|c| c.is_host_placeholder)
+                {
+                    tracing::info!(%chat_id, "Host placeholder removed: its listener is gone");
+                    self.chats.remove(&chat_id);
+                }
+                // A pending TOFU prompt for a session that just died can never
+                // be answered; leaving it queued blocks the next peer's prompt.
+                self.drop_fingerprint_requests_for_session(chat_id);
             }
 
             SessionEvent::Error(err) => {

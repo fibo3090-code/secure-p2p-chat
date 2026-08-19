@@ -38,6 +38,9 @@ pub enum TuiOverlay {
     },
     Identity,
     Transfers,
+    /// The Communities pane: servers, channels, members with their roles, and
+    /// the files shared where you can see them.
+    Party,
     Password {
         mode: PasswordMode,
     },
@@ -97,6 +100,7 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         TuiOverlay::Invite { link } => render_invite(f, &link, area),
         TuiOverlay::Identity => render_identity(f, app, area),
         TuiOverlay::Transfers => render_transfers(f, app, area),
+        TuiOverlay::Party => render_party(f, app, area),
         TuiOverlay::Password { mode } => render_password(f, app, mode, area),
         TuiOverlay::ConfirmQuit => render_confirm(
             f,
@@ -528,6 +532,225 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
         )),
         rows[1],
     );
+}
+
+/// The Communities pane: the servers you have joined, and for the selected one
+/// its channels (with their access rule), members (with role and presence), and
+/// the files shared where you can see them.
+///
+/// The commands remain the way to *act*; this is the surface that shows the
+/// state they act on, which command output could only ever print one slice of.
+fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
+    let area = centered_rect(84, 76, full);
+    let inner = clear_and_block(f, area, "Communities");
+
+    let servers = app.party_manager.server_ids();
+    if servers.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "You have not joined any communities.\n\n\
+                 Join one with:\n  \
+                 :party-connect <host[:port]> <username> [password]\n\n\
+                 The first time you connect to an address you will be shown the \
+                 server's code to check with its operator; run :party-trust to \
+                 accept it. Nothing — not your username, not the password — is \
+                 sent before you do.",
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray)),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let sel = app.party_sel.min(servers.len().saturating_sub(1));
+    // Server tabs across the top, so it is obvious which one the rest describes.
+    let tabs: Vec<Span> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let conn = app.party_manager.server(*id);
+            let name = conn
+                .map(|c| {
+                    if c.server_name.is_empty() {
+                        c.address.clone()
+                    } else {
+                        c.server_name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let style = if i == sel {
+                Style::default()
+                    .fg(BRAND_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Span::styled(format!(" {} ", name), style)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
+
+    let Some(conn) = servers
+        .get(sel)
+        .and_then(|id| app.party_manager.server(*id))
+    else {
+        return;
+    };
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(rows[1]);
+
+    // Left: channels and members.
+    let mut left: Vec<Line> = Vec::new();
+    left.push(Line::styled(
+        format!("{}  ({})", conn.address, party_status_label(&conn.status)),
+        Style::default().fg(Color::DarkGray),
+    ));
+    left.push(Line::raw(""));
+    left.push(Line::styled(
+        "CHANNELS",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    for c in &conn.channels {
+        // The kind is the access rule, so it belongs next to the name rather
+        // than being something you have to remember per channel.
+        let suffix = match c.kind {
+            messenger_core::party::ChannelKind::Public => String::new(),
+            other => format!("  ({})", other.label().to_lowercase()),
+        };
+        left.push(Line::raw(format!("  #{}{}", c.name, suffix)));
+    }
+    left.push(Line::raw(""));
+    left.push(Line::styled(
+        "MEMBERS",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    for m in &conn.members {
+        let dot = if m.online { "●" } else { "○" };
+        let me = if Some(m.id) == conn.member_id {
+            " (you)"
+        } else {
+            ""
+        };
+        let role = if m.role == messenger_core::party::Role::Member {
+            String::new()
+        } else {
+            format!("  [{}]", m.role.label().to_lowercase())
+        };
+        let style = if m.online {
+            Style::default()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        left.push(Line::styled(
+            format!("  {} {}{}{}", dot, m.username, me, role),
+            style,
+        ));
+    }
+    f.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), cols[0]);
+
+    // Right: shared files and storage.
+    let mut right: Vec<Line> = Vec::new();
+    right.push(Line::styled(
+        "SHARED FILES",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if conn.files.is_empty() {
+        right.push(Line::styled(
+            "  none visible — :party-files refreshes this",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for file in conn.files.iter().take(14) {
+            right.push(Line::raw(format!(
+                "  {:<24} {:>9}  {} · {}",
+                truncate(&file.name, 24),
+                crate::util::format_size(file.size),
+                file.uploader_name,
+                file.location_name
+            )));
+        }
+        if conn.files.len() > 14 {
+            right.push(Line::styled(
+                format!("  … and {} more", conn.files.len() - 14),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    if let Some(q) = conn.quota {
+        right.push(Line::raw(""));
+        let used = crate::util::format_size(q.used);
+        let line = match q.limit {
+            Some(limit) => format!(
+                "  You: {} of {}   Server: {} of {}",
+                used,
+                crate::util::format_size(limit),
+                crate::util::format_size(q.server_used),
+                crate::util::format_size(q.server_limit)
+            ),
+            None => format!(
+                "  You: {} (no personal limit)   Server: {} of {}",
+                used,
+                crate::util::format_size(q.server_used),
+                crate::util::format_size(q.server_limit)
+            ),
+        };
+        right.push(Line::styled(line, Style::default().fg(Color::DarkGray)));
+    }
+    if let Some(err) = &conn.last_error {
+        right.push(Line::raw(""));
+        right.push(Line::styled(
+            format!("  {}", err),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    f.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), cols[1]);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "←/→ switch community · :party-files refresh · :party-role · :party-channel-access · Esc close",
+            Style::default().fg(Color::DarkGray),
+        )),
+        rows[2],
+    );
+}
+
+fn party_status_label(status: &crate::app::party_manager::PartyStatus) -> String {
+    use crate::app::party_manager::PartyStatus;
+    match status {
+        PartyStatus::Connecting => "connecting".to_string(),
+        PartyStatus::Joined => "joined".to_string(),
+        PartyStatus::Rejected(r) => format!("rejected: {r}"),
+        PartyStatus::Disconnected => "disconnected".to_string(),
+    }
+}
+
+/// Trim to `max` display columns, marking the cut so a truncated name does not
+/// read as the whole name.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) {

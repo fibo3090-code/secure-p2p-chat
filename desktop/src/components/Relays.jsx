@@ -12,16 +12,30 @@ import { Button, Input } from "./ui.jsx";
 import { api } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
-const LOCAL_RELAY_CMD = "cargo run -p encodeur_rsa_rust -- --relay-server --port 9000";
+// The crate that actually provides `--relay-server` (see client/src/main.rs).
+// This is a copy-paste command: a wrong crate name here is a user typing it into
+// a terminal and being told the package does not exist.
+const LOCAL_RELAY_CMD = "cargo run --release -p p2pem-classic -- --relay-server --port 9000";
 
 function Copyable({ value }) {
   const [done, setDone] = useState(false);
+  // writeText returns a promise, so a sync try/catch never sees a rejection:
+  // "Copied ✓" appeared even when the clipboard was blocked and nothing was
+  // copied. Await it, and say so when it fails.
+  async function copy() {
+    try {
+      await navigator.clipboard?.writeText(value);
+      setDone(true);
+      setTimeout(() => setDone(false), 1200);
+    } catch {
+      toast("Could not copy — select the text and copy it manually.", "error");
+    }
+  }
   return (
     <div className="rl-cmd">
       <code>{value}</code>
-      <button className="copy-btn" title="Copy" onClick={() => {
-        try { navigator.clipboard.writeText(value); setDone(true); setTimeout(() => setDone(false), 1200); } catch { /* */ }
-      }}><Icon name={done ? "check" : "copy"} size={15} /></button>
+      <button className="copy-btn" title={done ? "Copied" : "Copy"} aria-label={done ? "Copied" : "Copy"}
+        onClick={copy}><Icon name={done ? "check" : "copy"} size={15} /></button>
     </div>
   );
 }

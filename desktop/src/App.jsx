@@ -191,8 +191,15 @@ export default function App() {
       )));
       // Live file-transfer progress, shown in the chat pane.
       api.listTransfers().then(setTransfers).catch(() => {});
-      // Surface any pending TOFU prompt even if its one-shot event was missed.
-      api.pendingFingerprint().then((p) => { if (p) setFpReq((cur) => cur || p); }).catch(() => {});
+      // The pending TOFU prompt is authoritative state on the bridge, which
+      // holds a queue: adopt whichever is at the head (so a second peer's
+      // prompt is surfaced once the first is answered, instead of being lost),
+      // and drop ours when there is none left — a prompt whose session already
+      // died can never be answered, and an undismissable dialog for it would
+      // wedge the app.
+      api.pendingFingerprint()
+        .then((p) => setFpReq((cur) => (p && cur && cur.chat_id === p.chat_id ? cur : p)))
+        .catch(() => {});
       api.lockState().then(setLockedState).catch(() => {});
       setActiveId((cur) => {
         if (cur) {
@@ -381,7 +388,10 @@ export default function App() {
                 // panel rather than "select a conversation" with nothing to select.
                 isFirstRun={convs.length === 0}
                 onStart={openCreator}
-                onCancelTransfer={(id) => api.cancelTransfer(id).catch(() => {})}
+                // A swallowed failure here is a cancel button that does
+                // nothing, on a transfer the user is actively trying to stop.
+                onCancelTransfer={(id) =>
+                  api.cancelTransfer(id).catch((e) => toast(`Could not cancel: ${e}`, "error"))}
                 transfers={transfers.filter((t) =>
                   // done/cancelled rows can linger in the snapshot until the next
                   // transfer; the completed file already shows as a message, so

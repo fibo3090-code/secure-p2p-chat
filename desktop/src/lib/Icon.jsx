@@ -7,7 +7,7 @@ import {
   ArrowDown, ArrowLeft, ArrowLeftRight, ArrowUp, Check, ChevronDown,
   ChevronRight, Circle, Clock, Copy, Download, EllipsisVertical, Eye, EyeOff,
   File, Fingerprint, Folder, Globe, Hash, Info, Key, Lock, LockOpen,
-  MessageSquare, Monitor, Moon, Paperclip, Pencil, Plug, Plus, RefreshCw,
+  Megaphone, MessageSquare, Monitor, Moon, Paperclip, Pencil, Plug, Plus, RefreshCw,
   Satellite, Search, Send, Server, Settings, Shield, ShieldCheck, Sun,
   Trash2, TriangleAlert, User, Users, X,
 } from "lucide-react";
@@ -23,7 +23,7 @@ const MAP = {
   copy: Copy, refresh: RefreshCw, clock: Clock, globe: Globe, trash: Trash2,
   swap: ArrowLeftRight, more: EllipsisVertical, edit: Pencil, info: Info,
   plug: Plug, satellite: Satellite, hash: Hash, monitor: Monitor,
-  folder: Folder,
+  folder: Folder, megaphone: Megaphone,
 };
 
 export function Icon({ name, size = 18, ...rest }) {

@@ -31,6 +31,7 @@ fn sample_chat(title: &str) -> Chat {
         typing_since: None,
         is_host_placeholder: false,
         read_count: 0,
+        title_is_custom: false,
     }
 }
 

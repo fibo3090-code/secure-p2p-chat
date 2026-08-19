@@ -30,9 +30,25 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::core::{recv_packet, send_packet};
 use crate::network::punch::{attempt_punch, parse_candidates, PunchRole, MAX_PUNCH_CANDIDATES};
+use crate::network::ratelimit::RateLimiter;
 
 const RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 const RELAY_TOKEN_BYTES: usize = 16;
+/// How long a freshly accepted connection has to send its `Host`/`Join` frame.
+///
+/// Without this a peer could connect and simply never speak: `recv_relay_message`
+/// would await forever, holding a task and a socket for the life of the process.
+/// That is the cheapest possible denial of service against a public rendezvous.
+const RELAY_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Most rendezvous slots the server will hold at once. Each pending entry parks
+/// a task and a socket for up to [`RELAY_WAIT_TIMEOUT`], so an uncapped map is
+/// an uncapped memory cost paid by anyone who can open connections.
+const MAX_PENDING_RENDEZVOUS: usize = 1024;
+/// Connections one address may open to the relay within [`RELAY_RATE_WINDOW`].
+/// More generous than the community server's: a legitimate client reconnects
+/// per rendezvous attempt, and punch retries reuse the control connection.
+const RELAY_MAX_CONNECTIONS_PER_IP: usize = 20;
+const RELAY_RATE_WINDOW: Duration = Duration::from_secs(30);
 /// How long the server waits for both peers' punch outcomes before assuming
 /// the worst and bridging. Must exceed the client-side punch budget plus the
 /// selection grace, with margin for slow links.
@@ -125,10 +141,32 @@ fn punching_disabled_by_env() -> bool {
 pub async fn run_relay_server(port: u16) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    // Same hardening the community server's accept loop has: an unlimited
+    // connection rate against a public rendezvous is an unlimited task and
+    // memory cost, and every accepted socket parks a slot until it times out.
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::with_limits(
+        RELAY_MAX_CONNECTIONS_PER_IP,
+        RELAY_RATE_WINDOW,
+    )));
     tracing::info!("Relay server listening on port {}", port);
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        // A failed `accept` is almost always transient (the peer went away
+        // between the SYN and our accept, or we momentarily ran out of file
+        // descriptors). Propagating it with `?` would take the whole rendezvous
+        // down for the life of the process over a single hiccup.
+        let (stream, addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!(error = %e, "relay accept failed; continuing to listen");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if rate_limiter.lock().await.check(addr.ip()) {
+            tracing::warn!(%addr, "refusing relay connection: rate limit exceeded");
+            continue;
+        }
         tracing::info!("Relay client connected from {}", addr);
         let pending = pending.clone();
         tokio::spawn(async move {
@@ -371,7 +409,20 @@ fn build_request(token: &str, as_host: bool, try_punch: bool, local_port: u16) -
 }
 
 async fn handle_relay_connection(mut stream: TcpStream, pending: PendingMap) -> Result<()> {
-    match recv_relay_message::<RelayRequest>(&mut stream).await? {
+    // Bounded: a client that connects and then says nothing must not hold this
+    // task and socket open indefinitely.
+    let hello = tokio::time::timeout(
+        RELAY_HELLO_TIMEOUT,
+        recv_relay_message::<RelayRequest>(&mut stream),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "relay client sent no request within {}s",
+            RELAY_HELLO_TIMEOUT.as_secs()
+        )
+    })??;
+    match hello {
         RelayRequest::Host { token } => host_flow(stream, pending, token, None).await,
         RelayRequest::HostV2 { token, punch } => {
             host_flow(stream, pending, token, Some(sanitize_caps(punch))).await
@@ -402,6 +453,18 @@ async fn host_flow(
     let (rendezvous_tx, rendezvous_rx) = oneshot::channel();
     {
         let mut guard = pending.lock().await;
+        // Expired slots are only removed by their own timeout task, so sweep
+        // them here too before deciding the map is full — otherwise a burst of
+        // abandoned hosts would lock out legitimate ones for five minutes.
+        guard.retain(|_, entry| entry.created_at.elapsed() <= RELAY_WAIT_TIMEOUT);
+        if guard.len() >= MAX_PENDING_RENDEZVOUS {
+            send_relay_message(
+                &mut stream,
+                &RelayResponse::Error("Relay is at capacity, try again shortly".to_string()),
+            )
+            .await?;
+            bail!("relay rendezvous table is full ({MAX_PENDING_RENDEZVOUS} slots)");
+        }
         if guard.contains_key(&token) {
             send_relay_message(
                 &mut stream,

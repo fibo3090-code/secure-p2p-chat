@@ -7,6 +7,23 @@ import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
 import { api, onBridge, fmtTime } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
+import {
+  DrivePanel, AuditPanel, ChannelAccessDialog, ROLES, kindIcon,
+} from "./PartyAdmin.jsx";
+
+// Roles this viewer may actually assign to `member`, mirroring the server's rule
+// (`Role::may_assign` plus the "not at or above your own" check). Rendering the
+// full list meant an admin was offered `admin` for a peer admin — pre-selected,
+// even — and every attempt came back refused.
+function assignableRoles(myRole, member) {
+  if (member.is_me || member.role === "owner") return [];
+  const rank = { guest: 0, member: 1, admin: 2, owner: 3 };
+  const mine = rank[myRole] ?? 0;
+  if (mine < rank.admin) return [];
+  // You cannot touch somebody at or above your own level.
+  if ((rank[member.role] ?? 0) >= mine) return [];
+  return ROLES.filter((r) => rank[r] < mine);
+}
 
 const STATUS_LABEL = {
   connecting: "Connecting…",
@@ -28,12 +45,20 @@ function JoinForm({ onJoined, onCancel, initial }) {
   const [saved, setSaved] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // A server whose identity has never been seen before. Nothing has been sent
+  // to it yet — not the username, not the password — until the user confirms
+  // the code below.
+  const [verify, setVerify] = useState(null);
 
   useEffect(() => {
-    api.partySaved().then((s) => setSaved(s || [])).catch(() => {});
+    // A failure here is not cosmetic: parties.json holds the pinned fingerprint
+    // of every community, and the bridge refuses to join when it cannot be read.
+    api.partySaved()
+      .then((s) => setSaved(s || []))
+      .catch((e) => { setSaved([]); setErr(String(e)); });
   }, []);
 
-  async function joinWith(addr, user, pass) {
+  async function joinWith(addr, user, pass, trust = false) {
     setErr("");
     if (!addr.trim()) return setErr("Enter the server address.");
     if (!user.trim()) return setErr("Choose a username.");
@@ -41,14 +66,50 @@ function JoinForm({ onJoined, onCancel, initial }) {
       return setErr(`Username must be ${MAX_USERNAME_CHARS} characters or fewer.`);
     setBusy(true);
     try {
-      await api.partyJoin(addr.trim(), user.trim(), pass);
-      toast(`Joining ${addr.trim()}…`, "success");
+      const res = await api.partyJoin(addr.trim(), user.trim(), pass, trust);
+      if (res?.status === "verify") {
+        setVerify({ address: addr.trim(), username: user.trim(), password: pass, ...res });
+        return;
+      }
+      toast(`Connecting to ${addr.trim()}…`, "success");
+      setVerify(null);
       onJoined && onJoined();
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(String(e)); setVerify(null); }
     finally { setBusy(false); }
   }
 
   const join = () => joinWith(address, username, password);
+
+  if (verify) {
+    return (
+      <div className="chat-pane chat-empty">
+        <div className="chat-empty-inner" style={{ maxWidth: 460 }}>
+          <span className="chat-empty-ic"><Icon name="lock" size={28} /></span>
+          <div className="chat-empty-h">Verify this community server</div>
+          <div className="chat-empty-p">
+            You have never joined <code>{verify.address}</code> before. Your username and
+            password have <strong>not</strong> been sent yet. Ask the operator to read out
+            their code and check it matches:
+          </div>
+          <div className="verify-sas">{verify.sas}</div>
+          <details className="party-verify-adv">
+            <summary>Advanced: full fingerprint</summary>
+            <code className="vf-fp-code">{verify.fingerprint}</code>
+          </details>
+          <div className="party-join">
+            <Button icon="check" disabled={busy} full
+              onClick={() => joinWith(verify.address, verify.username, verify.password, true)}>
+              The code matches — join
+            </Button>
+            <Button variant="ghost" full disabled={busy}
+              onClick={() => { setVerify(null); setBusy(false); }}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="chat-pane chat-empty">
@@ -57,15 +118,20 @@ function JoinForm({ onJoined, onCancel, initial }) {
         <div className="chat-empty-h">Join a community</div>
         <div className="chat-empty-p">
           Communities are administered, multi-channel rooms that keep history, served by the
-          <code> messenger-server</code> crate. Verify the server's fingerprint out of band after joining.
+          <code> messenger-server</code> crate. The first time you join one you will be asked to
+          check its code with the operator before anything is sent.
         </div>
         {saved.length > 0 && (
           <div className="party-saved">
             <div className="party-saved-h">Your communities</div>
             {saved.map((p) => (
+              // Selecting a saved community fills the form; it does not join.
+              // Joining straight from the card sent whatever happened to be in
+              // the shared password box — so a password typed for one
+              // community went to whichever card was clicked next.
               <button key={p.address} className="party-saved-card" disabled={busy}
-                title={`Rejoin as ${p.username}`}
-                onClick={() => { setAddress(p.address); setUsername(p.username); joinWith(p.address, p.username, password); }}>
+                title={`Fill in ${p.username}@${p.address}`}
+                onClick={() => { setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); }}>
                 <Avatar name={p.name || p.address} size={28} party />
                 <span className="party-saved-txt">
                   <span className="party-saved-name">{p.name || p.address}</span>
@@ -75,7 +141,8 @@ function JoinForm({ onJoined, onCancel, initial }) {
               </button>
             ))}
             <div className="party-saved-hint">
-              Joining a password-protected community? Type the password below first, then click it.
+              Pick one to fill the form below, then add its password if it has one and press
+              Connect &amp; join.
             </div>
           </div>
         )}
@@ -103,7 +170,7 @@ function fmtBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function MessageRow({ m, onDownload }) {
+function MessageRow({ m, onDownload, downloading }) {
   const mine = m.from_me;
   const isFile = m.kind === "file";
   return (
@@ -111,12 +178,16 @@ function MessageRow({ m, onDownload }) {
       <div className="msg-bubble">
         {!mine && <span className="msg-author">{m.sender_name}</span>}
         {isFile ? (
-          <button className="msg-file" title={`Download ${m.text}`}
-            onClick={() => onDownload(m)} disabled={!m.hash}>
+          // A download is a round trip to the community server, so the click
+          // must visibly do something — without this the button looked inert
+          // and invited repeat clicks that each queued another request.
+          <button className="msg-file"
+            title={downloading ? "Downloading…" : `Download ${m.text}`}
+            onClick={() => onDownload(m)} disabled={!m.hash || downloading}>
             <Icon name="file" size={14} />
             <span className="msg-file-name">{m.text}</span>
             {m.size != null && <span className="msg-file-size">{fmtBytes(m.size)}</span>}
-            <Icon name="download" size={14} />
+            <Icon name={downloading ? "clock" : "download"} size={14} />
           </button>
         ) : (
           <span className="msg-text">{m.text}</span>
@@ -140,8 +211,14 @@ export function Parties() {
   const [confirmLeave, setConfirmLeave] = useState(false); // two-click leave confirmation
   const [unread, setUnread] = useState({});          // thread key -> unread count
   const [shown, setShown] = useState(150);           // message window (see Messages.jsx)
+  const [downloading, setDownloading] = useState({}); // content hash -> in-flight download
+  const [view, setView] = useState("chat");          // chat | drive | audit
+  const [accessFor, setAccessFor] = useState(null);  // channel being edited, or "new"
+  const [confirmDelCh, setConfirmDelCh] = useState(null); // channel id armed for deletion
   const scrollRef = useRef(null);
   useEffect(() => setShown(150), [sid, cid, dm]);
+  // Leaving a community must not strand you on its Drive.
+  useEffect(() => { setView("chat"); setConfirmDelCh(null); }, [sid]);
 
   const server = useMemo(() => servers.find((s) => s.id === sid) || null, [servers, sid]);
 
@@ -171,6 +248,22 @@ export function Parties() {
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
 
+  // Opening the Drive or the log asks the server for it; the answer arrives
+  // asynchronously and lands in the next `party-updated` tick.
+  useEffect(() => {
+    if (!sid || view === "chat") return;
+    const ask = view === "drive" ? api.partyRefreshFiles : api.partyRefreshAudit;
+    ask(sid).catch(() => {});
+  }, [sid, view]);
+
+  // Surface a completed governance action once, then clear it so it does not
+  // re-toast on every poll.
+  useEffect(() => {
+    if (!server?.last_notice) return;
+    toast(server.last_notice, "success");
+    api.partyClearNotice(server.id).catch(() => {});
+  }, [server?.last_notice, server?.id]);
+
   // Initial load + live refresh on every poll tick.
   useEffect(() => { loadServers(); }, [loadServers]);
   useEffect(() => {
@@ -193,7 +286,9 @@ export function Parties() {
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [msgs.length, cid, dm]);
+    // `view` matters: the chat pane unmounts for the Drive and log, so coming
+    // back mounts a fresh node at scrollTop 0 and the thread looks scrolled up.
+  }, [msgs.length, cid, dm, view]);
 
   if (!servers.length || adding) {
     return (
@@ -204,8 +299,24 @@ export function Parties() {
   }
 
   const peer = dm ? server?.members.find((m) => m.id === dm) : null;
-  const threadName = dm ? `✉ ${peer?.username || "member"}` : `# ${server?.channels.find((c) => c.id === cid)?.name || ""}`;
+  const channel = !dm ? server?.channels.find((c) => c.id === cid) : null;
+  const threadName = dm ? `✉ ${peer?.username || "member"}` : `# ${channel?.name || ""}`;
   const connected = server?.status === "joined";
+  const isAdmin = server?.my_role === "admin" || server?.my_role === "owner";
+  // A guest is read-only everywhere; a channel's kind can also refuse an
+  // ordinary member. The server decides either way — this only means the
+  // composer explains itself instead of accepting a message that gets refused.
+  const readOnly = server?.my_role === "guest";
+  const canSend = connected && !readOnly && (dm ? true : channel?.can_post !== false);
+  const composerHint = !connected
+    ? "Not connected"
+    : readOnly
+      ? "Your role on this server is read-only"
+      : !dm && channel?.can_post === false
+        ? channel.kind === "announce"
+          ? "Only admins can post to an announcement channel"
+          : "This channel is locked"
+        : `Message ${threadName}`;
 
   async function send() {
     const text = draft.trim();
@@ -231,10 +342,24 @@ export function Parties() {
   }
 
   // Download a file message's bytes and save them via the native dialog.
+  // Tracked per content hash so the card shows it is working: the request can
+  // take as long as the server takes to answer, and a click with no feedback
+  // is indistinguishable from a broken button.
+  // Accepts both shapes: a message card names the file in `text`, a Drive row
+  // in `name`. Reading only one of them saved the file as `undefined`.
   async function downloadFile(m) {
-    if (!server || !m.hash) return;
-    try { await api.partyDownloadFile(server.id, m.hash, m.text); }
+    if (!server || !m.hash || downloading[m.hash]) return;
+    const filename = m.text || m.name || "file";
+    setDownloading((d) => ({ ...d, [m.hash]: true }));
+    try { await api.partyDownloadFile(server.id, m.hash, filename); }
     catch (e) { toast(String(e), "error"); }
+    finally {
+      setDownloading((d) => {
+        const next = { ...d };
+        delete next[m.hash];
+        return next;
+      });
+    }
   }
 
   async function createChannel() {
@@ -249,6 +374,46 @@ export function Parties() {
     catch (e) { toast(String(e), "error"); }
   }
 
+  // Create a channel of a chosen kind, or change an existing one's access.
+  async function submitAccess({ name, kind, members }) {
+    if (!server) return;
+    try {
+      if (accessFor === "new") {
+        await api.partyCreateChannelKind(server.id, name, kind, members);
+      } else {
+        await api.partySetChannelAccess(server.id, accessFor.id, kind, members);
+      }
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  // Delete a channel and its history (two-click, admins only).
+  async function deleteChannel(channel) {
+    if (!server) return;
+    if (confirmDelCh !== channel.id) { setConfirmDelCh(channel.id); return; }
+    setConfirmDelCh(null);
+    try {
+      await api.partyDeleteChannel(server.id, channel.id);
+      if (cid === channel.id) setCid(null);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  async function setRole(member, role) {
+    if (!server) return;
+    try { await api.partySetRole(server.id, member.id, role); loadServers(); }
+    catch (e) { toast(String(e), "error"); }
+  }
+
+  async function deleteFile(f) {
+    if (!server) return;
+    try {
+      await api.partyDeleteFile(server.id, f.hash, f.location);
+      await api.partyRefreshFiles(server.id);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
   async function dismissError() {
     if (!server) return;
     try { await api.partyClearError(server.id); loadServers(); } catch { /* ignore */ }
@@ -258,6 +423,8 @@ export function Parties() {
   // locally. The server keeps the membership, so rejoining later resumes it.
   async function leave() {
     if (!server) return;
+    // The first click arms it; the label switches to spell out that the pinned
+    // fingerprint goes with it.
     if (!confirmLeave) { setConfirmLeave(true); return; }
     setConfirmLeave(false);
     try {
@@ -277,9 +444,13 @@ export function Parties() {
     setAdding(true);
   }
 
-  // Remove a dead entry without rejoining.
+  // Remove a dead entry without rejoining. Two-click like `leave`: this also
+  // discards the community's pinned fingerprint, so rejoining afterwards is an
+  // unverified first contact again.
   async function removeServer() {
     if (!server) return;
+    if (!confirmLeave) { setConfirmLeave(true); return; }
+    setConfirmLeave(false);
     try {
       await api.partyLeave(server.id);
       setDm(null); setCid(null);
@@ -311,13 +482,35 @@ export function Parties() {
         <div className="party-side-h">Channels</div>
         <div className="party-list">
           {server?.channels.map((c) => (
-            <button key={c.id} className={cx("party-item", !dm && c.id === cid && "is-active")}
-              onClick={() => { setDm(null); setCid(c.id); markRead(server.id, c.id, c.messages); }}>
-              <span className="party-hash">#</span> {c.name}
-              {unread[`${server.id}|${c.id}`] > 0 && (
-                <span className="party-unread">{unread[`${server.id}|${c.id}`]}</span>
+            <div key={c.id} className="party-row">
+              <button className={cx("party-item", view === "chat" && !dm && c.id === cid && "is-active")}
+                title={c.kind === "public" ? `#${c.name}` : `#${c.name} — ${c.kind}`}
+                onClick={() => {
+                  setView("chat"); setDm(null); setCid(c.id);
+                  markRead(server.id, c.id, c.messages);
+                }}>
+                <span className="party-hash"><Icon name={kindIcon(c.kind)} size={12} /></span> {c.name}
+                {unread[`${server.id}|${c.id}`] > 0 && (
+                  <span className="party-unread">{unread[`${server.id}|${c.id}`]}</span>
+                )}
+              </button>
+              {isAdmin && (
+                <span className="party-rowacts">
+                  <button title={`Change who can use #${c.name}`} onClick={() => setAccessFor(c)}>
+                    <Icon name="settings" size={13} />
+                  </button>
+                  <button
+                    className={cx(confirmDelCh === c.id && "is-confirm")}
+                    title={confirmDelCh === c.id
+                      ? `Click again to delete #${c.name} and all of its history.`
+                      : `Delete #${c.name}`}
+                    onBlur={() => setConfirmDelCh(null)}
+                    onClick={() => deleteChannel(c)}>
+                    <Icon name="trash" size={13} />
+                  </button>
+                </span>
               )}
-            </button>
+            </div>
           ))}
         </div>
         <div className="party-newch">
@@ -325,21 +518,47 @@ export function Parties() {
             onChange={(e) => setNewChannel(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && createChannel()} />
           <button title="Create channel" onClick={createChannel}><Icon name="plus" size={15} /></button>
+          {isAdmin && (
+            <button title="New channel with a specific kind" onClick={() => setAccessFor("new")}>
+              <Icon name="settings" size={15} />
+            </button>
+          )}
         </div>
 
         <div className="party-side-h">Members ({server?.members.length || 0})</div>
         <div className="party-list">
           {server?.members.map((m) => (
-            <button key={m.id} disabled={m.is_me}
-              className={cx("party-item", "party-member", dm === m.id && "is-active")}
-              onClick={() => { if (!m.is_me) { setDm(m.id); markRead(server.id, `dm-${m.id}`, m.dm_messages); } }}
-              title={m.is_me ? "You" : `Direct message ${m.username}`}>
-              <span className={cx("party-dot", m.online ? "is-online" : "is-offline")} />
-              {m.is_me ? <>{m.username} <span className="party-you">you</span></> : <><Icon name="user" size={12} /> {m.username}</>}
-              {!m.is_me && unread[`${server.id}|dm-${m.id}`] > 0 && (
-                <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
+            <div key={m.id} className="party-row">
+              <button disabled={m.is_me}
+                className={cx("party-item", "party-member", view === "chat" && dm === m.id && "is-active")}
+                onClick={() => {
+                  if (m.is_me) return;
+                  setView("chat"); setDm(m.id);
+                  markRead(server.id, `dm-${m.id}`, m.dm_messages);
+                }}
+                title={m.is_me ? "You" : `Direct message ${m.username}`}>
+                <span className={cx("party-dot", m.online ? "is-online" : "is-offline")} />
+                {m.is_me ? <>{m.username} <span className="party-you">you</span></> : <><Icon name="user" size={12} /> {m.username}</>}
+                {m.role !== "member" && (
+                  <span className={cx("party-role", "role-" + m.role)}>{m.role}</span>
+                )}
+                {!m.is_me && unread[`${server.id}|dm-${m.id}`] > 0 && (
+                  <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
+                )}
+              </button>
+              {/* Offered only where the server would actually agree: you cannot
+                  change your own role, the owner's, or that of a peer at your
+                  own level, and you can only grant roles below your own. */}
+              {assignableRoles(server?.my_role, m).length > 0 && (
+                <select className="party-rolesel" value={m.role}
+                  title={`Role for ${m.username}`}
+                  onChange={(e) => setRole(m, e.target.value)}>
+                  {assignableRoles(server?.my_role, m).map((r) => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
               )}
-            </button>
+            </div>
           ))}
         </div>
       </aside>
@@ -361,12 +580,33 @@ export function Parties() {
             </div>
           </div>
           <div className="party-head-r">
+            <div className="party-views" role="tablist" aria-label="Community view">
+              <button role="tab" aria-selected={view === "chat"}
+                className={cx("party-view", view === "chat" && "is-active")}
+                onClick={() => setView("chat")} title="Conversation">
+                <Icon name="message" size={14} />
+              </button>
+              <button role="tab" aria-selected={view === "drive"}
+                className={cx("party-view", view === "drive" && "is-active")}
+                onClick={() => setView("drive")} title="Shared files">
+                <Icon name="folder" size={14} />
+              </button>
+              {isAdmin && (
+                <button role="tab" aria-selected={view === "audit"}
+                  className={cx("party-view", view === "audit" && "is-active")}
+                  onClick={() => setView("audit")} title="Activity log">
+                  <Icon name="clock" size={14} />
+                </button>
+              )}
+            </div>
             <div className="party-fp" title="Verify this out of band">
               <Icon name="fingerprint" size={13} />
               <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
             </div>
             <button className={cx("party-leave", confirmLeave && "is-confirm")}
-              title={confirmLeave ? "Click again to confirm leaving" : "Leave this community"}
+              title={confirmLeave
+                ? "Click again to leave. This also forgets the server's verified fingerprint, so rejoining means checking its code again."
+                : "Leave this community"}
               onClick={leave} onBlur={() => setConfirmLeave(false)}>
               <Icon name="x" size={14} /> {confirmLeave ? "Leave?" : "Leave"}
             </button>
@@ -393,32 +633,54 @@ export function Parties() {
           </div>
         )}
 
-        <div className="chat-scroll" ref={scrollRef}>
-          <div className="chat-thread">
-            {msgs.length === 0 && <div className="conv-empty">No messages yet.</div>}
-            {msgs.length > shown && (
-              <button className="thread-more" onClick={() => setShown((s) => s + 150)}>
-                Show earlier messages ({msgs.length - shown} more)
-              </button>
-            )}
-            {msgs.slice(-shown).map((m, i) => <MessageRow key={i} m={m} onDownload={downloadFile} />)}
-          </div>
-        </div>
+        {view === "drive" && (
+          <DrivePanel server={server} downloading={downloading}
+            onDownload={downloadFile} onDelete={deleteFile} />
+        )}
+        {view === "audit" && <AuditPanel server={server} />}
 
-        <div className="composer">
-          <button className="composer-clip" onClick={sendFile} title="Share a file" disabled={!connected}>
-            <Icon name="paperclip" size={18} />
-          </button>
-          <textarea className="composer-input" rows={1}
-            placeholder={connected ? `Message ${threadName}` : "Not connected"}
-            disabled={!connected}
-            value={draft} onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }} />
-          <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={send} title="Send" disabled={!connected}>
-            <Icon name="send" size={18} />
-          </button>
-        </div>
+        {view === "chat" && (
+          <>
+            <div className="chat-scroll" ref={scrollRef}>
+              <div className="chat-thread">
+                {msgs.length === 0 && <div className="conv-empty">No messages yet.</div>}
+                {msgs.length > shown && (
+                  <button className="thread-more" onClick={() => setShown((s) => s + 150)}>
+                    Show earlier messages ({msgs.length - shown} more)
+                  </button>
+                )}
+                {msgs.slice(-shown).map((m, i) => (
+                  <MessageRow key={i} m={m} onDownload={downloadFile}
+                    downloading={!!(m.hash && downloading[m.hash])} />
+                ))}
+              </div>
+            </div>
+
+            <div className="composer">
+              <button className="composer-clip" onClick={sendFile} title="Share a file"
+                disabled={!canSend}>
+                <Icon name="paperclip" size={18} />
+              </button>
+              <textarea className="composer-input" rows={1}
+                placeholder={composerHint}
+                disabled={!canSend}
+                value={draft} onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }} />
+              <button className={cx("composer-send", draft.trim() && "is-ready")} onClick={send}
+                title="Send" disabled={!canSend}>
+                <Icon name="send" size={18} />
+              </button>
+            </div>
+          </>
+        )}
       </main>
+
+      {accessFor && (
+        <ChannelAccessDialog server={server}
+          channel={accessFor === "new" ? null : accessFor}
+          onClose={() => setAccessFor(null)}
+          onSubmit={submitAccess} />
+      )}
     </div>
   );
 }

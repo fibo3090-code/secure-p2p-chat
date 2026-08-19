@@ -12,7 +12,7 @@ pub(crate) async fn start_host(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let (pk, name, fingerprint) = {
-        let id = state.identity.lock().unwrap();
+        let id = crate::lock_identity(&state.identity);
         (
             id.private_key().map_err(|e| e.to_string())?,
             id.name.clone(),
@@ -55,7 +55,7 @@ pub(crate) async fn connect_peer(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let pk = {
-        let id = state.identity.lock().unwrap();
+        let id = crate::lock_identity(&state.identity);
         id.private_key().map_err(|e| e.to_string())?
     };
     let mut mgr = state.manager.lock().await;
@@ -172,7 +172,7 @@ pub(crate) async fn host_via_relay(
 ) -> Result<String, String> {
     ensure_ready(&state)?;
     let pk = {
-        let id = state.identity.lock().unwrap();
+        let id = crate::lock_identity(&state.identity);
         id.private_key().map_err(|e| e.to_string())?
     };
     state
@@ -194,7 +194,7 @@ pub(crate) async fn connect_via_relay(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let pk = {
-        let id = state.identity.lock().unwrap();
+        let id = crate::lock_identity(&state.identity);
         id.private_key().map_err(|e| e.to_string())?
     };
     state

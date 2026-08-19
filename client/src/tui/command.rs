@@ -76,6 +76,10 @@ pub enum TuiCommand {
         username: String,
         password: Option<String>,
     },
+    /// Accept the community server identity shown by the last `:party-connect`
+    /// and finish joining. Separate command because the credentials are only
+    /// sent once the user has confirmed the fingerprint out of band.
+    PartyTrust,
     PartyPost(String),
     /// Send a direct message to a member (by username or `#index`) on the current
     /// Party server.
@@ -90,6 +94,27 @@ pub enum TuiCommand {
     /// Download a shared file (matched by name or content-hash prefix) from the
     /// current Party server into the download directory.
     PartyDownload(String),
+    /// Open the Communities pane.
+    PartyPane,
+    /// Refresh the shared-file listing and storage usage.
+    PartyFiles,
+    /// Delete a shared file by name or hash.
+    PartyDeleteFile(String),
+    /// Change a member's role: `<username> <guest|member|admin>`.
+    PartyRole {
+        username: String,
+        role: String,
+    },
+    /// Change a channel's access: `<#channel> <public|private|locked|announce> [members…]`.
+    PartyChannelAccess {
+        channel: String,
+        kind: String,
+        members: Vec<String>,
+    },
+    /// Delete a channel and its history.
+    PartyDeleteChannel(String),
+    /// Show the server's activity log (admins only).
+    PartyAudit,
     PartyStatus,
 
     // --- settings ---
@@ -174,6 +199,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Join a Party server",
     ),
     (
+        "party-trust",
+        ":party-trust",
+        "Accept the community server identity shown by :party-connect and join",
+    ),
+    (
         "party-post",
         ":party-post <message>",
         "Post a message to the current Party channel",
@@ -199,6 +229,41 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Save a shared Party file to your download folder",
     ),
     ("party-status", ":party-status", "Show joined Party servers"),
+    (
+        "party",
+        ":party",
+        "Open the Communities pane (channels, members, files)",
+    ),
+    (
+        "party-files",
+        ":party-files",
+        "Refresh the shared-file list and your storage usage",
+    ),
+    (
+        "party-delete-file",
+        ":party-delete-file <name|hash>",
+        "Delete a file you shared (or any, as an admin)",
+    ),
+    (
+        "party-role",
+        ":party-role <username> <guest|member|admin>",
+        "Change a member's role (admins only)",
+    ),
+    (
+        "party-channel-access",
+        ":party-channel-access <#channel> <public|private|locked|announce> [members…]",
+        "Change who can read and post in a channel (admins only)",
+    ),
+    (
+        "party-delete-channel",
+        ":party-delete-channel <#channel>",
+        "Delete a channel and its history (admins only)",
+    ),
+    (
+        "party-audit",
+        ":party-audit",
+        "Show the community's activity log (admins only)",
+    ),
     ("rename", ":rename <title>", "Rename the selected chat"),
     ("delete", ":delete", "Delete the selected chat"),
     ("clear-history", ":clear-history", "Erase all chats and contacts"),
@@ -435,6 +500,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
                 password,
             })
         }
+        "party-trust" => Ok(TuiCommand::PartyTrust),
         "party-post" => {
             if rest.is_empty() {
                 return Err("Usage: :party-post <message>".to_string());
@@ -473,6 +539,45 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
             Ok(TuiCommand::PartyDownload(rest))
         }
         "party-status" => Ok(TuiCommand::PartyStatus),
+        "party" => Ok(TuiCommand::PartyPane),
+        "party-files" => Ok(TuiCommand::PartyFiles),
+        "party-audit" => Ok(TuiCommand::PartyAudit),
+        "party-delete-file" => {
+            if rest.is_empty() {
+                return Err("Usage: :party-delete-file <name|hash>".to_string());
+            }
+            Ok(TuiCommand::PartyDeleteFile(rest))
+        }
+        "party-delete-channel" => {
+            if rest.is_empty() {
+                return Err("Usage: :party-delete-channel <#channel>".to_string());
+            }
+            Ok(TuiCommand::PartyDeleteChannel(
+                rest.trim_start_matches('#').to_string(),
+            ))
+        }
+        "party-role" => {
+            let username = parts
+                .next()
+                .ok_or_else(|| "Usage: :party-role <username> <guest|member|admin>".to_string())?;
+            let role = parts
+                .next()
+                .ok_or_else(|| "Usage: :party-role <username> <guest|member|admin>".to_string())?;
+            Ok(TuiCommand::PartyRole {
+                username: username.to_string(),
+                role: role.to_ascii_lowercase(),
+            })
+        }
+        "party-channel-access" => {
+            let usage = "Usage: :party-channel-access <#channel> <public|private|locked|announce> [members…]";
+            let channel = parts.next().ok_or_else(|| usage.to_string())?;
+            let kind = parts.next().ok_or_else(|| usage.to_string())?;
+            Ok(TuiCommand::PartyChannelAccess {
+                channel: channel.trim_start_matches('#').to_string(),
+                kind: kind.to_ascii_lowercase(),
+                members: parts.map(str::to_string).collect(),
+            })
+        }
 
         "rename" => {
             if rest.is_empty() {

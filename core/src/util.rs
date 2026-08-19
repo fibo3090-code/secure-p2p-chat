@@ -177,23 +177,115 @@ pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
-/// Sanitize filename to prevent path traversal attacks
+/// Longest filename this function will emit, in **bytes**.
+///
+/// The limit that matters is the operating system's, and it is a byte limit
+/// (255 on Linux/macOS) — not a character one. The receivers also prepend
+/// `tmp_<uuid>_` (41 bytes) before creating the spool file, so a name that is
+/// legal on its own can still make `File::create` fail with `ENAMETOOLONG`.
+/// Budgeting 150 bytes leaves room for that prefix and for the `_1`, `_2`
+/// disambiguating suffixes added on a name collision.
+pub const MAX_FILENAME_BYTES: usize = 150;
+
+/// Windows treats these as device names in *any* directory and with any
+/// extension, so `Downloads\CON` or `Downloads\NUL.txt` do not name files at
+/// all — the rename onto them fails, and the transfer dies with an I/O error
+/// that says nothing about why.
+#[rustfmt::skip]
+const WINDOWS_RESERVED: &[&str] = &[
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// True for characters that must never survive into a filename we display or
+/// create: C0/C1 control codes (a newline in a chat file card, a `\r` that
+/// rewrites the line in a terminal UI) and the Unicode bidirectional overrides.
+///
+/// The bidi ones are the interesting case. `U+202E RIGHT-TO-LEFT OVERRIDE`
+/// makes `photo_gnp.exe` *render* as `photo_exe.png` in every UI that draws the
+/// name — the extension check still sees `.exe` and refuses to open it, but the
+/// user was shown a lie, which is the whole point of the trick.
+fn is_forbidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
+}
+
+/// Reduce a peer-supplied name to something safe to create on this machine and
+/// honest to display.
+///
+/// Guards, in order: path separators and shell-hostile characters, control and
+/// bidi-override characters, `..` traversal, Windows reserved device names,
+/// Windows' silent stripping of trailing dots/spaces, and a **byte** length
+/// budget ([`MAX_FILENAME_BYTES`]) that keeps the extension intact.
 pub fn sanitize_filename(filename: &str) -> String {
-    let mut sanitized = filename
+    let mut sanitized: String = filename
         .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
         .chars()
-        .take(255)
-        .collect::<String>();
+        .map(|c| if is_forbidden_char(c) { '_' } else { c })
+        .collect();
 
     // Collapse any path traversal patterns
     while sanitized.contains("..") {
         sanitized = sanitized.replace("..", "_");
     }
 
+    // Windows drops trailing dots and spaces, so `evil.exe .` would be created
+    // as `evil.exe`; strip them here rather than let the OS surprise us.
+    let sanitized = sanitized.trim_matches(|c: char| c == '.' || c == ' ');
+    let mut sanitized = truncate_filename_bytes(sanitized, MAX_FILENAME_BYTES);
+
+    // A reserved device name is only reserved as the *stem*, so prefixing it is
+    // enough and keeps the name recognisable.
+    let stem = sanitized
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if WINDOWS_RESERVED.contains(&stem.as_str()) {
+        sanitized = format!("_{sanitized}");
+    }
+
     if sanitized.is_empty() {
         "file".to_string()
     } else {
         sanitized
+    }
+}
+
+/// Cut `name` to at most `budget` bytes on a character boundary, preserving the
+/// extension when there is one. Truncating blindly would drop `.pdf` off a long
+/// name and leave the user with a file their system cannot open.
+fn truncate_filename_bytes(name: &str, budget: usize) -> String {
+    if name.len() <= budget {
+        return name.to_string();
+    }
+
+    // Only treat a short trailing segment as an extension; a "." in the middle
+    // of a very long name is not one.
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .filter(|ext| !ext.is_empty() && ext.len() <= 16)
+        .unwrap_or("");
+    let stem = if ext.is_empty() {
+        name
+    } else {
+        &name[..name.len() - ext.len() - 1]
+    };
+
+    // `+ 1` for the dot we re-add below.
+    let stem_budget = budget.saturating_sub(if ext.is_empty() { 0 } else { ext.len() + 1 });
+    let mut end = stem_budget.min(stem.len());
+    while end > 0 && !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = &stem[..end];
+
+    if ext.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{stem}.{ext}")
     }
 }
 
@@ -341,6 +433,76 @@ mod tests {
             sanitize_filename("file:with*bad?chars"),
             "file_with_bad_chars"
         );
+    }
+
+    /// The name is created on disk, so the budget that matters is the OS's
+    /// **byte** limit — and the receivers prepend `tmp_<uuid>_` before creating
+    /// the spool file, so the emitted name must leave room for that.
+    #[test]
+    fn sanitize_filename_budgets_bytes_not_chars() {
+        let ascii = sanitize_filename(&format!("{}.pdf", "a".repeat(400)));
+        assert!(
+            ascii.len() <= MAX_FILENAME_BYTES,
+            "{} bytes is over budget",
+            ascii.len()
+        );
+        assert!(ascii.ends_with(".pdf"), "the extension must survive");
+
+        // Multi-byte characters: 400 chars is 1600 bytes, and the cut must land
+        // on a character boundary (a panic here would be a slicing bug).
+        let wide = sanitize_filename(&format!("{}.txt", "é".repeat(400)));
+        assert!(wide.len() <= MAX_FILENAME_BYTES);
+        assert!(wide.ends_with(".txt"));
+
+        // Leaves room for the receiver's `tmp_<uuid>_` prefix under NAME_MAX.
+        assert!(MAX_FILENAME_BYTES + "tmp_".len() + 36 + 1 < 255);
+    }
+
+    /// `CON`/`NUL`/`COM1` are devices on Windows in every directory and with any
+    /// extension, so creating or renaming onto them fails.
+    #[test]
+    fn sanitize_filename_defuses_windows_device_names() {
+        for reserved in ["CON", "nul", "Com1.txt", "LPT9.log", "aux"] {
+            let safe = sanitize_filename(reserved);
+            let stem = safe.split('.').next().unwrap().to_ascii_lowercase();
+            assert!(
+                !WINDOWS_RESERVED.contains(&stem.as_str()),
+                "{reserved} sanitized to {safe}, still a device name"
+            );
+        }
+        // An ordinary name that merely starts with those letters is untouched.
+        assert_eq!(sanitize_filename("console.log"), "console.log");
+    }
+
+    /// U+202E makes `photo_gnp.exe` render as `photo_exe.png`. The open gate
+    /// still reads the real extension, but the user must not be shown a lie.
+    #[test]
+    fn sanitize_filename_strips_control_and_bidi_characters() {
+        let spoofed = sanitize_filename("photo_\u{202E}gnp.exe");
+        assert!(!spoofed.contains('\u{202E}'));
+        assert!(spoofed.ends_with(".exe"));
+
+        let newline = sanitize_filename("invoice\r\n.pdf");
+        assert!(!newline.contains('\r') && !newline.contains('\n'));
+
+        for c in ['\u{202A}', '\u{2066}', '\u{200F}', '\u{0007}'] {
+            let out = sanitize_filename(&format!("a{c}b.txt"));
+            assert!(!out.contains(c), "{c:?} survived sanitization");
+        }
+    }
+
+    /// Windows silently drops trailing dots and spaces, so `evil.exe .` would
+    /// land as `evil.exe` — decide that here instead of letting the OS do it.
+    #[test]
+    fn sanitize_filename_strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_filename("report.pdf . "), "report.pdf");
+        // A name made only of dots and spaces has nothing left to keep, so it
+        // must still come out as something creatable rather than empty.
+        for nothing in ["...", "   ", ". . .", ""] {
+            let out = sanitize_filename(nothing);
+            assert!(!out.is_empty(), "{nothing:?} sanitized to an empty name");
+            assert!(!out.starts_with('.') && !out.ends_with('.'), "{out:?}");
+        }
     }
 
     #[test]

@@ -325,6 +325,94 @@ unambiguous, a new server acknowledges every accepted join with an immediate
 rather than mistaken for a legacy server and pointlessly retried.
 `P2PEM_NO_HOLEPUNCH=1` disables punching client-side.
 
+## Party (Communities) protocol
+
+Rides *on top of* an established v3 tunnel to a community server: the handshake
+authenticates and encrypts the channel, and these frames carry the application
+semantics. Defined in `core/src/party/mod.rs`, shared verbatim by client and
+server. All frames are bincode-serialized `PartyRequest` / `PartyResponse`.
+
+### Framing and replay protection
+
+Every Party frame carries an 8-byte big-endian sequence number **inside** the
+encryption, so it is covered by the AEAD tag:
+
+```text
+encrypt(seq_be_u64 || bincode(message), aad = transport_aad)
+```
+
+Each direction of each connection keeps its own `FrameSeq`. A frame whose
+sequence does not *advance* the counter is rejected and the connection drops.
+Without this an on-path attacker could replay a captured `PostMessage` — or a
+server's `Message` broadcast — and both ends would accept it as new.
+
+### Authorization model
+
+- **`Role`** — `Guest < Member < Admin < Owner`, ordered so checks read as
+  `role >= Role::Admin`. The **first identity to join becomes the Owner**; every
+  later one is a Member. A role may only be granted strictly below the granter's
+  own, the owner is never demoted, and a second owner is never created.
+- **`ChannelKind`** — `Public` (all read/write), `Locked` and `Announce` (all
+  read, admins write), `Private` (only the channel's `members` list, plus admins).
+  `ListChannels` is filtered per member, so a private channel does not reveal its
+  existence to a non-member.
+- **Files** are access-checked at the *download* endpoint against the `file_refs`
+  table: a member may fetch a blob only if some surviving reference to it sits in
+  a channel they may read or a DM thread they are in. Unknown and forbidden give
+  the same answer, so the endpoint never reveals a file's existence.
+
+### Requests
+
+`Join`, `ListMembers`, `ListChannels`, `PostMessage`, `FetchHistory`, `SendDm`,
+`FetchDmHistory`, `CreateChannel`, `PostFile`, `SendFileDm`, `DownloadFile`,
+then the appended governance set: `CreateChannelOfKind`, `DeleteChannel`,
+`SetChannelAccess`, `SetRole`, `ListFiles`, `DeleteFile`, `FetchAuditLog`,
+`FetchQuota`.
+
+### Responses
+
+`Joined`, `JoinRejected`, `Members`, `Channels`, `MessagePosted`, `Message`,
+`History`, `FileData`, `Error`, `ActionFailed`, then the appended set: `Files`,
+`Quota`, `AuditLog`, `Ok`, `DirectoryChanged`.
+
+- **`ActionFailed`** exists separately from `Error` because the client appends
+  outgoing messages optimistically and has to know a refusal belongs to the
+  message still on screen, so it can take it back rather than leave the user
+  believing it was delivered. Correlated FIFO against the client's pending-send
+  queue.
+- **`DirectoryChanged`** is a nudge to re-request `ListChannels`, not the list
+  itself. The list is per member and the hub fans one identical frame out to
+  every connection, so broadcasting it would either leak private channels or
+  hide them from their own members.
+
+### History paging
+
+`FetchHistory` / `FetchDmHistory` return at most `MAX_HISTORY_BATCH` (200)
+envelopes; the client asks again with the last `seq` it received. A whole channel
+in one frame stopped fitting past `MAX_PACKET_SIZE` once history grew, and the
+send failure dropped the connection with nothing on screen to explain it. The
+client **merges** pages by server-assigned sequence rather than replacing.
+
+### Files
+
+Uploads are inline, bounded by `MAX_INLINE_FILE_BYTES` (4 MiB); chunked transfer
+for larger files is not yet implemented. Blobs are content-addressed by SHA-256,
+deduplicated, and reference-counted per share. `DeleteFile` drops one reference
+and reclaims the bytes when the last one goes — but **leaves the message in
+history**, because sequence numbers are the identity clients merge on and
+removing an envelope would renumber the channel for everyone who already had it.
+Clients verify downloaded bytes against the requested hash; the hash *is* the
+integrity check.
+
+### Compatibility
+
+The Party protocol is append-only: new variants go on the end of each enum,
+because bincode encodes a variant's index. Even so, **community clients and
+servers must ship together** across the release that added the per-frame
+sequence number and `MemberInfo::role` / `ChannelInfo::members` — an older
+client against a newer server drops the connection at the first frame. Anyone
+self-hosting a community server has to restart it on the matching version.
+
 ## Compatibility Notes
 
 - history/storage migrations are separate from wire compatibility

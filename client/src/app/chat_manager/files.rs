@@ -5,6 +5,16 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// How much of an *unaccepted* incoming file may spool to disk before the offer
+/// is declined automatically.
+///
+/// With `auto_accept_files` off (the default) an incoming `FileMeta` is held in
+/// `AwaitingAcceptance` while the sender keeps streaming — the wire has no way
+/// to pause it. Without a ceiling a peer can therefore write up to
+/// `MAX_FILE_SIZE` (10 GiB) into the temp directory of someone who has not
+/// agreed to receive anything, and the first sign of it is a full disk.
+pub const MAX_UNACCEPTED_SPOOL_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
 /// Arguments for [`ChatManager::spawn_file_stream`]. Grouped into a struct to
 /// keep the streamer's setup readable (and satisfy the too-many-arguments lint).
 struct SpawnFileStream {
@@ -31,6 +41,23 @@ impl ChatManager {
     /// lock, and it can be cancelled mid-flight via [`cancel_transfer`].
     pub async fn send_file(&mut self, chat_id: Uuid, path: std::path::PathBuf) -> Result<()> {
         tracing::info!(chat_id = %chat_id, path = %path.display().to_string(), "Preparing to send file");
+        // One outgoing transfer per conversation at a time. `FileChunk` carries
+        // no transfer id, so two concurrent streams on the same session
+        // interleave their chunks into whichever spool the receiver has open —
+        // silently corrupting BOTH files. Serializing here is what makes the
+        // wire format safe; do not relax it without adding a transfer id to the
+        // chunk frames on both sides of `protocol.rs`.
+        if let Some(existing) = self.active_outgoing_transfer_id_for_chat(chat_id) {
+            let in_flight = self
+                .active_transfers
+                .get(&existing)
+                .map(|t| t.filename.clone())
+                .unwrap_or_else(|| "another file".to_string());
+            bail!(
+                "Still sending {} in this conversation. Wait for it to finish, or cancel it first.",
+                in_flight
+            );
+        }
         let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
         let (control_tx, file_tx) = self
             .sessions
@@ -369,6 +396,57 @@ impl ChatManager {
             );
         }
     }
+    /// Abort every still-running *incoming* transfer on a session that just
+    /// died: mark it failed and delete its partial spool.
+    ///
+    /// `session_id` is what the event pump reports; transfers are tracked under
+    /// the conversation the UI displays, so it is resolved first (on the host
+    /// side those differ). Call this **before** the session's `chat_id_mapping`
+    /// entries are dropped, or the transfer can no longer be matched.
+    ///
+    /// Without it a mid-receive disconnect left a progress row stuck at its last
+    /// byte count forever plus an orphaned temp file on disk, and the chat's
+    /// incoming slot occupied so the peer could never retry the send.
+    pub(super) fn fail_incoming_transfers(&mut self, session_id: Uuid, reason: &str) {
+        let chat_id = self.resolve_display_chat_id(session_id);
+        let stranded: Vec<Uuid> = self
+            .active_transfers
+            .iter()
+            .filter_map(|(id, t)| {
+                let active = matches!(
+                    t.status,
+                    TransferStatus::Pending
+                        | TransferStatus::AwaitingAcceptance
+                        | TransferStatus::InProgress
+                );
+                (t.chat_id == chat_id && t.direction == TransferDirection::Incoming && active)
+                    .then_some(*id)
+            })
+            .collect();
+
+        for transfer_id in stranded {
+            self.pending_file_end.remove(&transfer_id);
+            if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+                if let Err(e) = incoming.abort_cleanup() {
+                    tracing::warn!(%transfer_id, error = %e, "Failed to clean up stranded transfer");
+                }
+            }
+            let filename = self
+                .active_transfers
+                .get_mut(&transfer_id)
+                .map(|t| {
+                    t.status = TransferStatus::Failed(reason.to_string());
+                    t.filename.clone()
+                })
+                .unwrap_or_default();
+            tracing::warn!(file = %filename, reason = %reason, "Incoming file transfer interrupted");
+            self.add_toast(
+                ToastLevel::Error,
+                format!("File transfer interrupted ({}): {}", reason, filename),
+            );
+        }
+    }
+
     /// Start receiving a file
     pub fn start_receiving_file(
         &mut self,
@@ -474,7 +552,17 @@ impl ChatManager {
         }
         transfer.status = TransferStatus::Cancelled;
         let filename = transfer.filename.clone();
+        let chat_id = transfer.chat_id;
         self.pending_file_end.remove(&transfer_id);
+        // Tell the sender to stop, exactly as `cancel_transfer` does. Without
+        // this, declining a 5 GB offer still pulls all 5 GB across the wire —
+        // the decision only ever reached our own disk.
+        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        if let Some(session) = self.sessions.get(&session_id) {
+            let _ = session
+                .from_app_tx
+                .send(ProtocolMessage::FileCancel { seq: 0 });
+        }
         if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
             if let Err(e) = incoming.abort_cleanup() {
                 tracing::warn!(
@@ -617,6 +705,64 @@ impl ChatManager {
         };
 
         anyhow!(message)
+    }
+
+    /// Whether an offer still awaiting the user's decision has spooled more
+    /// than [`MAX_UNACCEPTED_SPOOL_BYTES`] to disk.
+    pub(super) fn unaccepted_spool_exceeded(&self, transfer_id: Uuid) -> bool {
+        self.active_transfers.get(&transfer_id).is_some_and(|t| {
+            t.status == TransferStatus::AwaitingAcceptance
+                && t.received > MAX_UNACCEPTED_SPOOL_BYTES
+        })
+    }
+
+    /// Decline an offer on the user's behalf because it has spooled too much
+    /// while waiting for them.
+    ///
+    /// Silently accepting an unbounded spool is the wrong trade: the user asked
+    /// to approve incoming files, and "approve" cannot mean "we already wrote
+    /// nine gigabytes to your disk while you thought about it".
+    pub(super) fn auto_decline_oversized_offer(&mut self, transfer_id: Uuid) {
+        let filename = self
+            .active_transfers
+            .get(&transfer_id)
+            .map(|t| t.filename.clone())
+            .unwrap_or_else(|| "the incoming file".to_string());
+        if let Err(e) = self.reject_incoming_file(transfer_id) {
+            tracing::warn!(%transfer_id, error = %e, "could not decline an oversized held offer");
+            return;
+        }
+        self.add_toast(
+            ToastLevel::Warning,
+            format!(
+                "Declined {} automatically: more than {} arrived before you accepted it. \
+                 Turn on auto-accept, or ask them to resend once you are ready.",
+                filename,
+                crate::util::format_size(MAX_UNACCEPTED_SPOOL_BYTES)
+            ),
+        );
+    }
+
+    /// Forget everything tracked about one transfer, stopping its streaming
+    /// task first so a cancelled send does not keep reading from disk into a
+    /// channel nobody is draining. Used when the conversation itself goes away.
+    pub(super) fn clear_transfer_bookkeeping(&mut self, transfer_id: Uuid) {
+        if let Some(handle) = self.outgoing_transfers.remove(&transfer_id) {
+            handle.cancel.store(true, Ordering::Relaxed);
+        }
+        self.active_transfers.remove(&transfer_id);
+        self.incoming_files.remove(&transfer_id);
+        self.pending_file_end.remove(&transfer_id);
+    }
+
+    /// Every tracked transfer belonging to a conversation, whatever its state.
+    /// Used when the conversation itself goes away and all of its transfer
+    /// bookkeeping must go with it.
+    pub(super) fn transfer_ids_for_chat(&self, chat_id: Uuid) -> Vec<Uuid> {
+        self.active_transfers
+            .iter()
+            .filter_map(|(id, t)| (t.chat_id == chat_id).then_some(*id))
+            .collect()
     }
 
     fn transfer_ids_for_chat_with_status<F>(&self, chat_id: Uuid, mut predicate: F) -> Vec<Uuid>

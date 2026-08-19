@@ -80,11 +80,11 @@ pub(crate) async fn list_conversations(
 pub(crate) async fn mark_read(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     ensure_ready(&state)?;
     let chat_id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    {
-        let mut mgr = state.manager.lock().await;
-        mgr.mark_chat_read(chat_id);
-    }
-    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
+    state.manager.lock().await.mark_chat_read(chat_id);
+    // Like `send_message`, this fires often (every open, and again on each
+    // arrival in the open thread) and a save rewrites the entire history. The
+    // poll loop picks the new read mark up — `state_signature` includes it —
+    // and writes it within `HISTORY_SAVE_MIN_INTERVAL`.
     Ok(())
 }
 
@@ -212,7 +212,11 @@ pub(crate) async fn send_message(
         .await
         .send_message(uuid, text)
         .map_err(|e| e.to_string())?;
-    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
+    // Deliberately does NOT save here. Every save rewrites the whole encrypted
+    // history, so saving per message is quadratic over a conversation's life.
+    // The poll loop notices the change and writes it within
+    // `HISTORY_SAVE_MIN_INTERVAL`, and the window-close handler flushes — so
+    // the message is persisted, just not once per keystroke-batch.
     Ok(())
 }
 
@@ -220,12 +224,15 @@ pub(crate) async fn send_message(
 /// The picker runs on a blocking thread so it never stalls the async runtime;
 /// a cancelled dialog is a successful no-op.
 #[tauri::command]
-pub(crate) async fn send_file(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
+pub(crate) async fn send_file<R: tauri::Runtime>(
+    id: String,
+    window: tauri::WebviewWindow<R>,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
     ensure_ready(&state)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_file())
-        .await
-        .map_err(|e| e.to_string())?;
+    let picked =
+        crate::native_file_dialog(window, |d| d.set_title("Send a file").pick_file()).await?;
     let Some(path) = picked else {
         return Ok(()); // user cancelled
     };
@@ -275,14 +282,15 @@ pub(crate) async fn decline_transfer(
         .map_err(|e| e.to_string())
 }
 
-/// Resolve a file message's on-disk path from history. The webview only ever
+/// Resolve a file message's on-disk path from history, plus whether the user
+/// sent it (as opposed to receiving it from the peer). The webview only ever
 /// passes (chat id, message id) — never a raw filesystem path — so the bridge
 /// cannot be used to open or read arbitrary files.
 async fn file_message_path(
     state: &tauri::State<'_, Bridge>,
     id: &str,
     msg: &str,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, bool), String> {
     let chat_id = Uuid::parse_str(id).map_err(|e| e.to_string())?;
     let msg_id = Uuid::parse_str(msg).map_err(|e| e.to_string())?;
     let mgr = state.manager.lock().await;
@@ -295,7 +303,7 @@ async fn file_message_path(
         .find(|m| m.id == msg_id)
         .ok_or_else(|| "No such message".to_string())?;
     match &m.content {
-        MessageContent::File { path: Some(p), .. } => Ok(p.clone()),
+        MessageContent::File { path: Some(p), .. } => Ok((p.clone(), m.from_me)),
         MessageContent::File { path: None, .. } => {
             Err("This file's location was not recorded".to_string())
         }
@@ -339,22 +347,138 @@ fn open_path_os(path: &Path, reveal: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Extensions whose "open" action is really "run this code".
+///
+/// Checked on every platform rather than per-OS: a `.desktop` file is inert on
+/// Windows and a `.exe` is inert on Linux, but warning about the wrong one costs
+/// a dialog while missing the right one costs the machine. The list covers the
+/// launchers that need no interpreter of their own — the classic double
+/// extension (`holiday.jpg.exe`) lands here because only the final one counts.
+const RISKY_EXTENSIONS: &[&str] = &[
+    // Windows executables, installers and script hosts
+    "exe",
+    "com",
+    "scr",
+    "pif",
+    "bat",
+    "cmd",
+    "msi",
+    "msp",
+    "msc",
+    "cpl",
+    "hta",
+    "vbs",
+    "vbe",
+    "jse",
+    "wsf",
+    "wsh",
+    "ps1",
+    "psm1",
+    "reg",
+    "lnk",
+    "url",
+    "scf",
+    "inf",
+    "chm",
+    "application",
+    "gadget", // Cross-platform runtimes / scripts
+    "jar",
+    "js",
+    "py",
+    "pl",
+    "rb",
+    "php", // Unix shells and launchers
+    "sh",
+    "bash",
+    "zsh",
+    "command",
+    "desktop",
+    "run",
+    "appimage",
+    "app",
+    "pkg",
+    "deb",
+    "rpm",
+];
+
+/// The reason opening `path` would be handing a peer's file to the OS to
+/// execute, or `None` when it is ordinary content.
+///
+/// Returns the extension so the warning can name what it is about — "this is a
+/// .exe" is actionable, "this file may be dangerous" is not.
+fn execution_risk(path: &Path) -> Option<String> {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_ascii_lowercase();
+        if RISKY_EXTENSIONS.contains(&lower.as_str()) {
+            return Some(lower);
+        }
+    }
+    // On Unix the executable bit decides, with or without an extension: a peer
+    // can send a file named `notes` that runs on click.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some("executable".to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Outcome of [`open_file`]: either it opened, or it was held back because the
+/// file would execute and the user has not said to go ahead.
+#[derive(Serialize)]
+pub(crate) struct OpenOutcome {
+    opened: bool,
+    /// The risky extension (or "executable"), when `opened` is false.
+    blocked: Option<String>,
+    /// The file's name, for the confirmation prompt.
+    filename: Option<String>,
+}
+
 /// Open a sent/received file with the default app (`reveal: false`) or show it
 /// in the file manager (`reveal: true`). A file card in the chat is no longer
 /// a dead end — this is what its click and folder button call.
+///
+/// A file that ARRIVED FROM A PEER and would execute is refused unless
+/// `confirm` is set: "open" on a received `.exe`/`.lnk`/`.desktop` runs
+/// attacker-chosen code, and a chat file card is exactly where a user clicks
+/// without thinking. Revealing in the file manager is always allowed — it
+/// launches nothing. Files the user sent came off their own disk, so they are
+/// not gated.
 #[tauri::command]
 pub(crate) async fn open_file(
     id: String,
     msg: String,
     reveal: bool,
+    confirm: Option<bool>,
     state: tauri::State<'_, Bridge>,
-) -> Result<(), String> {
+) -> Result<OpenOutcome, String> {
     ensure_ready(&state)?;
-    let path = file_message_path(&state, &id, &msg).await?;
+    let (path, from_me) = file_message_path(&state, &id, &msg).await?;
     if !path.exists() {
         return Err(format!("File no longer exists on disk: {}", path.display()));
     }
-    open_path_os(&path, reveal).map_err(|e| e.to_string())
+    if !reveal && !from_me && !confirm.unwrap_or(false) {
+        if let Some(kind) = execution_risk(&path) {
+            return Ok(OpenOutcome {
+                opened: false,
+                blocked: Some(kind),
+                filename: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .or_else(|| Some(path.display().to_string())),
+            });
+        }
+    }
+    open_path_os(&path, reveal).map_err(|e| e.to_string())?;
+    Ok(OpenOutcome {
+        opened: true,
+        blocked: None,
+        filename: None,
+    })
 }
 
 /// Cap on how large an image is inlined as a preview; larger ones fall back to
@@ -372,7 +496,7 @@ pub(crate) async fn file_preview(
 ) -> Result<Option<String>, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     ensure_ready(&state)?;
-    let path = file_message_path(&state, &id, &msg).await?;
+    let (path, _from_me) = file_message_path(&state, &id, &msg).await?;
     let mime = messenger_core::util::guess_mime(&path);
     if !mime.starts_with("image/") || mime == "image/svg+xml" {
         return Ok(None);

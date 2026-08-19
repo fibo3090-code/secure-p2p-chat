@@ -221,18 +221,17 @@ impl ChatManager {
                 actual_session_chat_id,
                 was_established,
             );
+            // This MUST be an error, not a toast-and-Ok. A front-end reads
+            // success as "sent": it clears the composer and shows no message
+            // row, so the text the user typed is destroyed and only a
+            // four-second toast marks its passing. Failing loudly lets every
+            // caller keep the draft.
             if was_established {
-                self.add_toast(
-                    ToastLevel::Error,
-                    "Not delivered: the peer is disconnected. Reconnect (or ask them to) and try again.".to_string(),
-                );
-            } else {
-                self.add_toast(
-                    ToastLevel::Info,
-                    "Connecting... please wait before sending messages".to_string(),
+                bail!(
+                    "Not delivered: the peer is disconnected. Reconnect (or ask them to) and try again."
                 );
             }
-            return Ok(()); // Do not error; just inform the user and skip sending
+            bail!("Not connected yet — wait for the connection before sending.");
         }
 
         let session = self

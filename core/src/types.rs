@@ -39,6 +39,14 @@ pub struct Chat {
     /// unread rather than hiding a message the user never saw.
     #[serde(default)]
     pub read_count: usize,
+    /// True once the user has renamed this conversation. Session lifecycle
+    /// events (`Connected`) relabel a chat with the peer address they just
+    /// reached, which would otherwise silently overwrite "Mum" with
+    /// `192.168.1.20:12345` on every reconnect. Older history files load as
+    /// `false`, which only means the next connect may re-derive the title —
+    /// never that a name is lost.
+    #[serde(default)]
+    pub title_is_custom: bool,
 }
 
 impl Chat {
@@ -493,6 +501,29 @@ mod tests {
         c.read_count = 7;
         let back: Chat = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.read_count, 7);
+    }
+
+    /// A user's rename must survive a save/load cycle, and old history (which
+    /// predates the flag) must load without it rather than failing to parse.
+    #[test]
+    fn title_is_custom_persists_and_defaults_for_old_history() {
+        let json = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "title":"old","peer_fingerprint":null,"participants":[],
+            "messages":[],"created_at":"2020-01-01T00:00:00Z"
+        }"#;
+        let old: Chat = serde_json::from_str(json).unwrap();
+        assert!(
+            !old.title_is_custom,
+            "old history has no rename recorded, so the title is still derived"
+        );
+
+        let mut c = old.clone();
+        c.title = "Mum".to_string();
+        c.title_is_custom = true;
+        let back: Chat = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(back.title_is_custom);
+        assert_eq!(back.title, "Mum");
     }
 
     #[test]
