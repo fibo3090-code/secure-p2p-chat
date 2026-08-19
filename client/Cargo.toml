@@ -67,6 +67,9 @@ arboard = { workspace = true }
 unicode-width = { workspace = true }
 
 [dev-dependencies]
+# The Community server, so `tests/party_e2e.rs` can stand a real one up in
+# process. Acyclic: the server depends only on messenger-core.
+messenger-server = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
