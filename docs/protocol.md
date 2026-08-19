@@ -325,6 +325,35 @@ unambiguous, a new server acknowledges every accepted join with an immediate
 rather than mistaken for a legacy server and pointlessly retried.
 `P2PEM_NO_HOLEPUNCH=1` disables punching client-side.
 
+## Identity proof signatures
+
+The proof that binds an ephemeral key to an identity is signed with **Ed25519**
+when both peers offer it, and **RSA-PSS** otherwise. Peers exchange
+`SupportedSignatureSchemes` before the tunnel is established and take the
+strongest common one; a peer that offers only RSA-PSS still connects.
+
+**The identity is still the RSA key.** `IdentityProof.public_key_pem` carries
+it, and the peer fingerprint — what TOFU pins — is derived from it exactly as
+before. The Ed25519 key is a *subkey* of that identity, derived from the RSA
+private key with HKDF-SHA256 under the frozen label
+`p2pem-ed25519-identity-subkey-v1`, so it is deterministic per identity and no
+keystore change was needed.
+
+An Ed25519 proof therefore carries two extra fields:
+
+- `ed25519_public` — the 32-byte subkey used to sign.
+- `ed25519_binding` — an RSA-PSS signature by the identity over
+  `SHA-256("P2PEM_ED25519_BINDING_V1" || subkey)`.
+
+The verifier checks the **binding first**: an unbound subkey proves only that
+somebody holds *some* Ed25519 key, which is not an identity, and accepting one
+would let an attacker pair a replayed `public_key_pem` — and so a trusted
+fingerprint — with a signing key of their own. Both fields default to absent, so
+proofs from peers that only do RSA-PSS parse unchanged.
+
+Both labels are frozen: changing either changes every derived key or invalidates
+every binding peers have already seen.
+
 ## Party (Communities) protocol
 
 Rides *on top of* an established v3 tunnel to a community server: the handshake

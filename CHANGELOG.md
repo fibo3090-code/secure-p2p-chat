@@ -22,6 +22,14 @@ predate tagged releases.
   once, so posting one you already have into another channel or DM costs
   nothing and takes no time.
 
+### Changed
+
+- **Connections are now signed with Ed25519** where both sides support it,
+  falling back to the previous RSA signature for older peers. Handshakes carry
+  64-byte signatures instead of 256 and verify faster. **Your safety number is
+  unchanged** — contacts you have already verified stay verified, and nobody
+  needs to re-check anything.
+
 ### Fixed
 
 - **A private channel's messages reached every connected member.** They were
