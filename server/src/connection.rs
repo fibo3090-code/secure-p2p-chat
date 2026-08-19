@@ -130,25 +130,28 @@ where
 mod tests {
     use super::*;
     use messenger_core::core::generate_rsa_keypair;
-    use messenger_core::party::{MessagePayload, PartyClient};
+    use messenger_core::party::{
+        ChannelKind, MessagePayload, PartyClient, UploadTarget, PARTY_CHUNK_BYTES,
+    };
     use messenger_core::RSA_KEY_BITS;
     use rsa::RsaPrivateKey;
     use tokio::io::DuplexStream;
 
     type TestClient = PartyClient<DuplexStream>;
 
-    /// Send a request and read the reply, skipping pushed directory refreshes.
+    /// Send a request and read the reply, skipping unsolicited pushes.
     ///
-    /// A member joining broadcasts the updated directory to everyone already
-    /// connected, so a client that was online first has a `Members` frame waiting
-    /// ahead of its own next reply. Real clients apply pushes and replies from one
-    /// interleaved stream (`PartyManager::apply` does); these single-stepped tests
-    /// skip the pushes so they can assert on the reply they asked for.
+    /// Joining broadcasts the refreshed directory and a channel change
+    /// broadcasts `DirectoryChanged`, so a client that was already online has
+    /// those waiting ahead of its own next reply. Real clients apply pushes and
+    /// replies from one interleaved stream (`PartyManager::apply` does); these
+    /// single-stepped tests skip the pushes to assert on the reply they asked
+    /// for.
     async fn request(client: &mut TestClient, req: PartyRequest) -> PartyResponse {
         client.send(&req).await.unwrap();
         loop {
             match client.recv().await.unwrap() {
-                PartyResponse::Members(_) => continue,
+                PartyResponse::Members(_) | PartyResponse::DirectoryChanged => continue,
                 other => return other,
             }
         }
@@ -373,6 +376,264 @@ mod tests {
         drop(bob);
         alice_srv.abort();
         bob_srv.abort();
+    }
+
+    /// Join and return the assigned member id.
+    async fn join_as(client: &mut TestClient, name: &str) -> Uuid {
+        match client.join(name, None).await.unwrap() {
+            PartyResponse::Joined { member_id, .. } => member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        }
+    }
+
+    /// Read whatever is already queued for this client and stop when it goes
+    /// quiet, so a later assertion sees only frames caused by what follows.
+    async fn drain(client: &mut TestClient) -> Vec<PartyResponse> {
+        let mut seen = Vec::new();
+        while let Ok(Ok(resp)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), client.recv()).await
+        {
+            seen.push(resp);
+        }
+        seen
+    }
+
+    /// A private channel's messages must not reach a member who is not in it —
+    /// over the wire, not merely in the dispatcher's return value.
+    ///
+    /// This is the end-to-end half of the access leak: the dispatcher deciding
+    /// on a `directed` list proves nothing on its own, because the bug lived in
+    /// the gap between what the dispatcher returned and who the hub actually
+    /// sent it to. `broadcast_except` pushed to every registered connection, so
+    /// a member correctly denied the channel in `ListChannels` and denied its
+    /// history still received every message posted to it.
+    #[tokio::test]
+    async fn a_private_channels_messages_never_reach_a_non_member_over_the_tunnel() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+
+        let client_privs: Vec<RsaPrivateKey> = (0..3)
+            .map(|_| generate_rsa_keypair(RSA_KEY_BITS).unwrap())
+            .collect();
+        let (mut owner, owner_srv) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &client_privs[0],
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+        let (mut bob, bob_srv) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &client_privs[1],
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+        let (mut carol, carol_srv) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &client_privs[2],
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+
+        // The first to join owns the server, so the owner can make a private
+        // channel; the other two are ordinary members.
+        let _owner_id = join_as(&mut owner, "owner").await;
+        let bob_id = join_as(&mut bob, "bob").await;
+        let _carol_id = join_as(&mut carol, "carol").await;
+
+        let channels = request(
+            &mut owner,
+            PartyRequest::CreateChannelOfKind {
+                name: "secret".to_string(),
+                kind: ChannelKind::Private,
+                members: vec![bob_id],
+            },
+        )
+        .await;
+        let private = match channels {
+            PartyResponse::Channels(list) => list.iter().find(|c| c.name == "secret").unwrap().id,
+            other => panic!("expected the refreshed channel list, got {other:?}"),
+        };
+
+        // Carol cannot even see it.
+        match request(&mut carol, PartyRequest::ListChannels).await {
+            PartyResponse::Channels(list) => assert!(
+                !list.iter().any(|c| c.id == private),
+                "a private channel must not be listed to a non-member"
+            ),
+            other => panic!("expected Channels, got {other:?}"),
+        }
+
+        // Quieten both spectators, so anything below is caused by the post.
+        drain(&mut bob).await;
+        drain(&mut carol).await;
+
+        assert!(matches!(
+            request(
+                &mut owner,
+                PartyRequest::PostMessage {
+                    channel: private,
+                    text: "members only".to_string(),
+                },
+            )
+            .await,
+            PartyResponse::MessagePosted { .. }
+        ));
+
+        // Bob is in the channel, so it reaches him.
+        let bobs = drain(&mut bob).await;
+        assert!(
+            bobs.iter().any(|r| matches!(
+                r,
+                PartyResponse::Message(env)
+                    if env.channel == private
+                        && env.payload == MessagePayload::Text("members only".to_string())
+            )),
+            "a channel member must receive the message; got {bobs:?}"
+        );
+
+        // Carol is not, so nothing about it reaches her socket at all.
+        let carols = drain(&mut carol).await;
+        assert!(
+            !carols
+                .iter()
+                .any(|r| matches!(r, PartyResponse::Message(_))),
+            "a non-member received a private channel's message: {carols:?}"
+        );
+
+        drop(owner);
+        drop(bob);
+        drop(carol);
+        owner_srv.abort();
+        bob_srv.abort();
+        carol_srv.abort();
+    }
+
+    /// A file too large for one frame goes up and comes back down over the real
+    /// tunnel, byte for byte.
+    ///
+    /// The pieces were unit-tested separately — `PartyState` directly, and the
+    /// client against a mock channel — but the whole path (offer, stream,
+    /// commit, then page back down) had never run through framing, the
+    /// dispatcher and the hub together.
+    #[tokio::test]
+    async fn a_chunked_upload_round_trips_over_the_tunnel() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+        let channel = state.lock().await.default_channel();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut client, server) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &client_priv,
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+        join_as(&mut client, "owner").await;
+
+        // Deliberately not a whole number of chunks, so the final short chunk is
+        // exercised — the case an off-by-one gets wrong.
+        let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 1234))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let upload = match request(
+            &mut client,
+            PartyRequest::StartUpload {
+                name: "big.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                size: payload.len() as u64,
+                target: UploadTarget::Channel(channel),
+            },
+        )
+        .await
+        {
+            PartyResponse::UploadReady { upload, chunk_size } => {
+                assert_eq!(chunk_size as usize, PARTY_CHUNK_BYTES);
+                upload
+            }
+            other => panic!("expected UploadReady, got {other:?}"),
+        };
+
+        // Chunks are not individually acknowledged, so they stream without a
+        // reply until the upload is committed.
+        for part in payload.chunks(PARTY_CHUNK_BYTES) {
+            client
+                .send(&PartyRequest::UploadChunk {
+                    upload,
+                    data: part.to_vec(),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            request(&mut client, PartyRequest::FinishUpload { upload }).await,
+            PartyResponse::MessagePosted { .. }
+        ));
+
+        // The upload became an ordinary file message in the channel.
+        let hash = match request(
+            &mut client,
+            PartyRequest::FetchHistory {
+                channel,
+                since_seq: 0,
+            },
+        )
+        .await
+        {
+            PartyResponse::History(items) => match &items[0].payload {
+                MessagePayload::File(f) => {
+                    assert_eq!(f.size, payload.len() as u64);
+                    assert_eq!(f.name, "big.bin");
+                    f.hash.clone()
+                }
+                other => panic!("expected a File payload, got {other:?}"),
+            },
+            other => panic!("expected History, got {other:?}"),
+        };
+        assert_eq!(
+            hash,
+            messenger_core::party::blob_hash(&payload),
+            "the server stored it under the content hash of what was sent"
+        );
+
+        // …and pages back down, in order, matching byte for byte.
+        let mut got: Vec<u8> = Vec::new();
+        loop {
+            match request(
+                &mut client,
+                PartyRequest::DownloadChunk {
+                    hash: hash.clone(),
+                    offset: got.len() as u64,
+                },
+            )
+            .await
+            {
+                PartyResponse::FileChunk {
+                    offset,
+                    total,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(offset, got.len() as u64, "chunks arrive in order");
+                    assert_eq!(total, payload.len() as u64);
+                    if data.is_empty() {
+                        break;
+                    }
+                    got.extend_from_slice(&data);
+                    if got.len() as u64 >= total {
+                        break;
+                    }
+                }
+                other => panic!("expected FileChunk, got {other:?}"),
+            }
+        }
+        assert_eq!(got, payload);
+
+        drop(client);
+        server.abort();
     }
 
     /// When a member's last connection goes away, everyone still connected must

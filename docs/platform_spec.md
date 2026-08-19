@@ -395,8 +395,23 @@ requested hash. `MAX_PARTY_FILE_BYTES` (100 MiB) is the hard ceiling;
 discards its spools. Both front-ends pick inline or chunked by size — nothing in
 the UI changes.
 
-**Remaining:** a full permission matrix (today's rules are role + channel-kind,
-not per-file grants).
+**Per-file permissions (shipped):** each share carries a
+[`FilePermissions`] set — `view / download / delete / share` — kept genuinely
+separate, because seeing that a file exists is not being able to fetch it, and
+neither implies being allowed to put it somewhere else. Resolution is
+location-scoped: an admin holds everything; anyone who cannot reach the
+location holds nothing (uploaders included, so making a channel private does
+not leave its files reachable by the people just excluded from it); within a
+reachable location the uploader holds everything, an explicit per-member grant
+overrides the location default, and otherwise the default applies. A guest
+never holds a write right whatever they were granted. `SetFilePermissions` is
+refused unless the caller's own rights cover what they are handing out, and
+only the uploader or an admin may change a share's grants at all. `ShareFile`
+makes the `share` right real: because content is addressed by hash, re-posting
+a file you hold costs a reference rather than a transfer, and the new share
+starts at the default — you pass on the file, not your authority over it.
+
+**Remaining:** `Policy` (§9) — server-wide rules rather than per-file grants.
 
 Target data model — content-addressable, deduplicated storage:
 
@@ -429,9 +444,9 @@ operator's data dir, plus a content-addressed filesystem blob store
 hosting with room to swap later. The former interim JSON snapshot is imported
 once on first load, then superseded. Of the objects listed above, `Blob`,
 `FileEntry` (as `MessagePayload::File`), `FileReference` (the `file_refs` table),
-`Quota` (server-wide *and* per-member), `Role`, and `AuditLog` (the `audit`
-table) all exist. `PermissionMatrix` and `Policy` are still design-only — access
-is decided today by role plus channel kind, not by per-file grants.
+`Quota` (server-wide *and* per-member), `Role`, `AuditLog` (the `audit` table)
+and `PermissionMatrix` (`FilePermissions`, stored per share with per-member
+grants) all exist. `Policy` is the one that remains design-only.
 
 ---
 
@@ -650,10 +665,7 @@ Each phase gets its own detailed plan before code lands.
 Phase 0  Workspace refactor                         ✅ done
 UI       Tauri + React desktop app (§10)            ✅ shipped (A–F) · TUI redesign (G) remains
 Phase 1  Party Server MVP (Administered)            ✅ complete (Communities pane in both UIs)
-Phase 2  Drive / files                              ◐ sharing, chunked transfer,
-                                                      deletion, quotas, provenance +
-                                                      Drive panel done ·
-                                                      permission matrix remains
+Phase 2  Drive / files                              ✅ done
 Phase 3  Governance & roles                         ◐ roles, channel access, audit
                                                       log done · policies remain
 Phase 4  E2EE server tier
@@ -679,12 +691,11 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   Shipped in **1.15.0**. The owner chose a minor bump; note that the shipped
   desktop artifact changed name and installer, so existing installations of the
   retired GUI do not upgrade in place and have to be replaced manually.
-- **Phase 2 — Drive / files. ◐ all but the permission matrix.** Content-addressed
-  sharing in channels & DMs (inline below 4 MiB, chunked above it up to 100 MiB),
-  working reference counting with deletion and reclamation, `file_refs`
-  provenance, physical + per-member logical quotas, and the Drive panel in both
-  front-ends have all landed (see §8). **Remaining:** a per-file permission
-  matrix.
+- **Phase 2 — Drive / files. ✅** Content-addressed sharing in channels & DMs
+  (inline below 4 MiB, chunked above it up to 100 MiB), working reference
+  counting with deletion and reclamation, `file_refs` provenance, physical +
+  per-member logical quotas, the Drive panel in both front-ends, and per-file
+  permissions with re-sharing (see §8).
 - **Phase 3 — Governance & roles. ◐ roles and audit done.** `Role`
   (Guest/Member/Admin/Owner) is enforced server-side, `ChannelKind` is a real
   access rule rather than a stored decoration, and an admin-only audit log
@@ -729,37 +740,49 @@ update the canonical doc — `architecture.md`/`protocol.md` — in the same cha
 - Stronger invite lifecycle controls: signed-invite **expiration is enforced**
   (30 days, timestamp covered by the signature); **revocation** before expiry
   remains open.
-- **Ed25519 identity proofs** (planned, own dedicated change — see below).
+- **Ed25519 identity proofs** — shipped for the proof signature (see below);
+  the fingerprint cutover remains.
 
-### Ed25519 migration plan (proposal, not started)
+### Ed25519 identity proofs — steps 1–3 shipped
 
-The wire already carries a `SignatureScheme` field in `IdentityProof`, but only
-RSA-PSS is implemented, and the `rsa` crate carries the unresolved
-RUSTSEC-2023-0071 timing advisory. Moving identity proofs to Ed25519
-(`ed25519-dalek` is already a dependency) removes that exposure and shrinks
-handshakes, but it is **not** a drop-in swap because the peer **fingerprint is
-derived from the identity public key** — naively replacing the key would change
-every user's fingerprint and break TOFU continuity for all existing contacts.
-Planned shape:
+Identity proofs are signed with **Ed25519** between peers that support it, and
+with RSA-PSS against anything older. `negotiate_signature_scheme` already
+preferred Ed25519; what was missing was a key to sign with and a way for the
+verifier to trust it.
 
-1. **Dual-key identities**: new identities get both an RSA-2048 and an Ed25519
-   keypair; existing identities grow an Ed25519 keypair on first unlock after
-   upgrade. The fingerprint stays RSA-derived for now (continuity).
-2. **Cross-signing**: the RSA key signs the Ed25519 public key once; the proof
-   travels with the identity so peers can bind the new key to the fingerprint
-   they already trust.
-3. **Scheme negotiation**: `IdentityProof` advertises both schemes; peers that
-   understand Ed25519 verify the Ed25519 proof (plus the cross-signature on
-   first sight), older peers keep verifying RSA-PSS. No protocol version bump
-   needed — the scheme field exists.
-4. **Fingerprint cutover** (last, separate release): once Ed25519-capable
-   versions are assumed, re-derive fingerprints from the Ed25519 key with an
-   explicit re-verification prompt (a UX event, not silent), then retire the
-   RSA path and the `rsa` dependency.
+The note this replaces justified the work by RUSTSEC-2023-0071 (the `rsa`
+Marvin timing issue). **That premise no longer holds**: RSA *decryption* was
+removed from the product in 1.13, and the advisory targets decryption, not
+PSS signatures — see the reasoning recorded against the entry in `deny.toml`.
+The remaining case for Ed25519 is a smaller, faster handshake (64-byte
+signatures instead of 256) and a path to eventually dropping the `rsa`
+dependency, not an open exposure.
 
-Steps 1–3 are back-compatible; step 4 is a breaking trust-model event and needs
-its own comms/UX design. Each step lands with handshake tests on both the
-old/new peer matrix.
+**How it works.** The Ed25519 signing key is a *subkey* of the RSA identity,
+derived from it with HKDF-SHA256 under a frozen label:
+
+- The fingerprint is still derived from the **RSA** public key, so TOFU
+  continuity is untouched — every existing contact stays verified, and the
+  handshake test asserts the exchanged fingerprints are unchanged.
+- Deriving rather than storing means an existing identity gains a subkey with
+  **no change to `identity.json`** — the file that is the only key to the
+  message history, and the last thing worth migrating for a signing-algorithm
+  change. It also means nothing had to be threaded through the handshake:
+  anything holding the RSA private key can derive it.
+- A verifier cannot derive it, so the proof carries the subkey plus an RSA-PSS
+  **binding signature** over it. An Ed25519 proof is accepted only once that
+  binding verifies under the identity the fingerprint names, so trusting a
+  fingerprint still means trusting exactly one key. A proof with no binding, a
+  binding from another identity, or a subkey swapped under someone else's
+  binding are all refused, each with a test.
+
+**What remains (step 4, a separate breaking release).** Re-derive fingerprints
+from an Ed25519 key with an explicit re-verification prompt — a UX event, not a
+silent change — and retire the RSA path. That step needs an *independent*
+Ed25519 key, since a derived subkey cannot outlive the key it comes from; it is
+the right place to mint one, because it re-verifies with the user anyway. Until
+then the subordinate relationship is the accurate description, and deriving it
+expresses exactly that.
 
 ### Cryptographic hardening roadmap (post-audit)
 

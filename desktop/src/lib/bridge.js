@@ -93,6 +93,10 @@ const realApi = {
     invoke("party_delete_file", { server, hash, location }),
   partyRefreshAudit: (server) => invoke("party_refresh_audit", { server }),
   partyClearNotice: (server) => invoke("party_clear_notice", { server }),
+  partyShareFile: (server, hash, from, { channel = null, peer = null } = {}) =>
+    invoke("party_share_file", { server, hash, from, channel, peer }),
+  partySetFilePermissions: (server, hash, location, member, perms) =>
+    invoke("party_set_file_permissions", { server, hash, location, member, perms }),
 };
 
 // ── Dev mock ────────────────────────────────────────────────────────────────
@@ -171,6 +175,7 @@ function makeMock() {
           hash: "mockhash", name: "roadmap.pdf", size: 284134, mime: "application/pdf",
           uploader: "mem-nova", uploader_name: "nova", location: gen, location_name: "#general",
           is_dm: false, shared_at: Date.now() - 3600000, can_delete: true,
+          can_view: true, can_download: true, can_share: true,
         },
       ],
       quota: { used: 284134, limit: 134217728, server_used: 284134, server_limit: 1073741824 },
@@ -297,6 +302,23 @@ function makeMock() {
     partyClearNotice: async (server) => {
       const s = partyState.servers.find((x) => x.id === server);
       if (s) s.last_notice = null;
+    },
+    partyShareFile: async (server, hash, _from, { channel = null } = {}) => {
+      const s = partyState.servers.find((x) => x.id === server);
+      const src = s?.files.find((f) => f.hash === hash);
+      if (!s || !src) return;
+      const target = s.channels.find((c) => c.id === channel);
+      s.files.push({ ...src, location: channel, location_name: `#${target?.name || "?"}` });
+    },
+    partySetFilePermissions: async (server, hash, location, member, perms) => {
+      const f = partyState.servers
+        .find((x) => x.id === server)?.files
+        .find((f) => f.hash === hash && f.location === location);
+      if (!f || member) return; // the mock only models the default grant
+      f.can_view = perms.view;
+      f.can_download = perms.download;
+      f.can_delete = perms.delete;
+      f.can_share = perms.share;
     },
   };
 }

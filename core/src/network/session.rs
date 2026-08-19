@@ -14,9 +14,11 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::core::{
-    derive_session_key, fingerprint_pubkey, generate_ephemeral_keypair, negotiate_signature_scheme,
-    parse_x25519_public, pem_decode_public, pem_encode_public, recv_packet, send_packet, AesCipher,
-    IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
+    cross_sign_ed25519, derive_ed25519_subkey, derive_session_key, ed25519_public_from_bytes,
+    ed25519_signature_from_bytes, fingerprint_pubkey, generate_ephemeral_keypair,
+    negotiate_signature_scheme, parse_x25519_public, pem_decode_public, pem_encode_public,
+    recv_packet, send_packet, sign_ed25519, verify_ed25519, verify_ed25519_binding, AesCipher,
+    Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
 };
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
@@ -175,8 +177,13 @@ pub async fn run_host_session(
     let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
     // 7.5. Negotiate Signature Scheme
-    // Current runtime support is RSA-PSS identity proofs only.
-    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
+    // Ed25519 first, RSA-PSS retained for peers that predate it —
+    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
+    // so an older peer that advertises only RSA-PSS still connects.
+    let our_schemes = vec![
+        SignatureScheme::Ed25519.to_u8(),
+        SignatureScheme::RsaPss.to_u8(),
+    ];
     let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
         schemes: our_schemes.clone(),
     };
@@ -223,23 +230,7 @@ pub async fn run_host_session(
 
     // 9. Create Identity Proof (using negotiated scheme)
     // We sign our own ephemeral key to bind it to our identity (prevent MITM)
-    let signature = match selected_scheme {
-        SignatureScheme::RsaPss => {
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(host_ephemeral_bytes); // Bind to my ephemeral key
-            signing_key
-                .sign_with_rng(&mut rng, &hasher.finalize())
-                .to_vec()
-        }
-        SignatureScheme::Ed25519 => {
-            return Err(anyhow!(
-                "Ed25519 identity proofs are not supported by this runtime"
-            ));
-        }
-    };
+    let signature = build_identity_signature(selected_scheme, &privkey, host_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
@@ -269,21 +260,11 @@ pub async fn run_host_session(
     }
 
     // 11. Verify Client Identity
-    let client_pubkey = pem_decode_public(&client_proof.public_key_pem)?;
-    let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey.clone());
-
-    // Verify signature: It must verify the CLIENT'S ephemeral key
-    let mut client_hasher = Sha256::new();
-    client_hasher.update(b"IDENTITY_PROOF");
-    client_hasher.update(&client_ephemeral_bytes); // Verify against what we received earlier
-    let client_digest = client_hasher.finalize();
-
-    verifying_key
-        .verify(
-            &client_digest,
-            &rsa::pss::Signature::try_from(client_proof.signature.as_slice())?,
-        )
-        .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
+    // Verifies under whichever scheme the peer used; an Ed25519 proof is
+    // only accepted when its subkey is bound to the RSA identity that the
+    // fingerprint — and therefore TOFU — is derived from.
+    verify_identity_proof(&client_proof, &client_ephemeral_bytes)
+        .map_err(|e| anyhow!("Client identity verification failed: {}", e))?;
 
     let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
     tracing::debug!("Verified client identity: {}...", &client_fingerprint[..8]);
@@ -500,7 +481,13 @@ pub async fn run_client_session_multi(
     };
 
     // Send our supported schemes (same as host: RSA-PSS only).
-    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
+    // Ed25519 first, RSA-PSS retained for peers that predate it —
+    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
+    // so an older peer that advertises only RSA-PSS still connects.
+    let our_schemes = vec![
+        SignatureScheme::Ed25519.to_u8(),
+        SignatureScheme::RsaPss.to_u8(),
+    ];
     let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
         schemes: our_schemes.clone(),
     };
@@ -552,43 +539,17 @@ pub async fn run_client_session_multi(
     }
 
     // 9. Verify Host Identity
-    let host_pubkey = pem_decode_public(&host_proof.public_key_pem)?;
-    let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey.clone());
-
-    // Verify signature: It must verify the HOST'S ephemeral key
-    let mut host_hasher = Sha256::new();
-    host_hasher.update(b"IDENTITY_PROOF");
-    host_hasher.update(&host_ephemeral_bytes); // Verify against what we received earlier
-    let host_digest = host_hasher.finalize();
-
-    verifying_key
-        .verify(
-            &host_digest,
-            &rsa::pss::Signature::try_from(host_proof.signature.as_slice())?,
-        )
-        .map_err(|e| anyhow!("Host identity signature verification failed: {}", e))?;
+    // Verifies under whichever scheme the peer used; an Ed25519 proof is
+    // only accepted when its subkey is bound to the RSA identity that the
+    // fingerprint — and therefore TOFU — is derived from.
+    verify_identity_proof(&host_proof, &host_ephemeral_bytes)
+        .map_err(|e| anyhow!("Host identity verification failed: {}", e))?;
 
     let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
     tracing::debug!("Verified host identity: {}...", &host_fingerprint[..8]);
 
     // 10. Create Identity Proof (using negotiated scheme)
-    let signature = match selected_scheme {
-        SignatureScheme::RsaPss => {
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(client_ephemeral_bytes); // Bind to my ephemeral key
-            signing_key
-                .sign_with_rng(&mut rng, &hasher.finalize())
-                .to_vec()
-        }
-        SignatureScheme::Ed25519 => {
-            return Err(anyhow!(
-                "Ed25519 identity proofs are not supported by this runtime"
-            ));
-        }
-    };
+    let signature = build_identity_signature(selected_scheme, &privkey, client_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
@@ -677,6 +638,84 @@ pub struct EstablishedTunnel {
     pub peer_chat_id: uuid::Uuid,
     pub cipher: AesCipher,
     pub transport_aad: Vec<u8>,
+    /// Which signature scheme the two peers settled on for identity proofs.
+    /// Worth surfacing rather than discarding: it is the one handshake choice
+    /// that varies by peer version, so it is what a diagnostic report needs to
+    /// answer "why did this connection behave differently from that one".
+    pub signature_scheme: SignatureScheme,
+}
+
+/// Sign our ephemeral key for the identity proof under the negotiated scheme.
+///
+/// Returns the bytes for [`IdentityProof::signature`]. For RSA-PSS that is the
+/// signature; for Ed25519 it is a serialized [`Ed25519Proof`] carrying the
+/// signature, the subkey, and the subkey's binding to this RSA identity.
+/// Shared by every handshake variant so all four sign identically.
+fn build_identity_signature(
+    scheme: SignatureScheme,
+    privkey: &RsaPrivateKey,
+    ephemeral_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"IDENTITY_PROOF");
+    hasher.update(ephemeral_bytes);
+    let digest = hasher.finalize();
+    match scheme {
+        SignatureScheme::RsaPss => {
+            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+            let mut rng = OsRng;
+            Ok(signing_key.sign_with_rng(&mut rng, &digest).to_vec())
+        }
+        SignatureScheme::Ed25519 => {
+            let signing_key = derive_ed25519_subkey(privkey)?;
+            let verifying = signing_key.verifying_key();
+            // Packed into the signature field so `IdentityProof` keeps the
+            // exact shape older peers expect.
+            Ok(bincode::serialize(&Ed25519Proof {
+                signature: sign_ed25519(&signing_key, &digest).to_bytes().to_vec(),
+                public: verifying.to_bytes().to_vec(),
+                binding: cross_sign_ed25519(privkey, &verifying)?,
+            })?)
+        }
+    }
+}
+
+/// Verify a peer's identity proof against the ephemeral key they sent.
+///
+/// The identity is always the RSA key in `public_key_pem` — that is what the
+/// fingerprint, and therefore TOFU, is derived from, and this step does not
+/// change it. An Ed25519 proof is accepted only when the subkey it was signed
+/// with is itself signed by that RSA identity, so trusting a fingerprint still
+/// means trusting exactly one key.
+fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> Result<()> {
+    let peer_pubkey = pem_decode_public(&proof.public_key_pem)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"IDENTITY_PROOF");
+    hasher.update(peer_ephemeral_bytes);
+    let digest = hasher.finalize();
+
+    match proof.signature_scheme {
+        SignatureScheme::RsaPss => {
+            let verifying_key = VerifyingKey::<Sha256>::new(peer_pubkey);
+            verifying_key
+                .verify(
+                    &digest,
+                    &rsa::pss::Signature::try_from(proof.signature.as_slice())?,
+                )
+                .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
+        }
+        SignatureScheme::Ed25519 => {
+            let blob: Ed25519Proof = bincode::deserialize(&proof.signature)
+                .map_err(|e| anyhow!("Ed25519 proof is malformed or missing its subkey: {}", e))?;
+            let ed_public = ed25519_public_from_bytes(&blob.public)?;
+            // Bind first: an unbound subkey proves only that somebody holds
+            // *some* Ed25519 key, which is not an identity.
+            verify_ed25519_binding(&peer_pubkey, &ed_public, &blob.binding)?;
+            let signature = ed25519_signature_from_bytes(&blob.signature)?;
+            verify_ed25519(&ed_public, &digest, &signature)
+                .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
+        }
+    }
 }
 
 /// Run the host side of the Protocol v3 handshake over `stream`: version exchange,
@@ -722,7 +761,13 @@ where
     }
     let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
 
-    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
+    // Ed25519 first, RSA-PSS retained for peers that predate it —
+    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
+    // so an older peer that advertises only RSA-PSS still connects.
+    let our_schemes = vec![
+        SignatureScheme::Ed25519.to_u8(),
+        SignatureScheme::RsaPss.to_u8(),
+    ];
     let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
         schemes: our_schemes.clone(),
     };
@@ -754,23 +799,7 @@ where
     let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
     let transport_aad = labeled_aad(b"transport", transcript_hash);
 
-    let signature = match selected_scheme {
-        SignatureScheme::RsaPss => {
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(host_ephemeral_bytes);
-            signing_key
-                .sign_with_rng(&mut rng, &hasher.finalize())
-                .to_vec()
-        }
-        SignatureScheme::Ed25519 => {
-            return Err(anyhow!(
-                "Ed25519 identity proofs are not supported by this runtime"
-            ));
-        }
-    };
+    let signature = build_identity_signature(selected_scheme, privkey, host_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
@@ -797,18 +826,11 @@ where
         ));
     }
 
-    let client_pubkey = pem_decode_public(&client_proof.public_key_pem)?;
-    let verifying_key = VerifyingKey::<Sha256>::new(client_pubkey);
-    let mut client_hasher = Sha256::new();
-    client_hasher.update(b"IDENTITY_PROOF");
-    client_hasher.update(&client_ephemeral_bytes);
-    let client_digest = client_hasher.finalize();
-    verifying_key
-        .verify(
-            &client_digest,
-            &rsa::pss::Signature::try_from(client_proof.signature.as_slice())?,
-        )
-        .map_err(|e| anyhow!("Client identity signature verification failed: {}", e))?;
+    // Verifies under whichever scheme the peer used; an Ed25519 proof is only
+    // accepted when its subkey is bound to the RSA identity that the
+    // fingerprint — and therefore TOFU — is derived from.
+    verify_identity_proof(&client_proof, &client_ephemeral_bytes)
+        .map_err(|e| anyhow!("Client identity verification failed: {}", e))?;
 
     let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
 
@@ -817,6 +839,7 @@ where
         peer_chat_id: client_proof.chat_id,
         cipher,
         transport_aad,
+        signature_scheme: selected_scheme,
     })
 }
 
@@ -864,7 +887,13 @@ where
         _ => return Err(anyhow!("Host did not send valid signature schemes")),
     };
 
-    let our_schemes = vec![SignatureScheme::RsaPss.to_u8()];
+    // Ed25519 first, RSA-PSS retained for peers that predate it —
+    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
+    // so an older peer that advertises only RSA-PSS still connects.
+    let our_schemes = vec![
+        SignatureScheme::Ed25519.to_u8(),
+        SignatureScheme::RsaPss.to_u8(),
+    ];
     let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
         schemes: our_schemes.clone(),
     };
@@ -904,38 +933,15 @@ where
         ));
     }
 
-    let host_pubkey = pem_decode_public(&host_proof.public_key_pem)?;
-    let verifying_key = VerifyingKey::<Sha256>::new(host_pubkey);
-    let mut host_hasher = Sha256::new();
-    host_hasher.update(b"IDENTITY_PROOF");
-    host_hasher.update(&host_ephemeral_bytes);
-    let host_digest = host_hasher.finalize();
-    verifying_key
-        .verify(
-            &host_digest,
-            &rsa::pss::Signature::try_from(host_proof.signature.as_slice())?,
-        )
-        .map_err(|e| anyhow!("Host identity signature verification failed: {}", e))?;
+    // Verifies under whichever scheme the peer used; an Ed25519 proof is only
+    // accepted when its subkey is bound to the RSA identity that the
+    // fingerprint — and therefore TOFU — is derived from.
+    verify_identity_proof(&host_proof, &host_ephemeral_bytes)
+        .map_err(|e| anyhow!("Host identity verification failed: {}", e))?;
 
     let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
 
-    let signature = match selected_scheme {
-        SignatureScheme::RsaPss => {
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(client_ephemeral_bytes);
-            signing_key
-                .sign_with_rng(&mut rng, &hasher.finalize())
-                .to_vec()
-        }
-        SignatureScheme::Ed25519 => {
-            return Err(anyhow!(
-                "Ed25519 identity proofs are not supported by this runtime"
-            ));
-        }
-    };
+    let signature = build_identity_signature(selected_scheme, privkey, client_ephemeral_bytes)?;
 
     let my_proof = IdentityProof {
         public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
@@ -953,6 +959,7 @@ where
         peer_chat_id: host_proof.chat_id,
         cipher,
         transport_aad,
+        signature_scheme: selected_scheme,
     })
 }
 
@@ -1046,6 +1053,7 @@ where
         peer_chat_id,
         cipher,
         transport_aad,
+        signature_scheme: _,
     } = host_handshake(stream, &privkey, chat_id).await?;
 
     // Optional connection-password gate (inside the encrypted, authenticated tunnel).
@@ -1131,6 +1139,7 @@ where
         peer_chat_id: _,
         cipher,
         transport_aad,
+        signature_scheme: _,
     } = client_handshake(stream, &privkey, chat_id).await?;
 
     // Answer the host's optional connection-password gate before proceeding.
@@ -2004,6 +2013,142 @@ mod tests {
         assert_eq!(host_aes, client_aes);
 
         Ok(())
+    }
+
+    /// Two current peers must actually settle on Ed25519 — and the fingerprint
+    /// they exchange must be unchanged, because every contact's TOFU trust is
+    /// pinned to it and this migration step deliberately does not touch it.
+    #[tokio::test]
+    async fn a_live_handshake_negotiates_ed25519_without_changing_the_fingerprint() {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let expected_host_fp = fingerprint_pubkey(
+            pem_encode_public(&rsa::RsaPublicKey::from(&host_priv))
+                .unwrap()
+                .as_bytes(),
+        );
+        let expected_client_fp = fingerprint_pubkey(
+            pem_encode_public(&rsa::RsaPublicKey::from(&client_priv))
+                .unwrap()
+                .as_bytes(),
+        );
+
+        let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+        let hp = host_priv.clone();
+        let host = tokio::spawn(async move {
+            host_handshake(&mut host_stream, &hp, uuid::Uuid::new_v4()).await
+        });
+        let client = client_handshake(&mut client_stream, &client_priv, uuid::Uuid::new_v4())
+            .await
+            .expect("client handshake");
+        let host = host.await.unwrap().expect("host handshake");
+
+        assert_eq!(host.signature_scheme, SignatureScheme::Ed25519);
+        assert_eq!(client.signature_scheme, SignatureScheme::Ed25519);
+        assert_eq!(client.peer_fingerprint, expected_host_fp);
+        assert_eq!(host.peer_fingerprint, expected_client_fp);
+    }
+
+    /// An Ed25519 proof is only worth anything with its binding: without one,
+    /// the subkey proves that somebody holds *some* Ed25519 key, which is not
+    /// an identity. Accepting it would let an attacker pair a stolen
+    /// `public_key_pem` — and therefore a trusted fingerprint — with a signing
+    /// key of their own.
+    #[test]
+    fn an_ed25519_proof_without_a_valid_binding_is_rejected() {
+        let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let ephemeral = [7u8; 32];
+        let signature =
+            build_identity_signature(SignatureScheme::Ed25519, &identity, &ephemeral).unwrap();
+        let pem = pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap();
+        let proof = |sig: Vec<u8>| IdentityProof {
+            public_key_pem: pem.clone(),
+            signature: sig,
+            version: PROTOCOL_VERSION as u32,
+            chat_id: uuid::Uuid::new_v4(),
+            signature_scheme: SignatureScheme::Ed25519,
+        };
+
+        let good = proof(signature.clone());
+        assert!(verify_identity_proof(&good, &ephemeral).is_ok());
+
+        let blob: Ed25519Proof = bincode::deserialize(&signature).unwrap();
+
+        // Binding removed.
+        let mut stripped = blob.clone();
+        stripped.binding = Vec::new();
+        assert!(
+            verify_identity_proof(&proof(bincode::serialize(&stripped).unwrap()), &ephemeral)
+                .is_err()
+        );
+
+        // A subkey swapped for the attacker's, keeping the victim's identity
+        // and their binding — the attack the binding exists to stop.
+        let attacker = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let attacker_key = derive_ed25519_subkey(&attacker).unwrap();
+        let mut digest = Sha256::new();
+        digest.update(b"IDENTITY_PROOF");
+        digest.update(ephemeral);
+        let mut swapped = blob.clone();
+        swapped.public = attacker_key.verifying_key().to_bytes().to_vec();
+        swapped.signature = sign_ed25519(&attacker_key, &digest.finalize())
+            .to_bytes()
+            .to_vec();
+        assert!(
+            verify_identity_proof(&proof(bincode::serialize(&swapped).unwrap()), &ephemeral)
+                .is_err(),
+            "a subkey the identity never vouched for must be refused"
+        );
+
+        // A binding made by somebody else's identity.
+        let mut foreign = blob.clone();
+        foreign.binding = cross_sign_ed25519(&attacker, &attacker_key.verifying_key()).unwrap();
+        assert!(
+            verify_identity_proof(&proof(bincode::serialize(&foreign).unwrap()), &ephemeral)
+                .is_err()
+        );
+
+        // Signing a different ephemeral key is still caught.
+        assert!(verify_identity_proof(&good, &[8u8; 32]).is_err());
+    }
+
+    /// The wire shape of `IdentityProof` must not have changed, or peers built
+    /// before Ed25519 cannot decode it.
+    ///
+    /// bincode is not self-describing: it decodes positionally, so a field
+    /// appended to this struct makes an older peer read past the end of the
+    /// buffer and fail the handshake with "unexpected end of file" —
+    /// `#[serde(default)]` does nothing about it. This caught exactly that
+    /// against a released 1.16.0 server, which is why the Ed25519 material
+    /// travels inside `signature` instead.
+    #[test]
+    fn the_identity_proof_wire_shape_is_unchanged_for_older_peers() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct AsOlderPeersSeeIt {
+            public_key_pem: String,
+            signature: Vec<u8>,
+            version: u32,
+            chat_id: uuid::Uuid,
+            signature_scheme: SignatureScheme,
+        }
+
+        for scheme in [SignatureScheme::RsaPss, SignatureScheme::Ed25519] {
+            let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+            let signature = build_identity_signature(scheme, &identity, &[3u8; 32]).unwrap();
+            let bytes = bincode::serialize(&IdentityProof {
+                public_key_pem: pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap(),
+                signature,
+                version: PROTOCOL_VERSION as u32,
+                chat_id: uuid::Uuid::new_v4(),
+                signature_scheme: scheme,
+            })
+            .unwrap();
+            assert!(
+                bincode::deserialize::<AsOlderPeersSeeIt>(&bytes).is_ok(),
+                "{scheme} proof no longer decodes against the released field layout"
+            );
+        }
     }
 
     #[test]

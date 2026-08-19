@@ -355,6 +355,109 @@ pub enum PartyRequest {
     /// Fetch one chunk of a stored file, starting at `offset`. The reply carries
     /// the total size, so the caller knows when it is done.
     DownloadChunk { hash: String, offset: u64 },
+
+    // --- Per-file permissions (appended; keep the order stable) --------------
+    /// Post a file you already hold somewhere else, without re-uploading it.
+    /// Requires [`FilePermissions::share`] on the source reference — and the
+    /// content is stored once, so this costs a reference, not a copy.
+    ShareFile {
+        hash: String,
+        /// The reference being re-shared, which is where the caller's rights
+        /// come from. One blob can sit in several places under different
+        /// grants, so the source has to be named.
+        from: Uuid,
+        target: UploadTarget,
+    },
+    /// Change what a shared file grants. `member: None` sets the default for
+    /// everyone who can reach the location; `Some(id)` sets one member's grant,
+    /// overriding the default for them.
+    ///
+    /// Only ever succeeds for rights the caller holds themselves.
+    SetFilePermissions {
+        hash: String,
+        location: Uuid,
+        member: Option<Uuid>,
+        perms: FilePermissions,
+    },
+}
+
+/// What a member may do with one shared file.
+///
+/// The rights are deliberately separate: seeing that a file exists is not the
+/// same as being able to fetch its bytes, and neither implies being allowed to
+/// put it somewhere else. `admin` from the design note is not a flag here —
+/// it is [`Role::is_admin`], which overrides all of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct FilePermissions {
+    /// See it in the listing and in a message.
+    pub view: bool,
+    /// Fetch its bytes.
+    pub download: bool,
+    /// Remove this share (not other shares of the same content).
+    pub delete: bool,
+    /// Post it somewhere else without re-uploading — the content-addressed
+    /// store makes that free, which is exactly why it needs its own right.
+    pub share: bool,
+}
+
+impl Default for FilePermissions {
+    /// What the audience of a channel or DM gets when a file is shared there:
+    /// they can see it and fetch it, and that is all. Deleting somebody else's
+    /// share and re-posting it elsewhere are both grants somebody has to make.
+    fn default() -> Self {
+        Self {
+            view: true,
+            download: true,
+            delete: false,
+            share: false,
+        }
+    }
+}
+
+impl FilePermissions {
+    /// Everything — what the uploader and any admin hold.
+    pub fn all() -> Self {
+        Self {
+            view: true,
+            download: true,
+            delete: true,
+            share: true,
+        }
+    }
+
+    /// Nothing.
+    pub fn none() -> Self {
+        Self {
+            view: false,
+            download: false,
+            delete: false,
+            share: false,
+        }
+    }
+
+    /// Whether `self` covers every right in `other`.
+    ///
+    /// This is the "you can only delegate rights you hold" rule: a grant is
+    /// refused unless the granter's own effective rights are a superset of it.
+    pub fn covers(self, other: Self) -> bool {
+        (!other.view || self.view)
+            && (!other.download || self.download)
+            && (!other.delete || self.delete)
+            && (!other.share || self.share)
+    }
+
+    /// Downloading something you cannot see, or sharing something you cannot
+    /// download, is not a coherent grant. Normalising here means the rule is
+    /// enforced once rather than at every call site.
+    pub fn normalized(self) -> Self {
+        let view = self.view || self.download || self.delete || self.share;
+        Self {
+            view,
+            download: self.download || self.share,
+            delete: self.delete,
+            share: self.share,
+        }
+    }
 }
 
 /// One shared file as shown in the Drive panel: the blob plus the provenance the
@@ -376,8 +479,11 @@ pub struct FileEntry {
     pub is_dm: bool,
     /// Unix milliseconds when it was shared.
     pub shared_at: u64,
-    /// Whether the *requesting* member may delete this reference.
+    /// Whether the *requesting* member may delete this reference. Kept as a
+    /// convenience for the UI; it is `perms.delete`.
     pub can_delete: bool,
+    /// What the requesting member may do with it. Appended field: keep it last.
+    pub perms: FilePermissions,
 }
 
 /// A member's storage usage against their allowance.

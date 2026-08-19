@@ -8,7 +8,8 @@ import { api, onBridge, fmtTime } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
 import {
-  DrivePanel, AuditPanel, ChannelAccessDialog, ROLES, kindIcon,
+  DrivePanel, AuditPanel, ChannelAccessDialog, FilePermissionsDialog, ShareFileDialog,
+  ROLES, kindIcon,
 } from "./PartyAdmin.jsx";
 
 // Roles this viewer may actually assign to `member`, mirroring the server's rule
@@ -215,6 +216,8 @@ export function Parties() {
   const [view, setView] = useState("chat");          // chat | drive | audit
   const [accessFor, setAccessFor] = useState(null);  // channel being edited, or "new"
   const [confirmDelCh, setConfirmDelCh] = useState(null); // channel id armed for deletion
+  const [permsFor, setPermsFor] = useState(null);    // file whose grants are being edited
+  const [shareFor, setShareFor] = useState(null);    // file being re-shared elsewhere
   const scrollRef = useRef(null);
   useEffect(() => setShown(150), [sid, cid, dm]);
   // Leaving a community must not strand you on its Drive.
@@ -403,6 +406,26 @@ export function Parties() {
     if (!server) return;
     try { await api.partySetRole(server.id, member.id, role); loadServers(); }
     catch (e) { toast(String(e), "error"); }
+  }
+
+  // Re-share a file into another channel or DM. The bytes are already on the
+  // server, so this is a reference rather than an upload.
+  async function shareFile(f, dest) {
+    if (!server) return;
+    try {
+      await api.partyShareFile(server.id, f.hash, f.location, dest);
+      await api.partyRefreshFiles(server.id);
+      loadServers(); loadMsgs();
+    } catch (e) { toast(String(e), "error"); }
+  }
+
+  async function setFilePerms(f, member, perms) {
+    if (!server) return;
+    try {
+      await api.partySetFilePermissions(server.id, f.hash, f.location, member, perms);
+      await api.partyRefreshFiles(server.id);
+      loadServers();
+    } catch (e) { toast(String(e), "error"); }
   }
 
   async function deleteFile(f) {
@@ -635,7 +658,8 @@ export function Parties() {
 
         {view === "drive" && (
           <DrivePanel server={server} downloading={downloading}
-            onDownload={downloadFile} onDelete={deleteFile} />
+            onDownload={downloadFile} onDelete={deleteFile}
+            onShare={setShareFor} onPermissions={setPermsFor} />
         )}
         {view === "audit" && <AuditPanel server={server} />}
 
@@ -674,6 +698,18 @@ export function Parties() {
           </>
         )}
       </main>
+
+      {permsFor && (
+        <FilePermissionsDialog server={server} file={permsFor}
+          onClose={() => setPermsFor(null)}
+          onSubmit={(member, perms) => setFilePerms(permsFor, member, perms)} />
+      )}
+
+      {shareFor && (
+        <ShareFileDialog server={server} file={shareFor}
+          onClose={() => setShareFor(null)}
+          onSubmit={(dest) => shareFile(shareFor, dest)} />
+      )}
 
       {accessFor && (
         <ChannelAccessDialog server={server}

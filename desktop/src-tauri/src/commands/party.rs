@@ -1,7 +1,7 @@
 //! Communities (Party servers): join/leave, channels, DMs, file sharing,
 //! and the saved-communities file (parties.json) with fingerprint pinning.
 use crate::*;
-use messenger_core::party::{ChannelKind, Role};
+use messenger_core::party::{ChannelKind, FilePermissions, Role, UploadTarget};
 
 // ── Communities (Party servers) ─────────────────────────────────────────────
 //
@@ -50,6 +50,10 @@ pub(crate) struct PartyFileDto {
     is_dm: bool,
     shared_at: u64,
     can_delete: bool,
+    /// What this client may do with the file, so the UI offers exactly that.
+    can_view: bool,
+    can_download: bool,
+    can_share: bool,
 }
 
 #[derive(Serialize)]
@@ -231,6 +235,9 @@ fn server_dto(
                 is_dm: f.is_dm,
                 shared_at: f.shared_at,
                 can_delete: f.can_delete,
+                can_view: f.perms.view,
+                can_download: f.perms.download,
+                can_share: f.perms.share,
             })
             .collect(),
         quota: conn.quota.map(|q| PartyQuotaDto {
@@ -741,6 +748,82 @@ pub(crate) async fn party_refresh_files(
         .lock()
         .await
         .refresh_files(sid)
+        .map_err(|e| e.to_string())
+}
+
+/// Re-share a file into another channel or DM without re-uploading it.
+/// `from` is the location it is being shared *from*, which is where the
+/// caller's right to do so comes from.
+#[tauri::command]
+pub(crate) async fn party_share_file(
+    server: String,
+    hash: String,
+    from: String,
+    channel: Option<String>,
+    peer: Option<String>,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let from = Uuid::parse_str(&from).map_err(|e| e.to_string())?;
+    let target = match (channel, peer) {
+        (Some(c), _) => UploadTarget::Channel(Uuid::parse_str(&c).map_err(|e| e.to_string())?),
+        (None, Some(p)) => UploadTarget::Dm(Uuid::parse_str(&p).map_err(|e| e.to_string())?),
+        (None, None) => return Err("no destination given".to_string()),
+    };
+    state
+        .party
+        .lock()
+        .await
+        .share_file(sid, hash, from, target)
+        .map_err(|e| e.to_string())
+}
+
+/// The four rights, as one object. Tauri binds a struct parameter by its own
+/// name, so this stays a single-word key (`perms`) and keeps the command's
+/// signature readable.
+#[derive(Deserialize)]
+pub(crate) struct PermsDto {
+    view: bool,
+    download: bool,
+    delete: bool,
+    share: bool,
+}
+
+/// Change what a shared file grants — by default (`member` omitted) or for one
+/// member. The server refuses anything the caller does not hold themselves.
+#[tauri::command]
+pub(crate) async fn party_set_file_permissions(
+    server: String,
+    hash: String,
+    location: String,
+    member: Option<String>,
+    perms: PermsDto,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let loc = Uuid::parse_str(&location).map_err(|e| e.to_string())?;
+    let member = match member {
+        Some(m) => Some(Uuid::parse_str(&m).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    state
+        .party
+        .lock()
+        .await
+        .set_file_permissions(
+            sid,
+            hash,
+            loc,
+            member,
+            FilePermissions {
+                view: perms.view,
+                download: perms.download,
+                delete: perms.delete,
+                share: perms.share,
+            },
+        )
         .map_err(|e| e.to_string())
 }
 

@@ -13,8 +13,8 @@ use rand::{rngs::OsRng, RngCore};
 use rsa::{
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey},
     pkcs8::{DecodePublicKey, EncodePublicKey},
-    pss::{SigningKey, VerifyingKey},
-    signature::{RandomizedSigner, SignatureEncoding},
+    pss::{Signature as RsaSignature, SigningKey, VerifyingKey},
+    signature::{RandomizedSigner, SignatureEncoding, Verifier as RsaVerifier},
     RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
@@ -192,6 +192,86 @@ impl std::fmt::Display for SignatureScheme {
     }
 }
 
+/// Domain separator for the Ed25519 signing key derived from an RSA identity.
+/// Frozen: changing it changes every derived key, and with it every binding
+/// signature peers have already seen.
+const ED25519_SUBKEY_INFO: &[u8] = b"p2pem-ed25519-identity-subkey-v1";
+
+/// Domain separator for the signature that binds a derived Ed25519 key to the
+/// RSA identity it belongs to. Also frozen.
+const ED25519_BINDING_LABEL: &[u8] = b"P2PEM_ED25519_BINDING_V1";
+
+/// Derive this identity's Ed25519 *signing subkey* from its RSA private key.
+///
+/// Deterministic, so the same identity always yields the same subkey and an
+/// existing identity gains one without touching `identity.json` — which matters
+/// because that file is the only key to the message history, and a migration
+/// that damages it is unrecoverable. It also means nothing has to be threaded
+/// through the handshake: anything holding the RSA private key can derive this.
+///
+/// The subordinate relationship is the point at this stage. The peer
+/// **fingerprint is still derived from the RSA public key**, so the RSA key is
+/// the identity and this is a signing key under it — deriving it expresses
+/// exactly that. A verifier cannot derive it (they have no private key), which
+/// is what [`cross_sign_ed25519`] is for.
+///
+/// Retiring RSA entirely (the last step of the migration) needs an independent
+/// key, since this one cannot outlive the key it comes from. That step
+/// re-derives fingerprints and re-verifies with the user anyway, so it is the
+/// right place to mint one — not here.
+pub fn derive_ed25519_subkey(privkey: &RsaPrivateKey) -> Result<Ed25519SigningKey> {
+    use rsa::pkcs8::EncodePrivateKey;
+    // The private key's DER is the secret input; it carries far more entropy
+    // than the 256 bits being extracted.
+    let der = privkey
+        .to_pkcs8_der()
+        .map_err(|e| anyhow!("Failed to encode RSA private key for derivation: {}", e))?;
+    let hkdf = Hkdf::<Sha256>::new(None, der.as_bytes());
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf.expand(ED25519_SUBKEY_INFO, seed.as_mut())
+        .map_err(|e| anyhow!("Failed to derive Ed25519 subkey: {}", e))?;
+    Ok(Ed25519SigningKey::from_bytes(&seed))
+}
+
+/// The bytes a binding signature covers: the label and the Ed25519 public key.
+fn ed25519_binding_digest(ed_public: &Ed25519VerifyingKey) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(ED25519_BINDING_LABEL);
+    hasher.update(ed_public.to_bytes());
+    hasher.finalize().to_vec()
+}
+
+/// Sign an Ed25519 public key with the RSA identity it belongs to.
+///
+/// This is what lets a peer accept an Ed25519 proof from a fingerprint they
+/// trust: they already know the RSA public key (it is what the fingerprint is
+/// derived from), so a valid binding says "the holder of that identity vouches
+/// for this signing key". Without it, an attacker could present any Ed25519 key
+/// alongside a stolen `public_key_pem` and sign with a key of their choosing.
+pub fn cross_sign_ed25519(
+    privkey: &RsaPrivateKey,
+    ed_public: &Ed25519VerifyingKey,
+) -> Result<Vec<u8>> {
+    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
+    let mut rng = OsRng;
+    Ok(signing_key
+        .sign_with_rng(&mut rng, &ed25519_binding_digest(ed_public))
+        .to_vec())
+}
+
+/// Verify that `ed_public` is bound to the RSA identity `rsa_public`.
+pub fn verify_ed25519_binding(
+    rsa_public: &RsaPublicKey,
+    ed_public: &Ed25519VerifyingKey,
+    signature: &[u8],
+) -> Result<()> {
+    let verifying_key = VerifyingKey::<Sha256>::new(rsa_public.clone());
+    let sig = RsaSignature::try_from(signature)
+        .map_err(|e| anyhow!("Malformed Ed25519 binding signature: {}", e))?;
+    RsaVerifier::verify(&verifying_key, &ed25519_binding_digest(ed_public), &sig)
+        .map_err(|e| anyhow!("Ed25519 key is not bound to this identity: {}", e))
+}
+
 /// Generate Ed25519 keypair
 pub fn generate_ed25519_keypair() -> (Ed25519SigningKey, Ed25519VerifyingKey) {
     let mut seed = [0u8; 32];
@@ -216,6 +296,22 @@ pub fn verify_ed25519(
     verifying_key
         .verify(data, signature)
         .map_err(|e| anyhow!("Ed25519 signature verification failed: {}", e))
+}
+
+/// Parse a raw 32-byte Ed25519 public key, as carried on the wire.
+pub fn ed25519_public_from_bytes(bytes: &[u8]) -> Result<Ed25519VerifyingKey> {
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 public key must be 32 bytes, got {}", bytes.len()))?;
+    Ed25519VerifyingKey::from_bytes(&arr).map_err(|e| anyhow!("Invalid Ed25519 public key: {}", e))
+}
+
+/// Parse a raw 64-byte Ed25519 signature, as carried on the wire.
+pub fn ed25519_signature_from_bytes(bytes: &[u8]) -> Result<Signature> {
+    let arr: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 signature must be 64 bytes, got {}", bytes.len()))?;
+    Ok(Signature::from_bytes(&arr))
 }
 
 /// Export Ed25519 public key to hex format (32 bytes)
@@ -1005,6 +1101,99 @@ mod tests {
         // Keys should be correct size
         assert_eq!(skey1.to_bytes().len(), 32);
         assert_eq!(vkey1.to_bytes().len(), 32);
+    }
+
+    /// The subkey is a deterministic function of the identity, so an existing
+    /// identity gains one without any change to `identity.json` — the file that
+    /// is the only key to the message history, and the last thing that should
+    /// be migrated for a signing-algorithm change.
+    #[test]
+    fn ed25519_subkey_is_deterministic_per_identity() {
+        let a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+
+        let a1 = derive_ed25519_subkey(&a).unwrap();
+        let a2 = derive_ed25519_subkey(&a).unwrap();
+        let b1 = derive_ed25519_subkey(&b).unwrap();
+
+        assert_eq!(
+            a1.verifying_key().to_bytes(),
+            a2.verifying_key().to_bytes(),
+            "the same identity must always derive the same subkey"
+        );
+        assert_ne!(
+            a1.verifying_key().to_bytes(),
+            b1.verifying_key().to_bytes(),
+            "different identities must derive different subkeys"
+        );
+    }
+
+    /// The binding is what lets a peer accept an Ed25519 proof from a
+    /// fingerprint they already trust — so it has to actually bind.
+    #[test]
+    fn the_binding_ties_a_subkey_to_exactly_one_identity() {
+        let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let other = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let subkey = derive_ed25519_subkey(&identity).unwrap();
+        let public = subkey.verifying_key();
+        let binding = cross_sign_ed25519(&identity, &public).unwrap();
+
+        assert!(verify_ed25519_binding(&RsaPublicKey::from(&identity), &public, &binding).is_ok());
+
+        // Somebody else's identity does not vouch for this key.
+        assert!(
+            verify_ed25519_binding(&RsaPublicKey::from(&other), &public, &binding).is_err(),
+            "a binding must not verify under an identity that did not make it"
+        );
+
+        // Nor does this binding cover a different key — which is the attack it
+        // exists to stop: presenting a stolen public_key_pem alongside an
+        // attacker-controlled signing key.
+        let attacker = derive_ed25519_subkey(&other).unwrap().verifying_key();
+        assert!(
+            verify_ed25519_binding(&RsaPublicKey::from(&identity), &attacker, &binding).is_err(),
+            "a binding must not transfer to another subkey"
+        );
+
+        // And a corrupted signature fails rather than being ignored.
+        let mut damaged = binding.clone();
+        damaged[0] ^= 0xff;
+        assert!(verify_ed25519_binding(&RsaPublicKey::from(&identity), &public, &damaged).is_err());
+    }
+
+    /// Adding a signing subkey must not disturb the fingerprint, because every
+    /// contact's TOFU trust is pinned to it.
+    #[test]
+    fn deriving_a_subkey_does_not_change_the_identity_fingerprint() {
+        let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let pem = pem_encode_public(&RsaPublicKey::from(&identity)).unwrap();
+        let before = fingerprint_pubkey(pem.as_bytes());
+        let _ = derive_ed25519_subkey(&identity).unwrap();
+        let after = fingerprint_pubkey(pem.as_bytes());
+        assert_eq!(before, after);
+    }
+
+    /// An older peer offering only RSA-PSS still negotiates, which is what
+    /// keeps this change back-compatible.
+    #[test]
+    fn negotiation_falls_back_for_a_peer_that_only_knows_rsa() {
+        let ours = [
+            SignatureScheme::Ed25519.to_u8(),
+            SignatureScheme::RsaPss.to_u8(),
+        ];
+        let legacy = [SignatureScheme::RsaPss.to_u8()];
+
+        assert_eq!(
+            negotiate_signature_scheme(&ours, &ours),
+            Some(SignatureScheme::Ed25519),
+            "two current peers use Ed25519"
+        );
+        assert_eq!(
+            negotiate_signature_scheme(&ours, &legacy),
+            Some(SignatureScheme::RsaPss),
+            "an older peer still connects, over RSA-PSS"
+        );
+        assert_eq!(negotiate_signature_scheme(&ours, &[]), None);
     }
 
     #[test]

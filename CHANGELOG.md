@@ -11,7 +11,32 @@ predate tagged releases.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Per-file permissions in communities.** A shared file now carries four
+  separate rights — see it, download it, remove it, share it on — set for
+  everyone who can reach it or for one person. Seeing that a file exists is no
+  longer the same as being able to download it. You can only pass on what you
+  hold yourself, and you keep full control of anything you shared.
+- **Sharing a file on without re-uploading it.** The server stores each file
+  once, so posting one you already have into another channel or DM costs
+  nothing and takes no time.
+
+### Changed
+
+- **Connections are now signed with Ed25519** where both sides support it,
+  falling back to the previous RSA signature for older peers. Handshakes carry
+  64-byte signatures instead of 256 and verify faster. **Your safety number is
+  unchanged** — contacts you have already verified stay verified, and nobody
+  needs to re-check anything.
+
+### Fixed
+
+- **A private channel's messages reached every connected member.** They were
+  correctly kept out of the channel list and refused its history, but each
+  message posted still arrived at their client as it was sent. Restricted
+  channels are now delivered only to the people allowed to read them, and the
+  fix is covered end to end rather than only in the layer that decides it.
 
 ## [1.16.0] - 2026-08-19
 
