@@ -67,15 +67,27 @@ fn free_port() -> u16 {
 /// peer labels observed on each side (`p2p:*` for a punched direct socket,
 /// `relay:*` when bridged) so callers can assert which transport was used.
 async fn pair_and_exchange() -> (String, String) {
-    let port = free_port();
-    let relay_addr = format!("127.0.0.1:{port}");
+    let relay_addr = start_relay().await;
+    pair_and_exchange_on(&relay_addr, &generate_relay_token(), "rendezvous hello").await
+}
 
+/// Start a relay on a free port and wait for it to be listening.
+async fn start_relay() -> String {
+    let port = free_port();
     tokio::spawn(async move {
         let _ = run_relay_server(port).await;
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
+    format!("127.0.0.1:{port}")
+}
 
-    let token = generate_relay_token();
+/// One full pairing on an existing relay: handshake, TOFU on both ends, and one
+/// host→client message carrying `payload`. Split out from
+/// [`pair_and_exchange`] so several pairings can share one relay — which is
+/// what the reconnect and concurrency tests need.
+async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (String, String) {
+    let relay_addr = relay_addr.to_string();
+    let token = token.to_string();
     let host_priv = generate_rsa_keypair(RSA_KEY_BITS).expect("host key");
     let client_priv = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
 
@@ -157,7 +169,7 @@ async fn pair_and_exchange() -> (String, String) {
     // transport carries the encrypted session end to end.
     host_out
         .send(ProtocolMessage::Text {
-            text: "rendezvous hello".to_string(),
+            text: payload.to_string(),
             timestamp: 1,
             seq: 1,
         })
@@ -172,7 +184,10 @@ async fn pair_and_exchange() -> (String, String) {
     .await;
     match received {
         SessionEvent::MessageReceived(ProtocolMessage::Text { text, .. }) => {
-            assert_eq!(text, "rendezvous hello");
+            assert_eq!(
+                text, payload,
+                "a pairing received another pairing's message"
+            );
         }
         _ => unreachable!(),
     }
@@ -218,4 +233,84 @@ async fn two_peers_pair_through_the_bridged_relay_when_punching_is_disabled() {
         client_label.starts_with("relay:"),
         "client should be bridged, got {client_label}"
     );
+}
+
+/// A relay is a long-lived service: peers drop and redial it constantly. One
+/// completed session must leave it able to broker the next one — a rendezvous
+/// slot that leaked, or a listener that died with its first pairing, would make
+/// the app work exactly once per relay restart.
+#[tokio::test]
+async fn one_relay_brokers_a_second_session_after_the_first_ends() {
+    let relay_addr = start_relay().await;
+
+    let first = generate_relay_token();
+    pair_and_exchange_on(&relay_addr, &first, "first session").await;
+
+    // A fresh token, as a reconnecting pair would use.
+    let second = generate_relay_token();
+    pair_and_exchange_on(&relay_addr, &second, "second session").await;
+
+    // And the very same token again, which is legitimate once its slot has been
+    // released by the pairing that consumed it.
+    pair_and_exchange_on(&relay_addr, &first, "third session").await;
+}
+
+/// Two pairings brokered at the same time by one relay. Each must reach its own
+/// partner: crossing them would put two strangers into a session together, with
+/// nothing but the v3 handshake's fingerprint check between them.
+#[tokio::test]
+async fn one_relay_brokers_two_pairings_at_once() {
+    let relay_addr = start_relay().await;
+
+    let a = {
+        let relay_addr = relay_addr.clone();
+        tokio::spawn(async move {
+            pair_and_exchange_on(&relay_addr, &generate_relay_token(), "pairing A").await
+        })
+    };
+    let b = {
+        let relay_addr = relay_addr.clone();
+        tokio::spawn(async move {
+            pair_and_exchange_on(&relay_addr, &generate_relay_token(), "pairing B").await
+        })
+    };
+
+    // `pair_and_exchange_on` asserts each side received its *own* payload, so
+    // completing at all is the crossing check.
+    a.await.expect("pairing A");
+    b.await.expect("pairing B");
+}
+
+/// A joiner that dials a token nobody registered must fail, and must fail
+/// *quickly* — the relay answers with an error rather than parking the client
+/// on a five-minute wait. The relay must also still be serving afterwards.
+#[tokio::test]
+async fn an_unknown_token_fails_fast_and_leaves_the_relay_serving() {
+    let relay_addr = start_relay().await;
+
+    let (ev_tx, _events) = mpsc::unbounded_channel();
+    let (_out, out_rx) = mpsc::unbounded_channel();
+    let (_file_tx, file_rx) = mpsc::channel(8);
+    let (_confirm, confirm_rx) = mpsc::unbounded_channel();
+    let privkey = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_client_session_via_relay(
+            &relay_addr,
+            &generate_relay_token(),
+            privkey,
+            ev_tx,
+            out_rx,
+            file_rx,
+            confirm_rx,
+            uuid::Uuid::new_v4(),
+        ),
+    )
+    .await
+    .expect("joining an unknown token must not hang");
+    assert!(result.is_err(), "an unknown token must not pair");
+
+    // The relay survived the refusal and still brokers a real pairing.
+    pair_and_exchange_on(&relay_addr, &generate_relay_token(), "still serving").await;
 }

@@ -291,13 +291,24 @@ export function FilePermissionsDialog({ server, file, onClose, onSubmit }) {
 
   // Downloading what you cannot see, and sharing what you cannot download, are
   // not coherent — mirror the server's normalisation so the switches behave.
+  //
+  // The cascade follows the *direction* of the switch the user actually moved.
+  // Re-deriving every rule on each change instead meant the implications fought
+  // each other: turning "See it" off while "Share it on" was set re-enabled
+  // download, which re-enabled view, so the click the user made had no visible
+  // effect at all and the only way to revoke access was to guess the order.
   function toggle(key) {
     setPerms((p) => {
       const next = { ...p, [key]: !p[key] };
-      if (next.share) next.download = true;
-      if (next.download || next.delete || next.share) next.view = true;
-      if (!next.view) { next.download = false; next.delete = false; next.share = false; }
-      if (!next.download) next.share = false;
+      if (next[key]) {
+        // Turning a right on grants what it depends on.
+        if (key === "share") next.download = true;
+        if (key === "share" || key === "download" || key === "delete") next.view = true;
+      } else {
+        // Turning one off revokes everything that depended on it.
+        if (key === "view") { next.download = false; next.delete = false; next.share = false; }
+        if (key === "download") next.share = false;
+      }
       return next;
     });
   }

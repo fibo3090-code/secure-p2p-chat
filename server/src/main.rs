@@ -7,27 +7,20 @@
 //! share files, and the server stores history durably (SQLite + blob store) so
 //! offline members catch up on reconnect.
 
-mod connection;
-mod dispatch;
-mod hub;
-mod identity;
-mod state;
+//! Everything below the argument parsing lives in the library half of this
+//! crate (`lib.rs`), so the server can also be stood up in process by a test.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
 use messenger_core::core::{fingerprint_pubkey, pem_encode_public};
-// Shared with the relay server's accept loop — both face the open internet and
-// need the same per-address ceiling.
-use messenger_core::network::ratelimit::RateLimiter;
+use messenger_server::hub::Hub;
+use messenger_server::state::PartyState;
+use messenger_server::{identity, run_accept_loop};
 use rsa::RsaPublicKey;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-
-use hub::Hub;
-use state::PartyState;
 
 /// Self-hosted Community (Party) server. Friends join with your address, an
 /// optional password, and a username — no port forwarding gymnastics on their
@@ -91,40 +84,5 @@ async fn main() -> anyhow::Result<()> {
         "Community server listening — share your address and this fingerprint with people you invite"
     );
 
-    // Bounds how fast one address may reconnect. Each accepted socket spawns a
-    // task that immediately runs an RSA handshake, and `dispatch::MAX_JOIN_ATTEMPTS`
-    // makes a password guesser reconnect every few attempts — so without this,
-    // reconnecting IS the guessing loop.
-    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
-
-    loop {
-        // A failed `accept` is almost always transient — the peer vanished
-        // between the SYN and our accept, or we briefly ran out of file
-        // descriptors. Propagating it with `?` took the whole community server
-        // down for the life of the process over one hiccup.
-        let (mut stream, addr) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept failed; continuing to listen");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-        };
-        if rate_limiter.lock().await.check(addr.ip()) {
-            tracing::warn!(%addr, "refusing connection: rate limit exceeded");
-            // Drop it without handshaking; the client sees a closed connection.
-            continue;
-        }
-        tracing::info!(%addr, "client connected");
-        let state = state.clone();
-        let privkey = privkey.clone();
-        let hub = hub.clone();
-        tokio::spawn(async move {
-            if let Err(e) = connection::serve_connection(&mut stream, &privkey, state, hub).await {
-                tracing::warn!(%addr, error = %e, "connection ended with error");
-            } else {
-                tracing::info!(%addr, "client disconnected");
-            }
-        });
-    }
+    run_accept_loop(listener, state, privkey, hub).await
 }

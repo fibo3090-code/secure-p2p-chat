@@ -1,8 +1,8 @@
 // Unified Messages surface — conversation list + chat pane. Clean port of the
 // mockup's chat.jsx, driven by live data adapted in lib/bridge.js.
-import { useRef, useEffect, useState } from "react";
+import { memo, useCallback, useMemo, useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { api, fmtDay } from "../lib/bridge.js";
+import { api, fmtDay, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { cx, Avatar, IconButton, Button, Modal, TrustBadge, TransportBadge } from "./ui.jsx";
 
@@ -74,40 +74,107 @@ const OFFLINE_NOTICE = {
   connecting: "Connecting… you'll be able to send as soon as the peer answers.",
 };
 
+// The markers beside a conversation are icons and a bare count, so a screen
+// reader reached the row and announced only the name and preview — the
+// unverified warning and the unread badge, the two things that decide whether
+// you open it, were invisible. Spelled out here and stitched into the row's
+// accessible name.
+export function rowStatusLabel(c) {
+  const bits = [];
+  if (c.unread > 0) bits.push(`${c.unread} unread message${c.unread === 1 ? "" : "s"}`);
+  if (c.kind === "group") bits.push("group");
+  if (c.kind === "channel") bits.push("channel");
+  if (c.transport === "relay") bits.push("over a relay");
+  if (c.transport === "server") bits.push("over a community server");
+  if (c.state === "hosting") bits.push("hosting, waiting for a peer");
+  else if (c.state === "connected") bits.push("connected");
+  else if (c.state === "connecting") bits.push("connecting");
+  else bits.push("offline");
+  if (c.trust === "unverified") bits.push("not verified");
+  return bits.join(", ");
+}
+
+// Memoised by value, not by identity: the conversation list is rebuilt from a
+// fresh bridge payload on every poll tick, so every row object is new each time
+// and the default shallow compare would never hit. Comparing the fields the row
+// actually renders is what stops an idle poll from re-rendering the whole list.
+function convRowsEqual(a, b) {
+  if (a.onSelect !== b.onSelect || a.active !== b.active) return false;
+  const x = a.c;
+  const y = b.c;
+  return (
+    x.id === y.id && x.name === y.name && x.last === y.last && x.lastT === y.lastT &&
+    x.typing === y.typing && x.kind === y.kind && x.transport === y.transport &&
+    x.state === y.state && x.trust === y.trust && x.unread === y.unread
+  );
+}
+
+const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
+  const status = rowStatusLabel(c);
+  return (
+    <button
+      className={cx("conv-row", active && "is-active")}
+      role="option"
+      aria-selected={active}
+      aria-label={`${c.name}. ${status}`}
+      onClick={() => onSelect(c.id)}
+    >
+      <Avatar name={c.name} size={42} state={c.state} party={c.trust === "party"} />
+      <div className="conv-main">
+        <div className="conv-line1">
+          <span className="conv-name">{c.name}</span>
+          <span className="conv-time">{c.lastT}</span>
+        </div>
+        <div className="conv-line2">
+          <span className="conv-preview">
+            {c.typing ? <em className="conv-typing">typing…</em> : c.last}
+          </span>
+          {/* aria-hidden: every marker here is repeated in the row's aria-label
+              above, in words. Leaving them exposed makes a reader announce a
+              bare number after the preview text. */}
+          <span className="conv-markers" aria-hidden="true">
+            {c.kind === "group" && <Icon name="users" size={12} />}
+            {c.kind === "channel" && <Icon name="hash" size={12} />}
+            {c.transport === "relay" && <Icon name="satellite" size={12} />}
+            {c.transport === "server" && <Icon name="server" size={12} />}
+            {c.state === "hosting" && <span className="marker-h">H</span>}
+            {c.trust === "unverified" && <span className="marker-warn"><Icon name="alert" size={12} /></span>}
+            {c.unread > 0 && <span className="conv-unread">{c.unread}</span>}
+          </span>
+        </div>
+      </div>
+    </button>
+  );
+}, convRowsEqual);
+
 export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery }) {
-  const filtered = contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
+  const filtered = useMemo(
+    () => contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase())),
+    [contacts, query],
+  );
+  // Total unread, announced politely. A badge appearing on a row the user is
+  // not looking at is otherwise a purely visual event.
+  const totalUnread = useMemo(
+    () => filtered.reduce((n, c) => n + (c.unread || 0), 0),
+    [filtered],
+  );
   return (
     <div className="conv-list">
       <div className="conv-search">
         <Icon name="search" size={15} />
-        <input placeholder="Search conversations" value={query} onChange={(e) => setQuery(e.target.value)} />
-        <button className="conv-add" onClick={onAdd} title="New connection"><Icon name="plus" size={17} /></button>
+        <input placeholder="Search conversations" aria-label="Search conversations"
+          value={query} onChange={(e) => setQuery(e.target.value)} />
+        <button className="conv-add" onClick={onAdd} title="New connection" aria-label="New connection"><Icon name="plus" size={17} /></button>
       </div>
-      <div className="conv-scroll">
+      <div className="sr-only" role="status" aria-live="polite">
+        {totalUnread > 0 ? `${totalUnread} unread message${totalUnread === 1 ? "" : "s"}` : "No unread messages"}
+      </div>
+      {/* listbox/option: the rows are a single-select list of conversations,
+          not a run of unrelated buttons, so a reader announces "3 of 12"
+          instead of leaving the user to count. */}
+      <div className="conv-scroll" role="listbox" aria-label="Conversations">
         {filtered.map((c) => (
-          <button key={c.id} className={cx("conv-row", activeId === c.id && "is-active")} onClick={() => onSelect(c.id)}>
-            <Avatar name={c.name} size={42} state={c.state} party={c.trust === "party"} />
-            <div className="conv-main">
-              <div className="conv-line1">
-                <span className="conv-name">{c.name}</span>
-                <span className="conv-time">{c.lastT}</span>
-              </div>
-              <div className="conv-line2">
-                <span className="conv-preview">
-                  {c.typing ? <em className="conv-typing">typing…</em> : c.last}
-                </span>
-                <span className="conv-markers">
-                  {c.kind === "group" && <Icon name="users" size={12} />}
-                  {c.kind === "channel" && <Icon name="hash" size={12} />}
-                  {c.transport === "relay" && <Icon name="satellite" size={12} />}
-                  {c.transport === "server" && <Icon name="server" size={12} />}
-                  {c.state === "hosting" && <span className="marker-h">H</span>}
-                  {c.trust === "unverified" && <span className="marker-warn"><Icon name="alert" size={12} /></span>}
-                  {c.unread > 0 && <span className="conv-unread">{c.unread}</span>}
-                </span>
-              </div>
-            </div>
-          </button>
+          <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} />
         ))}
         {filtered.length === 0 && (
           <div className="conv-empty">
@@ -128,7 +195,7 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
   );
 }
 
-function MessageItem({ m, preview, onOpen, onReveal }) {
+function MessageItemInner({ m, preview, onOpen, onReveal }) {
   if (m.kind === "system") {
     return (
       <div className={cx("sys-msg", m.warn && "is-warn", m.ok && "is-ok")}>
@@ -188,6 +255,26 @@ function MessageItem({ m, preview, onOpen, onReveal }) {
     </div>
   );
 }
+
+// Memoised by value. `chatToContact` rebuilds the whole message array from a
+// fresh bridge payload on every poll tick, so each `m` is a new object and the
+// default shallow compare never hits — a 150-message thread re-rendered every
+// row, several times a second, for the entire time the app was open. Comparing
+// the fields a row actually renders makes an idle tick cost nothing.
+function messagesEqual(a, b) {
+  if (a.preview !== b.preview || a.onOpen !== b.onOpen || a.onReveal !== b.onReveal) return false;
+  const x = a.m;
+  const y = b.m;
+  return (
+    x.id === y.id && x.kind === y.kind && x.text === y.text && x.t === y.t &&
+    x.from === y.from && x.author === y.author && x.delivered === y.delivered &&
+    x.name === y.name && x.size === y.size && x.progress === y.progress &&
+    x.hasPath === y.hasPath && x.path === y.path && x.dir === y.dir &&
+    x.warn === y.warn && x.ok === y.ok
+  );
+}
+
+const MessageItem = memo(MessageItemInner, messagesEqual);
 
 function transferPct(t) {
   return t.size > 0 ? Math.min(100, Math.round((t.received / t.size) * 100)) : 0;
@@ -382,23 +469,27 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   // Opening a peer's file can mean running their code. The bridge refuses
   // those unless confirmed and tells us what it is, so the click turns into a
   // question instead of an execution.
-  const openFile = async (m) => {
+  // useCallback, because these are the props `MessageItem`'s memo compares by
+  // identity — recreating them each render would defeat it entirely.
+  const contactId = contact ? contact.id : null;
+  const openFile = useCallback(async (m) => {
     try {
-      const r = await api.openFile(contact.id, m.id, false);
+      const r = await api.openFile(contactId, m.id, false);
       if (r && r.blocked) setRiskyOpen({ msg: m, kind: r.blocked, filename: r.filename || m.name });
-    } catch (e) { toast(String(e), "error"); }
-  };
+    } catch (e) { toast(friendlyError(e), "error"); }
+  }, [contactId]);
   const confirmRiskyOpen = async () => {
     const target = riskyOpen;
     setRiskyOpen(null);
     if (!target) return;
     try { await api.openFile(contact.id, target.msg.id, false, true); }
-    catch (e) { toast(String(e), "error"); }
+    catch (e) { toast(friendlyError(e), "error"); }
   };
   // Revealing never launches anything, so it is never gated.
-  const revealFile = (m) =>
-    api.openFile(contact.id, m.id, true)
-      .catch((e) => toast(`Could not show the file: ${e}`, "error"));
+  const revealFile = useCallback((m) =>
+    api.openFile(contactId, m.id, true)
+      .catch((e) => toast(`Could not show the file: ${friendlyError(e)}`, "error")),
+  [contactId]);
 
   // Sending needs a live session. Without this the composer accepted a whole
   // paragraph, the bridge reported success, and the text vanished.
@@ -415,6 +506,24 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
     : sending
       ? "Already sending a file in this conversation"
       : "Send file";
+
+  // The rendered window and its day separators, recomputed only when the thread
+  // or the window actually changes. `Date` parsing per message on every poll
+  // tick was the other half of the re-render cost.
+  //
+  // Declared before the early returns below: hooks must run in the same order on
+  // every render, so this cannot move inside the JSX.
+  const messages = contact ? contact.messages : null;
+  const visible = useMemo(() => {
+    if (!messages) return [];
+    let lastDay = null;
+    return messages.slice(-shown).map((m, i) => {
+      const day = m.ts ? new Date(m.ts).toDateString() : null;
+      const sep = day && day !== lastDay ? fmtDay(m.ts) : null;
+      if (day) lastDay = day;
+      return { m, sep, key: m.id || `i${i}` };
+    });
+  }, [messages, shown]);
 
   if (!contact) {
     // With nothing to select, "Select a conversation" is a dead end — and this
@@ -460,22 +569,13 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               Show earlier messages ({contact.messages.length - shown} more)
             </button>
           )}
-          {(() => {
-            const visible = contact.messages.slice(-shown);
-            let lastDay = null;
-            return visible.map((m, i) => {
-              const day = m.ts ? new Date(m.ts).toDateString() : null;
-              const sep = day && day !== lastDay ? fmtDay(m.ts) : null;
-              if (day) lastDay = day;
-              return (
-                <div key={m.id || i}>
-                  {sep && <div className="day-sep"><span>{sep}</span></div>}
-                  <MessageItem m={m} preview={m.id ? previews[m.id] : null}
-                    onOpen={openFile} onReveal={revealFile} />
-                </div>
-              );
-            });
-          })()}
+          {visible.map(({ m, sep, key }) => (
+            <div key={key}>
+              {sep && <div className="day-sep"><span>{sep}</span></div>}
+              <MessageItem m={m} preview={m.id ? previews[m.id] : null}
+                onOpen={openFile} onReveal={revealFile} />
+            </div>
+          ))}
         </div>
       </div>
 
@@ -493,7 +593,8 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
           title={clipTitle}
           disabled={!online || sending}
           onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
-        <textarea className="composer-input" rows={1}
+        <textarea className="composer-input" id="composer-input" rows={1}
+          aria-label={online ? `Message ${contact.name}` : "Message box — not connected"}
           placeholder={online ? `Message ${contact.name.split(" ")[0]}…` : "Not connected — reconnect to send"}
           // Typing into a conversation with no session used to look like it
           // worked: the send reported success, the box cleared, and the message

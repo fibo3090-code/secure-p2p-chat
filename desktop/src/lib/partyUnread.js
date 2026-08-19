@@ -19,34 +19,46 @@
 // read marks, which *are* tied to private conversations, live in the encrypted
 // history instead (`Chat::read_count`).
 
+import { read, write } from "./localStore.js";
+
 const STORAGE_KEY = "p2pem.party.read";
 
-/** Load the persisted marks, tolerating absent/corrupt/partial storage. */
+/** A stored blob is only a read-mark map if every entry is a count. */
+function isMarkMap(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  return Object.values(obj).every((v) => Number.isInteger(v) && v >= 0);
+}
+
+/// Load the persisted marks, tolerating absent/corrupt/partial/tampered storage.
+///
+/// Goes through `localStore`, so a damaged entry — or a blob lifted from another
+/// key — is rejected outright rather than parsed for whatever survives. Entries
+/// that are not counts are dropped individually, since one bad key must not cost
+/// the user every other thread's mark.
+///
+/// Every failure lands in the same place: an empty map, which over-reports
+/// unread. That is the safe direction — it shows messages that were already
+/// read, rather than hiding ones that were not.
 function load() {
-  try {
-    const raw = globalThis.localStorage?.getItem(STORAGE_KEY);
-    if (!raw) return new Map();
-    const obj = JSON.parse(raw);
-    if (!obj || typeof obj !== "object") return new Map();
-    return new Map(
-      Object.entries(obj).filter(([, v]) => Number.isInteger(v) && v >= 0),
-    );
-  } catch {
-    // Unreadable storage must never break the Communities pane — losing the
-    // marks only means a round of over-reporting, which is the safe direction.
-    return new Map();
-  }
+  const stored = read(
+    STORAGE_KEY,
+    isMarkMap,
+    // `legacy`: marks used to be a bare JSON object with no envelope.
+    (raw) => {
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return undefined;
+      return Object.fromEntries(
+        Object.entries(obj).filter(([, v]) => Number.isInteger(v) && v >= 0),
+      );
+    },
+  );
+  return new Map(Object.entries(stored ?? {}));
 }
 
 const seen = load();
 
 function persist() {
-  try {
-    globalThis.localStorage?.setItem(
-      STORAGE_KEY,
-      JSON.stringify(Object.fromEntries(seen)),
-    );
-  } catch { /* storage full or unavailable — badges still work this session */ }
+  write(STORAGE_KEY, Object.fromEntries(seen));
 }
 
 function threadKeys(server) {

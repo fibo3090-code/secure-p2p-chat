@@ -4,10 +4,10 @@ use rsa::pss::{SigningKey, VerifyingKey};
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -20,6 +20,7 @@ use crate::core::{
     recv_packet, send_packet, sign_ed25519, verify_ed25519, verify_ed25519_binding, AesCipher,
     Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
 };
+use crate::network::ratelimit::RateLimiter;
 use crate::types::SessionEvent;
 use crate::HANDSHAKE_TIMEOUT_SECS;
 
@@ -28,35 +29,36 @@ const HKDF_INFO: &[u8] = b"p2p-messenger-v2-forward-secrecy";
 
 /// Rate limiting: max connections per IP in the time window
 const RATE_LIMIT_MAX_CONNECTIONS: usize = 5;
-const RATE_LIMIT_WINDOW_SECS: u64 = 10;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Global rate limiter state
-static RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, Vec<Instant>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Global rate limiter state.
+///
+/// This is the shared [`RateLimiter`], not a bare map: the hand-rolled version
+/// here only ever *pruned* an address's timestamps and never dropped the address
+/// itself, so every source that had ever connected kept a `HashMap` entry for
+/// the life of the process. A scan across a /64 is enough to turn that into an
+/// out-of-memory condition a remote party controls. `RateLimiter` ages entries
+/// out and caps how many it will hold (`ratelimit::MAX_TRACKED_ADDRESSES`).
+static RATE_LIMITER: std::sync::LazyLock<Mutex<RateLimiter>> = std::sync::LazyLock::new(|| {
+    Mutex::new(RateLimiter::with_limits(
+        RATE_LIMIT_MAX_CONNECTIONS,
+        RATE_LIMIT_WINDOW,
+    ))
+});
 
 /// Check if an IP is rate-limited. Returns true if connection should be rejected.
 fn is_rate_limited(ip: IpAddr) -> bool {
     let mut limiter = RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-
-    let attempts = limiter.entry(ip).or_default();
-
-    // Remove old attempts outside the window
-    attempts.retain(|t| now.duration_since(*t) < window);
-
-    if attempts.len() >= RATE_LIMIT_MAX_CONNECTIONS {
+    let limited = limiter.check(ip);
+    if limited {
         tracing::warn!(
-            "Rate limiting IP {}: {} attempts in {}s",
+            "Rate limiting IP {}: more than {} connections in {:?}",
             ip,
-            attempts.len(),
-            RATE_LIMIT_WINDOW_SECS
+            RATE_LIMIT_MAX_CONNECTIONS,
+            RATE_LIMIT_WINDOW
         );
-        return true;
     }
-
-    attempts.push(now);
-    false
+    limited
 }
 
 /// Receive packet with handshake timeout to prevent Slowloris attacks
@@ -965,15 +967,23 @@ where
 
 /// Constant-time comparison so a wrong connection password cannot be recovered
 /// byte-by-byte via response timing.
+///
+/// `subtle::ConstantTimeEq` rather than a hand-rolled loop, for two reasons.
+/// The community server already uses `subtle` for exactly this comparison, and
+/// one implementation of "compare a secret" is one place to get it right. More
+/// concretely, a hand-written version's early `return` on a length mismatch is
+/// itself a timing signal — it answers "wrong length" faster than "wrong bytes",
+/// which hands an attacker the password's length for free before they start
+/// guessing its content. Here both operands are first hashed to a fixed 32
+/// bytes, so the comparison is over equal-length inputs whatever was sent and
+/// the length never reaches a branch.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // Hashing first is what makes the compare length-independent. It is not
+    // there to protect the password at rest (it never is at rest) — only to keep
+    // the length off the timing channel.
+    let ha = Sha256::digest(a);
+    let hb = Sha256::digest(b);
+    bool::from(ha.ct_eq(&hb))
 }
 
 /// Host side of the optional connection-password gate, run over the established
@@ -1659,6 +1669,21 @@ mod tests {
     use crate::RSA_KEY_BITS;
     use anyhow::Result;
     use rand::RngCore;
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"correct horse", b"correct horse"));
+        assert!(!constant_time_eq(b"correct horse", b"correct horsf"));
+        // Different lengths must simply compare unequal — and must do so on the
+        // same code path as a same-length mismatch, so the answer takes the same
+        // work either way and never reveals how long the secret is.
+        assert!(!constant_time_eq(b"short", b"considerably longer"));
+        assert!(!constant_time_eq(b"considerably longer", b"short"));
+        assert!(!constant_time_eq(b"", b"x"));
+        // A prefix is not a match: the digest covers the whole input.
+        assert!(!constant_time_eq(b"secret", b"secretsauce"));
+    }
 
     #[tokio::test]
     async fn initiate_rekey_frame_decryptable_by_peer_and_keys_agree() {

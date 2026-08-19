@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Modal, PasswordInput } from "./ui.jsx";
 import { THEMES } from "../lib/themes.js";
-import { api } from "../lib/bridge.js";
+import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
 function Toggle({ on, onChange, label, hint }) {
@@ -54,7 +54,7 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
       toast("Password changed. Use the new one next time you unlock.", "success");
       onClose();
     } catch (e) {
-      setErr(String(e));
+      setErr(friendlyError(e));
     } finally { setBusy(false); }
   }
 
@@ -109,7 +109,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
       await api.setDisplayName(name);
       toast("Display name updated.", "success");
       onIdentityChanged && onIdentityChanged();
-    } catch (e) { toast(String(e), "error"); setNameDraft(identity?.name || ""); }
+    } catch (e) { toast(friendlyError(e), "error"); setNameDraft(identity?.name || ""); }
   }
 
   // Apply one field and save; roll back the UI if the bridge rejects it.
@@ -127,7 +127,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
         auto_connect: next.auto_connect,
         enable_mdns: next.enable_mdns,
       });
-    } catch (e) { toast(String(e), "error"); setS(s); }
+    } catch (e) { toast(friendlyError(e), "error"); setS(s); }
   }
 
   function commitPort() {
@@ -146,7 +146,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
     try {
       const dir = await api.pickDownloadDir();
       if (dir) { setS((cur) => ({ ...cur, download_dir: dir })); toast("Download folder updated.", "success"); }
-    } catch (e) { toast(String(e), "error"); }
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   return (
@@ -199,7 +199,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
                   toast(`Backup saved to ${dest}`, "success");
                   api.getSettings().then(setS).catch(() => {});
                 }
-              } catch (e) { toast(String(e), "error"); }
+              } catch (e) { toast(friendlyError(e), "error"); }
             }}>
               <Icon name="copy" size={14} /> {backedUp ? "Export again" : "Export now"}
             </button>
@@ -295,7 +295,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
             </span>
             <button className="set-change" onClick={async () => {
               try { const p = await api.exportDiagnostics(); toast(`Diagnostics exported to ${p}`, "success"); }
-              catch (e) { toast(String(e), "error"); }
+              catch (e) { toast(friendlyError(e), "error"); }
             }}>
               <Icon name="file" size={14} /> Export
             </button>
@@ -306,7 +306,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               <span className="set-row-hint">Where your identity, encrypted history and diagnostics live</span>
             </span>
             <button className="set-change" onClick={async () => {
-              try { await api.openDataDir(); } catch (e) { toast(String(e), "error"); }
+              try { await api.openDataDir(); } catch (e) { toast(friendlyError(e), "error"); }
             }}>
               <Icon name="folder" size={14} /> Open
             </button>

@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, IconButton, Input, Modal, TrustBadge } from "./ui.jsx";
-import { api } from "../lib/bridge.js";
+import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
 export function Contacts({ onConnected }) {
@@ -16,7 +16,10 @@ export function Contacts({ onConnected }) {
   const [deleteTarget, setDeleteTarget] = useState(null);
 
   const load = useCallback(() => {
-    api.listContacts().then(setContacts).catch(() => {});
+    // `|| []` because the whole pane renders off `contacts.length`: one command
+    // answering with nothing takes the surface down entirely, and a contacts
+    // list is not worth a blank screen.
+    api.listContacts().then((list) => setContacts(list || [])).catch(() => {});
   }, []);
   useEffect(() => { load(); }, [load]);
 
@@ -36,12 +39,12 @@ export function Contacts({ onConnected }) {
       } else {
         toast(`Added ${res?.contact?.name || "contact"}.`, "success");
       }
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(friendlyError(e)); }
   }
   async function connect(id) {
     setErr("");
     try { await api.connectContact(id); onConnected && onConnected(); }
-    catch (e) { setErr(String(e)); }
+    catch (e) { setErr(friendlyError(e)); }
   }
   async function toggleBlock(c) {
     setErr("");
@@ -49,7 +52,7 @@ export function Contacts({ onConnected }) {
       if (c.trust === "blocked") await api.unblockContact(c.id);
       else await api.blockContact(c.id);
       load();
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(friendlyError(e)); }
   }
   // Say whether the copy happened. A clipboard write can be refused by the
   // webview, and silently doing nothing invites the user to paste a stale
@@ -67,7 +70,7 @@ export function Contacts({ onConnected }) {
     setDeleteTarget(null);
     setErr("");
     try { await api.removeContact(c.id); load(); }
-    catch (e) { setErr(String(e)); }
+    catch (e) { setErr(friendlyError(e)); }
   }
 
   return (

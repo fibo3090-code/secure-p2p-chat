@@ -23,12 +23,43 @@ pub const MAX_CONNECTIONS: usize = 10;
 /// The sliding window those connections are counted over.
 pub const WINDOW: Duration = Duration::from_secs(30);
 
+/// How many source addresses one limiter will track at once.
+///
+/// The per-address history is pruned by [`WINDOW`], which bounds the table for
+/// *honest* traffic but not for an attacker: a scan from a fresh address every
+/// few milliseconds — trivial from an IPv6 /64, and the normal shape of an
+/// internet-wide sweep — adds an entry per packet and only ever drops them
+/// `WINDOW` later. That is an unbounded allocation driven by a remote party, so
+/// the table is capped as well as aged.
+///
+/// At the cap, the addresses whose most recent connection is oldest are evicted
+/// first. Evicting the *stalest* is what keeps the limit meaningful under the
+/// attack that forces it: whoever is connecting hardest has the freshest entry
+/// and so is the last to be forgotten. The size is generous next to any real
+/// deployment (a busy server sees far fewer than this in a 30-second window) and
+/// costs well under a megabyte.
+pub const MAX_TRACKED_ADDRESSES: usize = 4096;
+
+/// One address's recent history.
+///
+/// `last_seen` advances on *every* check, including the ones that are refused,
+/// while `attempts` only records the connections that were allowed. The two
+/// differ precisely for an address that is over its limit and still trying —
+/// which is why eviction orders on `last_seen`: an attacker who keeps knocking
+/// must not be able to age their own entry out of the table.
+#[derive(Debug)]
+struct Entry {
+    attempts: Vec<Instant>,
+    last_seen: Instant,
+}
+
 /// Sliding-window counter of recent connections per source address.
 #[derive(Debug)]
 pub struct RateLimiter {
-    attempts: HashMap<IpAddr, Vec<Instant>>,
+    attempts: HashMap<IpAddr, Entry>,
     max: usize,
     window: Duration,
+    max_tracked: usize,
 }
 
 impl Default for RateLimiter {
@@ -49,7 +80,16 @@ impl RateLimiter {
             attempts: HashMap::new(),
             max,
             window,
+            max_tracked: MAX_TRACKED_ADDRESSES,
         }
+    }
+
+    /// Override how many addresses may be tracked at once. Exposed so the
+    /// eviction path is testable without allocating [`MAX_TRACKED_ADDRESSES`]
+    /// entries; production uses the default.
+    pub fn with_max_tracked(mut self, max_tracked: usize) -> Self {
+        self.max_tracked = max_tracked.max(1);
+        self
     }
 
     /// Record a connection from `ip` and report whether it should be refused.
@@ -59,22 +99,70 @@ impl RateLimiter {
         // Drop addresses whose whole history has aged out, so a long-running
         // server does not accumulate an entry per address it has ever seen.
         let window = self.window;
-        self.attempts
-            .retain(|_, seen| seen.iter().any(|t| now.duration_since(*t) < window));
+        self.attempts.retain(|_, e| {
+            e.attempts.iter().any(|t| now.duration_since(*t) < window)
+                || now.duration_since(e.last_seen) < window
+        });
+
+        // Age-based pruning alone leaves the table at the mercy of whoever is
+        // rotating source addresses, so enforce the hard ceiling too. Only a
+        // *new* address can grow the table, so this is the one place to check.
+        if !self.attempts.contains_key(&ip) && self.attempts.len() >= self.max_tracked {
+            self.evict_stalest();
+        }
 
         let max = self.max;
-        let seen = self.attempts.entry(ip).or_default();
-        seen.retain(|t| now.duration_since(*t) < window);
-        if seen.len() >= max {
+        let entry = self.attempts.entry(ip).or_insert_with(|| Entry {
+            attempts: Vec::new(),
+            last_seen: now,
+        });
+        // Every knock counts as contact, answered or not.
+        entry.last_seen = entry.last_seen.max(now);
+        entry.attempts.retain(|t| now.duration_since(*t) < window);
+        if entry.attempts.len() >= max {
             return true;
         }
-        seen.push(now);
+        entry.attempts.push(now);
         false
     }
 
     /// [`Self::check_at`] against the current clock.
     pub fn check(&mut self, ip: IpAddr) -> bool {
         self.check_at(ip, Instant::now())
+    }
+
+    /// Drop the addresses whose most recent connection is oldest, until there is
+    /// room for one more.
+    ///
+    /// Evicting an entry forgives that address its recent connections, so the
+    /// order matters: the freshest entries are the ones actively being limited,
+    /// and dropping those is exactly what an attacker rotating addresses would
+    /// want. A batch is taken rather than a single entry so a sustained scan
+    /// pays for the sort once every `max_tracked / 16` new addresses instead of
+    /// on every one of them.
+    fn evict_stalest(&mut self) {
+        let target = self.max_tracked.saturating_sub(1);
+        let batch = (self.max_tracked / 16).max(1);
+        let want_removed = self.attempts.len().saturating_sub(target).max(batch);
+
+        let mut by_recency: Vec<(IpAddr, Instant)> = self
+            .attempts
+            .iter()
+            .map(|(ip, entry)| (*ip, entry.last_seen))
+            .collect();
+        // Oldest last-seen first: those are the addresses closest to ageing out
+        // on their own.
+        by_recency.sort_unstable_by_key(|(_, last)| *last);
+
+        let removed = by_recency.len().min(want_removed);
+        for (ip, _) in by_recency.into_iter().take(removed) {
+            self.attempts.remove(&ip);
+        }
+        tracing::debug!(
+            evicted = removed,
+            tracked = self.attempts.len(),
+            "rate limiter table hit its address cap; forgot the stalest entries"
+        );
     }
 
     /// Addresses currently being tracked. Exposed for tests and diagnostics.
@@ -148,6 +236,60 @@ mod tests {
             rl.tracked_addresses(),
             1,
             "addresses with no connections in the window are dropped"
+        );
+    }
+
+    fn ip6(last: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, last])
+    }
+
+    /// A scan from a fresh address every few milliseconds used to add a table
+    /// entry per source and only drop it a whole window later, which is an
+    /// allocation a remote party controls. The table has a hard ceiling now.
+    #[test]
+    fn the_address_table_is_capped() {
+        let mut rl = RateLimiter::with_limits(MAX_CONNECTIONS, WINDOW).with_max_tracked(64);
+        let now = Instant::now();
+        for i in 0..10_000u16 {
+            // Every connection from a brand-new address, all inside one window
+            // so nothing ages out on its own.
+            rl.check_at(ip6(i), now + Duration::from_millis(u64::from(i)));
+        }
+        assert!(
+            rl.tracked_addresses() <= 64,
+            "the table must not grow past its cap, saw {}",
+            rl.tracked_addresses()
+        );
+    }
+
+    /// Eviction must forget the addresses that have gone quiet, never the one
+    /// currently flooding — otherwise the scan that fills the table is also the
+    /// way to clear your own limit.
+    #[test]
+    fn eviction_keeps_the_freshest_addresses() {
+        let mut rl = RateLimiter::with_limits(3, WINDOW).with_max_tracked(4);
+        let now = Instant::now();
+
+        // The flooder reaches its cap and is being refused.
+        for _ in 0..3 {
+            rl.check_at(ip(1), now);
+        }
+        assert!(rl.check_at(ip(1), now), "the flooder is limited");
+
+        // Now a rotation of fresh addresses pushes the table over its ceiling
+        // many times over, while the flooder keeps knocking alongside it. Each
+        // refused knock still counts as contact, so the flooder is never the
+        // stalest entry and never evicted.
+        for i in 0..40u16 {
+            let t = now + Duration::from_millis(u64::from(i) + 1);
+            rl.check_at(ip6(i), t);
+            rl.check_at(ip(1), t);
+        }
+
+        assert!(rl.tracked_addresses() <= 4);
+        assert!(
+            rl.check_at(ip(1), now + Duration::from_millis(41)),
+            "the address with the most recent connections must still be limited"
         );
     }
 

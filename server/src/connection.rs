@@ -20,6 +20,26 @@ use crate::dispatch::{handle_request, ConnState, Dispatch};
 use crate::hub::Hub;
 use crate::state::PartyState;
 
+/// Read one frame, taking ownership of the read half and the sequence counter
+/// and handing both back with the result.
+///
+/// Ownership is the point. It lets the caller hold a single read future across
+/// `select!` iterations instead of building a new one each time — see the
+/// comment at the call site for why abandoning a part-read frame breaks the
+/// connection for good.
+async fn read_frame<R>(
+    mut rd: R,
+    cipher: &messenger_core::core::AesCipher,
+    aad: &[u8],
+    mut seq: FrameSeq,
+) -> (R, FrameSeq, anyhow::Result<Vec<u8>>)
+where
+    R: AsyncRead + Unpin,
+{
+    let result = recv_framed(&mut rd, cipher, aad, &mut seq).await;
+    (rd, seq, result)
+}
+
 /// Serve one client connection to completion (until the peer disconnects or a
 /// frame fails to authenticate). The server's identity (`server_privkey`) is
 /// TOFU-verified by the client; the client's handshake-verified fingerprint is
@@ -46,20 +66,46 @@ where
     // Per-direction frame counters: every Party frame carries a sequence inside
     // the AEAD so a replayed frame cannot be accepted twice.
     let mut send_seq = FrameSeq::new();
-    let mut recv_seq = FrameSeq::new();
+    let recv_seq = FrameSeq::new();
 
     // Split so reads (incoming requests) and writes (replies + pushed broadcasts)
     // can be driven independently inside the select loop.
-    let (mut rd, mut wr) = tokio::io::split(&mut *stream);
+    let (rd, mut wr) = tokio::io::split(&mut *stream);
+
+    // The in-flight read, kept alive ACROSS loop iterations.
+    //
+    // This is the whole reason `read_frame` exists rather than calling
+    // `recv_framed` inline: `tokio::select!` drops the future in the branch that
+    // does not win, and `recv_framed` is not cancel-safe. It reads a 4-byte
+    // length prefix and then the body; dropping it in between takes those bytes
+    // off the socket and throws them away. The next read then treats body bytes
+    // as a length prefix, and the connection dies on a decrypt or length error —
+    // silently, from the client's point of view.
+    //
+    // That is not a rare interleaving: it happens whenever a broadcast arrives
+    // while this client is mid-frame, which is exactly what a busy community
+    // does. The symptom was a client whose pane simply stopped updating (a
+    // channel created by someone else never appearing, say) until it reconnected.
+    //
+    // Holding one future across iterations means a cancelled poll resumes where
+    // it left off, so no read is ever abandoned part-way.
+    let mut pending = Box::pin(read_frame(rd, &cipher, &aad, recv_seq));
 
     loop {
+        // The read half and its sequence counter, handed back when a frame
+        // completes, so the next read can be started after the branch body.
+        let mut finished = None;
+
         tokio::select! {
-            // A broadcast pushed to us by another connection.
+            // A broadcast pushed to us by another connection. `recv` IS
+            // cancel-safe: a message is either taken from the queue or left in it.
             Some(push) = out_rx.recv() => {
                 send_framed(&mut wr, &cipher, &aad, &mut send_seq, &push.to_bytes()).await?;
             }
             // An incoming request from this client.
-            incoming = recv_framed(&mut rd, &cipher, &aad, &mut recv_seq) => {
+            (rd_back, seq_back, incoming) = &mut pending => {
+                finished = Some((rd_back, seq_back));
+
                 let req_bytes = match incoming {
                     Ok(bytes) => bytes,
                     Err(_) => break, // peer closed, or a frame failed to authenticate
@@ -98,6 +144,10 @@ where
                     hub.send_to_member_except(member, conn_id, resp);
                 }
             }
+        }
+
+        if let Some((rd_back, seq_back)) = finished {
+            pending = Box::pin(read_frame(rd_back, &cipher, &aad, seq_back));
         }
     }
 
@@ -172,6 +222,139 @@ mod tests {
             .await
             .expect("client handshake");
         (client, handle)
+    }
+
+    /// Connect over a deliberately tiny duplex buffer, so a large frame cannot
+    /// be delivered in one write and the server is forced to read it in pieces.
+    /// That is the window where a cancelled read used to lose bytes.
+    async fn connect_with_buffer(
+        server_priv: RsaPrivateKey,
+        client_priv: &RsaPrivateKey,
+        state: Arc<Mutex<PartyState>>,
+        hub: Arc<Hub>,
+        buffer: usize,
+    ) -> (TestClient, tokio::task::JoinHandle<()>) {
+        let (mut server_stream, client_stream) = tokio::io::duplex(buffer);
+        let handle = tokio::spawn(async move {
+            let _ = serve_connection(&mut server_stream, &server_priv, state, hub).await;
+        });
+        let client = PartyClient::connect(client_stream, client_priv, Uuid::new_v4())
+            .await
+            .expect("client handshake");
+        (client, handle)
+    }
+
+    /// A broadcast arriving while this client is mid-frame must not cost it the
+    /// connection.
+    ///
+    /// The connection loop selects over "a broadcast to write" and "a request to
+    /// read", and `select!` drops the future in the branch that loses. Reading a
+    /// frame is *not* cancel-safe — it takes a 4-byte length prefix and then the
+    /// body — so a dropped read used to leave those bytes consumed and gone. The
+    /// next read parsed body bytes as a length, and the connection died on a
+    /// length or decrypt error with nothing said to either end.
+    ///
+    /// It looked to the user like a client that simply stopped updating: a
+    /// channel someone else created never appeared, messages stopped arriving,
+    /// and only a reconnect fixed it. It needed exactly two things to happen at
+    /// once, which is to say it needed the community to be busy.
+    ///
+    /// This forces the window deterministically: a tiny duplex buffer means the
+    /// big post below takes many reads to arrive, and another member broadcasts
+    /// throughout.
+    #[tokio::test]
+    async fn a_broadcast_arriving_mid_frame_does_not_break_the_connection() {
+        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+        let channel = state.lock().await.default_channel();
+
+        let (mut alice, _a) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &alice_priv,
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+        assert!(matches!(
+            alice.join("alice", None).await.unwrap(),
+            PartyResponse::Joined { .. }
+        ));
+
+        // 64 bytes: far smaller than one frame, so every frame is split.
+        let (mut bob, _b) =
+            connect_with_buffer(server_priv, &bob_priv, state.clone(), hub.clone(), 64).await;
+        assert!(matches!(
+            bob.join("bob", None).await.unwrap(),
+            PartyResponse::Joined { .. }
+        ));
+
+        let (mut bob_rd, mut bob_wr) = bob.split();
+
+        // Bob's reader runs as its own task, the way a real client's does. It
+        // has to: the server writes broadcasts into the same tiny pipe, and a
+        // client that only reads *after* finishing its write would deadlock the
+        // duplex rather than test anything.
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(async move {
+            loop {
+                match bob_rd.recv().await {
+                    Ok(resp) => {
+                        if seen_tx.send(Ok(resp)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = seen_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Bob starts a big post; through a 64-byte pipe it cannot land in one
+        // write, so the server is mid-frame for a long time.
+        let big = "x".repeat(32 * 1024);
+        let writer = tokio::spawn(async move {
+            bob_wr
+                .send(&PartyRequest::PostMessage { channel, text: big })
+                .await
+                .expect("bob's post is written");
+        });
+
+        // …while alice keeps broadcasting into it.
+        for i in 0..10 {
+            let _ = request(
+                &mut alice,
+                PartyRequest::PostMessage {
+                    channel,
+                    text: format!("alice {i}"),
+                },
+            )
+            .await;
+            tokio::task::yield_now().await;
+        }
+        writer.await.expect("writer task");
+
+        // Bob's own post must still be acknowledged. Under the old loop his
+        // stream was desynchronised long before this and the read errored out.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match seen_rx.recv().await {
+                    Some(Ok(PartyResponse::MessagePosted { channel: c, .. })) if c == channel => {
+                        return
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => panic!("bob's connection broke: {e}"),
+                    None => panic!("bob's reader stopped"),
+                }
+            }
+        })
+        .await
+        .expect("bob's post must be acknowledged");
+        reader.abort();
     }
 
     #[tokio::test]

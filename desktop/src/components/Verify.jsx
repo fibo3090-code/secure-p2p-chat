@@ -4,8 +4,7 @@ import { useState, useEffect } from "react";
 import { Modal, Button } from "./ui.jsx";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
-import { api } from "../lib/bridge.js";
-
+import { api, friendlyError } from "../lib/bridge.js";
 function group(fp) {
   return (fp || "").replace(/(.{4})/g, "$1 ").trim();
 }
@@ -28,7 +27,7 @@ export function Verify({ req, onClose }) {
       await api.confirmFingerprint(req.chat_id, accept);
       onClose();
     } catch (e) {
-      setErr(String(e));
+      setErr(friendlyError(e));
     } finally {
       setBusy(false);
     }

@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use messenger_core::party::{
     blob_hash, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
@@ -55,6 +56,21 @@ const MAX_AUDIT_ENTRIES: usize = 1000;
 /// member and there is no admin role, so this is the only thing standing between
 /// a bored member and unbounded server state.
 const MAX_CHANNELS: usize = 128;
+/// How many channels one member may create within [`CHANNEL_CREATE_WINDOW`].
+///
+/// [`MAX_CHANNELS`] bounds the server, but it bounds it *once*: any member may
+/// create a public channel, so a single one of them can walk the server to its
+/// ceiling in a burst — pushing a refreshed directory to every connection each
+/// time, burying the real channels, and leaving the community unable to make
+/// another until an admin cleans up. The server-wide cap does not distinguish
+/// that from a hundred members making one channel each; this does.
+///
+/// Deliberately generous: making a handful of channels in a minute is something
+/// a person setting a community up genuinely does.
+const MAX_CHANNELS_PER_MEMBER: usize = 5;
+/// The sliding window [`MAX_CHANNELS_PER_MEMBER`] is counted over.
+const CHANNEL_CREATE_WINDOW: Duration = Duration::from_secs(60);
+
 /// Filename of the legacy JSON snapshot, imported once into SQLite if present.
 const LEGACY_SNAPSHOT_FILE: &str = "party_state.json";
 
@@ -284,6 +300,12 @@ pub struct PartyState {
     db: Option<Connection>,
     /// When present, blob bytes are mirrored to files under this directory.
     blob_dir: Option<PathBuf>,
+    /// Recent channel creations per member, for the per-member burst limit.
+    ///
+    /// Deliberately in memory only. It is a burst limiter, not a quota: a
+    /// restart forgiving it costs nothing, because [`MAX_CHANNELS`] still bounds
+    /// the total and the channels already made are still there.
+    channel_creations: HashMap<Uuid, Vec<Instant>>,
 }
 
 impl PartyState {
@@ -312,6 +334,7 @@ impl PartyState {
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             db: None,
             blob_dir: None,
+            channel_creations: HashMap::new(),
         }
     }
 
@@ -721,6 +744,46 @@ impl PartyState {
         Ok(info)
     }
 
+    /// Refuse a member who has created [`MAX_CHANNELS_PER_MEMBER`] channels
+    /// inside [`CHANNEL_CREATE_WINDOW`].
+    ///
+    /// Admins are limited too. The point is not distrust of admins — it is that
+    /// a stolen or careless admin session is exactly the one that can reach the
+    /// restricted channel kinds, and a burst limit costs a legitimate admin
+    /// nothing they would notice.
+    fn check_channel_rate(&mut self, creator: Uuid, now: Instant) -> Result<(), String> {
+        // Members who have gone quiet stop being tracked, so this map does not
+        // outgrow the membership it is keyed by.
+        self.channel_creations.retain(|_, seen| {
+            seen.iter()
+                .any(|t| now.duration_since(*t) < CHANNEL_CREATE_WINDOW)
+        });
+        let recent = self
+            .channel_creations
+            .get(&creator)
+            .map(|seen| {
+                seen.iter()
+                    .filter(|t| now.duration_since(**t) < CHANNEL_CREATE_WINDOW)
+                    .count()
+            })
+            .unwrap_or(0);
+        if recent >= MAX_CHANNELS_PER_MEMBER {
+            return Err(format!(
+                "you have created {MAX_CHANNELS_PER_MEMBER} channels in the last \
+                 {} seconds — wait a moment before creating another",
+                CHANNEL_CREATE_WINDOW.as_secs()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record a successful creation against `creator`'s allowance.
+    fn record_channel_creation(&mut self, creator: Uuid, now: Instant) {
+        let seen = self.channel_creations.entry(creator).or_default();
+        seen.retain(|t| now.duration_since(*t) < CHANNEL_CREATE_WINDOW);
+        seen.push(now);
+    }
+
     /// Create a channel of a given kind on `creator`'s authority.
     ///
     /// Anyone who may write can make a `Public` channel; the restricted kinds
@@ -733,7 +796,20 @@ impl PartyState {
         creator: Uuid,
         name: &str,
         kind: ChannelKind,
+        members: Vec<Uuid>,
+    ) -> Result<ChannelInfo, String> {
+        self.create_channel_of_kind_at(creator, name, kind, members, Instant::now())
+    }
+
+    /// [`Self::create_channel_of_kind`] against a caller-supplied clock, so the
+    /// per-member rate limit is testable without sleeping for a minute.
+    pub fn create_channel_of_kind_at(
+        &mut self,
+        creator: Uuid,
+        name: &str,
+        kind: ChannelKind,
         mut members: Vec<Uuid>,
+        now: Instant,
     ) -> Result<ChannelInfo, String> {
         let role = self.role_of(creator);
         if !role.can_create_channel() {
@@ -745,7 +821,12 @@ impl PartyState {
                 kind.label().to_lowercase()
             ));
         }
+        // Checked before the channel is made, and recorded only once it is, so a
+        // rejected name (duplicate, too long, over the server cap) costs the
+        // member nothing against their allowance.
+        self.check_channel_rate(creator, now)?;
         let info = self.create_channel(name)?;
+        self.record_channel_creation(creator, now);
         if kind != ChannelKind::Public {
             if kind == ChannelKind::Private {
                 members.retain(|m| self.members.contains_key(m));
@@ -4473,6 +4554,131 @@ mod tests {
             .expect_err("past the cap");
         assert!(err.contains("maximum"), "error should say why: {err}");
         assert_eq!(state.channels.len(), MAX_CHANNELS);
+    }
+
+    /// The server-wide [`MAX_CHANNELS`] cap does not tell a hundred members
+    /// making one channel each from one member making a hundred. Without a
+    /// per-member limit, any single joined member can walk the server to its
+    /// ceiling in a burst — broadcasting a refreshed directory to every
+    /// connection each time and denying everyone else the feature until an admin
+    /// cleans up.
+    #[test]
+    fn a_member_cannot_burst_create_channels() {
+        let mut state = PartyState::new("Open", None);
+        let _owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let now = Instant::now();
+
+        for i in 0..MAX_CHANNELS_PER_MEMBER {
+            state
+                .create_channel_of_kind_at(
+                    bob,
+                    &format!("bob{i}"),
+                    ChannelKind::Public,
+                    vec![],
+                    now,
+                )
+                .unwrap_or_else(|e| panic!("channel {i} is within the allowance: {e}"));
+        }
+        let err = state
+            .create_channel_of_kind_at(bob, "one-more", ChannelKind::Public, vec![], now)
+            .expect_err("past the per-member allowance");
+        assert!(
+            err.contains("wait a moment"),
+            "the error should say it is temporary: {err}"
+        );
+        assert_eq!(
+            state.channels.len(),
+            1 + MAX_CHANNELS_PER_MEMBER,
+            "general plus the allowed burst, and nothing more"
+        );
+    }
+
+    /// The limit is per member, not per server: one member burning their
+    /// allowance must not stop everyone else from making a channel.
+    #[test]
+    fn the_channel_rate_limit_is_per_member() {
+        let mut state = PartyState::new("Open", None);
+        let _owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let carol = state.join("carol", None, None).unwrap();
+        let now = Instant::now();
+
+        for i in 0..MAX_CHANNELS_PER_MEMBER {
+            state
+                .create_channel_of_kind_at(
+                    bob,
+                    &format!("bob{i}"),
+                    ChannelKind::Public,
+                    vec![],
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(state
+            .create_channel_of_kind_at(bob, "bob-extra", ChannelKind::Public, vec![], now)
+            .is_err());
+        assert!(
+            state
+                .create_channel_of_kind_at(carol, "carol1", ChannelKind::Public, vec![], now)
+                .is_ok(),
+            "an unrelated member must not be caught in someone else's limit"
+        );
+    }
+
+    /// It is a rate limit, not a quota — the allowance comes back.
+    #[test]
+    fn the_channel_rate_limit_window_slides() {
+        let mut state = PartyState::new("Open", None);
+        let bob = state.join("bob", None, None).unwrap();
+        let now = Instant::now();
+
+        for i in 0..MAX_CHANNELS_PER_MEMBER {
+            state
+                .create_channel_of_kind_at(
+                    bob,
+                    &format!("bob{i}"),
+                    ChannelKind::Public,
+                    vec![],
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(state
+            .create_channel_of_kind_at(bob, "blocked", ChannelKind::Public, vec![], now)
+            .is_err());
+
+        let later = now + CHANNEL_CREATE_WINDOW + Duration::from_secs(1);
+        assert!(state
+            .create_channel_of_kind_at(bob, "later", ChannelKind::Public, vec![], later)
+            .is_ok());
+    }
+
+    /// A refused creation must not cost the member part of their allowance —
+    /// otherwise mistyping a duplicate name five times locks you out of making
+    /// the channel you were trying to make.
+    #[test]
+    fn a_rejected_channel_name_does_not_consume_the_allowance() {
+        let mut state = PartyState::new("Open", None);
+        let bob = state.join("bob", None, None).unwrap();
+        let now = Instant::now();
+
+        for _ in 0..20 {
+            assert!(state
+                .create_channel_of_kind_at(bob, "general", ChannelKind::Public, vec![], now)
+                .is_err());
+        }
+        for i in 0..MAX_CHANNELS_PER_MEMBER {
+            state
+                .create_channel_of_kind_at(
+                    bob,
+                    &format!("bob{i}"),
+                    ChannelKind::Public,
+                    vec![],
+                    now,
+                )
+                .unwrap_or_else(|e| panic!("attempt {i} should still be allowed: {e}"));
+        }
     }
 
     /// A non-member must not be able to read history by guessing a channel id.

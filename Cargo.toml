@@ -15,6 +15,9 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 messenger-core = { path = "core" }
+# Only ever a dev-dependency of the client, so `tests/party_e2e.rs` can stand a
+# real Community server up in process. Acyclic: the server depends only on core.
+messenger-server = { path = "server" }
 
 # Runtime async
 tokio = { version = "1", features = ["full"] }
