@@ -12,6 +12,83 @@ import { folderOf } from "./parse.js";
 
 const inTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 
+// ── Shared rules the mock mirrors from the Rust bridge ──────────────────────
+//
+// These exist so the dev mock enforces the *same* rules as production. A mock
+// that is more permissive than the real bridge is worse than no mock: it makes
+// the security-relevant paths invisible during browser-based UI work, so the
+// only place they are ever exercised is a user's machine.
+
+/// Schemes `open_url` will hand to the OS. Mirrors the check in
+/// `commands/chats.rs::open_url`, which refuses everything else.
+///
+/// The list is what matters, not the shape of the check: `javascript:` and
+/// `data:` URIs passed to `window.open` execute in the opener's origin, so a
+/// message body is enough to run script against the app if this is skipped.
+export function isOpenableUrl(url) {
+  return /^https?:\/\//i.test(String(url ?? "").trim());
+}
+
+/// Extensions the OS would *run* rather than display. Mirrors
+/// `RISKY_EXTENSIONS` in `commands/chats.rs`; kept in sync deliberately, because
+/// the mock's job is to make the confirmation dialog reachable in a browser.
+const RISKY_EXTENSIONS = new Set([
+  // Windows executables, installers and script hosts
+  "exe", "com", "scr", "pif", "bat", "cmd", "msi", "msp", "msc", "cpl", "hta",
+  "vbs", "vbe", "jse", "wsf", "wsh", "ps1", "psm1", "reg", "lnk", "url", "scf",
+  "inf", "chm", "application", "gadget",
+  // Cross-platform runtimes / scripts
+  "jar", "js", "py", "pl", "rb", "php",
+  // Unix shells and launchers
+  "sh", "bash", "zsh", "command", "desktop", "run", "appimage", "app", "pkg",
+  "deb", "rpm",
+]);
+
+/// The extension that makes `filename` an executable, or null for ordinary
+/// content. Only the *final* extension counts, so `holiday.jpg.exe` is caught.
+export function executionRisk(filename) {
+  const ext = String(filename ?? "").split(".").pop()?.toLowerCase();
+  return ext && RISKY_EXTENSIONS.has(ext) ? ext : null;
+}
+
+// ── Error text shown to people ──────────────────────────────────────────────
+
+/// Turn whatever the bridge threw into a sentence worth showing.
+///
+/// Command errors arrive as raw `Err(String)` from Rust — often an `io::Error`
+/// or an `anyhow` chain carrying an absolute path through the user's home
+/// directory, a temp filename, or an internal type name. Pasted into a toast
+/// verbatim (`String(e)`) that is both unreadable and a small disclosure: chat
+/// screenshots and bug reports then carry the local username and directory
+/// layout. This keeps the part that tells the user what happened and drops the
+/// part that only tells them where our code lives.
+export function friendlyError(e, fallback = "Something went wrong.") {
+  let msg = "";
+  if (typeof e === "string") msg = e;
+  else if (e && typeof e.message === "string") msg = e.message;
+  else if (e != null) msg = String(e);
+
+  msg = msg
+    // `Error: ...`, `Uncaught Error: ...` and friends add nothing.
+    .replace(/^(Uncaught\s+)?(Type|Range|Reference|Syntax)?Error:\s*/i, "")
+    // Absolute paths: Windows drive letters, UNC shares, and Unix home dirs.
+    .replace(/[A-Za-z]:\\[^\s"']*/g, "…")
+    .replace(/\\\\[^\s"']+/g, "…")
+    .replace(/(?:\/(?:home|Users|tmp|var|private)\/)[^\s"':,)]*/g, "…")
+    // `at fn (file.rs:12:3)` style location suffixes.
+    .replace(/\s*\bat\s+[\w:.$<>]+\s*\([^)]*\)/g, "")
+    .replace(/\s*\([\w.-]+\.(?:rs|js|jsx):\d+(?::\d+)?\)/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (!msg || msg === "…") return fallback;
+  // Long anyhow chains read as a wall; keep the first cause, which is the one
+  // that says what actually failed.
+  const [first] = msg.split(/:\s(?=[A-Z])/);
+  const out = (first || msg).trim().replace(/[.\s]+$/, "");
+  return out ? `${out}.` : fallback;
+}
+
 const realApi = {
   authStatus: () => invoke("auth_status"),
   unlock: (password) => invoke("unlock", { password }),
@@ -116,6 +193,11 @@ function makeMock() {
         { id: "m1", from_me: false, content: { type: "text", text: "hey! is this thing encrypted end to end?" }, timestamp: now },
         { id: "m2", from_me: true, content: { type: "text", text: "yep — X25519 + AES-GCM. fingerprint verified ✔" }, timestamp: now },
         { id: "m3", from_me: false, content: { type: "text", text: "slick. sending you the file now" }, timestamp: now },
+        { id: "m3a", from_me: false, content: { type: "file", filename: "roadmap.pdf", size: 248000, path: "/mock/roadmap.pdf" }, timestamp: now },
+        // A received file the OS would *run*. It is here so the "this file will
+        // run as a program" confirmation is reachable in a plain browser — the
+        // double extension is the shape that actually turns up in the wild.
+        { id: "m3b", from_me: false, content: { type: "file", filename: "holiday.jpg.exe", size: 8400000, path: "/mock/holiday.jpg.exe" }, timestamp: now },
       ],
     },
     "22222222-2222-2222-2222-222222222222": {
@@ -214,9 +296,31 @@ function makeMock() {
     setPresence: async () => {},
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000, path: "/mock/example.pdf" }, timestamp: new Date().toISOString() }); },
-    openFile: async () => ({ opened: true, blocked: null, filename: null }),
+    // Mirrors the real gate: a file *received from a peer* whose extension means
+    // the OS would run it is refused until `confirm` is passed. Always answering
+    // "opened" meant the confirmation dialog — the one security-critical thing
+    // this screen does — could not be reached at all in a plain browser, so it
+    // was only ever exercised by hand in the packaged app.
+    openFile: async (id, msg, reveal = false, confirm = false) => {
+      const m = (chats[id]?.messages || []).find((x) => x.id === msg);
+      const filename = m?.content?.filename || null;
+      const risk = m && !m.from_me ? executionRisk(filename) : null;
+      // Revealing in the file manager launches nothing, so it is never gated.
+      if (risk && !reveal && !confirm) {
+        return { opened: false, blocked: risk, filename };
+      }
+      return { opened: true, blocked: null, filename };
+    },
     filePreview: async () => null,
-    openUrl: async (url) => { window.open(url, "_blank", "noopener"); },
+    // The real bridge refuses anything that is not http(s) — `javascript:` and
+    // `data:` URIs handed to `window.open` execute against the app's origin. The
+    // mock refused nothing, so a regression in the calling code (linkifying an
+    // attacker-supplied string, say) looked fine in a browser and only failed
+    // closed once it reached the Rust side.
+    openUrl: async (url) => {
+      if (!isOpenableUrl(url)) throw new Error("Only http(s) links can be opened");
+      window.open(url, "_blank", "noopener");
+    },
     listTransfers: async () => [],
     acceptTransfer: async (_id) => {},
     declineTransfer: async (_id) => {},
