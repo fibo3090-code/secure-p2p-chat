@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Modal, Button, Input, PasswordInput } from "./ui.jsx";
-import { api } from "../lib/bridge.js";
+import { api, friendlyError } from "../lib/bridge.js";
 import { parsePort } from "../lib/parse.js";
 import { toast } from "../lib/toast.js";
 
@@ -144,7 +144,7 @@ export function Creator({ open, onClose, initialMode }) {
       if (p === null) return setErr(`"${raw.slice(i + 1)}" is not a valid port (1–65535).`);
     }
     await run(async () => {
-      try { await api.connectPeer(h, p, password.trim()); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(String(e)); }
+      try { await api.connectPeer(h, p, password.trim()); toast(`Connecting to ${h}:${p}…`); onClose(); } catch (e) { setErr(friendlyError(e)); }
     });
   }
   async function host() {
@@ -157,7 +157,7 @@ export function Creator({ open, onClose, initialMode }) {
         toast(`Hosting on :${p} — waiting for a peer`, "success");
         // Keep the dialog open and show the address to share.
         try { setHostAddr(await api.myAddresses()); } catch { onClose(); }
-      } catch (e) { setErr(String(e)); }
+      } catch (e) { setErr(friendlyError(e)); }
     });
   }
   async function relayConnect() {
@@ -166,7 +166,7 @@ export function Creator({ open, onClose, initialMode }) {
     if (!relayToken.trim()) return setErr("Enter the connection token your peer shared.");
     await run(async () => {
       try { await api.connectViaRelay(relay.trim(), relayToken.trim()); toast(`Connecting via relay ${relay.trim()}…`); onClose(); }
-      catch (e) { setErr(String(e)); }
+      catch (e) { setErr(friendlyError(e)); }
     });
   }
   async function relayHost() {
@@ -177,7 +177,7 @@ export function Creator({ open, onClose, initialMode }) {
         const token = await api.hostViaRelay(relay.trim());
         setHostToken(token);
         toast("Relay session open — share the relay + token", "success");
-      } catch (e) { setErr(String(e)); }
+      } catch (e) { setErr(friendlyError(e)); }
     });
   }
   async function doImport() {
@@ -185,11 +185,25 @@ export function Creator({ open, onClose, initialMode }) {
     if (!importLink.trim()) return setErr("Paste an invite link.");
     await run(async () => {
       try {
-        const c = await api.importInvite(importLink.trim());
+        // `import_invite` answers with { contact, signed }, not with the contact
+        // itself. Reading `.id` off the wrapper meant `connect_contact` was
+        // called with `undefined`, failed to parse as a UUID, and the dialog
+        // reported "Saved undefined to contacts." — so importing a link from
+        // here never actually connected.
+        const res = await api.importInvite(importLink.trim());
+        const c = res?.contact ?? res;
         setImportLink("");
+        // An unsigned (v1) link carries no proof of who made it. Same warning
+        // the Contacts pane gives, because it is the same decision.
+        if (res && res.signed === false) {
+          toast(
+            "Added from an unsigned invite link — anyone can create one. Compare the safety code when you first connect.",
+            "error",
+          );
+        }
         try { await api.connectContact(c.id); onClose(); }
-        catch { done(`Saved ${c.name} to contacts.`); }
-      } catch (e) { setErr(String(e)); }
+        catch { done(`Saved ${c.name || "the contact"} to contacts.`); }
+      } catch (e) { setErr(friendlyError(e)); }
     });
   }
 
