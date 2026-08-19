@@ -21,8 +21,18 @@ predate tagged releases.
 - **Sharing a file on without re-uploading it.** The server stores each file
   once, so posting one you already have into another channel or DM costs
   nothing and takes no time.
+- **The app is usable with a keyboard and a screen reader.** A skip link jumps
+  straight to the message box instead of making you tab past the toolbar, five
+  navigation buttons and every conversation you have. The conversation list is
+  announced as a list, with each row saying how many unread messages it has and
+  whether the person is verified — until now those were a coloured dot and a
+  bare number, invisible to a reader.
 
 ### Changed
+
+- **Long conversations no longer redraw constantly.** An open thread was
+  re-rendering every message several times a second for as long as the app was
+  running. Nothing looks different; it just stops costing battery.
 
 - **Connections are now signed with Ed25519** where both sides support it,
   falling back to the previous RSA signature for older peers. Handshakes carry
@@ -37,6 +47,33 @@ predate tagged releases.
   message posted still arrived at their client as it was sent. Restricted
   channels are now delivered only to the people allowed to read them, and the
   fix is covered end to end rather than only in the layer that decides it.
+- **A community could quietly stop updating until you reconnected.** If a
+  message arrived at the same moment you were sending one, the connection could
+  desynchronise and go silent — new channels never appeared, messages stopped
+  coming in, and nothing said anything was wrong. The busier the community, the
+  more likely it was.
+- **Adding someone from an invite link in "New connection" never connected.**
+  It saved the contact and then reported "Saved undefined to contacts" instead
+  of dialling them. Pasting the same link into the Contacts pane always worked;
+  this path did not.
+- **A file permission you turned off could turn itself back on.** Removing
+  someone's ability to see a file did nothing if they could still share it on —
+  the switch moved back and the only way through was to guess the right order.
+- **The Contacts pane could come up blank** instead of showing your contacts.
+
+### Security
+
+- **A wrong connection password no longer reveals its length.** The check
+  answered a wrong-length guess faster than a wrong-character one, which tells
+  an attacker how long the password is before they start guessing it.
+- **A peer can no longer grow the app's memory without bound** by connecting
+  repeatedly from changing addresses. The list of recent connections is now
+  capped, and the addresses knocking hardest are the last to be forgotten.
+- **One member can no longer flood a community with channels.** Creating them is
+  limited per person, so a single member cannot fill the server's channel list
+  and leave everyone else unable to make one.
+- **The desktop app declares a content security policy in the page itself**, not
+  only in the shell that loads it, so it holds wherever the page is opened.
 
 ## [1.16.0] - 2026-08-19
 
