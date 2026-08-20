@@ -87,6 +87,31 @@ pub const MAX_CHANNEL_NAME_CHARS: usize = 64;
 /// paths agree, and bounds durable storage / broadcast fan-out per message.
 pub const MAX_MESSAGE_TEXT_BYTES: usize = messenger_core::MAX_TEXT_MESSAGE_BYTES;
 
+/// Run a blocking filesystem operation without stalling the async runtime.
+///
+/// `PartyState` is deliberately synchronous — it is a state machine, and making
+/// every accessor `async` to accommodate two I/O paths would be the tail wagging
+/// the dog. But two of those paths move real bytes: a blob write and a blob read
+/// are each up to `MAX_PARTY_FILE_BYTES` (100 MiB), and they run inside
+/// `serve_connection`'s task while the state mutex is held. A plain
+/// `std::fs::write` there parks a runtime worker for the duration, so one member
+/// uploading a large file stalls unrelated members' messages on that worker.
+///
+/// `block_in_place` tells tokio the current thread is about to block so it can
+/// move the other tasks off it. It panics on a current-thread runtime, which is
+/// what `#[tokio::test]` gives you by default, hence the flavor check: outside a
+/// multi-threaded runtime the call is a plain function call, which is correct
+/// because there are no sibling tasks to rescue.
+fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Why a join was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinError {
@@ -1458,7 +1483,7 @@ impl PartyState {
         self.delete_blob_row(hash);
         if let Some(dir) = &self.blob_dir {
             let path = dir.join(hash);
-            if let Err(e) = std::fs::remove_file(&path) {
+            if let Err(e) = blocking_io(|| std::fs::remove_file(&path)) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::error!(error = %e, path = %path.display(), "failed to delete blob bytes");
                 }
@@ -1869,7 +1894,7 @@ impl PartyState {
             return Some(resident.clone());
         }
         let dir = self.blob_dir.as_ref()?;
-        match std::fs::read(dir.join(hash)) {
+        match blocking_io(|| std::fs::read(dir.join(hash))) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
                 tracing::error!(hash, error = %e, "blob is recorded but its file could not be read");
@@ -2024,7 +2049,7 @@ impl PartyState {
             return Ok(()); // memory-only store: the bytes stay resident instead
         };
         let path = dir.join(hash);
-        std::fs::write(&path, data).map_err(|e| {
+        blocking_io(|| std::fs::write(&path, data)).map_err(|e| {
             tracing::error!(error = %e, path = %path.display(), "failed to write file blob");
             "the server could not store this file".to_string()
         })
@@ -2358,20 +2383,49 @@ fn insert_blob_row(
 
 /// True when no members, channels, or DM threads exist yet (a pristine database).
 fn db_is_empty(conn: &Connection) -> rusqlite::Result<bool> {
-    Ok(table_count(conn, "members")? == 0
-        && table_count(conn, "channels")? == 0
-        && table_count(conn, "dm_threads")? == 0)
+    Ok(table_count(conn, CountedTable::Members)? == 0
+        && table_count(conn, CountedTable::Channels)? == 0
+        && table_count(conn, CountedTable::DmThreads)? == 0)
 }
 
-fn table_count(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
-    // `table` is a compile-time constant from this module, never user input.
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+/// The tables `table_count` will count. SQLite cannot bind an identifier as a
+/// parameter, so the name has to be interpolated — which means the only real
+/// defence is that the set of possible names is closed.
+///
+/// It was a `&str` with a comment promising callers would only pass literals. A
+/// comment is not a defence: the day someone counts rows for a caller-supplied
+/// name, the promise is silently broken and the compiler says nothing. As an
+/// enum the query cannot be given a name this module did not write.
+#[derive(Debug, Clone, Copy)]
+enum CountedTable {
+    Members,
+    Channels,
+    DmThreads,
+}
+
+impl CountedTable {
+    /// The literal that goes into the SQL. Every arm is a fixed string.
+    fn as_sql(self) -> &'static str {
+        match self {
+            CountedTable::Members => "members",
+            CountedTable::Channels => "channels",
+            CountedTable::DmThreads => "dm_threads",
+        }
+    }
+}
+
+fn table_count(conn: &Connection, table: CountedTable) -> rusqlite::Result<i64> {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {}", table.as_sql()),
+        [],
+        |r| r.get(0),
+    )
 }
 
 impl PartyState {
     fn count_channels(&self) -> rusqlite::Result<i64> {
         match &self.db {
-            Some(conn) => table_count(conn, "channels"),
+            Some(conn) => table_count(conn, CountedTable::Channels),
             None => Ok(0),
         }
     }
