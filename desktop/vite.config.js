@@ -45,6 +45,12 @@ export default defineConfig({
     target: "esnext",
   },
   test: {
+    // Vitest's default glob also matches `*.spec.js`, which would sweep up the
+    // Playwright smoke tests in `smoke/` and fail on `@playwright/test`'s API.
+    // The two runners are kept apart by convention: vitest owns `*.test.js`
+    // under `src/`, Playwright owns `smoke/`. Both directions are pinned —
+    // `playwright.config.js` sets `testDir: "./smoke"`.
+    include: ["src/**/*.test.{js,jsx}"],
     // Two environments in one suite: the pure modules (password policy, safety
     // grid, tokens) need nothing, and the component tests need a DOM. Node is
     // the default so the cheap tests stay cheap; a component file opts in with

@@ -155,3 +155,12 @@ core/fuzz/corpus/
 core/fuzz/artifacts/
 core/fuzz/coverage/
 core/fuzz/target/
+
+# ----------------------------------------------------------------------------
+# Playwright smoke tests
+# ----------------------------------------------------------------------------
+# Run output only. The config and the specs in desktop/smoke/ ARE tracked.
+desktop/test-results/
+desktop/playwright-report/
+desktop/blob-report/
+desktop/.playwright/

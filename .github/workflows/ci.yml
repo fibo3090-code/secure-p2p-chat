@@ -150,6 +150,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     timeout-minutes: 20
+    env:
+      # Park Playwright's browsers inside the workspace rather than in each
+      # platform's own cache directory, so the cache step below needs one path
+      # instead of a three-way conditional.
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -192,6 +197,40 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: desktop
+
+      # Everything above this line tests pieces. None of it notices if the
+      # assembled app fails to come up — which is how a CSP change that left
+      # every screen blank passed all of it. The smoke tests load the real page
+      # in a real browser and check that it paints; see desktop/smoke/.
+      #
+      # Chromium only, cached on the lockfile (which pins @playwright/test to an
+      # exact version, so a bump invalidates it).
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.playwright-browsers
+          key: playwright-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: desktop
+
+      - name: Smoke test
+        run: npm run smoke
+        working-directory: desktop
+
+      # Only on failure: the screenshots and the recorded console/CSP output are
+      # the whole point of the job when it goes red, and a blank-page bug is
+      # very hard to diagnose from a log line alone.
+      - name: Upload smoke test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report-${{ matrix.os }}
+          path: |
+            desktop/playwright-report/
+            desktop/test-results/
+          retention-days: 7
 
   build-verification:
     name: Build Verification

@@ -90,6 +90,19 @@ export default [
         },
     },
     {
+        // The Playwright smoke tests drive a real browser from Node; there is
+        // no React in them at all. The React plugin's rules are not merely
+        // noisy here, they are wrong: `react-hooks/rules-of-hooks` reads
+        // Playwright's `use` fixture callback as React's `use` hook and reports
+        // an error on correct code.
+        files: ["smoke/**", "playwright.config.js"],
+        languageOptions: { globals: { ...globals.node } },
+        rules: {
+            "react-hooks/rules-of-hooks": "off",
+            "react-hooks/exhaustive-deps": "off",
+        },
+    },
+    {
         // Test files get the test globals and a lighter touch: a deliberately
         // malformed fixture is the point of a test, not a mistake in it.
         files: ["**/*.test.{js,jsx}", "src/test/**"],
