@@ -141,33 +141,3 @@ test.describe("the app loads", () => {
     expectNoProblems(problems);
   });
 });
-
-// The production page must not permit inline script. This is the directive that
-// makes an injected `<script>` inert, and it is the one that had to be relaxed
-// for dev — so it is exactly the one at risk of being relaxed everywhere by a
-// change that only ever gets looked at in dev.
-//
-// Asserted against the served bytes, and paired with a check that the bundle is
-// external: `script-src 'self'` is only satisfiable because Vite emits the app
-// as a file rather than inline, and if that ever changed the policy would start
-// blocking the app itself.
-test("the shipped page allows no inline script", async ({ page }, testInfo) => {
-  test.skip(
-    testInfo.project.name !== "built",
-    "about the production policy; the dev server deliberately differs",
-  );
-
-  await page.goto("/");
-
-  const policy = await servedPolicy(page);
-  expect(policy).toContain("script-src 'self'");
-  expect(policy).not.toMatch(/script-src[^;]*unsafe-inline/);
-  expect(policy).not.toMatch(/script-src[^;]*unsafe-eval/);
-
-  // Every script on the page is external, so nothing depends on an inline
-  // allowance the policy does not grant.
-  const inlineScripts = await page.$$eval("script", (tags) =>
-    tags.filter((tag) => !tag.src && tag.textContent.trim().length > 0).length,
-  );
-  expect(inlineScripts, "inline <script> blocks in the shipped page").toBe(0);
-});

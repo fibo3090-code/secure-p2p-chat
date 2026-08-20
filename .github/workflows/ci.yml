@@ -211,8 +211,14 @@ jobs:
           path: ${{ github.workspace }}/.playwright-browsers
           key: playwright-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json') }}
 
+      # `npm run`, not `npx`: npx falls back to fetching from the registry and
+      # running lifecycle scripts when a binary is missing locally. The version
+      # is pinned exactly in package-lock.json and `npm ci` above installs it,
+      # so nothing here should ever touch the network — but a CI step that
+      # *could* silently fetch and execute an unpinned package is worth not
+      # having at all.
       - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
+        run: npm run smoke:install
         working-directory: desktop
 
       - name: Smoke test

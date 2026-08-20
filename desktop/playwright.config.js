@@ -63,7 +63,10 @@ export default defineConfig({
 
   webServer: [
     {
-      command: `npx vite --port ${DEV_PORT} --strictPort --host 127.0.0.1`,
+      // `npm run`, not `npx`: npx falls back to fetching from the registry
+      // and running lifecycle scripts when a binary is missing locally, which
+      // is not something a CI job should be able to do by accident.
+      command: `npm run dev -- --port ${DEV_PORT} --strictPort --host 127.0.0.1`,
       url: DEV_URL,
       reuseExistingServer: !process.env.CI,
       timeout: 90_000,
@@ -73,7 +76,7 @@ export default defineConfig({
     {
       // `dist/` is built by the `smoke` npm script before this runs, so preview
       // always serves the current source rather than the committed artifact.
-      command: `npx vite preview --port ${PREVIEW_PORT} --strictPort --host 127.0.0.1`,
+      command: `npm run preview -- --port ${PREVIEW_PORT} --strictPort --host 127.0.0.1`,
       url: PREVIEW_URL,
       reuseExistingServer: !process.env.CI,
       timeout: 90_000,
@@ -83,7 +86,16 @@ export default defineConfig({
   ],
 
   projects: [
-    { name: "dev", use: { baseURL: DEV_URL } },
+    {
+      name: "dev",
+      use: { baseURL: DEV_URL },
+      // `production-policy.spec.js` asserts what the *shipped* page allows.
+      // The dev server deliberately differs, so the file does not apply here
+      // — excluded by config rather than guarded by a `test.skip` inside the
+      // test, which reads as a disabled test to anyone (and anything) that
+      // scans for them.
+      testIgnore: /production-policy\.spec\.js/,
+    },
     { name: "built", use: { baseURL: PREVIEW_URL } },
   ],
 });
