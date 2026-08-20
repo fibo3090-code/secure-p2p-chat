@@ -98,7 +98,18 @@ impl ChatManager {
         // Only on the new-contact path. The refresh above deliberately leaves
         // everything trust-related alone, so re-pasting someone's link cannot
         // un-verify them.
-        contact.trust_state = TrustState::Unverified;
+        //
+        // `Blocked` is preserved, and that distinction matters: this clamp exists
+        // to stop an *unearned elevation* of trust, and a block is the opposite
+        // of trust. Flattening it to `Unverified` would silently lift a block —
+        // a worse bug than the one being fixed, and precisely what
+        // `remove_contact` documents as the thing only deletion may do.
+        contact.trust_state = match contact.trust_state {
+            TrustState::Blocked => TrustState::Blocked,
+            TrustState::Unverified | TrustState::Verified | TrustState::Trusted => {
+                TrustState::Unverified
+            }
+        };
         self.contacts.insert(id, contact);
         Ok(id)
     }

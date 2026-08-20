@@ -112,6 +112,22 @@ proptest! {
         );
     }
 
+    /// The trust clamp must not run in the other direction. Importing a contact
+    /// marked `Blocked` keeps the block — flattening it to `Unverified` would
+    /// silently lift a block, which is the failure the clamp exists to avoid the
+    /// mirror image of.
+    #[test]
+    fn importing_never_lifts_a_block(seed in 0u8..64) {
+        let mut manager = ChatManager::new(Config::default());
+        let mut contact = contact_with("Blocked Peer", Some(fingerprint_for(seed)));
+        contact.trust_state = TrustState::Blocked;
+        let id = manager.import_contact(contact).expect("import succeeds");
+        prop_assert_eq!(
+            manager.get_contact(id).map(|c| c.trust_state),
+            Some(TrustState::Blocked)
+        );
+    }
+
     /// Identity is the fingerprint. Re-importing the same one refreshes the
     /// existing contact instead of adding a second card for the same person.
     #[test]
