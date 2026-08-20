@@ -153,7 +153,7 @@ stored, forever. There is forward secrecy on the wire and none at rest. That is
 a bigger practical weakness than anything in the transport, and it is
 independent of everything else here.
 
-### 4.5 The trust model breaks, and this is the hardest part
+### 4.5 Verification: what async actually costs, and how to pay it
 
 This app's entire verification story is **SAS on a live handshake**.
 `derive_sas(transcript_material)` (`core/src/core/crypto.rs`) hashes the
@@ -161,27 +161,56 @@ transport AAD — the transcript of a handshake that *both parties just ran
 together*. That is what makes it a MITM detector: an attacker running two
 handshakes produces two different transcripts.
 
-**An asynchronous first message has no such transcript.** The sender is
-encrypting to prekeys fetched from a server, alone. There is nothing for the
-recipient to compare against, and nothing to show the sender at send time.
+**An asynchronous first message has no such transcript.** The sender encrypts to
+prekeys fetched from a server, alone, with the recipient offline.
 
-This is not a UI gap. It is a hole in the property the app is built around, and
-it has to be answered before anything is written:
+Be precise about what that does and does not break, because the first draft of
+this section overstated it. Two things remain comparable with no live handshake
+at all:
 
-- X3DH does produce a shared secret, so a SAS **can** be derived from it — but
-  only once both sides have run it, i.e. after the recipient comes online. So
-  the model changes from "verify, then talk" to "talk, then verify", and the UI
-  must carry unverified-but-delivered as a first-class state rather than
-  pretending it is either of the two states that exist today.
-- `known_trusted` must not be relaxed to make this convenient. The rule that an
-  invite link is not verification, and that only a chat-stored or
-  `Verified`/`Trusted` contact fingerprint auto-accepts, is load-bearing and was
-  a fixed bug once already.
-- The mailbox operator must not be able to impersonate. Prekeys are fetched
-  *from the operator*, so the operator can serve attacker-controlled prekeys.
-  The signed prekey's signature by the identity key is what prevents this — and
-  it only prevents it if the identity key was verified some other way. Which
-  returns to the point above.
+- **The identity key's fingerprint.** Alice fetched a bundle claiming to be
+  Bob's. She can hash the identity key in it and compare that fingerprint with
+  Bob out of band — which is the app's existing "advanced" verification path,
+  already rendered as the colour safety grid (`colorgrid.rs` / `colorgrid.js`,
+  derived from a fingerprint, not from a session). A forged bundle produces a
+  different fingerprint and is caught.
+- **The X3DH shared secret**, which both sides derive identically — Alice when
+  she sends, Bob when he collects. A SAS *can* be computed from it. Just not
+  simultaneously.
+
+So the MITM detection is intact and the mailbox cannot silently impersonate.
+What breaks is narrower: **the ergonomics of SAS** — the "you are both on a call
+right now, read six digits to each other" flow that makes verification something
+people actually do. That is worth fixing properly, but it is a usability
+problem, not a break in the security property.
+
+The fix, in the order the work should be done:
+
+1. **Signed prekey bundles, checked against a pinned fingerprint, do most of
+   it.** For a contact already `Verified`/`Trusted`, Alice has Bob's identity
+   fingerprint pinned; a bundle that does not match it is refused with no user
+   interaction and no SAS. This covers essentially all real traffic, because
+   people asynchronously message peers they already know.
+2. **First contact is the only case left, and it is a policy decision.** The
+   conservative default — *async first contact is not allowed; establish the
+   contact once live (or by invite plus verification), and asynchronous
+   messaging works forever after* — costs almost nothing in practice and keeps
+   today's trust model exactly as it is. It should be the default.
+3. **If async first contact is wanted anyway**, it needs a pairwise identity
+   code — `derive_safety_number(IK_A, IK_B)` over the two identity keys in a
+   fixed order, Signal's safety-number construction. Being identity-derived
+   rather than transcript-derived, it needs no handshake, is stable across
+   sessions, and can be compared at any time. It complements `derive_sas`
+   rather than replacing it, and like `derive_sas` and `history_key` it needs a
+   frozen known-answer test.
+
+Two rules that do not move:
+
+- `known_trusted` must not be relaxed to make any of this convenient. That only
+  a chat-stored or `Verified`/`Trusted` contact fingerprint auto-accepts is
+  load-bearing, and widening it was a real bug once already.
+- The UI must carry "delivered, sender unverified" as a first-class state.
+  Neither of the two states that exist today describes it honestly.
 
 ### 4.6 Multi-device is a fork in the road, not a later feature
 
@@ -269,7 +298,9 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 |---|---|
 | R1.1 | An asynchronously delivered first message `MUST NOT` be presented as coming from a verified peer. |
 | R1.2 | The UI `MUST` carry "delivered but unverified" as a first-class state. Today only "verified" and "awaiting verification" exist, and neither is honest here. |
-| R1.3 | A verification path `MUST` exist that does not require the original live handshake — a SAS over the X3DH transcript, computed once both sides have run it. |
+| R1.3 | A verification path `MUST` exist that does not require a live handshake. Comparing the identity fingerprint already qualifies; a pairwise `derive_safety_number(IK_A, IK_B)` `SHOULD` be added so the short-code ergonomics of SAS survive. See §4.5. |
+| R1.7 | Async **first contact** `MUST` be disallowed by default. Establishing a contact once — live, or by invite plus verification — and allowing asynchronous messaging thereafter keeps today's trust model intact at almost no cost. Enabling it `MUST` be a deliberate setting. |
+| R1.8 | A prekey bundle whose identity key does not match a **pinned** fingerprint for that contact `MUST` be refused outright — no prompt, no fallback to first-use trust. |
 | R1.4 | `known_trusted` `MUST NOT` be widened to auto-accept a fingerprint on the strength of a mailbox delivery. An invite link is not verification; neither is a message arriving. |
 | R1.5 | A malicious mailbox operator serving forged prekeys `MUST NOT` be able to impersonate a contact whose identity key the user has verified. |
 | R1.6 | Prekey bundles `MUST` be signed by the identity key, and the signature `MUST` be checked before any content is encrypted to them. |
@@ -366,7 +397,8 @@ into the wire format:
 
 1. **Multi-device: fanout, or permanently single-device?** (R6.1) Changing
    position later means redesigning the mailbox and the ratchet, with migration,
-   for everyone.
+   for everyone. This is the only genuinely unresolved blocking question — §4.5
+   answers the verification one.
 2. **Where does the mailbox live, and who keeps it up?** (R6.2) The relay only
    if it grows persistence and an uptime expectation; otherwise a separate
    service.
