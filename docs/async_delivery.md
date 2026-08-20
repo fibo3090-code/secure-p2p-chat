@@ -257,6 +257,50 @@ mailbox should accept that. The plausible shape is a sealed *reference*
 under the existing chunked path, but this is unresolved and should not be
 hand-waved.
 
+## 4.9 What this costs, and whether to build it at all
+
+A design document that lists only what a feature gains is selling, not
+designing. This feature takes real things away from the app, and they should be
+weighed before any of the above is worth reading twice.
+
+**"There is no server" stops being true.** Today the strongest claim this
+project can make is that a conversation exists on exactly two machines. A
+mailbox means a message sometimes rests on a third one. Encrypted, but present —
+and its operator learns that *someone* deposited something for a given recipient
+at a given time. §4.3 covers mitigating that; none of them make it untrue.
+
+**The security story stops fitting in a sentence.** "Compare six digits with the
+person you are talking to" is explicable to anyone. Prekeys, mailboxes and
+ratchets make it a paragraph, and a story users cannot follow is one they cannot
+rely on. That is a real loss, not a documentation problem.
+
+**New failure modes that cannot happen today.** Mailbox unreachable: messages
+stuck. Mailbox loses its disk: messages gone. A pure peer-to-peer app has
+neither.
+
+**More surface to keep correct.** The existing parsers have taken roughly 15
+million fuzz iterations without a crash. Anything added starts at zero, in the
+part of the codebase where mistakes are most expensive.
+
+**It requires infrastructure somebody pays for and keeps alive.** Store-and-
+forward only works if the mailbox is up when the sender deposits *and* when the
+recipient collects. That is a hosting bill and an operational commitment, which
+is a poor fit for a project run as a side project.
+
+### The resolution
+
+The trade is acceptable only because R7.3 makes the mailbox **optional**: with
+none configured the app must behave exactly as it does today. This is a mode to
+opt into, not a replacement for the peer-to-peer path, and it must never become
+one.
+
+That said, optional is not free — it is still months of careful work, a server
+to run, and a larger system to keep correct. **Sequencing advice: this should
+not be the next thing built.** The `history_key` weakness in §4.4 is days rather
+than months, needs no server and no recurring cost, and makes the app strictly
+better with nothing traded away. It should come first, and it is worth doing
+whether or not any of the rest of this document is ever implemented.
+
 ## 5. Staging
 
 Smallest useful increments, each shippable and testable alone:
