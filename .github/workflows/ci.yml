@@ -9,8 +9,96 @@ permissions:
   contents: read
 
 jobs:
+  # Decide whether this change can possibly affect the build.
+  #
+  # Every job below used to run on every pull request, so a one-file
+  # documentation change spent about 45 minutes of runner time compiling Rust on
+  # three platforms to prove that Markdown had not broken it.
+  #
+  # This is deliberately *not* `paths-ignore` on the workflow trigger. With
+  # `paths-ignore` the workflow does not run at all, so its checks never report
+  # — and the day someone turns on branch protection with required checks, every
+  # docs PR becomes permanently unmergeable, waiting on a check that will never
+  # arrive. Gating each job with `if:` instead means the jobs still exist and
+  # report a `skipped` conclusion, which branch protection accepts.
+  #
+  # It also fails **safe**: anything it cannot classify — an unreadable diff, a
+  # force push, a first push with no `before` commit — is treated as a code
+  # change and runs the full suite. The only way to skip is to positively
+  # establish that every changed path is documentation.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch -q --no-tags origin "$BASE_REF" || true
+            range="origin/$BASE_REF...HEAD"
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            range="$BEFORE..$SHA"
+          else
+            echo "no usable diff range; running everything"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! files=$(git diff --name-only "$range"); then
+            echo "could not diff $range; running everything"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$files" ]; then
+            echo "empty diff; running everything"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::group::changed files"
+          echo "$files"
+          echo "::endgroup::"
+
+          # Note what is NOT in this allowlist: .github/workflows/** is code as
+          # far as CI is concerned, because a workflow edit is exactly the kind
+          # of change that needs the full suite to prove itself.
+          docs_only=true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md|docs/*|LICENSE*|.github/ISSUE_TEMPLATE/*) ;;
+              *) docs_only=false; echo "code path: $f" ;;
+            esac
+          done <<< "$files"
+
+          if [ "$docs_only" = true ]; then
+            echo "documentation only — skipping build, test and audit jobs"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     name: Fast Checks
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Every job is bounded. The default is six hours, which is not a timeout so
     # much as an absence of one — a stuck job held a runner all night and the
@@ -66,6 +154,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Unit Tests
     runs-on: ${{ matrix.os }}
     # Generous: the workspace's end-to-end tests are genuinely networked and the
@@ -138,6 +228,8 @@ jobs:
         run: cargo test --workspace --doc
 
   frontend:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Frontend Build
     # The frontend ships inside a desktop app built for all three platforms, so
     # testing it on one is testing the wrong thing. Vite resolves paths, and the
@@ -239,6 +331,8 @@ jobs:
           retention-days: 7
 
   build-verification:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Build Verification
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -292,6 +386,8 @@ jobs:
   # Gating on this in CI is what stops that list from quietly going stale — a
   # leftover entry suppresses findings on a crate we may now use differently.
   supply-chain:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Supply Chain
     runs-on: ubuntu-latest
     timeout-minutes: 20
