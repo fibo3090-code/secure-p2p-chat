@@ -219,24 +219,36 @@ fn is_forbidden_char(c: char) -> bool {
 /// Windows' silent stripping of trailing dots/spaces, and a **byte** length
 /// budget ([`MAX_FILENAME_BYTES`]) that keeps the extension intact.
 pub fn sanitize_filename(filename: &str) -> String {
-    let mut sanitized: String = filename
+    // 1. Map anything that is a path separator or otherwise forbidden to `_`.
+    //    This is per-character, so it cannot change the length in bytes in a way
+    //    that matters below.
+    let mapped: String = filename
         .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
         .chars()
         .map(|c| if is_forbidden_char(c) { '_' } else { c })
         .collect();
 
-    // Collapse any path traversal patterns
-    while sanitized.contains("..") {
-        sanitized = sanitized.replace("..", "_");
-    }
+    // 2. Cut to the byte budget, then 3. tidy.
+    //
+    // The order matters and getting it wrong was exploitable twice over. Both
+    // the traversal collapse and the trailing-dot strip used to run *before*
+    // truncation, and truncation then put back what they had removed:
+    //
+    //   - `"A"*145 + ".exe." + "Z"*30` truncates to `AAA…AAA.exe.`, and Windows
+    //     silently drops that trailing dot to create `…​.exe`. `Path::extension()`
+    //     on the dotted name returns `Some("")`, so the desktop app's "this file
+    //     will run as a program" gate never fired for a file the OS then treated
+    //     as an executable. A peer picks the filename, so a peer picked that.
+    //
+    //   - Truncating between two dots separated by a multi-byte character
+    //     brought them together, re-creating a `..` the collapse had removed.
+    //
+    // Tidying after truncation fixes both, and only ever shrinks the name, so
+    // the budget still holds afterwards.
+    let mut sanitized = tidy_edges(&truncate_filename_bytes(&mapped, MAX_FILENAME_BYTES));
 
-    // Windows drops trailing dots and spaces, so `evil.exe .` would be created
-    // as `evil.exe`; strip them here rather than let the OS surprise us.
-    let sanitized = sanitized.trim_matches(|c: char| c == '.' || c == ' ');
-    let mut sanitized = truncate_filename_bytes(sanitized, MAX_FILENAME_BYTES);
-
-    // A reserved device name is only reserved as the *stem*, so prefixing it is
-    // enough and keeps the name recognisable.
+    // 4. A reserved device name is only reserved as the *stem*, so prefixing is
+    //    enough and keeps the name recognisable.
     let stem = sanitized
         .split('.')
         .next()
@@ -244,6 +256,11 @@ pub fn sanitize_filename(filename: &str) -> String {
         .to_ascii_lowercase();
     if WINDOWS_RESERVED.contains(&stem.as_str()) {
         sanitized = format!("_{sanitized}");
+        // The prefix can push a name that sat exactly on the budget one byte
+        // over it, and re-truncating can expose a trailing dot all over again.
+        if sanitized.len() > MAX_FILENAME_BYTES {
+            sanitized = tidy_edges(&truncate_filename_bytes(&sanitized, MAX_FILENAME_BYTES));
+        }
     }
 
     if sanitized.is_empty() {
@@ -251,6 +268,27 @@ pub fn sanitize_filename(filename: &str) -> String {
     } else {
         sanitized
     }
+}
+
+/// Collapse traversal components and strip the edge characters an operating
+/// system would quietly discard, so the name on disk is the name that was
+/// checked.
+///
+/// Only ever shrinks its input, which is what lets it run *after* truncation
+/// without breaking the byte budget.
+///
+/// Idempotent by construction: it loops until no `..` remains and removes *all*
+/// leading and trailing dots and spaces, so a second pass has nothing to do.
+/// `sanitizing_is_idempotent` in `core/tests/fuzz_parsers.rs` asserts that,
+/// because a sanitiser whose output differs from its own fixed point means the
+/// name written to disk depends on how many times it happened to be sanitised —
+/// and that is precisely how both bugs above hid.
+fn tidy_edges(name: &str) -> String {
+    let mut out = name.to_string();
+    while out.contains("..") {
+        out = out.replace("..", "_");
+    }
+    out.trim_matches(|c: char| c == '.' || c == ' ').to_string()
 }
 
 /// Cut `name` to at most `budget` bytes on a character boundary, preserving the
