@@ -11,6 +11,33 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Times could show as "Invalid Date" beside a message**, and a message with no
+  timestamp was dated 1 January 1970. Both looked like the message itself had
+  been damaged. A message with no recorded time now simply shows no time.
+- **Nearby peers on your network could linger after leaving, or disappear when
+  someone else did.** Removal matched names loosely, so a peer called "laptop"
+  could vanish because "laptop-alice" went away. Only applies with LAN discovery
+  turned on.
+- **Password managers were not told which password a field wanted**, so they
+  could offer to fill your existing password into a new-password box, or offer to
+  invent one while you were trying to unlock.
+
+### Security
+
+- **Your identity fingerprint is no longer broadcast on the local network.** With
+  LAN discovery on, it was included in the advertisement and read by nothing —
+  which told every device nearby which identity was at which address. Discovery
+  only ever supplied an address; the safety code is still what decides trust.
+- **A received file can no longer overwrite one that appears while it is being
+  saved.** The name is now claimed atomically rather than checked and then used.
+- **Rate limiting counts IPv6 by network, not by address.** A single ordinary
+  IPv6 allocation contains billions of addresses, so counting one at a time meant
+  the limit could be stepped around.
+- **A relayed conversation whose peer disappears without disconnecting is now
+  cleaned up** instead of holding the relay open indefinitely.
+
 ## [1.16.1] - 2026-08-20
 
 > **Breaking for Communities, again.** `FileEntry` gained a permissions field.
