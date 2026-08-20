@@ -69,11 +69,14 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
         </p>
         <PasswordInput value={current} autoFocus placeholder="Current password"
           autoComplete="current-password"
+          autoComplete="current-password"
           onChange={(e) => setCurrent(e.target.value)} />
         <PasswordInput value={next} placeholder={`New password (at least ${minLength} characters)`}
           autoComplete="new-password"
+          autoComplete="new-password"
           onChange={(e) => setNext(e.target.value)} />
         <PasswordInput value={confirm} placeholder="Repeat the new password"
+          autoComplete="new-password"
           autoComplete="new-password"
           onChange={(e) => setConfirm(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submit()} />

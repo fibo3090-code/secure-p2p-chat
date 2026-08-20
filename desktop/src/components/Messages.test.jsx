@@ -230,6 +230,19 @@ describe("ChatPane file cards", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("marks a date break as a separator", () => {
+    const day = 86400000;
+    render(<ChatPane {...base} contact={contactFixture({ messages: [
+      { id: "a", ts: Date.now() - 2 * day, from: "them", text: "older", t: "10:00" },
+      { id: "b", ts: Date.now(), from: "them", text: "newer", t: "11:00" },
+    ] })} />);
+    // Without the role a reader announces the date as a stray line of text
+    // between two messages, with nothing saying the thread moved to another day.
+    const seps = screen.getAllByRole("separator");
+    expect(seps.length).toBeGreaterThan(0);
+    expect(seps[0].getAttribute("aria-label")).toMatch(/^Messages from /);
+  });
+
   it("says where a received file actually landed", () => {
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ dir: "/home/me/Elsewhere" })] })} />);
     // Hardcoding "Downloads" was wrong for anyone who picked another folder, and

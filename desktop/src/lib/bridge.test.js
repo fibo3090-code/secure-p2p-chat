@@ -17,6 +17,8 @@ import {
   summaryToConv,
   chatToContact,
   fmtDay,
+  fmtTime,
+  fmtWhen,
   api,
 } from "./bridge.js";
 
@@ -238,6 +240,44 @@ describe("chatToContact", () => {
     expect(chatToContact({ ...chat, is_host_placeholder: true }, false).state).toBe("hosting");
     expect(chatToContact(chat, false).state).toBe("offline");
     expect(chatToContact(chat, true).state).toBe("connected");
+  });
+});
+
+describe("fmtTime", () => {
+  it("renders a wall-clock time", () => {
+    // Locale-dependent, so assert the shape rather than a literal.
+    expect(fmtTime("2026-08-20T13:45:00Z")).toMatch(/\d{1,2}[:.]\d{2}/);
+  });
+
+  it("returns empty rather than 'Invalid Date' for junk", () => {
+    // These land in message rows; "Invalid Date" beside a message reads as data
+    // loss to the user, where an empty stamp reads as "no timestamp".
+    expect(fmtTime("not a date")).toBe("");
+    expect(fmtTime(null)).toBe("");
+    expect(fmtTime(undefined)).toBe("");
+  });
+});
+
+describe("fmtWhen", () => {
+  it("gives a time for today and a weekday within the week", () => {
+    const now = new Date();
+    expect(fmtWhen(now.toISOString())).toMatch(/\d{1,2}[:.]\d{2}/);
+
+    const threeDaysAgo = new Date(now.getTime() - 3 * 86400000);
+    expect(fmtWhen(threeDaysAgo.toISOString())).toMatch(/[A-Za-z]{3}/);
+  });
+
+  it("falls back to a short date beyond a week", () => {
+    const longAgo = new Date(Date.now() - 60 * 86400000);
+    const out = fmtWhen(longAgo.toISOString());
+    expect(out).toBeTruthy();
+    expect(out).not.toMatch(/^\d{1,2}[:.]\d{2}$/);
+  });
+
+  it("is empty for a missing or unparseable stamp", () => {
+    expect(fmtWhen(null)).toBe("");
+    expect(fmtWhen("")).toBe("");
+    expect(fmtWhen("not a date")).toBe("");
   });
 });
 

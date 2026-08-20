@@ -571,7 +571,15 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
           )}
           {visible.map(({ m, sep, key }) => (
             <div key={key}>
-              {sep && <div className="day-sep"><span>{sep}</span></div>}
+              {/* A date break is a structural divider, not decoration: without
+                  the role a screen reader reads the date as a stray line of
+                  text between two messages, with nothing saying the thread has
+                  moved to another day. */}
+              {sep && (
+                <div className="day-sep" role="separator" aria-label={`Messages from ${sep}`}>
+                  <span>{sep}</span>
+                </div>
+              )}
               <MessageItem m={m} preview={m.id ? previews[m.id] : null}
                 onOpen={openFile} onReveal={revealFile} />
             </div>

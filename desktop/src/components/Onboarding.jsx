@@ -112,6 +112,7 @@ export function LockScreen({ onUnlock }) {
         <div className="onb-p-min">Enter your password to unlock your identity and history.</div>
         <div className="onb-field">
           <PasswordInput value={pw} autoFocus placeholder="Password" disabled={busy}
+            autoComplete="current-password"
             onChange={(e) => { setPw(e.target.value); setErr(""); }} />
           {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}
         </div>
@@ -159,6 +160,7 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
         {fingerprint && <code className="onb-fp-code">{fingerprint.slice(0, 32)}…</code>}
         <div className="onb-field">
           <PasswordInput value={pw} autoFocus placeholder={`New password (${min}+ characters)`} disabled={busy}
+            autoComplete="new-password"
             onChange={(e) => { setPw(e.target.value); setErr(""); }} />
           <div className="onb-strength">
             <span className={"onb-strength-bar s" + strength.score} />
@@ -167,6 +169,7 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
         </div>
         <div className="onb-field">
           <PasswordInput value={pw2} placeholder="Confirm password" disabled={busy}
+            autoComplete="new-password"
             onChange={(e) => { setPw2(e.target.value); setErr(""); }} />
           {mismatch && <span className="onb-err"><Icon name="alert" size={13} /> Passwords don't match</span>}
           {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}

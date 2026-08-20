@@ -3,6 +3,7 @@
 // lucide-react — a namespace import (`import * as Lucide`) with a dynamic
 // lookup ships the entire icon library (~1500 icons) and dominated the app
 // bundle. Unknown names degrade to a dot so a typo never breaks the build.
+import { memo } from "react";
 import {
   ArrowDown, ArrowLeft, ArrowLeftRight, ArrowUp, Check, ChevronDown,
   ChevronRight, Circle, Clock, Copy, Download, EllipsisVertical, Eye, EyeOff,
@@ -26,7 +27,14 @@ const MAP = {
   folder: Folder, megaphone: Megaphone,
 };
 
-export function Icon({ name, size = 18, ...rest }) {
+function IconInner({ name, size = 18, ...rest }) {
   const Cmp = MAP[name] || Circle;
   return <Cmp size={size} strokeWidth={1.9} {...rest} />;
 }
+
+/// Memoised. Icons are the single most-rendered component in the app — every
+/// conversation row, every marker, every button carries one — and their props
+/// are scalars, so the default shallow compare is both correct and cheap. This
+/// is what stops a poll tick from re-rendering several hundred SVGs that cannot
+/// have changed.
+export const Icon = memo(IconInner);

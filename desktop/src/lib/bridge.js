@@ -431,18 +431,44 @@ export const api = inTauri ? realApi : makeMock();
 export const onBridge = inTauri ? (event, cb) => listen(event, cb) : async () => () => {};
 
 // ── Adapters + formatting ────────────────────────────────────────────────────
+/// Parse a timestamp into a `Date`, or `null` when there isn't one.
+///
+/// Two traps, both of which shipped:
+///
+/// - `new Date("nonsense").toLocaleTimeString()` does not throw; it returns the
+///   *string* "Invalid Date". A try/catch is therefore no guard at all, and the
+///   words "Invalid Date" appeared next to the message text.
+/// - `new Date(null)` is not invalid — it is the Unix epoch. A message with no
+///   timestamp rendered as 1 January 1970 rather than as nothing.
+///
+/// Both read to the user as corrupted data. An absent stamp should render as an
+/// absent stamp.
+function parseStamp(ts) {
+  if (ts === null || ts === undefined || ts === "") return null;
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 export function fmtTime(ts) {
-  try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
-  catch { return ""; }
+  // The `isNaN` check is the point, and the try/catch is not a substitute for
+  // it: `new Date("nonsense").toLocaleTimeString()` does not throw, it returns
+  // the string "Invalid Date". So the catch never fired and every message row
+  // with an unparseable stamp rendered the words "Invalid Date" next to the
+  // text — which reads as data loss, where a blank stamp reads as "no time
+  // recorded". `fmtWhen` and `fmtDay` already guarded this; this one did not.
+  const d = parseStamp(ts);
+  if (!d) return "";
+  try {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch { return ""; }
 }
 
 // Compact "last activity" stamp for the conversation list: time-of-day for
 // today, weekday within the last week, short date otherwise.
 export function fmtWhen(ts) {
-  if (!ts) return "";
+  const d = parseStamp(ts);
+  if (!d) return "";
   try {
-    const d = new Date(ts);
-    if (isNaN(d)) return "";
     const now = new Date();
     if (d.toDateString() === now.toDateString()) return fmtTime(d);
     const days = (now - d) / 86400000;
@@ -453,8 +479,8 @@ export function fmtWhen(ts) {
 
 // Label for day separators inside a thread.
 export function fmtDay(ts) {
-  const d = new Date(ts);
-  if (isNaN(d)) return "";
+  const d = parseStamp(ts);
+  if (!d) return "";
   const today = new Date();
   const yesterday = new Date(today.getTime() - 86400000);
   if (d.toDateString() === today.toDateString()) return "Today";
