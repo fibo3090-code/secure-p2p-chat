@@ -11,6 +11,15 @@ predate tagged releases.
 
 ## [Unreleased]
 
+## [1.16.1] - 2026-08-20
+
+> **Breaking for Communities, again.** `FileEntry` gained a permissions field.
+> The wire format has no field tags, so a client and server on different versions
+> cannot read each other's file listings — the list arrives and is discarded,
+> with the Drive appearing empty rather than erroring. Anyone self-hosting a
+> community server has to restart it on this version, and their members have to
+> update too. Direct peer-to-peer conversations are unaffected.
+
 ### Added
 
 - **Per-file permissions in communities.** A shared file now carries four
@@ -1140,7 +1149,8 @@ predate tagged releases.
 - Basic chat functionality, end-to-end encryption (RSA + AES-GCM), file
   transfer, a simple GUI, and message history persistence.
 
-[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.0...HEAD
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.1...HEAD
+[1.16.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.0...v1.16.1
 [1.16.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.13.0...v1.14.0
