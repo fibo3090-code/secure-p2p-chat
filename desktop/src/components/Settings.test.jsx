@@ -21,7 +21,7 @@ import { Settings } from "./Settings.jsx";
 import { stubApi } from "../test/render.jsx";
 import { subscribe, dismiss } from "../lib/toast.js";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -51,7 +51,7 @@ const identity = {
   state: "ready", name: "Maya", fingerprint: "ab".repeat(32), min_password_len: 12,
 };
 
-beforeEach(() => { clearToasts(); useApi({ getSettings: settings }); });
+beforeEach(() => { clearToasts(); installApi({ getSettings: settings }); });
 afterEach(clearToasts);
 
 describe("Settings", () => {
@@ -70,14 +70,14 @@ describe("Settings", () => {
   });
 
   it("says when it was last backed up once one exists", async () => {
-    useApi({ getSettings: { ...settings, identity_backed_up_at: 1700000000000 } });
+    installApi({ getSettings: { ...settings, identity_backed_up_at: 1700000000000 } });
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
     expect(await screen.findByText("Backed up")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Export again/ })).toBeTruthy();
   });
 
   it("persists a toggle through the bridge", async () => {
-    const api = useApi({ getSettings: settings });
+    const api = installApi({ getSettings: settings });
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
     const toggle = await screen.findByText("Desktop notifications");
     await userEvent.click(toggle);
@@ -86,7 +86,7 @@ describe("Settings", () => {
   });
 
   it("rolls a rejected toggle back rather than leaving it flipped", async () => {
-    useApi({
+    installApi({
       getSettings: settings,
       updateSettings: async () => { throw new Error("settings file is read-only"); },
     });
@@ -100,7 +100,7 @@ describe("Settings", () => {
   });
 
   it("refuses a port outside 1–65535 and restores the previous value", async () => {
-    const api = useApi({ getSettings: settings });
+    const api = installApi({ getSettings: settings });
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
     const port = await screen.findByDisplayValue("12345");
     await userEvent.clear(port);
@@ -113,7 +113,7 @@ describe("Settings", () => {
   });
 
   it("saves a valid port change", async () => {
-    const api = useApi({ getSettings: settings });
+    const api = installApi({ getSettings: settings });
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
     const port = await screen.findByDisplayValue("12345");
     await userEvent.clear(port);
@@ -124,7 +124,7 @@ describe("Settings", () => {
   });
 
   it("commits a renamed display name and tells the shell to refresh", async () => {
-    const api = useApi({ getSettings: settings });
+    const api = installApi({ getSettings: settings });
     const onIdentityChanged = vi.fn();
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} onIdentityChanged={onIdentityChanged} />);
     const name = await screen.findByLabelText("Display name");
@@ -136,7 +136,7 @@ describe("Settings", () => {
   });
 
   it("restores the old name when the rename is refused", async () => {
-    useApi({ getSettings: settings, setDisplayName: async () => { throw new Error("name is taken"); } });
+    installApi({ getSettings: settings, setDisplayName: async () => { throw new Error("name is taken"); } });
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
     const name = await screen.findByLabelText("Display name");
     await userEvent.clear(name);
@@ -146,7 +146,7 @@ describe("Settings", () => {
   });
 
   it("does not call the bridge when the name is unchanged", async () => {
-    const api = useApi({ getSettings: settings });
+    const api = installApi({ getSettings: settings });
     render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
     const name = await screen.findByLabelText("Display name");
     await userEvent.click(name);

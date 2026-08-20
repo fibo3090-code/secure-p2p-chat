@@ -1,0 +1,40 @@
+[package]
+name = "messenger-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately its own workspace. The fuzz crate needs nightly and a sanitizer
+# build, so pulling it into the main workspace would put both in the path of
+# every ordinary `cargo build`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.messenger-core]
+path = ".."
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "party_frame"
+path = "fuzz_targets/party_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filename"
+path = "fuzz_targets/filename.rs"
+test = false
+doc = false
+bench = false

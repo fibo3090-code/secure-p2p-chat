@@ -144,3 +144,14 @@ AGENTS.md
 
 # Local Party/Community server state (contains the server identity key - never commit)
 party-data/
+
+# ----------------------------------------------------------------------------
+# Fuzzing (cargo-fuzz)
+# ----------------------------------------------------------------------------
+# Corpora and crash artefacts are generated locally and can be large. The
+# targets themselves ARE tracked — a fuzz target nobody can find is a fuzz
+# target nobody runs.
+core/fuzz/corpus/
+core/fuzz/artifacts/
+core/fuzz/coverage/
+core/fuzz/target/

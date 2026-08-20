@@ -20,7 +20,7 @@ vi.mock("./lib/bridge.js", async (importOriginal) => {
 import App from "./App.jsx";
 import { stubApi } from "./test/render.jsx";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -39,7 +39,7 @@ const conv = {
 };
 
 function readyApi(over = {}) {
-  return useApi({
+  return installApi({
     authStatus: ready,
     listConversations: [conv],
     listTransfers: [],
@@ -61,7 +61,7 @@ beforeEach(() => { readyApi(); });
 describe("App — boot", () => {
   it("shows a boot screen rather than a blank window while auth_status is pending", async () => {
     let resolve;
-    useApi({ authStatus: () => new Promise((r) => { resolve = r; }) });
+    installApi({ authStatus: () => new Promise((r) => { resolve = r; }) });
     const { container } = render(<App />);
     expect(container.querySelector(".onb-card")).toBeTruthy();
     resolve(ready);
@@ -69,7 +69,7 @@ describe("App — boot", () => {
   });
 
   it("reports a failed handshake and keeps retrying", async () => {
-    useApi({ authStatus: async () => { throw new Error("the backend did not respond"); } });
+    installApi({ authStatus: async () => { throw new Error("the backend did not respond"); } });
     render(<App />);
     expect(await screen.findByText(/did not respond/)).toBeTruthy();
   });
@@ -77,14 +77,14 @@ describe("App — boot", () => {
   it("refuses to continue past an unreadable identity, and offers no retry", async () => {
     // Regenerating here would make every stored message undecryptable and break
     // TOFU with every contact, while looking like a fresh install.
-    useApi({ authStatus: { ...ready, state: "error", error: "identity.json exists but could not be read" } });
+    installApi({ authStatus: { ...ready, state: "error", error: "identity.json exists but could not be read" } });
     render(<App />);
     expect(await screen.findByText(/Nothing has been changed or deleted/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
   });
 
   it("blocks every surface behind the lock screen", async () => {
-    useApi({ authStatus: { ...ready, state: "unlock" } });
+    installApi({ authStatus: { ...ready, state: "unlock" } });
     render(<App />);
     await screen.findByRole("button", { name: /unlock/i });
     expect(screen.queryByRole("navigation")).toBeNull();
@@ -92,7 +92,7 @@ describe("App — boot", () => {
   });
 
   it("blocks every surface behind the set-password screen", async () => {
-    useApi({ authStatus: { ...ready, state: "set_password" } });
+    installApi({ authStatus: { ...ready, state: "set_password" } });
     render(<App />);
     await screen.findByRole("button", { name: /Create identity/ });
     expect(screen.queryByRole("navigation")).toBeNull();

@@ -164,6 +164,23 @@ Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`).
 
 - Unit tests live in source files (e.g. `core/src/network/session.rs` has handshake tests); integration tests in each crate's `tests/`.
 - Async tests use `#[tokio::test]`. Handshake tests must verify derived keys match on both sides. Protocol changes require new (de)serialization tests. Adding `serde(default)` fields requires a back-compat test that loads old JSON.
+- **Fuzzing comes in two halves, and they are not interchangeable.**
+  `core/tests/fuzz_parsers.rs` is property-based (proptest), runs on stable in the
+  ordinary suite, and gates every PR — that is what makes it useful, and it is
+  what found the filename bypass in GHSA-6q3g-734c-22jm by asserting
+  `sanitize_filename` is idempotent. `core/fuzz/` is coverage-guided
+  (cargo-fuzz + libFuzzer), needs nightly, and is run deliberately via
+  `./scripts/fuzz.sh [target] [seconds]`. Two environment traps that script
+  absorbs: `cargo fuzz` shells out to `cargo`, so a distro `/usr/bin/cargo`
+  shadowing the rustup proxy makes the nested build silently use stable and fail
+  on `-Z` (prefix `~/.cargo/bin`; `+nightly` alone does not help), and
+  `core/fuzz` is its own workspace so a sanitizer build never lands in the path
+  of an ordinary `cargo build`. Corpora and crashes are gitignored; the targets
+  are tracked, because a fuzz target nobody can find is one nobody runs.
+- **The frontend is linted** (`cd desktop && npm run lint`, a CI gate). The rule
+  set is deliberately narrow — bugs, not style — because a linter that reports
+  400 opinions on install gets switched off. `exhaustive-deps` is a warning, not
+  an error, so existing deliberate dependency arrays do not block a merge.
 - **CI runs `cargo nextest run --workspace`** (plus `cargo test --workspace --doc`, which nextest does not cover). Process-per-test is what the suite is written for: the relay tests read a process-global env var and many bind loopback listeners. `.config/nextest.toml` sets the slow-test warning and a terminate-after, so a hung networked test fails instead of blocking the job.
 - **End-to-end tests, by subsystem** — each drives the real objects the shipped app drives, not a mock:
   - `core/tests/session_e2e.rs` — the v3 handshake and transport over a duplex stream.

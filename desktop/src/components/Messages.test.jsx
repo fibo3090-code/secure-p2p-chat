@@ -23,7 +23,7 @@ vi.mock("../lib/bridge.js", async (importOriginal) => {
 import { ConvList, ChatPane, rowStatusLabel } from "./Messages.jsx";
 import { stubApi, contactFixture, convFixture } from "../test/render.jsx";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -31,7 +31,7 @@ function useApi(overrides) {
 }
 
 beforeEach(() => {
-  useApi({});
+  installApi({});
 });
 
 describe("rowStatusLabel", () => {
@@ -194,7 +194,7 @@ describe("ChatPane file cards", () => {
     const openFile = vi.fn(async (_id, _msg, _reveal, confirm) =>
       confirm ? { opened: true, blocked: null, filename: "holiday.jpg.exe" }
               : { opened: false, blocked: "exe", filename: "holiday.jpg.exe" });
-    useApi({ openFile });
+    installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);
     await userEvent.click(screen.getByTitle("Open file"));
@@ -209,7 +209,7 @@ describe("ChatPane file cards", () => {
 
   it("lets the user back out of a blocked open without running anything", async () => {
     const openFile = vi.fn(async () => ({ opened: false, blocked: "exe", filename: "x.exe" }));
-    useApi({ openFile });
+    installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);
     await userEvent.click(screen.getByTitle("Open file"));
@@ -222,7 +222,7 @@ describe("ChatPane file cards", () => {
 
   it("never gates revealing in the file manager — it launches nothing", async () => {
     const openFile = vi.fn(async () => ({ opened: true, blocked: null, filename: null }));
-    useApi({ openFile });
+    installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);
     await userEvent.click(screen.getByTitle("Show in folder"));
