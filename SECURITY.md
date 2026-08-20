@@ -20,6 +20,42 @@ Only the latest released version receives security fixes.
 | Latest release (see [CHANGELOG.md](CHANGELOG.md)) | Yes |
 | Older releases | No — upgrade to the latest release |
 
+## Verifying a Download
+
+Releases are **not** signed with an OS code-signing certificate, so Windows
+SmartScreen and macOS Gatekeeper will warn about the installers. That warning is
+about a missing certificate, not about the contents. What a certificate would
+prove — that a file came from this project and has not been altered — is proved
+two other ways instead, both free and both checkable by you:
+
+**Build provenance** (the stronger one). Every release artifact is attested with
+[Sigstore](https://www.sigstore.dev/) via GitHub's `attest-build-provenance`,
+binding the file's digest to this repository, the exact commit, and the workflow
+run that produced it, and recording it in a public transparency log:
+
+```bash
+gh attestation verify <downloaded-file> --repo <owner>/<repo>
+```
+
+This is a claim a code-signing certificate cannot make. A certificate says "some
+holder of this key produced this file"; the attestation says "this file was
+built by this workflow, from source you can read, at this commit".
+
+**Checksums.** Each release carries a `SHA256SUMS` asset:
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS      # Linux
+shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS
+```
+
+Note the limit: a checksum only proves the file matches the release page. If the
+release page itself were the thing under an attacker's control, the checksum
+would match and prove nothing. Provenance does not have that weakness — verify
+that one if you verify only one.
+
+There is **no auto-updater**. Security fixes reach you only if you come back and
+download them, so watch the repository for releases if you rely on this.
+
 ## Security Posture
 
 Current overall risk assessment: **medium**.
