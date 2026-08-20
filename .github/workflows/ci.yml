@@ -139,7 +139,16 @@ jobs:
 
   frontend:
     name: Frontend Build
-    runs-on: ubuntu-latest
+    # The frontend ships inside a desktop app built for all three platforms, so
+    # testing it on one is testing the wrong thing. Vite resolves paths, and the
+    # suite touches `localStorage`, timezone-dependent formatting and file-name
+    # handling — all places where Windows and macOS differ from Linux in ways
+    # that only show up when you run there.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -156,6 +165,16 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+        working-directory: desktop
+
+      # Advisories in the npm tree were caught by nothing: `cargo-deny` covers
+      # the Rust half and there was no equivalent for the half that actually
+      # renders the UI. Scoped to production dependencies and to `high` — the
+      # dev tree pulls a long tail of build tooling whose advisories are not
+      # reachable from the shipped bundle, and failing on those trains people to
+      # ignore the job.
+      - name: Audit dependencies
+        run: npm audit --omit=dev --audit-level=high
         working-directory: desktop
 
       - name: Test
