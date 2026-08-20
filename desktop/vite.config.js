@@ -24,6 +24,18 @@ export default defineConfig({
   plugins: [react(), cspPlugin()],
   clearScreen: false,
   server: {
+    // Bind an explicit address rather than letting Vite choose.
+    //
+    // Left unset, Vite can end up listening on `[::1]` only, while
+    // `tauri.conf.json` points the webview at `localhost:5173` — and whether
+    // that resolves to `::1` or `127.0.0.1` first is a property of the machine,
+    // not of this project. When the two disagree the webview gets
+    // connection-refused and shows a blank window with nothing to explain it,
+    // which is indistinguishable from every other cause of a blank window.
+    //
+    // Pinning both sides to `127.0.0.1` takes name resolution out of the loop.
+    // Keep this in step with `devUrl` in `tauri.conf.json`.
+    host: "127.0.0.1",
     port: 5173,
     strictPort: true,
   },
