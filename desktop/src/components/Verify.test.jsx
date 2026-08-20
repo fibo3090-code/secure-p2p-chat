@@ -21,7 +21,7 @@ vi.mock("../lib/bridge.js", async (importOriginal) => {
 import { Verify } from "./Verify.jsx";
 import { stubApi } from "../test/render.jsx";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -35,7 +35,7 @@ const req = {
   sas: "418 902 🎃🎈🎁",
 };
 
-beforeEach(() => useApi({}));
+beforeEach(() => installApi({}));
 
 describe("Verify", () => {
   it("renders nothing when there is no pending request", () => {
@@ -66,7 +66,7 @@ describe("Verify", () => {
   });
 
   it("confirms trust with accept=true and closes", async () => {
-    const api = useApi({});
+    const api = installApi({});
     const onClose = vi.fn();
     render(<Verify req={req} onClose={onClose} />);
     await userEvent.click(screen.getByRole("button", { name: /Codes match/ }));
@@ -75,14 +75,14 @@ describe("Verify", () => {
   });
 
   it("rejects with accept=false", async () => {
-    const api = useApi({});
+    const api = installApi({});
     render(<Verify req={req} onClose={() => {}} />);
     await userEvent.click(screen.getByRole("button", { name: "Reject" }));
     expect(api.confirmFingerprint).toHaveBeenCalledWith("chat-1", false);
   });
 
   it("stays open on a failed confirmation, and only then offers a way out", async () => {
-    useApi({ confirmFingerprint: async () => { throw new Error("session is gone"); } });
+    installApi({ confirmFingerprint: async () => { throw new Error("session is gone"); } });
     const onClose = vi.fn();
     render(<Verify req={req} onClose={onClose} />);
 
@@ -98,7 +98,7 @@ describe("Verify", () => {
   });
 
   it("clears a previous request's error when a new peer arrives", async () => {
-    useApi({ confirmFingerprint: async () => { throw new Error("session is gone"); } });
+    installApi({ confirmFingerprint: async () => { throw new Error("session is gone"); } });
     const { rerender } = render(<Verify req={req} onClose={() => {}} />);
     await userEvent.click(screen.getByRole("button", { name: /Codes match/ }));
     await screen.findByText(/session is gone/i);

@@ -19,7 +19,7 @@ vi.mock("../lib/bridge.js", async (importOriginal) => {
 import { Contacts } from "./Contacts.jsx";
 import { stubApi } from "../test/render.jsx";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -31,7 +31,7 @@ const alice = {
   trust: "verified", reachable: true, relay_only: false, blocked: false,
 };
 
-beforeEach(() => useApi({ listContacts: [] }));
+beforeEach(() => installApi({ listContacts: [] }));
 
 describe("Contacts", () => {
   it("says there is nothing here rather than showing an empty grid", async () => {
@@ -40,7 +40,7 @@ describe("Contacts", () => {
   });
 
   it("lists a saved contact with its trust state and address", async () => {
-    useApi({ listContacts: [alice] });
+    installApi({ listContacts: [alice] });
     render(<Contacts />);
     expect(await screen.findByText("Alice")).toBeTruthy();
     expect(screen.getByText("192.168.1.21:12345")).toBeTruthy();
@@ -52,7 +52,7 @@ describe("Contacts", () => {
 
   it("imports an invite link and reloads the list", async () => {
     const importInvite = vi.fn(async () => ({ contact: { ...alice, name: "Imported" }, signed: true }));
-    const api = useApi({ importInvite, listContacts: async () => [] });
+    const api = installApi({ importInvite, listContacts: async () => [] });
     render(<Contacts />);
 
     await userEvent.type(screen.getByPlaceholderText(/Paste an invite link/), "chat-p2p://invite/abc");
@@ -65,7 +65,7 @@ describe("Contacts", () => {
   });
 
   it("shows the import failure instead of failing silently", async () => {
-    useApi({
+    installApi({
       listContacts: [],
       importInvite: async () => { throw new Error("invite fingerprint does not match its key"); },
     });
@@ -76,13 +76,13 @@ describe("Contacts", () => {
   });
 
   it("blocks and unblocks through the bridge", async () => {
-    const api = useApi({ listContacts: [alice] });
+    const api = installApi({ listContacts: [alice] });
     render(<Contacts />);
     await screen.findByText("Alice");
     await userEvent.click(screen.getByRole("button", { name: "Block" }));
     expect(api.blockContact).toHaveBeenCalledWith("c1");
 
-    useApi({ listContacts: [{ ...alice, trust: "blocked", blocked: true }] });
+    installApi({ listContacts: [{ ...alice, trust: "blocked", blocked: true }] });
     render(<Contacts />);
     const unblock = await screen.findAllByRole("button", { name: "Unblock" });
     await userEvent.click(unblock[0]);
@@ -90,7 +90,7 @@ describe("Contacts", () => {
   });
 
   it("will not offer Connect to a contact with no way to reach them", async () => {
-    useApi({ listContacts: [{ ...alice, reachable: false }] });
+    installApi({ listContacts: [{ ...alice, reachable: false }] });
     render(<Contacts />);
     await screen.findByText("Alice");
     expect(screen.getByRole("button", { name: "Connect" }).disabled).toBe(true);
@@ -98,7 +98,7 @@ describe("Contacts", () => {
   });
 
   it("confirms a delete, and admits it discards the verified fingerprint", async () => {
-    const api = useApi({ listContacts: [alice] });
+    const api = installApi({ listContacts: [alice] });
     render(<Contacts />);
     await screen.findByText("Alice");
     await userEvent.click(screen.getByRole("button", { name: "Delete contact" }));
@@ -112,7 +112,7 @@ describe("Contacts", () => {
   });
 
   it("warns that deleting a blocked contact lets them back in", async () => {
-    useApi({ listContacts: [{ ...alice, trust: "blocked", blocked: true }] });
+    installApi({ listContacts: [{ ...alice, trust: "blocked", blocked: true }] });
     render(<Contacts />);
     await screen.findByText("Alice");
     await userEvent.click(screen.getByRole("button", { name: "Delete contact" }));
@@ -121,7 +121,7 @@ describe("Contacts", () => {
   });
 
   it("can be cancelled without deleting anything", async () => {
-    const api = useApi({ listContacts: [alice] });
+    const api = installApi({ listContacts: [alice] });
     render(<Contacts />);
     await screen.findByText("Alice");
     await userEvent.click(screen.getByRole("button", { name: "Delete contact" }));

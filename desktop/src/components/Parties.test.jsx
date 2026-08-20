@@ -22,7 +22,7 @@ import { Parties } from "./Parties.jsx";
 import { stubApi } from "../test/render.jsx";
 import { _resetForTests } from "../lib/partyUnread.js";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -44,7 +44,7 @@ const joinedServer = {
 
 beforeEach(() => {
   _resetForTests();
-  useApi({ partyList: [], partySaved: [] });
+  installApi({ partyList: [], partySaved: [] });
 });
 
 describe("Parties — joining", () => {
@@ -54,7 +54,7 @@ describe("Parties — joining", () => {
   });
 
   it("refuses to submit without an address or a username", async () => {
-    const api = useApi({ partyList: [], partySaved: [] });
+    const api = installApi({ partyList: [], partySaved: [] });
     render(<Parties />);
     await screen.findByText("Join a community");
 
@@ -69,7 +69,7 @@ describe("Parties — joining", () => {
   });
 
   it("mirrors the server's username cap before the round trip", async () => {
-    const api = useApi({ partyList: [], partySaved: [] });
+    const api = installApi({ partyList: [], partySaved: [] });
     render(<Parties />);
     await screen.findByText("Join a community");
     await userEvent.type(screen.getByPlaceholderText(/server address/), "10.0.0.5:12345");
@@ -87,7 +87,7 @@ describe("Parties — joining", () => {
       trust
         ? { status: "joined", server: "s1", fingerprint: "aa".repeat(32) }
         : { status: "verify", fingerprint: "aa".repeat(32), sas: "418 902 🎃🎈🎁" });
-    useApi({ partyList: [], partySaved: [], partyJoin });
+    installApi({ partyList: [], partySaved: [], partyJoin });
 
     render(<Parties />);
     await screen.findByText("Join a community");
@@ -109,7 +109,7 @@ describe("Parties — joining", () => {
 
   it("backs out of verification without joining", async () => {
     const partyJoin = vi.fn(async () => ({ status: "verify", fingerprint: "aa".repeat(32), sas: "1 2 3" }));
-    useApi({ partyList: [], partySaved: [], partyJoin });
+    installApi({ partyList: [], partySaved: [], partyJoin });
     render(<Parties />);
     await screen.findByText("Join a community");
     await userEvent.type(screen.getByPlaceholderText(/server address/), "10.0.0.5:12345");
@@ -126,7 +126,7 @@ describe("Parties — joining", () => {
     // parties.json holds every community's pinned fingerprint. Swallowing a
     // parse failure would silently turn the next join back into an unverified
     // first contact.
-    useApi({
+    installApi({
       partyList: [],
       partySaved: async () => { throw new Error("parties.json is damaged"); },
     });
@@ -135,7 +135,7 @@ describe("Parties — joining", () => {
   });
 
   it("fills the form from a saved community but does not join from the card", async () => {
-    const api = useApi({
+    const api = installApi({
       partyList: [],
       partySaved: [{ address: "10.0.0.5:12345", username: "you", name: "Test", fingerprint: "aa" }],
     });
@@ -152,7 +152,7 @@ describe("Parties — joining", () => {
 
 describe("Parties — a joined community", () => {
   it("shows the channel and its history", async () => {
-    useApi({
+    installApi({
       partyList: [joinedServer],
       partySaved: [],
       partyHistory: [{ sender_name: "nova", from_me: false, kind: "text", text: "welcome", size: null, timestamp: Date.now() }],
@@ -162,7 +162,7 @@ describe("Parties — a joined community", () => {
   });
 
   it("posts to the active channel and clears the composer", async () => {
-    const api = useApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
+    const api = installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
     render(<Parties />);
     const box = await screen.findByLabelText(/^Message/);
     await userEvent.type(box, "hello");
@@ -172,7 +172,7 @@ describe("Parties — a joined community", () => {
   });
 
   it("puts a refused post back in the composer instead of losing it", async () => {
-    useApi({
+    installApi({
       partyList: [joinedServer], partySaved: [], partyHistory: [],
       partyPost: async () => { throw new Error("this channel is locked"); },
     });
@@ -195,14 +195,14 @@ describe("Parties — a joined community", () => {
       ...joinedServer,
       channels: [{ id: "ch1", name: "news", messages: 0, kind: "announce", members: [], can_post: false }],
     };
-    useApi({ partyList: [locked], partySaved: [], partyHistory: [] });
+    installApi({ partyList: [locked], partySaved: [], partyHistory: [] });
     render(<Parties />);
     await waitFor(() => expect(composer()?.getAttribute("placeholder")).toMatch(/Only admins can post/));
     expect(composer().disabled).toBe(true);
   });
 
   it("explains a guest's read-only role", async () => {
-    useApi({ partyList: [{ ...joinedServer, my_role: "guest" }], partySaved: [], partyHistory: [] });
+    installApi({ partyList: [{ ...joinedServer, my_role: "guest" }], partySaved: [], partyHistory: [] });
     render(<Parties />);
     await waitFor(() => expect(composer()?.getAttribute("placeholder")).toMatch(/read-only/));
     expect(composer().disabled).toBe(true);

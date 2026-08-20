@@ -1,7 +1,6 @@
 // Rename / delete / info dialogs for a conversation.
 import { useEffect, useState } from "react";
 import { Modal, Button, Input } from "./ui.jsx";
-import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
 
 export function RenameDialog({ target, onClose, onSubmit }) {

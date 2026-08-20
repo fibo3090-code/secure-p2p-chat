@@ -20,7 +20,7 @@ import { Relays } from "./Relays.jsx";
 import { stubApi } from "../test/render.jsx";
 import { subscribe, dismiss } from "../lib/toast.js";
 
-function useApi(overrides) {
+function installApi(overrides) {
   const api = stubApi(bridge.real, overrides);
   Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
   Object.assign(bridge.api, api);
@@ -35,7 +35,7 @@ function toasts() {
 }
 function clearToasts() { toasts().forEach((t) => dismiss(t.id)); }
 
-beforeEach(() => { clearToasts(); useApi({}); });
+beforeEach(() => { clearToasts(); installApi({}); });
 afterEach(clearToasts);
 
 describe("Relays", () => {
@@ -46,7 +46,7 @@ describe("Relays", () => {
   });
 
   it("refuses to pair without an address, and says which field is missing", async () => {
-    const api = useApi({});
+    const api = installApi({});
     render(<Relays />);
     await userEvent.click(screen.getByRole("button", { name: "Connect" }));
     expect(api.connectViaRelay).not.toHaveBeenCalled();
@@ -59,7 +59,7 @@ describe("Relays", () => {
   });
 
   it("pairs with the trimmed address and token", async () => {
-    const api = useApi({});
+    const api = installApi({});
     const onConnected = vi.fn();
     render(<Relays onConnected={onConnected} />);
     await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "  relay.test:9000  ");
@@ -71,7 +71,7 @@ describe("Relays", () => {
   });
 
   it("opens a relay session and shows the token to share", async () => {
-    useApi({ hostViaRelay: async () => "rly_deadbeef" });
+    installApi({ hostViaRelay: async () => "rly_deadbeef" });
     render(<Relays />);
     await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "relay.test:9000");
     await userEvent.click(screen.getByRole("button", { name: "Host" }));
@@ -79,7 +79,7 @@ describe("Relays", () => {
   });
 
   it("reports a failed pairing instead of silently doing nothing", async () => {
-    useApi({ connectViaRelay: async () => { throw new Error("relay refused the token"); } });
+    installApi({ connectViaRelay: async () => { throw new Error("relay refused the token"); } });
     render(<Relays />);
     await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "relay.test:9000");
     await userEvent.type(screen.getByPlaceholderText("connection token"), "rly_abc");
