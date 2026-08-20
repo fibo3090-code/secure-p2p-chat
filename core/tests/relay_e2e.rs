@@ -314,3 +314,42 @@ async fn an_unknown_token_fails_fast_and_leaves_the_relay_serving() {
     // The relay survived the refusal and still brokers a real pairing.
     pair_and_exchange_on(&relay_addr, &generate_relay_token(), "still serving").await;
 }
+
+/// The accept loop must survive connections that fail, one after another.
+///
+/// Both public accept loops log a failed `accept()` and continue rather than
+/// propagating it, because a transient failure — the peer vanishing between the
+/// SYN and the accept, or a momentary EMFILE — would otherwise take the whole
+/// rendezvous down for the life of the process. That is a one-line decision with
+/// no test behind it, and its absence is invisible until the day it matters.
+///
+/// What this injects is the failure that actually happens constantly in the
+/// wild: peers that connect and hang up without speaking. True EMFILE injection
+/// is deliberately not attempted — lowering `RLIMIT_NOFILE` would destabilise the
+/// test process itself and has no Windows equivalent, so it would trade a real
+/// check for a flaky one. This covers the same `continue`.
+#[tokio::test]
+async fn the_relay_keeps_serving_after_a_burst_of_failed_connections() {
+    let relay_addr = start_relay().await;
+
+    // Connect and drop, repeatedly. Each one reaches the accept loop and then
+    // fails in `handle_relay_connection` when the hello never arrives.
+    // Under the relay's own per-address cap (20 per 30s), with room left for the
+    // pairing below — otherwise this would be testing the rate limiter instead.
+    for _ in 0..6 {
+        if let Ok(stream) = tokio::net::TcpStream::connect(&relay_addr).await {
+            drop(stream);
+        }
+    }
+    // And some that connect, send garbage, and leave.
+    for _ in 0..6 {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(&relay_addr).await {
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(b"not a relay frame").await;
+            drop(stream);
+        }
+    }
+
+    // The listener is still there and still brokers a real pairing.
+    pair_and_exchange_on(&relay_addr, &generate_relay_token(), "still serving").await;
+}
