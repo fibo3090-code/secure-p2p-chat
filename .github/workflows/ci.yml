@@ -261,6 +261,14 @@ jobs:
       - name: cargo-deny
         run: cargo deny --all-features check
 
+      # deny.toml's own comment says a stale acceptance is worse than no
+      # acceptance, because it suppresses a real future finding on a crate we
+      # have since started using differently. Nothing enforced that, and an
+      # accept-list only ever grows. cargo-deny has no built-in report for
+      # unused advisory ignores, so this derives it.
+      - name: Accepted advisories are still applicable
+        run: ./scripts/check-stale-advisories.sh
+
       # The gitleaks binary directly, not gitleaks-action: that action exits 1
       # even when its own SARIF reports `"results": []` (it gates on a licence
       # key), which would make this job a permanent red herring. Running the
