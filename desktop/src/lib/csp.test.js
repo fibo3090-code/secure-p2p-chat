@@ -1,3 +1,20 @@
+    it("the shipped policy allows no inline script", () => {
+        // This is the directive that makes an injected <script> inert. If it
+        // ever gains 'unsafe-inline', the CSP has stopped doing the main thing
+        // it is here for.
+        expect(directives(cspPolicy())["script-src"]).toEqual(["'self'"]);
+        expect(directives(cspPolicy({ forHeader: true }))["script-src"]).toEqual(["'self'"]);
+    });
+
+    it("allows inline script in dev, because Vite requires it", () => {
+        // @vitejs/plugin-react injects its React Refresh preamble as an inline
+        // module script. Blocking it leaves the window blank with nothing on
+        // screen to explain why — which is exactly what happened when the meta
+        // tag was first added, and only in `tauri dev`, because Tauri's CSP
+        // header cannot apply to a page the Vite server delivers.
+        expect(directives(cspPolicy({ dev: true }))["script-src"]).toContain("'unsafe-inline'");
+    });
+
 // The Content Security Policy, and the drift guard that keeps the injected meta
 // tag and the Tauri shell's header saying the same thing. When both are present
 // the browser enforces their intersection, so a meta tag stricter than the
@@ -58,9 +75,16 @@ describe("cspPolicy", () => {
   it("never ships the dev server's localhost exception", () => {
     expect(cspPolicy()).not.toMatch(/localhost:5173/);
     expect(cspPolicy({ dev: true })).toMatch(/ws:\/\/localhost:5173/);
-    // And the widening is confined to connect-src.
+    // Dev widens exactly two directives and no others: connect-src for the HMR
+    // socket, script-src for Vite's inline preamble. Everything else must match
+    // what ships, or dev stops resembling production in ways that hide problems
+    // until release.
     const dev = directives(cspPolicy({ dev: true }));
-    expect(dev["script-src"]).toEqual(["'self'"]);
+    const prod = directives(cspPolicy());
+    for (const name of Object.keys(prod)) {
+      if (name === "connect-src" || name === "script-src") continue;
+      expect(dev[name]).toEqual(prod[name]);
+    }
     expect(dev["default-src"]).toEqual(["'self'"]);
   });
 

@@ -59,18 +59,46 @@ const HEADER_ONLY = [["frame-ancestors", ["'none'"]]];
 /// websocket back to the dev server and fetches modules over http. These are
 /// added *only* when building for development, so the shipped policy never
 /// carries a localhost exception.
-const DEV_CONNECT = ["ws://localhost:5173", "http://localhost:5173"];
+/// Both spellings of loopback: `vite.config.js` and `tauri.conf.json` pin
+/// `127.0.0.1`, but a browser opened by hand will use `localhost`, and a policy
+/// naming only one of them blocks HMR in whichever case it missed.
+const DEV_CONNECT = [
+  "ws://127.0.0.1:5173",
+  "http://127.0.0.1:5173",
+  "ws://localhost:5173",
+  "http://localhost:5173",
+];
+
+/// Dev-only `script-src` additions.
+///
+/// `@vitejs/plugin-react` injects its React Refresh preamble as an **inline**
+/// `<script type="module">`, and Vite serves its HMR client the same way. A bare
+/// `script-src 'self'` blocks both: the preamble never runs, the entry module
+/// throws, and the window comes up **blank** — with nothing on screen to explain
+/// it, because the thing that would have rendered an error is what failed to
+/// load. That is precisely what happened when the meta tag was first added, and
+/// it only showed up in `tauri dev`, since Tauri's CSP *header* cannot apply to
+/// a page the Vite server delivers.
+///
+/// This is not a relaxation of the shipped policy. Production keeps
+/// `script-src 'self'` with no inline allowance — the directive that makes an
+/// injected `<script>` inert — and `the shipped policy allows no inline script`
+/// asserts it.
+const DEV_SCRIPT = ["'unsafe-inline'"];
 
 /// The policy string.
 ///
-/// `dev: true` widens `connect-src` for Vite's HMR socket. `forHeader: true`
+/// `dev: true` widens `connect-src` for Vite's HMR socket and `script-src` for
+/// its inline preamble. `forHeader: true`
 /// adds the directives only a real header can carry — that is the form
 /// `tauri.conf.json` must hold.
 export function cspPolicy({ dev = false, forHeader = false } = {}) {
   const directives = forHeader ? [...BASE, ...HEADER_ONLY] : BASE;
   return directives
     .map(([name, values]) => {
-      const all = dev && name === "connect-src" ? [...values, ...DEV_CONNECT] : values;
+      let all = values;
+      if (dev && name === "connect-src") all = [...all, ...DEV_CONNECT];
+      if (dev && name === "script-src") all = [...all, ...DEV_SCRIPT];
       return `${name} ${all.join(" ")}`;
     })
     .join("; ");
