@@ -11,12 +11,13 @@ pub(crate) async fn start_host(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let (pk, name, fingerprint) = {
+    // No fingerprint here on purpose: mDNS advertises reachability only, never
+    // identity. See `Discovery::register`.
+    let (pk, name) = {
         let id = crate::lock_identity(&state.identity);
         (
             id.private_key().map_err(|e| e.to_string())?,
             id.name.clone(),
-            id.fingerprint.clone(),
         )
     };
     let enable_mdns = {
@@ -36,7 +37,7 @@ pub(crate) async fn start_host(
             *slot = messenger_core::network::Discovery::new().ok();
         }
         if let Some(d) = slot.as_mut() {
-            if let Err(e) = d.register(&name, port, &fingerprint) {
+            if let Err(e) = d.register(&name, port) {
                 tracing::warn!("mDNS registration failed: {e}");
             }
         }
