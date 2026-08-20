@@ -2,9 +2,11 @@
 
 **Status: design sketch and requirements. Nothing here is implemented.**
 
-§1–§6 sketch a design. §7 is the acceptance criteria — what this feature must
-have to be considered finished rather than merely working. §8 lists what is
-still undecided, and marks the two questions that cannot be deferred.
+**Start with "How it would work"** below — it is the whole feature in plain
+terms, with no vocabulary you need to look up. §1–§6 are the same thing for a
+reader who already has the vocabulary. §7 is the acceptance criteria: what this
+must have to count as finished rather than merely working. §8 is what is still
+undecided.
 
 This document exists because the two message tiers each lack what the other has,
 and no path currently connects them.
@@ -30,6 +32,103 @@ Two pieces of evidence, so this is not an impression:
 channels** (per-channel group keys). That is a real and separate problem. It
 does not address DMs, which is where most private conversation actually happens
 and where the async gap is total.
+
+---
+
+## How it would work, in plain terms
+
+The rest of this document assumes you know the vocabulary. This section does
+not. Two people, one mailbox.
+
+Think of the mailbox server as a post office that holds **padlocks and boxes**,
+never keys. Anyone can snap a padlock shut. Only its owner can open it.
+
+### Setting up, once
+
+When you turn the feature on, your app uploads three things:
+
+- **your public ID** — the thing your fingerprint is made from
+- **a stack of about a hundred one-time padlocks** — anyone may close one, only
+  you can open it, and each is used exactly once
+- **one spare padlock**, replaced weekly, for when the stack runs out
+
+All of them carry your signature, so nobody can swap in fakes. The server is
+holding padlocks, not keys, and can open nothing.
+
+### Alice and Bob meet — exactly as they do today
+
+They connect directly and compare the six digits and three emoji. Each app saves
+the other's fingerprint. **This step does not change**, and it is what makes
+everything after it safe.
+
+### Bob's laptop is closed. Alice sends a message
+
+1. Alice's app asks the mailbox for Bob's padlocks.
+2. The server hands over Bob's public ID, one one-time padlock, and the spare.
+   That one-time padlock is now used up and deleted.
+3. **Alice's app checks Bob's public ID against the fingerprint it saved when
+   they met.** A mismatch is refused outright — no prompt, no fallback.
+4. It combines her key with Bob's padlocks to work out a secret only she and Bob
+   can compute, and locks the message with it.
+5. She deposits the locked box addressed to Bob. **The outside does not say
+   "from Alice"** — that is inside, under the lock.
+
+Step 3 is the entire security of this arrangement. The server can lie about
+whose padlocks it just handed over, but Alice already knows what Bob looks like,
+so the lie is caught immediately and without asking the user anything.
+
+### Bob opens his laptop
+
+6. His app asks whether anything is waiting, and collects the box.
+7. His private key, plus the matching half of that one-time padlock, works out
+   the same secret. The box opens.
+8. Only now can he see it came from Alice.
+9. His app deletes it from the server.
+10. Every message after this changes the lock, so stealing one key does not open
+    the others.
+
+### If both are online
+
+Nothing changes. They connect directly, exactly as today. The mailbox is only
+ever a fallback.
+
+### What the server can and cannot see
+
+| Can see | Cannot see |
+|---|---|
+| Bob has a mailbox | What any message says |
+| Something was left for Bob at 14:32 | Who left it |
+| Roughly how big, padded into size buckets | Whether Alice and Bob talk at all |
+| When Bob collected | Anything at all, even if the disk is seized |
+
+The honest gap is **timing**. Deposits and collections falling into a rhythm say
+something about who talks to whom even when every box stays shut. §4.3 tries to
+blunt that and cannot eliminate it.
+
+### What goes wrong
+
+- **Server down when Alice sends** — she cannot send, and must be told so rather
+  than left believing it went.
+- **Server down when Bob checks** — he simply does not have it yet.
+- **Server loses its disk** — the message is gone. Alice was told "left at the
+  mailbox", never "Bob read it", and the difference has to be visible in the UI.
+- **Padlocks run out** — Alice sends two hundred messages while Bob is away, or
+  someone drains the stack deliberately. It falls back to the spare, which is
+  slightly weaker, and **both people are told**. A silent downgrade is the
+  failure to avoid here.
+- **A stranger tries to mail you** — refused by default. You have to have met
+  live once (R1.7).
+
+### The part that is still undecided
+
+Step 9 — *delete after collection* — quietly assumes Bob has **one** device.
+Give him two and whichever checks first takes the message; the other never sees
+it.
+
+Fixing that means Alice locks a separate copy for each of Bob's devices and the
+mailbox holds one per device. That is a different design, and it has to be
+chosen before any of this is built rather than bolted on afterwards. It is the
+one genuinely open question left (R6.1, §4.6).
 
 ---
 
@@ -257,7 +356,7 @@ mailbox should accept that. The plausible shape is a sealed *reference*
 under the existing chunked path, but this is unresolved and should not be
 hand-waved.
 
-## 4.9 What this costs, and whether to build it at all
+### 4.9 What this costs, and whether to build it at all
 
 A design document that lists only what a feature gains is selling, not
 designing. This feature takes real things away from the app, and they should be
