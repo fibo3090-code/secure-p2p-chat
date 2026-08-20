@@ -21,6 +21,9 @@ messenger-server = { path = "server" }
 
 # Runtime async
 tokio = { version = "1", features = ["full"] }
+# TCP keepalive, which tokio does not expose. Already in the tree via tokio, so
+# this adds no new compilation — only a direct, declared use of it.
+socket2 = "0.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
