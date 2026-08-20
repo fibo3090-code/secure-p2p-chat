@@ -61,6 +61,34 @@ jobs:
             echo "> First launch creates an identity and asks for a password that encrypts it."
             echo "> There is no account and no password reset — export a backup when prompted."
             echo
+            echo "<details><summary>Verify your download</summary>"
+            echo
+            echo "These installers are **not** signed with an OS code-signing certificate, so"
+            echo "Windows SmartScreen and macOS Gatekeeper will warn about them. That warning"
+            echo "is about a missing certificate, not about the contents — so here is how to"
+            echo "check the contents directly."
+            echo
+            echo "**Provenance** — proves the file was built by this repository's release"
+            echo "workflow, from this commit, and not by anyone else. Needs the \`gh\` CLI:"
+            echo
+            echo "\`\`\`"
+            echo "gh attestation verify <downloaded-file> --repo ${GITHUB_REPOSITORY}"
+            echo "\`\`\`"
+            echo
+            echo "**Checksums** — proves the bytes you got are the bytes that were published."
+            echo "Download \`SHA256SUMS\` from the assets below, then:"
+            echo
+            echo "\`\`\`"
+            echo "sha256sum --ignore-missing -c SHA256SUMS      # Linux"
+            echo "shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS"
+            echo "\`\`\`"
+            echo
+            echo "Provenance is the stronger of the two: a checksum only proves the file"
+            echo "matches this page, while an attestation proves this page's file came from"
+            echo "the source you can read."
+            echo
+            echo "</details>"
+            echo
             echo "---"
           } > release-notes.md
 
@@ -217,3 +245,68 @@ jobs:
         run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
         shell: bash
 
+
+  # ── Provenance and checksums ──────────────────────────────────────────────
+  #
+  # These installers carry no OS code-signing certificate — a Windows
+  # Authenticode cert and an Apple Developer membership are recurring costs this
+  # project does not carry. That is a deliberate choice, and it is worth being
+  # precise about what it does and does not cost the user: SmartScreen and
+  # Gatekeeper will warn, but the warning is about a *missing certificate*, not
+  # about the contents. What a certificate would actually prove — that the file
+  # came from this project and has not been altered — is proved here instead,
+  # for free, and arguably better.
+  #
+  #   SHA256SUMS   proves the bytes you downloaded match the bytes published.
+  #                Cheap, familiar, and no help at all if the release page
+  #                itself is what an attacker controls.
+  #   Provenance   binds each artifact's digest to this repository, this commit
+  #                and this workflow run, signed through Sigstore with an
+  #                ephemeral key and recorded in a public transparency log.
+  #                Free for public repositories. `gh attestation verify` checks
+  #                it, and it is the claim that actually matters: not "these are
+  #                the bytes on the page" but "these are the bytes this source
+  #                built".
+  #
+  # Run as one job after everything has been published, rather than per build
+  # job: it covers every asset regardless of which of the seven matrix legs
+  # produced it, and it does not need the four desktop runners to agree on how
+  # to parse tauri-action's artifact paths.
+  attest:
+    name: Provenance and checksums
+    needs: [desktop, tools]
+    runs-on: ubuntu-latest
+    # Job-level permissions REPLACE the workflow-level block rather than adding
+    # to it, so `contents` has to be restated here.
+    permissions:
+      contents: write # upload SHA256SUMS to the release
+      id-token: write # mint the short-lived Sigstore signing certificate
+      attestations: write # record the attestation against this repository
+    steps:
+      - name: Download every published asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --dir assets
+          # A SHA256SUMS from an earlier run of the same tag must not be hashed
+          # into the new one, and must not be attested as a build artifact.
+          rm -f assets/SHA256SUMS
+          ls -l assets
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'assets/*'
+
+      - name: Publish SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Hashes are recorded with bare filenames, so `-c` works from whatever
+          # directory the user downloaded into.
+          (cd assets && sha256sum -- *) > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber

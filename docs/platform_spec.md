@@ -704,6 +704,11 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   per-channel passwords.
 - **Phase 4 — E2EE server tier.** Per-channel group keys, ciphertext-only storage,
   key rotation on membership change, encrypted offline blobs; admin-read disabled.
+  Note that this phase covers **community channels only**. P2P DMs have no
+  asynchronous delivery at all — both peers must be online simultaneously — which
+  is a separate and arguably larger gap. See
+  [async_delivery.md](async_delivery.md) for a design sketch; the prekey
+  distribution it needs is also what makes group-key distribution here tractable.
 - **Phase 5 — Per-server identities.** Distinct per-server profile/keys bound to
   the global identity.
 - **Independent — P2P connection passwords + conversation lock. ✅** Shipped; see

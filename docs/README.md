@@ -30,6 +30,8 @@ This is the canonical index for project documentation.
 - `architecture.md`: code layout and runtime responsibility boundaries (today)
 - `protocol.md`: shipped wire behavior and compatibility notes
 - `platform_spec.md`: the single canonical forward-looking plan — vision, architecture, trust tiers, the Party server, the Tauri/React desktop UI, the phased roadmap, and the backlog
+- `async_delivery.md`: design sketch — asynchronous delivery without giving up
+  end-to-end encryption. **Not implemented**; a proposal, not a description
 - `SECURITY.md`: current security posture and disclosure guidance
 - `THREAT_MODEL.md`: assumptions, assets, attack surfaces, and limits
 - `CONTRIBUTING.md`: contribution process, local checks, PR checklist
