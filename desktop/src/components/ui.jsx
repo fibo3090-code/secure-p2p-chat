@@ -1,6 +1,6 @@
 // Shared presentational primitives — clean ES-module port of the mockup's
 // ui.jsx, reusing the same class names so the design-system CSS applies.
-import { useState, useId, useRef, useEffect } from "react";
+import { memo, useMemo, useState, useId, useRef, useEffect } from "react";
 import { Icon } from "../lib/Icon.jsx";
 
 export const cx = (...a) => a.filter(Boolean).join(" ");
@@ -23,10 +23,15 @@ export function IconButton({ name, label, active, size = 18, ...rest }) {
   );
 }
 
-export function Avatar({ name, size = 38, state, party }) {
-  const initials = (name || "?").split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
-  const hue = [...(name || "")].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
-  const bg = `oklch(0.62 0.13 ${hue})`;
+function AvatarInner({ name, size = 38, state, party }) {
+  // Both derive only from `name`, and an avatar is rendered once per
+  // conversation row on every poll tick — so the string walk was running for
+  // every row, several times a second, to produce the same number each time.
+  const { initials, bg } = useMemo(() => {
+    const letters = (name || "?").split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+    const hue = [...(name || "")].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+    return { initials: letters, bg: `oklch(0.62 0.13 ${hue})` };
+  }, [name]);
   return (
     <span className="avatar-wrap" style={{ width: size, height: size }}>
       <span className="avatar" style={{
@@ -40,6 +45,11 @@ export function Avatar({ name, size = 38, state, party }) {
     </span>
   );
 }
+
+/// Memoised: props are scalars, so the default shallow compare is exactly right
+/// here — unlike the message and conversation rows, whose props are rebuilt
+/// objects and need comparison by value.
+export const Avatar = memo(AvatarInner);
 
 const TRUST = {
   verified: { icon: "shieldCheck", label: "Verified", cls: "trust-ok" },
@@ -85,11 +95,18 @@ export function Input({ mono, ...rest }) {
   return <input className={cx("input", mono && "is-mono")} {...rest} />;
 }
 
-export function PasswordInput(props) {
+/// `autoComplete` is required, not optional, and there is no sensible default:
+/// a password manager offered "current-password" on a *new* password field will
+/// happily fill the old one, and offered "new-password" on an unlock field it
+/// suggests a fresh password to someone trying to get back in. Callers say which
+/// this is; the prop is passed through explicitly so it cannot be forgotten
+/// silently.
+export function PasswordInput({ autoComplete = "off", ...props }) {
   const [show, setShow] = useState(false);
   return (
     <span className="pw-wrap">
-      <input className="input" type={show ? "text" : "password"} {...props} />
+      <input className="input" type={show ? "text" : "password"}
+        autoComplete={autoComplete} {...props} />
       <button type="button" className="pw-toggle" onClick={() => setShow((s) => !s)} aria-label="Toggle visibility">
         <Icon name={show ? "eyeOff" : "eye"} size={16} />
       </button>

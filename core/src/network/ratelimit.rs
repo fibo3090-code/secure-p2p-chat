@@ -53,6 +53,30 @@ struct Entry {
     last_seen: Instant,
 }
 
+/// The key a source address is counted under.
+///
+/// IPv4 is counted per address. **IPv6 is counted per /64**, which is the
+/// smallest block anyone is routinely delegated — a single residential or cloud
+/// allocation hands its holder 2^64 addresses, so counting per-address means the
+/// limit can be stepped around by incrementing a number. Every honest client
+/// shares a /64 with the rest of its own LAN, which is the same blast radius
+/// IPv4 NAT already gives us, so this costs legitimate users nothing new.
+///
+/// It deliberately does not go wider than /64: /48 would put unrelated customers
+/// of one ISP into a single bucket, which turns a rate limit into collateral
+/// damage.
+fn limiter_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            // Keep the routing prefix, zero the interface identifier.
+            octets[8..].fill(0);
+            IpAddr::from(octets)
+        }
+    }
+}
+
 /// Sliding-window counter of recent connections per source address.
 #[derive(Debug)]
 pub struct RateLimiter {
@@ -96,6 +120,8 @@ impl RateLimiter {
     ///
     /// `now` is passed in so the behaviour is testable without sleeping.
     pub fn check_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+        // Count IPv6 by /64 rather than by address; see `limiter_key`.
+        let ip = limiter_key(ip);
         // Drop addresses whose whole history has aged out, so a long-running
         // server does not accumulate an entry per address it has ever seen.
         let window = self.window;
@@ -290,6 +316,63 @@ mod tests {
         assert!(
             rl.check_at(ip(1), now + Duration::from_millis(41)),
             "the address with the most recent connections must still be limited"
+        );
+    }
+
+    /// A /64 is the smallest block anyone is routinely delegated, so counting
+    /// IPv6 per address means the limit is bypassed by incrementing a number.
+    #[test]
+    fn ipv6_is_limited_by_prefix_not_by_address() {
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+
+        // Every connection from a different address inside one /64.
+        for i in 0..MAX_CONNECTIONS {
+            assert!(
+                !rl.check_at(ip6(i as u16), now),
+                "connection {i} is within the cap"
+            );
+        }
+        assert!(
+            rl.check_at(ip6(9999), now),
+            "a fresh address in the same /64 must not reset the limit"
+        );
+        assert_eq!(
+            rl.tracked_addresses(),
+            1,
+            "the whole /64 is one entry, not one per address"
+        );
+    }
+
+    /// …but a genuinely different network is still its own bucket. Widening
+    /// beyond /64 would make one ISP customer's flood everyone else's problem.
+    #[test]
+    fn separate_ipv6_prefixes_are_independent() {
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+        let other = IpAddr::from([0x2001, 0xdb8, 0, 1, 0, 0, 0, 1]);
+
+        for _ in 0..MAX_CONNECTIONS {
+            rl.check_at(ip6(1), now);
+        }
+        assert!(rl.check_at(ip6(2), now), "the flooding /64 is limited");
+        assert!(
+            !rl.check_at(other, now),
+            "a different /64 must not inherit someone else's limit"
+        );
+    }
+
+    #[test]
+    fn ipv4_is_still_counted_per_address() {
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MAX_CONNECTIONS {
+            rl.check_at(ip(1), now);
+        }
+        assert!(rl.check_at(ip(1), now));
+        assert!(
+            !rl.check_at(ip(2), now),
+            "IPv4 neighbours must stay independent"
         );
     }
 

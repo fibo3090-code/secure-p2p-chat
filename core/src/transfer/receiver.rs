@@ -8,6 +8,100 @@ use uuid::Uuid;
 use crate::util::sanitize_filename;
 use crate::MAX_FILE_SIZE;
 
+/// Atomically reserve an unused path in `dest_dir` for `filename`, appending
+/// `_1`, `_2`, … until one is free.
+///
+/// Returns a path that now exists as an empty placeholder owned by this process,
+/// Blocking twin of [`reserve_unique_path`], for the synchronous receiver.
+///
+/// Same reasoning: `exists()` then `rename` leaves a window in which anything
+/// able to write to the download directory can create the file and have it
+/// silently replaced. `create_new` closes it by making the check and the create
+/// one kernel operation.
+fn reserve_unique_path_sync(dest_dir: &Path, filename: &str) -> Result<PathBuf> {
+    const MAX_ATTEMPTS: u32 = 10_000;
+
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    for counter in 0..MAX_ATTEMPTS {
+        let candidate = if counter == 0 {
+            dest_dir.join(filename)
+        } else if ext.is_empty() {
+            dest_dir.join(format!("{stem}_{counter}"))
+        } else {
+            dest_dir.join(format!("{stem}_{counter}.{ext}"))
+        };
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not find a free filename for {filename} after {MAX_ATTEMPTS} attempts"
+    ))
+}
+
+/// so a subsequent rename onto it cannot clobber somebody else's file.
+async fn reserve_unique_path(dest_dir: &Path, filename: &str) -> Result<PathBuf> {
+    // A bound, so a directory already holding every candidate cannot spin here
+    // forever. In practice it stops at 1 or 2.
+    const MAX_ATTEMPTS: u32 = 10_000;
+
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    for counter in 0..MAX_ATTEMPTS {
+        let candidate = if counter == 0 {
+            dest_dir.join(filename)
+        } else if ext.is_empty() {
+            dest_dir.join(format!("{stem}_{counter}"))
+        } else {
+            dest_dir.join(format!("{stem}_{counter}.{ext}"))
+        };
+
+        // `create_new(true)` is O_EXCL: the existence check and the creation are
+        // one atomic operation, so two racing callers cannot both win.
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not find a free filename for {filename} after {MAX_ATTEMPTS} attempts"
+    ))
+}
+
 /// Incoming file being received
 pub struct IncomingFile {
     tmp_path: PathBuf,
@@ -94,31 +188,24 @@ impl IncomingFile {
         // Create destination directory
         tokio::fs::create_dir_all(dest_dir).await?;
 
-        // Handle filename conflicts
-        let mut final_path = dest_dir.join(&self.filename);
-        let mut counter = 1;
+        // Claim a free filename, atomically.
+        //
+        // This used to be `while final_path.exists()` followed by a rename, which
+        // leaves a window between the check and the rename. Anything that can
+        // write to the download directory — another local account, a shared
+        // downloads folder, a second transfer of the same name landing at the
+        // same moment — can create the file in that window, and the rename then
+        // silently replaces it. Overwriting a file the user already had because
+        // a peer sent one with a matching name is a bad enough outcome on its
+        // own; it is worse when the timing can be forced.
+        //
+        // `create_new` is the atomic form of "only if it does not exist": the
+        // kernel does the check and the create as one operation, so the name is
+        // reserved before anyone else can take it. Renaming onto the placeholder
+        // afterwards is safe, because by then the file is ours.
+        let final_path = reserve_unique_path(dest_dir, &self.filename).await?;
 
-        while final_path.exists() {
-            let stem = Path::new(&self.filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file");
-            let ext = Path::new(&self.filename)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-
-            let new_filename = if ext.is_empty() {
-                format!("{}_{}", stem, counter)
-            } else {
-                format!("{}_{}.{}", stem, counter, ext)
-            };
-
-            final_path = dest_dir.join(new_filename);
-            counter += 1;
-        }
-
-        // Atomic rename to final destination
+        // Atomic rename onto the name we just reserved.
         tokio::fs::rename(&self.tmp_path, &final_path).await?;
 
         tracing::info!("File saved to: {:?}", final_path);
@@ -236,38 +323,25 @@ impl IncomingFileSync {
             );
         }
 
-        // Handle filename conflicts for the final destination
-        let mut final_path = self.final_dest.clone();
-        let mut counter = 1;
-
         // Ensure parent directory of final path exists
-        if let Some(parent) = final_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let dest_dir = self
+            .final_dest
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&dest_dir)?;
 
-        while final_path.exists() {
-            let stem = self
-                .final_dest
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file");
-            let ext = self
-                .final_dest
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+        // Claim the name atomically — see `reserve_unique_path_sync`. This is the
+        // path the desktop and terminal clients actually take, so it matters more
+        // than the async twin above, not less.
+        let filename = self
+            .final_dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let final_path = reserve_unique_path_sync(&dest_dir, filename)?;
 
-            let new_filename = if ext.is_empty() {
-                format!("{}_{}", stem, counter)
-            } else {
-                format!("{}_{}.{}", stem, counter, ext)
-            };
-
-            final_path = self.final_dest.with_file_name(new_filename);
-            counter += 1;
-        }
-
-        // Rename temp file to final path
+        // Rename onto the name we just reserved.
         std::fs::rename(&self.tmp_path, &final_path)?;
         tracing::info!("File saved to: {:?}", final_path);
 

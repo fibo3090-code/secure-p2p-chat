@@ -420,6 +420,32 @@ fn build_request(token: &str, as_host: bool, try_punch: bool, local_port: u16) -
     }
 }
 
+/// Turn on TCP keepalive for a bridged socket.
+///
+/// A relayed session is a live conversation: it can legitimately sit idle for
+/// hours, so an inactivity timeout would disconnect people mid-chat. The problem
+/// is narrower than idleness — it is the *half-open* peer, the one whose machine
+/// slept, lost its network, or was killed without a FIN. `copy_bidirectional`
+/// has no way to notice: it is waiting on a socket that will never speak and
+/// never close, and it holds the task, both sockets and the pairing forever.
+///
+/// Keepalive is the mechanism built for exactly this. The kernel probes a quiet
+/// connection and tears it down when the peer stops answering, which surfaces as
+/// a normal end-of-stream and lets the task exit. It costs a few bytes an hour
+/// on genuinely idle connections and nothing on busy ones.
+///
+/// Failure to set it is logged and ignored: a relay that refuses to bridge
+/// because a socket option did not take is worse than one that bridges without
+/// the probe.
+fn enable_keepalive(stream: &TcpStream, side: &str) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(20));
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!(error = %e, side, "could not enable TCP keepalive on a bridged socket");
+    }
+}
+
 async fn handle_relay_connection(
     mut stream: TcpStream,
     pending: PendingMap,
@@ -546,6 +572,10 @@ async fn host_flow(
 
     send_relay_message(&mut stream, &RelayResponse::Paired).await?;
     send_relay_message(&mut peer_stream, &RelayResponse::Paired).await?;
+    // Before handing both sockets to the copy loop: a peer that vanishes without
+    // closing would otherwise pin this task and both sockets indefinitely.
+    enable_keepalive(&stream, "host");
+    enable_keepalive(&peer_stream, "joiner");
     copy_bidirectional(&mut stream, &mut peer_stream).await?;
     Ok(())
 }

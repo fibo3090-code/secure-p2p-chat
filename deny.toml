@@ -9,7 +9,9 @@ version = 2
 # Every entry names the crate and the path that reaches it. A stale entry is
 # worse than no entry — it silently suppresses a future finding on a crate we
 # have since started using differently — so entries are removed as soon as the
-# dependency goes away. Retiring the egui GUI dropped `epaint`/`ttf-parser` and
+# dependency goes away. This is now *enforced*, not just asked for:
+# `scripts/check-stale-advisories.sh` runs in CI and fails on any entry that no
+# longer matches a firing advisory. Retiring the egui GUI dropped `epaint`/`ttf-parser` and
 # the `image` AVIF chain, and those entries went with it.
 # Verify a claim before adding one: `cargo tree --workspace --target all -i <crate>`.
 ignore = [

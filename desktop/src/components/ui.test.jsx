@@ -88,6 +88,24 @@ describe("Input / PasswordInput", () => {
     expect(field.type).toBe("text");
   });
 
+  it("tells the password manager which field this is", async () => {
+    // Wrong values are actively harmful: "current-password" on a new-password
+    // field invites the manager to fill the old one, and "new-password" on an
+    // unlock field offers to invent one for someone trying to get back in.
+    const { rerender } = render(<PasswordInput value="" onChange={() => {}} autoComplete="new-password" />);
+    expect(document.querySelector("input").getAttribute("autocomplete")).toBe("new-password");
+
+    rerender(<PasswordInput value="" onChange={() => {}} autoComplete="current-password" />);
+    expect(document.querySelector("input").getAttribute("autocomplete")).toBe("current-password");
+  });
+
+  it("defaults to off rather than guessing", () => {
+    // A connection or community password is not the identity password, and a
+    // manager should not offer one for the other.
+    render(<PasswordInput value="" onChange={() => {}} />);
+    expect(document.querySelector("input").getAttribute("autocomplete")).toBe("off");
+  });
+
   it("forwards arbitrary props to the underlying input", () => {
     render(<Input placeholder="Relay address" aria-label="Relay address" />);
     expect(screen.getByLabelText("Relay address")).toBeTruthy();

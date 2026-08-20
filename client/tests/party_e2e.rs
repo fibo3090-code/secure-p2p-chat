@@ -584,3 +584,48 @@ async fn a_member_cannot_grant_themselves_a_role() {
         "the server must refuse a self-promotion"
     );
 }
+
+/// The community server's accept loop must survive failed connections too.
+///
+/// Same reasoning as the relay's: `accept()` errors are logged and skipped
+/// rather than propagated, so one transient failure cannot end the listener for
+/// the life of the process. Injected here as connections that hang up without
+/// completing a handshake, which is what a port scanner, a health check or a
+/// peer on a flaky link produces all day long.
+#[tokio::test]
+async fn the_server_keeps_serving_after_failed_connections() {
+    let server = start_server(None).await;
+
+    // Deliberately under `ratelimit::MAX_CONNECTIONS` (10 per 30s per address),
+    // leaving room for the join's own two connections. Going over does not test
+    // accept-loop resilience — it tests the rate limiter, which has its own
+    // tests, and it would refuse the very join this is trying to prove still
+    // works. Three of each is enough to run the `continue` repeatedly.
+    for _ in 0..3 {
+        if let Ok(stream) = tokio::net::TcpStream::connect(&server.address).await {
+            drop(stream);
+        }
+    }
+    for _ in 0..3 {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(&server.address).await {
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(b"garbage, not a v3 handshake").await;
+            drop(stream);
+        }
+    }
+
+    // A real member can still join and use it.
+    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
+    let (mut mgr, sid) = join(&server, "alice", None, &key).await;
+    pump_until(&mut mgr, "channels arrive", |m| {
+        channel_named(m, sid, "general").is_some()
+    })
+    .await;
+    let general = channel_named(&mgr, sid, "general").expect("general");
+    mgr.post(sid, general, "still here".to_string())
+        .expect("post");
+    pump_until(&mut mgr, "post lands", |m| {
+        texts_in(m, sid, general).contains(&"still here".to_string())
+    })
+    .await;
+}

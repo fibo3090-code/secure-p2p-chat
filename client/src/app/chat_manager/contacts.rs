@@ -82,6 +82,34 @@ impl ChatManager {
         let id = Uuid::new_v4();
         contact.id = id;
         contact.created_at = chrono::Utc::now();
+        // An invite link is not verification, and this is the layer that owns
+        // that rule. `parse_invite_link` already sets `Unverified` on both the v1
+        // and v2 paths, so nothing reaching here today is wrong — but the
+        // invariant was being *relied on* here while being *enforced* somewhere
+        // else, which is the arrangement that eventually breaks. A future invite
+        // version, or any other caller building a `Contact`, would have been
+        // taken at its word, and a pre-trusted fingerprint connects with no
+        // safety-code prompt at all.
+        //
+        // Same reasoning as `MIN_PASSWORD_LEN` living in `Identity::encrypt`
+        // rather than in the UIs: a caller that forgets must still be unable to
+        // do the unsafe thing.
+        //
+        // Only on the new-contact path. The refresh above deliberately leaves
+        // everything trust-related alone, so re-pasting someone's link cannot
+        // un-verify them.
+        //
+        // `Blocked` is preserved, and that distinction matters: this clamp exists
+        // to stop an *unearned elevation* of trust, and a block is the opposite
+        // of trust. Flattening it to `Unverified` would silently lift a block —
+        // a worse bug than the one being fixed, and precisely what
+        // `remove_contact` documents as the thing only deletion may do.
+        contact.trust_state = match contact.trust_state {
+            TrustState::Blocked => TrustState::Blocked,
+            TrustState::Unverified | TrustState::Verified | TrustState::Trusted => {
+                TrustState::Unverified
+            }
+        };
         self.contacts.insert(id, contact);
         Ok(id)
     }
