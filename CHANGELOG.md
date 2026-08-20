@@ -11,6 +11,12 @@ predate tagged releases.
 
 ## [Unreleased]
 
+## [1.16.2] - 2026-08-20
+
+> **Security release.** Fixes a flaw that let someone sending you a file hide
+> that it was a program. If you are on Windows, update. Earlier versions are
+> affected; there is no configuration change that avoids it.
+
 ### Fixed
 
 - **Times could show as "Invalid Date" beside a message**, and a message with no
@@ -26,6 +32,16 @@ predate tagged releases.
 
 ### Security
 
+- **Someone sending you a file could hide that it was a program.** The app warns
+  before opening a file a peer sent that your system would *run* rather than
+  show — that warning is the only thing standing between a received attachment
+  and code executing as you. A filename could be crafted so the check saw no
+  extension while Windows created the file as an executable anyway, and the
+  warning never appeared. The sender chooses the filename, so this needed no
+  cooperation from you beyond opening what looked like an ordinary file. Fixed by
+  deciding the final name before the check runs, so the name that is inspected is
+  the name that reaches the disk. Windows was affected; macOS and Linux were not,
+  as neither drops a trailing dot from a filename.
 - **Your identity fingerprint is no longer broadcast on the local network.** With
   LAN discovery on, it was included in the advertisement and read by nothing —
   which told every device nearby which identity was at which address. Discovery
@@ -1176,7 +1192,8 @@ predate tagged releases.
 - Basic chat functionality, end-to-end encryption (RSA + AES-GCM), file
   transfer, a simple GUI, and message history persistence.
 
-[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.1...HEAD
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.2...HEAD
+[1.16.2]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.1...v1.16.2
 [1.16.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.0...v1.16.1
 [1.16.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.14.0...v1.15.0
