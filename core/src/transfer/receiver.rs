@@ -242,17 +242,46 @@ impl IncomingFile {
 }
 
 /// Synchronous incoming file for use in non-async contexts
+///
+/// # The filename contract
+///
+/// A peer chooses the filename, so **this type sanitises it**, at the boundary,
+/// and does not rely on anyone upstream having done so. That is a change: it
+/// used to take a whole `dest_path` and keep it verbatim, and `finalize` handed
+/// `dest_path.file_name()` straight to [`reserve_unique_path_sync`]. Nothing on
+/// that path called [`sanitize_filename`] at all, so
+/// `IncomingFileSync::new(&download_dir.join("../../escaped.txt"), n)` wrote
+/// `escaped.txt` two directories above the download directory — both the temp
+/// spool and the final rename, because the traversal was in the *directory*
+/// component by then, not the file name.
+///
+/// It was not exploitable, because `ProtocolMessage::from_plain_bytes` sanitises
+/// `FileMeta.filename` at decode. But that made the entire traversal defence
+/// rest on one call in the decoder, with no test anywhere pinning the two
+/// together — which is exactly the shape of the last filename bug. So the
+/// directory and the name are now separate arguments: the directory is ours and
+/// is used as given, the name is the peer's and is sanitised here. The decoder
+/// still sanitises too; `sanitize_filename` is idempotent, so applying it twice
+/// costs nothing and neither call is load-bearing on its own.
 pub struct IncomingFileSync {
     tmp_path: PathBuf,
     file: std::fs::File,
     received: u64,
     expected: u64,
-    final_dest: PathBuf,
+    /// Directory the finished file lands in. Chosen by us (the configured
+    /// download directory), never derived from anything a peer sent.
+    dest_dir: PathBuf,
+    /// Peer-supplied name, already through [`sanitize_filename`].
+    safe_filename: String,
 }
 
 impl IncomingFileSync {
-    /// Create a new incoming file
-    pub fn new(dest_path: &Path, expected_size: u64) -> Result<Self> {
+    /// Start receiving into `dest_dir` under the peer-supplied `filename`.
+    ///
+    /// `filename` is treated as untrusted and sanitised here; `dest_dir` is
+    /// trusted and used as given. See the type-level note on why these are two
+    /// arguments rather than one joined path.
+    pub fn new(dest_dir: &Path, filename: &str, expected_size: u64) -> Result<Self> {
         if expected_size > crate::MAX_FILE_SIZE {
             anyhow::bail!(
                 "File size {} exceeds maximum allowed ({} bytes)",
@@ -260,18 +289,15 @@ impl IncomingFileSync {
                 crate::MAX_FILE_SIZE
             );
         }
-        let filename = dest_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
-
-        // Create temp directory if needed
-        let tmp_dir = dest_path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(tmp_dir)?;
 
         let safe_filename = sanitize_filename(filename);
+
+        // The spool lives *in* the download directory, because finalizing is a
+        // rename and a rename is only atomic within one filesystem.
+        std::fs::create_dir_all(dest_dir)?;
+
         let tmp_name = format!("tmp_{}_{}", Uuid::new_v4(), safe_filename);
-        let tmp_path = tmp_dir.join(tmp_name);
+        let tmp_path = dest_dir.join(tmp_name);
 
         let file = std::fs::File::create(&tmp_path)?;
 
@@ -280,7 +306,8 @@ impl IncomingFileSync {
             file,
             received: 0,
             expected: expected_size,
-            final_dest: dest_path.to_path_buf(),
+            dest_dir: dest_dir.to_path_buf(),
+            safe_filename,
         })
     }
 
@@ -323,23 +350,21 @@ impl IncomingFileSync {
             );
         }
 
-        // Ensure parent directory of final path exists
-        let dest_dir = self
-            .final_dest
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        std::fs::create_dir_all(&dest_dir)?;
+        // Ensure the destination directory exists.
+        std::fs::create_dir_all(&self.dest_dir)?;
+
+        // Sanitise again on the way out. `self.safe_filename` came through
+        // `sanitize_filename` in `new`, and the function is idempotent, so this
+        // is a no-op — which is the point: it costs one pass over a short string
+        // and it means no future edit to this struct can reintroduce a
+        // peer-controlled name on the rename path without the check still being
+        // in front of it.
+        let filename = sanitize_filename(&self.safe_filename);
 
         // Claim the name atomically — see `reserve_unique_path_sync`. This is the
         // path the desktop and terminal clients actually take, so it matters more
         // than the async twin above, not less.
-        let filename = self
-            .final_dest
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file");
-        let final_path = reserve_unique_path_sync(&dest_dir, filename)?;
+        let final_path = reserve_unique_path_sync(&self.dest_dir, &filename)?;
 
         // Rename onto the name we just reserved.
         std::fs::rename(&self.tmp_path, &final_path)?;
@@ -443,8 +468,7 @@ mod tests {
     #[test]
     fn test_sync_write_chunk_overflow() {
         let temp_dir = TempDir::new().unwrap();
-        let dest_path = temp_dir.path().join("test.txt");
-        let mut incoming = IncomingFileSync::new(&dest_path, 4).unwrap();
+        let mut incoming = IncomingFileSync::new(temp_dir.path(), "test.txt", 4).unwrap();
 
         let err = incoming
             .write_chunk(b"hello")
@@ -486,6 +510,84 @@ mod tests {
             std::fs::read(&final_path).unwrap(),
             b"abcd",
             "the excess bytes must never reach the disk"
+        );
+    }
+
+    /// The receiver is responsible for the peer's filename, not the decoder.
+    ///
+    /// This used to escape. `IncomingFileSync` kept the joined path verbatim and
+    /// `finalize` fed `file_name()` straight to `reserve_unique_path_sync`, so a
+    /// `FileMeta` naming `../../escaped.txt` put the file two directories above
+    /// the download directory. It was unreachable in practice only because
+    /// `ProtocolMessage::from_plain_bytes` sanitises at decode — one call, in a
+    /// different module, with nothing pinning the two together. This test is that
+    /// pin, at the boundary that actually writes to disk.
+    #[test]
+    fn a_traversing_filename_cannot_escape_the_download_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let download_dir = temp_dir.path().join("Downloads");
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        // Deliberately *not* pre-sanitised: the decoder is not in this test.
+        for hostile in [
+            "../../escaped.txt",
+            "..\\..\\escaped.txt",
+            "/etc/passwd",
+            "....//escaped.txt",
+        ] {
+            let mut incoming = IncomingFileSync::new(&download_dir, hostile, 4).unwrap();
+            incoming.write_chunk(b"boom").unwrap();
+            let final_path = incoming.finalize().expect("finalizes");
+
+            assert_eq!(
+                final_path.parent(),
+                Some(download_dir.as_path()),
+                "{hostile:?} landed outside the download directory at {final_path:?}"
+            );
+            assert!(
+                !final_path.to_string_lossy().contains(".."),
+                "{hostile:?} left a traversal component in {final_path:?}"
+            );
+        }
+
+        // Nothing was written above the download directory, including the spool.
+        assert!(!temp_dir.path().join("escaped.txt").exists());
+        assert!(!temp_dir.path().join("passwd").exists());
+    }
+
+    /// The spool must be inside the download directory too — both because a
+    /// rename is only atomic within one filesystem, and because a traversal in
+    /// the temp name is the same escape one step earlier.
+    #[test]
+    fn the_spool_stays_inside_the_download_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let download_dir = temp_dir.path().join("Downloads");
+
+        let incoming = IncomingFileSync::new(&download_dir, "../spooled.bin", 1).unwrap();
+        let spool = incoming.tmp_path.clone();
+        assert_eq!(spool.parent(), Some(download_dir.as_path()));
+        assert!(spool.exists());
+
+        incoming.abort_cleanup().unwrap();
+        assert!(!spool.exists(), "aborting must remove the spool");
+    }
+
+    /// A name the download directory already holds must not be clobbered.
+    #[test]
+    fn a_colliding_name_is_given_a_free_one() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("notes.txt"), b"mine").unwrap();
+
+        let mut incoming = IncomingFileSync::new(temp_dir.path(), "notes.txt", 5).unwrap();
+        incoming.write_chunk(b"theirs").ok();
+        incoming.write_chunk(b"peer!").unwrap();
+        let final_path = incoming.finalize().unwrap();
+
+        assert_ne!(final_path.file_name().unwrap(), "notes.txt");
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("notes.txt")).unwrap(),
+            b"mine",
+            "the file the user already had must survive"
         );
     }
 }

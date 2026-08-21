@@ -11,6 +11,134 @@ predate tagged releases.
 
 ## [Unreleased]
 
+Follow-up fixes to the pull requests merged on 20 August (#126–#137), from
+review. Nothing here changes what the app does for a user who is not being
+attacked; several of these change what happens to one who is.
+
+### Security
+
+- **A release's provenance signature could vouch for files no build produced.**
+  `SECURITY.md` tells you that `gh attestation verify` proves an installer was
+  built by this repository at a given commit. The release workflow signed
+  whatever assets happened to be attached to the tag — which, on a re-run, a
+  re-pushed tag, or with a file attached by hand, includes bytes no build job in
+  that run produced. The signature would have been genuine and its claim false.
+  Build jobs now hand their output to the workflow artifact store, and the
+  signing job signs exactly what came out of *that*.
+- **`SHA256SUMS` was the one unsigned file on the release page** — the file whose
+  entire job is to vouch for the others, so anyone who controlled the page could
+  swap the artifacts and the sums together. It is now attested like everything
+  else, and the verify instructions say to check it first.
+- **A part-built release could go public with no checksums and no provenance.**
+  Both build matrices are `fail-fast: false`, so one failed leg out of seven left
+  the other six attached to an already-public release with the signing job
+  skipped, and nothing on the page saying so. The release is now created as a
+  draft and published by the signing job, so it cannot half-ship.
+- **The verify command in `SECURITY.md` accepted a signature from any workflow in
+  the repository.** It now passes `--signer-workflow`, and says why that is not
+  optional: adding a workflow is a far easier thing to arrange than compromising
+  the release pipeline.
+- **A peer's filename could put a file outside your download folder.** The
+  receiving path kept the peer-supplied path verbatim and never sanitised it, so
+  a file named `../../escaped.txt` was written two directories above the download
+  directory — the temporary spool as well as the final file. Not reachable in
+  practice, because the message decoder sanitises filenames, which left the whole
+  defence resting on one call in one other file with no test connecting the two.
+  The receiver now takes the directory and the name separately and sanitises the
+  name itself, with tests at that boundary.
+- **One address could lock every other IPv4 client off a rate-limited server.**
+  The limiter counts IPv6 per /64 by zeroing the address's second half — which,
+  for an IPv4 client arriving on a dual-stack listener as `::ffff:a.b.c.d`, also
+  wipes the address *and* the marker that says it is IPv4. Every IPv4 client
+  collapsed into one bucket. Dormant while the relay was IPv4-only; the relay is
+  now dual-stack, so it would not have stayed dormant.
+- **Text frames of invalid UTF-8 decoded to three times their size.** The size
+  cap was checked against the bytes on the wire, then each invalid byte was
+  turned into a 3-byte replacement character, so the cap bounded the wire and not
+  the memory: 512 chunks of junk held about 72 MiB for one message against a
+  documented ceiling of roughly 24 MiB. Invalid text is now refused. No
+  legitimate sender can produce it.
+- **Community frames could be padded without changing their meaning.** bincode
+  stops at the end of a value and ignores whatever follows, so `frame` and
+  `frame || junk` decoded identically. Trailing bytes are now rejected; the wire
+  format is unchanged and there is a test pinning that.
+
+### Performance
+
+- **One member's file transfer no longer stalls everyone else's messages on a
+  community server.** Blob reads and writes ran inside the state mutex, so a
+  100 MiB transfer held the lock for its whole duration — and the chunked
+  download path re-read the *entire* blob to slice out each 64 KiB chunk, which
+  for a 100 MiB file is roughly sixteen hundred full reads, all under the lock.
+  The permission check still happens under the lock; the bytes now move outside
+  it, and a chunk request reads a chunk.
+
+### Fixed
+
+- **A nearby peer that changed address stayed unreachable.** A peer moving from
+  Wi-Fi to Ethernet, or renewing its DHCP lease, was treated as a duplicate of
+  its own stale entry, so the address that worked was never added. A peer
+  advertising several addresses was also only ever offered on the first. Only
+  applies with LAN discovery turned on.
+- **CI's package-install retry could not retry.** It sent `SIGTERM`, which `apt`
+  and `dpkg` deliberately ignore mid-transaction, so the timeout left the
+  transaction unfinished and the lock held — attempts two and three then failed
+  deterministically. Now a hard kill, with `dpkg --configure -a` before each
+  retry.
+- **Playwright's browser install was the one unbounded network step in CI**, and
+  carried a comment claiming nothing there touched the network. It downloads a
+  browser and shells out to `apt` as root. Bounded and retried like the others.
+
+### Documentation
+
+- `docs/async_delivery.md`: three `MUST`s in §7 could not all be satisfied — the
+  envelope must not name the sender, deposits must be rate-limited per sender,
+  and expiry must be reported to the sender. Resolved with a per-epoch deposit
+  pseudonym, with full sealed-sender delivery tokens recorded as the deferred
+  upgrade. Also: post-compromise security restated as "after one round trip"
+  (a message count is not testable when the peer never replies), the X3DH
+  initial-message replay on the prekey-exhaustion path addressed, one-time prekey
+  deletion and bundle-fetch rate limiting added, identity rotation and revocation
+  added as requirements, the claim that R2.2 closes the `history_key` weakness
+  corrected, and the plain-terms table no longer promises that the operator
+  cannot tell whether two people talk — under the document's own default it can.
+- The history-scaling probe documents that it must be run with `--release`, and
+  prints a warning when it is not: `serde_json` and ChaCha20-Poly1305 are among
+  the most inlining-sensitive code in the tree, and a debug build is slower by a
+  different factor at each size, which is precisely wrong for a scaling probe.
+- `desktop/src/lib/bridge.js`: the dev mock shipping in the production bundle was
+  an accident of how the Tauri gate was written, and the built smoke-test project
+  quietly turned it into a dependency. Now stated as a contract in both places,
+  and asserted, so removing it fails with an explanation.
+
+### Changed
+
+- Release builds no longer use a warm cargo cache. An attestation that says
+  "built from this source at this commit" should not have been built from object
+  files produced by earlier runs on other refs.
+- Every action in the release workflow is pinned to a commit SHA, and every job
+  has a `timeout-minutes`. These jobs hold `contents: write` and mint Sigstore
+  signatures; a mutable tag on any action in that blast radius is a way to get
+  valid provenance for someone else's bytes.
+- The release workflow refuses to start when the git tag does not match the
+  workspace version. The download table in the release notes is built from the
+  tag while the bundles are named from `Cargo.toml`, so a mismatch previously
+  published a page pointing at filenames that do not exist — and only became
+  visible after every build had finished.
+- The fuzzing setup: `-max_len` is set (libFuzzer's 4096-byte default could not
+  reach any of the 48–64 KiB caps these decoders are about, which is why the
+  round-trip target could not find its own bug), the fuzz crate is compile- and
+  lint-checked in CI (it declares its own workspace, so `--workspace` never
+  reached it), a tracked seed corpus was added, a crash in one target no longer
+  skips the rest, the party target asserts properties that can actually fail
+  rather than two calls that structurally cannot, and there are new targets for
+  `recv_packet` and `IdentityProof` — both of which sit earlier in the trust
+  chain than anything previously fuzzed.
+- The JS↔Rust invoke-argument contract check parses every call site or fails
+  saying which it could not read. It previously skipped anything its regex could
+  not match — nested objects, computed names — silently, with a test whose only
+  guard was "more than 40 calls were checked".
+
 ## [1.16.2] - 2026-08-20
 
 > **Security release.** Fixes a flaw that let someone sending you a file hide

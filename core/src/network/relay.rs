@@ -143,6 +143,60 @@ pub async fn run_relay_server(port: u16) -> Result<()> {
     run_relay_server_with_wait_timeout(port, RELAY_WAIT_TIMEOUT).await
 }
 
+/// Bind a listener that serves IPv6 **and** IPv4 clients, falling back to
+/// IPv4-only where IPv6 is not available.
+///
+/// The relay used to bind `0.0.0.0`, which is IPv4-only. That made the per-/64
+/// IPv6 accounting in [`crate::network::ratelimit`] dead code in production: the
+/// branch existed, nothing ever reached it, and the one bug it did contain (an
+/// IPv4-mapped address masking down to `::`, so every IPv4 client shared a
+/// bucket) could sit there indefinitely without anyone noticing. Either the
+/// relay is dual-stack and that code is live and tested, or it is IPv4-only and
+/// the IPv6 half should not pretend otherwise. This is the former.
+///
+/// The bind is explicit about `IPV6_V6ONLY` rather than inheriting a default,
+/// because the default is not the same everywhere: Linux takes it from
+/// `net.ipv6.bindv6only` (usually 0, dual-stack) while **Windows defaults it on**,
+/// so a plain `[::]` bind there would quietly stop accepting IPv4 altogether.
+/// Turning it off explicitly means one socket serves both families on every
+/// platform, and IPv4 peers arrive as `::ffff:a.b.c.d` — which is exactly why
+/// `limiter_key` has to canonicalise before it masks.
+///
+/// A host with IPv6 disabled outright cannot create the socket at all; there the
+/// fallback keeps the relay working as it did before, and says so in the log
+/// rather than failing to start.
+async fn bind_dual_stack(port: u16) -> Result<TcpListener> {
+    match try_bind_dual_stack(port) {
+        Ok(std_listener) => {
+            std_listener.set_nonblocking(true)?;
+            Ok(TcpListener::from_std(std_listener)?)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not bind a dual-stack socket; falling back to IPv4-only. \
+                 IPv6 peers will not be able to reach this relay."
+            );
+            Ok(TcpListener::bind(("0.0.0.0", port)).await?)
+        }
+    }
+}
+
+fn try_bind_dual_stack(port: u16) -> Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    // Matches what `TcpListener::bind` does, so a restart does not have to wait
+    // out TIME_WAIT on the rendezvous port.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+    // The same backlog tokio uses.
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
 /// [`run_relay_server`] with a caller-chosen rendezvous lifetime.
 ///
 /// The only reason this exists is testability: [`RELAY_WAIT_TIMEOUT`] is five
@@ -151,7 +205,7 @@ pub async fn run_relay_server(port: u16) -> Result<()> {
 /// test that does not take five minutes to run. Production always uses the
 /// constant.
 pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duration) -> Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = bind_dual_stack(port).await?;
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     // Same hardening the community server's accept loop has: an unlimited
     // connection rate against a public rendezvous is an unlimited task and

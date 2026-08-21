@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
-use crate::dispatch::{handle_request, ConnState, Dispatch};
+use crate::dispatch::{handle_finish_upload, handle_request, ConnState, Dispatch};
 use crate::hub::Hub;
 use crate::state::PartyState;
 
@@ -112,6 +112,13 @@ where
                 };
 
                 let outcome = match PartyRequest::from_bytes(&req_bytes) {
+                    // Routed around `handle_request` on purpose: finishing an
+                    // upload hashes and writes up to 100 MiB, and that must not
+                    // happen with the state mutex held. See
+                    // `dispatch::handle_finish_upload`.
+                    Some(PartyRequest::FinishUpload { upload }) => {
+                        handle_finish_upload(&state, &mut conn, upload).await
+                    }
                     Some(req) => {
                         let mut st = state.lock().await;
                         handle_request(&mut st, &mut conn, req)
@@ -120,6 +127,7 @@ where
                         replies: vec![PartyResponse::Error("malformed request".to_string())],
                         broadcast: Vec::new(),
                         directed: Vec::new(),
+                        deferred: Vec::new(),
                     },
                 };
 
@@ -132,6 +140,14 @@ where
                 }
 
                 for resp in outcome.replies {
+                    send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await?;
+                }
+                // Blob reads deliberately deferred until the state guard above
+                // was dropped: a 100 MiB read under the mutex queues every other
+                // member's messages behind one person's download. See
+                // `Dispatch::deferred`.
+                for pending in outcome.deferred {
+                    let resp = pending.resolve().await;
                     send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await?;
                 }
                 for resp in outcome.broadcast {

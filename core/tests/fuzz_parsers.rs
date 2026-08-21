@@ -183,6 +183,15 @@ proptest! {
                     std::mem::discriminant(&second),
                     "re-encoding changed the frame type"
                 );
+                // Discriminant equality alone is too weak: a decoder that
+                // *rewrites* the payload (lossy UTF-8 did, three bytes per
+                // invalid byte) keeps the same variant while producing a value
+                // that no longer round-trips. Compare the bytes.
+                prop_assert_eq!(
+                    re_encoded,
+                    second.to_plain_bytes(),
+                    "re-encoding is not a fixed point"
+                );
             }
         }
     }
@@ -315,6 +324,112 @@ fn known_hostile_filenames_are_defused() {
             3,
             "{raw:?} produced extra path components: {joined:?}"
         );
+    }
+}
+
+/// Invalid UTF-8 in a text frame must be **refused**, not repaired.
+///
+/// The decoder used to run `String::from_utf8_lossy` after checking the declared
+/// wire length against the cap. Every invalid byte becomes U+FFFD, which is three
+/// bytes, so the check bounded the wire and not the result: a `Text` frame of
+/// 65,557 `0xFF` bytes passed the check, decoded to a 196,629-byte `String`, and
+/// then could not be re-encoded within the same cap. That is a decoder accepting
+/// a state its own encoder cannot produce, and the practical cost was a memory
+/// bound out by a factor of three — 512 `TextChunk` frames of 48 KiB of invalid
+/// UTF-8 held about 72 MiB for one message against a documented ~24 MiB ceiling.
+///
+/// The property test above asserts exactly this and never found it, because it
+/// generates at most 2 KiB and the frames that trip it are 64 KiB. Hence an
+/// explicit case.
+mod lossy_utf8_broke_the_wire_caps {
+    use super::*;
+    use messenger_core::{MAX_TEXT_CHUNKS, MAX_TEXT_MESSAGE_BYTES, TEXT_CHUNK_BYTES};
+
+    /// Tag 2: `Text { text, timestamp, seq }`.
+    fn text_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![2u8];
+        frame.extend_from_slice(&1u64.to_be_bytes()); // seq
+        frame.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Tag 11: `TextChunk { .. }`.
+    fn text_chunk_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![11u8];
+        frame.extend_from_slice(uuid::Uuid::nil().as_bytes());
+        frame.extend_from_slice(&1u64.to_be_bytes()); // seq
+        frame.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+        frame.extend_from_slice(&0u32.to_be_bytes()); // chunk_index
+        frame.extend_from_slice(&1u32.to_be_bytes()); // total_chunks
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn a_text_frame_of_invalid_utf8_is_refused() {
+        let payload = vec![0xFFu8; MAX_TEXT_MESSAGE_BYTES];
+        assert!(
+            ProtocolMessage::from_plain_bytes(&text_frame(&payload)).is_none(),
+            "invalid UTF-8 must be refused, not expanded into three bytes each"
+        );
+    }
+
+    #[test]
+    fn a_text_chunk_of_invalid_utf8_is_refused() {
+        let payload = vec![0xFFu8; TEXT_CHUNK_BYTES];
+        assert!(
+            ProtocolMessage::from_plain_bytes(&text_chunk_frame(&payload)).is_none(),
+            "invalid UTF-8 must be refused, not expanded into three bytes each"
+        );
+    }
+
+    /// Valid UTF-8 at the cap still works, including multi-byte characters —
+    /// the fix must reject invalid input, not merely reject non-ASCII.
+    #[test]
+    fn valid_text_at_the_cap_still_decodes() {
+        // "é" is two bytes; fill the budget exactly.
+        let payload = "é".repeat(MAX_TEXT_MESSAGE_BYTES / 2).into_bytes();
+        assert_eq!(payload.len(), MAX_TEXT_MESSAGE_BYTES);
+        let decoded = ProtocolMessage::from_plain_bytes(&text_frame(&payload))
+            .expect("valid UTF-8 at the cap must decode");
+        match &decoded {
+            ProtocolMessage::Text { text, .. } => {
+                assert_eq!(text.len(), MAX_TEXT_MESSAGE_BYTES)
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(
+            decoded.to_plain_bytes(),
+            text_frame(&payload),
+            "a frame at the cap must re-encode byte-for-byte"
+        );
+    }
+
+    /// The bound that was actually wrong: the reassembly budget. With lossy
+    /// decoding, `MAX_TEXT_CHUNKS` frames of `TEXT_CHUNK_BYTES` decoded to three
+    /// times the documented ceiling.
+    #[test]
+    fn the_reassembly_budget_bounds_decoded_bytes_not_just_wire_bytes() {
+        let payload = vec![0xFFu8; TEXT_CHUNK_BYTES];
+        let mut decoded_bytes = 0usize;
+        for _ in 0..8 {
+            if let Some(ProtocolMessage::TextChunk { text_part, .. }) =
+                ProtocolMessage::from_plain_bytes(&text_chunk_frame(&payload))
+            {
+                decoded_bytes += text_part.len();
+            }
+        }
+        assert_eq!(
+            decoded_bytes, 0,
+            "these frames must not decode at all; if they do, each one costs 3x its wire size"
+        );
+
+        // The documented ceiling, stated where it can be checked.
+        let ceiling = MAX_TEXT_CHUNKS as usize * TEXT_CHUNK_BYTES;
+        assert_eq!(ceiling, 512 * 48 * 1024, "the ~24 MiB budget");
     }
 }
 

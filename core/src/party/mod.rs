@@ -613,27 +613,57 @@ pub enum PartyResponse {
 /// again with `since_seq` set to the last envelope it received.
 pub const MAX_HISTORY_BATCH: usize = 200;
 
+/// The bincode configuration both Party codecs use.
+///
+/// Byte-for-byte what `bincode::serialize`/`deserialize` produce — fixed-width
+/// integers, little-endian — with one addition: **trailing bytes are rejected**.
+///
+/// bincode 1.x stops at the end of the value and silently ignores whatever
+/// follows, so `frame` and `frame || anything` decoded to the same request. Two
+/// distinct byte strings with one meaning is a malleable frame: anyone who can
+/// modify bytes in flight can pad a frame without changing what it does, and any
+/// reasoning that treats "the same request" and "the same bytes" as equivalent
+/// is wrong. Frames arrive length-prefixed and are covered by the AEAD tag, so a
+/// legitimate encoder never produces the trailing bytes this now refuses.
+fn party_codec() -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
+}
+
 impl PartyRequest {
     /// Serialize to bytes for transport inside the encrypted tunnel.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("PartyRequest serialization is infallible")
+        use bincode::Options;
+        party_codec()
+            .serialize(self)
+            .expect("PartyRequest serialization is infallible")
     }
 
-    /// Parse from transport bytes; returns `None` on malformed input.
+    /// Parse from transport bytes; returns `None` on malformed input, which
+    /// includes a frame with anything appended to it.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        bincode::deserialize(bytes).ok()
+        use bincode::Options;
+        party_codec().deserialize(bytes).ok()
     }
 }
 
 impl PartyResponse {
     /// Serialize to bytes for transport inside the encrypted tunnel.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("PartyResponse serialization is infallible")
+        use bincode::Options;
+        party_codec()
+            .serialize(self)
+            .expect("PartyResponse serialization is infallible")
     }
 
-    /// Parse from transport bytes; returns `None` on malformed input.
+    /// Parse from transport bytes; returns `None` on malformed input, which
+    /// includes a frame with anything appended to it.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        bincode::deserialize(bytes).ok()
+        use bincode::Options;
+        party_codec().deserialize(bytes).ok()
     }
 }
 
@@ -1199,5 +1229,52 @@ mod tests {
             PartyResponse::Members(ref m) if m.is_empty()
         ));
         server.await.unwrap();
+    }
+
+    /// A frame with anything appended must be refused.
+    ///
+    /// bincode 1.x stops at the end of the value and ignores the rest, so
+    /// `frame` and `frame || junk` used to decode identically — two distinct
+    /// byte strings with one meaning, which makes a frame malleable by anyone
+    /// who can touch the bytes and quietly breaks any argument that equates
+    /// "same request" with "same bytes".
+    #[test]
+    fn a_frame_with_trailing_bytes_is_refused() {
+        let req = PartyRequest::ListChannels;
+        let bytes = req.to_bytes();
+        assert_eq!(
+            PartyRequest::from_bytes(&bytes),
+            Some(PartyRequest::ListChannels),
+            "the frame itself still decodes"
+        );
+
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(
+            PartyRequest::from_bytes(&padded).is_none(),
+            "a padded request must not decode to the same thing"
+        );
+
+        let resp = PartyResponse::Ok("fine".to_string());
+        let mut padded = resp.to_bytes();
+        padded.extend_from_slice(b"junk");
+        assert!(
+            PartyResponse::from_bytes(&padded).is_none(),
+            "a padded response must not decode to the same thing"
+        );
+    }
+
+    /// The trailing-byte rejection must not change the wire format: rejecting
+    /// junk is worth nothing if it also stops old peers being understood.
+    #[test]
+    fn the_wire_format_is_unchanged() {
+        let req = PartyRequest::ListChannels;
+        assert_eq!(
+            req.to_bytes(),
+            bincode::serialize(&req).unwrap(),
+            "fixed-width little-endian, exactly as bincode::serialize writes it"
+        );
+        let resp = PartyResponse::Ok("fine".to_string());
+        assert_eq!(resp.to_bytes(), bincode::serialize(&resp).unwrap());
     }
 }

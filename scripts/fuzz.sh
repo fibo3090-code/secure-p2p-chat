@@ -28,6 +28,20 @@ cd "$(dirname "$0")/../core"
 TARGET="${1:-}"
 SECONDS_PER_TARGET="${2:-60}"
 
+# ── Input size ───────────────────────────────────────────────────────────────
+#
+# libFuzzer defaults to 4096 bytes. Every interesting cap in these decoders sits
+# well above that — MAX_TEXT_MESSAGE_BYTES is 64 KiB, TEXT_CHUNK_BYTES is 48 KiB
+# — so at the default the fuzzer cannot reach the branches worth fuzzing no
+# matter how long it runs. That is not a theoretical gap: the round-trip bug in
+# the text decoder (lossy UTF-8 expanding one byte to three, so a frame inside
+# the wire cap decoded past it) lives strictly above 64 KiB, and `protocol_frame`
+# asserted exactly the property it violated while being unable to generate an
+# input that would show it.
+#
+# 128 KiB clears the largest of those caps with room to overshoot it.
+MAX_LEN="${P2PEM_FUZZ_MAX_LEN:-131072}"
+
 export PATH="$HOME/.cargo/bin:$PATH"
 export RUSTUP_TOOLCHAIN=nightly
 
@@ -40,12 +54,38 @@ if ! command -v cargo-fuzz >/dev/null 2>&1; then
     exit 1
 fi
 
+failed=()
+
 run_one() {
     local name="$1"
-    echo "── fuzzing ${name} for ${SECONDS_PER_TARGET}s ─────────────────────────"
-    cargo fuzz run "$name" -- \
+    # cargo-fuzz accumulates a corpus here between runs; `fuzz/seeds/` is the
+    # tracked starting material, so a fresh checkout does not begin from nothing
+    # — the corpus directory itself is gitignored.
+    local corpus="fuzz/corpus/${name}"
+    local seeds="fuzz/seeds/${name}"
+    mkdir -p "$corpus"
+    if [ -d "$seeds" ]; then
+        cp -n "$seeds"/* "$corpus"/ 2>/dev/null || true
+    fi
+
+    echo "── fuzzing ${name} for ${SECONDS_PER_TARGET}s (max_len=${MAX_LEN}) ──────"
+
+    # A crash in one target must not skip the rest. `set -e` aborted the whole
+    # loop on the first failure, so later targets never ran at all — and the
+    # artifact for the one that did fail landed in a gitignored directory with
+    # nothing said about where. Record it, keep going, report at the end.
+    if cargo fuzz run "$name" "$corpus" -- \
         -max_total_time="$SECONDS_PER_TARGET" \
-        -print_final_stats=1
+        -max_len="$MAX_LEN" \
+        -print_final_stats=1; then
+        return 0
+    fi
+
+    failed+=("$name")
+    echo "!! ${name} failed. Reproducers (gitignored, so copy them out):" >&2
+    ls -1 "fuzz/artifacts/${name}" 2>/dev/null | sed "s|^|   core/fuzz/artifacts/${name}/|" >&2 || true
+    echo "   Re-run one with: cargo fuzz run ${name} core/fuzz/artifacts/${name}/<file>" >&2
+    return 0
 }
 
 if [ -n "$TARGET" ]; then
@@ -55,3 +95,12 @@ else
         run_one "$name"
     done
 fi
+
+if [ "${#failed[@]}" -gt 0 ]; then
+    echo
+    echo "fuzzing found crashes in: ${failed[*]}" >&2
+    exit 1
+fi
+
+echo
+echo "all targets finished cleanly"

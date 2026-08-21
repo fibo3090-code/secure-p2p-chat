@@ -6,8 +6,25 @@
 //! is quadratic. This prints the numbers so the decision about whether that
 //! matters is made from data rather than from the shape of the code.
 //!
-//! Ignored by default — it is a probe, not a test. Run with:
-//!   cargo test -p p2pem-classic --test history_scaling_probe -- --ignored --nocapture
+//! Ignored by default — it is a probe, not a test. **Run it in release mode:**
+//!
+//! ```text
+//! cargo test --release -p p2pem-classic --test history_scaling_probe -- --ignored --nocapture
+//! ```
+//!
+//! `--release` is not a nicety here, it is the difference between the numbers
+//! meaning something and being noise. The two things this loop spends its time
+//! in are `serde_json` and ChaCha20-Poly1305, and both are among the most
+//! inlining-sensitive code in the dependency tree: a debug build leaves every
+//! serializer call and every quarter-round as a real function call with
+//! overflow checks around it, which is comfortably an order of magnitude slower
+//! and — worse for a *scaling* probe — slower by a different factor at each
+//! size. The point of this file is that a product decision gets made from data.
+//! Debug-build data would answer a question nobody asked.
+//!
+//! There is no timing assertion anywhere in here, so it cannot be flaky; the
+//! only way it can mislead is by being read as if it described the shipped
+//! build. Hence this paragraph.
 
 use messenger_core::types::{Chat, ChatKind, Message, MessageContent, Transport};
 use p2pem_classic::app::persistence::HistoryFile;
@@ -53,6 +70,16 @@ fn how_does_saving_scale_with_history_size() {
     let dir = tempfile::tempdir().expect("dir");
     let key = [7u8; 32];
 
+    println!();
+    // A number is only as good as the build that produced it, so the table says
+    // which build it is rather than leaving the reader to remember.
+    if cfg!(debug_assertions) {
+        println!("  ⚠ DEBUG BUILD — these timings are not the shipped ones.");
+        println!("    serde_json and ChaCha20-Poly1305 are both heavily inlined in release;");
+        println!("    re-run with --release before making a decision from this table.");
+    } else {
+        println!("  release build");
+    }
     println!();
     println!("  messages |  file size |  one save | cost of reaching it");
     println!("  ---------+------------+-----------+--------------------");

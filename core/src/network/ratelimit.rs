@@ -65,9 +65,27 @@ struct Entry {
 /// It deliberately does not go wider than /64: /48 would put unrelated customers
 /// of one ISP into a single bucket, which turns a rate limit into collateral
 /// damage.
+///
+/// ⚠️ **Canonicalise before matching.** An IPv4-mapped address (`::ffff:a.b.c.d`)
+/// is an `IpAddr::V6`, and its four address bytes live in `octets[12..]` — inside
+/// the range the /64 mask zeroes. So did the `0xffff` marker at `octets[10..12]`.
+/// Masking one without unwrapping it first mapped *every* IPv4 client to the same
+/// key, `::`, and one address could then spend the whole bucket and lock out
+/// every other IPv4 client on the server. That was latent only because
+/// `relay.rs` binds `0.0.0.0`, which hands us `IpAddr::V4` directly and never
+/// takes this branch — the moment anything binds `[::]` (a dual-stack listener,
+/// which is the entire point of the /64 work) it becomes a one-line denial of
+/// service. `to_ipv4_mapped` is the canonicalisation, and it has to happen
+/// before the mask, not after.
 fn limiter_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
+        // A dual-stack listener reports IPv4 peers as `::ffff:a.b.c.d`. That is
+        // an IPv4 client and must be counted per address, exactly as it would be
+        // on an IPv4-only listener.
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+            IpAddr::V4(v6.to_ipv4_mapped().expect("just checked"))
+        }
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
             // Keep the routing prefix, zero the interface identifier.
@@ -359,6 +377,58 @@ mod tests {
         assert!(
             !rl.check_at(other, now),
             "a different /64 must not inherit someone else's limit"
+        );
+    }
+
+    /// A dual-stack listener (`[::]`) reports an IPv4 peer as `::ffff:a.b.c.d`,
+    /// and the /64 mask zeroes everything from octet 8 — which is where both the
+    /// address *and* the `0xffff` marker live. Without canonicalising first,
+    /// every IPv4 client in the world hashed to the same key, `::`, and one
+    /// address could lock out all the others.
+    #[test]
+    fn ipv4_mapped_addresses_are_not_collapsed_into_one_bucket() {
+        let mapped = |a, b, c, d| IpAddr::V6(std::net::Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
+
+        assert_ne!(
+            limiter_key(mapped(1, 2, 3, 4)),
+            limiter_key(mapped(203, 0, 113, 9)),
+            "two different IPv4 clients must not share a bucket"
+        );
+        assert_eq!(
+            limiter_key(mapped(203, 0, 113, 9)),
+            limiter_key(IpAddr::from([203, 0, 113, 9])),
+            "the same client must count the same whether the listener is v4 or dual-stack"
+        );
+
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MAX_CONNECTIONS {
+            rl.check_at(mapped(1, 2, 3, 4), now);
+        }
+        assert!(
+            rl.check_at(mapped(1, 2, 3, 4), now),
+            "the flooder is limited"
+        );
+        assert!(
+            !rl.check_at(mapped(203, 0, 113, 9), now),
+            "one IPv4 address must not be able to lock out every other IPv4 client"
+        );
+    }
+
+    /// The v4-mapped unwrap must not swallow real IPv6. `::ffff:0:0/96` is the
+    /// mapped range; `64:ff9b::/96` (NAT64) and ordinary global addresses are not.
+    #[test]
+    fn real_ipv6_is_still_counted_by_prefix() {
+        let nat64 = IpAddr::from([0x0064, 0xff9b, 0, 0, 0, 0, 0xc000, 0x0221]);
+        assert_eq!(
+            limiter_key(nat64),
+            IpAddr::from([0x0064, 0xff9b, 0, 0, 0, 0, 0, 0]),
+            "a NAT64 address is IPv6 and is masked to its /64"
+        );
+        assert_eq!(
+            limiter_key(ip6(7)),
+            IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0]),
+            "a global IPv6 address keeps its prefix and loses its interface id"
         );
     }
 

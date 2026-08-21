@@ -10,6 +10,27 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { folderOf } from "./parse.js";
 
+// ── The mock ships in the production bundle, and that is now a contract ─────
+//
+// The gate is a *runtime* one — "is there a Tauri host on this page?" — not
+// `import.meta.env.DEV`, so the mock is not stripped from a production build.
+// Inside the app it is unreachable: Tauri always defines
+// `window.__TAURI_INTERNALS__` before the page's scripts run, so `api` is the
+// real bridge and the mock is dead code that never executes.
+//
+// That started as a side effect of how the gate was written. It stopped being
+// one when `desktop/smoke/` grew a **built** project: `vite preview` serves
+// `dist/` in a plain Chromium with no Tauri host, so the only reason the shipped
+// bundle renders anything there at all is that the mock came along with it. The
+// smoke tests are the only gate that starts the app, and the built half is the
+// regression gate for the production CSP — if a future change gates the mock on
+// `import.meta.env.DEV`, the shipped bundle stops being able to paint outside
+// Tauri and that gate goes with it.
+//
+// So: deliberate, and stated here rather than left to be rediscovered. If you
+// do want the mock out of production, the built smoke project needs a different
+// way to bring the app up first — a stub `window.__TAURI_INTERNALS__` injected
+// by an init script is the obvious one — and this comment should go with it.
 const inTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 
 // ── Shared rules the mock mirrors from the Rust bridge ──────────────────────

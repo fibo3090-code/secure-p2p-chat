@@ -28,18 +28,35 @@ about a missing certificate, not about the contents. What a certificate would
 prove — that a file came from this project and has not been altered — is proved
 two other ways instead, both free and both checkable by you:
 
-**Build provenance** (the stronger one). Every release artifact is attested with
+**Build provenance** (the stronger one). Every artifact on a release page —
+including the `SHA256SUMS` file itself — is attested with
 [Sigstore](https://www.sigstore.dev/) via GitHub's `attest-build-provenance`,
 binding the file's digest to this repository, the exact commit, and the workflow
 run that produced it, and recording it in a public transparency log:
 
 ```bash
-gh attestation verify <downloaded-file> --repo <owner>/<repo>
+gh attestation verify <downloaded-file> \
+  --repo <owner>/<repo> \
+  --signer-workflow <owner>/<repo>/.github/workflows/release.yml
 ```
+
+**Do not drop `--signer-workflow`.** Without it the command accepts an
+attestation minted by *any* workflow in the repository, and adding a workflow is
+a far easier thing for an attacker to arrange than compromising the release
+pipeline. `--repo` says which repository's attestations to look up;
+`--signer-workflow` says which workflow was allowed to sign.
 
 This is a claim a code-signing certificate cannot make. A certificate says "some
 holder of this key produced this file"; the attestation says "this file was
 built by this workflow, from source you can read, at this commit".
+
+What "every release artifact" means here is deliberately narrow: the release
+workflow attests exactly the files its own build jobs produced in that run,
+collected from the workflow artifact store, and it publishes the release from
+draft only once all of them are attested and checksummed. It does not attest
+whatever happens to be attached to the tag, so an asset from an earlier run of a
+re-pushed tag, or one attached by hand, cannot pick up a signature it did not
+earn — it simply has none, and `gh attestation verify` says so.
 
 **Checksums.** Each release carries a `SHA256SUMS` asset:
 
@@ -50,8 +67,9 @@ shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS
 
 Note the limit: a checksum only proves the file matches the release page. If the
 release page itself were the thing under an attacker's control, the checksum
-would match and prove nothing. Provenance does not have that weakness — verify
-that one if you verify only one.
+would match and prove nothing — which is why `SHA256SUMS` is attested too, and
+why verifying *it* with the command above is what makes the sums worth reading.
+Provenance is the one to run if you run only one.
 
 There is **no auto-updater**. Security fixes reach you only if you come back and
 download them, so watch the repository for releases if you rely on this.
