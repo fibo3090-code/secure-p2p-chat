@@ -45,7 +45,7 @@ hkdf = "0.12"
 
 # Encodage
 hex = "0.4"
-base64 = "0.21"
+base64 = "0.22"
 
 # Logging. The app keeps its own bounded in-process buffer for the log overlay
 # and diagnostics bundles (`client/src/logbuf.rs`) — that used to be
