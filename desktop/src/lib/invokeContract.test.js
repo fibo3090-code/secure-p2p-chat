@@ -71,6 +71,55 @@ describe("parseInvokeCalls", () => {
         ]);
     });
 
+    // Comment stripping knew about strings but not about regex literals, so a
+    // pattern containing a quote — `/["']/` — opened what looked like a string.
+    // It ran to the next unrelated quote, and everything from there on was
+    // misaligned by one quote: the `//` below ended up *outside* a string and
+    // its commented-out call was counted as real.
+    //
+    // Each of these keeps a commented-out `invoke` after the pattern, because
+    // that is what makes the misparse observable. Mistaking a regex for a string
+    // copies the same characters through either way; what changes is which of
+    // the quotes that follow are read as openers, and so whether a real comment
+    // is still recognised as one.
+    it("is not derailed by a regex literal containing a quote", () => {
+        const source = [
+            'const strip = /["\']/g;',
+            'const label = "x"; // invoke("ghost")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
+    it("does not mistake division for the start of a regex", () => {
+        // Reading `total / count` as a pattern consumes up to the next slash —
+        // the first character of the comment — and what remains of the `//`
+        // opens another, so the commented-out call is copied through as code.
+        const source = [
+            'const ratio = total / count; // invoke("ghost")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
+    it("does not end a pattern at a slash inside a character class", () => {
+        const source = [
+            'const path = /[/"]+/g;',
+            'const label = "x"; // invoke("ghost")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
     // A call this parser cannot read is the dangerous case: it used to vanish
     // from the subject set without a word. Now it is reported, and the real
     // bridge asserts there are none.

@@ -29,11 +29,57 @@
 /// A caller never sends these, so they must not be treated as missing keys.
 const INJECTED_PARAMS = new Set(["state", "window", "app", "webview", "handle"]);
 
-/// Strip comments, leaving string literals intact.
+/// Keywords after which a `/` opens a regular expression rather than dividing.
+/// Without them `return /["']/` reads as "identifier, then division".
+const REGEX_PRECEDING_KEYWORDS = new Set([
+    "return",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "new",
+    "delete",
+    "void",
+    "throw",
+    "case",
+    "do",
+    "else",
+    "yield",
+    "await",
+]);
+
+/// Whether a `/` appearing after `out` opens a regex literal or is a division.
+///
+/// JavaScript cannot be tokenised without this distinction, and the rule is
+/// positional: after a *value* — an identifier, a number, `)`, `]` — a slash
+/// divides; anywhere an expression may begin, it opens a regex.
+function regexCanStartAfter(out) {
+    const before = out.replace(/\s+$/, "");
+    if (before === "") return true;
+    const last = before[before.length - 1];
+    if (/[)\]}]/.test(last)) return false;
+    if (/[\w$]/.test(last)) {
+        // An identifier or number — a divisor, unless it is one of the keywords
+        // that can only be followed by the start of an expression.
+        const word = before.match(/[\w$]+$/)?.[0] ?? "";
+        return REGEX_PRECEDING_KEYWORDS.has(word);
+    }
+    return true;
+}
+
+/// Strip comments, leaving string literals and regex literals intact.
 ///
 /// Needed so a commented-out `invoke(...)` is not counted as a call site — the
 /// count is an assertion now, so a miscount is a failing test rather than a
 /// quietly smaller subject set.
+///
+/// Regex literals are recognised rather than left to fall through, because that
+/// is where this used to go wrong: a pattern containing a quote — `/["']/`, of
+/// the kind a few lines below — opened what looked like a string literal, so
+/// everything up to the next unrelated quote was swallowed as string contents,
+/// taking any real `invoke(` site in between with it. Nothing caught that,
+/// because `scanInvokeCalls` and `countInvokeSites` both read this function's
+/// output: they agreed with each other about a source neither had seen whole.
 function stripComments(source) {
     let out = "";
     let i = 0;
@@ -48,6 +94,32 @@ function stripComments(source) {
             i += 2;
             while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
             i += 2;
+            continue;
+        }
+        if (ch === "/" && regexCanStartAfter(out)) {
+            out += ch;
+            i++;
+            // A `/` inside a character class is literal, so `[/]` does not end
+            // the pattern and must not be read as if it did.
+            let inClass = false;
+            while (i < source.length) {
+                const c = source[i];
+                out += c;
+                i++;
+                if (c === "\\") {
+                    out += source[i] ?? "";
+                    i++;
+                    continue;
+                }
+                if (c === "\n") break; // unterminated — not a regex after all
+                if (c === "[") inClass = true;
+                else if (c === "]") inClass = false;
+                else if (c === "/" && !inClass) break;
+            }
+            while (i < source.length && /[a-z]/.test(source[i])) {
+                out += source[i]; // flags
+                i++;
+            }
             continue;
         }
         if (ch === '"' || ch === "'" || ch === "`") {

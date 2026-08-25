@@ -62,6 +62,35 @@ attacked; several of these change what happens to one who is.
   stops at the end of a value and ignores whatever follows, so `frame` and
   `frame || junk` decoded identically. Trailing bytes are now rejected; the wire
   format is unchanged and there is a test pinning that.
+- **Any member could grow a community server's memory until it died.** Declare a
+  file, send less of it than you declared, then finish: the server answered
+  "upload is incomplete" and kept the partial bytes, because the connection
+  dropped the upload's id *before* the state was asked to finish it. Nothing
+  reclaimed them — the concurrency cap counts a list that had just been emptied,
+  and the disconnect sweep is gated on that same list — so each round abandoned
+  up to the per-file limit, and a restart was the only way back. Every refusal
+  now releases its bytes, and the connection forgets the id only after the state
+  has acted on it.
+- **A community file message could point at bytes that were not there.** Two
+  members uploading identical content — a forwarded image — staged to the same
+  content-hash path, so one of them being refused deleted the file the other was
+  about to record; that second upload then skipped its own write, believing the
+  bytes were already on disk. The message reached the whole channel and every
+  download of it answered "unknown file", permanently. Uploads now stage under a
+  private name and are renamed into place on commit, so a refusal can only ever
+  delete its own bytes.
+- **A community DM upload was not re-checked against its recipient.** The
+  recipient is verified before the transfer starts, but the re-check on the far
+  side of the disk write covered only the sender — so a recipient who stopped
+  being a member during a large upload still had the message appended to their
+  thread.
+- **The LAN discovery cache is now bounded.** mDNS is unauthenticated
+  local-network input, and the list has no cap: anything on the network can
+  announce as many services as it likes and grow the vector both front-ends read.
+  Listing every advertised address rather than only the first — a fix in this
+  same release — multiplies that, and each address costs a scan of everything
+  already listed. Capped per peer and overall. Only applies with LAN discovery
+  turned on, which is off by default.
 
 ### Performance
 
@@ -88,6 +117,24 @@ attacked; several of these change what happens to one who is.
 - **Playwright's browser install was the one unbounded network step in CI**, and
   carried a comment claiming nothing there touched the network. It downloads a
   browser and shells out to `apt` as root. Bounded and retried like the others.
+- **The release workflow's own package install was still unbounded.** CI's three
+  `apt` blocks were wrapped in a bounded retry for a reason that applies at least
+  as strongly here: a stalled mirror otherwise sits in this step until the job
+  timeout kills it an hour later, on the one workflow whose failure means no
+  release. Bounded and retried like the others.
+- **The invoke-contract check could not see a whole source file.** Its comment
+  stripper knew about string literals but not regex literals, so a pattern
+  containing a quote — `/["']/` — opened what looked like a string and threw off
+  every quote after it, which could leave a commented-out `invoke(` counted as a
+  real call site. The new exact-count assertion could not catch this: the scanner
+  and the counter both read the stripper's output, so they agreed with each other
+  about a source neither had seen whole.
+- **Merging the release artifacts could have dropped one silently.** The download
+  step flattened all seven build legs into one directory, keeping whichever file
+  it wrote last on a basename collision. Nothing would have reported it — the
+  step that verifies the published bytes compares that same directory against the
+  release, so both sides would have been missing the same file. The merge is now
+  explicit and a collision is an error, with the artifact count asserted too.
 
 ### Documentation
 
@@ -120,6 +167,10 @@ attacked; several of these change what happens to one who is.
   has a `timeout-minutes`. These jobs hold `contents: write` and mint Sigstore
   signatures; a mutable tag on any action in that blast radius is a way to get
   valid provenance for someone else's bytes.
+- The desktop and tools release jobs now run with `contents: read`. They hand
+  their output to the artifact store and never touch the release, so neither
+  needs the `contents: write` it would otherwise inherit — and between them they
+  run `npm ci` and a Tauri build, the most third-party code in the pipeline.
 - The release workflow refuses to start when the git tag does not match the
   workspace version. The download table in the release notes is built from the
   tag while the bundles are named from `Cargo.toml`, so a mismatch previously

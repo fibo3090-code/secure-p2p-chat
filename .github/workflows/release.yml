@@ -169,6 +169,13 @@ jobs:
     name: P2PEM Desktop (${{ matrix.label }})
     needs: create-release
     timeout-minutes: 60
+    # This job hands its output to the artifact store and never touches the
+    # release, so it does not need the workflow-level `contents: write` it would
+    # otherwise inherit. It runs `npm ci` and a Tauri build — the most
+    # third-party code in the pipeline — and now does so without a token that
+    # can write to the repository.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -194,10 +201,28 @@ jobs:
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
-            libayatana-appindicator3-dev patchelf
+          # Bounded for the same reason as ci.yml's three apt blocks: apt has no
+          # timeout of its own, and a stalled mirror otherwise sits here until
+          # `timeout-minutes: 60` kills the job — an hour spent to report
+          # nothing, on the one workflow where the failure means no release.
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 120 sudo -E dpkg --configure -a \
+               && timeout -k 30 420 sudo -E apt-get install -y \
+                    libgtk-3-dev libwayland-dev libxkbcommon-dev \
+                    libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
+                    libayatana-appindicator3-dev patchelf; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "apt attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed three times; this is an infrastructure problem, not the diff"
+          exit 1
 
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -283,6 +308,10 @@ jobs:
     name: P2PEM Tools (${{ matrix.label }})
     needs: create-release
     timeout-minutes: 45
+    # Uploads to the artifact store, not to the release — same reasoning as the
+    # desktop job above.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -392,9 +421,43 @@ jobs:
       - name: Collect this run's build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: assets
+          path: artifacts
           pattern: release-*
-          merge-multiple: true
+
+      # Deliberately not `merge-multiple: true`. That flattens the artifacts into
+      # one directory and, on a basename collision, silently keeps whichever file
+      # it wrote last. The current seven legs produce distinct names so nothing
+      # would be lost today — but a future leg that collides would lose a file
+      # invisibly: the verification step below compares the merged directory
+      # against the release, and both sides would be missing the same file, so it
+      # would agree. Merging by hand makes the collision an error instead.
+      - name: Merge the artifacts, refusing a name collision
+        run: |
+          set -euo pipefail
+          # One per build leg: four desktop platforms plus three tools targets.
+          # Update this alongside the matrices; `needs` gates on all seven
+          # succeeding, so a mismatch here means one uploaded nothing expected.
+          expected_artifacts=7
+
+          found=$(find artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$found" -ne "$expected_artifacts" ]; then
+            echo "::error::expected $expected_artifacts build artifacts, collected $found"
+            find artifacts -mindepth 1 -maxdepth 1 -type d
+            exit 1
+          fi
+
+          mkdir -p assets
+          collision=0
+          while IFS= read -r file; do
+            base=$(basename "$file")
+            if [ -e "assets/$base" ]; then
+              echo "::error::two build legs both produced '$base'; one would be silently dropped"
+              collision=1
+              continue
+            fi
+            mv -- "$file" "assets/$base"
+          done < <(find artifacts -mindepth 2 -type f | sort)
+          [ "$collision" -eq 0 ] || exit 1
 
       - name: Show what will be signed
         run: |

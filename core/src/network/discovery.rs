@@ -11,6 +11,21 @@ use std::sync::{Arc, Mutex};
 /// Service type for mDNS discovery. Follows Zeroconf naming conventions.
 const SERVICE_TYPE: &str = "_p2p-messenger._tcp.local.";
 
+/// Ceiling on the discovery cache.
+///
+/// mDNS is unauthenticated local-network input: anything on the LAN can announce
+/// as many services as it likes under as many names, and this vector lives behind
+/// the mutex both front-ends read to draw "Nearby peers". Unbounded, a responder
+/// advertising a few hundred fullnames grows it without limit — and now that each
+/// service contributes one entry *per address* rather than one in total, so does
+/// the linear scan `merge_resolved` runs for every address it is given.
+const MAX_DISCOVERED_PEERS: usize = 256;
+
+/// Ceiling on how many of one service's advertised addresses are kept. A real
+/// dual-homed machine has two or three; a responder claiming twenty is not
+/// describing something anyone needs offered twenty times.
+const MAX_ADDRESSES_PER_PEER: usize = 8;
+
 /// Information about a discovered peer on the local network.
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
@@ -192,9 +207,19 @@ fn merge_resolved(
     fingerprint: Option<&str>,
     addresses: &[String],
 ) {
+    // Before the cap is consulted, so a peer re-announcing itself always frees
+    // its own slots first and can never be locked out of a full cache by its
+    // own stale entries.
     peers.retain(|p| p.fullname != fullname);
 
-    for address in addresses {
+    for address in addresses.iter().take(MAX_ADDRESSES_PER_PEER) {
+        if peers.len() >= MAX_DISCOVERED_PEERS {
+            tracing::warn!(
+                limit = MAX_DISCOVERED_PEERS,
+                "mDNS discovery cache is full; ignoring further peers"
+            );
+            break;
+        }
         if peers
             .iter()
             .any(|p| p.address == *address && p.port == port)
@@ -377,6 +402,80 @@ mod tests {
         assert_eq!(
             listed,
             vec![("desktop", "192.168.1.12"), ("laptop", "192.168.1.11")]
+        );
+    }
+
+    /// The cache is bounded. Anything on the LAN can announce as many services
+    /// as it likes, so a flood of forged fullnames must stop growing the vector
+    /// the UI reads rather than growing it until something gives.
+    #[test]
+    fn the_discovery_cache_has_a_hard_peer_limit() {
+        let mut peers = Vec::new();
+        for i in 0..(MAX_DISCOVERED_PEERS + 50) {
+            // Distinct addresses throughout, so it is the cap doing the work
+            // here and not the endpoint dedup.
+            merge_resolved(
+                &mut peers,
+                &format!("peer-{i}._p2p-messenger._tcp.local."),
+                &format!("peer-{i}"),
+                12345,
+                None,
+                &[format!("192.0.{}.{}", i / 254, i % 254 + 1)],
+            );
+        }
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
+    }
+
+    /// One service's address list is bounded too — otherwise a single forged
+    /// announcement fills the cache on its own, and each address costs a scan of
+    /// everything already in it.
+    #[test]
+    fn one_service_cannot_claim_unlimited_addresses() {
+        let mut peers = Vec::new();
+        let addresses: Vec<String> = (1..=60).map(|i| format!("192.0.2.{i}")).collect();
+        merge_resolved(
+            &mut peers,
+            "greedy._p2p-messenger._tcp.local.",
+            "greedy",
+            12345,
+            None,
+            &addresses,
+        );
+        assert_eq!(peers.len(), MAX_ADDRESSES_PER_PEER);
+    }
+
+    /// The cap must not lock out a peer that is simply re-announcing itself:
+    /// its own stale entries are dropped before the limit is consulted.
+    #[test]
+    fn a_full_cache_still_accepts_a_peer_re_announcing_itself() {
+        let mut peers = Vec::new();
+        for i in 0..MAX_DISCOVERED_PEERS {
+            merge_resolved(
+                &mut peers,
+                &format!("peer-{i}._p2p-messenger._tcp.local."),
+                &format!("peer-{i}"),
+                12345,
+                None,
+                &[format!("10.0.{}.{}", i / 254, i % 254 + 1)],
+            );
+        }
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
+
+        // peer-0 moved from Wi-Fi to Ethernet and re-announced.
+        merge_resolved(
+            &mut peers,
+            "peer-0._p2p-messenger._tcp.local.",
+            "peer-0",
+            12345,
+            None,
+            &["10.9.9.9".to_string()],
+        );
+        assert!(
+            peers
+                .iter()
+                .any(|p| p.fullname == "peer-0._p2p-messenger._tcp.local."
+                    && p.address == "10.9.9.9"),
+            "a re-announcing peer must not be shut out by a full cache"
         );
     }
 

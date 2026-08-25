@@ -244,11 +244,17 @@ pub async fn handle_finish_upload(
     let Some(member) = conn.member() else {
         return Dispatch::reply(PartyResponse::Error("join required".to_string()));
     };
-    conn.uploads.retain(|u| *u != upload);
-
+    // Take first, forget second. Clearing the connection's id up front made the
+    // two sides disagree the moment `take_upload` refused: the spool stayed in
+    // `PartyState` with nothing left pointing at it, `MAX_CONCURRENT_UPLOADS`
+    // counted a `conn.uploads` that had just been emptied, and the disconnect
+    // sweep — gated on this very list being non-empty — never ran. `take_upload`
+    // is terminal either way, so the id is dropped here on both outcomes.
     let taken = {
         let mut st = state.lock().await;
-        match st.take_upload(member, upload) {
+        let result = st.take_upload(member, upload);
+        conn.uploads.retain(|u| *u != upload);
+        match result {
             Ok(taken) => taken,
             Err(reason) => {
                 return Dispatch::reply(PartyResponse::ActionFailed {
@@ -545,6 +551,12 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     match state.upload_chunk(member, upload, &data) {
                         Ok(()) => Dispatch::default(),
                         Err(reason) => {
+                            // A failed chunk ends the upload, so the spool goes
+                            // with it. `upload_chunk` only removes it on the
+                            // over-declared path; an oversize chunk left the
+                            // bytes resident in `PartyState` while this line
+                            // dropped the last id that could reach them.
+                            state.cancel_upload(member, upload);
                             conn.uploads.retain(|u| *u != upload);
                             Dispatch::reply(PartyResponse::Error(reason))
                         }
@@ -555,8 +567,12 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 // lock released. This arm is the synchronous equivalent, kept
                 // for callers that drive `handle_request` directly.
                 PartyRequest::FinishUpload { upload } => {
+                    // After the state transition, for the reason spelled out in
+                    // `handle_finish_upload`: forgetting the id first is what
+                    // let a refused finish strand its spool.
+                    let result = state.finish_upload(member, upload);
                     conn.uploads.retain(|u| *u != upload);
-                    match state.finish_upload(member, upload) {
+                    match result {
                         Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
                         Ok((env, UploadTarget::Dm(to))) => Dispatch {
                             replies: vec![PartyResponse::MessagePosted {
@@ -628,6 +644,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::MAX_CONCURRENT_UPLOADS;
     use messenger_core::party::MessagePayload;
 
     /// Join and return the assigned member id.
@@ -1095,5 +1112,120 @@ mod tests {
             },
         );
         assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
+    }
+
+    /// Declare a size, send less than it, finish. The server refuses — and must
+    /// keep nothing.
+    ///
+    /// This used to be an unbounded memory leak a Guest could drive: the
+    /// connection dropped its id *before* the state was asked to finish, so the
+    /// refused spool stayed in `PartyState::uploads` with nothing referencing
+    /// it. Two things that should have stopped it did not — the concurrency cap
+    /// counts `conn.uploads`, which had just been emptied, and the disconnect
+    /// sweep is gated on that same list being non-empty — so each round
+    /// abandoned up to the per-file limit until the process restarted.
+    #[test]
+    fn repeatedly_finishing_incomplete_uploads_keeps_nothing() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        joined_id(&mut state, &mut conn, "alice");
+        let channel = state.default_channel();
+
+        for round in 0..(MAX_CONCURRENT_UPLOADS * 3) {
+            let ready = handle_request(
+                &mut state,
+                &mut conn,
+                PartyRequest::StartUpload {
+                    name: "partial.bin".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                    size: 8,
+                    target: UploadTarget::Channel(channel),
+                },
+            );
+            let upload = match ready.replies.as_slice() {
+                [PartyResponse::UploadReady { upload, .. }] => *upload,
+                other => panic!("round {round}: expected UploadReady, got {other:?}"),
+            };
+            handle_request(
+                &mut state,
+                &mut conn,
+                PartyRequest::UploadChunk {
+                    upload,
+                    data: b"half".to_vec(),
+                },
+            );
+            let failed =
+                handle_request(&mut state, &mut conn, PartyRequest::FinishUpload { upload });
+            assert!(
+                matches!(
+                    failed.replies.as_slice(),
+                    [PartyResponse::ActionFailed { reason, .. }] if reason.contains("incomplete")
+                ),
+                "round {round}: unexpected reply {:?}",
+                failed.replies
+            );
+
+            assert_eq!(
+                state.pending_upload_count(),
+                0,
+                "round {round}: the refused spool is still held"
+            );
+            assert!(conn.open_uploads().is_empty(), "round {round}");
+        }
+    }
+
+    /// An oversize chunk ends the upload, and the bytes already spooled for it
+    /// go too. `upload_chunk` only discards on the over-declared path, so the
+    /// dispatcher has to finish the job — otherwise this is the same leak as
+    /// above by a different route.
+    #[test]
+    fn a_rejected_chunk_releases_the_spool() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        joined_id(&mut state, &mut conn, "alice");
+        let channel = state.default_channel();
+
+        let ready = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::StartUpload {
+                name: "big.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                size: (PARTY_CHUNK_BYTES * 4) as u64,
+                target: UploadTarget::Channel(channel),
+            },
+        );
+        let upload = match ready.replies.as_slice() {
+            [PartyResponse::UploadReady { upload, .. }] => *upload,
+            other => panic!("expected UploadReady, got {other:?}"),
+        };
+        handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::UploadChunk {
+                upload,
+                data: vec![0u8; PARTY_CHUNK_BYTES],
+            },
+        );
+        assert_eq!(state.pending_upload_count(), 1);
+
+        let rejected = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::UploadChunk {
+                upload,
+                data: vec![0u8; PARTY_CHUNK_BYTES + 1],
+            },
+        );
+        assert!(matches!(
+            rejected.replies.as_slice(),
+            [PartyResponse::Error(reason)] if reason.contains("too large")
+        ));
+        assert_eq!(
+            state.pending_upload_count(),
+            0,
+            "the spool must not outlive the upload it belonged to"
+        );
+        assert!(conn.open_uploads().is_empty());
     }
 }
