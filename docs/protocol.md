@@ -102,7 +102,7 @@ the host has no password configured, the flag is `0` and the exchange is a no-op
 
 ### Transcript binding
 
-The runtime binds encrypted identity proofs and transport packets to the handshake transcript using AAD derived from the transcript hash.
+The runtime binds encrypted identity proofs and transport packets to the handshake transcript using AAD derived from the transcript hash. Identity proofs are decoded with fixed-width bincode and reject trailing bytes, so an authenticated proof has one accepted wire representation before it informs any trust decision.
 
 That means:
 

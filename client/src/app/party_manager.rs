@@ -110,14 +110,22 @@ pub struct PartyServerConn {
     /// this connection joined, so a refreshed channel list does not re-fetch
     /// everything on every broadcast.
     history_requested: HashSet<Uuid>,
-    /// Outgoing messages appended locally but not yet acknowledged by the
-    /// server, oldest first, as `(thread, message index)`.
+    /// Threads with an outgoing message appended locally but not yet
+    /// acknowledged by the server, oldest first.
     ///
     /// The server answers each send with exactly one `MessagePosted` or
     /// `ActionFailed`, in order, so the head of this queue identifies which
-    /// optimistic message a reply belongs to. Without the correlation a refused
-    /// post simply stayed on screen looking delivered.
-    pending_sends: VecDeque<(Uuid, usize)>,
+    /// thread a reply belongs to. Without the correlation a refused post simply
+    /// stayed on screen looking delivered.
+    ///
+    /// It stores the *thread*, not a position in that thread's vector: a
+    /// history page merges into the same vector and re-sorts it, which moves
+    /// every unconfirmed message. Storing indices meant a page landing between
+    /// a send and its reply made the reply stamp — or delete — the wrong
+    /// message. An unconfirmed send is instead the envelope still carrying
+    /// `seq == 0`, and the sort keeps those in append order at the end, so the
+    /// oldest pending send in a thread is its first `seq == 0` envelope.
+    pending_sends: VecDeque<Uuid>,
     outgoing_tx: mpsc::UnboundedSender<PartyRequest>,
     incoming_rx: mpsc::UnboundedReceiver<Incoming>,
     /// Chunked uploads waiting for the server to accept them, in the order they
@@ -148,16 +156,25 @@ impl PartyServerConn {
     /// server's ordered reply can either stamp it with its real sequence or
     /// take it back off the screen.
     fn append_pending(&mut self, thread: Uuid, envelope: Envelope) {
-        let list = self.messages.entry(thread).or_default();
-        list.push(envelope);
-        self.pending_sends.push_back((thread, list.len() - 1));
+        debug_assert_eq!(envelope.seq, 0, "an optimistic send must be unsequenced");
+        self.messages.entry(thread).or_default().push(envelope);
+        self.pending_sends.push_back(thread);
+    }
+
+    /// Position of the oldest unconfirmed send in `thread` — the first envelope
+    /// the server has not yet assigned a sequence to.
+    fn oldest_unconfirmed(&self, thread: Uuid) -> Option<usize> {
+        self.messages.get(&thread)?.iter().position(|e| e.seq == 0)
     }
 
     /// The server acknowledged the oldest unconfirmed send: stamp the real
     /// sequence onto it so a later history page merges cleanly instead of
     /// duplicating it.
     fn confirm_oldest_pending(&mut self, seq: u64) {
-        let Some((thread, index)) = self.pending_sends.pop_front() else {
+        let Some(thread) = self.pending_sends.pop_front() else {
+            return;
+        };
+        let Some(index) = self.oldest_unconfirmed(thread) else {
             return;
         };
         if let Some(env) = self
@@ -174,23 +191,19 @@ impl PartyServerConn {
     /// message was delivered that the server never stored, and nothing later
     /// corrects them.
     fn retract_oldest_pending(&mut self) -> bool {
-        let Some((thread, index)) = self.pending_sends.pop_front() else {
+        let Some(thread) = self.pending_sends.pop_front() else {
             return false;
         };
-        let Some(list) = self.messages.get_mut(&thread) else {
+        let Some(index) = self.oldest_unconfirmed(thread) else {
             return false;
         };
-        if index >= list.len() {
-            return false;
-        }
-        list.remove(index);
-        // Every later pending index in the same thread shifts down by one.
-        for (t, i) in self.pending_sends.iter_mut() {
-            if *t == thread && *i > index {
-                *i -= 1;
+        match self.messages.get_mut(&thread) {
+            Some(list) => {
+                list.remove(index);
+                true
             }
+            None => false,
         }
-        true
     }
 
     /// Offer a chunked upload and hold its bytes until the server accepts.
@@ -1749,6 +1762,43 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|e| e.contains("locked")));
+    }
+
+    /// A history page landing between a send and its reply must not misdirect
+    /// that reply. The page merges into the same vector and re-sorts it, so any
+    /// position recorded at send time is stale by the time the answer arrives —
+    /// which used to stamp the sequence onto, or delete, somebody else's
+    /// message.
+    #[test]
+    fn a_history_page_between_a_send_and_its_reply_does_not_misdirect_it() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let peer = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        mgr.post(id, channel, "mine".to_string()).unwrap();
+
+        // Durable history arrives first and is merged ahead of the unconfirmed
+        // send, moving it to the end of the vector.
+        tx.send(Incoming::Response(PartyResponse::History(vec![
+            envelope(channel, peer, 1, "older"),
+            envelope(channel, peer, 2, "newer"),
+        ])))
+        .unwrap();
+        tx.send(Incoming::Response(PartyResponse::ActionFailed {
+            channel,
+            reason: "this channel is locked".to_string(),
+        }))
+        .unwrap();
+        mgr.poll_events();
+
+        let msgs = &mgr.server(id).unwrap().messages[&channel];
+        assert_eq!(msgs.len(), 2, "only the refused send is removed");
+        assert!(
+            msgs.iter().all(|e| e.sender == peer),
+            "the peer's history survived; the local send was the one retracted"
+        );
     }
 
     /// Content addressing is the integrity check. Matching on the hash the

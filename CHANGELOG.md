@@ -11,6 +11,48 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rejected Community file upload no longer leaves its partial bytes in the
+  server.** A client could finish an incomplete upload, make the connection
+  forget its id, and leave the server retaining the partial file until restart.
+  Failed uploads now always release their spool.
+- **LAN discovery now has a fixed peer limit.** mDNS announcements are
+  unauthenticated local-network input; a flood can no longer grow the shared
+  peer list without bound.
+- **The Linux desktop release job now retries bounded package installation.** A
+  stalled package mirror fails visibly instead of occupying the release runner
+  until its job-wide timeout.
+- **The declared minimum Rust version was wrong.** `rust-version` said 1.86
+  while the dependency tree had moved on to 1.89 — `cargo check --workspace` on
+  1.86 is refused outright. Nothing in CI built on the declared version, so the
+  promise had gone stale unnoticed and the first person to find out would have
+  been someone building from source. Corrected to 1.89, which is verified.
+
+### Added
+
+- **An `msrv` CI job that builds the workspace on the declared
+  `rust-version`.** It reads the version out of `Cargo.toml` rather than
+  repeating it, so the check cannot drift from the promise it is checking. This
+  is what the two corrections above needed and did not have: one comment claimed
+  a dependency broke the MSRV when it did not, and the manifest claimed an MSRV
+  the tree no longer met.
+
+### Security
+
+- **Identity-proof packets now reject trailing bytes.** The authenticated
+  handshake has one valid byte representation for each proof, including before
+  a peer has been trusted.
+
+### Dependencies
+
+- Updated `x25519-dalek` to 3.0 and use its OS-randomness API, removing the
+  incompatible `rand_core` boundary and unifying Curve25519 on version 5.
+- Updated `rusqlite` to 0.40. It had been pinned to 0.39 by a comment claiming
+  0.40's `libsqlite3-sys` needed unstable `cfg_select`; that build script defines
+  its own `cfg_select!` macro to keep its MSRV low, so the pin was guarding
+  against nothing.
+
 ## [1.16.2] - 2026-08-20
 
 > **Security release.** Fixes a flaw that let someone sending you a file hide

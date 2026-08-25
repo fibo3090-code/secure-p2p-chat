@@ -156,8 +156,14 @@ where
         // A client that vanished mid-transfer must not pin its spool for the
         // life of the process. Each pending upload can hold up to
         // MAX_PARTY_FILE_BYTES, so this is memory, not just tidiness.
-        if !conn.open_uploads().is_empty() {
-            state.lock().await.cancel_uploads_for(member);
+        // Cancel this connection's ids rather than all of the member's ids:
+        // one person can have multiple devices uploading at once.
+        let uploads = conn.open_uploads().to_vec();
+        if !uploads.is_empty() {
+            let mut st = state.lock().await;
+            for upload in uploads {
+                st.cancel_upload(member, upload);
+            }
         }
         // Presence is per-member but connections are per-device: only go offline
         // once this member's *last* connection is gone, or closing one of two
