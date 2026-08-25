@@ -379,7 +379,7 @@ pub fn negotiate_signature_scheme(
 
 /// Generate ephemeral X25519 keypair for forward secrecy
 pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
-    let secret = EphemeralSecret::random_from_rng(OsRng);
+    let secret = EphemeralSecret::random();
     let public = X25519PublicKey::from(&secret);
     (secret, public)
 }

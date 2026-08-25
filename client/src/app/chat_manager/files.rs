@@ -228,7 +228,7 @@ impl ChatManager {
                 }
                 progress.fetch_add(n as u64, Ordering::Relaxed);
                 sent_chunks += 1;
-                if sent_chunks % 64 == 0 {
+                if sent_chunks.is_multiple_of(64) {
                     tracing::trace!(sent_chunks = %sent_chunks, "File sending progress");
                 }
             }
@@ -751,7 +751,15 @@ impl ChatManager {
             handle.cancel.store(true, Ordering::Relaxed);
         }
         self.active_transfers.remove(&transfer_id);
-        self.incoming_files.remove(&transfer_id);
+        // Dropping the `IncomingFileSync` closes the handle but leaves the
+        // spooled `tmp_<uuid>_<name>` behind. Deleting a conversation mid-receive
+        // is exactly when nobody is left to notice, so the partial file would
+        // sit in the temp directory forever.
+        if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+            if let Err(e) = incoming.abort_cleanup() {
+                tracing::warn!(%transfer_id, error = %e, "Failed to clean up discarded transfer");
+            }
+        }
         self.pending_file_end.remove(&transfer_id);
     }
 

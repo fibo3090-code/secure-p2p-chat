@@ -62,7 +62,14 @@ impl ChatManager {
             if let Some(existing) = self
                 .contacts
                 .values()
-                .find(|c| c.fingerprint.as_deref() == Some(fp))
+                // Case-insensitively, like the self check above: a fingerprint
+                // is hex, so the same peer spelled in a different case is still
+                // the same peer and must not become a second card.
+                .find(|c| {
+                    c.fingerprint
+                        .as_deref()
+                        .is_some_and(|known| known.eq_ignore_ascii_case(fp))
+                })
                 .map(|c| c.id)
             {
                 // Same peer, possibly a fresher address or relay token. Update

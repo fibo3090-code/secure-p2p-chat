@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use bincode::Options;
 use rand::rngs::OsRng;
 use rsa::pss::{SigningKey, VerifyingKey};
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
@@ -72,6 +73,18 @@ where
         Ok(Err(e)) => Err(anyhow!("Receive failed: {}", e)),
         Err(_) => Err(anyhow!("Handshake timeout ({}s)", HANDSHAKE_TIMEOUT_SECS)),
     }
+}
+
+/// Decode an identity proof in exactly the fixed-width bincode format used by
+/// `bincode::serialize`, while refusing bytes after the proof. The proof is
+/// handled before a peer is trusted, so accepting `proof || junk` would give two
+/// wire encodings the same authenticated meaning.
+fn decode_identity_proof(bytes: &[u8]) -> Result<IdentityProof> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("invalid identity proof: {e}"))
 }
 
 fn labeled_aad(label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
@@ -252,7 +265,7 @@ pub async fn run_host_session(
     let client_proof_bytes = cipher
         .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
-    let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    let client_proof = decode_identity_proof(&client_proof_bytes)?;
     if client_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Client used unexpected signature scheme: expected {}, got {}",
@@ -531,7 +544,7 @@ pub async fn run_client_session_multi(
     let host_proof_bytes = cipher
         .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
-    let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    let host_proof = decode_identity_proof(&host_proof_bytes)?;
     if host_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Host used unexpected signature scheme: expected {}, got {}",
@@ -819,7 +832,7 @@ where
     let client_proof_bytes = cipher
         .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
-    let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    let client_proof = decode_identity_proof(&client_proof_bytes)?;
     if client_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Client used unexpected signature scheme: expected {}, got {}",
@@ -926,7 +939,7 @@ where
     let host_proof_bytes = cipher
         .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
-    let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    let host_proof = decode_identity_proof(&host_proof_bytes)?;
     if host_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Host used unexpected signature scheme: expected {}, got {}",
@@ -2200,6 +2213,21 @@ mod tests {
             cipher.decrypt(&encrypted, None).is_none(),
             "identity proof must not decrypt when AAD is stripped"
         );
+    }
+
+    #[test]
+    fn identity_proof_rejects_trailing_bytes() {
+        let proof = IdentityProof {
+            public_key_pem: "test-public-key".to_string(),
+            signature: vec![1, 2, 3, 4],
+            version: PROTOCOL_VERSION as u32,
+            chat_id: uuid::Uuid::new_v4(),
+            signature_scheme: SignatureScheme::RsaPss,
+        };
+        let mut bytes = bincode::serialize(&proof).unwrap();
+        bytes.extend_from_slice(b"unexpected trailing data");
+
+        assert!(decode_identity_proof(&bytes).is_err());
     }
 
     #[test]

@@ -1684,6 +1684,10 @@ impl PartyState {
 
     /// Complete an upload: store the assembled bytes and post the file message.
     /// Returns the envelope to deliver, and whether it was a DM.
+    ///
+    /// Finishing is terminal. A rejection must discard the spool too: otherwise
+    /// a client can repeatedly finish incomplete uploads, while the dispatcher
+    /// has already forgotten their ids, and retain up to the file limit per try.
     pub fn finish_upload(
         &mut self,
         uploader: Uuid,
@@ -1695,6 +1699,7 @@ impl PartyState {
         if pending.uploader != uploader {
             return Err("no such upload".to_string());
         }
+        let pending = self.uploads.remove(&upload).expect("checked above");
         if (pending.data.len() as u64) != pending.declared {
             let short = pending.declared - pending.data.len() as u64;
             return Err(format!(
@@ -1702,7 +1707,6 @@ impl PartyState {
                 messenger_core::util::format_size(short)
             ));
         }
-        let pending = self.uploads.remove(&upload).expect("checked above");
         let target = pending.target;
         let envelope = match target {
             UploadTarget::Channel(channel) => {
@@ -1728,7 +1732,7 @@ impl PartyState {
         }
     }
 
-    /// Drop every upload belonging to `member` (their connection went away).
+    /// Drop every upload belonging to `member`.
     pub fn cancel_uploads_for(&mut self, member: Uuid) {
         self.uploads.retain(|_, p| p.uploader != member);
     }
@@ -4128,6 +4132,14 @@ mod tests {
         state.upload_chunk(owner, upload, b"abc").unwrap();
         let err = state.finish_upload(owner, upload).unwrap_err();
         assert!(err.contains("incomplete"), "got: {err}");
+        assert!(
+            !state.uploads.contains_key(&upload),
+            "a failed finish must release the partial upload"
+        );
+        assert!(
+            state.upload_chunk(owner, upload, b"def").is_err(),
+            "the discarded upload cannot be revived after finishing"
+        );
     }
 
     /// Everything checkable is checked before a byte moves — otherwise the

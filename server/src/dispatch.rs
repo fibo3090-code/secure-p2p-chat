@@ -410,14 +410,23 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     match state.upload_chunk(member, upload, &data) {
                         Ok(()) => Dispatch::default(),
                         Err(reason) => {
+                            // A failed chunk terminates this upload. In particular,
+                            // rejecting an oversize chunk must not drop only the
+                            // connection-side id and leave its in-memory spool
+                            // unreachable until the server restarts.
+                            state.cancel_upload(member, upload);
                             conn.uploads.retain(|u| *u != upload);
                             Dispatch::reply(PartyResponse::Error(reason))
                         }
                     }
                 }
                 PartyRequest::FinishUpload { upload } => {
+                    let result = state.finish_upload(member, upload);
+                    // `FinishUpload` is terminal whether it succeeds or fails.
+                    // Update the connection only after the state transition, so
+                    // disconnect cleanup can never lose track of a retained spool.
                     conn.uploads.retain(|u| *u != upload);
-                    match state.finish_upload(member, upload) {
+                    match result {
                         Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
                         Ok((env, UploadTarget::Dm(to))) => Dispatch {
                             replies: vec![PartyResponse::MessagePosted {
@@ -940,5 +949,47 @@ mod tests {
             },
         );
         assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
+    }
+
+    #[test]
+    fn failed_finish_discards_the_upload_from_state_and_connection() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        let member = joined_id(&mut state, &mut conn, "alice");
+        let channel = state.default_channel();
+
+        let ready = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::StartUpload {
+                name: "partial.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                size: 8,
+                target: UploadTarget::Channel(channel),
+            },
+        );
+        let upload = match ready.replies.as_slice() {
+            [PartyResponse::UploadReady { upload, .. }] => *upload,
+            other => panic!("expected UploadReady, got {other:?}"),
+        };
+        handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::UploadChunk {
+                upload,
+                data: b"half".to_vec(),
+            },
+        );
+
+        let failed = handle_request(&mut state, &mut conn, PartyRequest::FinishUpload { upload });
+        assert!(matches!(
+            failed.replies.as_slice(),
+            [PartyResponse::ActionFailed { reason, .. }] if reason.contains("incomplete")
+        ));
+        assert!(conn.open_uploads().is_empty());
+        assert!(
+            state.upload_chunk(member, upload, b"rest").is_err(),
+            "the rejected upload must not stay reachable through PartyState"
+        );
     }
 }

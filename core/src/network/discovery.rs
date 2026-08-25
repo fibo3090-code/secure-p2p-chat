@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 
 /// Service type for mDNS discovery. Follows Zeroconf naming conventions.
 const SERVICE_TYPE: &str = "_p2p-messenger._tcp.local.";
+/// mDNS is unauthenticated LAN input. Keep its responder-controlled peer list
+/// bounded so a burst of forged service announcements cannot grow the UI's
+/// shared discovery state without limit.
+const MAX_DISCOVERED_PEERS: usize = 256;
 
 /// Information about a discovered peer on the local network.
 #[derive(Debug, Clone)]
@@ -54,6 +58,23 @@ pub struct Discovery {
 /// neither test.
 fn service_txt_properties() -> HashMap<String, String> {
     HashMap::new()
+}
+
+/// Insert a newly resolved endpoint unless it is already represented or the
+/// bounded discovery cache is full. The cap is deliberately checked only after
+/// duplicate detection, so a legitimate re-announcement never consumes capacity.
+fn merge_resolved(peers: &mut Vec<DiscoveredPeer>, peer: DiscoveredPeer) -> bool {
+    if peers.iter().any(|known| {
+        known.fullname == peer.fullname
+            || (known.address == peer.address && known.port == peer.port)
+    }) {
+        return false;
+    }
+    if peers.len() >= MAX_DISCOVERED_PEERS {
+        return false;
+    }
+    peers.push(peer);
+    true
 }
 
 impl Discovery {
@@ -157,16 +178,7 @@ impl Discovery {
                         );
 
                         if let Ok(mut peers) = discovered_peers.lock() {
-                            // Avoid duplicates
-                            // Keyed on the service name as well as the endpoint:
-                            // one host can advertise twice, and re-resolving an
-                            // existing service must not duplicate it.
-                            if !peers.iter().any(|p| {
-                                p.fullname == peer.fullname
-                                    || (p.address == peer.address && p.port == peer.port)
-                            }) {
-                                peers.push(peer);
-                            }
+                            let _ = merge_resolved(&mut peers, peer);
                         }
                     }
                 }
@@ -247,6 +259,29 @@ mod tests {
             vec!["laptop", "desktop"],
             "only the peer that actually left may be removed"
         );
+    }
+
+    #[test]
+    fn discovery_cache_has_a_hard_peer_limit() {
+        let mut peers: Vec<_> = (0..MAX_DISCOVERED_PEERS)
+            .map(|i| DiscoveredPeer {
+                name: format!("peer-{i}"),
+                address: format!("192.0.2.{}", i + 1),
+                port: 12345,
+                fingerprint: None,
+                fullname: format!("peer-{i}._p2p-messenger._tcp.local."),
+            })
+            .collect();
+        let extra = DiscoveredPeer {
+            name: "extra".to_string(),
+            address: "198.51.100.1".to_string(),
+            port: 12345,
+            fingerprint: None,
+            fullname: "extra._p2p-messenger._tcp.local.".to_string(),
+        };
+
+        assert!(!merge_resolved(&mut peers, extra));
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
     }
 
     /// The TXT record must not carry identity. Discovery answers "something is

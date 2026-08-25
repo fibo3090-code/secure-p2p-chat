@@ -514,14 +514,9 @@ async fn host_flow(
         // them here too before deciding the map is full — otherwise a burst of
         // abandoned hosts would lock out legitimate ones for five minutes.
         guard.retain(|_, entry| entry.created_at.elapsed() <= wait_timeout);
-        if guard.len() >= MAX_PENDING_RENDEZVOUS {
-            send_relay_message(
-                &mut stream,
-                &RelayResponse::Error("Relay is at capacity, try again shortly".to_string()),
-            )
-            .await?;
-            bail!("relay rendezvous table is full ({MAX_PENDING_RENDEZVOUS} slots)");
-        }
+        // Duplicate token first: a host re-registering a token that is still in
+        // use should hear *that*, not "at capacity", which sends them off
+        // debugging the relay's load instead of their own duplicate.
         if guard.contains_key(&token) {
             send_relay_message(
                 &mut stream,
@@ -529,6 +524,14 @@ async fn host_flow(
             )
             .await?;
             bail!("Relay token already in use");
+        }
+        if guard.len() >= MAX_PENDING_RENDEZVOUS {
+            send_relay_message(
+                &mut stream,
+                &RelayResponse::Error("Relay is at capacity, try again shortly".to_string()),
+            )
+            .await?;
+            bail!("relay rendezvous table is full ({MAX_PENDING_RENDEZVOUS} slots)");
         }
         guard.insert(
             token.clone(),
@@ -540,11 +543,27 @@ async fn host_flow(
     }
 
     send_relay_message(&mut stream, &RelayResponse::Waiting).await?;
+    let waiting_since = Instant::now();
 
     let (mut peer_stream, joiner_caps) =
         match tokio::time::timeout(wait_timeout, rendezvous_rx).await {
             Ok(Ok(paired)) => paired,
-            Ok(Err(_)) => bail!("Relay joiner dropped before pairing"),
+            // The sender went away without pairing us. Either the joiner's task
+            // dropped mid-handshake, or another host's sweep removed our slot
+            // because it had aged out — in which case this is the timeout,
+            // reported from a different branch. Tell the host either way: the
+            // connection used to just close, so an expired relay looked
+            // identical to a broken one from the client side.
+            Ok(Err(_)) => {
+                pending.lock().await.remove(&token);
+                let reason = if waiting_since.elapsed() >= wait_timeout {
+                    "Relay wait timed out"
+                } else {
+                    "Relay joiner dropped before pairing"
+                };
+                send_relay_message(&mut stream, &RelayResponse::Error(reason.to_string())).await?;
+                bail!("{reason}");
+            }
             Err(_) => {
                 let mut guard = pending.lock().await;
                 guard.remove(&token);

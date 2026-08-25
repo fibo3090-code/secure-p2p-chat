@@ -758,7 +758,14 @@ impl ChatManager {
         self.outgoing_transfers.clear();
         self.pending_file_sends.clear();
         self.active_transfers.clear();
-        self.incoming_files.clear();
+        // Same reason as `clear_transfer_bookkeeping`: dropping the receivers
+        // closes their handles but strands the spooled temp files on disk, and
+        // this path exists precisely to leave nothing behind.
+        for (transfer_id, incoming) in self.incoming_files.drain() {
+            if let Err(e) = incoming.abort_cleanup() {
+                tracing::warn!(%transfer_id, error = %e, "Failed to clean up transfer while clearing data");
+            }
+        }
         self.pending_file_end.clear();
         self.pending_text_sends.clear();
         self.awaiting_ack.clear();
