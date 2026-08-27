@@ -222,6 +222,34 @@ fn read_range(path: &Path, offset: u64, len: Option<usize>) -> Option<Vec<u8>> {
     }
 }
 
+/// Remove staging files left by an upload that did not survive to its rename.
+///
+/// [`STAGING_PREFIX`] notes that an orphan is *inert* — nothing enumerates this
+/// directory, so it cannot be mistaken for a blob. That is true and it is not
+/// the whole cost: the bytes are still on the disk, up to `MAX_PARTY_FILE_BYTES`
+/// of them per crash, and the storage accounting cannot see them because it sums
+/// `PartyState::blobs` rather than the directory. An operator's ceiling then
+/// silently stops meaning what it says. Swept at startup, which is the one
+/// moment no upload can be staging.
+fn sweep_staging_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if !name.starts_with(STAGING_PREFIX) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => tracing::info!(file = %name, "removed an interrupted upload's staging file"),
+            Err(e) => {
+                tracing::warn!(error = %e, file = %name, "could not remove a staging file")
+            }
+        }
+    }
+}
+
 /// A completed upload taken out of the state so its bytes can be hashed and
 /// written with the lock released. See [`PartyState::take_upload`].
 pub struct TakenUpload {
@@ -621,6 +649,7 @@ impl PartyState {
         std::fs::create_dir_all(data_dir)?;
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
+        sweep_staging_files(&blob_dir);
         let conn = Connection::open(data_dir.join(DB_FILE))?;
         init_schema(&conn)?;
 
@@ -5509,6 +5538,32 @@ mod tests {
         // Committing moved the staging file rather than copying it.
         assert!(dir.path().join(BLOB_DIR).join(&hash).exists());
         assert!(!staged_path.exists());
+    }
+
+    /// An upload killed between staging and its rename leaves a file behind.
+    /// It is inert — nothing looks it up — but it is not free: the bytes stay on
+    /// disk and the storage accounting sums `blobs`, not the directory, so the
+    /// operator's ceiling quietly stops bounding what is actually stored.
+    #[test]
+    fn an_interrupted_upload_staging_file_is_swept_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _ = PartyState::load("Srv", None, dir.path()).unwrap();
+        }
+        let blob_dir = dir.path().join(BLOB_DIR);
+        let orphan = blob_dir.join(format!("{STAGING_PREFIX}6f1e-abandoned"));
+        std::fs::write(&orphan, b"interrupted").unwrap();
+        // A real blob must survive the sweep.
+        let keep = blob_dir.join("deadbeef");
+        std::fs::write(&keep, b"real").unwrap();
+
+        let _ = PartyState::load("Srv", None, dir.path()).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "the interrupted staging file must be swept"
+        );
+        assert!(keep.exists(), "a stored blob must not be");
     }
 
     /// A member who loses the right to post while their bytes are being written

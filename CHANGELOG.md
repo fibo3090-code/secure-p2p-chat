@@ -57,7 +57,10 @@ attacked; several of these change what happens to one who is.
   turned into a 3-byte replacement character, so the cap bounded the wire and not
   the memory: 512 chunks of junk held about 72 MiB for one message against a
   documented ceiling of roughly 24 MiB. Invalid text is now refused. No
-  legitimate sender can produce it.
+  legitimate sender can produce it. Applies to the legacy `TEXT:` frame as well
+  as the current binary one — that arm keeps its decoded string, so it had the
+  same expansion, while the other legacy arms parse to a number and drop the
+  string.
 - **Community frames could be padded without changing their meaning.** bincode
   stops at the end of a value and ignores whatever follows, so `frame` and
   `frame || junk` decoded identically. Trailing bytes are now rejected; the wire
@@ -116,7 +119,20 @@ attacked; several of these change what happens to one who is.
   retry.
 - **Playwright's browser install was the one unbounded network step in CI**, and
   carried a comment claiming nothing there touched the network. It downloads a
-  browser and shells out to `apt` as root. Bounded and retried like the others.
+  browser and shells out to `apt` as root. Bounded and retried like the others —
+  portably, because unlike the `apt` steps this one runs on all three platforms
+  and macOS ships no GNU `timeout`, with a step-level `timeout-minutes` as the
+  backstop that needs no coreutils at all.
+- **The release workflow now refuses to run against an already-published
+  release.** Everything after the build acts on a page it expects to be a draft;
+  against a published one it would replace live assets before their digests were
+  verified, and a failed verification would leave those replacements up — the
+  same shape as the bug the job exists to prevent.
+- **An interrupted upload no longer strands its bytes on disk permanently.** A
+  staging file orphaned by a crash is inert — nothing looks it up — but it still
+  occupies the disk, and the storage ceiling is computed from the recorded blobs
+  rather than the directory, so the operator's limit quietly stopped bounding
+  what was actually stored. Swept at startup.
 - **The release workflow's own package install was still unbounded.** CI's three
   `apt` blocks were wrapped in a bounded retry for a reason that applies at least
   as strongly here: a stalled mirror otherwise sits in this step until the job
@@ -188,7 +204,11 @@ attacked; several of these change what happens to one who is.
 - The JS↔Rust invoke-argument contract check parses every call site or fails
   saying which it could not read. It previously skipped anything its regex could
   not match — nested objects, computed names — silently, with a test whose only
-  guard was "more than 40 calls were checked".
+  guard was "more than 40 calls were checked". A nested call is reported rather
+  than skipped, and the bridge assertion is checked against a count taken from
+  the *raw* source as well — the scanner and its counter previously shared a
+  comment stripper, so a stripper bug shrank both sides together and the equality
+  still held.
 
 ## [1.16.2] - 2026-08-20
 

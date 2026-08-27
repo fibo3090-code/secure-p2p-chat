@@ -245,18 +245,48 @@ recipient and per epoch (say, per UTC day),
 deposit_id = HKDF(shared_secret_with_recipient, "p2pem-deposit-v1" || epoch)
 ```
 
-and puts that in the envelope. It is stable within an epoch, so the server can
-count deposits against it and can address a TTL-expiry notice to it. It is
-unlinkable across epochs and across recipients, and it is derived from a secret
-the server does not have, so it names nobody: the operator learns "some sender
-deposited eleven times today for this recipient", not who.
+and puts that in the envelope. It is unlinkable across epochs and across
+recipients, and it is derived from a secret the server does not have, so it names
+nobody: the operator learns "the same party deposited eleven times today for this
+recipient", not who they are.
 
-This is weaker than sealed sender and it is stated as weaker. What it costs is
-listed in §4.3 and belongs in `SECURITY.md`; what it buys is that R5.2 and R4.4
-become implementable in stage 2 instead of blocking on a subsystem nobody has
-scheduled. R3.1 is restated to match — the envelope must not carry a *long-term*
-identity — and delivery tokens stay the documented upgrade path, to be taken
-whenever the token subsystem is worth building.
+⚠️ **It is not server-verifiable, and that limits what it can be used for.** The
+server does not hold the shared secret, so it cannot check that a `deposit_id`
+was honestly derived. A sender who wants to evade a per-pseudonym budget simply
+puts a fresh random value in the field each time. Any requirement that depends on
+the server *enforcing* something per sender therefore cannot rest on this, and
+saying otherwise would be the same mistake as the requirement it replaces —
+stating something the design cannot do. So, precisely:
+
+| Wanted | Rests on | Enforceable now? |
+|---|---|---|
+| Rate-limit deposits (R5.2) | recipient address + source IP, both of which the server can see and check | **Yes** |
+| Rate-limit *per sender* | a token the server can verify without identifying | **No** — needs delivery tokens (stage 6) |
+| Report TTL expiry (R4.4) | the pseudonym, as a return address | **Yes** — see below |
+
+Per-*sender* limiting is the one that needs the token subsystem, and R5.2 is
+reworded to ask for what a blind server can actually do: cap deposits per
+recipient mailbox and per source address. Those bound the abuse that matters
+(filling someone's mailbox, and flooding the server) without needing to know who
+is doing it. A sender-specific budget waits for stage 6, and the requirement says
+so rather than implying it is met.
+
+For R4.4 the pseudonym is enough, because forging it is self-defeating. It is a
+**return address, not a credential**: the server files an expiry notice under the
+`deposit_id` the deposit carried, and the sender collects it by polling for that
+id over the same fetch endpoint it uses for its own mailbox. An unknown id
+returns nothing, and a sender who invents ids simply never collects notices for
+its own messages. Knowing the id *is* the authentication — it is derived from a
+secret only the two parties hold — so no separate credential and no push channel
+is needed. What the server learns is that somebody asked about an id it holds a
+notice for, which is the same linkability §4.3 already accounts for.
+
+This is all weaker than sealed sender and it is stated as weaker. What it costs
+is listed in §4.3 and belongs in `SECURITY.md`; what it buys is that R4.4 and a
+meaningful part of R5.2 become implementable in stage 2 instead of blocking on a
+subsystem nobody has scheduled. R3.1 is restated to match — the envelope must not
+carry a *long-term* identity — and delivery tokens stay the documented upgrade
+path, to be taken whenever the token subsystem is worth building.
 
 Constraints that have to be designed in, not bolted on: a per-recipient storage
 cap, a TTL after which undelivered messages are dropped, and a size cap well
@@ -572,7 +602,7 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 | R1.7 | Async **first contact** `MUST` be disallowed by default. Establishing a contact once — live, or by invite plus verification — and allowing asynchronous messaging thereafter keeps today's trust model intact at almost no cost. Enabling it `MUST` be a deliberate setting. |
 | R1.8 | A prekey bundle whose identity key does not match a **pinned** fingerprint for that contact `MUST` be refused outright — no prompt, no fallback to first-use trust. The refusal `MUST` be attributed to a *changed key*, not reported as a delivery failure, and `MUST` offer re-verification (R1.9). Refusing silently and refusing permanently are different things; only the first is wanted. |
 | R1.9 | Identity **rotation** `MUST` be a supported operation, not an accident. A contact whose identity key changes `MUST` land in an explicit "safety number changed" state — R1.2's "delivered but unverified", carrying the reason — from which the user can re-verify out of band and re-pin. Without this, R1.8's hard refusal makes a compromised key a permanent loss of *every* contact: the one user who most needs to rotate is the one who has just been compromised, and under R1.8 alone rotating makes them unreachable forever. |
-| R1.10 | Rotation `MUST` be signed by the key being retired where that key is still available (so an ordinary rotation is verifiable without out-of-band contact), and `MUST` fall back to out-of-band re-verification where it is not (the compromise case, where the old key cannot be trusted to speak). Both paths `MUST` be distinguishable in the UI, because they carry different assurance. |
+| R1.10 | Rotation `SHOULD` be signed by the key being retired, and that signature `MUST` be treated as **evidence, not authorization**. ⚠️ The distinction is the whole requirement. A signature from the retired key proves control of that key — and in the case rotation exists for, an attacker *has* that key, so "signed by the old key" is exactly what a hostile rotation looks like too. It may therefore raise confidence in a routine rotation (a planned key change, a device migration) and `MUST NOT` on its own authorise one. Authorisation comes from out-of-band re-verification (R1.9) whenever the retired key may be compromised, and the user `MUST` be told which of the two happened, because they carry different assurance and only one of them is a MITM defence. |
 | R1.11 | A **revocation** — "this identity is burned, refuse it" — `MUST` be expressible and `MUST` be honoured even when no replacement key is offered. |
 | R1.12 | Under §4.6 option 1 (one identity key, all devices), adding a device `MUST NOT` change the identity key, so it `MUST NOT` trigger R1.9. Rotation and enrolment are different events and must not present as the same one. |
 | R1.4 | `known_trusted` `MUST NOT` be widened to auto-accept a fingerprint on the strength of a mailbox delivery. An invite link is not verification; neither is a message arriving. |
@@ -608,16 +638,17 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 |---|---|
 | R4.1 | An operator dropping messages `MUST` be **detectable** — an authenticated per-conversation sequence number inside the ciphertext, as `FrameSeq` already does for party frames. |
 | R4.2 | Replayed mailbox entries `MUST` be rejected — **including the initial message on the SPK-only path**, which is the case the in-ciphertext sequence number does not cover. X3DH's initial message is replayable whenever no one-time prekey is consumed: the recipient re-derives the identical `SK` from identical inputs, so an operator can re-deliver the first sealed entry and it decrypts again. R2.9 (destroy the private OPK at first use) removes the ordinary path; the fallback path needs R4.2a. See §4.4a. |
-| R4.2a | The initial message `MUST` carry a random `initial_id`, and the recipient `MUST` keep a bounded, TTL-aged set of the ones it has accepted, per sender identity. This is durable state, which R5.5 evicts and a reinstall destroys — deliberately bounded so that losing it costs at most one accepted replay of a pre-reinstall message, which is a visible duplicate rather than a decryption the attacker could not otherwise obtain. |
+| R4.2a | The initial message `MUST` carry a random `initial_id`, and the recipient `MUST` keep a bounded set of the ones it has accepted, per sender identity. ⚠️ **Those tombstones `MUST` outlive the mailbox TTL, and `MUST` be bounded by the signed prekey's acceptance window instead.** Ageing them out on the mailbox TTL does not work: an operator who kept a copy of the ciphertext simply re-submits it after the tombstone expires, the SPK-only path re-derives the identical `SK`, and the message is accepted again — R4.2 violated by waiting. The SPK window is the right bound because it is what actually ends the replay: once the recipient stops accepting that signed prekey, the old initial message cannot derive a usable key at all. A reinstall still destroys the set; the cost is bounded at one accepted replay of a pre-reinstall message, which is a visible duplicate rather than a decryption the attacker could not otherwise obtain. |
 | R4.3 | Out-of-order collection `MUST NOT` lose messages or wedge a session. |
-| R4.4 | A message the sender believes was delivered `MUST NOT` be silently lost by mailbox eviction; TTL expiry `MUST` be reported to the sender — addressed by the R3.1 deposit pseudonym, which is what makes "report to the sender" a thing the server can do at all without learning who the sender is. A design in which the server cannot address the sender `MUST NOT` claim this requirement. |
+| R4.4 | A message the sender believes was delivered `MUST NOT` be silently lost by mailbox eviction; TTL expiry `MUST` be reported to the sender. The **retrieval path `MUST` be specified**, not assumed: the server files the notice under the `deposit_id` the deposit carried, and the sender collects it by polling that id over the same fetch endpoint it already uses — no push channel, no callback, no separate credential, because knowing the id *is* the authentication (it is derived from a secret only the two parties hold). An unknown id returns nothing. A design in which the server cannot address the sender, or in which no defined channel carries the notice, `MUST NOT` claim this requirement. |
 
 ### R5 — Abuse resistance
 
 | | Requirement |
 |---|---|
 | R5.1 | Per-recipient storage `MUST` be capped, as `MAX_MEMBER_BLOB_BYTES` already caps party storage and for the same reason. |
-| R5.2 | Deposits `MUST` be rate-limited per deposit pseudonym (R3.1) and per IP, reusing `network::ratelimit`. "Per sender" is not implementable against an envelope that names nobody; the pseudonym is the unit that is both countable and non-identifying. Note the limiter's own precondition: it must canonicalise IPv4-mapped IPv6 before masking, or every IPv4 client on a dual-stack listener shares one bucket. |
+| R5.2 | Deposits `MUST` be rate-limited per **recipient mailbox** and per **source IP**, reusing `network::ratelimit`. Both are values the server can see and check, so both are enforceable against a blind envelope, and together they bound the abuse that matters: filling one person's mailbox, and flooding the server. Note the limiter's own precondition: it must canonicalise IPv4-mapped IPv6 before masking, or every IPv4 client on a dual-stack listener shares one bucket. |
+| R5.2a | Rate limiting **per sender** `MUST NOT` be claimed until delivery tokens exist (stage 6). ⚠️ An earlier revision of R5.2 rested it on the R3.1 deposit pseudonym; that does not work, and the reason is worth keeping. The pseudonym is derived from a secret the *server does not hold*, so the server cannot check that any given value was honestly derived — a sender who wants more than their budget puts a fresh random value in the field each time and the limit never binds. A pseudonym is usable as a return address (R4.4), where forging it costs the forger their own notice; it is not usable as a budget, where forging it costs the victim. Anything the server must *enforce* per sender needs a token the server can verify without learning who holds it. |
 | R5.3 | Deliberate one-time-prekey exhaustion by an attacker `MUST NOT` degrade a victim's secrecy silently — see R2.6. |
 | R5.3a | Prekey **bundle fetches** `MUST` be rate-limited, per requester and per target. Nothing previously limited them, which made draining a victim's one-time prekeys a free, unauthenticated `GET` loop; after it, every first message to that victim falls back to SPK-only and R2.5's first-message forward secrecy is gone for as long as the attacker keeps the batch empty. R5.3 only asked that the downgrade be *visible*, and visible is not prevented. |
 | R5.3b | The one-time prekey batch `MUST` be replenished automatically while the client is online, and exhaustion `MUST` be surfaced to the *victim* as a probable attack rather than only to the sender as a downgrade. |
@@ -709,12 +740,17 @@ into the wire format:
   `SECURITY.md` **and** in the plain-terms table rather than designed away, and
   rotation as stage 6, which re-derives those two requirements. §4.3.
 - **Q7 — Sender anonymity versus rate limiting and TTL reporting.** A **per-epoch
-  deposit pseudonym**, not full sealed sender. R3.1 as originally written was
-  unsatisfiable alongside R5.2 and R4.4: a server that cannot distinguish senders
-  can neither count them nor address them. Blind-signed delivery tokens are the
-  right long-term answer and are a subsystem this plan does not schedule; the
-  pseudonym makes both requirements implementable in stage 2, at a cost stated in
-  §4.2 and §4.3. Decide it before the envelope is written, because it is a field.
+  deposit pseudonym** for addressing, and rate limits on what the server can
+  actually check. R3.1 as originally written was unsatisfiable alongside R5.2 and
+  R4.4: a server that cannot distinguish senders can neither count them nor
+  address them. The split is by *who bears the cost of forging the field*: as a
+  **return address** (R4.4) a forged pseudonym costs only the forger their own
+  expiry notice, so the pseudonym is enough; as a **budget** (R5.2) a forged
+  pseudonym costs the victim, and since the server cannot verify the derivation
+  it is worth nothing there. So per-sender limiting waits for blind-signed
+  delivery tokens (stage 6), and R5.2 asks instead for per-recipient and per-IP
+  limits, which a blind server can enforce today. §4.2. Decide it before the
+  envelope is written, because it is a field.
 - **Q8 — Identity rotation and revocation.** **In scope, as R1.9–R1.12.** R1.8's
   hard refusal is right against MITM and, on its own, makes a compromised key a
   permanent loss of every contact — the user who most needs to rotate is the one

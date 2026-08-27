@@ -15,6 +15,7 @@ import {
     parseInvokeCalls,
     scanInvokeCalls,
     countInvokeSites,
+    countRawInvokeSites,
     parseRustCommands,
     contractProblems,
 } from "./invokeContract.js";
@@ -129,6 +130,14 @@ describe("parseInvokeCalls", () => {
         expect(unparsed).toHaveLength(1);
         expect(unparsed[0].reason).toMatch(/not a string literal/);
     });
+    it("counts raw occurrences separately from live ones", () => {
+        const source = [
+            '// invoke("removed_command")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(countRawInvokeSites(source)).toBe(2);
+    });
 });
 
 describe("parseRustCommands", () => {
@@ -203,6 +212,18 @@ describe("the real bridge", () => {
         ).toEqual([]);
         expect(calls.length).toBe(countInvokeSites(bridgeSource));
         expect(calls.length).toBeGreaterThan(40);
+
+        // …and against the *raw* text as well, which is the half the stripper
+        // cannot influence. `countInvokeSites` above shares `stripComments` with
+        // the scanner, so a stripper bug shrinks both sides together and the
+        // equality still holds — the regex-literal bug did exactly that.
+        // `bridge.js` contains no commented-out or quoted `invoke(`, so the two
+        // counts must agree; if someone adds one, this fails and says so rather
+        // than quietly checking one call fewer.
+        expect(
+            calls.length,
+            "a call site in bridge.js is being skipped, or a commented-out one was added",
+        ).toBe(countRawInvokeSites(bridgeSource));
 
         const commands = parseRustCommands(rustSource);
         expect(commands.length).toBeGreaterThan(40);

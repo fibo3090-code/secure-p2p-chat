@@ -383,7 +383,13 @@ impl ProtocolMessage {
             if b.len() > crate::MAX_TEXT_MESSAGE_BYTES {
                 return None;
             }
-            let s = String::from_utf8_lossy(&b[5..]);
+            // Strict, like the binary arm, and for the same reason: this branch
+            // *keeps* its decoded string, so lossy decoding here would let a
+            // legacy `TEXT:1:` frame of `0xFF` bytes pass the wire check and
+            // then hold roughly three times the cap. The other legacy arms parse
+            // their string into a `u64` and drop it, so they are bounded by the
+            // parse; this one is not. See `decode_text`.
+            let s = decode_text(&b[5..])?;
             let parts: Vec<&str> = s.splitn(2, ':').collect();
             if parts.len() == 2 {
                 let seq = parts[0].parse::<u64>().ok()?;
@@ -688,11 +694,12 @@ impl ProtocolMessage {
 /// meaning nothing.
 ///
 /// Every invalid byte becomes U+FFFD, which is **three** bytes. So a `Text`
-/// frame declaring 65,557 bytes of `0xFF` passed the `MAX_TEXT_MESSAGE_BYTES`
-/// check on the way in, decoded to a 196,629-byte `String`, and then failed to
-/// re-encode within the same cap: the decoder accepted a value its own encoder
-/// cannot produce, which is what `core/fuzz/fuzz_targets/protocol_frame.rs`
-/// asserts is impossible.
+/// frame carrying a 65,536-byte payload of `0xFF` — 65,557 bytes on the wire,
+/// once the 21-byte header is counted — passed the `MAX_TEXT_MESSAGE_BYTES`
+/// check on the way in, decoded to a 196,608-byte `String`, and then failed to
+/// re-encode within the same cap: 196,629 bytes back on the wire, three times
+/// over. The decoder accepted a value its own encoder cannot produce, which is
+/// what `core/fuzz/fuzz_targets/protocol_frame.rs` asserts is impossible.
 ///
 /// The practical consequence was a memory bound that was out by 3×.
 /// `MAX_TEXT_MESSAGE_BYTES` and `TEXT_CHUNK_BYTES` bound *wire* bytes; with

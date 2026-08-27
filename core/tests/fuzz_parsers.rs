@@ -408,6 +408,36 @@ mod lossy_utf8_broke_the_wire_caps {
         );
     }
 
+    /// The **legacy** `TEXT:` arm too. `from_plain_bytes` falls through to the
+    /// ASCII-prefixed format when the binary tag does not match, and `T` (0x54)
+    /// is not a binary tag — so this branch is reachable from the wire, it keeps
+    /// its decoded string, and it had the same 3x expansion. The other legacy
+    /// arms parse into a `u64` and drop the string, so they are bounded by the
+    /// parse rather than by the cap.
+    #[test]
+    fn a_legacy_text_frame_of_invalid_utf8_is_refused() {
+        let mut frame = b"TEXT:1:".to_vec();
+        frame.extend(std::iter::repeat_n(
+            0xFFu8,
+            MAX_TEXT_MESSAGE_BYTES - frame.len(),
+        ));
+        assert_eq!(frame.len(), MAX_TEXT_MESSAGE_BYTES, "at the wire cap");
+        assert!(
+            ProtocolMessage::from_plain_bytes(&frame).is_none(),
+            "the legacy arm must refuse invalid UTF-8 too"
+        );
+
+        // …and still accepts a legitimate legacy frame.
+        let ok = ProtocolMessage::from_plain_bytes(b"TEXT:7:hello").expect("valid legacy frame");
+        match ok {
+            ProtocolMessage::Text { text, seq, .. } => {
+                assert_eq!(text, "hello");
+                assert_eq!(seq, 7);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
     /// The bound that was actually wrong: the reassembly budget. With lossy
     /// decoding, `MAX_TEXT_CHUNKS` frames of `TEXT_CHUNK_BYTES` decoded to three
     /// times the documented ceiling.

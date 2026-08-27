@@ -269,7 +269,17 @@ export function scanInvokeCalls(source) {
             continue;
         }
         // Re-scan from past this call, so a nested `invoke(` inside it is not
-        // matched twice.
+        // matched twice — but *report* any it contained rather than skipping
+        // them. Advancing past the argument list silently put a nested call in
+        // neither `calls` nor `unparsed`, which is the exact failure mode this
+        // scanner exists to prevent. `bridge.js` has none today; if one appears
+        // it must be a loud failure, not a quiet omission.
+        for (const _nested of args.text.slice(1).match(/\binvoke\s*\(/g) ?? []) {
+            unparsed.push({
+                snippet,
+                reason: "a nested invoke( inside an argument list is not checked",
+            });
+        }
         site.lastIndex = args.end;
 
         const inner = args.text.slice(1, -1).trim();
@@ -315,10 +325,26 @@ export function scanInvokeCalls(source) {
     return { calls, unparsed };
 }
 
-/// How many `invoke(` call sites the source contains, counted independently of
-/// whether they could be parsed. The test asserts this equals `calls.length`.
+/// How many *live* `invoke(` call sites the source contains — comments and
+/// string contents excluded — counted independently of whether they could be
+/// parsed.
 export function countInvokeSites(source) {
     return (stripComments(source).match(/\binvoke\s*\(/g) || []).length;
+}
+
+/// How many `invoke(` occurrences the **raw** text contains: comments, strings
+/// and all.
+///
+/// This is the other half of the note on `stripComments`. Sharing the scanner
+/// between the checked set and its count is what let the regex-literal bug hide:
+/// a live call swallowed by the stripper left both one smaller, so the equality
+/// still held and the call went unchecked in silence — "they agreed with each
+/// other about a source neither had seen whole". A count taken from the raw text
+/// cannot agree with a mis-scan, so on a file known to contain no commented-out
+/// or quoted `invoke(` — which `bridge.js` is — it turns that class of bug into
+/// a failing assertion instead of a quieter subject set.
+export function countRawInvokeSites(source) {
+    return (source.match(/\binvoke\s*\(/g) || []).length;
 }
 
 /// The parsed calls, for callers that do not care about the diagnostics.

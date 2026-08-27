@@ -64,8 +64,13 @@ run_one() {
     local corpus="fuzz/corpus/${name}"
     local seeds="fuzz/seeds/${name}"
     mkdir -p "$corpus"
-    if [ -d "$seeds" ]; then
-        cp -n "$seeds"/* "$corpus"/ 2>/dev/null || true
+    # `2>/dev/null || true` here would swallow a real failure — an unreadable
+    # seed, or a corpus directory that is not writable — and the run would then
+    # fuzz from nothing while still reporting "all targets finished cleanly".
+    # The only error worth ignoring is the empty-glob case, which `compgen`
+    # separates out.
+    if [ -d "$seeds" ] && compgen -G "$seeds/*" > /dev/null; then
+        cp -n -- "$seeds"/* "$corpus"/
     fi
 
     echo "── fuzzing ${name} for ${SECONDS_PER_TARGET}s (max_len=${MAX_LEN}) ──────"

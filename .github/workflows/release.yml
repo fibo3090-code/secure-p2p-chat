@@ -153,7 +153,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${GITHUB_REF_NAME} already exists; leaving its notes alone."
+            # An existing release is fine only while it is still a draft.
+            #
+            # Everything downstream assumes it is operating on a page nobody can
+            # see yet. Against a published release, `gh release upload --clobber`
+            # would replace live assets *before* their digests are verified, and
+            # a failed verification would leave those replacements up — the same
+            # shape as the bug this job exists to prevent, acting on a page whose
+            # contents this run did not produce. Refuse rather than tidy up after.
+            is_draft="$(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release ${GITHUB_REF_NAME} is already published."
+              echo "::error::Re-running would clobber published assets before they are verified."
+              echo "::error::Delete the release (or push a new tag) if you intend to rebuild it."
+              exit 1
+            fi
+            echo "Release ${GITHUB_REF_NAME} already exists as a draft; leaving its notes alone."
           else
             gh release create "${GITHUB_REF_NAME}" \
               --repo "${GITHUB_REPOSITORY}" \

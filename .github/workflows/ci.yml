@@ -366,11 +366,35 @@ jobs:
       # skipped entirely when the browser cache above hit.
       - name: Install Playwright Chromium
         shell: bash
+        # The backstop, and the one that needs no coreutils: GitHub kills the
+        # step itself. `bounded` below caps each *attempt* so the retries mean
+        # something; this caps the step whether or not it is available.
+        timeout-minutes: 14
         run: |
           set -uo pipefail
+
+          # macOS runners have no GNU `timeout` — it is coreutils, and BSD
+          # userland does not ship it. Homebrew installs it as `gtimeout`. The
+          # apt blocks elsewhere in this file can assume `timeout` because they
+          # are gated to ubuntu; this step runs on all three platforms, and
+          # assuming it here turned every macOS run of this job into three
+          # instant "failures" and a red check.
+          bounded() {
+            local secs="$1"; shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout -k 30 "$secs" "$@"
+            elif command -v gtimeout >/dev/null 2>&1; then
+              gtimeout -k 30 "$secs" "$@"
+            else
+              # No per-attempt bound available. `timeout-minutes` above still
+              # bounds the step, which is the property that matters.
+              "$@"
+            fi
+          }
+
           for attempt in 1 2 3; do
             echo "::group::playwright install attempt $attempt"
-            if timeout -k 30 600 npm run smoke:install; then
+            if bounded 240 npm run smoke:install; then
               echo "::endgroup::"
               exit 0
             fi
