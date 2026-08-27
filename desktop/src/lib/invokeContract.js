@@ -29,34 +29,327 @@
 /// A caller never sends these, so they must not be treated as missing keys.
 const INJECTED_PARAMS = new Set(["state", "window", "app", "webview", "handle"]);
 
-/// Extract `{ command, keys }` for every `invoke(...)` call in `bridge.js`.
+/// Keywords after which a `/` opens a regular expression rather than dividing.
+/// Without them `return /["']/` reads as "identifier, then division".
+const REGEX_PRECEDING_KEYWORDS = new Set([
+    "return",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "new",
+    "delete",
+    "void",
+    "throw",
+    "case",
+    "do",
+    "else",
+    "yield",
+    "await",
+]);
+
+/// Whether a `/` appearing after `out` opens a regex literal or is a division.
 ///
-/// Handles the three shapes the file actually uses:
+/// JavaScript cannot be tokenised without this distinction, and the rule is
+/// positional: after a *value* — an identifier, a number, `)`, `]` — a slash
+/// divides; anywhere an expression may begin, it opens a regex.
+function regexCanStartAfter(out) {
+    const before = out.replace(/\s+$/, "");
+    if (before === "") return true;
+    const last = before[before.length - 1];
+    if (/[)\]}]/.test(last)) return false;
+    if (/[\w$]/.test(last)) {
+        // An identifier or number — a divisor, unless it is one of the keywords
+        // that can only be followed by the start of an expression.
+        const word = before.match(/[\w$]+$/)?.[0] ?? "";
+        return REGEX_PRECEDING_KEYWORDS.has(word);
+    }
+    return true;
+}
+
+/// Strip comments, leaving string literals and regex literals intact.
+///
+/// Needed so a commented-out `invoke(...)` is not counted as a call site — the
+/// count is an assertion now, so a miscount is a failing test rather than a
+/// quietly smaller subject set.
+///
+/// Regex literals are recognised rather than left to fall through, because that
+/// is where this used to go wrong: a pattern containing a quote — `/["']/`, of
+/// the kind a few lines below — opened what looked like a string literal, so
+/// everything up to the next unrelated quote was swallowed as string contents,
+/// taking any real `invoke(` site in between with it. Nothing caught that,
+/// because `scanInvokeCalls` and `countInvokeSites` both read this function's
+/// output: they agreed with each other about a source neither had seen whole.
+function stripComments(source) {
+    let out = "";
+    let i = 0;
+    while (i < source.length) {
+        const ch = source[i];
+        const next = source[i + 1];
+        if (ch === "/" && next === "/") {
+            while (i < source.length && source[i] !== "\n") i++;
+            continue;
+        }
+        if (ch === "/" && next === "*") {
+            i += 2;
+            while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+            i += 2;
+            continue;
+        }
+        if (ch === "/" && regexCanStartAfter(out)) {
+            out += ch;
+            i++;
+            // A `/` inside a character class is literal, so `[/]` does not end
+            // the pattern and must not be read as if it did.
+            let inClass = false;
+            while (i < source.length) {
+                const c = source[i];
+                out += c;
+                i++;
+                if (c === "\\") {
+                    out += source[i] ?? "";
+                    i++;
+                    continue;
+                }
+                if (c === "\n") break; // unterminated — not a regex after all
+                if (c === "[") inClass = true;
+                else if (c === "]") inClass = false;
+                else if (c === "/" && !inClass) break;
+            }
+            while (i < source.length && /[a-z]/.test(source[i])) {
+                out += source[i]; // flags
+                i++;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+            const quote = ch;
+            out += ch;
+            i++;
+            while (i < source.length) {
+                out += source[i];
+                if (source[i] === "\\") {
+                    out += source[i + 1] ?? "";
+                    i += 2;
+                    continue;
+                }
+                if (source[i] === quote) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        out += ch;
+        i++;
+    }
+    return out;
+}
+
+const OPENERS = { "{": "}", "[": "]", "(": ")" };
+const CLOSERS = new Set(["}", "]", ")"]);
+
+/// Read the balanced region starting at `start` (which must be an opener),
+/// returning `{ text, end }` where `end` is the index just past the closer.
+/// Returns `null` if it never closes. String literals are skipped whole.
+function readBalanced(source, start) {
+    const stack = [OPENERS[source[start]]];
+    let i = start + 1;
+    while (i < source.length) {
+        const ch = source[i];
+        if (ch === '"' || ch === "'" || ch === "`") {
+            const quote = ch;
+            i++;
+            while (i < source.length) {
+                if (source[i] === "\\") {
+                    i += 2;
+                    continue;
+                }
+                if (source[i] === quote) break;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (OPENERS[ch]) {
+            stack.push(OPENERS[ch]);
+        } else if (CLOSERS.has(ch)) {
+            if (stack[stack.length - 1] !== ch) return null;
+            stack.pop();
+            if (stack.length === 0) {
+                return { text: source.slice(start, i + 1), end: i + 1 };
+            }
+        }
+        i++;
+    }
+    return null;
+}
+
+/// Split an object literal's body on commas at depth zero, skipping strings.
+function topLevelKeys(objectText) {
+    const inner = objectText.slice(1, -1);
+    const keys = [];
+    let depth = 0;
+    let current = "";
+    let i = 0;
+    while (i < inner.length) {
+        const ch = inner[i];
+        if (ch === '"' || ch === "'" || ch === "`") {
+            const quote = ch;
+            current += ch;
+            i++;
+            while (i < inner.length) {
+                current += inner[i];
+                if (inner[i] === "\\") {
+                    current += inner[i + 1] ?? "";
+                    i += 2;
+                    continue;
+                }
+                if (inner[i] === quote) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (OPENERS[ch]) depth++;
+        else if (CLOSERS.has(ch)) depth--;
+
+        if (ch === "," && depth === 0) {
+            keys.push(current);
+            current = "";
+        } else {
+            current += ch;
+        }
+        i++;
+    }
+    if (current.trim()) keys.push(current);
+
+    return keys
+        // `key: value` -> key; shorthand `key` -> key. The colon split is safe
+        // here because everything nested has been kept inside `current`.
+        .map((part) => part.trim().split(":")[0].trim())
+        .filter(Boolean);
+}
+
+/// Scan `source` for every `invoke(...)` call site.
+///
+/// Returns `{ calls, unparsed }`. `calls` is `{ command, keys }` per call;
+/// `unparsed` names every site this parser could not read, with the reason.
+///
+/// The distinction is the point. This used to be one regex with `[^}]*` for the
+/// argument object, which meant a call with a **nested** object, or a computed
+/// command name, simply did not match — and a call that does not match is not
+/// checked, silently. The check would have kept passing while the calls most
+/// likely to be wrong went unexamined. The old test's floor of "more than 40"
+/// could not catch that either; the count is now asserted exactly, and anything
+/// unreadable is reported rather than skipped.
+///
+/// Handles:
 ///   invoke("auth_status")
 ///   invoke("mark_read", { id })
 ///   invoke("change_password", { current, new: next })
-export function parseInvokeCalls(source) {
+///   invoke("update_settings", { settings: { theme, dir } })   <- nested
+export function scanInvokeCalls(source) {
+    const code = stripComments(source);
     const calls = [];
-    const re = /invoke\(\s*"([a-z_0-9]+)"\s*(?:,\s*(\{[^}]*\}))?\s*\)/g;
+    const unparsed = [];
+
+    const site = /\binvoke\s*\(/g;
     let m;
-    while ((m = re.exec(source)) !== null) {
-        const [, command, argObject] = m;
-        const keys = [];
-        if (argObject) {
-            // Split the object literal on top-level commas. The bridge never
-            // nests an object inside an invoke payload, so this is sufficient
-            // and stays readable.
-            for (const part of argObject.slice(1, -1).split(",")) {
-                const trimmed = part.trim();
-                if (!trimmed) continue;
-                // `key: value` → key; shorthand `key` → key.
-                const key = trimmed.split(":")[0].trim();
-                if (key) keys.push(key);
-            }
+    while ((m = site.exec(code)) !== null) {
+        const openParen = m.index + m[0].length - 1;
+        const snippet = code.slice(m.index, m.index + 80).split("\n")[0];
+
+        const args = readBalanced(code, openParen);
+        if (!args) {
+            unparsed.push({ snippet, reason: "argument list never closes" });
+            continue;
         }
-        calls.push({ command, keys });
+        // Re-scan from past this call, so a nested `invoke(` inside it is not
+        // matched twice — but *report* any it contained rather than skipping
+        // them. Advancing past the argument list silently put a nested call in
+        // neither `calls` nor `unparsed`, which is the exact failure mode this
+        // scanner exists to prevent. `bridge.js` has none today; if one appears
+        // it must be a loud failure, not a quiet omission.
+        for (const _nested of args.text.slice(1).match(/\binvoke\s*\(/g) ?? []) {
+            unparsed.push({
+                snippet,
+                reason: "a nested invoke( inside an argument list is not checked",
+            });
+        }
+        site.lastIndex = args.end;
+
+        const inner = args.text.slice(1, -1).trim();
+        if (!inner.startsWith('"')) {
+            unparsed.push({
+                snippet,
+                reason: "command name is not a string literal",
+            });
+            continue;
+        }
+        const closeQuote = inner.indexOf('"', 1);
+        if (closeQuote === -1) {
+            unparsed.push({ snippet, reason: "unterminated command name" });
+            continue;
+        }
+        const command = inner.slice(1, closeQuote);
+
+        const rest = inner.slice(closeQuote + 1).trim();
+        if (rest === "") {
+            calls.push({ command, keys: [] });
+            continue;
+        }
+        if (!rest.startsWith(",")) {
+            unparsed.push({ snippet, reason: "unexpected text after the command name" });
+            continue;
+        }
+        const afterComma = rest.slice(1).trim();
+        if (!afterComma.startsWith("{")) {
+            unparsed.push({
+                snippet,
+                reason: "argument is not an object literal",
+            });
+            continue;
+        }
+        const obj = readBalanced(afterComma, 0);
+        if (!obj || obj.end !== afterComma.length) {
+            unparsed.push({ snippet, reason: "argument object is malformed" });
+            continue;
+        }
+        calls.push({ command, keys: topLevelKeys(obj.text) });
     }
-    return calls;
+
+    return { calls, unparsed };
+}
+
+/// How many *live* `invoke(` call sites the source contains — comments and
+/// string contents excluded — counted independently of whether they could be
+/// parsed.
+export function countInvokeSites(source) {
+    return (stripComments(source).match(/\binvoke\s*\(/g) || []).length;
+}
+
+/// How many `invoke(` occurrences the **raw** text contains: comments, strings
+/// and all.
+///
+/// This is the other half of the note on `stripComments`. Sharing the scanner
+/// between the checked set and its count is what let the regex-literal bug hide:
+/// a live call swallowed by the stripper left both one smaller, so the equality
+/// still held and the call went unchecked in silence — "they agreed with each
+/// other about a source neither had seen whole". A count taken from the raw text
+/// cannot agree with a mis-scan, so on a file known to contain no commented-out
+/// or quoted `invoke(` — which `bridge.js` is — it turns that class of bug into
+/// a failing assertion instead of a quieter subject set.
+export function countRawInvokeSites(source) {
+    return (source.match(/\binvoke\s*\(/g) || []).length;
+}
+
+/// The parsed calls, for callers that do not care about the diagnostics.
+export function parseInvokeCalls(source) {
+    return scanInvokeCalls(source).calls;
 }
 
 /// Extract `{ command, params }` for every `#[tauri::command]` in a Rust source.

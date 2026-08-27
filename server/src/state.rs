@@ -40,6 +40,13 @@ use uuid::Uuid;
 const DB_FILE: &str = "party.db";
 /// Subdirectory under the data dir holding content-addressed file blobs.
 const BLOB_DIR: &str = "blobs";
+/// Filename prefix for bytes written by phase 2 of an upload but not yet
+/// committed. Uploads stage under a unique name and are renamed into place
+/// under their content hash, so a refused upload can only unlink its own bytes
+/// — see [`StagedUpload::staged_path`]. Nothing enumerates the blob directory
+/// (records are looked up by hash), so a staging file orphaned by a crash is
+/// inert rather than mistakable for a blob.
+const STAGING_PREFIX: &str = "staging_";
 /// Default ceiling on the total bytes of distinct file blobs the server stores,
 /// bounding memory/disk growth from uploads. A safety cap until the Phase 3 quota
 /// system lands; operators can adjust it via [`PartyState::set_max_blob_bytes`].
@@ -90,16 +97,30 @@ pub const MAX_MESSAGE_TEXT_BYTES: usize = messenger_core::MAX_TEXT_MESSAGE_BYTES
 /// Run a blocking filesystem operation without stalling the async runtime.
 ///
 /// `PartyState` is deliberately synchronous — it is a state machine, and making
-/// every accessor `async` to accommodate two I/O paths would be the tail wagging
-/// the dog. But two of those paths move real bytes: a blob write and a blob read
-/// are each up to `MAX_PARTY_FILE_BYTES` (100 MiB), and they run inside
-/// `serve_connection`'s task while the state mutex is held. A plain
-/// `std::fs::write` there parks a runtime worker for the duration, so one member
-/// uploading a large file stalls unrelated members' messages on that worker.
+/// every accessor `async` to accommodate a couple of I/O paths would be the tail
+/// wagging the dog.
 ///
-/// `block_in_place` tells tokio the current thread is about to block so it can
-/// move the other tasks off it. It panics on a current-thread runtime, which is
-/// what `#[tokio::test]` gives you by default, hence the flavor check: outside a
+/// ⚠️ **This frees the runtime worker, not the state mutex, and the mutex was
+/// the actual bottleneck.** `serve_connection` holds `state.lock().await` across
+/// the whole of `handle_request`, so a blob read or write running inside it held
+/// the lock for the full transfer and every unrelated member's message queued
+/// behind it — which is exactly the symptom `block_in_place` was reaching for and
+/// could not fix. The bytes have to move *outside* the lock, and they now do:
+///
+///   * reads: [`PartyState::blob_read_for`] resolves the access check and the
+///     record under the lock and returns a [`BlobRead`] plan; `dispatch` puts it
+///     in [`Dispatch::deferred`] and `serve_connection` resolves it after the
+///     guard is dropped.
+///   * writes: `finish_upload` is split into [`PartyState::take_upload`],
+///     [`stage_upload`] (hash + write, no lock) and
+///     [`PartyState::commit_upload`].
+///
+/// What is left for this helper is the small stuff — an `unlink` when a blob's
+/// last reference goes, and the fallback write on the storage-full path — where
+/// the work is a metadata operation or already degenerate. `block_in_place`
+/// tells tokio the current thread is about to block so it can move the other
+/// tasks off it. It panics on a current-thread runtime, which is what
+/// `#[tokio::test]` gives you by default, hence the flavor check: outside a
 /// multi-threaded runtime the call is a plain function call, which is correct
 /// because there are no sibling tasks to rescue.
 fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
@@ -110,6 +131,246 @@ fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
         }
         _ => f(),
     }
+}
+
+/// A blob read that has been *authorised* but not yet *performed*.
+///
+/// The access check and the record lookup need the state lock; moving the bytes
+/// does not, and moving them under it is what made one member's download stall
+/// every other member's messages. `dispatch` returns these in
+/// [`crate::dispatch::Dispatch::deferred`] and `serve_connection` calls
+/// [`BlobRead::resolve`] once the guard has been dropped.
+#[derive(Debug, Clone)]
+pub enum BlobRead {
+    /// A memory-only store: the bytes are resident, so there is nothing left to
+    /// do. Also used for a chunk sliced out of a resident blob.
+    Ready(Vec<u8>),
+    /// A disk-backed store keeps nothing resident. Read this range instead.
+    File {
+        path: PathBuf,
+        offset: u64,
+        /// `None` reads to the end of the file.
+        len: Option<usize>,
+    },
+}
+
+impl BlobRead {
+    /// Perform the read. **Call this with the state lock released.**
+    ///
+    /// `spawn_blocking` rather than `block_in_place`: there is no lock held and
+    /// no borrow of the state, so the read belongs on the blocking pool where it
+    /// cannot occupy a runtime worker at all.
+    pub async fn resolve(self) -> Option<Vec<u8>> {
+        match self {
+            BlobRead::Ready(bytes) => Some(bytes),
+            BlobRead::File { path, offset, len } => {
+                tokio::task::spawn_blocking(move || read_range(&path, offset, len))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        }
+    }
+}
+
+/// Read `len` bytes (or to EOF) from `offset`.
+///
+/// Seeking matters here. `blob_chunk_for` used to read the *whole* blob and then
+/// slice one chunk out of it, so downloading a 100 MiB file in 64 KiB chunks read
+/// 100 MiB off the disk about sixteen hundred times — every one of them with the
+/// state mutex held. The chunk endpoint reads a chunk.
+fn read_range(path: &Path, offset: u64, len: Option<usize>) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(path = %path.display(), error = %e, "blob is recorded but its file could not be opened");
+            return None;
+        }
+    };
+    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    let read = match len {
+        Some(len) => {
+            buf.resize(len, 0);
+            let mut filled = 0;
+            loop {
+                if filled == len {
+                    break Ok(filled);
+                }
+                match file.read(&mut buf[filled..]) {
+                    Ok(0) => break Ok(filled),
+                    Ok(n) => filled += n,
+                    Err(e) => break Err(e),
+                }
+            }
+        }
+        None => file.read_to_end(&mut buf),
+    };
+    match read {
+        Ok(n) => {
+            buf.truncate(n);
+            Some(buf)
+        }
+        Err(e) => {
+            tracing::error!(path = %path.display(), error = %e, "blob is recorded but its file could not be read");
+            None
+        }
+    }
+}
+
+/// Remove staging files left by an upload that did not survive to its rename.
+///
+/// [`STAGING_PREFIX`] notes that an orphan is *inert* — nothing enumerates this
+/// directory, so it cannot be mistaken for a blob. That is true and it is not
+/// the whole cost: the bytes are still on the disk, up to `MAX_PARTY_FILE_BYTES`
+/// of them per crash, and the storage accounting cannot see them because it sums
+/// `PartyState::blobs` rather than the directory. An operator's ceiling then
+/// silently stops meaning what it says. Swept at startup, which is the one
+/// moment no upload can be staging.
+fn sweep_staging_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if !name.starts_with(STAGING_PREFIX) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => tracing::info!(file = %name, "removed an interrupted upload's staging file"),
+            Err(e) => {
+                tracing::warn!(error = %e, file = %name, "could not remove a staging file")
+            }
+        }
+    }
+}
+
+/// A completed upload taken out of the state so its bytes can be hashed and
+/// written with the lock released. See [`PartyState::take_upload`].
+pub struct TakenUpload {
+    uploader: Uuid,
+    name: String,
+    mime: String,
+    target: UploadTarget,
+    data: Vec<u8>,
+    /// Where blobs are stored, or `None` for a memory-only state.
+    blob_dir: Option<PathBuf>,
+    /// Phase 1 already knows this member (or the server) is at their storage
+    /// ceiling. It cannot *reject* on that alone — the upload may turn out to be
+    /// a dedup hit, which costs no storage — but it can decline to write bytes
+    /// that are probably about to be refused. See [`stage_upload`].
+    at_storage_ceiling: bool,
+}
+
+/// A completed upload whose bytes have been hashed and (usually) written.
+pub struct StagedUpload {
+    uploader: Uuid,
+    name: String,
+    mime: String,
+    target: UploadTarget,
+    hash: String,
+    size: u64,
+    data: Vec<u8>,
+    /// Where these bytes are, when phase 2 already put them on disk: a staging
+    /// file belonging to *this* upload alone. `None` means they are still in
+    /// `data` and nothing has been written.
+    ///
+    /// Deliberately not the content-hash path. Two members uploading identical
+    /// content — a forwarded image — stage concurrently, and when both wrote to
+    /// `blobs/<hash>` neither could tell the file apart from the other's. One
+    /// being refused then unlinked bytes the other was about to record, and that
+    /// second upload skipped its own write (it believed they were there), so the
+    /// file message went out to the whole channel pointing at nothing. Staging
+    /// privately and renaming into place on commit means a refusal can only ever
+    /// delete its own bytes.
+    staged_path: Option<PathBuf>,
+}
+
+impl StagedUpload {
+    pub fn target(&self) -> UploadTarget {
+        self.target
+    }
+}
+
+/// Phase 2 of finishing an upload: hash the bytes and put them on disk, **with
+/// the state lock released**.
+///
+/// Writing before the blob is recorded is deliberate and is the invariant
+/// `write_blob_file` documents: a recorded blob whose bytes are not there is an
+/// upload that was acknowledged and broadcast to a whole channel and then
+/// answered "unknown file" forever. Writing *before* the dedup check simply
+/// rewrites identical bytes over an identical file in the rare case the content
+/// is already stored — content addressing makes that safe, and it buys the write
+/// happening without the lock.
+pub async fn stage_upload(taken: TakenUpload) -> Result<StagedUpload, String> {
+    // Hashing 100 MiB is real CPU work and has no business on a runtime worker
+    // either, so it goes to the blocking pool along with the write.
+    tokio::task::spawn_blocking(move || stage_upload_blocking(taken))
+        .await
+        .map_err(|_| "the server could not store this file".to_string())?
+}
+
+/// The body of [`stage_upload`], for callers that are already on a thread where
+/// blocking is fine (`PartyState::finish_upload`, and every test).
+pub fn stage_upload_blocking(taken: TakenUpload) -> Result<StagedUpload, String> {
+    let TakenUpload {
+        uploader,
+        name,
+        mime,
+        target,
+        data,
+        blob_dir,
+        at_storage_ceiling,
+    } = taken;
+
+    let size = data.len() as u64;
+    let hash = blob_hash(&data);
+    let staged_path = match (&blob_dir, at_storage_ceiling) {
+        // Nowhere to write: a memory-only store keeps the bytes resident.
+        (None, _) => None,
+        // Probably about to be refused for storage. Don't spend 100 MiB of disk
+        // writes to find that out; `commit_upload` falls back to writing under
+        // the lock in the one case this guess is wrong (a dedup miss whose quota
+        // freed up in between), which is a degenerate path by definition.
+        (Some(_), true) => None,
+        (Some(dir), false) => {
+            // A name unique to this upload rather than the content hash — see
+            // `StagedUpload::staged_path`. It shares the blob directory so that
+            // committing is a rename, and a rename is only atomic within one
+            // filesystem.
+            let path = dir.join(format!("{STAGING_PREFIX}{}", Uuid::new_v4()));
+            match std::fs::write(&path, &data) {
+                Ok(()) => Some(path),
+                Err(e) => {
+                    tracing::error!(error = %e, hash, "failed to write file blob");
+                    return Err("the server could not store this file".to_string());
+                }
+            }
+        }
+    };
+
+    Ok(StagedUpload {
+        uploader,
+        name,
+        mime,
+        target,
+        hash,
+        size,
+        // Only kept when they are not on disk; a disk-backed store reads on
+        // demand, and holding these would make the storage ceiling a memory
+        // ceiling too.
+        data: if staged_path.is_some() {
+            Vec::new()
+        } else {
+            data
+        },
+        staged_path,
+    })
 }
 
 /// Why a join was refused.
@@ -388,6 +649,7 @@ impl PartyState {
         std::fs::create_dir_all(data_dir)?;
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
+        sweep_staging_files(&blob_dir);
         let conn = Connection::open(data_dir.join(DB_FILE))?;
         init_schema(&conn)?;
 
@@ -1684,17 +1946,46 @@ impl PartyState {
 
     /// Complete an upload: store the assembled bytes and post the file message.
     /// Returns the envelope to deliver, and whether it was a DM.
+    ///
+    /// Hashes and writes inline, so the caller's lock is held for the whole
+    /// transfer. The server splits this into [`Self::take_upload`] →
+    /// [`stage_upload`] → [`Self::commit_upload`] instead; this remains for
+    /// synchronous callers and tests, and is defined in terms of the same three
+    /// steps so the two paths cannot drift.
     pub fn finish_upload(
         &mut self,
         uploader: Uuid,
         upload: Uuid,
     ) -> Result<(Envelope, UploadTarget), String> {
+        let taken = self.take_upload(uploader, upload)?;
+        let staged = stage_upload_blocking(taken)?;
+        self.commit_upload(staged)
+    }
+
+    /// Phase 1 of finishing an upload, under the state lock: validate it and
+    /// take the spooled bytes out of the state. Nothing is hashed, written or
+    /// recorded here — see [`stage_upload`] for why.
+    ///
+    /// **Taking is terminal, including when it refuses.** Every outcome below
+    /// past the ownership check drops the spool, because the caller has by then
+    /// stopped tracking this upload id and nothing else would ever reclaim it.
+    /// Leaving it behind on the refusal paths let a member spool bytes, be told
+    /// "upload is incomplete", and repeat: each round abandoned up to
+    /// `MAX_PARTY_FILE_BYTES` of resident memory that survived even the
+    /// connection closing, and `MAX_CONCURRENT_UPLOADS` counted none of it.
+    pub fn take_upload(&mut self, uploader: Uuid, upload: Uuid) -> Result<TakenUpload, String> {
         let Some(pending) = self.uploads.get(&upload) else {
             return Err("no such upload".to_string());
         };
+        // Checked *before* the removal below, and the only refusal that leaves
+        // the spool in place: this id belongs to somebody else, and naming it
+        // must not be a way to destroy their upload.
         if pending.uploader != uploader {
             return Err("no such upload".to_string());
         }
+
+        let pending = self.uploads.remove(&upload).expect("checked above");
+
         if (pending.data.len() as u64) != pending.declared {
             let short = pending.declared - pending.data.len() as u64;
             return Err(format!(
@@ -1702,14 +1993,64 @@ impl PartyState {
                 messenger_core::util::format_size(short)
             ));
         }
-        let pending = self.uploads.remove(&upload).expect("checked above");
-        let target = pending.target;
-        let envelope = match target {
-            UploadTarget::Channel(channel) => {
-                self.post_file_bytes(uploader, channel, pending.name, pending.mime, pending.data)?
-            }
+
+        // Refuse before moving any bytes when the post itself would be refused:
+        // an upload to a channel the member may not write to should not cost a
+        // 100 MiB disk write to find that out.
+        match pending.target {
+            UploadTarget::Channel(channel) => self.member_can_post_to_channel(uploader, channel)?,
             UploadTarget::Dm(to) => {
-                self.post_file_dm_bytes(uploader, to, pending.name, pending.mime, pending.data)?
+                if !self.is_member(to) {
+                    return Err("recipient is not a member of this server".to_string());
+                }
+                if !self.role_of(uploader).can_write() {
+                    return Err("your role on this server is read-only".to_string());
+                }
+            }
+        }
+
+        let size = pending.data.len() as u64;
+        let at_storage_ceiling = self.would_exceed_storage(uploader, size);
+
+        Ok(TakenUpload {
+            uploader,
+            name: pending.name,
+            mime: pending.mime,
+            target: pending.target,
+            data: pending.data,
+            blob_dir: self.blob_dir.clone(),
+            at_storage_ceiling,
+        })
+    }
+
+    /// Whether storing `size` more bytes of *new* content for `uploader` would
+    /// breach either ceiling. A guess, not a decision: it does not know whether
+    /// the content is already stored, and `commit_upload` re-checks under the
+    /// lock. See [`TakenUpload::at_storage_ceiling`].
+    fn would_exceed_storage(&self, uploader: Uuid, size: u64) -> bool {
+        let stored: u64 = self.blobs.values().map(|r| r.size).sum();
+        if stored.saturating_add(size) > self.max_blob_bytes {
+            return true;
+        }
+        match self.member_blob_limit(uploader) {
+            Some(limit) => self.member_blob_bytes(uploader).saturating_add(size) > limit,
+            None => false,
+        }
+    }
+
+    /// Phase 3 of finishing an upload, under the state lock again: record the
+    /// blob and post the file message. The bytes are already on disk by now
+    /// (or resident, for a memory-only store).
+    pub fn commit_upload(
+        &mut self,
+        staged: StagedUpload,
+    ) -> Result<(Envelope, UploadTarget), String> {
+        let target = staged.target;
+        let envelope = match target {
+            UploadTarget::Channel(channel) => self.post_staged_file(staged, channel, None)?,
+            UploadTarget::Dm(to) => {
+                let thread_id = messenger_core::party::dm_thread_id(staged.uploader, to);
+                self.post_staged_file(staged, thread_id, Some(to))?
             }
         };
         Ok((envelope, target))
@@ -1731,6 +2072,14 @@ impl PartyState {
     /// Drop every upload belonging to `member` (their connection went away).
     pub fn cancel_uploads_for(&mut self, member: Uuid) {
         self.uploads.retain(|_, p| p.uploader != member);
+    }
+
+    /// Upload spools currently held in memory. For tests that need to assert a
+    /// refusal released its bytes — the leak this guards is invisible from the
+    /// outside, because the reply is identical either way.
+    #[cfg(test)]
+    pub(crate) fn pending_upload_count(&self) -> usize {
+        self.uploads.len()
     }
 
     /// One chunk of a stored blob, plus the file's total size, for a member who
@@ -1816,6 +2165,224 @@ impl PartyState {
         chan.messages.push(envelope.clone());
         self.persist_message(&envelope);
         Ok(envelope)
+    }
+
+    /// Record a staged blob and post it as a file message to `location` (a
+    /// channel, or a DM thread when `is_dm`).
+    ///
+    /// The permission checks run **again** here even though
+    /// [`Self::take_upload`] already made them: the lock was released in
+    /// between, and a member who was demoted, removed, or whose channel was
+    /// deleted while their bytes were being written must not get the post
+    /// anyway. When a re-check refuses, the bytes staged on disk are dropped —
+    /// nothing references them, so leaving them would be a leak.
+    fn post_staged_file(
+        &mut self,
+        staged: StagedUpload,
+        location: Uuid,
+        dm_to: Option<Uuid>,
+    ) -> Result<Envelope, String> {
+        let sender = staged.uploader;
+        let is_dm = dm_to.is_some();
+
+        if let Err(e) = self.recheck_can_post(sender, location, dm_to) {
+            self.discard_staged_bytes(&staged);
+            return Err(e);
+        }
+
+        let tier = self.tier;
+        let meta = self.record_staged_blob(staged)?;
+        self.record_file_ref(sender, &meta, location, is_dm);
+
+        let (messages, seq) = if is_dm {
+            let thread = self.dm_threads.entry(location).or_insert_with(|| DmThread {
+                id: location,
+                messages: Vec::new(),
+            });
+            let seq = thread.messages.len() as u64 + 1;
+            (&mut thread.messages, seq)
+        } else {
+            let chan = self
+                .channel_mut(location)
+                .expect("channel existence re-checked above");
+            let seq = chan.messages.len() as u64 + 1;
+            (&mut chan.messages, seq)
+        };
+
+        let envelope = Envelope {
+            tier,
+            sender,
+            channel: location,
+            seq,
+            timestamp: current_timestamp_millis(),
+            payload: MessagePayload::File(meta),
+        };
+        messages.push(envelope.clone());
+
+        if is_dm {
+            self.persist_dm(location, &envelope);
+        } else {
+            self.persist_message(&envelope);
+        }
+        Ok(envelope)
+    }
+
+    /// The permission checks `take_upload` made, made again on the far side of
+    /// the disk write.
+    ///
+    /// `dm_to` is the DM recipient, or `None` for a channel post. It is carried
+    /// separately because `location` is the *thread* id for a DM — a hash of
+    /// both member ids, which nothing can be checked against. Without it the
+    /// re-check covered only the sender, so a recipient removed from the server
+    /// during a 100 MiB upload still had the DM appended to their thread.
+    fn recheck_can_post(
+        &self,
+        sender: Uuid,
+        location: Uuid,
+        dm_to: Option<Uuid>,
+    ) -> Result<(), String> {
+        if !self.is_member(sender) {
+            return Err("sender is not a member of this server".to_string());
+        }
+        match dm_to {
+            Some(to) => {
+                if !self.role_of(sender).can_write() {
+                    return Err("your role on this server is read-only".to_string());
+                }
+                if !self.is_member(to) {
+                    return Err("recipient is not a member of this server".to_string());
+                }
+                Ok(())
+            }
+            None => self.member_can_post_to_channel(sender, location),
+        }
+    }
+
+    /// Drop bytes that were staged on disk for an upload that is not going to be
+    /// recorded.
+    ///
+    /// Unconditional, and safe to be so: the path names a staging file this
+    /// upload alone wrote, so nothing else can be holding it. The predecessor
+    /// unlinked `blobs/<hash>` and tried to stay clear of other uploads by
+    /// skipping the delete when `self.blobs` held the hash — a point-in-time
+    /// test blind to stagers that had not committed yet, which is exactly when
+    /// it mattered.
+    fn discard_staged_bytes(&self, staged: &StagedUpload) {
+        Self::remove_staged_file(staged.staged_path.as_deref());
+    }
+
+    fn remove_staged_file(path: Option<&Path>) {
+        let Some(path) = path else { return };
+        if let Err(e) = blocking_io(|| std::fs::remove_file(path)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, path = %path.display(), "could not remove a staged blob");
+            }
+        }
+    }
+
+    /// Move staged bytes into place under their content hash, completing the
+    /// "bytes on disk before anything records them" invariant that
+    /// [`write_blob_file`](Self::write_blob_file) documents.
+    ///
+    /// A rename, so the blob either exists in full or not at all. It replaces
+    /// any file already at the destination, which is only reachable when a crash
+    /// left one behind: a *recorded* blob is handled by the dedup branch above,
+    /// and both the rename and the record happen under the same lock.
+    fn promote_staged_file(&self, path: &Path, hash: &str) -> Result<(), String> {
+        let Some(dir) = &self.blob_dir else {
+            return Ok(());
+        };
+        let dest = dir.join(hash);
+        blocking_io(|| std::fs::rename(path, &dest)).map_err(|e| {
+            tracing::error!(error = %e, path = %path.display(), "failed to commit a staged blob");
+            // Leave nothing behind on the way out.
+            Self::remove_staged_file(Some(path));
+            "the server could not store this file".to_string()
+        })
+    }
+
+    /// [`Self::store_blob`] for bytes that have already been hashed and written.
+    /// The dedup, quota and bookkeeping are identical; the difference is that
+    /// the 100 MiB of I/O happened before the lock was taken.
+    fn record_staged_blob(&mut self, staged: StagedUpload) -> Result<FileMeta, String> {
+        let StagedUpload {
+            uploader,
+            name,
+            mime,
+            hash,
+            size,
+            data,
+            staged_path,
+            ..
+        } = staged;
+
+        if let Some(rec) = self.blobs.get_mut(&hash) {
+            // Content addressing means any bytes staged for this upload are
+            // byte-identical to the ones already stored, so the recorded blob
+            // needs nothing from us — and our staging file is surplus.
+            rec.refcount += 1;
+            let refcount = rec.refcount;
+            self.persist_blob_refcount(&hash, refcount);
+            Self::remove_staged_file(staged_path.as_deref());
+        } else {
+            // Deduplicated re-uploads above never grow storage; only distinct
+            // new content counts against the ceilings. Re-checked here rather
+            // than trusted from `take_upload`, because the lock was released in
+            // between and another upload may have taken the space.
+            let stored: u64 = self.blobs.values().map(|r| r.size).sum();
+            if stored.saturating_add(size) > self.max_blob_bytes {
+                Self::remove_staged_file(staged_path.as_deref());
+                return Err("server file storage is full".to_string());
+            }
+            if let Some(limit) = self.member_blob_limit(uploader) {
+                let used = self.member_blob_bytes(uploader);
+                if used.saturating_add(size) > limit {
+                    let reason = format!(
+                        "this would exceed your {} file storage allowance ({} of it already used)",
+                        messenger_core::util::format_size(limit),
+                        messenger_core::util::format_size(used)
+                    );
+                    Self::remove_staged_file(staged_path.as_deref());
+                    return Err(reason);
+                }
+            }
+
+            // Normally the bytes are already on disk and only need moving under
+            // their hash — that is the point of the split, and it preserves the
+            // invariant `write_blob_file` documents (bytes first, record
+            // second). The fallback covers the one case `take_upload`'s ceiling
+            // guess was wrong in our favour.
+            match staged_path.as_deref() {
+                Some(path) => self.promote_staged_file(path, &hash)?,
+                None => self.write_blob_file(&hash, &data)?,
+            }
+            self.persist_blob_row(&hash, size, &mime, 1);
+            let resident = if self.blob_dir.is_some() {
+                None
+            } else {
+                Some(data)
+            };
+            self.blobs.insert(
+                hash.clone(),
+                BlobRecord {
+                    size,
+                    mime: mime.clone(),
+                    data: resident,
+                    refcount: 1,
+                },
+            );
+        }
+
+        Ok(FileMeta {
+            hash,
+            // The display name is member-supplied: reduce it to a safe filename
+            // here (the single choke point for channel and DM uploads) so no
+            // client ever receives a name that could escape its download
+            // directory. P2P transfers get the same treatment at protocol decode.
+            name: sanitize_filename(&name),
+            size,
+            mime,
+        })
     }
 
     /// Store a file and send it as a direct message to `to`. Returns the assigned
@@ -1925,11 +2492,96 @@ impl PartyState {
     /// The bytes of a stored blob, but only when `member` is permitted to see it.
     /// Returns `None` both when the blob is unknown and when access is denied, so
     /// the endpoint never reveals the existence of a file the member can't access.
+    ///
+    /// Reads the bytes *now*, so it holds whatever lock the caller holds for the
+    /// duration. The server does not use it on the request path — see
+    /// [`Self::blob_read_for`] — but it is the natural shape for tests and for
+    /// any synchronous caller that is not sharing a mutex with live connections.
     pub fn blob_bytes_for(&self, member: Uuid, hash: &str) -> Option<Vec<u8>> {
         if !self.member_can_access_blob(member, hash) {
             return None;
         }
         self.blob_bytes(hash)
+    }
+
+    /// Authorise a whole-blob read without performing it.
+    ///
+    /// This is what the download endpoint uses. The access check and the record
+    /// lookup need the state lock; the bytes do not, and reading them under it
+    /// made one member's download the head of a queue every other member's
+    /// messages sat in. `None` for both unknown and denied, as above.
+    ///
+    /// **The authorisation is a point-in-time decision, deliberately.** A member
+    /// whose access is revoked after this returns still receives the bytes of
+    /// the read already in flight. That is accepted rather than overlooked: the
+    /// alternative is re-taking the lock per chunk, which is the contention this
+    /// exists to remove, and it buys very little — the member could have
+    /// finished the download a moment earlier, and revocation stops the *next*
+    /// one either way.
+    ///
+    /// Note the asymmetry with the upload path, which re-checks on the far side
+    /// of the same window ([`Self::recheck_can_post`]). The two are not
+    /// inconsistent: a stale *write* publishes a message to a whole channel and
+    /// leaves it in history, while a stale *read* hands over bytes that were
+    /// already permitted when the request was made. Content addressing also
+    /// makes the returned path safe to read late — `blobs/<hash>` either holds
+    /// that exact content or nothing, so a slow read can never be redirected
+    /// onto some other file's bytes.
+    pub fn blob_read_for(&self, member: Uuid, hash: &str) -> Option<BlobRead> {
+        if !self.member_can_access_blob(member, hash) {
+            return None;
+        }
+        let record = self.blobs.get(hash)?;
+        if let Some(resident) = &record.data {
+            return Some(BlobRead::Ready(resident.clone()));
+        }
+        let dir = self.blob_dir.as_ref()?;
+        Some(BlobRead::File {
+            path: dir.join(hash),
+            offset: 0,
+            len: None,
+        })
+    }
+
+    /// Authorise one chunk of a blob without performing the read, plus the
+    /// file's total size. The counterpart of [`Self::blob_read_for`] for the
+    /// chunked download path.
+    pub fn blob_chunk_read_for(
+        &self,
+        member: Uuid,
+        hash: &str,
+        offset: u64,
+    ) -> Option<(BlobRead, u64)> {
+        if !self.member_can_access_blob(member, hash) {
+            return None;
+        }
+        let record = self.blobs.get(hash)?;
+
+        if let Some(resident) = &record.data {
+            let total = resident.len() as u64;
+            if offset >= total {
+                return Some((BlobRead::Ready(Vec::new()), total));
+            }
+            let start = offset as usize;
+            let end = (start + PARTY_CHUNK_BYTES).min(resident.len());
+            // Slicing a resident blob is a memcpy of one chunk, not of the whole
+            // file, so it is cheap enough to do here.
+            return Some((BlobRead::Ready(resident[start..end].to_vec()), total));
+        }
+
+        let total = record.size;
+        let dir = self.blob_dir.as_ref()?;
+        if offset >= total {
+            return Some((BlobRead::Ready(Vec::new()), total));
+        }
+        Some((
+            BlobRead::File {
+                path: dir.join(hash),
+                offset,
+                len: Some(PARTY_CHUNK_BYTES),
+            },
+            total,
+        ))
     }
 
     // --- Durable mirroring (best-effort: failures are logged, not propagated, so a
@@ -4745,5 +5397,397 @@ mod tests {
 
         let stranger = Uuid::new_v4();
         assert!(state.history_since(stranger, chan, 0).is_empty());
+    }
+
+    /// The download path must hand back a *plan*, not bytes: reading 100 MiB
+    /// under the state mutex is what queued every other member's messages behind
+    /// one person's download.
+    #[test]
+    fn a_disk_backed_download_defers_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let channel = state
+            .create_channel_of_kind(alice, "secret", ChannelKind::Private, vec![alice])
+            .unwrap()
+            .id;
+        let meta = state
+            .post_file(
+                alice,
+                channel,
+                "f.bin".to_string(),
+                "application/octet-stream".to_string(),
+                b"payload".to_vec(),
+            )
+            .map(|env| match env.payload {
+                MessagePayload::File(f) => f,
+                other => panic!("expected a File payload, got {other:?}"),
+            })
+            .unwrap();
+
+        match state.blob_read_for(alice, &meta.hash) {
+            Some(BlobRead::File { path, offset, len }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(len, None);
+                assert!(path.exists(), "the plan must point at bytes that are there");
+            }
+            other => panic!("expected a deferred file read, got {other:?}"),
+        }
+
+        // Denied and unknown are both `None`, and neither leaks a path. Bob is
+        // not in the private channel the file was shared into.
+        let bob = state.join("bob", None, None).unwrap();
+        assert!(state.blob_read_for(bob, &meta.hash).is_none());
+        assert!(state.blob_read_for(alice, "deadbeef").is_none());
+    }
+
+    /// A chunk request must read a chunk. It used to read the whole blob and
+    /// slice one out, so a 100 MiB download in 64 KiB chunks read 100 MiB off
+    /// the disk about sixteen hundred times — each time with the lock held.
+    #[tokio::test]
+    async fn a_chunk_request_reads_only_that_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let env = state
+            .post_file(
+                alice,
+                channel,
+                "big.bin".to_string(),
+                "application/octet-stream".to_string(),
+                payload.clone(),
+            )
+            .unwrap();
+        let hash = match env.payload {
+            MessagePayload::File(f) => f.hash,
+            other => panic!("expected a File payload, got {other:?}"),
+        };
+
+        let mut got = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let (read, total) = state
+                .blob_chunk_read_for(alice, &hash, offset)
+                .expect("authorised");
+            assert_eq!(total, payload.len() as u64);
+            match &read {
+                BlobRead::File { len, .. } => assert_eq!(*len, Some(PARTY_CHUNK_BYTES)),
+                BlobRead::Ready(bytes) => {
+                    assert!(bytes.is_empty(), "disk-backed: only EOF is ready")
+                }
+            }
+            let bytes = read.resolve().await.expect("readable");
+            if bytes.is_empty() {
+                break;
+            }
+            assert!(
+                bytes.len() <= PARTY_CHUNK_BYTES,
+                "a chunk request must not pull the whole file"
+            );
+            offset += bytes.len() as u64;
+            got.extend_from_slice(&bytes);
+        }
+        assert_eq!(got, payload, "the chunks must reassemble to the file");
+    }
+
+    /// The three-phase upload path has to reach the same state the one-shot one
+    /// does — including the invariant that the bytes are on disk before anything
+    /// records them.
+    #[tokio::test]
+    async fn the_split_upload_path_stores_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let payload = b"chunked upload".to_vec();
+        let upload = state
+            .start_upload(
+                alice,
+                "u.bin".to_string(),
+                "application/octet-stream".to_string(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(alice, upload, &payload).unwrap();
+
+        let taken = state.take_upload(alice, upload).unwrap();
+        let staged = stage_upload(taken).await.unwrap();
+        // Phase 2 put the bytes on disk, but under a name private to this
+        // upload: nothing has recorded them, and they do not appear under their
+        // content hash until commit renames them there.
+        let staged_path = staged.staged_path.clone().expect("phase 2 writes to disk");
+        assert!(staged_path.exists());
+        assert!(!dir.path().join(BLOB_DIR).join(&staged.hash).exists());
+        assert!(!state.blobs.contains_key(&staged.hash));
+
+        let (env, target) = state.commit_upload(staged).unwrap();
+        assert_eq!(target, UploadTarget::Channel(channel));
+        let hash = match env.payload {
+            MessagePayload::File(f) => f.hash,
+            other => panic!("expected a File payload, got {other:?}"),
+        };
+        assert_eq!(state.blob_bytes_for(alice, &hash), Some(payload));
+        // Committing moved the staging file rather than copying it.
+        assert!(dir.path().join(BLOB_DIR).join(&hash).exists());
+        assert!(!staged_path.exists());
+    }
+
+    /// An upload killed between staging and its rename leaves a file behind.
+    /// It is inert — nothing looks it up — but it is not free: the bytes stay on
+    /// disk and the storage accounting sums `blobs`, not the directory, so the
+    /// operator's ceiling quietly stops bounding what is actually stored.
+    #[test]
+    fn an_interrupted_upload_staging_file_is_swept_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _ = PartyState::load("Srv", None, dir.path()).unwrap();
+        }
+        let blob_dir = dir.path().join(BLOB_DIR);
+        let orphan = blob_dir.join(format!("{STAGING_PREFIX}6f1e-abandoned"));
+        std::fs::write(&orphan, b"interrupted").unwrap();
+        // A real blob must survive the sweep.
+        let keep = blob_dir.join("deadbeef");
+        std::fs::write(&keep, b"real").unwrap();
+
+        let _ = PartyState::load("Srv", None, dir.path()).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "the interrupted staging file must be swept"
+        );
+        assert!(keep.exists(), "a stored blob must not be");
+    }
+
+    /// A member who loses the right to post while their bytes are being written
+    /// must not get the post anyway — and their staged bytes must not be left
+    /// behind, because nothing references them.
+    #[tokio::test]
+    async fn an_upload_refused_after_staging_leaves_no_orphan_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let payload = b"about to be refused".to_vec();
+        let upload = state
+            .start_upload(
+                bob,
+                "u.bin".to_string(),
+                "application/octet-stream".to_string(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(bob, upload, &payload).unwrap();
+
+        let taken = state.take_upload(bob, upload).unwrap();
+        let staged = stage_upload(taken).await.unwrap();
+        let staged_path = staged.staged_path.clone().expect("phase 2 writes to disk");
+        assert!(staged_path.exists());
+
+        // Bob is demoted to a read-only role between phase 2 and phase 3.
+        state.set_role(owner, bob, Role::Guest).unwrap();
+
+        let err = state.commit_upload(staged).expect_err("must be refused");
+        assert!(err.contains("read-only"), "unexpected reason: {err}");
+        assert!(
+            !staged_path.exists(),
+            "bytes nothing references must not be left on disk"
+        );
+    }
+
+    /// Stage an upload of `payload` from `who`, ready to commit.
+    async fn stage_for(
+        state: &mut PartyState,
+        who: Uuid,
+        payload: &[u8],
+        target: UploadTarget,
+    ) -> StagedUpload {
+        let upload = state
+            .start_upload(
+                who,
+                "u.bin".to_string(),
+                "application/octet-stream".to_string(),
+                payload.len() as u64,
+                target,
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(who, upload, payload).unwrap();
+        let taken = state.take_upload(who, upload).unwrap();
+        stage_upload(taken).await.unwrap()
+    }
+
+    /// Two members uploading byte-identical content — a forwarded image — stage
+    /// at the same time. One of them then being refused must not take the
+    /// other's bytes with it.
+    ///
+    /// While both staged to `blobs/<hash>` the refusal unlinked the shared file,
+    /// and the surviving upload skipped its own write because it believed the
+    /// bytes were already there. It then recorded a blob with nothing behind it:
+    /// the file message reached the whole channel and every download of it
+    /// answered "unknown file", permanently.
+    #[tokio::test]
+    async fn a_refused_upload_cannot_unlink_an_identical_concurrent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let payload = b"the same forwarded image".to_vec();
+        let owner_staged =
+            stage_for(&mut state, owner, &payload, UploadTarget::Channel(channel)).await;
+        let bob_staged = stage_for(&mut state, bob, &payload, UploadTarget::Channel(channel)).await;
+
+        // Identical content, but each upload owns its own bytes on disk.
+        assert_eq!(owner_staged.hash, bob_staged.hash);
+        assert_ne!(owner_staged.staged_path, bob_staged.staged_path);
+
+        // Bob loses the right to post while both uploads are in flight.
+        state.set_role(owner, bob, Role::Guest).unwrap();
+        let err = state
+            .commit_upload(bob_staged)
+            .expect_err("bob must be refused");
+        assert!(err.contains("read-only"), "unexpected reason: {err}");
+
+        // The owner's upload, staged before the refusal, still has its bytes.
+        let (env, _) = state.commit_upload(owner_staged).unwrap();
+        let hash = match env.payload {
+            MessagePayload::File(f) => f.hash,
+            other => panic!("expected a File payload, got {other:?}"),
+        };
+        assert_eq!(
+            state.blob_bytes_for(owner, &hash),
+            Some(payload),
+            "a published file message must not point at bytes another upload's refusal deleted"
+        );
+    }
+
+    /// `take_upload` checks the DM recipient; the re-check on the far side of the
+    /// disk write did not, so a recipient who stopped being a member during the
+    /// upload still had the message appended to their thread.
+    ///
+    /// Nothing removes a member through the public API yet, which is why this
+    /// reaches into the map: the point is that the two checks agree, not that
+    /// there is a way to trigger the disagreement today.
+    #[tokio::test]
+    async fn a_dm_upload_is_refused_when_the_recipient_stops_being_a_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+
+        let payload = b"a direct message attachment".to_vec();
+        let staged = stage_for(&mut state, alice, &payload, UploadTarget::Dm(bob)).await;
+        let staged_path = staged.staged_path.clone().expect("phase 2 writes to disk");
+
+        state.members.remove(&bob);
+
+        let err = state.commit_upload(staged).expect_err("must be refused");
+        assert!(err.contains("recipient"), "unexpected reason: {err}");
+        assert!(
+            !staged_path.exists(),
+            "bytes nothing references must not be left on disk"
+        );
+        let thread = messenger_core::party::dm_thread_id(alice, bob);
+        assert!(
+            state
+                .dm_threads
+                .get(&thread)
+                .is_none_or(|t| t.messages.is_empty()),
+            "a refused DM upload must not be appended to the thread"
+        );
+    }
+
+    /// Every way `take_upload` can refuse past the ownership check must release
+    /// the spool. The caller stops tracking the id either way, so an entry left
+    /// in `uploads` is unreachable memory that survives the connection closing —
+    /// and repeating the refusal is a way to accumulate it.
+    #[test]
+    fn a_refused_take_releases_the_spool() {
+        for (label, complete) in [("incomplete", false), ("not permitted", true)] {
+            let mut state = PartyState::new("Srv", None);
+            let owner = state.join("owner", None, None).unwrap();
+            let bob = state.join("bob", None, None).unwrap();
+            let channel = state.default_channel();
+
+            let payload = b"eight ..".to_vec();
+            let upload = state
+                .start_upload(
+                    bob,
+                    "u.bin".to_string(),
+                    "application/octet-stream".to_string(),
+                    payload.len() as u64,
+                    UploadTarget::Channel(channel),
+                    0,
+                )
+                .unwrap();
+            if complete {
+                state.upload_chunk(bob, upload, &payload).unwrap();
+                // Refuse on permission rather than on size.
+                state.set_role(owner, bob, Role::Guest).unwrap();
+            } else {
+                state.upload_chunk(bob, upload, &payload[..4]).unwrap();
+            }
+
+            assert!(
+                state.take_upload(bob, upload).is_err(),
+                "{label} must be refused"
+            );
+            assert!(
+                !state.uploads.contains_key(&upload),
+                "{label}: the spool must not outlive the refusal"
+            );
+            assert!(
+                state.upload_chunk(bob, upload, &payload).is_err(),
+                "{label}: the discarded upload must not be reachable again"
+            );
+        }
+    }
+
+    /// The one refusal that must *not* discard: naming somebody else's upload id
+    /// is not a way to destroy their transfer.
+    #[test]
+    fn taking_an_upload_that_is_not_yours_leaves_it_alone() {
+        let mut state = PartyState::new("Srv", None);
+        let alice = state.join("alice", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let payload = b"alice's file".to_vec();
+        let upload = state
+            .start_upload(
+                alice,
+                "u.bin".to_string(),
+                "application/octet-stream".to_string(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+                0,
+            )
+            .unwrap();
+        state.upload_chunk(alice, upload, &payload).unwrap();
+
+        assert!(
+            state.take_upload(bob, upload).is_err(),
+            "bob must not be able to take alice's upload"
+        );
+        assert!(
+            state.uploads.contains_key(&upload),
+            "alice's spool must survive bob naming its id"
+        );
+        state
+            .take_upload(alice, upload)
+            .expect("alice's own upload still completes");
     }
 }

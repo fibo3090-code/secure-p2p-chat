@@ -13,6 +13,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import {
     parseInvokeCalls,
+    scanInvokeCalls,
+    countInvokeSites,
+    countRawInvokeSites,
     parseRustCommands,
     contractProblems,
 } from "./invokeContract.js";
@@ -40,6 +43,100 @@ describe("parseInvokeCalls", () => {
         expect(
             parseInvokeCalls('invoke("change_password", { current, new: next })'),
         ).toEqual([{ command: "change_password", keys: ["current", "new"] }]);
+    });
+
+    // The old parser used `[^}]*` for the argument object, so a nested object
+    // ended the match at the *inner* brace and the call did not match at all —
+    // it was skipped, silently, rather than flagged.
+    it("reads a nested argument object", () => {
+        expect(
+            parseInvokeCalls('invoke("update_settings", { settings: { a, b }, id })'),
+        ).toEqual([{ command: "update_settings", keys: ["settings", "id"] }]);
+    });
+
+    it("reads an argument object containing a brace in a string", () => {
+        expect(parseInvokeCalls('invoke("open_url", { url: "a}b" })')).toEqual([
+            { command: "open_url", keys: ["url"] },
+        ]);
+    });
+
+    it("ignores a commented-out call", () => {
+        const source = [
+            '// invoke("removed_command", { id })',
+            '/* invoke("also_removed") */',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
+    // Comment stripping knew about strings but not about regex literals, so a
+    // pattern containing a quote — `/["']/` — opened what looked like a string.
+    // It ran to the next unrelated quote, and everything from there on was
+    // misaligned by one quote: the `//` below ended up *outside* a string and
+    // its commented-out call was counted as real.
+    //
+    // Each of these keeps a commented-out `invoke` after the pattern, because
+    // that is what makes the misparse observable. Mistaking a regex for a string
+    // copies the same characters through either way; what changes is which of
+    // the quotes that follow are read as openers, and so whether a real comment
+    // is still recognised as one.
+    it("is not derailed by a regex literal containing a quote", () => {
+        const source = [
+            'const strip = /["\']/g;',
+            'const label = "x"; // invoke("ghost")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
+    it("does not mistake division for the start of a regex", () => {
+        // Reading `total / count` as a pattern consumes up to the next slash —
+        // the first character of the comment — and what remains of the `//`
+        // opens another, so the commented-out call is copied through as code.
+        const source = [
+            'const ratio = total / count; // invoke("ghost")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
+    it("does not end a pattern at a slash inside a character class", () => {
+        const source = [
+            'const path = /[/"]+/g;',
+            'const label = "x"; // invoke("ghost")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "mark_read", keys: ["id"] },
+        ]);
+    });
+
+    // A call this parser cannot read is the dangerous case: it used to vanish
+    // from the subject set without a word. Now it is reported, and the real
+    // bridge asserts there are none.
+    it("reports a computed command name instead of skipping it", () => {
+        const { calls, unparsed } = scanInvokeCalls("invoke(name, { id })");
+        expect(calls).toEqual([]);
+        expect(unparsed).toHaveLength(1);
+        expect(unparsed[0].reason).toMatch(/not a string literal/);
+    });
+    it("counts raw occurrences separately from live ones", () => {
+        const source = [
+            '// invoke("removed_command")',
+            'invoke("mark_read", { id })',
+        ].join("\n");
+        expect(countInvokeSites(source)).toBe(1);
+        expect(countRawInvokeSites(source)).toBe(2);
     });
 });
 
@@ -103,12 +200,32 @@ describe("contractProblems", () => {
 });
 
 describe("the real bridge", () => {
-    it("parses a plausible number of commands from both sides", () => {
-        // A guard on the guard: if either regex stopped matching, the contract
-        // check below would pass by finding nothing to compare.
-        const calls = parseInvokeCalls(bridgeSource);
-        const commands = parseRustCommands(rustSource);
+    it("parses every invoke call site, with none skipped", () => {
+        // A guard on the guard, and it is an equality rather than a floor. A
+        // floor of "more than 40" was satisfied by a parser that silently
+        // skipped the calls it could not read — which were, by construction, the
+        // unusual ones most likely to be wrong. If a call site cannot be parsed,
+        // that is the failure; it must never be an omission.
+        const { calls, unparsed } = scanInvokeCalls(bridgeSource);
+        expect(
+            unparsed.map((u) => `${u.reason}: ${u.snippet}`),
+        ).toEqual([]);
+        expect(calls.length).toBe(countInvokeSites(bridgeSource));
         expect(calls.length).toBeGreaterThan(40);
+
+        // …and against the *raw* text as well, which is the half the stripper
+        // cannot influence. `countInvokeSites` above shares `stripComments` with
+        // the scanner, so a stripper bug shrinks both sides together and the
+        // equality still holds — the regex-literal bug did exactly that.
+        // `bridge.js` contains no commented-out or quoted `invoke(`, so the two
+        // counts must agree; if someone adds one, this fails and says so rather
+        // than quietly checking one call fewer.
+        expect(
+            calls.length,
+            "a call site in bridge.js is being skipped, or a commented-out one was added",
+        ).toBe(countRawInvokeSites(bridgeSource));
+
+        const commands = parseRustCommands(rustSource);
         expect(commands.length).toBeGreaterThan(40);
     });
 

@@ -13,7 +13,7 @@ use messenger_core::party::{
 };
 use uuid::Uuid;
 
-use crate::state::PartyState;
+use crate::state::{stage_upload, BlobRead, PartyState};
 
 /// The outcome of handling one request:
 /// - `replies` go back to the requesting connection;
@@ -27,14 +27,72 @@ pub struct Dispatch {
     pub replies: Vec<PartyResponse>,
     pub broadcast: Vec<PartyResponse>,
     pub directed: Vec<(Uuid, PartyResponse)>,
+    /// Replies that still need bytes read off the disk.
+    ///
+    /// `handle_request` runs with the state mutex held, and a blob is up to
+    /// `MAX_PARTY_FILE_BYTES` (100 MiB). Reading it here would hold the lock for
+    /// the whole transfer and queue every other member's messages behind one
+    /// person's download — and the chunked endpoint made that far worse, because
+    /// it read the *entire* blob to slice out each 64 KiB chunk. So the access
+    /// check happens here, under the lock, and the read happens in
+    /// `serve_connection` after the guard is dropped. These are appended after
+    /// `replies`, which preserves reply order: no request produces both.
+    pub deferred: Vec<Deferred>,
 }
 
 impl Dispatch {
     fn reply(resp: PartyResponse) -> Self {
         Self {
             replies: vec![resp],
-            broadcast: Vec::new(),
-            directed: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    fn deferred(one: Deferred) -> Self {
+        Self {
+            deferred: vec![one],
+            ..Default::default()
+        }
+    }
+}
+
+/// A reply whose payload is read once the state lock has been released.
+#[derive(Debug)]
+pub enum Deferred {
+    FileData {
+        hash: String,
+        read: BlobRead,
+    },
+    FileChunk {
+        hash: String,
+        offset: u64,
+        total: u64,
+        read: BlobRead,
+    },
+}
+
+impl Deferred {
+    /// Perform the read and build the reply. **Call with the lock released.**
+    pub async fn resolve(self) -> PartyResponse {
+        match self {
+            Deferred::FileData { hash, read } => match read.resolve().await {
+                Some(data) => PartyResponse::FileData { hash, data },
+                None => PartyResponse::Error("unknown file".to_string()),
+            },
+            Deferred::FileChunk {
+                hash,
+                offset,
+                total,
+                read,
+            } => match read.resolve().await {
+                Some(data) => PartyResponse::FileChunk {
+                    hash,
+                    offset,
+                    total,
+                    data,
+                },
+                None => PartyResponse::Error("unknown file".to_string()),
+            },
         }
     }
 }
@@ -122,6 +180,7 @@ fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
             replies: vec![ack],
             broadcast: vec![PartyResponse::Message(env)],
             directed: Vec::new(),
+            deferred: Vec::new(),
         };
     }
     let readers = state.members_who_can_read(env.channel);
@@ -132,6 +191,7 @@ fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
             .into_iter()
             .map(|m| (m, PartyResponse::Message(env.clone())))
             .collect(),
+        deferred: Vec::new(),
     }
 }
 
@@ -156,6 +216,81 @@ fn channel_list_refresh(state: &PartyState, member: Uuid) -> Dispatch {
         replies: vec![PartyResponse::Channels(state.channels_for(member))],
         broadcast: vec![PartyResponse::DirectoryChanged],
         directed: Vec::new(),
+        deferred: Vec::new(),
+    }
+}
+
+/// `FinishUpload`, with the 100 MiB of hashing and disk I/O outside the lock.
+///
+/// This is the counterpart of the deferred read path, for writes. The
+/// `FinishUpload` arm of [`handle_request`] does the same work in one shot with
+/// the caller's lock held; `serve_connection` routes around it to here so that
+/// one member's upload does not stall every other member's messages behind the
+/// state mutex. Three phases, two of which need the lock:
+///
+///   1. [`PartyState::take_upload`] — validate, check the member may post at
+///      all, and take the spooled bytes out of the state.
+///   2. [`stage_upload`] — hash and write, on the blocking pool, no lock.
+///   3. [`PartyState::commit_upload`] — re-check permissions and storage, record
+///      the blob, append the message.
+///
+/// The state can change between 1 and 3, which is why 3 re-checks rather than
+/// trusting 1; bytes staged for an upload that is then refused are unlinked.
+pub async fn handle_finish_upload(
+    state: &tokio::sync::Mutex<PartyState>,
+    conn: &mut ConnState,
+    upload: Uuid,
+) -> Dispatch {
+    let Some(member) = conn.member() else {
+        return Dispatch::reply(PartyResponse::Error("join required".to_string()));
+    };
+    // Take first, forget second. Clearing the connection's id up front made the
+    // two sides disagree the moment `take_upload` refused: the spool stayed in
+    // `PartyState` with nothing left pointing at it, `MAX_CONCURRENT_UPLOADS`
+    // counted a `conn.uploads` that had just been emptied, and the disconnect
+    // sweep — gated on this very list being non-empty — never ran. `take_upload`
+    // is terminal either way, so the id is dropped here on both outcomes.
+    let taken = {
+        let mut st = state.lock().await;
+        let result = st.take_upload(member, upload);
+        conn.uploads.retain(|u| *u != upload);
+        match result {
+            Ok(taken) => taken,
+            Err(reason) => {
+                return Dispatch::reply(PartyResponse::ActionFailed {
+                    channel: Uuid::nil(),
+                    reason,
+                })
+            }
+        }
+    };
+
+    let staged = match stage_upload(taken).await {
+        Ok(staged) => staged,
+        Err(reason) => {
+            return Dispatch::reply(PartyResponse::ActionFailed {
+                channel: Uuid::nil(),
+                reason,
+            })
+        }
+    };
+
+    let mut st = state.lock().await;
+    match st.commit_upload(staged) {
+        Ok((env, UploadTarget::Channel(_))) => channel_fanout(&st, env),
+        Ok((env, UploadTarget::Dm(to))) => Dispatch {
+            replies: vec![PartyResponse::MessagePosted {
+                channel: env.channel,
+                seq: env.seq,
+            }],
+            broadcast: Vec::new(),
+            directed: dm_delivery(member, to, env),
+            deferred: Vec::new(),
+        },
+        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
+            channel: Uuid::nil(),
+            reason,
+        }),
     }
 }
 
@@ -199,6 +334,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         // never showed up and the online dots never changed.
                         broadcast: vec![PartyResponse::Members(state.members())],
                         directed: Vec::new(),
+                        deferred: Vec::new(),
                     }
                 }
                 Err(e) => {
@@ -257,6 +393,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         }],
                         broadcast: Vec::new(),
                         directed: dm_delivery(member, to, env),
+                        deferred: Vec::new(),
                     },
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                         channel: messenger_core::party::dm_thread_id(member, to),
@@ -292,14 +429,17 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         }],
                         broadcast: Vec::new(),
                         directed: dm_delivery(member, to, env),
+                        deferred: Vec::new(),
                     },
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                         channel: messenger_core::party::dm_thread_id(member, to),
                         reason: e,
                     }),
                 },
-                PartyRequest::DownloadFile { hash } => match state.blob_bytes_for(member, &hash) {
-                    Some(data) => Dispatch::reply(PartyResponse::FileData { hash, data }),
+                // Authorised here, read after the lock is released — see
+                // `Dispatch::deferred`.
+                PartyRequest::DownloadFile { hash } => match state.blob_read_for(member, &hash) {
+                    Some(read) => Dispatch::deferred(Deferred::FileData { hash, read }),
                     // Same reply for unknown and access-denied, so the endpoint
                     // never reveals a file the member isn't allowed to see.
                     None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
@@ -360,6 +500,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                             PartyResponse::DirectoryChanged,
                         ],
                         directed: Vec::new(),
+                        deferred: Vec::new(),
                     },
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                 },
@@ -410,14 +551,28 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     match state.upload_chunk(member, upload, &data) {
                         Ok(()) => Dispatch::default(),
                         Err(reason) => {
+                            // A failed chunk ends the upload, so the spool goes
+                            // with it. `upload_chunk` only removes it on the
+                            // over-declared path; an oversize chunk left the
+                            // bytes resident in `PartyState` while this line
+                            // dropped the last id that could reach them.
+                            state.cancel_upload(member, upload);
                             conn.uploads.retain(|u| *u != upload);
                             Dispatch::reply(PartyResponse::Error(reason))
                         }
                     }
                 }
+                // `serve_connection` routes this to `handle_finish_upload`
+                // instead, which does the hashing and the disk write with the
+                // lock released. This arm is the synchronous equivalent, kept
+                // for callers that drive `handle_request` directly.
                 PartyRequest::FinishUpload { upload } => {
+                    // After the state transition, for the reason spelled out in
+                    // `handle_finish_upload`: forgetting the id first is what
+                    // let a refused finish strand its spool.
+                    let result = state.finish_upload(member, upload);
                     conn.uploads.retain(|u| *u != upload);
-                    match state.finish_upload(member, upload) {
+                    match result {
                         Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
                         Ok((env, UploadTarget::Dm(to))) => Dispatch {
                             replies: vec![PartyResponse::MessagePosted {
@@ -426,6 +581,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                             }],
                             broadcast: Vec::new(),
                             directed: dm_delivery(member, to, env),
+                            deferred: Vec::new(),
                         },
                         Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
                             channel: Uuid::nil(),
@@ -451,6 +607,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                                 }],
                                 broadcast: Vec::new(),
                                 directed: dm_delivery(member, to, env),
+                                deferred: Vec::new(),
                             },
                         },
                         Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
@@ -469,12 +626,12 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                 },
                 PartyRequest::DownloadChunk { hash, offset } => {
-                    match state.blob_chunk_for(member, &hash, offset) {
-                        Some((data, total)) => Dispatch::reply(PartyResponse::FileChunk {
+                    match state.blob_chunk_read_for(member, &hash, offset) {
+                        Some((read, total)) => Dispatch::deferred(Deferred::FileChunk {
                             hash,
                             offset,
                             total,
-                            data,
+                            read,
                         }),
                         None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
                     }
@@ -487,6 +644,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::MAX_CONCURRENT_UPLOADS;
     use messenger_core::party::MessagePayload;
 
     /// Join and return the assigned member id.
@@ -902,8 +1060,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn download_returns_bytes_for_known_and_errors_for_unknown() {
+    /// The download reply is *deferred*: the access check happens under the
+    /// lock, the read happens after it. Resolving it here is what
+    /// `serve_connection` does once its guard is dropped.
+    #[tokio::test]
+    async fn download_returns_bytes_for_known_and_errors_for_unknown() {
         let mut state = PartyState::new("Srv", None);
         let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", None);
@@ -929,7 +1090,18 @@ mod tests {
 
         let ok = handle_request(&mut state, &mut conn, PartyRequest::DownloadFile { hash });
         assert!(
-            matches!(&ok.replies[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
+            ok.replies.is_empty(),
+            "the bytes must not be read under the lock"
+        );
+        let resolved: Vec<PartyResponse> = {
+            let mut out = Vec::new();
+            for d in ok.deferred {
+                out.push(d.resolve().await);
+            }
+            out
+        };
+        assert!(
+            matches!(&resolved[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
         );
 
         let missing = handle_request(
@@ -940,5 +1112,120 @@ mod tests {
             },
         );
         assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
+    }
+
+    /// Declare a size, send less than it, finish. The server refuses — and must
+    /// keep nothing.
+    ///
+    /// This used to be an unbounded memory leak a Guest could drive: the
+    /// connection dropped its id *before* the state was asked to finish, so the
+    /// refused spool stayed in `PartyState::uploads` with nothing referencing
+    /// it. Two things that should have stopped it did not — the concurrency cap
+    /// counts `conn.uploads`, which had just been emptied, and the disconnect
+    /// sweep is gated on that same list being non-empty — so each round
+    /// abandoned up to the per-file limit until the process restarted.
+    #[test]
+    fn repeatedly_finishing_incomplete_uploads_keeps_nothing() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        joined_id(&mut state, &mut conn, "alice");
+        let channel = state.default_channel();
+
+        for round in 0..(MAX_CONCURRENT_UPLOADS * 3) {
+            let ready = handle_request(
+                &mut state,
+                &mut conn,
+                PartyRequest::StartUpload {
+                    name: "partial.bin".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                    size: 8,
+                    target: UploadTarget::Channel(channel),
+                },
+            );
+            let upload = match ready.replies.as_slice() {
+                [PartyResponse::UploadReady { upload, .. }] => *upload,
+                other => panic!("round {round}: expected UploadReady, got {other:?}"),
+            };
+            handle_request(
+                &mut state,
+                &mut conn,
+                PartyRequest::UploadChunk {
+                    upload,
+                    data: b"half".to_vec(),
+                },
+            );
+            let failed =
+                handle_request(&mut state, &mut conn, PartyRequest::FinishUpload { upload });
+            assert!(
+                matches!(
+                    failed.replies.as_slice(),
+                    [PartyResponse::ActionFailed { reason, .. }] if reason.contains("incomplete")
+                ),
+                "round {round}: unexpected reply {:?}",
+                failed.replies
+            );
+
+            assert_eq!(
+                state.pending_upload_count(),
+                0,
+                "round {round}: the refused spool is still held"
+            );
+            assert!(conn.open_uploads().is_empty(), "round {round}");
+        }
+    }
+
+    /// An oversize chunk ends the upload, and the bytes already spooled for it
+    /// go too. `upload_chunk` only discards on the over-declared path, so the
+    /// dispatcher has to finish the job — otherwise this is the same leak as
+    /// above by a different route.
+    #[test]
+    fn a_rejected_chunk_releases_the_spool() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        joined_id(&mut state, &mut conn, "alice");
+        let channel = state.default_channel();
+
+        let ready = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::StartUpload {
+                name: "big.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                size: (PARTY_CHUNK_BYTES * 4) as u64,
+                target: UploadTarget::Channel(channel),
+            },
+        );
+        let upload = match ready.replies.as_slice() {
+            [PartyResponse::UploadReady { upload, .. }] => *upload,
+            other => panic!("expected UploadReady, got {other:?}"),
+        };
+        handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::UploadChunk {
+                upload,
+                data: vec![0u8; PARTY_CHUNK_BYTES],
+            },
+        );
+        assert_eq!(state.pending_upload_count(), 1);
+
+        let rejected = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::UploadChunk {
+                upload,
+                data: vec![0u8; PARTY_CHUNK_BYTES + 1],
+            },
+        );
+        assert!(matches!(
+            rejected.replies.as_slice(),
+            [PartyResponse::Error(reason)] if reason.contains("too large")
+        ));
+        assert_eq!(
+            state.pending_upload_count(),
+            0,
+            "the spool must not outlive the upload it belonged to"
+        );
+        assert!(conn.open_uploads().is_empty());
     }
 }

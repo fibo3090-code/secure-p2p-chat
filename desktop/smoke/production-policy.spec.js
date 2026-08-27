@@ -38,3 +38,29 @@ test("the shipped page allows no inline script", async ({ page }) => {
   );
   expect(inlineScripts, "inline <script> blocks in the shipped page").toBe(0);
 });
+
+// The built page renders because the dev mock is in the shipped bundle.
+//
+// `bridge.js` gates on `window.__TAURI_INTERNALS__` — a runtime check for a
+// Tauri host — rather than on `import.meta.env.DEV`, so the mock is not stripped
+// from a production build. `vite preview` serves `dist/` in a plain Chromium
+// with no Tauri host, so that is the only reason anything paints here at all.
+//
+// That was an accident of how the gate was written, and the `built` smoke
+// project quietly turned it into a dependency. Asserting it makes the
+// dependency visible: if someone tree-shakes the mock out of production, this
+// fails saying so, instead of `app-loads.spec.js` failing with "React did not
+// mount" in the built project only.
+test("the shipped bundle can still come up without a Tauri host", async ({ page }) => {
+  await page.goto("/");
+
+  const hasTauriHost = await page.evaluate(() => !!window.__TAURI_INTERNALS__);
+  expect(
+    hasTauriHost,
+    "vite preview must not be providing a Tauri host — that is the point of this check",
+  ).toBe(false);
+
+  // It painted anyway, which means the mock shipped. See the note on `inTauri`
+  // in `src/lib/bridge.js` before changing that.
+  await expect(page.locator("#root > *")).toHaveCount(1);
+});

@@ -24,14 +24,57 @@ permissions:
 #   2. P2PEM Tools    — terminal client + relay + community server, for people
 #                       running this on a headless box. Clearly secondary.
 #
-# The release body is written first, so the page explains itself the moment the
-# artifacts start landing.
+# ── Why nothing reaches the release page until the very end ────────────────
+#
+# The build jobs do **not** upload to the release. They hand their bundles to
+# the workflow artifact store, and one final job downloads *those* artifacts,
+# attests them, checksums them, uploads them and only then flips the release out
+# of draft. Two problems made that necessary:
+#
+#   * `gh release download` pulls whatever is attached to the tag — including an
+#     asset from an earlier run, a re-pushed tag, or one attached by hand. Feeding
+#     that to `attest-build-provenance` mints a Sigstore signature saying bytes
+#     no build job in this run ever produced were "built by this repo at this
+#     commit". The subject set has to be what this run built, and the artifact
+#     store is the only place that holds exactly that.
+#   * Both matrices are `fail-fast: false`, so one failed leg out of seven used
+#     to leave the other six attached to an already-public release with `attest`
+#     skipped: no checksums, no provenance, and nothing on the page saying so.
+#     A draft that is published by the attest job cannot half-ship.
+#
+# Every third-party action is pinned to a commit SHA. These jobs hold
+# `contents: write` and mint provenance with `id-token: write`; a mutable tag on
+# any action in that blast radius is a way to get valid provenance for someone
+# else's bytes.
 jobs:
   create-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The release notes name files by the *tag*; tauri's bundler names them
+      # from `workspace.package.version`. When those disagree the download table
+      # points at filenames that do not exist, and the mismatch is only visible
+      # once every build has finished. Check it in the first ten seconds instead.
+      - name: Tag matches the workspace version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(
+            sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+              | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1
+          )"
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "::error::could not read workspace.package.version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${CARGO_VERSION}."
+            echo "::error::The bundles would be named P2PEM_${CARGO_VERSION}_* while the notes advertise P2PEM_${TAG_VERSION}_*."
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches workspace version ${CARGO_VERSION}"
 
       - name: Compose release notes
         run: |
@@ -72,8 +115,15 @@ jobs:
             echo "workflow, from this commit, and not by anyone else. Needs the \`gh\` CLI:"
             echo
             echo "\`\`\`"
-            echo "gh attestation verify <downloaded-file> --repo ${GITHUB_REPOSITORY}"
+            echo "gh attestation verify <downloaded-file> \\"
+            echo "  --repo ${GITHUB_REPOSITORY} \\"
+            echo "  --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release.yml"
             echo "\`\`\`"
+            echo
+            echo "\`--signer-workflow\` is not optional decoration: without it the command"
+            echo "accepts an attestation minted by *any* workflow in this repository, and a"
+            echo "workflow that can be added in a pull request is a much easier thing to"
+            echo "control than this one."
             echo
             echo "**Checksums** — proves the bytes you got are the bytes that were published."
             echo "Download \`SHA256SUMS\` from the assets below, then:"
@@ -82,6 +132,9 @@ jobs:
             echo "sha256sum --ignore-missing -c SHA256SUMS      # Linux"
             echo "shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS"
             echo "\`\`\`"
+            echo
+            echo "\`SHA256SUMS\` is itself attested, so verify it the same way before trusting"
+            echo "what it says about anything else."
             echo
             echo "Provenance is the stronger of the two: a checksum only proves the file"
             echo "matches this page, while an attestation proves this page's file came from"
@@ -92,25 +145,53 @@ jobs:
             echo "---"
           } > release-notes.md
 
-      - name: Ensure release exists
+      # Created as a **draft**. Nothing is attached yet, and nothing will be
+      # until the attest job has provenance and checksums for every artifact —
+      # publishing is that job's last step.
+      - name: Ensure a draft release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release ${{ github.ref_name }} already exists; leaving its notes alone."
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            # An existing release is fine only while it is still a draft.
+            #
+            # Everything downstream assumes it is operating on a page nobody can
+            # see yet. Against a published release, `gh release upload --clobber`
+            # would replace live assets *before* their digests are verified, and
+            # a failed verification would leave those replacements up — the same
+            # shape as the bug this job exists to prevent, acting on a page whose
+            # contents this run did not produce. Refuse rather than tidy up after.
+            is_draft="$(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release ${GITHUB_REF_NAME} is already published."
+              echo "::error::Re-running would clobber published assets before they are verified."
+              echo "::error::Delete the release (or push a new tag) if you intend to rebuild it."
+              exit 1
+            fi
+            echo "Release ${GITHUB_REF_NAME} already exists as a draft; leaving its notes alone."
           else
-            gh release create "${{ github.ref_name }}" \
-              --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --title "P2PEM ${{ github.ref_name }}" \
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "P2PEM ${GITHUB_REF_NAME}" \
               --notes-file release-notes.md \
-              --generate-notes
+              --generate-notes \
+              --draft
           fi
 
   # ── The app ───────────────────────────────────────────────────────────────
   desktop:
     name: P2PEM Desktop (${{ matrix.label }})
     needs: create-release
+    timeout-minutes: 60
+    # This job hands its output to the artifact store and never touches the
+    # release, so it does not need the workflow-level `contents: write` it would
+    # otherwise inherit. It runs `npm ci` and a Tauri build — the most
+    # third-party code in the pipeline — and now does so without a token that
+    # can write to the repository.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -131,33 +212,53 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
-            libayatana-appindicator3-dev patchelf
+          # Bounded for the same reason as ci.yml's three apt blocks: apt has no
+          # timeout of its own, and a stalled mirror otherwise sits here until
+          # `timeout-minutes: 60` kills the job — an hour spent to report
+          # nothing, on the one workflow where the failure means no release.
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 120 sudo -E dpkg --configure -a \
+               && timeout -k 30 420 sudo -E apt-get install -y \
+                    libgtk-3-dev libwayland-dev libxkbcommon-dev \
+                    libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
+                    libayatana-appindicator3-dev patchelf; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "apt attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed three times; this is an infrastructure problem, not the diff"
+          exit 1
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch @ 2025-06
         with:
           toolchain: stable
           targets: ${{ contains(matrix.args, 'apple') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: desktop/src-tauri
+      # No `Swatinem/rust-cache` here, deliberately. The attestation this
+      # pipeline mints says "built from this source at this commit"; a warm
+      # cargo cache means the build actually consumed object files produced by
+      # earlier runs, on other refs, from source that is not this commit. CI
+      # builds should be fast, release builds that mint provenance should be
+      # cold — the ~15 minutes is the price of the claim being true.
 
       - name: Install frontend dependencies
         run: npm ci
@@ -169,20 +270,64 @@ jobs:
         run: npm run build
         working-directory: desktop
 
-      - name: Build and upload desktop installers
-        uses: tauri-apps/tauri-action@v0
+      # No `tagName`/`releaseId`: tauri-action builds and reports the bundle
+      # paths, and uploading is the attest job's business. See the header.
+      - name: Build desktop installers
+        id: tauri
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: 'P2PEM ${{ github.ref_name }}'
           args: ${{ matrix.args }}
+
+      - name: Stage installers
+        shell: bash
+        env:
+          # Via the environment, not interpolated into the script body: this is
+          # action output being fed to a shell.
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          # Via a file rather than a pipe or `mapfile`: a `while read` fed by a
+          # pipe runs in a subshell, so `exit 1` inside it would not fail the
+          # step, and `mapfile` is bash 4 — which the macOS runner's /bin/bash
+          # is not.
+          printf '%s' "$ARTIFACT_PATHS" | jq -r '.[]' > artifact-paths.txt
+          staged=0
+          while IFS= read -r bundle; do
+            [ -z "$bundle" ] && continue
+            if [ ! -f "$bundle" ]; then
+              echo "::error::tauri-action reported a bundle that is not there: $bundle"
+              exit 1
+            fi
+            cp -- "$bundle" staging/
+            staged=$((staged + 1))
+          done < artifact-paths.txt
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::tauri-action produced no artifacts"
+            exit 1
+          fi
+          ls -l staging
+
+      - name: Upload installers to the artifact store
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-desktop-${{ matrix.label }}
+          path: staging/
+          if-no-files-found: error
+          retention-days: 7
 
   # ── Secondary: headless / self-hosting tools ──────────────────────────────
   tools:
     name: P2PEM Tools (${{ matrix.label }})
     needs: create-release
+    timeout-minutes: 45
+    # Uploads to the artifact store, not to the release — same reasoning as the
+    # desktop job above.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -196,15 +341,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch @ 2025-06
         with:
           toolchain: stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      # Cold build on purpose — same reasoning as the desktop job above.
 
       # No GUI toolkit is needed any more: the client crate is the app core plus
       # a terminal UI, and the server is headless.
@@ -239,14 +383,15 @@ jobs:
           Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
           "ASSET=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Upload
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
-        shell: bash
+      - name: Upload tools archive to the artifact store
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-tools-${{ matrix.label }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
 
-
-  # ── Provenance and checksums ──────────────────────────────────────────────
+  # ── Provenance, checksums, and publication ────────────────────────────────
   #
   # These installers carry no OS code-signing certificate — a Windows
   # Authenticode cert and an Apple Developer membership are recurring costs this
@@ -259,7 +404,9 @@ jobs:
   #
   #   SHA256SUMS   proves the bytes you downloaded match the bytes published.
   #                Cheap, familiar, and no help at all if the release page
-  #                itself is what an attacker controls.
+  #                itself is what an attacker controls — which is exactly why it
+  #                is attested too, rather than being the one unsigned file that
+  #                vouches for all the others.
   #   Provenance   binds each artifact's digest to this repository, this commit
   #                and this workflow run, signed through Sigstore with an
   #                ephemeral key and recorded in a public transparency log.
@@ -268,45 +415,137 @@ jobs:
   #                the bytes on the page" but "these are the bytes this source
   #                built".
   #
-  # Run as one job after everything has been published, rather than per build
-  # job: it covers every asset regardless of which of the seven matrix legs
-  # produced it, and it does not need the four desktop runners to agree on how
-  # to parse tauri-action's artifact paths.
+  # `needs` gates this on all seven build legs succeeding, so a partial build
+  # never publishes: the release stays a draft with the failure visible.
   attest:
-    name: Provenance and checksums
+    name: Provenance, checksums and publish
     needs: [desktop, tools]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Job-level permissions REPLACE the workflow-level block rather than adding
     # to it, so `contents` has to be restated here.
     permissions:
-      contents: write # upload SHA256SUMS to the release
+      contents: write # upload assets and publish the release
       id-token: write # mint the short-lived Sigstore signing certificate
       attestations: write # record the attestation against this repository
     steps:
-      - name: Download every published asset
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The subject set: exactly the artifacts the build jobs in *this run*
+      # uploaded, named by an explicit pattern. Not "whatever is attached to the
+      # tag" — that set includes assets from previous runs of a re-pushed tag and
+      # anything a human attached by hand, and signing those would say this
+      # source built bytes it has never seen.
+      - name: Collect this run's build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: release-*
+
+      # Deliberately not `merge-multiple: true`. That flattens the artifacts into
+      # one directory and, on a basename collision, silently keeps whichever file
+      # it wrote last. The current seven legs produce distinct names so nothing
+      # would be lost today — but a future leg that collides would lose a file
+      # invisibly: the verification step below compares the merged directory
+      # against the release, and both sides would be missing the same file, so it
+      # would agree. Merging by hand makes the collision an error instead.
+      - name: Merge the artifacts, refusing a name collision
         run: |
+          set -euo pipefail
+          # One per build leg: four desktop platforms plus three tools targets.
+          # Update this alongside the matrices; `needs` gates on all seven
+          # succeeding, so a mismatch here means one uploaded nothing expected.
+          expected_artifacts=7
+
+          found=$(find artifacts -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$found" -ne "$expected_artifacts" ]; then
+            echo "::error::expected $expected_artifacts build artifacts, collected $found"
+            find artifacts -mindepth 1 -maxdepth 1 -type d
+            exit 1
+          fi
+
           mkdir -p assets
-          gh release download "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --dir assets
-          # A SHA256SUMS from an earlier run of the same tag must not be hashed
-          # into the new one, and must not be attested as a build artifact.
-          rm -f assets/SHA256SUMS
+          collision=0
+          while IFS= read -r file; do
+            base=$(basename "$file")
+            if [ -e "assets/$base" ]; then
+              echo "::error::two build legs both produced '$base'; one would be silently dropped"
+              collision=1
+              continue
+            fi
+            mv -- "$file" "assets/$base"
+          done < <(find artifacts -mindepth 2 -type f | sort)
+          [ "$collision" -eq 0 ] || exit 1
+
+      - name: Show what will be signed
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A assets 2>/dev/null)" ]; then
+            echo "::error::no build artifacts were collected"
+            exit 1
+          fi
+          # A SHA256SUMS can only ever be produced by the step below, so one
+          # appearing here would mean a build job uploaded something it should not.
+          if [ -e assets/SHA256SUMS ]; then
+            echo "::error::a build job uploaded a SHA256SUMS; refusing to sign it"
+            exit 1
+          fi
           ls -l assets
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: 'assets/*'
 
-      - name: Publish SHA256SUMS
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Generated after the artifacts are final and attested in its own right.
+      # It used to be produced *after* the attest step and so was the one file on
+      # the page with no signature behind it — which matters, because it is the
+      # file whose whole job is to vouch for the others. Anyone who controlled
+      # the release page could swap the artifacts and the sums together.
+      - name: Generate SHA256SUMS
         run: |
+          set -euo pipefail
           # Hashes are recorded with bare filenames, so `-c` works from whatever
           # directory the user downloaded into.
           (cd assets && sha256sum -- *) > SHA256SUMS
           cat SHA256SUMS
-          gh release upload "$GITHUB_REF_NAME" SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Attest SHA256SUMS
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'SHA256SUMS'
+
+      - name: Upload every asset to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" SHA256SUMS assets/* \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+      # The attestation and the checksums describe the bytes this runner holds.
+      # Read them back off the release and prove they are the same bytes, so
+      # "verify your download" cannot fail for anyone in a way we could have
+      # caught here — a truncated upload, or an asset left over from an earlier
+      # run of this tag that `--clobber` did not cover.
+      - name: Verify the published bytes match what was signed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --dir published --clobber
+          cp SHA256SUMS assets/SHA256SUMS
+          (cd assets && sha256sum -- *) > expected.sums
+          (cd published && sha256sum -- *) > published.sums
+          if ! diff -u expected.sums published.sums; then
+            echo "::error::the release page does not hold the bytes that were signed"
+            exit 1
+          fi
+          echo "every published asset matches its attested digest"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --draft=false

@@ -11,6 +11,21 @@ use std::sync::{Arc, Mutex};
 /// Service type for mDNS discovery. Follows Zeroconf naming conventions.
 const SERVICE_TYPE: &str = "_p2p-messenger._tcp.local.";
 
+/// Ceiling on the discovery cache.
+///
+/// mDNS is unauthenticated local-network input: anything on the LAN can announce
+/// as many services as it likes under as many names, and this vector lives behind
+/// the mutex both front-ends read to draw "Nearby peers". Unbounded, a responder
+/// advertising a few hundred fullnames grows it without limit — and now that each
+/// service contributes one entry *per address* rather than one in total, so does
+/// the linear scan `merge_resolved` runs for every address it is given.
+const MAX_DISCOVERED_PEERS: usize = 256;
+
+/// Ceiling on how many of one service's advertised addresses are kept. A real
+/// dual-homed machine has two or three; a responder claiming twenty is not
+/// describing something anyone needs offered twenty times.
+const MAX_ADDRESSES_PER_PEER: usize = 8;
+
 /// Information about a discovered peer on the local network.
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
@@ -140,34 +155,18 @@ impl Discovery {
                         .get("fingerprint")
                         .map(|p| p.val_str().to_string());
 
-                    if let Some(addr) = addresses.iter().next() {
-                        let peer = DiscoveredPeer {
-                            name: info.get_hostname().trim_end_matches('.').to_string(),
-                            address: addr.to_string(),
+                    let name = info.get_hostname().trim_end_matches('.').to_string();
+                    let addresses: Vec<String> = addresses.iter().map(|a| a.to_string()).collect();
+
+                    if let Ok(mut peers) = discovered_peers.lock() {
+                        merge_resolved(
+                            &mut peers,
+                            &fullname,
+                            &name,
                             port,
-                            fingerprint,
-                            fullname: fullname.clone(),
-                        };
-
-                        tracing::info!(
-                            name = %peer.name,
-                            address = %peer.address,
-                            port = %peer.port,
-                            "Discovered peer via mDNS"
+                            fingerprint.as_deref(),
+                            &addresses,
                         );
-
-                        if let Ok(mut peers) = discovered_peers.lock() {
-                            // Avoid duplicates
-                            // Keyed on the service name as well as the endpoint:
-                            // one host can advertise twice, and re-resolving an
-                            // existing service must not duplicate it.
-                            if !peers.iter().any(|p| {
-                                p.fullname == peer.fullname
-                                    || (p.address == peer.address && p.port == peer.port)
-                            }) {
-                                peers.push(peer);
-                            }
-                        }
                     }
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
@@ -181,6 +180,60 @@ impl Discovery {
                 _ => {}
             }
         }
+    }
+}
+
+/// Fold one `ServiceResolved` event into the peer list.
+///
+/// A resolve is the current truth about a service, so it **replaces** what we
+/// held for that `fullname` rather than being skipped as a duplicate. Skipping
+/// was wrong twice over:
+///
+///   * A peer that changed address — a DHCP renewal, Wi-Fi to Ethernet — matched
+///     on `fullname` and was dropped, so its stale entry stayed in the list and
+///     the address that actually works was never added. Connecting kept failing
+///     until the service happened to be removed and re-announced.
+///   * A dual-homed peer resolves with several addresses, of which only the
+///     first was ever taken, so it was offered on exactly one interface no
+///     matter how many it advertised.
+///
+/// A separate service advertising the same endpoint is still one way in, so the
+/// endpoint dedup stays.
+fn merge_resolved(
+    peers: &mut Vec<DiscoveredPeer>,
+    fullname: &str,
+    name: &str,
+    port: u16,
+    fingerprint: Option<&str>,
+    addresses: &[String],
+) {
+    // Before the cap is consulted, so a peer re-announcing itself always frees
+    // its own slots first and can never be locked out of a full cache by its
+    // own stale entries.
+    peers.retain(|p| p.fullname != fullname);
+
+    for address in addresses.iter().take(MAX_ADDRESSES_PER_PEER) {
+        if peers.len() >= MAX_DISCOVERED_PEERS {
+            tracing::warn!(
+                limit = MAX_DISCOVERED_PEERS,
+                "mDNS discovery cache is full; ignoring further peers"
+            );
+            break;
+        }
+        if peers
+            .iter()
+            .any(|p| p.address == *address && p.port == port)
+        {
+            continue;
+        }
+        tracing::info!(name, address, port, "Discovered peer via mDNS");
+        peers.push(DiscoveredPeer {
+            name: name.to_string(),
+            address: address.clone(),
+            port,
+            fingerprint: fingerprint.map(|f| f.to_string()),
+            fullname: fullname.to_string(),
+        });
     }
 }
 
@@ -246,6 +299,183 @@ mod tests {
             left,
             vec!["laptop", "desktop"],
             "only the peer that actually left may be removed"
+        );
+    }
+
+    /// A peer that changes address must end up reachable at the new one.
+    ///
+    /// The dedup this replaces treated same-fullname-different-address as a
+    /// duplicate and dropped it, so the stale entry survived and the working
+    /// address was never added.
+    #[test]
+    fn a_peer_that_moves_is_relisted_at_its_new_address() {
+        let mut peers = Vec::new();
+        merge_resolved(
+            &mut peers,
+            "laptop._p2p-messenger._tcp.local.",
+            "laptop",
+            12345,
+            None,
+            &["192.168.1.10".to_string()],
+        );
+        assert_eq!(peers.len(), 1);
+
+        // DHCP renewal: same service, new address.
+        merge_resolved(
+            &mut peers,
+            "laptop._p2p-messenger._tcp.local.",
+            "laptop",
+            12345,
+            None,
+            &["192.168.1.77".to_string()],
+        );
+        let addresses: Vec<&str> = peers.iter().map(|p| p.address.as_str()).collect();
+        assert_eq!(
+            addresses,
+            vec!["192.168.1.77"],
+            "the stale address must not outlive the resolve that replaced it"
+        );
+    }
+
+    /// A dual-homed peer advertises several addresses and must be offered on all
+    /// of them — taking only the first left it reachable on one interface.
+    #[test]
+    fn every_advertised_address_of_a_peer_is_listed() {
+        let mut peers = Vec::new();
+        merge_resolved(
+            &mut peers,
+            "nas._p2p-messenger._tcp.local.",
+            "nas",
+            12345,
+            Some("AB"),
+            &["192.168.1.5".to_string(), "10.0.0.5".to_string()],
+        );
+        let addresses: Vec<&str> = peers.iter().map(|p| p.address.as_str()).collect();
+        assert_eq!(addresses, vec!["192.168.1.5", "10.0.0.5"]);
+        assert!(peers.iter().all(|p| p.fingerprint.as_deref() == Some("AB")));
+
+        // Re-resolving is idempotent.
+        merge_resolved(
+            &mut peers,
+            "nas._p2p-messenger._tcp.local.",
+            "nas",
+            12345,
+            Some("AB"),
+            &["192.168.1.5".to_string(), "10.0.0.5".to_string()],
+        );
+        assert_eq!(peers.len(), 2, "re-resolving must not duplicate anything");
+    }
+
+    /// Replacing one service must not disturb another, even on the same host.
+    #[test]
+    fn merging_one_service_leaves_other_peers_alone() {
+        let mut peers = Vec::new();
+        merge_resolved(
+            &mut peers,
+            "desktop._p2p-messenger._tcp.local.",
+            "desktop",
+            12345,
+            None,
+            &["192.168.1.12".to_string()],
+        );
+        merge_resolved(
+            &mut peers,
+            "laptop._p2p-messenger._tcp.local.",
+            "laptop",
+            12345,
+            None,
+            &["192.168.1.10".to_string()],
+        );
+        merge_resolved(
+            &mut peers,
+            "laptop._p2p-messenger._tcp.local.",
+            "laptop",
+            12345,
+            None,
+            &["192.168.1.11".to_string()],
+        );
+
+        let listed: Vec<(&str, &str)> = peers
+            .iter()
+            .map(|p| (p.name.as_str(), p.address.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("desktop", "192.168.1.12"), ("laptop", "192.168.1.11")]
+        );
+    }
+
+    /// The cache is bounded. Anything on the LAN can announce as many services
+    /// as it likes, so a flood of forged fullnames must stop growing the vector
+    /// the UI reads rather than growing it until something gives.
+    #[test]
+    fn the_discovery_cache_has_a_hard_peer_limit() {
+        let mut peers = Vec::new();
+        for i in 0..(MAX_DISCOVERED_PEERS + 50) {
+            // Distinct addresses throughout, so it is the cap doing the work
+            // here and not the endpoint dedup.
+            merge_resolved(
+                &mut peers,
+                &format!("peer-{i}._p2p-messenger._tcp.local."),
+                &format!("peer-{i}"),
+                12345,
+                None,
+                &[format!("192.0.{}.{}", i / 254, i % 254 + 1)],
+            );
+        }
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
+    }
+
+    /// One service's address list is bounded too — otherwise a single forged
+    /// announcement fills the cache on its own, and each address costs a scan of
+    /// everything already in it.
+    #[test]
+    fn one_service_cannot_claim_unlimited_addresses() {
+        let mut peers = Vec::new();
+        let addresses: Vec<String> = (1..=60).map(|i| format!("192.0.2.{i}")).collect();
+        merge_resolved(
+            &mut peers,
+            "greedy._p2p-messenger._tcp.local.",
+            "greedy",
+            12345,
+            None,
+            &addresses,
+        );
+        assert_eq!(peers.len(), MAX_ADDRESSES_PER_PEER);
+    }
+
+    /// The cap must not lock out a peer that is simply re-announcing itself:
+    /// its own stale entries are dropped before the limit is consulted.
+    #[test]
+    fn a_full_cache_still_accepts_a_peer_re_announcing_itself() {
+        let mut peers = Vec::new();
+        for i in 0..MAX_DISCOVERED_PEERS {
+            merge_resolved(
+                &mut peers,
+                &format!("peer-{i}._p2p-messenger._tcp.local."),
+                &format!("peer-{i}"),
+                12345,
+                None,
+                &[format!("10.0.{}.{}", i / 254, i % 254 + 1)],
+            );
+        }
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
+
+        // peer-0 moved from Wi-Fi to Ethernet and re-announced.
+        merge_resolved(
+            &mut peers,
+            "peer-0._p2p-messenger._tcp.local.",
+            "peer-0",
+            12345,
+            None,
+            &["10.9.9.9".to_string()],
+        );
+        assert!(
+            peers
+                .iter()
+                .any(|p| p.fullname == "peer-0._p2p-messenger._tcp.local."
+                    && p.address == "10.9.9.9"),
+            "a re-announcing peer must not be shut out by a full cache"
         );
     }
 

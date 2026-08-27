@@ -383,7 +383,13 @@ impl ProtocolMessage {
             if b.len() > crate::MAX_TEXT_MESSAGE_BYTES {
                 return None;
             }
-            let s = String::from_utf8_lossy(&b[5..]);
+            // Strict, like the binary arm, and for the same reason: this branch
+            // *keeps* its decoded string, so lossy decoding here would let a
+            // legacy `TEXT:1:` frame of `0xFF` bytes pass the wire check and
+            // then hold roughly three times the cap. The other legacy arms parse
+            // their string into a `u64` and drop it, so they are bounded by the
+            // parse; this one is not. See `decode_text`.
+            let s = decode_text(&b[5..])?;
             let parts: Vec<&str> = s.splitn(2, ':').collect();
             if parts.len() == 2 {
                 let seq = parts[0].parse::<u64>().ok()?;
@@ -523,7 +529,9 @@ impl ProtocolMessage {
                 if cursor + len > b.len() {
                     return None;
                 }
-                let text = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
+                // Strict, not lossy — see `decode_text` for why the difference
+                // is a memory bound and not a matter of taste.
+                let text = decode_text(&b[cursor..cursor + len])?;
                 Some(Self::Text {
                     text,
                     timestamp,
@@ -561,7 +569,7 @@ impl ProtocolMessage {
                 if cursor + len > b.len() {
                     return None;
                 }
-                let text_part = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
+                let text_part = decode_text(&b[cursor..cursor + len])?;
                 Some(Self::TextChunk {
                     message_id,
                     chunk_index,
@@ -677,6 +685,34 @@ impl ProtocolMessage {
             _ => None,
         }
     }
+}
+
+/// Decode a text payload as **strict** UTF-8, refusing anything else.
+///
+/// This used to be `String::from_utf8_lossy`, and the difference is not
+/// cosmetic — it is the difference between the wire caps meaning something and
+/// meaning nothing.
+///
+/// Every invalid byte becomes U+FFFD, which is **three** bytes. So a `Text`
+/// frame carrying a 65,536-byte payload of `0xFF` — 65,557 bytes on the wire,
+/// once the 21-byte header is counted — passed the `MAX_TEXT_MESSAGE_BYTES`
+/// check on the way in, decoded to a 196,608-byte `String`, and then failed to
+/// re-encode within the same cap: 196,629 bytes back on the wire, three times
+/// over. The decoder accepted a value its own encoder cannot produce, which is
+/// what `core/fuzz/fuzz_targets/protocol_frame.rs` asserts is impossible.
+///
+/// The practical consequence was a memory bound that was out by 3×.
+/// `MAX_TEXT_MESSAGE_BYTES` and `TEXT_CHUNK_BYTES` bound *wire* bytes; with
+/// lossy decoding they did not bound decoded memory, so 512 `TextChunk` frames
+/// of 48 KiB of invalid UTF-8 made the reassembler in
+/// `client/src/app/chat_manager/text.rs` hold about 72 MiB for one message
+/// against a documented ceiling of roughly 24 MiB.
+///
+/// Rejecting costs nothing in compatibility: the encoder writes a Rust `String`,
+/// which is UTF-8 by construction, so no peer of any version can legitimately
+/// send a text frame this refuses.
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }
 
 #[cfg(test)]

@@ -121,11 +121,25 @@ jobs:
           #
           # noninteractive so a package that wants to ask something fails rather
           # than waiting forever for an answer nobody can give.
+          #
+          # `timeout -k 30`, and a `dpkg --configure -a` before each retry,
+          # because the retry as first written could not work. Plain `timeout`
+          # sends SIGTERM, which apt and dpkg deliberately ignore in the middle
+          # of a transaction so a half-configured package is never left behind —
+          # so the timeout fired, apt kept running, and when it was finally
+          # killed it left `/var/lib/dpkg/lock` held and the transaction
+          # unfinished. Attempts 2 and 3 then failed deterministically on the
+          # lock: three attempts that were really one. `-k 30` follows up with
+          # SIGKILL, and `dpkg --configure -a` finishes whatever the kill
+          # interrupted so the next attempt starts from a clean database.
           export DEBIAN_FRONTEND=noninteractive
           for attempt in 1 2 3; do
             echo "::group::apt attempt $attempt"
-            if timeout 240 sudo -E apt-get update \
-               && timeout 420 sudo -E apt-get install -y \
+            if [ "$attempt" -gt 1 ]; then
+              sudo -E dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
                  libgtk-3-dev libwebkit2gtk-4.1-dev \
                  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
               echo "::endgroup::"
@@ -152,6 +166,25 @@ jobs:
 
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `core/fuzz` declares its own workspace on purpose (a sanitizer build
+      # must not land in the path of an ordinary `cargo build`), which means
+      # `--workspace` above does not reach it. Nothing did: the fuzz targets
+      # were not compiled, formatted or linted by CI at all, so renaming
+      # `sanitize_filename` would have broken all of them with nothing turning
+      # red — and a fuzz target that no longer builds is one nobody runs.
+      #
+      # `cargo check`, not `cargo fuzz`: this needs neither nightly nor a
+      # sanitizer, because the question is only whether the targets still
+      # compile against the code they are meant to be fuzzing.
+      - name: Format (fuzz targets)
+        run: cargo fmt --manifest-path core/fuzz/Cargo.toml --all -- --check
+
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path core/fuzz/Cargo.toml --all-targets
+
+      - name: Lint (fuzz targets)
+        run: cargo clippy --manifest-path core/fuzz/Cargo.toml --all-targets -- -D warnings
 
   test:
     needs: changes
@@ -182,11 +215,25 @@ jobs:
           #
           # noninteractive so a package that wants to ask something fails rather
           # than waiting forever for an answer nobody can give.
+          #
+          # `timeout -k 30`, and a `dpkg --configure -a` before each retry,
+          # because the retry as first written could not work. Plain `timeout`
+          # sends SIGTERM, which apt and dpkg deliberately ignore in the middle
+          # of a transaction so a half-configured package is never left behind —
+          # so the timeout fired, apt kept running, and when it was finally
+          # killed it left `/var/lib/dpkg/lock` held and the transaction
+          # unfinished. Attempts 2 and 3 then failed deterministically on the
+          # lock: three attempts that were really one. `-k 30` follows up with
+          # SIGKILL, and `dpkg --configure -a` finishes whatever the kill
+          # interrupted so the next attempt starts from a clean database.
           export DEBIAN_FRONTEND=noninteractive
           for attempt in 1 2 3; do
             echo "::group::apt attempt $attempt"
-            if timeout 240 sudo -E apt-get update \
-               && timeout 420 sudo -E apt-get install -y \
+            if [ "$attempt" -gt 1 ]; then
+              sudo -E dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
                  libgtk-3-dev libwebkit2gtk-4.1-dev \
                  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
               echo "::endgroup::"
@@ -303,14 +350,60 @@ jobs:
           path: ${{ github.workspace }}/.playwright-browsers
           key: playwright-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json') }}
 
-      # `npm run`, not `npx`: npx falls back to fetching from the registry and
-      # running lifecycle scripts when a binary is missing locally. The version
-      # is pinned exactly in package-lock.json and `npm ci` above installs it,
-      # so nothing here should ever touch the network — but a CI step that
-      # *could* silently fetch and execute an unpinned package is worth not
-      # having at all.
+      # `npm run`, not `npx`, so the *runner* is the exact version
+      # `package-lock.json` pins and `npm ci` installed — npx falls back to
+      # fetching from the registry and running lifecycle scripts when a binary
+      # is missing locally, and a CI step that could silently fetch and execute
+      # an unpinned package is worth not having at all.
+      #
+      # To be clear about what this step does do: `playwright install
+      # --with-deps chromium` **downloads a browser** and, on Linux, shells out
+      # to `apt-get` as root for its shared libraries. An earlier version of
+      # this comment claimed "nothing here should ever touch the network", which
+      # was true of the runner and not of the command it was attached to. That
+      # made it the one apt call in this workflow with no timeout around it —
+      # exactly the hang the retries elsewhere exist for. Bounded here, and
+      # skipped entirely when the browser cache above hit.
       - name: Install Playwright Chromium
-        run: npm run smoke:install
+        shell: bash
+        # The backstop, and the one that needs no coreutils: GitHub kills the
+        # step itself. `bounded` below caps each *attempt* so the retries mean
+        # something; this caps the step whether or not it is available.
+        timeout-minutes: 14
+        run: |
+          set -uo pipefail
+
+          # macOS runners have no GNU `timeout` — it is coreutils, and BSD
+          # userland does not ship it. Homebrew installs it as `gtimeout`. The
+          # apt blocks elsewhere in this file can assume `timeout` because they
+          # are gated to ubuntu; this step runs on all three platforms, and
+          # assuming it here turned every macOS run of this job into three
+          # instant "failures" and a red check.
+          bounded() {
+            local secs="$1"; shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout -k 30 "$secs" "$@"
+            elif command -v gtimeout >/dev/null 2>&1; then
+              gtimeout -k 30 "$secs" "$@"
+            else
+              # No per-attempt bound available. `timeout-minutes` above still
+              # bounds the step, which is the property that matters.
+              "$@"
+            fi
+          }
+
+          for attempt in 1 2 3; do
+            echo "::group::playwright install attempt $attempt"
+            if bounded 240 npm run smoke:install; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "playwright install attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::playwright install failed three times; this is an infrastructure problem, not the diff"
+          exit 1
         working-directory: desktop
 
       - name: Smoke test
@@ -353,11 +446,25 @@ jobs:
           #
           # noninteractive so a package that wants to ask something fails rather
           # than waiting forever for an answer nobody can give.
+          #
+          # `timeout -k 30`, and a `dpkg --configure -a` before each retry,
+          # because the retry as first written could not work. Plain `timeout`
+          # sends SIGTERM, which apt and dpkg deliberately ignore in the middle
+          # of a transaction so a half-configured package is never left behind —
+          # so the timeout fired, apt kept running, and when it was finally
+          # killed it left `/var/lib/dpkg/lock` held and the transaction
+          # unfinished. Attempts 2 and 3 then failed deterministically on the
+          # lock: three attempts that were really one. `-k 30` follows up with
+          # SIGKILL, and `dpkg --configure -a` finishes whatever the kill
+          # interrupted so the next attempt starts from a clean database.
           export DEBIAN_FRONTEND=noninteractive
           for attempt in 1 2 3; do
             echo "::group::apt attempt $attempt"
-            if timeout 240 sudo -E apt-get update \
-               && timeout 420 sudo -E apt-get install -y \
+            if [ "$attempt" -gt 1 ]; then
+              sudo -E dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
                  libgtk-3-dev libwebkit2gtk-4.1-dev \
                  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
               echo "::endgroup::"
