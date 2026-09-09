@@ -171,6 +171,13 @@ proptest! {
     /// Anything the decoder accepts must survive a re-encode unchanged. A
     /// decoder that accepts what its encoder cannot produce has a state in it
     /// that nothing else in the system knows about.
+    ///
+    /// The assertion is on the **bytes**, not on the discriminant. Comparing
+    /// discriminants let a decoder that silently altered a frame's contents —
+    /// a lossy filename, a sanitised name, a truncation — round-trip clean,
+    /// which is precisely the class of bug this property is for. Encoding is
+    /// compared from the second encode onward because the legacy `TEXT:` arm
+    /// stamps the current clock, so only the re-encoded form is a fixpoint.
     #[test]
     fn decode_encode_decode_is_stable(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
         if let Some(first) = ProtocolMessage::from_plain_bytes(&bytes) {
@@ -182,6 +189,11 @@ proptest! {
                     std::mem::discriminant(&first),
                     std::mem::discriminant(&second),
                     "re-encoding changed the frame type"
+                );
+                prop_assert_eq!(
+                    &re_encoded,
+                    &second.to_plain_bytes(),
+                    "encoding is not a fixpoint — the decoder altered the frame"
                 );
             }
         }
@@ -196,6 +208,36 @@ proptest! {
     #[test]
     fn party_response_decoder_survives_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
         let _ = PartyResponse::from_bytes(&bytes);
+    }
+
+    /// Bincode stops at the end of a value and ignores the rest, so a Party
+    /// frame with junk appended used to decode to exactly the frame without it:
+    /// two distinct byte strings with one meaning, on the codec both a client
+    /// and a server parse from a party they have not yet decided to trust.
+    #[test]
+    fn party_frames_reject_trailing_bytes(
+        junk in proptest::collection::vec(any::<u8>(), 1..64),
+    ) {
+        let req = PartyRequest::ListChannels;
+        let mut bytes = req.to_bytes();
+        prop_assert!(
+            PartyRequest::from_bytes(&bytes).is_some(),
+            "the encoder's own output must parse back"
+        );
+        bytes.extend_from_slice(&junk);
+        prop_assert!(
+            PartyRequest::from_bytes(&bytes).is_none(),
+            "trailing bytes decoded to the frame without them"
+        );
+
+        let resp = PartyResponse::Error("nope".to_string());
+        let mut bytes = resp.to_bytes();
+        prop_assert!(PartyResponse::from_bytes(&bytes).is_some());
+        bytes.extend_from_slice(&junk);
+        prop_assert!(
+            PartyResponse::from_bytes(&bytes).is_none(),
+            "trailing bytes decoded to the frame without them"
+        );
     }
 
     /// `sanitize_filename` decides where a received file is written, so its
@@ -314,6 +356,111 @@ fn known_hostile_filenames_are_defused() {
             joined.components().count(),
             3,
             "{raw:?} produced extra path components: {joined:?}"
+        );
+    }
+}
+
+/// Invalid UTF-8 in a peer-supplied string field is refused, not repaired.
+///
+/// `String::from_utf8_lossy` turns each invalid byte into U+FFFD — three bytes
+/// for one. Every cap in this decoder counts *wire* bytes, so lossy decoding
+/// meant a 64 KiB `Text` frame produced a 192 KiB `String`, and 512 `TextChunk`
+/// frames at the 48 KiB chunk cap produced roughly 72 MiB against a documented
+/// budget of about 24 MiB. It also made the decoder accept frames its own
+/// encoder cannot reproduce: the re-encoded form was three times as long and,
+/// past the cap, no longer parsed at all.
+///
+/// Every one of these fields is written by `to_plain_bytes` out of a Rust
+/// `String`, so refusing costs a conforming peer nothing.
+#[test]
+fn invalid_utf8_is_refused_rather_than_repaired() {
+    // Tag 2 — Text: seq, timestamp, len, then the bytes.
+    let mut text = vec![2u8];
+    text.extend_from_slice(&1u64.to_be_bytes());
+    text.extend_from_slice(&0u64.to_be_bytes());
+    text.extend_from_slice(&3u32.to_be_bytes());
+    text.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    assert!(
+        ProtocolMessage::from_plain_bytes(&text).is_none(),
+        "invalid UTF-8 accepted in Text"
+    );
+
+    // Tag 11 — TextChunk: id, seq, timestamp, index, total, len, bytes.
+    let mut chunk = vec![11u8];
+    chunk.extend_from_slice(&[0u8; 16]);
+    chunk.extend_from_slice(&1u64.to_be_bytes());
+    chunk.extend_from_slice(&0u64.to_be_bytes());
+    chunk.extend_from_slice(&0u32.to_be_bytes());
+    chunk.extend_from_slice(&2u32.to_be_bytes());
+    chunk.extend_from_slice(&3u32.to_be_bytes());
+    chunk.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    assert!(
+        ProtocolMessage::from_plain_bytes(&chunk).is_none(),
+        "invalid UTF-8 accepted in TextChunk"
+    );
+
+    // Tag 3 — FileMeta. `sanitize_filename` bounds the length, so this one is
+    // not the amplification bug; it is the field a peer most wants to control,
+    // and two distinct byte strings must not collapse onto one name on disk.
+    let mut meta = vec![3u8];
+    meta.extend_from_slice(&1u64.to_be_bytes());
+    meta.extend_from_slice(&10u64.to_be_bytes());
+    meta.extend_from_slice(&3u32.to_be_bytes());
+    meta.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    assert!(
+        ProtocolMessage::from_plain_bytes(&meta).is_none(),
+        "invalid UTF-8 accepted in FileMeta"
+    );
+
+    // The legacy arms decode the same way. `FILE_META|` is the one that keeps
+    // what it decoded; it used to answer `Some(FileMeta { filename: "\u{fffd}\u{fffd}\u{fffd}" })`.
+    let mut legacy = b"FILE_META|1|".to_vec();
+    legacy.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    legacy.extend_from_slice(b"|10");
+    assert!(
+        ProtocolMessage::from_plain_bytes(&legacy).is_none(),
+        "invalid UTF-8 accepted in legacy FILE_META"
+    );
+
+    let mut legacy_text = b"TEXT:1:".to_vec();
+    legacy_text.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    assert!(
+        ProtocolMessage::from_plain_bytes(&legacy_text).is_none(),
+        "invalid UTF-8 accepted in legacy TEXT"
+    );
+}
+
+/// The legacy numeric arms bound the slice before they decode it.
+///
+/// Each one parses a `u64` and throws the string away, which was the argument
+/// for leaving them lossy. That argument is about what is *retained*, not about
+/// what is *allocated*: a frame is capped at `MAX_PACKET_SIZE` (8 MiB), so
+/// `PING:` followed by 8 MiB of `0xFF` cost about 24 MiB transiently, per frame,
+/// per connection, before returning `None`.
+#[test]
+fn legacy_numeric_arms_refuse_an_oversized_field() {
+    for prefix in [
+        &b"VERSION:"[..],
+        &b"FILE_END:"[..],
+        &b"PING:"[..],
+        &b"TYPING_START:"[..],
+        &b"TYPING_STOP:"[..],
+    ] {
+        let mut frame = prefix.to_vec();
+        frame.extend(std::iter::repeat_n(b'9', 4096));
+        assert!(
+            ProtocolMessage::from_plain_bytes(&frame).is_none(),
+            "{} accepted a 4 KiB number",
+            String::from_utf8_lossy(prefix)
+        );
+
+        // A number of a length a real peer could send still parses.
+        let mut ok = prefix.to_vec();
+        ok.extend_from_slice(b"1");
+        assert!(
+            ProtocolMessage::from_plain_bytes(&ok).is_some(),
+            "{} refused a valid frame",
+            String::from_utf8_lossy(prefix)
         );
     }
 }

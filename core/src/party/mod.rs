@@ -620,8 +620,10 @@ impl PartyRequest {
     }
 
     /// Parse from transport bytes; returns `None` on malformed input.
+    ///
+    /// Trailing bytes are malformed input: see [`crate::util::decode_exact`].
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        bincode::deserialize(bytes).ok()
+        crate::util::decode_exact(bytes).ok()
     }
 }
 
@@ -632,8 +634,10 @@ impl PartyResponse {
     }
 
     /// Parse from transport bytes; returns `None` on malformed input.
+    ///
+    /// Trailing bytes are malformed input: see [`crate::util::decode_exact`].
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        bincode::deserialize(bytes).ok()
+        crate::util::decode_exact(bytes).ok()
     }
 }
 

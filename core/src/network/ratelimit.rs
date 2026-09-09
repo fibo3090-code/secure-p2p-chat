@@ -66,8 +66,8 @@ struct Entry {
 /// of one ISP into a single bucket, which turns a rate limit into collateral
 /// damage.
 fn limiter_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
             // Keep the routing prefix, zero the interface identifier.
@@ -75,6 +75,46 @@ fn limiter_key(ip: IpAddr) -> IpAddr {
             IpAddr::from(octets)
         }
     }
+}
+
+/// The well-known NAT64 prefix from RFC 6052 §2.1, `64:ff9b::/96`.
+///
+/// Every IPv4 address reachable through a NAT64 gateway is embedded in it, so a
+/// /64 mask over one of these addresses puts *the entire IPv4 internet* into a
+/// single bucket. Translating back to the IPv4 address it carries is the same
+/// move as unwrapping an IPv4-mapped address, for the same reason.
+const NAT64_WELL_KNOWN_PREFIX: [u8; 12] = [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Reduce an address to the one that actually identifies its source.
+///
+/// An IPv6 socket accepting IPv4 connections reports them as IPv4-mapped
+/// (`::ffff:a.b.c.d`). Masking those to a /64 zeroes octets 8..16 — which is
+/// where the `ffff` marker *and* the whole IPv4 address live — so
+/// `::ffff:1.2.3.4` and `::ffff:203.0.113.9` both became `::`. Every IPv4
+/// client would have shared one bucket, and any single IPv4 address could have
+/// spent the limit for all of them.
+///
+/// This was latent only because the relay binds `0.0.0.0` today. The point of
+/// the /64 work is dual-stack, and the moment anything binds `[::]` the
+/// collapse becomes a one-address denial of service against every IPv4 peer.
+///
+/// NAT64 is the same shape one level up, and worth handling here rather than
+/// discovering later: those addresses are not the gateway's own, they are the
+/// IPv4 destination wearing an IPv6 costume.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let octets = v6.octets();
+    if octets[..12] == NAT64_WELL_KNOWN_PREFIX {
+        return IpAddr::V4(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    IpAddr::V6(v6)
 }
 
 /// Sliding-window counter of recent connections per source address.
@@ -373,6 +413,79 @@ mod tests {
         assert!(
             !rl.check_at(ip(2), now),
             "IPv4 neighbours must stay independent"
+        );
+    }
+
+    /// An IPv6 socket accepting IPv4 connections reports them as IPv4-mapped.
+    /// Masking those to a /64 wiped the `ffff` marker along with the address, so
+    /// every IPv4 client landed in the `::` bucket and one of them could spend
+    /// the limit for all of them.
+    #[test]
+    fn ipv4_mapped_addresses_are_counted_per_ipv4_address() {
+        let mapped = |last: u8| -> IpAddr {
+            format!("::ffff:203.0.113.{last}")
+                .parse()
+                .expect("valid IPv4-mapped address")
+        };
+
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MAX_CONNECTIONS {
+            rl.check_at(mapped(1), now);
+        }
+        assert!(rl.check_at(mapped(1), now), "this one is over its own cap");
+        assert!(
+            !rl.check_at(mapped(2), now),
+            "a neighbouring IPv4 address must not inherit the first one's count"
+        );
+
+        // And the mapped form is the same bucket as the plain form, so a
+        // dual-stack listener does not hand out two budgets for one address.
+        assert!(
+            rl.check_at("203.0.113.1".parse().unwrap(), now),
+            "the mapped and plain forms of one address must share a bucket"
+        );
+    }
+
+    /// The same collapse one level up. `64:ff9b::/96` is the well-known NAT64
+    /// prefix, so a /64 over it is a single bucket for the whole IPv4 internet:
+    /// one client behind any NAT64 gateway anywhere would lock out every other.
+    #[test]
+    fn nat64_addresses_are_counted_per_embedded_ipv4_address() {
+        let nat64 = |last: u8| -> IpAddr {
+            format!("64:ff9b::203.0.113.{last}")
+                .parse()
+                .expect("valid NAT64 address")
+        };
+
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MAX_CONNECTIONS {
+            rl.check_at(nat64(1), now);
+        }
+        assert!(rl.check_at(nat64(1), now));
+        assert!(
+            !rl.check_at(nat64(2), now),
+            "NAT64 clients must not share one bucket"
+        );
+    }
+
+    /// A genuine IPv6 address that merely starts with the same first four
+    /// octets is not NAT64 — the prefix is 96 bits, not 32.
+    #[test]
+    fn a_longer_prefix_match_is_not_treated_as_nat64() {
+        let a: IpAddr = "64:ff9b:1::1".parse().unwrap();
+        let b: IpAddr = "64:ff9b:2::1".parse().unwrap();
+
+        let mut rl = RateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..MAX_CONNECTIONS {
+            rl.check_at(a, now);
+        }
+        assert!(rl.check_at(a, now));
+        assert!(
+            !rl.check_at(b, now),
+            "these are different /64s and must be independent"
         );
     }
 

@@ -512,10 +512,16 @@ impl ChatManager {
 
                                 match self.start_receiving_file(actual_chat_id, &filename, size) {
                                     Ok(transfer_id) => {
-                                        // Create new IncomingFileSync for this transfer
-                                        let file_path = self.config.download_dir.join(&filename);
-
-                                        match IncomingFileSync::new(&file_path, size) {
+                                        // The directory is ours, the name is the
+                                        // peer's: passing them separately is what
+                                        // lets the receiver sanitise the name
+                                        // itself rather than trusting the decoder
+                                        // to have done it.
+                                        match IncomingFileSync::new(
+                                            &self.config.download_dir,
+                                            &filename,
+                                            size,
+                                        ) {
                                             Ok(incoming) => {
                                                 self.incoming_files.insert(transfer_id, incoming);
                                             }

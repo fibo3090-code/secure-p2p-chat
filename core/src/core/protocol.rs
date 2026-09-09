@@ -204,6 +204,47 @@ fn default_signature_scheme() -> SignatureScheme {
     SignatureScheme::RsaPss
 }
 
+/// The longest a decimal `u64` can be, which is every number any legacy arm
+/// parses. The legacy arms used to hand the whole remainder of the frame to
+/// `String::from_utf8_lossy` before parsing it, so `PING:` followed by 8 MiB of
+/// `0xFF` allocated ~24 MiB (one replacement character is three bytes) before
+/// the parse could reject it. Bounding the slice first makes the allocation
+/// proportional to what a valid frame could contain.
+const MAX_LEGACY_NUMBER_BYTES: usize = 20;
+
+/// Decode a peer-supplied field as UTF-8, or refuse the frame.
+///
+/// `String::from_utf8_lossy` was the wrong tool here twice over.
+///
+/// It **expands**: every invalid byte becomes U+FFFD, three bytes for one. Every
+/// cap in this decoder counts wire bytes, so a 64 KiB `Text` frame of invalid
+/// UTF-8 decoded to 192 KiB, and the 512-chunk ceiling that documents a ~24 MiB
+/// message actually admitted ~72 MiB into the reassembler.
+///
+/// It also **alters**: distinct byte strings collapse onto the same `String`, so
+/// the decoder accepted frames its own encoder could not reproduce — re-encoding
+/// one produced different bytes and, past the cap, a frame that no longer
+/// parsed. A codec whose accept set is wider than its output set has states in
+/// it that nothing downstream was written for.
+///
+/// Refusing is safe: every one of these fields is produced by
+/// [`ProtocolMessage::to_plain_bytes`] from a Rust `String`, so a conforming
+/// peer never sends anything this rejects.
+fn decode_text(b: &[u8]) -> Option<&str> {
+    std::str::from_utf8(b).ok()
+}
+
+/// Decode a legacy arm's trailing field, which is always a decimal number.
+///
+/// Bounded before it is decoded: the parse would reject a long slice anyway, but
+/// only after the whole thing had been turned into a `String`.
+fn decode_number_field(b: &[u8]) -> Option<&str> {
+    if b.len() > MAX_LEGACY_NUMBER_BYTES {
+        return None;
+    }
+    decode_text(b)
+}
+
 impl ProtocolMessage {
     /// Overwrite the transport sequence number on variants that carry one.
     ///
@@ -363,7 +404,7 @@ impl ProtocolMessage {
         // Fallback: legacy ASCII-prefixed format for compatibility with tests and older peers
         // Keep legacy parsing limited and defensive to avoid DoS or injection.
         if b.starts_with(b"VERSION:") {
-            let version_str = String::from_utf8_lossy(&b[8..]);
+            let version_str = decode_number_field(&b[8..])?;
             if let Ok(version) = version_str.trim().parse::<u8>() {
                 return Some(Self::Version { version });
             }
@@ -383,7 +424,7 @@ impl ProtocolMessage {
             if b.len() > crate::MAX_TEXT_MESSAGE_BYTES {
                 return None;
             }
-            let s = String::from_utf8_lossy(&b[5..]);
+            let s = decode_text(&b[5..])?;
             let parts: Vec<&str> = s.splitn(2, ':').collect();
             if parts.len() == 2 {
                 let seq = parts[0].parse::<u64>().ok()?;
@@ -398,7 +439,10 @@ impl ProtocolMessage {
         }
 
         if b.starts_with(b"FILE_META|") {
-            let s = String::from_utf8_lossy(b);
+            // The filename is kept, so this arm cannot be lossy either — see the
+            // note on `decode_text`. It was the one legacy arm that retained the
+            // string it decoded.
+            let s = decode_text(b)?;
             let parts: Vec<&str> = s.splitn(4, '|').collect();
             if parts.len() == 4 {
                 let seq = parts[1].parse::<u64>().ok()?;
@@ -434,25 +478,25 @@ impl ProtocolMessage {
         }
 
         if b.starts_with(b"FILE_END:") {
-            let s = String::from_utf8_lossy(&b[9..]);
+            let s = decode_number_field(&b[9..])?;
             let seq = s.trim().parse::<u64>().ok()?;
             return Some(Self::FileEnd { seq });
         }
 
         if b.starts_with(b"PING:") {
-            let s = String::from_utf8_lossy(&b[5..]);
+            let s = decode_number_field(&b[5..])?;
             let seq = s.trim().parse::<u64>().ok()?;
             return Some(Self::Ping { seq });
         }
 
         if b.starts_with(b"TYPING_START:") {
-            let s = String::from_utf8_lossy(&b[13..]);
+            let s = decode_number_field(&b[13..])?;
             let seq = s.trim().parse::<u64>().ok()?;
             return Some(Self::TypingStart { seq });
         }
 
         if b.starts_with(b"TYPING_STOP:") {
-            let s = String::from_utf8_lossy(&b[12..]);
+            let s = decode_number_field(&b[12..])?;
             let seq = s.trim().parse::<u64>().ok()?;
             return Some(Self::TypingStop { seq });
         }
@@ -523,7 +567,7 @@ impl ProtocolMessage {
                 if cursor + len > b.len() {
                     return None;
                 }
-                let text = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
+                let text = decode_text(&b[cursor..cursor + len])?.to_string();
                 Some(Self::Text {
                     text,
                     timestamp,
@@ -561,7 +605,7 @@ impl ProtocolMessage {
                 if cursor + len > b.len() {
                     return None;
                 }
-                let text_part = String::from_utf8_lossy(&b[cursor..cursor + len]).to_string();
+                let text_part = decode_text(&b[cursor..cursor + len])?.to_string();
                 Some(Self::TextChunk {
                     message_id,
                     chunk_index,
@@ -587,8 +631,8 @@ impl ProtocolMessage {
                 if cursor + fn_len > b.len() {
                     return None;
                 }
-                let raw_filename = String::from_utf8_lossy(&b[cursor..cursor + fn_len]).to_string();
-                let filename = crate::util::sanitize_filename(&raw_filename);
+                let raw_filename = decode_text(&b[cursor..cursor + fn_len])?;
+                let filename = crate::util::sanitize_filename(raw_filename);
                 Some(Self::FileMeta {
                     filename,
                     size,

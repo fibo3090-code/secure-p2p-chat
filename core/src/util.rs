@@ -157,6 +157,31 @@ mod atomic_write_tests {
     }
 }
 
+/// Decode a bincode frame, refusing anything left over after it.
+///
+/// `bincode::deserialize` stops at the end of the value and ignores whatever
+/// follows, so `frame || junk` decodes to exactly the same thing as `frame`.
+/// That gives two distinct byte strings one meaning — an on-path attacker who
+/// can append to a frame changes its bytes without changing what the peer
+/// reads, and a digest, a cache key or an equality check over the raw frame
+/// disagrees with the decoder about whether two frames are the same.
+///
+/// Every frame in this project is produced by `bincode::serialize` and carried
+/// in a length-delimited envelope, so nothing a conforming peer sends has
+/// trailing bytes and refusing them costs nothing.
+///
+/// The options are the ones `bincode::serialize` itself uses — fixed-width
+/// integers, little-endian — with trailing bytes rejected instead of allowed,
+/// so this reads exactly what the matching `serialize` wrote and nothing wider.
+pub fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("malformed frame: {e}"))
+}
 /// Get current timestamp in milliseconds since Unix epoch
 pub fn current_timestamp_millis() -> u64 {
     SystemTime::now()

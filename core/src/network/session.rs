@@ -252,7 +252,7 @@ pub async fn run_host_session(
     let client_proof_bytes = cipher
         .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
-    let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    let client_proof: IdentityProof = decode_identity_proof(&client_proof_bytes)?;
     if client_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Client used unexpected signature scheme: expected {}, got {}",
@@ -531,7 +531,7 @@ pub async fn run_client_session_multi(
     let host_proof_bytes = cipher
         .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
-    let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    let host_proof: IdentityProof = decode_identity_proof(&host_proof_bytes)?;
     if host_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Host used unexpected signature scheme: expected {}, got {}",
@@ -682,6 +682,21 @@ fn build_identity_signature(
     }
 }
 
+/// Decode a peer's `IdentityProof`, refusing anything appended to it.
+///
+/// This frame is decoded **before any trust decision has been made** — it is
+/// what the fingerprint, and therefore TOFU, is computed from. Plain
+/// `bincode::deserialize` stops at the end of the struct and ignores the rest,
+/// so `proof || junk` decoded identically to `proof`: two distinct byte strings
+/// with one meaning, on the earliest attacker-reachable frame in the handshake.
+///
+/// The Party codec refuses trailing bytes for exactly this reason, and both
+/// frames sit inside the AEAD tunnel, so the argument is the same in both
+/// places. See [`messenger_core::util::decode_exact`].
+fn decode_identity_proof(bytes: &[u8]) -> Result<IdentityProof> {
+    crate::util::decode_exact(bytes)
+}
+
 /// Verify a peer's identity proof against the ephemeral key they sent.
 ///
 /// The identity is always the RSA key in `public_key_pem` — that is what the
@@ -707,7 +722,9 @@ fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> 
                 .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
         }
         SignatureScheme::Ed25519 => {
-            let blob: Ed25519Proof = bincode::deserialize(&proof.signature)
+            // The subkey blob is carried inside the signature field, so it is
+            // just as peer-controlled as the proof around it.
+            let blob: Ed25519Proof = crate::util::decode_exact(&proof.signature)
                 .map_err(|e| anyhow!("Ed25519 proof is malformed or missing its subkey: {}", e))?;
             let ed_public = ed25519_public_from_bytes(&blob.public)?;
             // Bind first: an unbound subkey proves only that somebody holds
@@ -819,7 +836,7 @@ where
     let client_proof_bytes = cipher
         .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
-    let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+    let client_proof: IdentityProof = decode_identity_proof(&client_proof_bytes)?;
     if client_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Client used unexpected signature scheme: expected {}, got {}",
@@ -926,7 +943,7 @@ where
     let host_proof_bytes = cipher
         .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
-    let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+    let host_proof: IdentityProof = decode_identity_proof(&host_proof_bytes)?;
     if host_proof.signature_scheme != selected_scheme {
         return Err(anyhow!(
             "Host used unexpected signature scheme: expected {}, got {}",
@@ -1960,7 +1977,7 @@ mod tests {
             let client_proof_bytes = cipher
                 .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
                 .expect("client proof decrypt should succeed");
-            let client_proof: IdentityProof = bincode::deserialize(&client_proof_bytes)?;
+            let client_proof: IdentityProof = decode_identity_proof(&client_proof_bytes)?;
             assert_eq!(client_proof.version, PROTOCOL_VERSION as u32);
 
             Ok(host_aes_key)
@@ -2003,7 +2020,7 @@ mod tests {
             let host_proof_bytes = cipher
                 .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
                 .expect("host proof decrypt should succeed");
-            let host_proof: IdentityProof = bincode::deserialize(&host_proof_bytes)?;
+            let host_proof: IdentityProof = decode_identity_proof(&host_proof_bytes)?;
             assert_eq!(host_proof.version, PROTOCOL_VERSION as u32);
 
             // 5. Send Client Identity Proof (Encrypted)
@@ -2174,6 +2191,38 @@ mod tests {
                 "{scheme} proof no longer decodes against the released field layout"
             );
         }
+    }
+
+    /// `proof || junk` must not decode to `proof`.
+    ///
+    /// This frame is parsed before any trust decision, so a decoder that gives
+    /// two distinct byte strings one meaning is doing it at the point where the
+    /// peer's identity is still an open question. The positive half of the
+    /// assertion matters as much as the negative one: it pins that the strict
+    /// options still read exactly what `bincode::serialize` writes, so this is a
+    /// compatibility check, not only a rejection check.
+    #[test]
+    fn an_identity_proof_with_trailing_bytes_is_refused() {
+        let proof = IdentityProof {
+            public_key_pem: "test-public-key".to_string(),
+            signature: vec![1, 2, 3, 4],
+            version: PROTOCOL_VERSION as u32,
+            chat_id: uuid::Uuid::new_v4(),
+            signature_scheme: SignatureScheme::RsaPss,
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+
+        let decoded = decode_identity_proof(&bytes).expect("the encoder's own output must parse");
+        assert_eq!(decoded.public_key_pem, proof.public_key_pem);
+        assert_eq!(decoded.chat_id, proof.chat_id);
+        assert_eq!(decoded.signature, proof.signature);
+
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(b"appended by someone on the path");
+        assert!(
+            decode_identity_proof(&padded).is_err(),
+            "trailing bytes must not decode to the same proof"
+        );
     }
 
     #[test]

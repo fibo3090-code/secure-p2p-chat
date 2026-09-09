@@ -56,6 +56,67 @@ fn service_txt_properties() -> HashMap<String, String> {
     HashMap::new()
 }
 
+/// Most peers the list will hold.
+///
+/// mDNS is unauthenticated LAN input: anything on the network can announce as
+/// many services as it likes, and each announcement is resolved under a mutex
+/// that the UI reads. Without a cap, a hostile responder advertising a few
+/// hundred names — now multiplied by the addresses each one claims — turns the
+/// peer list into an unbounded allocation and every poll into a quadratic scan.
+///
+/// 256 is far more than any real network offers and small enough that the
+/// linear scan below stays free.
+const MAX_DISCOVERED_PEERS: usize = 256;
+
+/// Most addresses recorded for one advertised service.
+///
+/// A dual-homed peer legitimately advertises two or three (Wi-Fi and Ethernet,
+/// IPv4 and IPv6). A responder claiming twenty is not describing a real machine.
+const MAX_ADDRESSES_PER_PEER: usize = 8;
+
+/// Fold a freshly resolved service into the peer list.
+///
+/// Two bugs live in the naive version of this, and they pull in opposite
+/// directions.
+///
+/// The first is *dropping* the update. Treating "same fullname" as "already
+/// known" means a peer that changes address — a DHCP renewal, Wi-Fi to
+/// Ethernet — keeps its stale entry forever and the address it is actually
+/// reachable on is never added. Taking only the first address had the same
+/// effect on a dual-homed peer: it was only ever listed on whichever interface
+/// resolved first. So a re-resolve has to *replace* what the service previously
+/// claimed, not be skipped.
+///
+/// The second is *ordering*. Removing the old entries and then discovering
+/// there is no room to re-add them is worse than refusing the newcomer: a LAN
+/// attacker who fills the list makes your real laptop vanish from the UI at its
+/// next routine re-announcement, which is the opposite of what a cap is for.
+/// Retaining first is what makes that impossible — the slots this service just
+/// gave up are available to it again, so a re-announcing peer can always
+/// re-add at least as many entries as it had.
+fn merge_resolved(peers: &mut Vec<DiscoveredPeer>, fullname: &str, resolved: Vec<DiscoveredPeer>) {
+    peers.retain(|p| p.fullname != fullname);
+
+    for peer in resolved {
+        if peers.len() >= MAX_DISCOVERED_PEERS {
+            tracing::warn!(
+                cap = MAX_DISCOVERED_PEERS,
+                "mDNS peer list is full; ignoring further advertisements"
+            );
+            break;
+        }
+        // A second service advertising an endpoint we already list is not a
+        // second peer.
+        if peers
+            .iter()
+            .any(|p| p.address == peer.address && p.port == peer.port)
+        {
+            continue;
+        }
+        peers.push(peer);
+    }
+}
+
 impl Discovery {
     /// Create a new Discovery instance.
     pub fn new() -> anyhow::Result<Self> {
@@ -140,34 +201,34 @@ impl Discovery {
                         .get("fingerprint")
                         .map(|p| p.val_str().to_string());
 
-                    if let Some(addr) = addresses.iter().next() {
-                        let peer = DiscoveredPeer {
-                            name: info.get_hostname().trim_end_matches('.').to_string(),
+                    let name = info.get_hostname().trim_end_matches('.').to_string();
+                    let resolved: Vec<DiscoveredPeer> = addresses
+                        .iter()
+                        .take(MAX_ADDRESSES_PER_PEER)
+                        .map(|addr| DiscoveredPeer {
+                            name: name.clone(),
                             address: addr.to_string(),
                             port,
-                            fingerprint,
+                            fingerprint: fingerprint.clone(),
                             fullname: fullname.clone(),
-                        };
+                        })
+                        .collect();
 
+                    if resolved.is_empty() {
+                        continue;
+                    }
+
+                    for peer in &resolved {
                         tracing::info!(
                             name = %peer.name,
                             address = %peer.address,
                             port = %peer.port,
                             "Discovered peer via mDNS"
                         );
+                    }
 
-                        if let Ok(mut peers) = discovered_peers.lock() {
-                            // Avoid duplicates
-                            // Keyed on the service name as well as the endpoint:
-                            // one host can advertise twice, and re-resolving an
-                            // existing service must not duplicate it.
-                            if !peers.iter().any(|p| {
-                                p.fullname == peer.fullname
-                                    || (p.address == peer.address && p.port == peer.port)
-                            }) {
-                                peers.push(peer);
-                            }
-                        }
+                    if let Ok(mut peers) = discovered_peers.lock() {
+                        merge_resolved(&mut peers, &fullname, resolved);
                     }
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
@@ -261,6 +322,116 @@ mod tests {
             "nothing should be advertised in the clear, found {props:?}"
         );
         assert!(!props.contains_key("fingerprint"));
+    }
+
+    fn peer(fullname: &str, address: &str) -> DiscoveredPeer {
+        DiscoveredPeer {
+            name: "laptop".to_string(),
+            address: address.to_string(),
+            port: 12345,
+            fingerprint: None,
+            fullname: fullname.to_string(),
+        }
+    }
+
+    /// A peer that changes address must be listed at the new one.
+    ///
+    /// The old dedup treated "same fullname" as "already known" and skipped the
+    /// update, so a DHCP renewal or a move from Wi-Fi to Ethernet left the stale
+    /// address on screen and the reachable one absent.
+    #[test]
+    fn a_peer_that_moved_is_listed_at_its_new_address() {
+        let mut peers = vec![peer("laptop._p2p-messenger._tcp.local.", "192.168.1.10")];
+        merge_resolved(
+            &mut peers,
+            "laptop._p2p-messenger._tcp.local.",
+            vec![peer("laptop._p2p-messenger._tcp.local.", "192.168.1.42")],
+        );
+
+        assert_eq!(peers.len(), 1, "the stale entry must not survive");
+        assert_eq!(peers[0].address, "192.168.1.42");
+    }
+
+    /// A dual-homed peer is listed on every interface it advertises, not only
+    /// on whichever one resolved first.
+    #[test]
+    fn a_dual_homed_peer_is_listed_on_every_address() {
+        let mut peers = Vec::new();
+        merge_resolved(
+            &mut peers,
+            "laptop._p2p-messenger._tcp.local.",
+            vec![
+                peer("laptop._p2p-messenger._tcp.local.", "192.168.1.42"),
+                peer("laptop._p2p-messenger._tcp.local.", "fe80::1"),
+            ],
+        );
+
+        let addresses: Vec<&str> = peers.iter().map(|p| p.address.as_str()).collect();
+        assert_eq!(addresses, ["192.168.1.42", "fe80::1"]);
+    }
+
+    /// The list is bounded. mDNS is unauthenticated LAN input, and the mutex
+    /// holding this vector is one the UI reads on every frame.
+    #[test]
+    fn the_peer_list_is_capped() {
+        let mut peers = Vec::new();
+        for i in 0..(MAX_DISCOVERED_PEERS + 50) {
+            let fullname = format!("flood-{i}._p2p-messenger._tcp.local.");
+            merge_resolved(
+                &mut peers,
+                &fullname,
+                vec![peer(&fullname, &format!("10.0.{}.{}", i / 256, i % 256))],
+            );
+        }
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
+    }
+
+    /// A flood must not be able to evict a real peer at its next routine
+    /// re-announcement.
+    ///
+    /// This is why the retain runs *before* the cap check: removing a service's
+    /// old entries and then finding no room to re-add them makes the peer
+    /// disappear from the UI, which is strictly worse than refusing the
+    /// newcomer would have been.
+    #[test]
+    fn a_full_list_does_not_swallow_a_re_announcing_peer() {
+        let mut peers = Vec::new();
+        let mine = "mine._p2p-messenger._tcp.local.";
+        merge_resolved(&mut peers, mine, vec![peer(mine, "192.168.1.42")]);
+
+        for i in 0..(MAX_DISCOVERED_PEERS + 50) {
+            let fullname = format!("flood-{i}._p2p-messenger._tcp.local.");
+            merge_resolved(
+                &mut peers,
+                &fullname,
+                vec![peer(&fullname, &format!("10.0.{}.{}", i / 256, i % 256))],
+            );
+        }
+        assert_eq!(peers.len(), MAX_DISCOVERED_PEERS, "the cap still holds");
+
+        // The real peer re-announces, as mDNS makes it do periodically.
+        merge_resolved(&mut peers, mine, vec![peer(mine, "192.168.1.42")]);
+        assert!(
+            peers.iter().any(|p| p.fullname == mine),
+            "a re-announcing peer vanished from a full list"
+        );
+    }
+
+    /// Two services advertising one endpoint are one peer.
+    #[test]
+    fn a_duplicate_endpoint_is_not_a_second_peer() {
+        let mut peers = Vec::new();
+        merge_resolved(
+            &mut peers,
+            "a._p2p-messenger._tcp.local.",
+            vec![peer("a._p2p-messenger._tcp.local.", "192.168.1.42")],
+        );
+        merge_resolved(
+            &mut peers,
+            "b._p2p-messenger._tcp.local.",
+            vec![peer("b._p2p-messenger._tcp.local.", "192.168.1.42")],
+        );
+        assert_eq!(peers.len(), 1);
     }
 
     /// Exercises the register → poll → unregister lifecycle when an mDNS daemon is
