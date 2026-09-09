@@ -29,5 +29,16 @@ fuzz_target!(|data: &[u8]| {
             std::mem::discriminant(&again),
             "re-encoding changed the frame type"
         );
+        // On the *bytes*, not only on the type. Comparing discriminants let a
+        // decoder that silently altered a frame's contents — a lossy string, a
+        // sanitised filename, a truncation — round-trip clean, which is the
+        // whole class of bug this contract is for. Compared from the second
+        // encode onward because the legacy `TEXT:` arm stamps the current
+        // clock, so only the re-encoded form is a fixpoint.
+        assert_eq!(
+            re_encoded,
+            again.to_plain_bytes(),
+            "encoding is not a fixpoint — the decoder altered the frame"
+        );
     }
 });

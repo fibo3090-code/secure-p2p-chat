@@ -43,4 +43,34 @@ fuzz_target!(|data: &[u8]| {
     // was established, and the name on disk depends on how many times the
     // function happened to be called.
     assert_eq!(out, sanitize_filename(&out), "not a fixed point: {raw:?}");
+
+    // No control characters and no bidi overrides. This is the assertion the
+    // docstring above leans on and the target had dropped: U+202E renders
+    // `photo_gnp.exe` as `photo_exe.png`, so a name that survives with one in
+    // it defeats the executable-extension warning by display alone, without
+    // changing a byte of what runs.
+    assert!(
+        !out.chars().any(|c| c.is_control()),
+        "control character survived: {out:?}"
+    );
+    assert!(
+        !out.chars().any(|c| matches!(
+            c,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+        )),
+        "bidi override survived: {out:?}"
+    );
+
+    // Not a Windows reserved device name. `CON`, `NUL`, `COM1` and friends are
+    // devices at every path, so writing to one is not writing a file — and the
+    // name that reaches disk is the one the user was shown.
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = out.split('.').next().unwrap_or(&out).to_ascii_uppercase();
+    assert!(
+        !RESERVED.contains(&stem.as_str()),
+        "Windows device name survived: {out:?}"
+    );
 });

@@ -28,6 +28,19 @@ cd "$(dirname "$0")/../core"
 TARGET="${1:-}"
 SECONDS_PER_TARGET="${2:-60}"
 
+# libFuzzer's default `-max_len` is 4096 bytes.
+#
+# Every interesting cap in these decoders sits above that: MAX_TEXT_MESSAGE_BYTES
+# is 64 KiB, TEXT_CHUNK_BYTES is 48 KiB, FILE_CHUNK_SIZE is 64 KiB. At the
+# default the mutator can never build an input that reaches the branch on the far
+# side of a length check, so the whole "what happens at and past the cap" half of
+# each decoder was unreachable no matter how long the fuzzer ran — which is why
+# the protocol target could not find the amplification bug that its own
+# round-trip contract describes.
+#
+# 96 KiB clears the largest cap with room for the header fields in front of it.
+MAX_LEN="${P2PEM_FUZZ_MAX_LEN:-98304}"
+
 export PATH="$HOME/.cargo/bin:$PATH"
 export RUSTUP_TOOLCHAIN=nightly
 
@@ -40,18 +53,40 @@ if ! command -v cargo-fuzz >/dev/null 2>&1; then
     exit 1
 fi
 
+# Corpora live here and are reused across runs. libFuzzer's coverage feedback is
+# cumulative, so a corpus thrown away after every run makes each one start from
+# nothing — which for a decoder guarded by length checks means starting from
+# nothing every time. Gitignored, because a corpus is generated data.
+CORPUS_ROOT="fuzz/corpus"
+
 run_one() {
     local name="$1"
+    local corpus="${CORPUS_ROOT}/${name}"
+    mkdir -p "$corpus"
     echo "── fuzzing ${name} for ${SECONDS_PER_TARGET}s ─────────────────────────"
-    cargo fuzz run "$name" -- \
+    cargo fuzz run "$name" "$corpus" -- \
         -max_total_time="$SECONDS_PER_TARGET" \
+        -max_len="$MAX_LEN" \
         -print_final_stats=1
 }
 
 if [ -n "$TARGET" ]; then
     run_one "$TARGET"
 else
+    # `set -e` would stop the sweep at the first target that finds something,
+    # so the targets after it never run at all — the run that finally finds a
+    # bug is exactly the run you most want the rest of the results from. Each
+    # failure is recorded and reported together at the end instead.
+    failed=()
     for name in $(cargo fuzz list); do
-        run_one "$name"
+        if ! run_one "$name"; then
+            echo "!! ${name} reported a failure; artifacts are under core/fuzz/artifacts/${name}" >&2
+            failed+=("$name")
+        fi
     done
+    if [ ${#failed[@]} -gt 0 ]; then
+        echo >&2
+        echo "error: ${#failed[@]} target(s) failed: ${failed[*]}" >&2
+        exit 1
+    fi
 fi

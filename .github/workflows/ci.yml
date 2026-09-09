@@ -121,11 +121,20 @@ jobs:
           #
           # noninteractive so a package that wants to ask something fails rather
           # than waiting forever for an answer nobody can give.
+          # `timeout` alone sends SIGTERM, which apt installs a handler for and
+          # ignores while it is mid-transaction — so attempt 1 "times out"
+          # without actually dying, keeps the dpkg lock, and attempts 2 and 3
+          # then fail deterministically on that lock rather than retrying
+          # anything. `-k 30` follows with SIGKILL, and `dpkg --configure -a`
+          # repairs whatever the kill interrupted before the next attempt.
           export DEBIAN_FRONTEND=noninteractive
           for attempt in 1 2 3; do
             echo "::group::apt attempt $attempt"
-            if timeout 240 sudo -E apt-get update \
-               && timeout 420 sudo -E apt-get install -y \
+            if [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
                  libgtk-3-dev libwebkit2gtk-4.1-dev \
                  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
               echo "::endgroup::"
@@ -152,6 +161,86 @@ jobs:
 
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `core/fuzz` declares its own `[workspace]` on purpose — a sanitizer
+      # build must never end up in the path of an ordinary `cargo build` — and
+      # the consequence is that `--workspace` above does not reach it. So the
+      # fuzz targets were never compiled by anything: renaming a function they
+      # call broke all three with nothing anywhere turning red, and a fuzz
+      # target that no longer builds is a fuzz target nobody runs.
+      #
+      # `cargo check`, not `cargo fuzz`: this is about the targets still
+      # compiling against the current API, which stable can answer in seconds.
+      # Actually running them needs nightly and real time, and stays deliberate
+      # (`./scripts/fuzz.sh`).
+      - name: Fuzz targets still compile
+        run: cargo check --manifest-path core/fuzz/Cargo.toml --all-targets
+
+  # The declared MSRV was decoration: `rust-version` sat in the manifest and
+  # nothing on any machine checked it, so it drifted from what the code actually
+  # needs and the first person to find out would have been a packager or a user
+  # building from source. Cheap to answer, so answer it.
+  msrv:
+    name: Minimum Supported Rust Version
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Read the floor from the manifest rather than hard-coding it here. Two
+      # places to update is one place to forget, and the manifest is the one
+      # cargo itself enforces against dependencies.
+      - name: Read rust-version from the workspace manifest
+        id: msrv
+        run: |
+          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+          if [ -z "$version" ]; then
+            echo "::error::no rust-version in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $version"
+
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
+                 libgtk-3-dev libwebkit2gtk-4.1-dev \
+                 libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "apt attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed three times; this is an infrastructure problem, not the diff"
+          exit 1
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      # `--locked`, because the committed lockfile is what a source build uses.
+      # A resolver free to pick newer dependencies would answer a question
+      # nobody asked.
+      - name: Check the workspace on the declared floor
+        run: cargo check --workspace --all-targets --locked
 
   test:
     needs: changes
@@ -182,11 +271,20 @@ jobs:
           #
           # noninteractive so a package that wants to ask something fails rather
           # than waiting forever for an answer nobody can give.
+          # `timeout` alone sends SIGTERM, which apt installs a handler for and
+          # ignores while it is mid-transaction — so attempt 1 "times out"
+          # without actually dying, keeps the dpkg lock, and attempts 2 and 3
+          # then fail deterministically on that lock rather than retrying
+          # anything. `-k 30` follows with SIGKILL, and `dpkg --configure -a`
+          # repairs whatever the kill interrupted before the next attempt.
           export DEBIAN_FRONTEND=noninteractive
           for attempt in 1 2 3; do
             echo "::group::apt attempt $attempt"
-            if timeout 240 sudo -E apt-get update \
-               && timeout 420 sudo -E apt-get install -y \
+            if [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
                  libgtk-3-dev libwebkit2gtk-4.1-dev \
                  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
               echo "::endgroup::"
@@ -306,11 +404,35 @@ jobs:
       # `npm run`, not `npx`: npx falls back to fetching from the registry and
       # running lifecycle scripts when a binary is missing locally. The version
       # is pinned exactly in package-lock.json and `npm ci` above installs it,
-      # so nothing here should ever touch the network — but a CI step that
+      # so this runs the pinned Playwright and nothing else — a CI step that
       # *could* silently fetch and execute an unpinned package is worth not
       # having at all.
+      #
+      # It does, however, reach the network: `playwright install --with-deps`
+      # downloads the browser and, on Linux, shells out to apt as root. That is
+      # the same unbounded-hang exposure the Rust jobs' apt calls have, so it
+      # gets the same treatment — a per-attempt bound generous enough for a cold
+      # cache on a slow mirror, backed by the step timeout rather than replacing
+      # it, and the dpkg lock repaired between attempts.
       - name: Install Playwright Chromium
-        run: npm run smoke:install
+        timeout-minutes: 14
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::playwright install attempt $attempt"
+            if [ "${{ runner.os }}" = "Linux" ] && [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 480 npm run smoke:install; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "playwright install attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::playwright install failed three times; this is an infrastructure problem, not the diff"
+          exit 1
         working-directory: desktop
 
       - name: Smoke test
@@ -353,11 +475,20 @@ jobs:
           #
           # noninteractive so a package that wants to ask something fails rather
           # than waiting forever for an answer nobody can give.
+          # `timeout` alone sends SIGTERM, which apt installs a handler for and
+          # ignores while it is mid-transaction — so attempt 1 "times out"
+          # without actually dying, keeps the dpkg lock, and attempts 2 and 3
+          # then fail deterministically on that lock rather than retrying
+          # anything. `-k 30` follows with SIGKILL, and `dpkg --configure -a`
+          # repairs whatever the kill interrupted before the next attempt.
           export DEBIAN_FRONTEND=noninteractive
           for attempt in 1 2 3; do
             echo "::group::apt attempt $attempt"
-            if timeout 240 sudo -E apt-get update \
-               && timeout 420 sudo -E apt-get install -y \
+            if [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
                  libgtk-3-dev libwebkit2gtk-4.1-dev \
                  libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
               echo "::endgroup::"

@@ -269,10 +269,15 @@ proptest! {
             prop_assert_ne!(stem.as_str(), lpt.as_str());
         }
 
-        // No control characters or bidi overrides — U+202E renders
-        // "photo_gnp.exe" as "photo_exe.png" in every file manager.
+        // No control characters or bidi controls — U+202E renders
+        // "photo_gnp.exe" as "photo_exe.png" in every file manager. The full set
+        // the sanitiser strips, not only the overrides: the isolates
+        // (U+2066..=U+2069) and the plain marks (U+200E, U+200F) reorder the
+        // display just as effectively, and asserting a narrower set than the
+        // implementation guarantees leaves the difference untested.
         prop_assert!(
-            !out.chars().any(|c| c.is_control() || ('\u{202A}'..='\u{202E}').contains(&c)),
+            !out.chars().any(|c| c.is_control()
+                || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')),
             "control or bidi character survived: {out:?}"
         );
 

@@ -876,10 +876,26 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             seed_history(conn);
         }
         PartyResponse::Message(env) => {
+            // Sequence 0 is *our* sentinel for "sent, not yet acknowledged", and
+            // the server has no business using it: an honest one assigns
+            // `len() + 1`, so 0 never appears on the wire. Accepting it let a
+            // non-conforming or hostile server plant an envelope that the sort
+            // at `History` files in among the user's own unconfirmed sends —
+            // and once it sits at a lower index than a real pending message,
+            // `ActionFailed` retracts *their* row while the user's stays on
+            // screen looking delivered, which is the exact failure the pending
+            // queue exists to prevent.
+            if env.seq == 0 {
+                tracing::warn!(
+                    channel = %env.channel,
+                    "server sent an envelope with sequence 0; ignoring it"
+                );
+                return;
+            }
             let thread = conn.messages.entry(env.channel).or_default();
             // A live broadcast can race a history page carrying the same
             // envelope; both are keyed by the server-assigned sequence.
-            if env.seq == 0 || !thread.iter().any(|e| e.seq == env.seq) {
+            if !thread.iter().any(|e| e.seq == env.seq) {
                 thread.push(env);
             }
         }
@@ -887,8 +903,13 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             let page_was_full = items.len() >= MAX_HISTORY_BATCH;
             let threads: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
             for th in threads {
-                let page: Vec<Envelope> =
-                    items.iter().filter(|e| e.channel == th).cloned().collect();
+                // Same sentinel, same reasoning as `Message` above: a history
+                // page is no more trustworthy than a broadcast.
+                let page: Vec<Envelope> = items
+                    .iter()
+                    .filter(|e| e.channel == th && e.seq != 0)
+                    .cloned()
+                    .collect();
                 let existing = conn.messages.entry(th).or_default();
                 // Merge rather than replace: history is paged now, so a later
                 // page must not throw away the earlier one. Server-assigned
@@ -1713,6 +1734,63 @@ mod tests {
             MAX_HISTORY_BATCH + 1,
             "a later page must not throw away the earlier one"
         );
+    }
+
+    /// Sequence 0 is the client's own sentinel for "sent, not yet
+    /// acknowledged", and the server must never be able to occupy it.
+    ///
+    /// An honest server assigns `len() + 1` and so never sends 0. A hostile one
+    /// that does gets its envelope sorted in among the user's unconfirmed sends
+    /// — and from there the ordered `ActionFailed` reply retracts the planted
+    /// row instead of the user's, leaving a message on screen that the server
+    /// refused and never stored. That is precisely the failure the pending
+    /// queue exists to prevent, reached by handing the server the one value the
+    /// queue reserves for itself.
+    #[test]
+    fn a_planted_zero_sequence_envelope_is_ignored() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        // The server pushes a seq-0 envelope into the channel before we post.
+        tx.send(Incoming::Response(PartyResponse::Message(envelope(
+            channel, me, 0, "planted",
+        ))))
+        .unwrap();
+        mgr.poll_events();
+        assert!(
+            mgr.server(id)
+                .unwrap()
+                .messages
+                .get(&channel)
+                .is_none_or(|t| t.is_empty()),
+            "a seq-0 envelope from the server was accepted"
+        );
+
+        // A history page carrying one is refused on the same grounds.
+        tx.send(Incoming::Response(PartyResponse::History(vec![
+            envelope(channel, me, 0, "planted in history"),
+            envelope(channel, me, 4, "real"),
+        ])))
+        .unwrap();
+        mgr.poll_events();
+        let thread = &mgr.server(id).unwrap().messages[&channel];
+        assert_eq!(thread.len(), 1, "the planted envelope survived history");
+        assert_eq!(thread[0].seq, 4);
+
+        // With nothing planted, our own send is the one the refusal retracts.
+        mgr.post(id, channel, "mine".to_string()).unwrap();
+        assert_eq!(mgr.server(id).unwrap().messages[&channel].len(), 2);
+        tx.send(Incoming::Response(PartyResponse::ActionFailed {
+            channel,
+            reason: "nope".to_string(),
+        }))
+        .unwrap();
+        mgr.poll_events();
+        let thread = &mgr.server(id).unwrap().messages[&channel];
+        assert_eq!(thread.len(), 1, "the refusal retracted the wrong message");
+        assert_eq!(thread[0].seq, 4, "the server's real message was removed");
     }
 
     /// A post the server refuses used to stay on screen looking delivered: the
