@@ -7,7 +7,18 @@
 //! matters is made from data rather than from the shape of the code.
 //!
 //! Ignored by default — it is a probe, not a test. Run with:
-//!   cargo test -p p2pem-classic --test history_scaling_probe -- --ignored --nocapture
+//!
+//!   cargo test --release -p p2pem-classic --test history_scaling_probe \
+//!       -- --ignored --nocapture
+//!
+//! **`--release`, not optionally.** The numbers are here so a product decision
+//! can be made from them, and the two things dominating this loop —
+//! `serde_json` and ChaCha20-Poly1305 — are among the most inlining-sensitive
+//! code in the tree. A debug build overstates both by roughly an order of
+//! magnitude and does not overstate them by the *same* factor at every size, so
+//! a debug run does not even preserve the shape of the curve. Deciding "this is
+//! fine up to N messages" from a debug measurement decides it about a program
+//! nobody runs.
 
 use messenger_core::types::{Chat, ChatKind, Message, MessageContent, Transport};
 use p2pem_classic::app::persistence::HistoryFile;

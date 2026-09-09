@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-1.15.0-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE.md)
 [![Security](https://img.shields.io/badge/security-self--assessed-yellow)](SECURITY.md)
-[![Rust](https://img.shields.io/badge/rust-1.86+-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89+-orange)](https://www.rust-lang.org/)
 
 Messages that go straight from your device to your friend's, end-to-end
 encrypted, with no account and no server holding your history. Built in Rust.

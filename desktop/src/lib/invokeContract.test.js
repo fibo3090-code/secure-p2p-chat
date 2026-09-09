@@ -12,6 +12,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import {
+    countInvokeSites,
     parseInvokeCalls,
     parseRustCommands,
     contractProblems,
@@ -102,6 +103,56 @@ describe("contractProblems", () => {
     });
 });
 
+describe("the scanner knows code from text", () => {
+    it("does not see a call site inside a string or a comment", () => {
+        const source = `
+            // invoke("commented_out")
+            /* invoke("also_commented") */
+            const label = "invoke(not_a_call)";
+            api.invoke("real_command", { id });
+        `;
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "real_command", keys: ["id"] },
+        ]);
+    });
+
+    it("does not let a quote inside a regex literal swallow the file", () => {
+        // The failure this pins: a naive string-stripper treats the `"` in the
+        // character class as opening a string, and everything up to the next
+        // quote — including a real call site — disappears into it. The result
+        // is self-consistent, so every count derived from it agrees with every
+        // other and nothing looks wrong.
+        const source = `
+            const quoted = /["']/g;
+            invoke("survives_the_regex", { id });
+        `;
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "survives_the_regex", keys: ["id"] },
+        ]);
+    });
+
+    it("reads a payload containing a nested object", () => {
+        // `[^}]` stopped at the first `}`, so this call did not match at all —
+        // and an unmatched call is an unchecked call.
+        const source = `invoke("party_create_channel", { id, spec: { kind, name } });`;
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([
+            { command: "party_create_channel", keys: ["id", "spec"] },
+        ]);
+    });
+
+    it("counts a call whose command name it cannot read", () => {
+        // A computed command name is not something the scanner can check. The
+        // point is that it is *counted*, so the equality assertion below turns
+        // it into a visible failure instead of a silent omission.
+        const source = `invoke(commandName, { id });`;
+        expect(countInvokeSites(source)).toBe(1);
+        expect(parseInvokeCalls(source)).toEqual([]);
+    });
+});
+
 describe("the real bridge", () => {
     it("parses a plausible number of commands from both sides", () => {
         // A guard on the guard: if either regex stopped matching, the contract
@@ -110,6 +161,17 @@ describe("the real bridge", () => {
         const commands = parseRustCommands(rustSource);
         expect(calls.length).toBeGreaterThan(40);
         expect(commands.length).toBeGreaterThan(40);
+    });
+
+    it("reads every invoke call site in the bridge, not most of them", () => {
+        // `toBeGreaterThan(40)` was the only floor, and it is satisfied by
+        // skipping a quarter of the file. A call the scanner cannot parse is
+        // simply not checked — which for a test whose whole subject is silent
+        // no-ops is the one way it must not fail. Equality makes an
+        // unparseable call site fail loudly and name itself.
+        const parsed = parseInvokeCalls(bridgeSource).length;
+        const sites = countInvokeSites(bridgeSource);
+        expect(parsed).toBe(sites);
     });
 
     it("sends exactly the arguments every Rust command declares", () => {

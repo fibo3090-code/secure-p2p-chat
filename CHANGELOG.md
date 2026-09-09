@@ -11,6 +11,47 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Security
+
+- **A file arriving from a peer is now sanitised by the receiver as well as by
+  the decoder.** Until now only one call, in the frame decoder, stood between a
+  peer-chosen filename and the disk: the receiver kept the joined destination
+  path verbatim, so anything reaching it another way could write outside the
+  download folder. Nothing did — but nothing pinned that, either, and it is the
+  path both apps take.
+- **Malformed text and filenames from a peer are refused instead of repaired.**
+  Invalid bytes were being replaced with `�`, three bytes for one, which meant a
+  message could decode to three times the size its declared limit allowed and
+  two different messages could arrive under the same filename.
+- **A frame with extra bytes appended is no longer treated as the frame without
+  them.** This applied to the identity proof exchanged during a handshake, which
+  is read before there is any decision about whether to trust the peer.
+- **Rate limiting no longer treats every IPv4 caller as one caller.** On a
+  server listening on IPv6, all IPv4 connections shared a single budget, so one
+  address could have used up everyone's. Not reachable in the shipped relay,
+  which listens on IPv4.
+- **A community server can no longer be made to leak memory without bound**, by
+  starting large uploads and finishing them short. The abandoned data is now
+  released, and it no longer bought the sender an extra upload slot each time.
+- **A community server can no longer plant a message among your unsent ones**,
+  which let it steer which message a "not sent" error took off your screen.
+
+### Fixed
+
+- **A device on your network that changes address is listed at the new one.** It
+  used to keep its old entry forever, and a machine on two networks was only
+  ever shown on one of them. The list of nearby peers is also now capped, so
+  nothing on the network can grow it without limit.
+
+### Changed
+
+- Releases are now built, signed and verified before the release page becomes
+  visible, and the provenance signature covers exactly what the build produced —
+  including `SHA256SUMS`, which was previously the one unsigned file. See
+  SECURITY.md for how to check it.
+- The minimum supported Rust version is now correctly declared as 1.89. It said
+  1.86, which no longer built.
+
 ## [1.16.2] - 2026-08-20
 
 > **Security release.** Fixes a flaw that let someone sending you a file hide

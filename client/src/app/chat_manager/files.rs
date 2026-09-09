@@ -228,7 +228,7 @@ impl ChatManager {
                 }
                 progress.fetch_add(n as u64, Ordering::Relaxed);
                 sent_chunks += 1;
-                if sent_chunks % 64 == 0 {
+                if sent_chunks.is_multiple_of(64) {
                     tracing::trace!(sent_chunks = %sent_chunks, "File sending progress");
                 }
             }

@@ -4,7 +4,7 @@ This document is the technical guide for building, testing, changing, and releas
 
 ## Toolchain
 
-- Rust: `1.86+`
+- Rust: `1.89+`
 - Edition: `2021`
 - The repo is a Cargo **workspace** of four crates: `core/` (`messenger-core`),
   `client/` (`p2pem-classic`), `server/` (`messenger-server`), and

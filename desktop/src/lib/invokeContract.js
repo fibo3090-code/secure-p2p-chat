@@ -29,34 +29,196 @@
 /// A caller never sends these, so they must not be treated as missing keys.
 const INJECTED_PARAMS = new Set(["state", "window", "app", "webview", "handle"]);
 
+/// Neutralise everything that is text rather than code, keeping the source's
+/// exact length and line structure.
+///
+/// The scan below is a regex over text, so it has to be told what is *code*.
+/// Comments alone are not enough — `invoke("log", { msg: "invoke(x)" })` would
+/// otherwise look like a second, unparseable call — and handling strings
+/// without also handling regex literals is worse than handling neither: a regex
+/// containing a quote, say `/["']/`, opens a string that then swallows real
+/// code up to the next matching quote, and the self-consistent nonsense that
+/// results passes every assertion made against it.
+///
+/// Comments and regex literals are blanked outright; nothing inside them is
+/// ever wanted. String and template literals keep their *contents* — the first
+/// argument to `invoke` is a string, and blanking it would erase the command
+/// name this whole file exists to read — and lose only the structural
+/// characters the scanner keys on: brackets and separators. So `"invoke(x)"`
+/// stops looking like a call site and a brace inside a string stops confusing
+/// the brace matcher, while `"auth_status"` still reads as `auth_status`.
+///
+/// Spaces rather than deletion, so offsets stay intact and a future check that
+/// wants a line number gets the right one.
+export function blankNonCode(source) {
+    let out = "";
+    let i = 0;
+    // Whether a `/` here starts a regex literal or is a division sign is
+    // decided by what came before it — the same rule a JS tokeniser uses.
+    let prevSignificant = "";
+    const blank = (text) => text.replace(/[^\n]/g, " ");
+
+    while (i < source.length) {
+        const ch = source[i];
+        const next = source[i + 1];
+
+        if (ch === "/" && next === "/") {
+            const end = source.indexOf("\n", i);
+            const stop = end === -1 ? source.length : end;
+            out += blank(source.slice(i, stop));
+            i = stop;
+            continue;
+        }
+        if (ch === "/" && next === "*") {
+            const end = source.indexOf("*/", i + 2);
+            const stop = end === -1 ? source.length : end + 2;
+            out += blank(source.slice(i, stop));
+            i = stop;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+            let j = i + 1;
+            while (j < source.length) {
+                if (source[j] === "\\") {
+                    j += 2;
+                    continue;
+                }
+                if (source[j] === ch) break;
+                j++;
+            }
+            const stop = Math.min(j + 1, source.length);
+            const body = source.slice(i + 1, stop - 1);
+            out += ch + body.replace(/[(){}[\],;]/g, " ") + (source[stop - 1] ?? "");
+            i = stop;
+            prevSignificant = ch;
+            continue;
+        }
+        if (ch === "/" && startsRegex(prevSignificant)) {
+            let j = i + 1;
+            let inClass = false;
+            while (j < source.length) {
+                const c = source[j];
+                if (c === "\\") {
+                    j += 2;
+                    continue;
+                }
+                if (c === "[") inClass = true;
+                else if (c === "]") inClass = false;
+                else if (c === "/" && !inClass) break;
+                else if (c === "\n") break; // unterminated; treat as division
+                j++;
+            }
+            if (source[j] === "/") {
+                // Include the trailing flags.
+                let k = j + 1;
+                while (k < source.length && /[a-z]/.test(source[k])) k++;
+                out += blank(source.slice(i, k));
+                i = k;
+                prevSignificant = "/";
+                continue;
+            }
+            // Not a regex after all — fall through and treat it as an operator.
+        }
+
+        out += ch;
+        if (!/\s/.test(ch)) prevSignificant = ch;
+        i++;
+    }
+    return out;
+}
+
+/// A `/` starts a regex literal when the previous significant character cannot
+/// end an expression. Deliberately conservative: over-reading a division as a
+/// regex would blank real code, so anything that could be a value ends the
+/// expression.
+function startsRegex(prev) {
+    if (prev === "") return true;
+    return !/[a-zA-Z0-9_$)\]}"'`]/.test(prev);
+}
+
+/// Count the `invoke(` call sites in a source, so a call the scanner *cannot*
+/// read is a loud failure rather than a silent omission.
+///
+/// This exists because the scanner is a regex, and a regex has an accept set
+/// narrower than the language. A call it does not match simply is not checked —
+/// the contract test then passes by having nothing to compare, which is the
+/// failure mode a contract test must not have.
+export function countInvokeSites(source) {
+    const matches = blankNonCode(source).match(/\binvoke\s*\(/g);
+    return matches ? matches.length : 0;
+}
+
 /// Extract `{ command, keys }` for every `invoke(...)` call in `bridge.js`.
 ///
-/// Handles the three shapes the file actually uses:
+/// Handles the shapes the file actually uses:
 ///   invoke("auth_status")
 ///   invoke("mark_read", { id })
 ///   invoke("change_password", { current, new: next })
+///   invoke("party_post", { id, channel: { kind, name } })
+///
+/// The argument object is matched by counting braces rather than with `[^}]`.
+/// The old pattern stopped at the first `}`, so a payload with a nested object
+/// did not match at all and the call was skipped — silently, which for a check
+/// whose entire purpose is catching silent no-ops was the wrong way to fail.
+/// `countInvokeSites` is the backstop: anything this misses is still counted.
 export function parseInvokeCalls(source) {
+    const code = blankNonCode(source);
     const calls = [];
-    const re = /invoke\(\s*"([a-z_0-9]+)"\s*(?:,\s*(\{[^}]*\}))?\s*\)/g;
+    const re = /\binvoke\(\s*"([a-z_0-9]+)"\s*(,\s*\{)?/g;
     let m;
-    while ((m = re.exec(source)) !== null) {
-        const [, command, argObject] = m;
+    while ((m = re.exec(code)) !== null) {
+        const [, command, hasArgs] = m;
         const keys = [];
-        if (argObject) {
-            // Split the object literal on top-level commas. The bridge never
-            // nests an object inside an invoke payload, so this is sufficient
-            // and stays readable.
-            for (const part of argObject.slice(1, -1).split(",")) {
+        if (hasArgs) {
+            const open = code.indexOf("{", m.index + m[0].length - 1);
+            const close = matchingBrace(code, open);
+            if (close === -1) continue;
+            const inner = code.slice(open + 1, close);
+            for (const part of splitTopLevel(inner)) {
                 const trimmed = part.trim();
                 if (!trimmed) continue;
                 // `key: value` → key; shorthand `key` → key.
                 const key = trimmed.split(":")[0].trim();
                 if (key) keys.push(key);
             }
+            re.lastIndex = close;
         }
         calls.push({ command, keys });
     }
     return calls;
+}
+
+/// Index of the `}` closing the `{` at `open`, or -1.
+function matchingBrace(source, open) {
+    let depth = 0;
+    for (let i = open; i < source.length; i++) {
+        if (source[i] === "{") depth++;
+        else if (source[i] === "}") {
+            depth--;
+            if (depth === 0) return i;
+        }
+    }
+    return -1;
+}
+
+/// Split an object literal's body on commas that are not inside a nested
+/// brace, bracket or paren.
+function splitTopLevel(inner) {
+    const parts = [];
+    let depth = 0;
+    let current = "";
+    for (const ch of inner) {
+        if (ch === "{" || ch === "[" || ch === "(") depth++;
+        else if (ch === "}" || ch === "]" || ch === ")") depth--;
+        if (ch === "," && depth === 0) {
+            parts.push(current);
+            current = "";
+        } else {
+            current += ch;
+        }
+    }
+    if (current.trim()) parts.push(current);
+    return parts;
 }
 
 /// Extract `{ command, params }` for every `#[tauri::command]` in a Rust source.

@@ -10,6 +10,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { folderOf } from "./parse.js";
 
+// The gate is the Tauri host object, deliberately, and **not**
+// `import.meta.env.DEV`.
+//
+// That means the mock is compiled into the production bundle too. It is dead
+// weight in the shipped app — `__TAURI_INTERNALS__` is always present inside
+// the webview, so `realApi` is always what the app gets — but two things depend
+// on the mock surviving the build, and they are worth writing down rather than
+// leaving as an accident of how the condition happens to be spelled:
+//
+//   - The `built` smoke project serves `dist/` through `vite preview`, in a
+//     plain browser with no Tauri host. Without the mock in the bundle, the very
+//     first `api.authStatus()` rejects, `App.jsx` shows its boot error, and the
+//     smoke test would be asserting that the error screen renders.
+//   - Anyone opening the built output to look at the UI gets a navigable app
+//     rather than a dead page.
+//
+// If this ever needs to become `import.meta.env.DEV` — to keep the mock out of
+// the shipped bundle — the built smoke project needs a real answer for the
+// bridge first, or it silently starts testing the boot-error path.
 const inTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 
 // ── Shared rules the mock mirrors from the Rust bridge ──────────────────────
