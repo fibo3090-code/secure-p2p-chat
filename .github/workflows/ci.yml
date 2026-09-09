@@ -418,12 +418,31 @@ jobs:
         timeout-minutes: 14
         shell: bash
         run: |
+          # macOS ships no `timeout` — it is GNU coreutils, and the runner does
+          # not have it (nor `gtimeout`, which needs `brew install coreutils`).
+          # An unguarded `timeout` here does not degrade to running the command:
+          # it is a "command not found", so every attempt "fails" instantly and
+          # the step reports an infrastructure problem that never happened.
+          #
+          # So bind the per-attempt limit only where a timeout exists, and let
+          # the step's own `timeout-minutes` be the bound everywhere else. It is
+          # the real backstop in either case; the per-attempt bound just turns a
+          # stalled mirror into a retry instead of a dead step.
+          if command -v timeout >/dev/null 2>&1; then
+            bounded() { timeout -k 30 480 "$@"; }
+          elif command -v gtimeout >/dev/null 2>&1; then
+            bounded() { gtimeout -k 30 480 "$@"; }
+          else
+            echo "note: no timeout available on ${{ runner.os }}; relying on the step timeout"
+            bounded() { "$@"; }
+          fi
+
           for attempt in 1 2 3; do
             echo "::group::playwright install attempt $attempt"
             if [ "${{ runner.os }}" = "Linux" ] && [ "$attempt" -gt 1 ]; then
               sudo dpkg --configure -a || true
             fi
-            if timeout -k 30 480 npm run smoke:install; then
+            if bounded npm run smoke:install; then
               echo "::endgroup::"
               exit 0
             fi

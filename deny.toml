@@ -20,20 +20,18 @@ ignore = [
                          # decryption, which is what the attack targets.
     "RUSTSEC-2024-0436", # paste unmaintained (transitive, proc-macro/build-time)
     "RUSTSEC-2025-0141", # bincode unmaintained (direct in core, migration pending)
-    # The gtk-rs GTK3 binding family is unmaintained. Reaches us only through
-    # Tauri's Linux backend (muda / tao -> tauri-runtime-wry); the ecosystem is
-    # mid-migration to GTK4. Nothing actionable on our side — review each Tauri
-    # release.
-    "RUSTSEC-2024-0411",
-    "RUSTSEC-2024-0412",
-    "RUSTSEC-2024-0413",
-    "RUSTSEC-2024-0414",
-    "RUSTSEC-2024-0415",
-    "RUSTSEC-2024-0416",
-    "RUSTSEC-2024-0417",
-    "RUSTSEC-2024-0418",
-    "RUSTSEC-2024-0419",
-    "RUSTSEC-2024-0420",
+    # RUSTSEC-2024-0411 through -0420 (the gtk-rs GTK3 binding family: gtk,
+    # gdk, atk, gtk-sys, gdk-sys, atk-sys, gdkx11, gdkx11-sys, gdkwayland-sys,
+    # gtk3-macros) were accepted here as unmaintained. All ten were **withdrawn
+    # upstream on 2026-08-14** and no longer exist as findings, so the entries
+    # were removed on 2026-09-09.
+    #
+    # The crates themselves are still in the tree, unchanged — they reach us
+    # through Tauri's Linux backend (muda / tao -> tauri-runtime-wry). Nothing
+    # about our dependencies changed; the advisories did. Should RustSec
+    # reinstate them, they will fire again and want a fresh entry with a reason
+    # written at that time, which is the whole point of not leaving dead ones
+    # here.
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (transitive, build-time only)
     "RUSTSEC-2025-0075", # unic-* family unmaintained (transitive)
     "RUSTSEC-2025-0080",

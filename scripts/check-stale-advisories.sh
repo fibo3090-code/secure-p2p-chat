@@ -31,7 +31,24 @@ trap 'rm -rf "$work"; [ -f deny.toml.stale-check-backup ] && mv deny.toml.stale-
 listed="$work/listed.txt"
 firing="$work/firing.txt"
 
-grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' deny.toml | sort -u > "$listed"
+# Only what the `ignore = [...]` array actually accepts.
+#
+# This used to grep the whole file, which meant a *comment* mentioning an
+# advisory ID counted as accepting it — so writing down why an entry had been
+# removed re-created the very failure that removing it was meant to fix. A
+# comment accepts nothing; the array is the thing with an effect, so the array
+# is what to read.
+python3 - > "$listed" <<'PARSE'
+import re
+s = open("deny.toml", encoding="utf-8").read()
+block = re.search(r"ignore\s*=\s*\[(.*?)\n\]", s, re.S)
+body = block.group(1) if block else ""
+# Strip comments inside the array too: an entry can be commented out in place,
+# and one that is commented out is not in force either.
+body = re.sub(r"#[^\n]*", "", body)
+for advisory in sorted(set(re.findall(r"RUSTSEC-\d{4}-\d{4}", body))):
+    print(advisory)
+PARSE
 
 # Temporarily neutralise the ignore list so every advisory reports itself.
 cp deny.toml deny.toml.stale-check-backup
