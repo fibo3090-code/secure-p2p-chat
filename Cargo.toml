@@ -70,7 +70,7 @@ ratatui-crossterm = { version = "0.1.0", features = ["crossterm_0_29"] }
 # rusqlite 0.40.2 succeeds. Left at 0.39 only so the bump lands through its own
 # Dependabot PR rather than conflicting with the open lockfile changes; the note
 # is gone because a false blocker in a comment is what stops the next person.
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Utilities
 anyhow = "1"
