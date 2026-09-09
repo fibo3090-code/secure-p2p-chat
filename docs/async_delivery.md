@@ -97,13 +97,27 @@ ever a fallback.
 | Can see | Cannot see |
 |---|---|
 | Bob has a mailbox | What any message says |
-| Something was left for Bob at 14:32 | Who left it |
-| Roughly how big, padded into size buckets | Whether Alice and Bob talk at all |
-| When Bob collected | Anything at all, even if the disk is seized |
+| Something was left for Bob at 14:32 | Who left it, from the envelope alone |
+| Roughly how big, padded into size buckets | Anything at all, even if the disk is seized |
+| When Bob collected | |
 
-The honest gap is **timing**. Deposits and collections falling into a rhythm say
-something about who talks to whom even when every box stays shut. §4.3 tries to
-blunt that and cannot eliminate it.
+This table used to promise, on the "cannot see" side, that the operator cannot
+tell **whether Alice and Bob talk at all**. Under this document's own default
+that is false, and §4.3 says so three sections later — R3.3 makes unlinkable
+addressing a `SHOULD`, and the fallback it explicitly permits is
+fingerprint-addressed mailboxes with the graph leak documented. With fixed
+addresses, deposit and collection patterns across two known mailboxes are the
+social graph.
+
+This is the part users read, so it is the part that must not overclaim. Two
+honest gaps, not one:
+
+- **Addressing.** Unless and until mailbox addresses rotate, the operator learns
+  who corresponds with whom. That is a consequence of choosing fixed addresses,
+  not a limitation of the crypto.
+- **Timing.** Deposits and collections falling into a rhythm say something about
+  who talks to whom even when every box stays shut and every address rotates.
+  §4.3 tries to blunt that and cannot eliminate it.
 
 ### What goes wrong
 
@@ -447,24 +461,31 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 | R1.4 | `known_trusted` `MUST NOT` be widened to auto-accept a fingerprint on the strength of a mailbox delivery. An invite link is not verification; neither is a message arriving. |
 | R1.5 | A malicious mailbox operator serving forged prekeys `MUST NOT` be able to impersonate a contact whose identity key the user has verified. |
 | R1.6 | Prekey bundles `MUST` be signed by the identity key, and the signature `MUST` be checked before any content is encrypted to them. |
+| R1.9 | There `MUST` be an identity rotation and revocation path, and a UI state for "this contact's safety number changed". R1.8's hard refuse is right against a MITM and, with no rotation path anywhere in R1, it is also permanent: a user whose key is compromised, or who simply reinstalls, becomes unreachable to every contact who pinned them, forever, with no prompt by design. R1.2's "delivered but unverified" is the natural home for the changed-key state. This also constrains §4.6 option 1 — if adding a second device changes the identity key, every existing contact hits R1.8. |
 
 ### R2 — Confidentiality and secrecy over time
 
 | | Requirement |
 |---|---|
 | R2.1 | The mailbox `MUST NOT` hold plaintext, nor any key from which plaintext is derivable. |
-| R2.2 | Every message `MUST` be encrypted under a key that is **not** derivable from the long-term identity key alone. This also closes the `history_key` weakness in §4.4. |
+| R2.2 | Every message `MUST` be encrypted under a key that is **not** derivable from the long-term identity key alone. |
+| | *This does **not** close the `history_key` weakness in §4.4, as it previously claimed.* R2.2 constrains the key a message travels under; `history_key` encrypts the stored history **at rest**, on a separate path (`client/src/app/persistence.rs`). A stolen `identity.json` still decrypts every message already on disk no matter what R2.2 says about the wire. Stage 4 is what closes that, and only stage 4. |
 | R2.3 | Forward secrecy `MUST` hold per message after session establishment. |
-| R2.4 | Post-compromise security `MUST` hold: a passive attacker holding one message key loses access within a bounded number of messages. |
+| R2.4 | Post-compromise security `MUST` hold: a passive attacker holding one message key loses access **within one round trip** — that is, once the peer has sent anything back. |
+| | *The bound is a round trip, not a message count, and the difference is the whole of the async case.* Healing comes from a DH ratchet step, which needs a message **back**. Bob offline for a week while Alice sends 200 messages advances only the sending chain: forward secrecy, zero healing. Stated as "a bounded number of messages" this requirement was unsatisfiable as written, and R8.7 demands a test for every `MUST` — there is no test for a bound that a week of one-way traffic does not reach. The honest form admits the round trip may never come. |
 | R2.5 | The first message `MUST` have forward secrecy when a one-time prekey is available. |
 | R2.6 | When one-time prekeys are exhausted, the session `MUST` degrade to signed-prekey-only rather than fail, and the degradation `MUST` be visible to both users — not silent. |
 | R2.7 | Key derivations `MUST` bind the full transcript, as the v3 handshake already does. |
+| R2.8 | A one-time prekey's **private** key `MUST` be destroyed once it has been used. Nothing above required this, and without it R2.5's first-message forward secrecy is a property of a key still sitting on disk. |
+| R2.9 | Prekey **bundle fetches** `MUST` be rate-limited, per requester and per target. R5.2 limits deposits only, so draining a victim's one-time prekeys is an unauthenticated `GET` loop — after which every first message falls back to R2.6's signed-prekey-only path and R5.3 only asks that the fall be visible. |
+| R2.10 | The signed-prekey-only fallback `MUST` reject a replayed initial message. X3DH's initial message is replayable exactly when no one-time prekey is consumed: the operator re-delivers the first sealed entry and Bob re-derives an identical `SK`. R4.2 is the requirement this belongs to, and its only stated defence is an in-ciphertext sequence number needing durable per-conversation state — which R5.5 evicts and a reinstall destroys. The R2.6 / R4.2 interaction is **not** currently designed. |
 
 ### R3 — Metadata
 
 | | Requirement |
 |---|---|
 | R3.1 | The mailbox envelope `MUST NOT` name the sender. Sender identity goes inside the sealed payload. |
+| | ⚠️ **R3.1 as written cannot hold at the same time as R5.2 or R4.4.** A server that cannot identify the sender cannot rate-limit *per sender* (R5.2), and cannot report a TTL expiry *to the sender* (R4.4). This is not a wording problem; it is three `MUST`s that are jointly unsatisfiable, and R8.7 asks for a test of each. See §8 question 0 — it has to be answered before anyone writes the wire format, because the resolution changes the envelope. |
 | R3.2 | Ciphertext `MUST` be padded to fixed size buckets, so length does not leak message size. |
 | R3.3 | Mailbox addresses `SHOULD` be unlinkable across messages. If they are not, the social-graph leak `MUST` be documented in `SECURITY.md`. |
 | R3.4 | Everything the operator can still observe `MUST` be enumerated in `SECURITY.md` under what the app does not claim. |
@@ -476,14 +497,15 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 | R4.1 | An operator dropping messages `MUST` be **detectable** — an authenticated per-conversation sequence number inside the ciphertext, as `FrameSeq` already does for party frames. |
 | R4.2 | Replayed mailbox entries `MUST` be rejected. |
 | R4.3 | Out-of-order collection `MUST NOT` lose messages or wedge a session. |
-| R4.4 | A message the sender believes was delivered `MUST NOT` be silently lost by mailbox eviction; TTL expiry `MUST` be reported to the sender. |
+| R4.4 | A message the sender believes was delivered `MUST NOT` be silently lost by mailbox eviction; TTL expiry `MUST` be reported to the sender. **Conflicts with R3.1** — see the note there and §8 question 0. |
 
 ### R5 — Abuse resistance
 
 | | Requirement |
 |---|---|
 | R5.1 | Per-recipient storage `MUST` be capped, as `MAX_MEMBER_BLOB_BYTES` already caps party storage and for the same reason. |
-| R5.2 | Deposits `MUST` be rate-limited per sender and per IP, reusing `network::ratelimit`. |
+| R5.2 | Deposits `MUST` be rate-limited per sender and per IP, reusing `network::ratelimit`. **Conflicts with R3.1** — see the note there and §8 question 0. Per-IP alone is achievable today; per-sender is not, without something in the envelope the server can count. |
+| | *And a per-recipient cap is itself a denial tool.* An attacker who fills Bob's mailbox budget blocks Bob's legitimate senders, and the per-IP limit does nothing against a distributed one. Either R5.1 accepts inbound denial of service as a residual and says so, or the cap needs a per-sender dimension — which is the very thing R3.1 forbids. |
 | R5.3 | Deliberate one-time-prekey exhaustion by an attacker `MUST NOT` degrade a victim's secrecy silently — see R2.6. |
 | R5.4 | There `MUST` be a policy for unsolicited mail from unknown identities, and its default `MUST` be the conservative one. |
 | R5.5 | Entries `MUST` have a TTL and `MUST` be evicted on collection. |
@@ -534,9 +556,36 @@ should be stated rather than blurred.
 
 ## 8. Open questions
 
-Ordered by how expensive they are to answer late. The first two are **blocking**
-— R6 says they must be closed before implementation, because both are frozen
-into the wire format:
+Ordered by how expensive they are to answer late. The first three are
+**blocking** — R6 says they must be closed before implementation, because all
+three are frozen into the wire format:
+
+0. **Sender anonymity, or per-sender accounting? R3.1 forbids what R5.2 and R4.4
+   require.** The envelope must not name the sender; deposits must be
+   rate-limited per sender; TTL expiry must be reported to the sender. A server
+   that cannot identify the sender can do neither of the latter two. Two ways
+   out, and they produce different wire formats:
+
+   - **Sealed-sender-style delivery tokens.** An unlinkable credential the server
+     can verify and count without learning who presented it. This is what Signal
+     does. It is a subsystem of its own and appears nowhere in the staging plan —
+     costing it honestly is part of answering this.
+   - **Downgrade R3.1** to "the server does not learn a long-term identity" and
+     accept a per-epoch pseudonym: enough to count and to address a notice, not
+     enough to follow across epochs.
+
+   A related detail that survives either choice: R4.4 cannot currently say
+   *which* message expired. A `deposit_id` scoped to (sender, recipient, epoch)
+   is shared by every deposit in that epoch, so a notice filed under it tells the
+   sender that something expired, not what. A per-message discriminator the
+   server can see is a new field and new linkability, and it is not specified.
+
+   And "knowing the id is the authentication" holds against strangers, not
+   against the two parties who necessarily know it: the operator was handed every
+   `deposit_id`, and the recipient derives the same value from the same HKDF
+   inputs. Whether a fetch **consumes** the notice therefore decides whether a
+   recipient can collect the sender's expiry notices before the sender does. Not
+   stated either way.
 
 1. **Multi-device: fanout, or permanently single-device?** (R6.1) Changing
    position later means redesigning the mailbox and the ratchet, with migration,
@@ -550,6 +599,11 @@ Answerable later without regret:
 
 3. Rotating mailbox addresses from the start, or fingerprint-addressed first and
    accept the documented graph leak while the feature proves itself? (R3.3)
+   Note that this one is not as free as its position here suggests: choosing
+   *rotating* breaks R5.1's per-recipient quota and R5.4's unknown-sender policy,
+   both of which are `MUST`s and both of which are stated against a stable
+   address. Choosing *fixed* is fine, and then §2's plain-terms table has to keep
+   saying so — it has been corrected to.
 4. `vodozemac`, or a ratchet over the existing primitives?
 5. Migrate existing history when `history_key` changes, or leave old history on
    the old key and start fresh? (R7.5 — either is acceptable; silence is not.)
