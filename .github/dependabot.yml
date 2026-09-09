@@ -16,6 +16,34 @@ updates:
     directory: /desktop
     schedule:
       interval: weekly
+    ignore:
+      # ESLint 10 cannot be installed here at all, in any combination.
+      #
+      # `eslint-plugin-react@7.37.5` is the latest published release and its peer
+      # range still stops at `^9.7`, so `npm ci` on a lockfile carrying eslint 10
+      # dies with ERESOLVE — the frontend job fails at the install step, before
+      # Lint, Test, Build and the smoke tests ever run. Bumping `@eslint/js`
+      # alongside it does not help; the conflict is the plugin, not the pair.
+      # (`eslint-plugin-react-hooks` is already v10-ready.)
+      #
+      # So a Dependabot PR for either is guaranteed-red work for a reviewer, on a
+      # weekly schedule. Ignoring the majors is not a decision to stay on ESLint 9
+      # forever: it is a decision not to be told about an upgrade that cannot be
+      # performed. Lift it when eslint-plugin-react ships v10 support, or when
+      # the six rules drawn from that plugin are replaced.
+      #
+      # Reaching for `--legacy-peer-deps` in CI instead would paper over a plugin
+      # genuinely untested against v10.
+      - dependency-name: eslint
+        update-types: [version-update:semver-major]
+      - dependency-name: "@eslint/js"
+        update-types: [version-update:semver-major]
+      # jsdom 30 requires Node >= 22 and CI pins Node 20, so this bump fails CI
+      # for a reason that has nothing to do with jsdom. The Node 20 -> 22 move is
+      # the real decision and deserves its own change; until it happens, this is
+      # another guaranteed-red PR every week.
+      - dependency-name: jsdom
+        update-types: [version-update:semver-major]
 
 # glib <0.20 is pinned transitively by Tauri 2.x (gtk 0.18). Revisit when Tauri
 # upgrades its GTK stack; see https://github.com/advisories/GHSA-wrw7-89jp-8q8g

@@ -36,6 +36,13 @@ predate tagged releases.
 - **A community server can no longer plant a message among your unsent ones**,
   which let it steer which message a "not sent" error took off your screen.
 
+### Performance
+
+- **Downloading a large file from a community server no longer slows the server
+  down for everyone else.** Each 64 KiB piece of a download was reading the
+  entire file off disk — about 160 GB of reads for one 100 MB file — while
+  holding the lock every other member's messages queue behind.
+
 ### Fixed
 
 - **A device on your network that changes address is listed at the new one.** It

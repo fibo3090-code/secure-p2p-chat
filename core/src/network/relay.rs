@@ -522,6 +522,18 @@ async fn host_flow(
             .await?;
             bail!("relay rendezvous table is full ({MAX_PENDING_RENDEZVOUS} slots)");
         }
+        // This answer does tell an unauthenticated caller whether a token is
+        // currently registered — but so does every other answer, so reordering
+        // the checks does not close it and should not be mistaken for closing
+        // it. The alternative to "already in use" is `Waiting`, which is just as
+        // distinguishable: a caller learns the same bit either way, because
+        // registering *is* the observable difference. Removing the oracle would
+        // mean the relay no longer answering differently for a taken token,
+        // which it cannot do while a token is what pairs two peers.
+        //
+        // What bounds the exposure is `validate_token` above and the token's own
+        // entropy: guessing is the attack, and this only confirms a guess the
+        // caller could equally confirm by squatting on it.
         if guard.contains_key(&token) {
             send_relay_message(
                 &mut stream,

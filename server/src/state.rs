@@ -93,15 +93,32 @@ pub const MAX_MESSAGE_TEXT_BYTES: usize = messenger_core::MAX_TEXT_MESSAGE_BYTES
 /// every accessor `async` to accommodate two I/O paths would be the tail wagging
 /// the dog. But two of those paths move real bytes: a blob write and a blob read
 /// are each up to `MAX_PARTY_FILE_BYTES` (100 MiB), and they run inside
-/// `serve_connection`'s task while the state mutex is held. A plain
-/// `std::fs::write` there parks a runtime worker for the duration, so one member
-/// uploading a large file stalls unrelated members' messages on that worker.
+/// `serve_connection`'s task.
 ///
 /// `block_in_place` tells tokio the current thread is about to block so it can
 /// move the other tasks off it. It panics on a current-thread runtime, which is
 /// what `#[tokio::test]` gives you by default, hence the flavor check: outside a
 /// multi-threaded runtime the call is a plain function call, which is correct
 /// because there are no sibling tasks to rescue.
+///
+/// ## What this does *not* fix
+///
+/// It frees the runtime **worker**; it does not free the **lock**. Every call
+/// site here runs under `state.lock().await` (see `connection.rs`), so for the
+/// duration of the I/O every other connection's request is still queued behind
+/// the mutex. Moving the tasks off this thread does not help them, because they
+/// are not waiting on the thread.
+///
+/// That is worth being precise about, because the comment this replaces claimed
+/// otherwise — and a comment saying a problem is solved is what stops the next
+/// person from solving it. Genuinely removing the stall means moving the bytes
+/// outside the lock: authorise under it, read or write after releasing it. That
+/// is a restructuring of the request path, not a change of thread label.
+///
+/// Two things narrow the exposure in the meantime. `blob_chunk_for` reads one
+/// `PARTY_CHUNK_BYTES` chunk rather than the whole file, so the chunked download
+/// path — the one large files take — holds the lock for 64 KiB of I/O and not
+/// 100 MiB of it. The whole-blob `blob_bytes` path remains as described above.
 fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {
@@ -1780,14 +1797,50 @@ impl PartyState {
         if !self.member_can_access_blob(member, hash) {
             return None;
         }
-        let bytes = self.blob_bytes(hash)?;
-        let total = bytes.len() as u64;
+        let record = self.blobs.get(hash)?;
+        let total = record.size;
         if offset >= total {
             return Some((Vec::new(), total));
         }
-        let start = offset as usize;
-        let end = (start + PARTY_CHUNK_BYTES).min(bytes.len());
-        Some((bytes[start..end].to_vec(), total))
+
+        // In-memory mode (no blob directory) keeps the bytes resident, so slice.
+        if let Some(resident) = &record.data {
+            let total = resident.len() as u64;
+            if offset >= total {
+                return Some((Vec::new(), total));
+            }
+            let start = offset as usize;
+            let end = (start + PARTY_CHUNK_BYTES).min(resident.len());
+            return Some((resident[start..end].to_vec(), total));
+        }
+
+        // Disk-backed: seek and read *one chunk*.
+        //
+        // This used to call `blob_bytes`, which reads the whole file — so
+        // serving a 64 KiB chunk of a 100 MiB blob read 100 MiB off disk, and a
+        // full download of that file read about 160 GiB across its 1,600
+        // chunks. Every one of those reads happens with the state mutex held,
+        // which is what makes it more than a waste of I/O: one member fetching
+        // a large file stalls every other member's messages for the duration,
+        // repeatedly. The chunked path is the one large files actually take.
+        let dir = self.blob_dir.as_ref()?;
+        let path = dir.join(hash);
+        let read = blocking_io(|| -> std::io::Result<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let want = PARTY_CHUNK_BYTES.min((total - offset) as usize);
+            let mut buf = Vec::with_capacity(want);
+            file.take(want as u64).read_to_end(&mut buf)?;
+            Ok(buf)
+        });
+        match read {
+            Ok(bytes) => Some((bytes, total)),
+            Err(e) => {
+                tracing::error!(hash, error = %e, "blob is recorded but its file could not be read");
+                None
+            }
+        }
     }
 
     /// Validate an inline upload's size, returning the data on success.
@@ -4364,6 +4417,86 @@ mod tests {
                 UploadTarget::Channel(channel),
             )
             .is_ok());
+    }
+
+    /// A chunked download reads one chunk, not the whole file.
+    ///
+    /// Serving 64 KiB of a 100 MiB blob used to read all 100 MiB off disk —
+    /// about 160 GiB over a full download's 1,600 chunks, every byte of it with
+    /// the state mutex held, so one member fetching a large file repeatedly
+    /// stalled everyone else's messages.
+    ///
+    /// The observable contract is unchanged, which is what this pins: same
+    /// bytes, same reported total, same behaviour past the end.
+    #[test]
+    fn a_chunked_read_returns_the_same_bytes_from_disk_as_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let channel = state.default_channel();
+
+        // Two and a bit chunks, so offsets land mid-file and at the tail.
+        let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 1234))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let env = state
+            .post_file(
+                owner,
+                channel,
+                "big.bin".into(),
+                "application/octet-stream".into(),
+                payload.clone(),
+            )
+            .unwrap();
+        let hash = file_payload(&env).hash.clone();
+
+        let mut reassembled = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let (chunk, total) = state
+                .blob_chunk_for(owner, &hash, offset)
+                .expect("the owner may read their own file");
+            assert_eq!(total, payload.len() as u64, "reported size drifted");
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(
+                chunk.len() <= PARTY_CHUNK_BYTES,
+                "a chunk must not exceed the chunk size"
+            );
+            reassembled.extend_from_slice(&chunk);
+            offset += chunk.len() as u64;
+        }
+        assert_eq!(reassembled, payload, "the file did not round-trip");
+
+        // Past the end is an empty chunk and the real total, not an error.
+        let (tail, total) = state
+            .blob_chunk_for(owner, &hash, payload.len() as u64 + 99)
+            .unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(total, payload.len() as u64);
+
+        // Access is still decided before any byte is read.
+        let mallory = state.join("mallory", None, None).unwrap();
+        state.set_role(owner, mallory, Role::Guest).unwrap();
+        let private = state
+            .create_channel_of_kind(owner, "private", ChannelKind::Private, vec![])
+            .unwrap()
+            .id;
+        let env = state
+            .post_file(
+                owner,
+                private,
+                "secret.bin".into(),
+                "application/octet-stream".into(),
+                b"secret".to_vec(),
+            )
+            .unwrap();
+        let secret_hash = file_payload(&env).hash.clone();
+        assert!(
+            state.blob_chunk_for(mallory, &secret_hash, 0).is_none(),
+            "a chunked read must not bypass the access check"
+        );
     }
 
     /// Someone else's failed `FinishUpload` must not discard your spool. The
