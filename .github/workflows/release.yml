@@ -9,8 +9,13 @@ concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
+# Read-only by default. Exactly two jobs need to write, and they say so
+# themselves: `create-release` drafts the release, and `attest` mints provenance
+# and publishes. The build matrices no longer upload anything to the release —
+# they hand their output to the run's artifact store instead — so they hold no
+# write token at all.
 permissions:
-  contents: write
+  contents: read
 
 # One product, one obvious download.
 #
@@ -24,14 +29,61 @@ permissions:
 #   2. P2PEM Tools    — terminal client + relay + community server, for people
 #                       running this on a headless box. Clearly secondary.
 #
-# The release body is written first, so the page explains itself the moment the
-# artifacts start landing.
+# ── Why the release is drafted and published last ─────────────────────────────
+#
+# Provenance is a claim about *what this run built*. The previous shape could
+# not keep that claim true, in two ways that both ended with a signature over
+# bytes nobody in this run had produced:
+#
+#   - Each build leg uploaded straight to the release, and `attest` then
+#     downloaded "every asset currently attached to the tag" and signed all of
+#     them. On a re-run, a re-pushed tag, or with an asset attached by hand,
+#     Sigstore certified bytes no build job here ever saw.
+#   - `needs: [desktop, tools]` with `fail-fast: false` on both matrices meant
+#     one failed leg out of seven left the other six sitting on an already-public
+#     release with no checksums and no provenance, silently.
+#
+# So: build legs upload to the workflow's own artifact store, which is scoped to
+# this run and cannot contain anything from another one. `attest` downloads from
+# there, signs exactly that, generates SHA256SUMS over it, signs that too, and
+# only then uploads to a release that has been a draft the whole time — and
+# publishes it as the last step, after verifying that what is on the page hashes
+# to what was signed. Nothing is downloadable until all of that has held.
+#
+# ── Why the actions are pinned to commit SHAs ────────────────────────────────
+#
+# `attest` holds `contents: write` *and* `id-token: write`. A tag is a mutable
+# pointer, so an action referenced by tag is an action whose contents its author
+# — or anyone who compromises their account — can change under us. In this job
+# that does not mean "a bad build": it means valid Sigstore provenance, signed
+# by this repository's identity, over an attacker's bytes. The comment beside
+# each pin records which version it is, so a bump is still a readable diff.
 jobs:
   create-release:
+    name: Draft the release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the draft
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # The tag names the download table in the release notes; Cargo.toml names
+      # the bundles tauri-action builds. Nothing checked that those two agreed,
+      # so a tag pushed at the wrong commit produced a page listing files that
+      # would never appear, and the mismatch only surfaced as a broken link on a
+      # published release.
+      - name: The tag must match the workspace version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "tag: $tag_version, Cargo.toml: $manifest_version"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $manifest_version"
+            exit 1
+          fi
 
       - name: Compose release notes
         run: |
@@ -58,24 +110,8 @@ jobs:
             echo
             echo "</details>"
             echo
-            echo "> First launch creates an identity and asks for a password that encrypts it."
-            echo "> There is no account and no password reset — export a backup when prompted."
+            echo "### Verifying what you downloaded"
             echo
-            echo "<details><summary>Verify your download</summary>"
-            echo
-            echo "These installers are **not** signed with an OS code-signing certificate, so"
-            echo "Windows SmartScreen and macOS Gatekeeper will warn about them. That warning"
-            echo "is about a missing certificate, not about the contents — so here is how to"
-            echo "check the contents directly."
-            echo
-            echo "**Provenance** — proves the file was built by this repository's release"
-            echo "workflow, from this commit, and not by anyone else. Needs the \`gh\` CLI:"
-            echo
-            echo "\`\`\`"
-            echo "gh attestation verify <downloaded-file> --repo ${GITHUB_REPOSITORY}"
-            echo "\`\`\`"
-            echo
-            echo "**Checksums** — proves the bytes you got are the bytes that were published."
             echo "Download \`SHA256SUMS\` from the assets below, then:"
             echo
             echo "\`\`\`"
@@ -83,27 +119,34 @@ jobs:
             echo "shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS"
             echo "\`\`\`"
             echo
-            echo "Provenance is the stronger of the two: a checksum only proves the file"
-            echo "matches this page, while an attestation proves this page's file came from"
-            echo "the source you can read."
-            echo
-            echo "</details>"
+            echo "Every asset here, \`SHA256SUMS\` included, carries a Sigstore provenance"
+            echo "attestation binding it to this repository, this commit and this workflow"
+            echo "run. See SECURITY.md for the \`gh attestation verify\` command."
             echo
             echo "---"
           } > release-notes.md
 
-      - name: Ensure release exists
+      # Draft, always. A release that already exists and is *published* is not
+      # something to upload onto: this workflow's whole guarantee is that
+      # nothing is downloadable before it has been signed and verified.
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release ${{ github.ref_name }} already exists; leaving its notes alone."
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::$GITHUB_REF_NAME is already published. Refusing to upload onto a live release; delete it or push a new tag."
+              exit 1
+            fi
+            echo "Reusing the existing draft for $GITHUB_REF_NAME."
           else
-            gh release create "${{ github.ref_name }}" \
-              --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --title "P2PEM ${{ github.ref_name }}" \
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "P2PEM $GITHUB_REF_NAME" \
               --notes-file release-notes.md \
+              --draft \
               --generate-notes
           fi
 
@@ -111,6 +154,7 @@ jobs:
   desktop:
     name: P2PEM Desktop (${{ matrix.label }})
     needs: create-release
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -131,33 +175,61 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      # Bounded and retried, like every other apt call in this repository. This
+      # was the one left bare: `timeout-minutes` eventually stops it, but a
+      # ninety-minute hang that reports nothing is a worse failure than a
+      # four-minute one that says which mirror stalled. `-k 30` because apt
+      # ignores SIGTERM mid-transaction, and `dpkg --configure -a` repairs the
+      # lock the kill leaves behind.
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
-            libayatana-appindicator3-dev patchelf
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
+                 libgtk-3-dev libwayland-dev libxkbcommon-dev \
+                 libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
+                 libayatana-appindicator3-dev patchelf; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "apt attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed three times; this is an infrastructure problem, not the diff"
+          exit 1
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        # actions/setup-node v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, the `stable` branch head. Pinned to a commit,
+        # so the toolchain has to be named explicitly below — the action
+        # otherwise reads it from the ref it was called by.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           targets: ${{ contains(matrix.args, 'apple') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: desktop/src-tauri
+      # No dependency cache here, deliberately. The attestation says these bytes
+      # were built from this source at this commit; a cache restored from an
+      # earlier run on another ref means the build actually consumed objects
+      # compiled from source this run never saw. A release build that mints
+      # provenance should be cold. It costs minutes, once per release.
 
       - name: Install frontend dependencies
         run: npm ci
@@ -169,20 +241,84 @@ jobs:
         run: npm run build
         working-directory: desktop
 
-      - name: Build and upload desktop installers
-        uses: tauri-apps/tauri-action@v0
+      # `--locked`: without it a semver-compatible dependency published between
+      # the tagged commit and this build ships inside a fully attested
+      # installer, and the attestation says nothing about the difference.
+      - name: Build desktop installers
+        id: tauri
+        # tauri-apps/tauri-action v0.6.2
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
           tagName: ${{ github.ref_name }}
           releaseName: 'P2PEM ${{ github.ref_name }}'
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} --locked
+
+      # tauri-action reports what it built as a JSON array of paths. Copying
+      # those rather than globbing the bundle tree is what keeps this honest:
+      # the artifact contains what the builder says it produced, nothing else.
+      #
+      # `-r`, because a macOS `.app` is a directory. The loop this replaces
+      # tested `[ ! -f "$bundle" ]` and would have hard-failed both macOS legs
+      # the first time tauri-action listed one.
+      - name: Stage installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' > artifacts.json
+          cat artifacts.json
+          # jq is preinstalled on every GitHub-hosted runner, Windows included.
+          # `-r` and a newline-delimited list, read from a file rather than a
+          # pipe, so the loop body runs in this shell and its `exit` means what
+          # it says.
+          jq -r '.[]' artifacts.json > artifacts.txt
+          count=0
+          while IFS= read -r bundle; do
+            [ -n "$bundle" ] || continue
+            if [ ! -e "$bundle" ]; then
+              echo "::error::tauri-action reported $bundle, which does not exist"
+              exit 1
+            fi
+            # Directories (a macOS .app) are archived, because a release asset
+            # is a file and an attestation subject is a digest over one. The
+            # loop this replaces tested `[ ! -f "$bundle" ]` and would have
+            # hard-failed both macOS legs the first time one was listed.
+            if [ -d "$bundle" ]; then
+              tar -czf "staged/$(basename "$bundle").tar.gz" \
+                -C "$(dirname "$bundle")" "$(basename "$bundle")"
+            else
+              cp -a "$bundle" staged/
+            fi
+            count=$((count + 1))
+          done < artifacts.txt
+          if [ "$count" -eq 0 ]; then
+            echo "::error::tauri-action produced no artifacts"
+            exit 1
+          fi
+          ls -l staged
+
+      - name: Upload installers to the run
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-${{ matrix.label }}
+          path: staged/
+          if-no-files-found: error
+          retention-days: 7
+          # Without this, re-running a failed attest after successful builds
+          # fails deterministically with a 409 on the artifact that is already
+          # there — so the one thing you would want to retry is the one thing
+          # you cannot.
+          overwrite: true
 
   # ── Secondary: headless / self-hosting tools ──────────────────────────────
   tools:
     name: P2PEM Tools (${{ matrix.label }})
     needs: create-release
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -196,15 +332,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, the `stable` branch head.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      # No dependency cache: see the desktop job.
 
       # No GUI toolkit is needed any more: the client crate is the app core plus
       # a terminal UI, and the server is headless.
@@ -224,7 +361,7 @@ jobs:
           cp README.md LICENSE.md "$STAGE/"
           cp docs/USER_GUIDE.md "$STAGE/" 2>/dev/null || true
           tar -czf "${STAGE}.tar.gz" "$STAGE"
-          echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          mkdir -p staged && mv "${STAGE}.tar.gz" staged/
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
@@ -236,17 +373,20 @@ jobs:
           Copy-Item target/release/server.exe "$stage/p2pem-server.exe"
           Copy-Item README.md, LICENSE.md $stage
           if (Test-Path docs/USER_GUIDE.md) { Copy-Item docs/USER_GUIDE.md $stage }
-          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
-          "ASSET=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-Item -ItemType Directory -Force -Path staged | Out-Null
+          Compress-Archive -Path $stage -DestinationPath "staged/$stage.zip" -Force
 
-      - name: Upload
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
-        shell: bash
+      - name: Upload tools to the run
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tools-${{ matrix.label }}
+          path: staged/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
-
-  # ── Provenance and checksums ──────────────────────────────────────────────
+  # ── Provenance, checksums, and publication ────────────────────────────────
   #
   # These installers carry no OS code-signing certificate — a Windows
   # Authenticode cert and an Apple Developer membership are recurring costs this
@@ -259,7 +399,8 @@ jobs:
   #
   #   SHA256SUMS   proves the bytes you downloaded match the bytes published.
   #                Cheap, familiar, and no help at all if the release page
-  #                itself is what an attacker controls.
+  #                itself is what an attacker controls — which is why it is
+  #                itself attested rather than left as the one unsigned file.
   #   Provenance   binds each artifact's digest to this repository, this commit
   #                and this workflow run, signed through Sigstore with an
   #                ephemeral key and recorded in a public transparency log.
@@ -267,46 +408,123 @@ jobs:
   #                it, and it is the claim that actually matters: not "these are
   #                the bytes on the page" but "these are the bytes this source
   #                built".
-  #
-  # Run as one job after everything has been published, rather than per build
-  # job: it covers every asset regardless of which of the seven matrix legs
-  # produced it, and it does not need the four desktop runners to agree on how
-  # to parse tauri-action's artifact paths.
   attest:
-    name: Provenance and checksums
+    name: Provenance, checksums and publish
     needs: [desktop, tools]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Job-level permissions REPLACE the workflow-level block rather than adding
     # to it, so `contents` has to be restated here.
     permissions:
-      contents: write # upload SHA256SUMS to the release
+      contents: write # upload the assets and publish the release
       id-token: write # mint the short-lived Sigstore signing certificate
       attestations: write # record the attestation against this repository
     steps:
-      - name: Download every published asset
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # No `run-id`, so this is scoped to *this* run and cannot reach another
+      # one's artifacts. That scoping is the whole point: it is what makes
+      # "these are the bytes this run built" a fact about the download rather
+      # than an assumption about the release page.
+      - name: Collect what this run built
+        # actions/download-artifact v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: staging
+          pattern: '{desktop,tools}-*'
+
+      # `merge-multiple` would flatten these silently, so a basename collision
+      # between two legs would lose one file with nothing to show for it. Merge
+      # by hand and refuse a collision instead.
+      - name: Flatten, refusing any name collision
         run: |
+          set -euo pipefail
           mkdir -p assets
-          gh release download "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --dir assets
-          # A SHA256SUMS from an earlier run of the same tag must not be hashed
-          # into the new one, and must not be attested as a build artifact.
-          rm -f assets/SHA256SUMS
+          # Not `find ... | while`, which puts the loop in a subshell where an
+          # `exit` on a collision would be swallowed and the step would pass.
+          find staging -type f > files.txt
+          while IFS= read -r f; do
+            name="$(basename "$f")"
+            if [ -e "assets/$name" ]; then
+              echo "::error::two build legs produced a file named $name"
+              exit 1
+            fi
+            mv "$f" "assets/$name"
+          done < files.txt
+          # Seven legs, at least one file each. A leg that produced nothing
+          # would have failed its own upload, but assert it here too: this is
+          # the last point at which "the release is incomplete" is cheap to
+          # notice.
+          count="$(find assets -type f | wc -l)"
+          echo "collected $count files"
+          if [ "$count" -lt 7 ]; then
+            echo "::error::expected at least 7 assets, found $count"
+            exit 1
+          fi
           ls -l assets
 
+      # Hashes are recorded with bare filenames, so `-c` works from whatever
+      # directory the user downloaded into. Generated *before* the attest step,
+      # so it is one of the signed subjects: it used to be created afterwards
+      # and was therefore the one file on the page with no attestation at all,
+      # which is precisely the file an attacker who controls the page would
+      # want to swap alongside the artifacts.
+      - name: Generate SHA256SUMS
+        run: |
+          (cd assets && sha256sum -- * > SHA256SUMS)
+          cat assets/SHA256SUMS
+
+      # Every subject here came out of this run's artifact store, so the set is
+      # bounded by construction rather than by a glob over whatever happens to
+      # be attached to the tag.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        # actions/attest-build-provenance v4.2.2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: 'assets/*'
 
-      - name: Publish SHA256SUMS
+      - name: Upload the signed bytes to the draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Hashes are recorded with bare filenames, so `-c` works from whatever
-          # directory the user downloaded into.
-          (cd assets && sha256sum -- *) > SHA256SUMS
-          cat SHA256SUMS
-          gh release upload "$GITHUB_REF_NAME" SHA256SUMS \
+          # Re-check immediately before writing. The draft check in
+          # `create-release` passed tens of minutes ago, on the far side of the
+          # whole build matrix; a release published in that window — by a
+          # person, or by an earlier queued run — would walk straight past it.
+          is_draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::$GITHUB_REF_NAME was published while this run was building. Refusing to overwrite its assets."
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" assets/* \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Download the assets back off the release and confirm they hash to what
+      # was signed. Nothing is supposed to repackage anything between the attest
+      # step and the upload, and this is how that stops being a supposition.
+      - name: Verify the published bytes match what was signed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p published
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --dir published --clobber
+          cd published
+          sha256sum --quiet -c SHA256SUMS
+          # And SHA256SUMS itself, which by construction cannot check itself.
+          published_sum="$(sha256sum SHA256SUMS | cut -d' ' -f1)"
+          signed_sum="$(sha256sum ../assets/SHA256SUMS | cut -d' ' -f1)"
+          if [ "$published_sum" != "$signed_sum" ]; then
+            echo "::error::the published SHA256SUMS is not the one that was signed"
+            exit 1
+          fi
+          echo "every published asset matches the attested digest"
+
+      # Last. Until this runs the release is a draft, so a failure anywhere
+      # above leaves nothing downloadable rather than a public page missing its
+      # checksums and provenance.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "published $GITHUB_REF_NAME"

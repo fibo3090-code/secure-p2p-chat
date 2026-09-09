@@ -34,8 +34,16 @@ binding the file's digest to this repository, the exact commit, and the workflow
 run that produced it, and recording it in a public transparency log:
 
 ```bash
-gh attestation verify <downloaded-file> --repo <owner>/<repo>
+gh attestation verify <downloaded-file> \
+  --repo <owner>/<repo> \
+  --signer-workflow <owner>/<repo>/.github/workflows/release.yml
 ```
+
+`--signer-workflow` is not optional garnish. Without it, `verify` accepts an
+attestation minted by *any* workflow in the repository — so a workflow that
+could be made to attest something it did not build would still satisfy the
+check. Naming the release workflow is what makes the answer "this came off the
+release pipeline" rather than "something in this repository signed it".
 
 This is a claim a code-signing certificate cannot make. A certificate says "some
 holder of this key produced this file"; the attestation says "this file was
@@ -48,10 +56,20 @@ sha256sum --ignore-missing -c SHA256SUMS      # Linux
 shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS
 ```
 
+`SHA256SUMS` is itself attested, so you can verify it the same way before
+trusting what it says.
+
 Note the limit: a checksum only proves the file matches the release page. If the
 release page itself were the thing under an attacker's control, the checksum
-would match and prove nothing. Provenance does not have that weakness — verify
-that one if you verify only one.
+would match and prove nothing — unless you check its provenance too, which is
+why that file is signed rather than left as the one unsigned asset. Provenance
+does not have that weakness in the first place; verify that one if you verify
+only one.
+
+What provenance still does not tell you: *who decided* this release should
+exist. Any commit that carries a matching workspace version and a pushed `v*`
+tag mints genuine provenance and publishes. The attestation is a faithful claim
+about the build, not an approval.
 
 There is **no auto-updater**. Security fixes reach you only if you come back and
 download them, so watch the repository for releases if you rely on this.
