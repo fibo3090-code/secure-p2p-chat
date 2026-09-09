@@ -389,7 +389,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     size,
                     target,
                 } => {
-                    match state.start_upload(member, name, mime, size, target, conn.uploads.len()) {
+                    match state.start_upload(member, name, mime, size, target) {
                         Ok(upload) => {
                             conn.uploads.push(upload);
                             Dispatch::reply(PartyResponse::UploadReady {
@@ -416,8 +416,14 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     }
                 }
                 PartyRequest::FinishUpload { upload } => {
+                    // After the call, not before. Clearing the connection's
+                    // bookkeeping first meant an error path that left the spool
+                    // in `PartyState` also left the connection believing it had
+                    // nothing in flight — so the concurrency cap read zero and
+                    // the disconnect sweep, gated on this same list, never ran.
+                    let outcome = state.finish_upload(member, upload);
                     conn.uploads.retain(|u| *u != upload);
-                    match state.finish_upload(member, upload) {
+                    match outcome {
                         Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
                         Ok((env, UploadTarget::Dm(to))) => Dispatch {
                             replies: vec![PartyResponse::MessagePosted {

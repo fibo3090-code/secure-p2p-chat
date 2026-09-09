@@ -1589,6 +1589,18 @@ impl PartyState {
     /// the hard ceiling and the uploader's remaining allowance, and the target
     /// against the permission rules — because the alternative is spooling a
     /// hundred megabytes and then saying no.
+    /// Begin a chunked upload, if this member is allowed one.
+    ///
+    /// The concurrency cap counts the uploads *this state* is holding for the
+    /// member, not the ones the connection believes it has open. Those two
+    /// numbers used to be allowed to disagree: `FinishUpload` cleared the
+    /// connection's list before calling `finish_upload`, which then returned
+    /// `Err` on the incomplete path without dropping the spool. The connection
+    /// then reported zero in flight while the server still held up to
+    /// `MAX_PARTY_FILE_BYTES` per abandoned upload, so the cap could be walked
+    /// past indefinitely — declare 100 MiB, send 99, finish, repeat. Deriving
+    /// the count from the spools themselves makes the cap true regardless of
+    /// what any caller remembers.
     pub fn start_upload(
         &mut self,
         uploader: Uuid,
@@ -1596,12 +1608,11 @@ impl PartyState {
         mime: String,
         size: u64,
         target: UploadTarget,
-        in_flight: usize,
     ) -> Result<Uuid, String> {
         if !self.is_member(uploader) {
             return Err("sender is not a member of this server".to_string());
         }
-        if in_flight >= MAX_CONCURRENT_UPLOADS {
+        if self.uploads_in_flight(uploader) >= MAX_CONCURRENT_UPLOADS {
             return Err(format!(
                 "you already have {MAX_CONCURRENT_UPLOADS} uploads in progress"
             ));
@@ -1684,6 +1695,14 @@ impl PartyState {
 
     /// Complete an upload: store the assembled bytes and post the file message.
     /// Returns the envelope to deliver, and whether it was a DM.
+    /// Complete an upload.
+    ///
+    /// The spool is dropped on **every** path out of here, success or failure.
+    /// It used to survive the incomplete case, which was the leak: a member
+    /// declaring 100 MiB, sending 99 and finishing got an error back and left
+    /// the 99 MiB behind, with nothing that would ever reclaim it short of a
+    /// restart. Finishing short is a client that broke its own protocol; the
+    /// bytes are not worth keeping on the chance it comes back for them.
     pub fn finish_upload(
         &mut self,
         uploader: Uuid,
@@ -1693,10 +1712,13 @@ impl PartyState {
             return Err("no such upload".to_string());
         };
         if pending.uploader != uploader {
+            // Not this member's upload: say nothing about it and, crucially,
+            // do not remove it — it belongs to someone else.
             return Err("no such upload".to_string());
         }
         if (pending.data.len() as u64) != pending.declared {
             let short = pending.declared - pending.data.len() as u64;
+            self.uploads.remove(&upload);
             return Err(format!(
                 "upload is incomplete — {} still missing",
                 messenger_core::util::format_size(short)
@@ -1731,6 +1753,24 @@ impl PartyState {
     /// Drop every upload belonging to `member` (their connection went away).
     pub fn cancel_uploads_for(&mut self, member: Uuid) {
         self.uploads.retain(|_, p| p.uploader != member);
+    }
+
+    /// How many uploads this member currently has spooled here.
+    pub fn uploads_in_flight(&self, member: Uuid) -> usize {
+        self.uploads
+            .values()
+            .filter(|p| p.uploader == member)
+            .count()
+    }
+
+    /// Bytes currently held in upload spools, across every member.
+    ///
+    /// Not a limit — [`MAX_CONCURRENT_UPLOADS`] and [`MAX_PARTY_FILE_BYTES`]
+    /// are what bound this — but the number a test needs in order to assert
+    /// that an abandoned upload was actually reclaimed rather than merely
+    /// forgotten by its connection.
+    pub fn staged_upload_bytes(&self) -> u64 {
+        self.uploads.values().map(|p| p.data.len() as u64).sum()
     }
 
     /// One chunk of a stored blob, plus the file's total size, for a member who
@@ -4048,7 +4088,6 @@ mod tests {
                 "application/octet-stream".into(),
                 payload.len() as u64,
                 UploadTarget::Channel(channel),
-                0,
             )
             .unwrap();
         for chunk in payload.chunks(PARTY_CHUNK_BYTES) {
@@ -4099,7 +4138,6 @@ mod tests {
                 "application/octet-stream".into(),
                 4,
                 UploadTarget::Channel(channel),
-                0,
             )
             .unwrap();
         state.upload_chunk(owner, upload, b"abcd").unwrap();
@@ -4122,7 +4160,6 @@ mod tests {
                 "application/octet-stream".into(),
                 10,
                 UploadTarget::Channel(channel),
-                0,
             )
             .unwrap();
         state.upload_chunk(owner, upload, b"abc").unwrap();
@@ -4148,19 +4185,11 @@ mod tests {
                 octet(),
                 MAX_PARTY_FILE_BYTES + 1,
                 UploadTarget::Channel(channel),
-                0
             )
             .is_err());
         // Empty.
         assert!(state
-            .start_upload(
-                bob,
-                "e".into(),
-                octet(),
-                0,
-                UploadTarget::Channel(channel),
-                0
-            )
+            .start_upload(bob, "e".into(), octet(), 0, UploadTarget::Channel(channel),)
             .is_err());
         // Past the member's allowance.
         state.set_max_member_blob_bytes(1024);
@@ -4171,42 +4200,44 @@ mod tests {
                 octet(),
                 4096,
                 UploadTarget::Channel(channel),
-                0,
             )
             .unwrap_err();
         assert!(err.contains("allowance"), "got: {err}");
         state.set_max_member_blob_bytes(MAX_MEMBER_BLOB_BYTES);
-        // Too many at once.
+        // Too many at once. The cap counts the spools the state is actually
+        // holding, so it has to be reached by opening them, not by asserting it.
+        let opened: Vec<Uuid> = (0..MAX_CONCURRENT_UPLOADS)
+            .map(|i| {
+                state
+                    .start_upload(
+                        bob,
+                        format!("n{i}"),
+                        octet(),
+                        16,
+                        UploadTarget::Channel(channel),
+                    )
+                    .expect("under the cap")
+            })
+            .collect();
         let err = state
-            .start_upload(
-                bob,
-                "n".into(),
-                octet(),
-                16,
-                UploadTarget::Channel(channel),
-                MAX_CONCURRENT_UPLOADS,
-            )
+            .start_upload(bob, "n".into(), octet(), 16, UploadTarget::Channel(channel))
             .unwrap_err();
         assert!(err.contains("in progress"), "got: {err}");
+        for upload in opened {
+            state.cancel_upload(bob, upload);
+        }
         // A channel they may not post to.
         let locked = state
             .create_channel_of_kind(owner, "locked", ChannelKind::Locked, vec![])
             .unwrap()
             .id;
         assert!(state
-            .start_upload(
-                bob,
-                "l".into(),
-                octet(),
-                16,
-                UploadTarget::Channel(locked),
-                0
-            )
+            .start_upload(bob, "l".into(), octet(), 16, UploadTarget::Channel(locked),)
             .is_err());
         // A guest cannot upload at all, DM included.
         state.set_role(owner, bob, Role::Guest).unwrap();
         assert!(state
-            .start_upload(bob, "g".into(), octet(), 16, UploadTarget::Dm(owner), 0)
+            .start_upload(bob, "g".into(), octet(), 16, UploadTarget::Dm(owner))
             .is_err());
     }
 
@@ -4225,7 +4256,6 @@ mod tests {
                 "application/octet-stream".into(),
                 8,
                 UploadTarget::Channel(channel),
-                0,
             )
             .unwrap();
 
@@ -4241,6 +4271,126 @@ mod tests {
         // Bob's connection goes away.
         state.cancel_uploads_for(bob);
         assert!(state.upload_chunk(bob, upload, b"abcd").is_err());
+    }
+
+    /// An upload finished short must not leave its spool behind.
+    ///
+    /// This was an unbounded memory leak a Guest could drive: declare the
+    /// maximum, send all but a byte of it, call `FinishUpload`. The server
+    /// answered "upload is incomplete" and kept every byte, while the
+    /// connection — which cleared its own list *before* the call — reported
+    /// nothing in flight, so `MAX_CONCURRENT_UPLOADS` read zero and the
+    /// disconnect sweep, gated on that same list, never ran. Each round leaked
+    /// up to `MAX_PARTY_FILE_BYTES` and nothing short of a restart reclaimed it.
+    #[test]
+    fn an_upload_finished_short_does_not_leak_its_spool() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        let _ = owner;
+
+        for _ in 0..(MAX_CONCURRENT_UPLOADS * 3) {
+            let upload = state
+                .start_upload(
+                    bob,
+                    "x".into(),
+                    "application/octet-stream".into(),
+                    64,
+                    UploadTarget::Channel(channel),
+                )
+                .expect("the cap must not be reached by abandoned uploads");
+            state.upload_chunk(bob, upload, &[0u8; 32]).unwrap();
+
+            let err = state.finish_upload(bob, upload).unwrap_err();
+            assert!(err.contains("incomplete"), "got: {err}");
+
+            assert_eq!(
+                state.staged_upload_bytes(),
+                0,
+                "the spool survived a short finish"
+            );
+            assert_eq!(
+                state.uploads_in_flight(bob),
+                0,
+                "the abandoned upload still counts against the cap"
+            );
+        }
+    }
+
+    /// The concurrency cap is enforced against the spools the server holds, not
+    /// against a number a caller passes in. Nothing a connection forgets can
+    /// buy a member more of them.
+    #[test]
+    fn the_upload_cap_counts_what_the_server_is_holding() {
+        let mut state = PartyState::new("Srv", None);
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let mut opened = Vec::new();
+        for i in 0..MAX_CONCURRENT_UPLOADS {
+            opened.push(
+                state
+                    .start_upload(
+                        bob,
+                        format!("f{i}"),
+                        "application/octet-stream".into(),
+                        16,
+                        UploadTarget::Channel(channel),
+                    )
+                    .expect("under the cap"),
+            );
+        }
+        assert_eq!(state.uploads_in_flight(bob), MAX_CONCURRENT_UPLOADS);
+        assert!(state
+            .start_upload(
+                bob,
+                "one-too-many".into(),
+                "application/octet-stream".into(),
+                16,
+                UploadTarget::Channel(channel),
+            )
+            .is_err());
+
+        // Cancelling one frees exactly one slot.
+        state.cancel_upload(bob, opened[0]);
+        assert_eq!(state.uploads_in_flight(bob), MAX_CONCURRENT_UPLOADS - 1);
+        assert!(state
+            .start_upload(
+                bob,
+                "now-there-is-room".into(),
+                "application/octet-stream".into(),
+                16,
+                UploadTarget::Channel(channel),
+            )
+            .is_ok());
+    }
+
+    /// Someone else's failed `FinishUpload` must not discard your spool. The
+    /// "no such upload" answer is deliberately the same for a stranger's id and
+    /// a made-up one, and it must stay just as inert.
+    #[test]
+    fn a_strangers_finish_does_not_drop_your_upload() {
+        let mut state = PartyState::new("Srv", None);
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let upload = state
+            .start_upload(
+                bob,
+                "x".into(),
+                "application/octet-stream".into(),
+                8,
+                UploadTarget::Channel(channel),
+            )
+            .unwrap();
+        state.upload_chunk(bob, upload, b"abcd").unwrap();
+
+        assert!(state.finish_upload(owner, upload).is_err());
+        assert_eq!(state.uploads_in_flight(bob), 1, "bob's upload was dropped");
+        assert!(state.upload_chunk(bob, upload, b"efgh").is_ok());
+        assert!(state.finish_upload(bob, upload).is_ok());
     }
 
     /// The rights are separate on purpose: seeing that a file exists is not the

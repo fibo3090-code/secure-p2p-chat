@@ -156,9 +156,13 @@ where
         // A client that vanished mid-transfer must not pin its spool for the
         // life of the process. Each pending upload can hold up to
         // MAX_PARTY_FILE_BYTES, so this is memory, not just tidiness.
-        if !conn.open_uploads().is_empty() {
-            state.lock().await.cancel_uploads_for(member);
-        }
+        //
+        // Unconditional, deliberately. This used to be gated on
+        // `!conn.open_uploads().is_empty()`, which made the sweep depend on the
+        // connection's own bookkeeping being accurate — and the one case where
+        // it was not was exactly the case where a spool had been orphaned. The
+        // authority on what this member has spooled is the state, so ask it.
+        state.lock().await.cancel_uploads_for(member);
         // Presence is per-member but connections are per-device: only go offline
         // once this member's *last* connection is gone, or closing one of two
         // open clients would report them as offline while they are still here.
