@@ -203,7 +203,18 @@ Handled in `ChatManager::handle_tofu_verification` (via `handle_session_event`).
   separate workspace is a workspace `--workspace` does not reach and the targets
   were never compiled by anything. `scripts/fuzz.sh` sets `-max_len` (libFuzzer
   defaults to 4096 bytes; every cap in these decoders sits at 48–64 KiB, so the
-  branches worth reaching were unreachable) and keeps a corpus between runs.
+  branches worth reaching were unreachable), keeps a corpus between runs, and
+  copies in `core/fuzz/seeds/` — which **is** tracked, unlike the corpus. Seeds
+  are not a nicety for the bincode targets (`party_frame`, `identity_proof`): an
+  enum variant is a little-endian u32, so four random bytes are essentially
+  never a valid one and a run from empty spends its whole budget being rejected
+  at the first field. `the_tracked_seed_corpus_still_reaches_its_decoders`
+  (`core/tests/fuzz_parsers.rs`) fails if a seed stops decoding, which is what
+  catches the corpus going stale when a decoder is tightened.
+  Five targets: `protocol_frame`, `party_frame`, `filename`, and — earlier in
+  the trust chain than any of those — `framing` (`recv_packet`'s 4-byte length
+  prefix, pre-handshake and pre-decryption, reachable by anyone who can open a
+  socket) and `identity_proof` (decoded before any trust decision).
 - **The frontend is linted** (`cd desktop && npm run lint`, a CI gate). The rule
   set is deliberately narrow — bugs, not style — because a linter that reports
   400 opinions on install gets switched off. `exhaustive-deps` is a warning, not

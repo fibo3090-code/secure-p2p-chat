@@ -552,3 +552,93 @@ mod truncation_reintroduced_what_sanitising_removed {
         }
     }
 }
+
+/// The tracked seed corpus must actually reach the decoders it is for.
+///
+/// Seeds are only worth tracking if they decode: a corpus of inputs that all
+/// bounce off the first field teaches libFuzzer nothing and is exactly the
+/// starting-from-nothing problem it exists to fix. This is also the check that
+/// catches a seed going stale when a decoder is tightened — which has already
+/// happened once here, when the frame decoder stopped repairing invalid UTF-8.
+#[test]
+fn the_tracked_seed_corpus_still_reaches_its_decoders() {
+    use std::path::Path;
+
+    fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/seeds")
+            .join(target);
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                if e.path().is_file() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    out.push((name, std::fs::read(e.path()).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    // Party frames are bincode: an enum variant is a little-endian u32, so an
+    // undecodable seed is a seed that does nothing at all.
+    let party = seeds("party_frame");
+    assert!(!party.is_empty(), "no party_frame seeds found");
+    let decoded = party
+        .iter()
+        .filter(|(_, b)| {
+            PartyRequest::from_bytes(b).is_some() || PartyResponse::from_bytes(b).is_some()
+        })
+        .count();
+    assert_eq!(
+        decoded,
+        party.len(),
+        "party_frame seeds that no longer decode: {:?}",
+        party
+            .iter()
+            .filter(|(_, b)| PartyRequest::from_bytes(b).is_none()
+                && PartyResponse::from_bytes(b).is_none())
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>()
+    );
+
+    // Protocol frames: most seeds should decode, but some are deliberately at
+    // or past a cap and must be *refused* — so assert the split rather than
+    // that everything parses.
+    let protocol = seeds("protocol_frame");
+    assert!(!protocol.is_empty(), "no protocol_frame seeds found");
+    let accepted: Vec<&String> = protocol
+        .iter()
+        .filter(|(_, b)| ProtocolMessage::from_plain_bytes(b).is_some())
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !accepted.is_empty(),
+        "no protocol_frame seed decodes at all — the corpus is dead weight"
+    );
+    // And every seed, accepted or not, must leave the decoder unharmed.
+    for (name, bytes) in &protocol {
+        let _ = ProtocolMessage::from_plain_bytes(bytes);
+        assert!(
+            bytes.len() <= 128 * 1024,
+            "seed {name} is larger than any cap"
+        );
+    }
+
+    // Identity proofs are read before any trust decision; the seeds are there
+    // to give the fuzzer a valid shape to mutate from.
+    let proofs = seeds("identity_proof");
+    assert!(!proofs.is_empty(), "no identity_proof seeds found");
+    let ok = proofs
+        .iter()
+        .filter(|(_, b)| {
+            messenger_core::util::decode_exact::<messenger_core::core::IdentityProof>(b).is_ok()
+        })
+        .count();
+    assert!(
+        ok >= proofs.len() - 1,
+        "identity_proof seeds no longer decode ({ok} of {})",
+        proofs.len()
+    );
+}

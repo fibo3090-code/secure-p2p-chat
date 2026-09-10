@@ -59,10 +59,25 @@ fi
 # nothing every time. Gitignored, because a corpus is generated data.
 CORPUS_ROOT="fuzz/corpus"
 
+# Tracked starting material, one directory per target. Copied into the corpus
+# before each run rather than passed as a second corpus directory, so libFuzzer
+# is free to minimise and extend them in place without rewriting tracked files.
+#
+# They exist because the accumulated corpus does not: `core/fuzz/corpus/` is
+# gitignored, so every fresh checkout started from nothing. For the bincode
+# targets that is not merely slow but hopeless — an enum variant is a
+# little-endian u32, and four random bytes are essentially never a valid one, so
+# the whole budget goes on being rejected at the first field. See
+# `core/fuzz/seeds/README.md`.
+SEED_ROOT="fuzz/seeds"
+
 run_one() {
     local name="$1"
     local corpus="${CORPUS_ROOT}/${name}"
     mkdir -p "$corpus"
+    if [ -d "${SEED_ROOT}/${name}" ]; then
+        cp -n "${SEED_ROOT}/${name}"/* "$corpus"/ 2>/dev/null || true
+    fi
     echo "── fuzzing ${name} for ${SECONDS_PER_TARGET}s ─────────────────────────"
     cargo fuzz run "$name" "$corpus" -- \
         -max_total_time="$SECONDS_PER_TARGET" \
