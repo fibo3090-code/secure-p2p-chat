@@ -145,6 +145,7 @@ where
                             download_reply(hash, offset, total, bytes)
                         }
                         Deferred::Upload(staged) => {
+                            let staged_id = staged.id();
                             // Phase 2: hash and write, off the lock.
                             let staged = tokio::task::spawn_blocking(move || {
                                 let mut staged = staged;
@@ -161,11 +162,18 @@ where
                                     // than for a 100 MiB write.
                                     let mut st = state.lock().await;
                                     let committed = st.commit_upload(*staged);
-                                    upload_committed(&st, conn.member().unwrap_or_else(Uuid::nil), committed)
+                                    let out = upload_committed(
+                                        &st,
+                                        conn.member().unwrap_or_else(Uuid::nil),
+                                        committed,
+                                    );
+                                    drop(st);
+                                    conn.finish_upload(staged_id);
+                                    out
                                 }
                                 Ok((staged, Err(reason))) => {
-                                    let mut st = state.lock().await;
-                                    st.discard_upload(*staged);
+                                    state.lock().await.discard_upload(*staged);
+                                    conn.finish_upload(staged_id);
                                     Dispatch {
                                         replies: vec![PartyResponse::ActionFailed {
                                             channel: Uuid::nil(),
@@ -174,13 +182,27 @@ where
                                         ..Dispatch::default()
                                     }
                                 }
-                                Err(_) => Dispatch {
-                                    replies: vec![PartyResponse::ActionFailed {
-                                        channel: Uuid::nil(),
-                                        reason: "the server could not store this file".to_string(),
-                                    }],
-                                    ..Dispatch::default()
-                                },
+                                Err(_) => {
+                                    // The blocking task panicked or was
+                                    // cancelled; the staged upload went with it,
+                                    // so only the reservation is left to release.
+                                    state
+                                        .lock()
+                                        .await
+                                        .cancel_connection_uploads(
+                                            conn.member().unwrap_or_else(Uuid::nil),
+                                            &[staged_id],
+                                        );
+                                    conn.finish_upload(staged_id);
+                                    Dispatch {
+                                        replies: vec![PartyResponse::ActionFailed {
+                                            channel: Uuid::nil(),
+                                            reason: "the server could not store this file"
+                                                .to_string(),
+                                        }],
+                                        ..Dispatch::default()
+                                    }
+                                }
                             }
                         }
                     };
@@ -223,12 +245,19 @@ where
         // life of the process. Each pending upload can hold up to
         // MAX_PARTY_FILE_BYTES, so this is memory, not just tidiness.
         //
-        // Unconditional, deliberately. This used to be gated on
-        // `!conn.open_uploads().is_empty()`, which made the sweep depend on the
-        // connection's own bookkeeping being accurate — and the one case where
-        // it was not was exactly the case where a spool had been orphaned. The
-        // authority on what this member has spooled is the state, so ask it.
-        state.lock().await.cancel_uploads_for(member);
+        // This connection's ids, not every id belonging to the member: one
+        // person can be signed in from two devices with uploads in flight on
+        // both, and sweeping by member would make closing a laptop cancel the
+        // phone's transfer.
+        //
+        // The list stays accurate because every path that ends an upload — a
+        // failed chunk, a refused finish, a commit, a discard — clears the id
+        // through `ConnState::finish_upload`, and an id in flight is left listed
+        // precisely so this can release its reservation.
+        let open = conn.open_uploads().to_vec();
+        if !open.is_empty() {
+            state.lock().await.cancel_connection_uploads(member, &open);
+        }
         // Presence is per-member but connections are per-device: only go offline
         // once this member's *last* connection is gone, or closing one of two
         // open clients would report them as offline while they are still here.

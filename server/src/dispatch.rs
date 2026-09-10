@@ -175,9 +175,22 @@ impl ConnState {
         }
     }
 
-    /// Uploads this connection left in flight, for cleanup on disconnect.
+    /// Uploads and staged reservations this connection has in flight, for
+    /// cleanup on disconnect. Both are keyed by the same id.
     pub fn open_uploads(&self) -> &[Uuid] {
         &self.uploads
+    }
+
+    /// Forget one in-flight id, once it has been committed or discarded.
+    pub fn finish_upload(&mut self, upload: Uuid) {
+        self.uploads.retain(|u| *u != upload);
+    }
+
+    /// Record an id for an upload that did not come from `StartUpload` — an
+    /// inline one, which has no client-supplied id but still holds a
+    /// reservation that a disconnect must release.
+    pub fn track_upload(&mut self, upload: Uuid) {
+        self.uploads.push(upload);
     }
 
     /// The joined member's id, if this connection has completed `Join`.
@@ -387,7 +400,10 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     mime,
                     data,
                 ) {
-                    Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
+                    Ok(staged) => {
+                        conn.track_upload(staged.id());
+                        Dispatch::defer(Deferred::Upload(Box::new(staged)))
+                    }
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e }),
                 },
                 PartyRequest::SendFileDm {
@@ -398,7 +414,10 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                 } => {
                     match state.begin_inline_upload(member, UploadTarget::Dm(to), name, mime, data)
                     {
-                        Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
+                        Ok(staged) => {
+                            conn.track_upload(staged.id());
+                            Dispatch::defer(Deferred::Upload(Box::new(staged)))
+                        }
                         Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                             channel: messenger_core::party::dm_thread_id(member, to),
                             reason: e,
@@ -525,7 +544,15 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     match state.upload_chunk(member, upload, &data) {
                         Ok(()) => Dispatch::default(),
                         Err(reason) => {
-                            conn.uploads.retain(|u| *u != upload);
+                            // A failed chunk ends the upload on *both* sides.
+                            // Clearing only the connection's id left the spool
+                            // in `PartyState` with nothing able to reach it —
+                            // holding the member's concurrency slot and its
+                            // bytes until the connection dropped. "chunk is too
+                            // large" is the reachable case: it returns before
+                            // the state removes anything.
+                            state.cancel_upload(member, upload);
+                            conn.finish_upload(upload);
                             Dispatch::reply(PartyResponse::Error(reason))
                         }
                     }
@@ -542,18 +569,23 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     // had nothing in flight — so the concurrency cap read zero
                     // and the disconnect sweep, gated on this same list, never
                     // ran.
-                    let outcome = state.begin_upload(member, upload);
-                    conn.uploads.retain(|u| *u != upload);
-                    match outcome {
+                    match state.begin_upload(member, upload) {
+                        // Stays listed on the connection until the deferred
+                        // phase finishes: between here and the commit it is a
+                        // *reservation*, and a disconnect in that window has to
+                        // release it. `connection.rs` clears it after.
                         Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
-                        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
-                            channel: Uuid::nil(),
-                            reason,
-                        }),
+                        Err(reason) => {
+                            conn.finish_upload(upload);
+                            Dispatch::reply(PartyResponse::ActionFailed {
+                                channel: Uuid::nil(),
+                                reason,
+                            })
+                        }
                     }
                 }
                 PartyRequest::CancelUpload { upload } => {
-                    conn.uploads.retain(|u| *u != upload);
+                    conn.finish_upload(upload);
                     state.cancel_upload(member, upload);
                     Dispatch::default()
                 }

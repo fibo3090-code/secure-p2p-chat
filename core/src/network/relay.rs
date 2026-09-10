@@ -553,10 +553,29 @@ async fn host_flow(
 
     send_relay_message(&mut stream, &RelayResponse::Waiting).await?;
 
+    let waiting_since = Instant::now();
     let (mut peer_stream, joiner_caps) =
         match tokio::time::timeout(wait_timeout, rendezvous_rx).await {
             Ok(Ok(paired)) => paired,
-            Ok(Err(_)) => bail!("Relay joiner dropped before pairing"),
+            // The sender went away without pairing us. Either the joiner's task
+            // dropped mid-handshake, or another host's sweep removed our slot
+            // because it had aged out — in which case this *is* the timeout,
+            // arriving through a different branch.
+            //
+            // Both used to end with the connection simply closing, so from the
+            // host's side an expired rendezvous looked identical to a broken
+            // relay. And the slot was left in the table either way, holding a
+            // token nobody could re-register until the sweep found it.
+            Ok(Err(_)) => {
+                pending.lock().await.remove(&token);
+                let reason = if waiting_since.elapsed() >= wait_timeout {
+                    "Relay wait timed out"
+                } else {
+                    "Relay joiner dropped before pairing"
+                };
+                send_relay_message(&mut stream, &RelayResponse::Error(reason.to_string())).await?;
+                bail!("{reason}");
+            }
             Err(_) => {
                 let mut guard = pending.lock().await;
                 guard.remove(&token);

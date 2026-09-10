@@ -54,6 +54,19 @@ predate tagged releases.
 - **Permission to post a file is re-checked when it finishes arriving**, not
   only when it starts. On a large upload those are minutes apart, and someone
   whose access was removed in between still had their file posted.
+- **Closing one device no longer cancels uploads in progress on another.** If
+  you were signed in to a community from a laptop and a phone, closing either
+  one stopped both.
+- **A file transfer interrupted by deleting the conversation now cleans up after
+  itself.** The partial download was left in your downloads folder with nothing
+  to remove it.
+- **The same contact added twice, with their code written in different letter
+  case, is recognised as one person** rather than becoming two entries with
+  separate trust.
+- **A relay connection that times out waiting for the other side now says so.**
+  It used to just close, so an expired invite looked exactly like a broken
+  relay — and the used-up slot was left behind, blocking that code from being
+  reused.
 
 ### Fixed
 

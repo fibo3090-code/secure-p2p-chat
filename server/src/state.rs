@@ -142,6 +142,26 @@ struct Reservation {
 /// the two apart with certainty: no hash starts with this.
 const STAGING_PREFIX: &str = "staging_";
 
+/// Everything [`PartyState::stage`] needs to build a [`StagedUpload`].
+///
+/// A struct rather than seven positional arguments: they are mostly `Uuid` and
+/// `String`, so a transposed pair would type-check and silently attribute an
+/// upload to the wrong member or file it under the wrong name.
+struct StageRequest {
+    /// Keys both the reservation and the staging file. For a chunked upload
+    /// this is the client's own upload id, so the connection's list of open
+    /// uploads doubles as its list of reservations to release.
+    id: Uuid,
+    uploader: Uuid,
+    target: UploadTarget,
+    name: String,
+    mime: String,
+    data: Vec<u8>,
+    /// `None` means "not known here", which forces a pessimistic reservation.
+    /// Every current caller knows it — see [`PartyState::stage`].
+    known_hash: Option<String>,
+}
+
 /// An upload that has passed its checks and had its bytes taken out of the
 /// spool, on its way to disk.
 ///
@@ -180,6 +200,15 @@ pub struct StagedUpload {
 }
 
 impl StagedUpload {
+    /// The id this upload's reservation and staging file are keyed by.
+    ///
+    /// The runtime records it so a connection torn down mid-upload can release
+    /// the reservation, which `Drop` cannot reach — it can remove the file, but
+    /// not touch the state that is counting the bytes.
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
     /// Hash the bytes and write them to this upload's own staging file.
     ///
     /// **Call this with no lock held.** It is up to `MAX_PARTY_FILE_BYTES` of
@@ -1949,14 +1978,17 @@ impl PartyState {
         // is free here — no 100 MiB pass under the lock, and no pessimism in the
         // reservation. See `PendingUpload::hasher`.
         let hash = pending.hasher.finish();
-        self.stage(
+        // Keyed by the upload's own id, so the connection's existing list of
+        // open uploads is also the list of reservations to release if it dies.
+        self.stage(StageRequest {
+            id: upload,
             uploader,
             target,
-            pending.name,
-            pending.mime,
-            pending.data,
-            Some(hash),
-        )
+            name: pending.name,
+            mime: pending.mime,
+            data: pending.data,
+            known_hash: Some(hash),
+        })
     }
 
     /// Phase 1 for an **inline** upload — one that arrived whole in a single
@@ -1979,13 +2011,23 @@ impl PartyState {
     ) -> Result<StagedUpload, String> {
         let data = Self::check_inline_size(data)?;
         self.check_may_post_file(uploader, target)?;
-        // Inline uploads are capped at 4 MiB and the bytes are already in hand,
-        // so hashing here costs single-digit milliseconds — cheap enough to buy
-        // an exact answer to "do we already hold this?", which is what keeps a
-        // re-upload of stored content free at a full ceiling. The chunked path
-        // cannot afford the same trick at 100 MiB; see `begin_upload`.
+        // Capped at 4 MiB and already in hand, so hashing here costs
+        // single-digit milliseconds — cheap enough to buy an exact answer to "do
+        // we already hold this?", which is what keeps a re-upload of stored
+        // content free at a full ceiling. A chunked upload reaches the same
+        // answer differently, by hashing each chunk as it arrives.
         let hash = blob_hash(&data);
-        self.stage(uploader, target, name, mime, data, Some(hash))
+        self.stage(StageRequest {
+            // No client-supplied id for an inline upload, so one is minted here
+            // and recorded on the connection by the dispatcher.
+            id: Uuid::new_v4(),
+            uploader,
+            target,
+            name,
+            mime,
+            data,
+            known_hash: Some(hash),
+        })
     }
 
     /// Build a [`StagedUpload`], reserving storage for it unless the content is
@@ -2002,15 +2044,16 @@ impl PartyState {
     /// reserve its size and give it back at commit — so a future caller that
     /// genuinely cannot know the hash up front is safe rather than wrong. It
     /// would just be needlessly strict at a full ceiling.
-    fn stage(
-        &mut self,
-        uploader: Uuid,
-        target: UploadTarget,
-        name: String,
-        mime: String,
-        data: Vec<u8>,
-        known_hash: Option<String>,
-    ) -> Result<StagedUpload, String> {
+    fn stage(&mut self, req: StageRequest) -> Result<StagedUpload, String> {
+        let StageRequest {
+            id,
+            uploader,
+            target,
+            name,
+            mime,
+            data,
+            known_hash,
+        } = req;
         let size = data.len() as u64;
         // Content already held costs no new storage, so it needs no reservation
         // and no ceiling check — the same rule commit applies once the hash is
@@ -2018,7 +2061,6 @@ impl PartyState {
         let already_held = known_hash
             .as_deref()
             .is_some_and(|h| self.blobs.contains_key(h));
-        let id = Uuid::new_v4();
         if !already_held {
             self.check_storage_room(uploader, size)?;
             self.reservations.insert(
@@ -2228,12 +2270,37 @@ impl PartyState {
         }
     }
 
-    /// Drop every upload belonging to `member` (their connection went away).
+    /// Drop the uploads and reservations belonging to **one connection**.
     ///
-    /// Reservations go too. A connection torn down between phase 1 and phase 3
-    /// leaves a claim nothing else would release — its `StagedUpload` cleans up
-    /// its own file when dropped, but it cannot reach the state to give the
-    /// storage back.
+    /// Per connection, not per member: one person can be signed in from two
+    /// devices, each with uploads in flight. Sweeping by member would make
+    /// closing a laptop cancel the phone's transfer — the connection that went
+    /// away is the one whose work should go with it.
+    ///
+    /// `ids` are the things this connection had open: pending upload spools and
+    /// staged reservations, both keyed the same way. A staged upload's `Drop`
+    /// removes its own file but cannot reach the state to give the storage back,
+    /// so the reservation has to be released from here.
+    pub fn cancel_connection_uploads(&mut self, member: Uuid, ids: &[Uuid]) {
+        for id in ids {
+            if self.uploads.get(id).is_some_and(|p| p.uploader == member) {
+                self.uploads.remove(id);
+            }
+            if self
+                .reservations
+                .get(id)
+                .is_some_and(|r| r.member == member)
+            {
+                self.reservations.remove(id);
+            }
+        }
+    }
+
+    /// Drop every upload belonging to `member`, across all their connections.
+    ///
+    /// Only for tests and for a deliberate per-member reset; the disconnect path
+    /// wants [`Self::cancel_connection_uploads`], which does not reach across a
+    /// member's other devices.
     pub fn cancel_uploads_for(&mut self, member: Uuid) {
         self.uploads.retain(|_, p| p.uploader != member);
         self.reservations.retain(|_, r| r.member != member);
@@ -5170,6 +5237,123 @@ mod tests {
             state.begin_upload(bob, upload).is_ok(),
             "the abandoned upload's claim was never released"
         );
+    }
+
+    /// One member's two devices are two connections, and closing one must not
+    /// cancel the other's uploads.
+    ///
+    /// The disconnect sweep used to run per *member*, so a laptop closing took
+    /// the phone's transfer with it. Sweeping the ids the departing connection
+    /// actually had open is what makes multi-device work rather than merely
+    /// appear to.
+    #[test]
+    fn closing_one_device_does_not_cancel_another_s_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+
+        let start = |state: &mut PartyState, name: &str| {
+            let upload = state
+                .start_upload(
+                    bob,
+                    name.to_string(),
+                    "application/octet-stream".into(),
+                    8,
+                    UploadTarget::Channel(channel),
+                )
+                .unwrap();
+            state.upload_chunk(bob, upload, b"1234").unwrap();
+            upload
+        };
+
+        let laptop = start(&mut state, "from-laptop.bin");
+        let phone = start(&mut state, "from-phone.bin");
+        assert_eq!(state.uploads_in_flight(bob), 2);
+
+        // The laptop's connection goes away, carrying only its own id.
+        state.cancel_connection_uploads(bob, &[laptop]);
+
+        assert_eq!(
+            state.uploads_in_flight(bob),
+            1,
+            "the phone's upload was cancelled"
+        );
+        assert!(
+            state.upload_chunk(bob, laptop, b"5678").is_err(),
+            "the laptop's upload should be gone"
+        );
+        assert!(
+            state.upload_chunk(bob, phone, b"5678").is_ok(),
+            "the phone's upload must still be usable"
+        );
+        // And it can still be completed: 4 + 4 is the 8 bytes it declared.
+        assert!(state.finish_upload(bob, phone).is_ok());
+    }
+
+    /// A staged reservation belongs to the connection that made it, so a
+    /// disconnect releases that one and leaves another device's alone.
+    #[test]
+    fn a_disconnect_releases_only_its_own_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        state.set_max_blob_bytes(250);
+
+        let stage_one = |state: &mut PartyState, fill: u8| {
+            let upload = state
+                .start_upload(
+                    bob,
+                    format!("f{fill}.bin"),
+                    "application/octet-stream".into(),
+                    100,
+                    UploadTarget::Channel(channel),
+                )
+                .unwrap();
+            state.upload_chunk(bob, upload, &[fill; 100]).unwrap();
+            (upload, state.begin_upload(bob, upload).unwrap())
+        };
+
+        let (laptop_id, laptop) = stage_one(&mut state, b'a');
+        let (_phone_id, mut phone) = stage_one(&mut state, b'b');
+        phone.write_staging().unwrap();
+
+        // 200 of 250 reserved: a third 100-byte upload has no room.
+        let upload = state
+            .start_upload(
+                bob,
+                "third.bin".into(),
+                "application/octet-stream".into(),
+                100,
+                UploadTarget::Channel(channel),
+            )
+            .unwrap();
+        state.upload_chunk(bob, upload, &[b'c'; 100]).unwrap();
+        assert!(state.begin_upload(bob, upload).is_err());
+
+        // The laptop disconnects mid-stage. Its reservation goes; the phone's
+        // does not.
+        drop(laptop);
+        state.cancel_connection_uploads(bob, &[laptop_id]);
+
+        let upload = state
+            .start_upload(
+                bob,
+                "fourth.bin".into(),
+                "application/octet-stream".into(),
+                100,
+                UploadTarget::Channel(channel),
+            )
+            .unwrap();
+        state.upload_chunk(bob, upload, &[b'd'; 100]).unwrap();
+        assert!(
+            state.begin_upload(bob, upload).is_ok(),
+            "the laptop's reservation was not released"
+        );
+
+        // The phone's upload is untouched and still commits.
+        assert!(state.commit_upload(phone).is_ok());
     }
 
     /// Two members uploading identical content must not be able to delete each
