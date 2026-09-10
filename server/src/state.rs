@@ -191,11 +191,21 @@ impl StagedUpload {
     /// neither can remove the other's: a shared name meant one member's failed
     /// commit could unlink bytes the other's commit was about to record, leaving
     /// a file message that answers "unknown file" forever.
+    ///
+    /// A failed write **propagates**, unlike the persistence mirrors elsewhere
+    /// in this file. Those mirror state that is already correct in memory, so a
+    /// failure costs durability and nothing else. These bytes are the file: a
+    /// disk-backed store keeps nothing resident, so a write that failed quietly
+    /// would leave the upload acknowledged, the file message broadcast to the
+    /// whole channel, and every download of it answering "unknown file" for
+    /// good. Refusing the upload is the only honest outcome.
     pub fn write_staging(&mut self) -> Result<(), String> {
         let Some(data) = self.data.take() else {
             return Err("upload has already been written".to_string());
         };
-        self.hash = Some(blob_hash(&data));
+        if self.hash.is_none() {
+            self.hash = Some(blob_hash(&data));
+        }
 
         let Some(dir) = self.blob_dir.clone() else {
             // Memory-only store: keep the bytes for the commit to record.
@@ -1344,68 +1354,6 @@ impl PartyState {
 
     // --- File sharing (Phase 2, slice 1) ----------------------------------------
 
-    /// Store `data` as a content-addressed blob (deduplicated by hash, with the
-    /// bytes mirrored to disk) and return its [`FileMeta`]. A repeated upload of the
-    /// same content reuses the existing blob and bumps its reference count. A new,
-    /// distinct blob is rejected if it would push total stored bytes past the
-    /// configured ceiling.
-    fn store_blob(
-        &mut self,
-        uploader: Uuid,
-        name: &str,
-        mime: &str,
-        data: Vec<u8>,
-    ) -> Result<FileMeta, String> {
-        let hash = blob_hash(&data);
-        let size = data.len() as u64;
-        if let Some(rec) = self.blobs.get_mut(&hash) {
-            rec.refcount += 1;
-            let refcount = rec.refcount;
-            self.persist_blob_refcount(&hash, refcount);
-        } else {
-            // Deduplicated re-uploads above never grow storage; only a distinct
-            // new blob counts against the ceiling. The server-wide ceiling alone
-            // lets the first member to reach it deny the feature to everyone
-            // else, so storage is budgeted per member too — both live in
-            // `check_storage_room`, which also counts uploads currently being
-            // staged, so an inline upload cannot slip in under a limit that
-            // chunked uploads have already spoken for.
-            self.check_storage_room(uploader, size)?;
-            // Store the bytes before recording the blob: if this fails there must
-            // be no row and no in-memory record, so the upload is refused cleanly
-            // rather than leaving a message pointing at a file nobody can fetch.
-            self.write_blob_file(&hash, &data)?;
-            self.persist_blob_row(&hash, size, mime, 1);
-            // Only keep the bytes resident when there is nowhere to read them
-            // back from; a disk-backed store reads on demand.
-            let resident = if self.blob_dir.is_some() {
-                None
-            } else {
-                Some(data)
-            };
-            self.blobs.insert(
-                hash.clone(),
-                BlobRecord {
-                    size,
-                    mime: mime.to_string(),
-                    data: resident,
-                    refcount: 1,
-                },
-            );
-        }
-        Ok(FileMeta {
-            hash,
-            // The display name is member-supplied: reduce it to a safe filename
-            // here (the single choke point for channel and DM uploads) so no
-            // client ever receives a name that could escape its download
-            // directory (e.g. `..\..\evil.exe`). P2P transfers get the same
-            // treatment at protocol decode.
-            name: sanitize_filename(name),
-            size,
-            mime: mime.to_string(),
-        })
-    }
-
     /// This member's storage allowance, or `None` when they are exempt.
     fn member_blob_limit(&self, member: Uuid) -> Option<u64> {
         if self.role_of(member).is_admin() {
@@ -1977,24 +1925,95 @@ impl PartyState {
         self.check_storage_room(uploader, size)?;
 
         let pending = self.uploads.remove(&upload).expect("checked above");
-        let id = Uuid::new_v4();
-        self.reservations.insert(
-            id,
-            Reservation {
-                member: uploader,
-                bytes: size,
-            },
-        );
+        // No pre-computed hash: hashing up to `MAX_PARTY_FILE_BYTES` here would
+        // put exactly the work this split exists to move back under the lock.
+        // The reservation is therefore pessimistic — see `stage`.
+        self.stage(
+            uploader,
+            target,
+            pending.name,
+            pending.mime,
+            pending.data,
+            None,
+        )
+    }
 
+    /// Phase 1 for an **inline** upload — one that arrived whole in a single
+    /// request rather than in chunks.
+    ///
+    /// Inline uploads are capped at `MAX_INLINE_FILE_BYTES` (4 MiB), so writing
+    /// one under the lock is 25x cheaper than a chunked upload's 100 MiB. It is
+    /// still not free, and more to the point a rule with an exception in it is a
+    /// rule that gets forgotten: "no blob write happens under the state lock" is
+    /// worth being true without qualification. Both paths therefore stage,
+    /// commit and reclaim identically — one fewer shape to reason about, and one
+    /// fewer place for the ceiling checks and the re-check to drift apart.
+    pub fn begin_inline_upload(
+        &mut self,
+        uploader: Uuid,
+        target: UploadTarget,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<StagedUpload, String> {
+        let data = Self::check_inline_size(data)?;
+        self.check_may_post_file(uploader, target)?;
+        // Inline uploads are capped at 4 MiB and the bytes are already in hand,
+        // so hashing here costs single-digit milliseconds — cheap enough to buy
+        // an exact answer to "do we already hold this?", which is what keeps a
+        // re-upload of stored content free at a full ceiling. The chunked path
+        // cannot afford the same trick at 100 MiB; see `begin_upload`.
+        let hash = blob_hash(&data);
+        self.stage(uploader, target, name, mime, data, Some(hash))
+    }
+
+    /// Build a [`StagedUpload`], reserving storage for it unless the content is
+    /// one the store already holds.
+    ///
+    /// `known_hash` is `Some` only when the caller could afford to compute it
+    /// under the lock. When it is `None` the reservation is necessarily
+    /// pessimistic: a duplicate reserves its size and gives it back at commit,
+    /// so a re-upload of existing content can be refused at a full ceiling where
+    /// it would previously have deduplicated. That is the price of not hashing
+    /// 100 MiB with the lock held, and it is the right way round — the refusal
+    /// is immediate and truthful, and `ShareFile` re-shares content the server
+    /// already holds without going near this path at all.
+    fn stage(
+        &mut self,
+        uploader: Uuid,
+        target: UploadTarget,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        known_hash: Option<String>,
+    ) -> Result<StagedUpload, String> {
+        let size = data.len() as u64;
+        // Content already held costs no new storage, so it needs no reservation
+        // and no ceiling check — the same rule commit applies once the hash is
+        // known for certain.
+        let already_held = known_hash
+            .as_deref()
+            .is_some_and(|h| self.blobs.contains_key(h));
+        let id = Uuid::new_v4();
+        if !already_held {
+            self.check_storage_room(uploader, size)?;
+            self.reservations.insert(
+                id,
+                Reservation {
+                    member: uploader,
+                    bytes: size,
+                },
+            );
+        }
         Ok(StagedUpload {
             id,
             uploader,
             target,
-            name: pending.name,
-            mime: pending.mime,
-            data: Some(pending.data),
+            name,
+            mime,
+            data: Some(data),
             blob_dir: self.blob_dir.clone(),
-            hash: None,
+            hash: known_hash,
             size,
             staging_path: None,
         })
@@ -2217,54 +2236,16 @@ impl PartyState {
     /// One chunk of a stored blob, plus the file's total size, for a member who
     /// is allowed to see it. `None` when unknown or not permitted — the same
     /// answer either way, so the endpoint never reveals a file's existence.
+    ///
+    /// Reads **under the lock**. The server's own request path does not use
+    /// this: it goes through [`Self::plan_blob_read`] so the bytes move after
+    /// the lock is released. Kept for in-process callers and tests, and
+    /// delegating rather than duplicating so there is exactly one place that
+    /// decides what a read is allowed to see.
     pub fn blob_chunk_for(&self, member: Uuid, hash: &str, offset: u64) -> Option<(Vec<u8>, u64)> {
-        if !self.member_can_access_blob(member, hash) {
-            return None;
-        }
-        let record = self.blobs.get(hash)?;
-        let total = record.size;
-        if offset >= total {
-            return Some((Vec::new(), total));
-        }
-
-        // In-memory mode (no blob directory) keeps the bytes resident, so slice.
-        if let Some(resident) = &record.data {
-            let total = resident.len() as u64;
-            if offset >= total {
-                return Some((Vec::new(), total));
-            }
-            let start = offset as usize;
-            let end = (start + PARTY_CHUNK_BYTES).min(resident.len());
-            return Some((resident[start..end].to_vec(), total));
-        }
-
-        // Disk-backed: seek and read *one chunk*.
-        //
-        // This used to call `blob_bytes`, which reads the whole file — so
-        // serving a 64 KiB chunk of a 100 MiB blob read 100 MiB off disk, and a
-        // full download of that file read about 160 GiB across its 1,600
-        // chunks. Every one of those reads happens with the state mutex held,
-        // which is what makes it more than a waste of I/O: one member fetching
-        // a large file stalls every other member's messages for the duration,
-        // repeatedly. The chunked path is the one large files actually take.
-        let dir = self.blob_dir.as_ref()?;
-        let path = dir.join(hash);
-        let read = blocking_io(|| -> std::io::Result<Vec<u8>> {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(&path)?;
-            file.seek(SeekFrom::Start(offset))?;
-            let want = PARTY_CHUNK_BYTES.min((total - offset) as usize);
-            let mut buf = Vec::with_capacity(want);
-            file.take(want as u64).read_to_end(&mut buf)?;
-            Ok(buf)
-        });
-        match read {
-            Ok(bytes) => Some((bytes, total)),
-            Err(e) => {
-                tracing::error!(hash, error = %e, "blob is recorded but its file could not be read");
-                None
-            }
-        }
+        let plan = self.plan_blob_read(member, hash, Some(offset))?;
+        let total = plan.total();
+        plan.perform().map(|bytes| (bytes, total))
     }
 
     /// Validate an inline upload's size, returning the data on success.
@@ -2291,38 +2272,39 @@ impl PartyState {
         mime: String,
         data: Vec<u8>,
     ) -> Result<Envelope, String> {
-        if !self.is_member(sender) {
-            return Err("sender is not a member of this server".to_string());
-        }
-        self.member_can_post_to_channel(sender, channel)?;
-        let data = Self::check_inline_size(data)?;
-        self.post_file_bytes(sender, channel, name, mime, data)
+        self.post_inline_file(sender, UploadTarget::Channel(channel), name, mime, data)
     }
 
-    /// Store already-validated bytes and post them as a file message to
-    /// `channel`. Shared by the inline path and the chunked one, which has
-    /// checked the size against its own (much larger) ceiling instead.
-    fn post_file_bytes(
+    /// Run all three upload phases back to back, with no lock to release
+    /// between them.
+    ///
+    /// The convenience form of the staged path, for in-process callers and
+    /// tests. It writes under whatever lock the caller holds, which is why the
+    /// server's request path does **not** use it — but it is the same three
+    /// functions in the same order, so there is still exactly one place that
+    /// decides what may be stored and exactly one that writes it. The previous
+    /// inline path was a second implementation of both, and a second
+    /// implementation is what quietly stops matching.
+    fn post_inline_file(
         &mut self,
         sender: Uuid,
-        channel: Uuid,
+        target: UploadTarget,
         name: String,
         mime: String,
         data: Vec<u8>,
     ) -> Result<Envelope, String> {
-        if !self.is_member(sender) {
-            return Err("sender is not a member of this server".to_string());
+        let mut staged = self.begin_inline_upload(sender, target, name, mime, data)?;
+        if let Err(reason) = staged.write_staging() {
+            self.discard_upload(staged);
+            return Err(reason);
         }
-        self.member_can_post_to_channel(sender, channel)?;
-        let meta = self.store_blob(sender, &name, &mime, data)?;
-        self.append_file_message(sender, channel, meta)
+        self.commit_upload(staged).map(|(env, _)| env)
     }
 
     /// Record a file reference and append the file message to a channel.
     ///
-    /// Shared by the inline path (`post_file_bytes`, which stores the bytes
-    /// itself) and the chunked one (`commit_upload`, whose bytes are already on
-    /// disk), so both produce the same envelope in the same order.
+    /// Called by `commit_upload` for both the inline and the chunked path,
+    /// so every file message is appended in exactly one way.
     fn append_file_message(
         &mut self,
         sender: Uuid,
@@ -2358,37 +2340,7 @@ impl PartyState {
         mime: String,
         data: Vec<u8>,
     ) -> Result<Envelope, String> {
-        if !self.is_member(from) {
-            return Err("sender is not a member of this server".to_string());
-        }
-        if !self.is_member(to) {
-            return Err("recipient is not a member of this server".to_string());
-        }
-        let data = Self::check_inline_size(data)?;
-        self.post_file_dm_bytes(from, to, name, mime, data)
-    }
-
-    /// Store already-validated bytes and send them as a file DM. Shared by the
-    /// inline and chunked paths, like [`Self::post_file_bytes`].
-    fn post_file_dm_bytes(
-        &mut self,
-        from: Uuid,
-        to: Uuid,
-        name: String,
-        mime: String,
-        data: Vec<u8>,
-    ) -> Result<Envelope, String> {
-        if !self.is_member(from) {
-            return Err("sender is not a member of this server".to_string());
-        }
-        if !self.is_member(to) {
-            return Err("recipient is not a member of this server".to_string());
-        }
-        if !self.role_of(from).can_write() {
-            return Err("your role on this server is read-only".to_string());
-        }
-        let meta = self.store_blob(from, &name, &mime, data)?;
-        self.append_file_dm(from, to, meta)
+        self.post_inline_file(from, UploadTarget::Dm(to), name, mime, data)
     }
 
     /// Record a file reference and append the file message to a DM thread.
@@ -2462,15 +2414,11 @@ impl PartyState {
     /// Returns `None` both when the blob is unknown and when access is denied, so
     /// the endpoint never reveals the existence of a file the member can't access.
     ///
-    /// Reads from disk **while holding the state lock**. Prefer
-    /// [`Self::plan_blob_read`], which decides access here and leaves the bytes
-    /// to be moved after the lock is released. This is kept for the in-process
-    /// callers (tests, and the memory-only store) where there is no lock to hold.
+    /// Reads **under the lock**, like [`Self::blob_chunk_for`], and for the same
+    /// reason is not what the server's request path uses. Delegates to
+    /// [`Self::plan_blob_read`] so both share one access decision.
     pub fn blob_bytes_for(&self, member: Uuid, hash: &str) -> Option<Vec<u8>> {
-        if !self.member_can_access_blob(member, hash) {
-            return None;
-        }
-        self.blob_bytes(hash)
+        self.plan_blob_read(member, hash, None)?.perform()
     }
 
     /// Decide a download *without performing it*.
@@ -2637,26 +2585,6 @@ impl PartyState {
         if let Err(e) = insert_dm_message_row(conn, thread_id, e) {
             tracing::error!(error = %e, "failed to persist party direct message");
         }
-    }
-
-    /// Write a blob's bytes to the on-disk store.
-    ///
-    /// Unlike the other persistence helpers this one **propagates** its error.
-    /// The rest are mirrors of state that is already correct in memory, so a
-    /// failed write costs durability and nothing else. These bytes are different:
-    /// when the store is disk-backed nothing keeps them resident, so a write that
-    /// failed silently left a blob recorded but unreadable — the upload was
-    /// acknowledged, the file message was broadcast to the whole channel, and
-    /// every download of it answered "unknown file" forever.
-    fn write_blob_file(&self, hash: &str, data: &[u8]) -> Result<(), String> {
-        let Some(dir) = &self.blob_dir else {
-            return Ok(()); // memory-only store: the bytes stay resident instead
-        };
-        let path = dir.join(hash);
-        blocking_io(|| std::fs::write(&path, data)).map_err(|e| {
-            tracing::error!(error = %e, path = %path.display(), "failed to write file blob");
-            "the server could not store this file".to_string()
-        })
     }
 
     fn persist_blob_row(&self, hash: &str, size: u64, mime: &str, refcount: u32) {

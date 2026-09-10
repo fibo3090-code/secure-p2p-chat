@@ -372,14 +372,22 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     let thread = messenger_core::party::dm_thread_id(member, with);
                     Dispatch::reply(PartyResponse::History(state.dm_history(thread, since_seq)))
                 }
+                // Inline uploads take the same three phases as chunked ones —
+                // see `begin_inline_upload` for why the 4 MiB cap is not reason
+                // enough to keep a second path.
                 PartyRequest::PostFile {
                     channel,
                     name,
                     mime,
                     data,
-                } => match state.post_file(member, channel, name, mime, data) {
-                    // Like PostMessage, including the private-channel rule.
-                    Ok(env) => channel_fanout(state, env),
+                } => match state.begin_inline_upload(
+                    member,
+                    UploadTarget::Channel(channel),
+                    name,
+                    mime,
+                    data,
+                ) {
+                    Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e }),
                 },
                 PartyRequest::SendFileDm {
@@ -387,23 +395,16 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     name,
                     mime,
                     data,
-                } => match state.post_file_dm(member, to, name, mime, data) {
-                    // Like SendDm: ack the sender, deliver to the recipient and to
-                    // the sender's other devices.
-                    Ok(env) => Dispatch {
-                        replies: vec![PartyResponse::MessagePosted {
-                            channel: env.channel,
-                            seq: env.seq,
-                        }],
-                        broadcast: Vec::new(),
-                        directed: dm_delivery(member, to, env),
-                        deferred: None,
-                    },
-                    Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
-                        channel: messenger_core::party::dm_thread_id(member, to),
-                        reason: e,
-                    }),
-                },
+                } => {
+                    match state.begin_inline_upload(member, UploadTarget::Dm(to), name, mime, data)
+                    {
+                        Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
+                        Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
+                            channel: messenger_core::party::dm_thread_id(member, to),
+                            reason: e,
+                        }),
+                    }
+                }
                 PartyRequest::DownloadFile { hash } => {
                     match state.plan_blob_read(member, &hash, None) {
                         Some(plan) => Dispatch::defer(Deferred::Download {
@@ -991,6 +992,46 @@ mod tests {
         assert!(matches!(&out.replies[..], [PartyResponse::Error(m)] if m == "join required"));
     }
 
+    /// Drive a dispatch to completion the way `connection.rs` does: perform any
+    /// deferred I/O, then fold the resulting replies back in.
+    ///
+    /// A test that only looked at `handle_request`'s immediate output would
+    /// silently stop checking anything the moment an operation moved to the
+    /// deferred half — which is most of the file operations. This keeps the
+    /// assertions about end-to-end behaviour rather than about which half
+    /// produced them.
+    fn settle(state: &mut PartyState, member: Uuid, mut out: Dispatch) -> Dispatch {
+        let Some(work) = out.deferred.take() else {
+            return out;
+        };
+        let done = match work {
+            Deferred::Download { hash, offset, plan } => {
+                let total = plan.total();
+                download_reply(hash, offset, total, plan.perform())
+            }
+            Deferred::Upload(staged) => {
+                let mut staged = *staged;
+                match staged.write_staging() {
+                    Ok(()) => {
+                        let committed = state.commit_upload(staged);
+                        upload_committed(state, member, committed)
+                    }
+                    Err(reason) => {
+                        state.discard_upload(staged);
+                        Dispatch::reply(PartyResponse::ActionFailed {
+                            channel: Uuid::nil(),
+                            reason,
+                        })
+                    }
+                }
+            }
+        };
+        out.replies.extend(done.replies);
+        out.broadcast.extend(done.broadcast);
+        out.directed.extend(done.directed);
+        out
+    }
+
     #[test]
     fn post_file_acks_the_poster_and_broadcasts_a_file_message() {
         let mut state = PartyState::new("Srv", None);
@@ -998,6 +1039,7 @@ mod tests {
         join(&mut state, &mut conn, "alice", None);
         let channel = state.default_channel();
 
+        let me = conn.member().unwrap();
         let out = handle_request(
             &mut state,
             &mut conn,
@@ -1008,6 +1050,7 @@ mod tests {
                 data: b"\x89PNG data".to_vec(),
             },
         );
+        let out = settle(&mut state, me, out);
         assert!(matches!(
             &out.replies[..],
             [PartyResponse::MessagePosted { .. }]
@@ -1027,6 +1070,7 @@ mod tests {
         join(&mut state, &mut conn, "alice", None);
         let channel = state.default_channel();
 
+        let me = conn.member().unwrap();
         let post = handle_request(
             &mut state,
             &mut conn,
@@ -1037,6 +1081,7 @@ mod tests {
                 data: b"payload".to_vec(),
             },
         );
+        let post = settle(&mut state, me, post);
         let hash = match &post.broadcast[..] {
             [PartyResponse::Message(env)] => match &env.payload {
                 MessagePayload::File(f) => f.hash.clone(),
