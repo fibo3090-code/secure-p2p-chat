@@ -58,7 +58,7 @@ hex = "0.4"
 #
 # Setting it now means the bump is safe whenever it lands rather than needing to
 # be remembered at the time.
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 
 # Logging. The app keeps its own bounded in-process buffer for the log overlay
 # and diagnostics bundles (`client/src/logbuf.rs`) — that used to be
