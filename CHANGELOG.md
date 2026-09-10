@@ -38,10 +38,22 @@ predate tagged releases.
 
 ### Performance
 
-- **Downloading a large file from a community server no longer slows the server
-  down for everyone else.** Each 64 KiB piece of a download was reading the
-  entire file off disk — about 160 GB of reads for one 100 MB file — while
-  holding the lock every other member's messages queue behind.
+- **Sending or downloading a large file on a community server no longer slows
+  the server down for everyone else.** Both moved their bytes while holding the
+  lock that every other member's messages wait behind, so one 100 MB transfer
+  stalled the whole community for its duration. The bytes now move outside it.
+- **A download was reading the entire file for each small piece it sent** —
+  about 160 GB of disk reads for one 100 MB file.
+
+### Fixed
+
+- **A file upload that fails at the last moment no longer leaves its data on the
+  server.** Uploads are also now counted against the storage limit while they
+  are still arriving, so a burst of them can no longer fill the disk well past
+  the configured ceiling before being refused.
+- **Permission to post a file is re-checked when it finishes arriving**, not
+  only when it starts. On a large upload those are minutes apart, and someone
+  whose access was removed in between still had their file posted.
 
 ### Fixed
 

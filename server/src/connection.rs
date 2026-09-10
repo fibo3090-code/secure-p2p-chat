@@ -16,7 +16,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
-use crate::dispatch::{handle_request, ConnState, Dispatch};
+use crate::dispatch::{
+    download_reply, handle_request, upload_committed, ConnState, Deferred, Dispatch,
+};
 use crate::hub::Hub;
 use crate::state::PartyState;
 
@@ -111,17 +113,81 @@ where
                     Err(_) => break, // peer closed, or a frame failed to authenticate
                 };
 
-                let outcome = match PartyRequest::from_bytes(&req_bytes) {
+                let mut outcome = match PartyRequest::from_bytes(&req_bytes) {
                     Some(req) => {
                         let mut st = state.lock().await;
                         handle_request(&mut st, &mut conn, req)
                     }
                     None => Dispatch {
                         replies: vec![PartyResponse::Error("malformed request".to_string())],
-                        broadcast: Vec::new(),
-                        directed: Vec::new(),
+                        ..Dispatch::default()
                     },
                 };
+
+                // The lock is released above. Anything that moves real bytes —
+                // a blob read, a blob write — was deliberately *not* done inside
+                // `handle_request`, because doing it there does it with the
+                // state mutex held and one member's 100 MiB transfer then stalls
+                // every other member's messages for its whole duration.
+                //
+                // `spawn_blocking`, not `block_in_place`: this is ordinary file
+                // I/O with nothing borrowed from the state, so it belongs on the
+                // blocking pool, and unlike `block_in_place` it does not require
+                // a multi-threaded runtime (the tests run on a current-thread
+                // one).
+                if let Some(work) = outcome.deferred.take() {
+                    let done = match work {
+                        Deferred::Download { hash, offset, plan } => {
+                            let total = plan.total();
+                            let bytes = tokio::task::spawn_blocking(move || plan.perform())
+                                .await
+                                .unwrap_or(None);
+                            download_reply(hash, offset, total, bytes)
+                        }
+                        Deferred::Upload(staged) => {
+                            // Phase 2: hash and write, off the lock.
+                            let staged = tokio::task::spawn_blocking(move || {
+                                let mut staged = staged;
+                                let outcome = staged.write_staging();
+                                (staged, outcome)
+                            })
+                            .await;
+                            match staged {
+                                Ok((staged, Ok(()))) => {
+                                    // Phase 3: re-check and commit, under the
+                                    // lock again. The upload's own bytes are on
+                                    // disk by now; this only renames and records,
+                                    // so the lock is held for a rename rather
+                                    // than for a 100 MiB write.
+                                    let mut st = state.lock().await;
+                                    let committed = st.commit_upload(*staged);
+                                    upload_committed(&st, conn.member().unwrap_or_else(Uuid::nil), committed)
+                                }
+                                Ok((staged, Err(reason))) => {
+                                    let mut st = state.lock().await;
+                                    st.discard_upload(*staged);
+                                    Dispatch {
+                                        replies: vec![PartyResponse::ActionFailed {
+                                            channel: Uuid::nil(),
+                                            reason,
+                                        }],
+                                        ..Dispatch::default()
+                                    }
+                                }
+                                Err(_) => Dispatch {
+                                    replies: vec![PartyResponse::ActionFailed {
+                                        channel: Uuid::nil(),
+                                        reason: "the server could not store this file".to_string(),
+                                    }],
+                                    ..Dispatch::default()
+                                },
+                            }
+                        }
+                    };
+                    outcome.replies.extend(done.replies);
+                    outcome.broadcast.extend(done.broadcast);
+                    outcome.directed.extend(done.directed);
+                }
 
                 // Register for broadcasts/DMs once this connection has joined.
                 if !registered {

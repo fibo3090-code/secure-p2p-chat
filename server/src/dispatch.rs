@@ -13,7 +13,7 @@ use messenger_core::party::{
 };
 use uuid::Uuid;
 
-use crate::state::PartyState;
+use crate::state::{BlobReadPlan, PartyState, StagedUpload};
 
 /// The outcome of handling one request:
 /// - `replies` go back to the requesting connection;
@@ -27,6 +27,36 @@ pub struct Dispatch {
     pub replies: Vec<PartyResponse>,
     pub broadcast: Vec<PartyResponse>,
     pub directed: Vec<(Uuid, PartyResponse)>,
+    /// Work the runtime must do **after** releasing the state lock, and which
+    /// produces further replies of its own. `None` for almost every request.
+    ///
+    /// This exists because two operations move real bytes — a blob read and a
+    /// blob write, each up to `MAX_PARTY_FILE_BYTES` — and doing them inside
+    /// `handle_request` means doing them with the state mutex held, so one
+    /// member's 100 MiB transfer stalls every other member's messages for its
+    /// whole duration. Deciding *whether* they may happen is a question about
+    /// state and stays here; performing them is not.
+    ///
+    /// `handle_request` remains sync and network-free. The runtime
+    /// (`connection.rs`) is what knows how to await, so it owns the second half:
+    /// see [`Deferred`].
+    pub deferred: Option<Deferred>,
+}
+
+/// I/O the runtime performs once the state lock is released.
+#[derive(Debug)]
+pub enum Deferred {
+    /// Read an authorised blob and answer with its bytes.
+    ///
+    /// `offset` distinguishes the two download shapes: `None` is `DownloadFile`
+    /// (answer `FileData`), `Some` is `DownloadChunk` (answer `FileChunk`).
+    Download {
+        hash: String,
+        offset: Option<u64>,
+        plan: BlobReadPlan,
+    },
+    /// Write a staged upload's bytes, then commit it under the lock again.
+    Upload(Box<StagedUpload>),
 }
 
 impl Dispatch {
@@ -35,7 +65,77 @@ impl Dispatch {
             replies: vec![resp],
             broadcast: Vec::new(),
             directed: Vec::new(),
+            deferred: None,
         }
+    }
+
+    /// A dispatch whose whole effect happens after the lock is released.
+    fn defer(work: Deferred) -> Self {
+        Self {
+            replies: Vec::new(),
+            broadcast: Vec::new(),
+            directed: Vec::new(),
+            deferred: Some(work),
+        }
+    }
+}
+
+/// Turn the result of phase 3 into the replies and fan-out it produces.
+///
+/// The same shapes `FinishUpload` used to build inline, kept here beside every
+/// other response shape rather than in the runtime — which should know only
+/// *when* the I/O happens, not what the answer looks like.
+pub fn upload_committed(
+    state: &PartyState,
+    member: Uuid,
+    result: Result<(Envelope, UploadTarget), String>,
+) -> Dispatch {
+    match result {
+        // A file posted to a channel fans out exactly like a text post: broadcast
+        // when the channel is open to everyone, directed at the readers when it
+        // is not.
+        Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
+        Ok((env, UploadTarget::Dm(to))) => Dispatch {
+            replies: vec![PartyResponse::MessagePosted {
+                channel: env.channel,
+                seq: env.seq,
+            }],
+            broadcast: Vec::new(),
+            directed: dm_delivery(member, to, env),
+            deferred: None,
+        },
+        // `ActionFailed`, not `Error`: the client showed the file optimistically
+        // the moment it started sending, so a refusal has to be attributable to
+        // that message or the row stays on screen looking delivered.
+        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
+            channel: Uuid::nil(),
+            reason,
+        }),
+    }
+}
+
+/// Turn a performed download into the reply it answers.
+///
+/// Split out so the shape of the answer lives beside every other response shape
+/// rather than in the runtime, which should only know *when* to do the I/O.
+pub fn download_reply(
+    hash: String,
+    offset: Option<u64>,
+    total: u64,
+    bytes: Option<Vec<u8>>,
+) -> Dispatch {
+    match (bytes, offset) {
+        (Some(data), None) => Dispatch::reply(PartyResponse::FileData { hash, data }),
+        (Some(data), Some(offset)) => Dispatch::reply(PartyResponse::FileChunk {
+            hash,
+            offset,
+            total,
+            data,
+        }),
+        // The read failed after access was granted — the blob's last reference
+        // was deleted while this was in flight, or the file is gone. Same answer
+        // as an unknown hash, which is also what it now is.
+        (None, _) => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
     }
 }
 
@@ -122,6 +222,7 @@ fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
             replies: vec![ack],
             broadcast: vec![PartyResponse::Message(env)],
             directed: Vec::new(),
+            deferred: None,
         };
     }
     let readers = state.members_who_can_read(env.channel);
@@ -132,6 +233,7 @@ fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
             .into_iter()
             .map(|m| (m, PartyResponse::Message(env.clone())))
             .collect(),
+        deferred: None,
     }
 }
 
@@ -156,6 +258,7 @@ fn channel_list_refresh(state: &PartyState, member: Uuid) -> Dispatch {
         replies: vec![PartyResponse::Channels(state.channels_for(member))],
         broadcast: vec![PartyResponse::DirectoryChanged],
         directed: Vec::new(),
+        deferred: None,
     }
 }
 
@@ -199,6 +302,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         // never showed up and the online dots never changed.
                         broadcast: vec![PartyResponse::Members(state.members())],
                         directed: Vec::new(),
+                        deferred: None,
                     }
                 }
                 Err(e) => {
@@ -257,6 +361,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         }],
                         broadcast: Vec::new(),
                         directed: dm_delivery(member, to, env),
+                        deferred: None,
                     },
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                         channel: messenger_core::party::dm_thread_id(member, to),
@@ -292,18 +397,26 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                         }],
                         broadcast: Vec::new(),
                         directed: dm_delivery(member, to, env),
+                        deferred: None,
                     },
                     Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
                         channel: messenger_core::party::dm_thread_id(member, to),
                         reason: e,
                     }),
                 },
-                PartyRequest::DownloadFile { hash } => match state.blob_bytes_for(member, &hash) {
-                    Some(data) => Dispatch::reply(PartyResponse::FileData { hash, data }),
-                    // Same reply for unknown and access-denied, so the endpoint
-                    // never reveals a file the member isn't allowed to see.
-                    None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
-                },
+                PartyRequest::DownloadFile { hash } => {
+                    match state.plan_blob_read(member, &hash, None) {
+                        Some(plan) => Dispatch::defer(Deferred::Download {
+                            hash,
+                            offset: None,
+                            plan,
+                        }),
+                        // Same reply for unknown and access-denied, so the
+                        // endpoint never reveals a file the member isn't
+                        // allowed to see.
+                        None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
+                    }
+                }
 
                 // --- Governance and file management ---------------------------
                 PartyRequest::CreateChannelOfKind {
@@ -360,6 +473,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                             PartyResponse::DirectoryChanged,
                         ],
                         directed: Vec::new(),
+                        deferred: None,
                     },
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                 },
@@ -416,23 +530,21 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     }
                 }
                 PartyRequest::FinishUpload { upload } => {
-                    // After the call, not before. Clearing the connection's
-                    // bookkeeping first meant an error path that left the spool
-                    // in `PartyState` also left the connection believing it had
-                    // nothing in flight — so the concurrency cap read zero and
-                    // the disconnect sweep, gated on this same list, never ran.
-                    let outcome = state.finish_upload(member, upload);
+                    // Phase 1 only: check it and take the bytes. The write is
+                    // deferred, because it is up to `MAX_PARTY_FILE_BYTES` of
+                    // hashing and I/O and doing it here does it with the state
+                    // lock held.
+                    //
+                    // The connection's own list is cleared *after* the call, not
+                    // before. Clearing it first meant an error path that left the
+                    // spool in `PartyState` also left the connection believing it
+                    // had nothing in flight — so the concurrency cap read zero
+                    // and the disconnect sweep, gated on this same list, never
+                    // ran.
+                    let outcome = state.begin_upload(member, upload);
                     conn.uploads.retain(|u| *u != upload);
                     match outcome {
-                        Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
-                        Ok((env, UploadTarget::Dm(to))) => Dispatch {
-                            replies: vec![PartyResponse::MessagePosted {
-                                channel: env.channel,
-                                seq: env.seq,
-                            }],
-                            broadcast: Vec::new(),
-                            directed: dm_delivery(member, to, env),
-                        },
+                        Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
                         Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
                             channel: Uuid::nil(),
                             reason,
@@ -457,6 +569,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                                 }],
                                 broadcast: Vec::new(),
                                 directed: dm_delivery(member, to, env),
+                                deferred: None,
                             },
                         },
                         Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
@@ -475,12 +588,11 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
                     Err(e) => Dispatch::reply(PartyResponse::Error(e)),
                 },
                 PartyRequest::DownloadChunk { hash, offset } => {
-                    match state.blob_chunk_for(member, &hash, offset) {
-                        Some((data, total)) => Dispatch::reply(PartyResponse::FileChunk {
+                    match state.plan_blob_read(member, &hash, Some(offset)) {
+                        Some(plan) => Dispatch::defer(Deferred::Download {
                             hash,
-                            offset,
-                            total,
-                            data,
+                            offset: Some(offset),
+                            plan,
                         }),
                         None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
                     }
@@ -933,17 +1045,35 @@ mod tests {
             other => panic!("expected broadcast, got {other:?}"),
         };
 
+        // A download is now answered in two halves: `handle_request` decides,
+        // under the lock, whether it may happen and what to read; the runtime
+        // performs the read once the lock is released. Drive both here, which is
+        // what `connection.rs` does.
         let ok = handle_request(&mut state, &mut conn, PartyRequest::DownloadFile { hash });
+        assert!(ok.replies.is_empty(), "the bytes must not be read inline");
+        let reply = match ok.deferred {
+            Some(Deferred::Download { hash, offset, plan }) => {
+                let total = plan.total();
+                download_reply(hash, offset, total, plan.perform())
+            }
+            other => panic!("expected a deferred download, got {other:?}"),
+        };
         assert!(
-            matches!(&ok.replies[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
+            matches!(&reply.replies[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
         );
 
+        // Denied and unknown are refused before anything is deferred, so the
+        // endpoint still cannot be used to learn that a file exists.
         let missing = handle_request(
             &mut state,
             &mut conn,
             PartyRequest::DownloadFile {
                 hash: "deadbeef".to_string(),
             },
+        );
+        assert!(
+            missing.deferred.is_none(),
+            "nothing to read for an unknown file"
         );
         assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
     }
