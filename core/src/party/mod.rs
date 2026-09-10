@@ -85,10 +85,49 @@ pub enum MessagePayload {
 /// Content address (lowercase hex SHA-256) of a blob's bytes. Both sides compute
 /// this identically so uploads can be deduplicated by content.
 pub fn blob_hash(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
+    let mut hasher = BlobHasher::new();
     hasher.update(data);
-    hex::encode(hasher.finalize())
+    hasher.finish()
+}
+
+/// The same content address, computed as the bytes arrive.
+///
+/// A chunked upload has its bytes handed to the server 64 KiB at a time, so the
+/// hash can be accumulated across those chunks instead of computed in one pass
+/// at the end. That matters because the one-pass version has to happen
+/// *somewhere*: doing it while holding the server's state lock stalls every
+/// other member for as long as hashing 100 MiB takes, and doing it after the
+/// lock is released means the server does not know, while deciding whether to
+/// accept the upload, whether it already holds this exact content — so it has
+/// to assume it does not and reserve storage it may not need.
+///
+/// Feeding each chunk in as it lands costs microseconds per chunk, on work the
+/// server is doing under the lock anyway, and the answer is ready the moment the
+/// upload completes.
+///
+/// Deliberately the same type [`blob_hash`] is built from, so the incremental
+/// and one-shot forms cannot drift apart — two content-address functions that
+/// disagree would silently split deduplication and, worse, make a file's address
+/// depend on how it happened to be uploaded.
+#[derive(Debug, Clone, Default)]
+pub struct BlobHasher {
+    inner: sha2::Sha256,
+}
+
+impl BlobHasher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        use sha2::Digest;
+        self.inner.update(data);
+    }
+
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        hex::encode(self.inner.finalize())
+    }
 }
 
 /// A single stored/transported message. One data model across both tiers.
@@ -971,6 +1010,42 @@ mod tests {
         // Known SHA-256 of "hello" (lowercase hex).
         assert_eq!(
             blob_hash(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    /// The incremental hasher and the one-shot function must agree, for every
+    /// chunking of the same bytes.
+    ///
+    /// If they ever diverged, a file's content address would depend on how it
+    /// happened to be uploaded — inline or chunked, and with which chunk
+    /// boundaries. Deduplication would silently stop working, and the same file
+    /// would be stored under two addresses.
+    #[test]
+    fn incremental_and_one_shot_hashing_agree() {
+        let payload: Vec<u8> = (0..(64 * 1024 + 12345)).map(|i| (i % 251) as u8).collect();
+        let expected = blob_hash(&payload);
+
+        for chunk_size in [1usize, 7, 1024, 64 * 1024, payload.len(), payload.len() * 2] {
+            let mut hasher = BlobHasher::new();
+            for chunk in payload.chunks(chunk_size.max(1)) {
+                hasher.update(chunk);
+            }
+            assert_eq!(
+                hasher.finish(),
+                expected,
+                "chunking at {chunk_size} changed the content address"
+            );
+        }
+
+        // Empty input, and the fixed known answer, both hold through the
+        // incremental form too.
+        assert_eq!(BlobHasher::new().finish(), blob_hash(b""));
+        let mut hasher = BlobHasher::new();
+        hasher.update(b"hel");
+        hasher.update(b"lo");
+        assert_eq!(
+            hasher.finish(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }

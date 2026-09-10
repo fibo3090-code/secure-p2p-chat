@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use messenger_core::party::{
-    blob_hash, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
+    blob_hash, AuditEntry, BlobHasher, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
     FilePermissions, MemberInfo, MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget,
     MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
 };
@@ -447,6 +447,16 @@ struct PendingUpload {
     declared: u64,
     target: UploadTarget,
     data: Vec<u8>,
+    /// The content address, accumulated as chunks arrive.
+    ///
+    /// Hashing here rather than at the end is what lets `begin_upload` know
+    /// whether the server already holds this exact content *while it still has
+    /// the lock*, and therefore whether it needs to reserve storage at all. The
+    /// alternative — hashing in one pass later — forces a pessimistic
+    /// reservation, which refuses a deduplicated re-upload at a full ceiling.
+    /// Each chunk is at most `PARTY_CHUNK_BYTES`, so this adds microseconds to
+    /// work already being done under the lock.
+    hasher: BlobHasher,
 }
 
 /// Uploads one connection may have in flight at once. Each one can hold up to
@@ -1835,6 +1845,7 @@ impl PartyState {
                 declared: size,
                 target,
                 data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
+                hasher: BlobHasher::new(),
             },
         );
         Ok(id)
@@ -1865,6 +1876,7 @@ impl PartyState {
             return Err(format!("{name} sent more data than it declared"));
         }
         pending.data.extend_from_slice(data);
+        pending.hasher.update(data);
         Ok(())
     }
 
@@ -1920,21 +1932,30 @@ impl PartyState {
         // Check where it is going *before* taking the bytes, so a refusal leaves
         // the spool exactly as it was.
         let target = pending.target;
-        let size = pending.data.len() as u64;
         self.check_may_post_file(uploader, target)?;
-        self.check_storage_room(uploader, size)?;
-
+        // The ceiling is checked inside `stage`, which knows the content hash
+        // and can therefore skip the check entirely for content the store
+        // already holds. Checking here as well would defeat that: it runs before
+        // the hash is consulted, so it refuses a deduplicated re-upload that
+        // costs no new storage.
+        //
+        // The spool is taken before that check can fail, so a refused finish
+        // consumes it. That is deliberate: the client has to start over either
+        // way, and holding its bytes until the connection drops is the shape of
+        // the leak that `an_upload_finished_short_does_not_leak_its_spool`
+        // exists to prevent.
         let pending = self.uploads.remove(&upload).expect("checked above");
-        // No pre-computed hash: hashing up to `MAX_PARTY_FILE_BYTES` here would
-        // put exactly the work this split exists to move back under the lock.
-        // The reservation is therefore pessimistic — see `stage`.
+        // The hash was accumulated chunk by chunk as the upload arrived, so it
+        // is free here — no 100 MiB pass under the lock, and no pessimism in the
+        // reservation. See `PendingUpload::hasher`.
+        let hash = pending.hasher.finish();
         self.stage(
             uploader,
             target,
             pending.name,
             pending.mime,
             pending.data,
-            None,
+            Some(hash),
         )
     }
 
@@ -1970,14 +1991,17 @@ impl PartyState {
     /// Build a [`StagedUpload`], reserving storage for it unless the content is
     /// one the store already holds.
     ///
-    /// `known_hash` is `Some` only when the caller could afford to compute it
-    /// under the lock. When it is `None` the reservation is necessarily
-    /// pessimistic: a duplicate reserves its size and gives it back at commit,
-    /// so a re-upload of existing content can be refused at a full ceiling where
-    /// it would previously have deduplicated. That is the price of not hashing
-    /// 100 MiB with the lock held, and it is the right way round — the refusal
-    /// is immediate and truthful, and `ShareFile` re-shares content the server
-    /// already holds without going near this path at all.
+    /// `known_hash` is `Some` for every path that reaches here today: an inline
+    /// upload hashes its 4 MiB in hand, and a chunked one accumulates the hash
+    /// as its chunks arrive. So no reservation is made for content the store
+    /// already holds, and a deduplicated re-upload still succeeds at a full
+    /// ceiling — the property `a_new_blob_past_the_storage_ceiling_is_rejected`
+    /// pins.
+    ///
+    /// `None` is still handled, and handled pessimistically — a duplicate would
+    /// reserve its size and give it back at commit — so a future caller that
+    /// genuinely cannot know the hash up front is safe rather than wrong. It
+    /// would just be needlessly strict at a full ceiling.
     fn stage(
         &mut self,
         uploader: Uuid,
@@ -5028,13 +5052,82 @@ mod tests {
             .expect_err("the ceiling is already spoken for");
         assert!(err.contains("storage is full"), "got: {err}");
 
-        // Giving one back frees exactly its reservation.
+        // Giving one back frees exactly its reservation. (A refused finish
+        // consumes its spool — see `begin_upload` — so this needs a fresh one.)
         let first = staged.remove(0);
         state.discard_upload(first);
+        let upload = state
+            .start_upload(
+                bob,
+                "fourth".into(),
+                "application/octet-stream".into(),
+                100,
+                UploadTarget::Channel(channel),
+            )
+            .unwrap();
+        state.upload_chunk(bob, upload, &[b'w'; 100]).unwrap();
         assert!(
             state.begin_upload(bob, upload).is_ok(),
             "discarding a staged upload must release its claim"
         );
+    }
+
+    /// A deduplicated re-upload still succeeds at a full ceiling — on the
+    /// **chunked** path too, not only the inline one.
+    ///
+    /// Content the store already holds costs no new storage, so it must not be
+    /// refused for lack of room. That is easy inline (the bytes are in hand and
+    /// can be hashed) and was briefly lost for chunked uploads, where the hash
+    /// used to be unknown until after the ceiling check and the reservation had
+    /// to assume the worst. Accumulating the hash as chunks arrive removes the
+    /// guesswork rather than documenting it.
+    #[test]
+    fn a_deduplicated_chunked_reupload_succeeds_at_a_full_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+        let owner = state.join("owner", None, None).unwrap();
+        let bob = state.join("bob", None, None).unwrap();
+        let channel = state.default_channel();
+        let _ = owner;
+        let payload = [7u8; 200];
+
+        let upload_it = |state: &mut PartyState, name: &str| -> Result<(), String> {
+            let upload = state.start_upload(
+                bob,
+                name.to_string(),
+                "application/octet-stream".into(),
+                payload.len() as u64,
+                UploadTarget::Channel(channel),
+            )?;
+            for chunk in payload.chunks(64) {
+                state.upload_chunk(bob, upload, chunk)?;
+            }
+            state.finish_upload(bob, upload).map(|_| ())
+        };
+
+        upload_it(&mut state, "first.bin").expect("room for the first");
+
+        // The store is now exactly full.
+        state.set_max_blob_bytes(payload.len() as u64);
+
+        // Distinct content is refused, as it must be.
+        let upload = state
+            .start_upload(
+                bob,
+                "other.bin".into(),
+                "application/octet-stream".into(),
+                8,
+                UploadTarget::Channel(channel),
+            )
+            .unwrap();
+        state.upload_chunk(bob, upload, b"distinct").unwrap();
+        let err = state.finish_upload(bob, upload).unwrap_err();
+        assert!(err.contains("storage is full"), "got: {err}");
+
+        // The same content again adds no bytes, so it is still allowed.
+        upload_it(&mut state, "same-again.bin")
+            .expect("a chunked re-upload of stored content adds no bytes");
+        assert_eq!(state.blobs.len(), 1, "dedupe stored a second copy");
     }
 
     /// A member whose connection dies between phase 1 and phase 3 must not
