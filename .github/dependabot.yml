@@ -38,12 +38,6 @@ updates:
         update-types: [version-update:semver-major]
       - dependency-name: "@eslint/js"
         update-types: [version-update:semver-major]
-      # jsdom 30 requires Node >= 22 and CI pins Node 20, so this bump fails CI
-      # for a reason that has nothing to do with jsdom. The Node 20 -> 22 move is
-      # the real decision and deserves its own change; until it happens, this is
-      # another guaranteed-red PR every week.
-      - dependency-name: jsdom
-        update-types: [version-update:semver-major]
 
 # glib <0.20 is pinned transitively by Tauri 2.x (gtk 0.18). Revisit when Tauri
 # upgrades its GTK stack; see https://github.com/advisories/GHSA-wrw7-89jp-8q8g

@@ -45,7 +45,20 @@ hkdf = "0.12"
 
 # Encodage
 hex = "0.4"
-base64 = "0.22"
+# `default-features = false`, deliberately and ahead of the 0.23 bump.
+#
+# 0.23 adds a `simd-unsafe` feature and puts it in the default set: 0.22.1 has 4
+# `unsafe` blocks, 0.23.1 has 63, 22 of them hand-written AVX2/NEON kernels. With
+# a bare `base64 = "0.23"` all of that compiles into every binary the moment the
+# version bumps — in the one crate that parses stranger-supplied input (v2 and v1
+# invite links, identity proofs, DER blobs). None of it would be *reachable*
+# (the SIMD engines are opt-in types and our call sites use the scalar
+# `GeneralPurpose`), but it is surface, and base64's own lib.rs is
+# `#![forbid(unsafe_code)]` when the feature is off.
+#
+# Setting it now means the bump is safe whenever it lands rather than needing to
+# be remembered at the time.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 
 # Logging. The app keeps its own bounded in-process buffer for the log overlay
 # and diagnostics bundles (`client/src/logbuf.rs`) — that used to be
