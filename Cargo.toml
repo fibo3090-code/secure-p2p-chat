@@ -39,7 +39,12 @@ subtle = "2.6"
 aes-gcm = "0.11.0"
 rand = "0.8.6"
 getrandom = "0.4"
-x25519-dalek = "2.0"
+# `getrandom`, not the `rand` integration. 3.0's `random_from_rng` is generic
+# over rand_core 0.10 while this workspace's `OsRng` is rand 0.8 / rand_core
+# 0.6, so the two cannot meet without dragging a second `rand` version through
+# the tree. `EphemeralSecret::random()` calls `getrandom::fill` directly — the
+# same crate already depended on, and the same approach the ed25519 seed uses.
+x25519-dalek = { version = "3.0", features = ["getrandom"] }
 ed25519-dalek = { version = "3.0", features = ["zeroize"] }
 hkdf = "0.12"
 
@@ -75,15 +80,11 @@ ratatui-crossterm = { version = "0.1.0", features = ["crossterm_0_29"] }
 
 # Embedded SQLite (bundled: compiles SQLite from source, no system dependency).
 #
-# The pin here carried a note claiming 0.40 could not be taken because
-# libsqlite3-sys 0.38's build script needs the unstable `cfg_select`. That is no
-# longer true — 0.38.2's build.rs defines its own `cfg_select!` macro, with the
-# comment "Just to keep MSRV low" — and it was doubly stale once the workspace
-# floor moved to 1.89. Verified: `cargo check -p messenger-server` against
-# rusqlite 0.40.2 succeeds. Left at 0.39 only so the bump lands through its own
-# Dependabot PR rather than conflicting with the open lockfile changes; the note
-# is gone because a false blocker in a comment is what stops the next person.
-rusqlite = { version = "0.39", features = ["bundled"] }
+# 0.39 was held back by a note claiming libsqlite3-sys 0.38's build script needs
+# the unstable `cfg_select`. That stopped being true — 0.38.2 defines its own
+# `cfg_select!` macro, "Just to keep MSRV low" — and was doubly stale once the
+# floor moved to 1.89.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Utilities
 anyhow = "1"

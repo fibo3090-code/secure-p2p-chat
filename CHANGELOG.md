@@ -77,6 +77,10 @@ predate tagged releases.
 
 ### Changed
 
+- Updated the X25519 key-exchange and SQLite libraries. The key-exchange bump
+  also removes a duplicate copy of the underlying elliptic-curve implementation,
+  so there is now one rather than two compiled into every build.
+
 - Releases are now built, signed and verified before the release page becomes
   visible, and the provenance signature covers exactly what the build produced —
   including `SHA256SUMS`, which was previously the one unsigned file. See
