@@ -702,13 +702,27 @@ Independent:  P2P connection passwords + conversation lock   ✅ done
   records role, channel and file actions (see §7). **Remaining:** trust-tier
   labeling, transparency panel, consent-or-leave, visibility & contact policies,
   per-channel passwords.
-- **Phase 4 — E2EE server tier.** Per-channel group keys, ciphertext-only storage,
-  key rotation on membership change, encrypted offline blobs; admin-read disabled.
-  Note that this phase covers **community channels only**. P2P DMs have no
-  asynchronous delivery at all — both peers must be online simultaneously — which
-  is a separate and arguably larger gap. See
-  [async_delivery.md](async_delivery.md) for a design sketch; the prekey
-  distribution it needs is also what makes group-key distribution here tractable.
+- **Phase 4 — E2EE server tiers.** A three-rung ladder rather than one switch:
+  `Administered` (today) → `PrivateE2EE` (sealed DMs, channels still moderatable)
+  → `FullE2EE` (both sealed). Channels are sealed **per channel**; DMs follow one
+  server-wide setting. Keys rotate on every membership change, and a member who
+  joins a sealed channel sees nothing posted before they joined — no historical
+  key is transportable, by design. See **[server_tiers.md](server_tiers.md)** for
+  the full design, its staging, and the requirements.
+
+  The security of the whole ladder rests on stage 0 of that document: members are
+  currently identified by whatever the *server* says they are (`MemberInfo`
+  carries no key), and sealing content to a key the operator chose buys nothing
+  against the operator. Per-member identity keys and TOFU come first.
+
+  **Asynchronous P2P delivery is deliberately not pursued.** It was designed out
+  in full — a standalone blind mailbox holding sealed envelopes, addressed by
+  prekey — and the decision (2026-09-10) was to leave peer-to-peer messaging
+  exactly as it is and put the effort into the server tiers instead. That leaves
+  a real, known gap: **P2P DMs require both peers online simultaneously**, and
+  nothing here changes that. The prekey machinery that design needed survives in
+  `server_tiers.md`, where it lands inside the community server rather than in a
+  new service, so it costs no new infrastructure.
 - **Phase 5 — Per-server identities.** Distinct per-server profile/keys bound to
   the global identity.
 - **Independent — P2P connection passwords + conversation lock. ✅** Shipped; see

@@ -100,7 +100,8 @@ Controls:
 
 Residual limitation:
 
-- the Administered tier is not end-to-end encrypted against the operator; the planned E2EE tier (per-channel group keys, ciphertext-only storage) is future work
+- the Administered tier is not end-to-end encrypted against the operator. **Community DMs are plaintext on the operator's disk**, which is the sharpest form of this and the first thing the planned tiers address — see [docs/server_tiers.md](docs/server_tiers.md) for the ladder (`Administered` → `PrivateE2EE` → `FullE2EE`), which is design, not shipped behaviour
+- members are currently identified by whatever the **server** says they are: `MemberInfo` carries no identity key, so community trust is a pin on the *server*, not on each member. This is consistent with a tier where the operator can read everything anyway, and it is the first thing that has to change before any sealed tier means anything
 
 ### Desktop app webview / IPC
 
