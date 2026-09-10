@@ -97,27 +97,30 @@ ever a fallback.
 | Can see | Cannot see |
 |---|---|
 | Bob has a mailbox | What any message says |
-| Something was left for Bob at 14:32 | Who left it, from the envelope alone |
-| Roughly how big, padded into size buckets | Anything at all, even if the disk is seized |
-| When Bob collected | |
+| Something was left for Bob at 14:32 | Who left it — no name, only a code that changes daily |
+| Roughly how big, padded into size buckets | Who that code belongs to, or what it was yesterday |
+| When Bob collected | Anything at all, even if the disk is seized |
+| That the same daily code left 11 things | |
 
-This table used to promise, on the "cannot see" side, that the operator cannot
-tell **whether Alice and Bob talk at all**. Under this document's own default
-that is false, and §4.3 says so three sections later — R3.3 makes unlinkable
-addressing a `SHOULD`, and the fallback it explicitly permits is
-fingerprint-addressed mailboxes with the graph leak documented. With fixed
-addresses, deposit and collection patterns across two known mailboxes are the
-social graph.
+This table is the part users read, so it is the part that must not overclaim. It
+previously promised that the operator cannot tell **whether Alice and Bob talk
+at all**. That is not true of the design as it stands, and the honest version has
+two gaps rather than none:
 
-This is the part users read, so it is the part that must not overclaim. Two
-honest gaps, not one:
-
-- **Addressing.** Unless and until mailbox addresses rotate, the operator learns
-  who corresponds with whom. That is a consequence of choosing fixed addresses,
-  not a limitation of the crypto.
+- **Addressing.** Mailboxes are addressed by fingerprint in stage 1 (§8.2), so
+  the operator learns who corresponds with whom. That is a consequence of
+  choosing fixed addresses, not a limitation of the crypto, and it is the leak
+  R3.3 requires `SECURITY.md` to spell out.
 - **Timing.** Deposits and collections falling into a rhythm say something about
   who talks to whom even when every box stays shut and every address rotates.
-  §4.3 tries to blunt that and cannot eliminate it.
+  §4.3 blunts that and cannot eliminate it.
+
+The daily code in the third row is the deposit pseudonym (§8.1). It exists so
+the mailbox can rate-limit a flood and tell a sender their message expired —
+neither of which is possible against a sender the server cannot distinguish at
+all. It buys those at a stated price: within one day the operator can count how
+many distinct people wrote to a mailbox and how often. It cannot connect those
+codes to people, or to the previous day's.
 
 ### What goes wrong
 
@@ -142,7 +145,8 @@ it.
 Fixing that means Alice locks a separate copy for each of Bob's devices and the
 mailbox holds one per device. That is a different design, and it has to be
 chosen before any of this is built rather than bolted on afterwards. It is the
-one genuinely open question left (R6.1, §4.6).
+one genuinely open question left (R6.1, §4.6, §8.4) — everything else that was
+undecided has a recommended answer in §8.
 
 ---
 
@@ -220,11 +224,19 @@ and must be visible rather than silent.
 
 ### 4.2 The mailbox is blind
 
-The server stores a row of: **address**, **opaque ciphertext**, **timestamp**.
-It must not learn the sender — sender identity goes *inside* the sealed
-payload, not in the envelope. This is sealed-sender, and it is the difference
-between "the operator cannot read your messages" and "the operator cannot read
-your messages but knows exactly who you talk to and when".
+The server stores a row of: **address**, **deposit pseudonym**, **opaque
+ciphertext**, **timestamp**. It must not learn the sender's identity — that goes
+*inside* the sealed payload, never in the envelope.
+
+The pseudonym is `HKDF(pairwise_secret, "deposit" ‖ epoch)`: derivable only by
+the two parties, unlinkable to a long-term identity, and unlinkable to the same
+pair's pseudonym in the next epoch. It is there because a mailbox that cannot
+distinguish senders at all cannot rate-limit them (R5.2) and cannot tell one
+that their message expired (R4.4) — see §8.1, which is where that trade is
+argued rather than assumed. It is the difference between "the operator cannot
+read your messages" and "the operator cannot read your messages but knows
+exactly who you talk to and when"; the pseudonym sits deliberately between those
+two, and §8.1 says exactly how far.
 
 Constraints that have to be designed in, not bolted on: a per-recipient storage
 cap, a TTL after which undelivered messages are dropped, and a size cap well
@@ -236,12 +248,20 @@ for the same reason.
 
 A mailbox addressed by fingerprint leaks the social graph to its operator
 through arrival and collection patterns, even with perfect content encryption.
-Mitigations worth *considering* — not necessarily shipping:
+**Stage 1 accepts that leak** (§8.2) rather than pretending otherwise, because
+rotating addresses breaks the per-recipient quota and the unknown-sender policy
+as they are currently written.
+
+Shipping in stage 1:
+
+- fixed-size padding buckets
+- batched, randomised collection rather than fetch-on-arrival
+
+Deferred to a later stage, with the quota and unknown-sender policies restated
+against it first:
 
 - rotating per-pair mailbox addresses derived from a shared secret, so the
   address is unlinkable across messages
-- fixed-size padding buckets
-- batched, randomised collection rather than fetch-on-arrival
 
 A small self-hosted mailbox will have weak anonymity properties regardless. The
 right response is to document that plainly in `SECURITY.md` — the file already
@@ -421,7 +441,7 @@ Smallest useful increments, each shippable and testable alone:
 | Stage | What | Why this order |
 |---|---|---|
 | 1 | Publish and fetch prekeys. No mailbox. | Pure key distribution, no storage, no new trust. Testable end to end. |
-| 2 | **Blind mailbox on the relay, text only.** | This is the feature. Capped, TTL'd, sealed-sender. |
+| 2 | **Blind mailbox on the relay, text only.** | This is the feature. Capped, TTL'd, and blind to sender identity — carrying the deposit pseudonym of R3.1a, not a name. |
 | 3 | Double Ratchet replacing the per-session schedule. | Needs stage 1. Independent of stage 2. |
 | 4 | Separate `history_key` from the identity key. | Standalone win; do it whenever. |
 | 5 | Community E2EE tier (spec Phase 4) reusing stage 1. | Group keys are much easier once prekey distribution exists. |
@@ -461,7 +481,8 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 | R1.4 | `known_trusted` `MUST NOT` be widened to auto-accept a fingerprint on the strength of a mailbox delivery. An invite link is not verification; neither is a message arriving. |
 | R1.5 | A malicious mailbox operator serving forged prekeys `MUST NOT` be able to impersonate a contact whose identity key the user has verified. |
 | R1.6 | Prekey bundles `MUST` be signed by the identity key, and the signature `MUST` be checked before any content is encrypted to them. |
-| R1.9 | There `MUST` be an identity rotation and revocation path, and a UI state for "this contact's safety number changed". R1.8's hard refuse is right against a MITM and, with no rotation path anywhere in R1, it is also permanent: a user whose key is compromised, or who simply reinstalls, becomes unreachable to every contact who pinned them, forever, with no prompt by design. R1.2's "delivered but unverified" is the natural home for the changed-key state. This also constrains §4.6 option 1 — if adding a second device changes the identity key, every existing contact hits R1.8. |
+| R1.9 | Identity rotation `MUST` be possible, as a **succession statement signed by the outgoing key** naming the incoming one. A contact holding the old pin verifies it, moves the pin, and enters R1.2's "delivered but unverified" state with a visible *safety number changed* marker until re-verified out of band. A key arriving with no valid succession signature still hits R1.8 unchanged — that is the MITM case, and it stays as strict as it is. Without this, R1.8's hard refuse is not just strict but permanent: a compromised or reinstalled key means being unreachable to every contact who pinned it, forever, by design. See §8.3. This also constrains §4.6 option 1 — if adding a second device changes the identity key, every existing contact hits R1.8. |
+| R1.10 | Losing the private key outright `MUST` be documented as requiring out-of-band re-verification. R1.9 covers a *planned* rotation, where the old key is still available to sign; it cannot cover a key that is gone, and implying otherwise would be worse than saying so. |
 
 ### R2 — Confidentiality and secrecy over time
 
@@ -484,10 +505,11 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 
 | | Requirement |
 |---|---|
-| R3.1 | The mailbox envelope `MUST NOT` name the sender. Sender identity goes inside the sealed payload. |
-| | ⚠️ **R3.1 as written cannot hold at the same time as R5.2 or R4.4.** A server that cannot identify the sender cannot rate-limit *per sender* (R5.2), and cannot report a TTL expiry *to the sender* (R4.4). This is not a wording problem; it is three `MUST`s that are jointly unsatisfiable, and R8.7 asks for a test of each. See §8 question 0 — it has to be answered before anyone writes the wire format, because the resolution changes the envelope. |
+| R3.1 | The mailbox envelope `MUST NOT` carry the sender's **long-term identity**, in any form the operator can link across epochs. Sender identity goes inside the sealed payload. |
+| R3.1a | The envelope `MAY` carry a **deposit pseudonym**: `HKDF(pairwise_secret, "deposit" ‖ epoch)`, where `epoch` is a coarse time bucket (a day). It is derivable only by the two parties, is unlinkable to a long-term identity, and is unlinkable to the same pair's pseudonym in any other epoch. |
+| | *This is the resolution of a contradiction, not a preference.* R3.1 as originally written — the envelope names nothing about the sender at all — cannot hold at the same time as R5.2 (rate-limit **per sender**) or R4.4 (report expiry **to the sender**): a server that cannot distinguish senders can do neither. Three `MUST`s, jointly unsatisfiable, with R8.7 asking for a test of each. The pseudonym is what makes all three satisfiable at once. See §8 for the alternative and what it would cost. |
 | R3.2 | Ciphertext `MUST` be padded to fixed size buckets, so length does not leak message size. |
-| R3.3 | Mailbox addresses `SHOULD` be unlinkable across messages. If they are not, the social-graph leak `MUST` be documented in `SECURITY.md`. |
+| R3.3 | Mailbox addresses `SHOULD` be unlinkable across messages. Stage 1 deliberately does **not** meet this — fixed, fingerprint-derived addresses, because rotation breaks R5.1 and R5.4 as written (§8.2) — so the second half of this requirement is the operative one: the social-graph leak `MUST` be documented in `SECURITY.md`, and §2's plain-terms table `MUST NOT` claim otherwise. |
 | R3.4 | Everything the operator can still observe `MUST` be enumerated in `SECURITY.md` under what the app does not claim. |
 
 ### R4 — Delivery integrity
@@ -497,25 +519,27 @@ or `SHOULD` (perfect prefers it, and its absence must be justified in writing).
 | R4.1 | An operator dropping messages `MUST` be **detectable** — an authenticated per-conversation sequence number inside the ciphertext, as `FrameSeq` already does for party frames. |
 | R4.2 | Replayed mailbox entries `MUST` be rejected. |
 | R4.3 | Out-of-order collection `MUST NOT` lose messages or wedge a session. |
-| R4.4 | A message the sender believes was delivered `MUST NOT` be silently lost by mailbox eviction; TTL expiry `MUST` be reported to the sender. **Conflicts with R3.1** — see the note there and §8 question 0. |
+| R4.4 | A message the sender believes was delivered `MUST NOT` be silently lost by mailbox eviction; TTL expiry `MUST` be reported under the depositing pseudonym (R3.1a), which the sender polls for. |
+| R4.4a | An expiry notice `MUST` carry a per-message discriminator the sender chose — an opaque tag sealed at deposit time and echoed back. Without one, a pseudonym covering a whole epoch tells the sender that *something* expired, not what: eleven deposits in a day share one pseudonym. The tag is visible to the operator, so it `MUST` be random per message and carry no structure. |
+| R4.4b | Fetching an expiry notice `MUST NOT` consume it. The pseudonym is derived identically by both parties, so a destructive fetch lets the recipient collect the sender's expiry notices before the sender does. "Knowing the id is the authentication" holds against strangers, not against the two parties who both derive it. |
 
 ### R5 — Abuse resistance
 
 | | Requirement |
 |---|---|
 | R5.1 | Per-recipient storage `MUST` be capped, as `MAX_MEMBER_BLOB_BYTES` already caps party storage and for the same reason. |
-| R5.2 | Deposits `MUST` be rate-limited per sender and per IP, reusing `network::ratelimit`. **Conflicts with R3.1** — see the note there and §8 question 0. Per-IP alone is achievable today; per-sender is not, without something in the envelope the server can count. |
-| | *And a per-recipient cap is itself a denial tool.* An attacker who fills Bob's mailbox budget blocks Bob's legitimate senders, and the per-IP limit does nothing against a distributed one. Either R5.1 accepts inbound denial of service as a residual and says so, or the cap needs a per-sender dimension — which is the very thing R3.1 forbids. |
+| R5.2 | Deposits `MUST` be rate-limited per deposit pseudonym (R3.1a) and per IP, reusing `network::ratelimit`. |
+| R5.2a | A recipient's mailbox budget `MUST` be apportioned per pseudonym rather than being a single pool. A single pool is a denial tool: an attacker who fills Bob's budget blocks Bob's legitimate senders, and a per-IP limit does nothing against a distributed attack. Per-pseudonym apportionment means a flood costs the flooder their own slice and leaves everyone else's intact — which is the whole reason the pseudonym is worth its privacy cost. |
 | R5.3 | Deliberate one-time-prekey exhaustion by an attacker `MUST NOT` degrade a victim's secrecy silently — see R2.6. |
 | R5.4 | There `MUST` be a policy for unsolicited mail from unknown identities, and its default `MUST` be the conservative one. |
 | R5.5 | Entries `MUST` have a TTL and `MUST` be evicted on collection. |
 
-### R6 — The two forks that must be closed before stage 1
+### R6 — The forks that must be closed before stage 1
 
 | | Requirement |
 |---|---|
-| R6.1 | Multi-device `MUST` be decided before any wire format is frozen: fanout designed in, or single-device committed to permanently and documented. Not deferred. |
-| R6.2 | Mailbox hosting `MUST` be decided with its operational story attached — the relay only if it grows persistence, backup and an uptime expectation. |
+| R6.1 | Multi-device `MUST` be decided before any wire format is frozen: fanout designed in, or single-device committed to permanently and documented. Not deferred. **Still open** — see §8.4. This is the one blocking question left. |
+| R6.2 | Mailbox hosting `MUST` be decided with its operational story attached — the relay only if it grows persistence, backup and an uptime expectation. Not frozen into the wire format, so unlike R6.1 it may follow the design rather than precede it. |
 
 ### R7 — Compatibility and operations
 
@@ -554,61 +578,107 @@ The feature is **perfect** when:
 Anything less is fine engineering. It is just not perfect, and the difference
 should be stated rather than blurred.
 
-## 8. Open questions
+## 8. Decisions, and the one that is still open
 
-Ordered by how expensive they are to answer late. The first three are
-**blocking** — R6 says they must be closed before implementation, because all
-three are frozen into the wire format:
+Everything below was a contradiction or a gap. Each now carries a **recommended
+resolution** with its reasoning and its cost, so what is left is confirming or
+overturning one decision rather than re-deriving all of them. Overturning any of
+them is a normal outcome; leaving them unstated was not.
 
-0. **Sender anonymity, or per-sender accounting? R3.1 forbids what R5.2 and R4.4
-   require.** The envelope must not name the sender; deposits must be
-   rate-limited per sender; TTL expiry must be reported to the sender. A server
-   that cannot identify the sender can do neither of the latter two. Two ways
-   out, and they produce different wire formats:
+### 8.1 Sender anonymity vs per-sender accounting — **resolved: deposit pseudonym**
 
-   - **Sealed-sender-style delivery tokens.** An unlinkable credential the server
-     can verify and count without learning who presented it. This is what Signal
-     does. It is a subsystem of its own and appears nowhere in the staging plan —
-     costing it honestly is part of answering this.
-   - **Downgrade R3.1** to "the server does not learn a long-term identity" and
-     accept a per-epoch pseudonym: enough to count and to address a notice, not
-     enough to follow across epochs.
+R3.1 forbade the envelope naming the sender; R5.2 required rate-limiting per
+sender and R4.4 required reporting expiry to the sender. A server that cannot
+distinguish senders can do neither. Two ways out:
 
-   A related detail that survives either choice: R4.4 cannot currently say
-   *which* message expired. A `deposit_id` scoped to (sender, recipient, epoch)
-   is shared by every deposit in that epoch, so a notice filed under it tells the
-   sender that something expired, not what. A per-message discriminator the
-   server can see is a new field and new linkability, and it is not specified.
+| | Sealed-sender delivery tokens | **Deposit pseudonym** (recommended) |
+|---|---|---|
+| What the operator learns | nothing beyond "a valid token was spent" | "pseudonym X deposited N times this epoch" |
+| Linkable across epochs | no | no — the epoch is in the KDF input |
+| Linkable to an identity | no | no — derived from the pairwise secret |
+| Rate-limit per sender | yes | yes |
+| Report expiry to sender | needs a return path built separately | yes, the pseudonym is the return address |
+| Cost to build | a subsystem: blind signatures or a VOPRF, issuance, redemption, double-spend prevention | one HKDF call |
+| In the staging plan | no | yes, stage 1 |
 
-   And "knowing the id is the authentication" holds against strangers, not
-   against the two parties who necessarily know it: the operator was handed every
-   `deposit_id`, and the recipient derives the same value from the same HKDF
-   inputs. Whether a fetch **consumes** the notice therefore decides whether a
-   recipient can collect the sender's expiry notices before the sender does. Not
-   stated either way.
+Recommendation: **the pseudonym**, with tokens named as a later upgrade rather
+than a prerequisite. Requiring tokens at stage 1 means the feature does not
+ship, and shipping nothing protects nobody. The pseudonym gives up strictly less
+than the status quo, where async messages do not exist at all and the
+conversation happens over a community server that stores DMs in plaintext.
 
-1. **Multi-device: fanout, or permanently single-device?** (R6.1) Changing
-   position later means redesigning the mailbox and the ratchet, with migration,
-   for everyone. This is the only genuinely unresolved blocking question — §4.5
-   answers the verification one.
-2. **Where does the mailbox live, and who keeps it up?** (R6.2) The relay only
-   if it grows persistence and an uptime expectation; otherwise a separate
-   service.
+What it costs, to be stated in `SECURITY.md` rather than discovered: the
+operator can count deposits per pseudonym within an epoch, and therefore learns
+how many distinct correspondents a mailbox has that day and how often each
+writes. It cannot connect those to identities or across epochs. That is more
+than perfect sealed-sender leaks and much less than the envelope naming people.
 
-Answerable later without regret:
+If you would rather have the tokens: R3.1a is what to delete, and R5.2/R4.4
+become blocked on a subsystem that needs its own design document and its own
+stage.
 
-3. Rotating mailbox addresses from the start, or fingerprint-addressed first and
-   accept the documented graph leak while the feature proves itself? (R3.3)
-   Note that this one is not as free as its position here suggests: choosing
-   *rotating* breaks R5.1's per-recipient quota and R5.4's unknown-sender policy,
-   both of which are `MUST`s and both of which are stated against a stable
-   address. Choosing *fixed* is fine, and then §2's plain-terms table has to keep
-   saying so — it has been corrected to.
-4. `vodozemac`, or a ratchet over the existing primitives?
-5. Migrate existing history when `history_key` changes, or leave old history on
-   the old key and start fresh? (R7.5 — either is acceptable; silence is not.)
-6. How do files ride the mailbox? (§4.8 — sealed reference plus the existing
-   chunked fetch is the plausible shape, but it is not designed.)
+### 8.2 Mailbox addressing — **resolved: fixed for stage 1, and say so**
+
+Rotating per-pair addresses are better for unlinkability and break two `MUST`s
+as written: R5.1's per-recipient quota and R5.4's unknown-sender policy are both
+stated against a stable address. Rotation is not free elsewhere either — it
+needs a rendezvous scheme so a sender knows which address to write to after a
+gap.
+
+Recommendation: **fixed, fingerprint-derived addresses for stage 1**, with
+rotation as a later stage once the quota and unknown-sender policies have been
+restated against it. The condition is that §2's plain-terms table stops
+promising the operator cannot tell who talks to whom — it has been corrected to
+say the opposite, because that is the part users read.
+
+### 8.3 Identity rotation — **resolved: signed succession, and a changed-key state**
+
+R1.8's hard refuse of an unpinned identity key is right against a MITM, and with
+no rotation path anywhere it is also permanent: a compromised or merely
+reinstalled key means being unreachable to every contact who pinned you, by
+design, forever.
+
+Recommendation: a rotation is a **succession statement signed by the outgoing
+key** naming the incoming one. A contact holding the old pin verifies the
+signature, moves the pin, and enters R1.2's "delivered but unverified" state
+with a visible *safety number changed* marker until re-verified out of band.
+This keeps R1.8 exactly as strict for a key that arrives with no succession
+signature — which is the MITM case — while making a planned rotation possible.
+
+It does not cover losing the private key outright. That case needs an
+out-of-band re-verification and should say so rather than pretending otherwise.
+
+### 8.4 Multi-device — **open, and genuinely yours to decide**
+
+This one is not a technical judgement with a defensible default, so it is not
+being given one. It is a product commitment: either every message is encrypted
+separately to each of a recipient's devices and the mailbox holds one copy per
+device, or the app commits to one device per identity, permanently and in
+writing.
+
+- **Fanout** costs a per-device prekey directory, per-device sessions, and a
+  sender who must discover the current device set — plus deciding what happens
+  when a device is added mid-conversation or lost.
+- **Single-device** costs nothing now and cannot be reversed later without
+  redesigning the mailbox and the ratchet, with migration, for everyone.
+
+R6.1 says this must be closed before implementation, and it means it: both
+answers are frozen into the wire format. §2's step 9 (*delete after collection*)
+already assumes single-device — with two devices, whichever polls first takes
+the message and the other never sees it.
+
+**This is the blocking question.** The three above are settled unless you say
+otherwise; this one is not settled at all.
+
+### 8.5 Answerable later without regret
+
+- `vodozemac`, or a ratchet over the existing primitives?
+- Migrate existing history when `history_key` changes, or leave old history on
+  the old key and start fresh? (R7.5 — either is acceptable; silence is not.)
+- How do files ride the mailbox? (§4.8 — a sealed reference plus the existing
+  chunked fetch is the plausible shape, but it is not designed.)
+- Where the mailbox runs, and who keeps it up (R6.2). Not frozen into the wire
+  format, so unlike R6.1 it can follow the design rather than precede it.
 
 ---
 
