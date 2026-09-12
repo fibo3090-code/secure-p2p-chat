@@ -348,8 +348,16 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p p2pem-classic -p messenger-server
 
+      # The `shell:` on this step and the next one is not redundant. `runs-on`
+      # here is `${{ matrix.os }}`, so the shell each step gets is decided by a
+      # value that is not known until the matrix expands — which is fine at run
+      # time and useless to any linter reading the file. actionlint falls back
+      # to assuming bash and reports the PowerShell step below as a pile of
+      # syntax errors. Saying which shell each one wants costs two lines and
+      # makes the workflow lintable.
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           STAGE="P2PEM-Tools_${VERSION}_${{ matrix.label }}"
@@ -365,6 +373,7 @@ jobs:
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart("v")
           $stage = "P2PEM-Tools_${version}_${{ matrix.label }}"

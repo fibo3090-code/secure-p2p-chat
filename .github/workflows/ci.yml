@@ -4,12 +4,28 @@ on:
   push:
     branches: ["main", "master"]
   pull_request:
+  # Coverage runs on pushes rather than pull requests (see the `coverage` job),
+  # so there has to be a way to ask for it on demand.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A push to a pull request branch used to leave the previous run's three
+# eleven-minute test jobs running to completion against a commit nobody was
+# waiting on any more. Superseded runs are cancelled instead.
+#
+# `main` is deliberately excluded from cancellation: its runs are what the
+# branch protection check and the coverage trend are read from, and cancelling
+# one because another landed behind it leaves a commit on the default branch
+# with no verdict at all. The group falls back to the run id there, which is
+# unique, so nothing is ever cancelled on main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  # Decide whether this change can possibly affect the build.
+  # Decide which parts of the tree this change can possibly affect.
   #
   # Every job below used to run on every pull request, so a one-file
   # documentation change spent about 45 minutes of runner time compiling Rust on
@@ -23,18 +39,26 @@ jobs:
   # report a `skipped` conclusion, which branch protection accepts.
   #
   # It also fails **safe**: anything it cannot classify — an unreadable diff, a
-  # force push, a first push with no `before` commit — is treated as a code
-  # change and runs the full suite. The only way to skip is to positively
-  # establish that every changed path is documentation.
+  # force push, a first push with no `before` commit, a path no arm below
+  # recognises — is treated as touching everything and runs the full suite. The
+  # only way to skip an area is to positively establish that nothing in the diff
+  # reaches it.
+  #
+  # The classification is per *area*, not one code/docs boolean. With a single
+  # flag a React-only change ran 33 minutes of Rust tests across three
+  # platforms, and a change to `core/` ran the whole three-platform Playwright
+  # matrix. Neither proved anything the other's area could break.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      rust: ${{ steps.filter.outputs.rust }}
+      frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -49,56 +73,75 @@ jobs:
         run: |
           set -uo pipefail
 
-          if [ "$EVENT" = "pull_request" ]; then
+          everything() {
+            echo "$1"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            everything "manual run; running everything"
+          elif [ "$EVENT" = "pull_request" ]; then
             git fetch -q --no-tags origin "$BASE_REF" || true
             range="origin/$BASE_REF...HEAD"
           elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             range="$BEFORE..$SHA"
           else
-            echo "no usable diff range; running everything"
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            everything "no usable diff range; running everything"
           fi
 
           if ! files=$(git diff --name-only "$range"); then
-            echo "could not diff $range; running everything"
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            everything "could not diff $range; running everything"
           fi
 
           if [ -z "$files" ]; then
-            echo "empty diff; running everything"
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            everything "empty diff; running everything"
           fi
 
           echo "::group::changed files"
           echo "$files"
           echo "::endgroup::"
 
-          # Note what is NOT in this allowlist: .github/workflows/** is code as
-          # far as CI is concerned, because a workflow edit is exactly the kind
-          # of change that needs the full suite to prove itself.
-          docs_only=true
+          rust=false
+          frontend=false
+
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
-              *.md|docs/*|LICENSE*|.github/ISSUE_TEMPLATE/*) ;;
-              *) docs_only=false; echo "code path: $f" ;;
+              # Documentation. Nothing here can change a build. Note that the
+              # secret scan below is *not* gated on this — a credential pasted
+              # into a README is still a published credential.
+              *.md|docs/*|LICENSE*|.github/ISSUE_TEMPLATE/*)
+                echo "docs:     $f" ;;
+              # A workflow or CI-config edit is exactly the kind of change that
+              # needs the full suite to prove itself, so it counts as every
+              # area at once.
+              .github/*|.config/*)
+                rust=true; frontend=true; echo "ci:       $f" ;;
+              # The Tauri shell is a Rust workspace member. `npm ci` in desktop/
+              # never compiles it, so it belongs to the Rust half despite living
+              # under desktop/.
+              desktop/src-tauri/*)
+                rust=true; echo "rust:     $f" ;;
+              desktop/*)
+                frontend=true; echo "frontend: $f" ;;
+              *.rs|Cargo.toml|Cargo.lock|*/Cargo.toml|deny.toml|rustfmt.toml|clippy.toml|scripts/*)
+                rust=true; echo "rust:     $f" ;;
+              # Unrecognised. Fail safe.
+              *)
+                rust=true; frontend=true; echo "unknown:  $f" ;;
             esac
           done <<< "$files"
 
-          if [ "$docs_only" = true ]; then
-            echo "documentation only — skipping build, test and audit jobs"
-            echo "code=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          fi
+          echo "rust=$rust"         >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust frontend=$frontend"
 
   check:
     name: Fast Checks
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     # Every job is bounded. The default is six hours, which is not a timeout so
     # much as an absence of one — a stuck job held a runner all night and the
@@ -106,7 +149,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -148,13 +194,15 @@ jobs:
           exit 1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -171,8 +219,8 @@ jobs:
       #
       # `cargo check`, not `cargo fuzz`: this is about the targets still
       # compiling against the current API, which stable can answer in seconds.
-      # Actually running them needs nightly and real time, and stays deliberate
-      # (`./scripts/fuzz.sh`).
+      # Actually running them needs nightly and real time, and happens in
+      # fuzz.yml on a schedule (and via `./scripts/fuzz.sh` by hand).
       - name: Fuzz targets still compile
         run: cargo check --manifest-path core/fuzz/Cargo.toml --all-targets
 
@@ -183,12 +231,15 @@ jobs:
   msrv:
     name: Minimum Supported Rust Version
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       # Read the floor from the manifest rather than hard-coding it here. Two
       # places to update is one place to forget, and the manifest is the one
@@ -227,12 +278,14 @@ jobs:
           exit 1
 
       - name: Install Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: msrv-${{ steps.msrv.outputs.version }}
 
@@ -244,18 +297,22 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.rust == 'true'
     name: Unit Tests
     runs-on: ${{ matrix.os }}
     # Generous: the workspace's end-to-end tests are genuinely networked and the
     # Windows leg is the slowest. Locally the full suite is around six minutes.
     timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -298,12 +355,14 @@ jobs:
           exit 1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       # nextest runs each test in its own process, which is what the workspace
       # is actually written for: the relay tests read a process-global
@@ -313,12 +372,20 @@ jobs:
       # It is also roughly twice as fast, and reports a hung test instead of
       # blocking the job until the workflow timeout.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        # taiki-e/install-action v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
         with:
           tool: cargo-nextest
 
+      # `--profile ci` is not decoration. `.config/nextest.toml` defines a `ci`
+      # profile — print every test rather than only the failures, so a log from
+      # a failed run says what else was running at the time, and `fail-fast =
+      # false` so one failure does not hide the others — and without this flag
+      # nextest used the default profile and that entire section was dead
+      # config. The suite here is networked and order-sensitive enough that
+      # "what else was running" is usually the whole diagnosis.
       - name: Run Tests
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --profile ci
 
       # nextest does not run doctests, so they get their own step rather than
       # quietly disappearing from CI.
@@ -327,7 +394,7 @@ jobs:
 
   frontend:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.frontend == 'true'
     name: Frontend Build
     # The frontend ships inside a desktop app built for all three platforms, so
     # testing it on one is testing the wrong thing. Vite resolves paths, and the
@@ -347,12 +414,14 @@ jobs:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        # actions/setup-node v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
           cache: npm
@@ -368,7 +437,15 @@ jobs:
       # dev tree pulls a long tail of build tooling whose advisories are not
       # reachable from the shipped bundle, and failing on those trains people to
       # ignore the job.
+      #
+      # One platform is enough: this asks the registry a question about the
+      # lockfile, and the lockfile does not vary by runner. Running it three
+      # times only bought three chances for a registry hiccup to redden the
+      # build. audit.yml asks the same question on a schedule, which is what
+      # catches an advisory published against dependencies that are not
+      # currently being changed.
       - name: Audit dependencies
+        if: matrix.os == 'ubuntu-latest'
         run: npm audit --omit=dev --audit-level=high
         working-directory: desktop
 
@@ -388,6 +465,29 @@ jobs:
         run: npm run build
         working-directory: desktop
 
+      # `desktop/dist/` is committed. The release pipeline rebuilds it, so a
+      # stale bundle cannot reach a user — but it can absolutely reach a
+      # developer, because `cargo build -p p2pem-desktop` bundles whatever is on
+      # disk. The symptom is the worst kind: the app runs, and it is silently a
+      # previous version of the UI.
+      #
+      # Vite writes content-hashed filenames, so a source change that was not
+      # rebuilt shows up as a modified index.html plus an untracked asset —
+      # which is why this reads `git status`, not `git diff`. Linux only: this
+      # compares bytes, and there is no reason to make three platforms agree on
+      # them when one answers the question.
+      - name: The committed bundle is not stale
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: desktop
+        run: |
+          if [ -n "$(git status --porcelain -- dist)" ]; then
+            echo "::error::desktop/dist is stale — run 'npm run build' in desktop/ and commit the result"
+            git status --porcelain -- dist
+            git diff -- dist | head -50
+            exit 1
+          fi
+          echo "committed bundle matches a fresh build"
+
       # Everything above this line tests pieces. None of it notices if the
       # assembled app fails to come up — which is how a CSP change that left
       # every screen blank passed all of it. The smoke tests load the real page
@@ -396,7 +496,8 @@ jobs:
       # Chromium only, cached on the lockfile (which pins @playwright/test to an
       # exact version, so a bump invalidates it).
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        # actions/cache v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ github.workspace }}/.playwright-browsers
           key: playwright-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json') }}
@@ -463,7 +564,8 @@ jobs:
       # very hard to diagnose from a log line alone.
       - name: Upload smoke test report
         if: failure()
-        uses: actions/upload-artifact@v4
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: smoke-report-${{ matrix.os }}
           path: |
@@ -473,13 +575,16 @@ jobs:
 
   build-verification:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.rust == 'true'
     name: Build Verification
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -521,15 +626,123 @@ jobs:
           exit 1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Build
         run: cargo build --workspace --locked
+
+  # How much of this the tests actually reach was, until now, unknown. 593 test
+  # functions is a number about the tests, not about the code — and this is a
+  # codebase whose invariants are mostly security invariants, where the
+  # interesting question is which branch of a trust decision has never been
+  # executed.
+  #
+  # Deliberately **not** on pull requests. Instrumented, the suite runs roughly
+  # twice as long as the 11 minutes it already takes, which would make coverage
+  # the critical path of every review. On pushes to main it is free — nobody is
+  # waiting on it — and that is enough to see the trend.
+  #
+  # There is deliberately no `--fail-under-lines` yet. A floor picked before
+  # measuring is either so low it asserts nothing or so high it is red on
+  # arrival, and a job that is red on arrival is a job people learn to ignore —
+  # the same reasoning that scopes `npm audit` to `high`. Read the first few
+  # runs, then set the floor just under the real number and let it ratchet.
+  coverage:
+    needs: changes
+    if: github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true'
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if [ "$attempt" -gt 1 ]; then
+              sudo dpkg --configure -a || true
+            fi
+            if timeout -k 30 240 sudo -E apt-get update \
+               && timeout -k 30 420 sudo -E apt-get install -y \
+                 libgtk-3-dev libwebkit2gtk-4.1-dev \
+                 libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "apt attempt $attempt failed or timed out"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed three times; this is an infrastructure problem, not the diff"
+          exit 1
+
+      - name: Install Rust
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        # Swatinem/rust-cache v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: coverage
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        # taiki-e/install-action v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      # `--no-report` keeps the raw profile data instead of rendering and
+      # discarding it, so the two reports below are both generated from one
+      # instrumented run of the suite rather than running it twice.
+      #
+      # The nextest profile is selected through the environment rather than
+      # `--profile ci`: under `cargo llvm-cov nextest`, `--profile` is cargo's
+      # build profile, and the flag would be read by the wrong tool.
+      - name: Measure
+        env:
+          NEXTEST_PROFILE: ci
+        run: cargo llvm-cov --no-report nextest --workspace
+
+      # The test files are excluded from the measurement. Coverage *of* a test
+      # is a tautology — it ran, so it is covered — and leaving them in inflates
+      # the number by exactly the part of the tree that needs no assurance.
+      - name: Report
+        run: |
+          ignore='(^|/)(tests|benches)/|fuzz/|/examples/'
+          cargo llvm-cov report --lcov --output-path lcov.info \
+            --ignore-filename-regex "$ignore"
+          {
+            echo '## Coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only --ignore-filename-regex "$ignore"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 30
 
   # Supply chain: advisories, licences, and sources. The accepted-risk list lives
   # in deny.toml, where each entry names the crate and the path that reaches it.
@@ -537,21 +750,26 @@ jobs:
   # leftover entry suppresses findings on a crate we may now use differently.
   supply-chain:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.rust == 'true'
     name: Supply Chain
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        # taiki-e/install-action v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
         with:
           tool: cargo-deny
 
@@ -568,6 +786,76 @@ jobs:
       - name: Accepted advisories are still applicable
         run: ./scripts/check-stale-advisories.sh
 
+  # The workflows are the one part of this repository that nothing else builds,
+  # compiles or executes before it reaches main — they are only ever tested by
+  # running, and release.yml only ever runs on a tag, which is the worst
+  # possible moment to discover a typo in it.
+  #
+  # actionlint type-checks every `${{ }}` expression against the real context
+  # schema, verifies `needs:` references resolve, catches a job depending on one
+  # that cannot run, and pipes each `run:` block through shellcheck. It found
+  # two things on the way in: a shell block that no linter could classify
+  # because `runs-on` was a matrix expression, and confirmation that the
+  # `changes` classifier's case arms were reachable.
+  #
+  # Ungated and unbounded by any other job: it needs no toolchain, no apt, and
+  # no cache, and finishes in seconds.
+  workflow-lint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      # Pinned by version and checksum-verified. This downloads and executes a
+      # binary in a job that reads the repository — the same reasoning that made
+      # the Playwright step use `npm run` rather than `npx`.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+          # sha256 of actionlint_1.7.7_linux_amd64.tar.gz from the release page.
+          ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+        run: |
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o actionlint.tar.gz "$url"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm -f actionlint actionlint.tar.gz
+          actionlint --version
+
+      # shellcheck is preinstalled on ubuntu runners; actionlint picks it up and
+      # lints every `run:` block with it.
+      - name: Lint workflows
+        run: actionlint -color
+
+  # Secret scanning is its own job, and it is the one job with no `if:` on it.
+  #
+  # It used to live inside Supply Chain, which is gated on the diff touching
+  # Rust — so a pull request that only edited Markdown skipped it entirely. A
+  # credential pasted into a README is a published credential; the file
+  # extension it landed in has nothing to do with it. It is also the cheapest
+  # job here, so there is nothing to gain by gating it.
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # `fetch-depth: 0`, because the step below claims to scan history and the
+      # default shallow clone gave it exactly one commit to look at. A secret
+      # that was committed and later removed is still published — that is the
+      # case this job exists for, and it was the one case it could not see.
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       # The gitleaks binary directly, not gitleaks-action: that action exits 1
       # even when its own SARIF reports `"results": []` (it gates on a licence
       # key), which would make this job a permanent red herring. Running the
@@ -583,8 +871,49 @@ jobs:
             | sudo tar -xz -C /usr/local/bin gitleaks
           gitleaks version
 
-      # Full history: a secret that was committed and later removed is still
-      # published, so scanning only the diff would miss the case that matters.
       - name: Secret scan
         run: gitleaks detect --no-banner --redact --verbose
 
+  # One check to protect the branch on.
+  #
+  # The jobs above report `skipped` when the diff does not reach their area,
+  # which is what makes a docs-only pull request mergeable — but it also makes
+  # them useless as required checks directly: a required check that is skipped
+  # never reports `success`, and branch protection configured against a list of
+  # them has to be edited every time a job is added or renamed. This job is the
+  # single required check instead, and it is the only one that has to be named
+  # in the branch ruleset.
+  #
+  # `if: always()` so it still runs when something upstream failed — without it
+  # the gate would be skipped alongside the failure and report nothing at all,
+  # which is indistinguishable from passing.
+  #
+  # `skipped` counts as a pass; `failure` and `cancelled` do not.
+  ci-success:
+    name: All checks passed
+    if: always()
+    needs:
+      - changes
+      - check
+      - msrv
+      - test
+      - frontend
+      - build-verification
+      - coverage
+      - supply-chain
+      - workflow-lint
+      - secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort
+          if echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' >/dev/null; then
+            echo "all green"
+          else
+            echo "::error::at least one job did not pass"
+            exit 1
+          fi
