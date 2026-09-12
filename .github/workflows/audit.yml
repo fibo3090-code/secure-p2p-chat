@@ -1,0 +1,164 @@
+name: Scheduled Audit
+
+# CI answers "did this change break anything". It cannot answer "did the world
+# change under a tree nobody is touching", and that is the shape almost every
+# dependency advisory has: the code is fine on Friday, an advisory is published
+# on Saturday, and the repository keeps reporting green until somebody happens
+# to open a pull request. For a project whose whole value proposition is that it
+# handles other people's private messages, "somebody happened to open a pull
+# request" is not a detection strategy.
+#
+# So the same three questions CI asks on a diff are asked here on a clock, and a
+# failure opens an issue rather than reddening a build nobody is looking at.
+# Dependabot is not a substitute: it proposes version bumps, it does not tell
+# you that what you already have pinned has become vulnerable.
+on:
+  schedule:
+    # 07:00 UTC daily. Deliberately not midnight — that is when everyone else's
+    # cron fires and GitHub delays scheduled runs under load.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Advisories, licences and secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write # file the report when something turns up
+    steps:
+      # Full history for the same reason CI's secret scan needs it: a secret
+      # that was committed and later removed is still published.
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        # dtolnay/rust-toolchain, stable branch
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny
+        # taiki-e/install-action v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-deny
+
+      - name: Install Node
+        # actions/setup-node v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      # Each check runs even if an earlier one failed, and each appends to a
+      # report. Stopping at the first failure would mean a single stale advisory
+      # entry hides a real vulnerability underneath it — and since the only
+      # output of this workflow is one issue, that issue has to describe
+      # everything that is wrong, not the first thing.
+      - name: Run the checks
+        id: audit
+        run: |
+          report=$(mktemp)
+          failed=0
+
+          run() { # run <heading> <command...>
+            local heading="$1"; shift
+            echo "::group::$heading"
+            local out rc=0
+            out=$("$@" 2>&1) || rc=$?
+            echo "$out"
+            echo "::endgroup::"
+            if [ $rc -ne 0 ]; then
+              failed=1
+              {
+                echo "### ❌ $heading"
+                echo
+                echo '```'
+                # Trim: the issue body has a 65536-character limit and a
+                # dependency tree dump will happily exceed it.
+                echo "$out" | tail -80
+                echo '```'
+                echo
+              } >> "$report"
+            else
+              echo "### ✅ $heading" >> "$report"
+              echo >> "$report"
+            fi
+          }
+
+          run "Rust advisories, licences and sources (cargo-deny)" \
+            cargo deny --all-features check
+          run "Accepted advisories are still applicable" \
+            ./scripts/check-stale-advisories.sh
+          run "npm production advisories" \
+            npm --prefix desktop audit --omit=dev --audit-level=high
+          run "Secret scan (full history)" \
+            gitleaks detect --no-banner --redact --verbose
+
+          {
+            echo 'report<<AUDIT_EOF'
+            cat "$report"
+            echo 'AUDIT_EOF'
+            echo "failed=$failed"
+          } >> "$GITHUB_OUTPUT"
+
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # One issue, reopened and updated rather than a new one per day. A daily
+      # cron that files a fresh issue every morning produces a tracker nobody
+      # reads by the end of the week.
+      - name: File or update the report
+        if: steps.audit.outputs.failed == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT: ${{ steps.audit.outputs.report }}
+          TITLE: 'Scheduled audit is failing'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # shellcheck disable=SC2016  # the backticks are Markdown code spans
+          # for the issue body, not command substitution — single quotes are
+          # exactly what keeps them literal.
+          body=$(printf '%s\n\n---\n\nFrom [this run](%s) against `%s`.\n' \
+            "$REPORT" "$RUN_URL" "$GITHUB_SHA")
+
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --state open --search "$TITLE in:title" \
+            --json number -q '.[0].number')
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            echo "updated issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --body "$body"
+          fi
+
+      - name: Fail the run if anything was found
+        if: steps.audit.outputs.failed == '1'
+        run: |
+          echo "::error::the scheduled audit found something; see the issue it filed"
+          exit 1
