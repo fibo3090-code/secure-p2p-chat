@@ -33,7 +33,7 @@ Controls:
 
 - X25519 + HKDF session establishment
 - transcript-bound authenticated encryption
-- RSA-PSS identity proofs
+- Ed25519 identity proofs, with RSA-PSS as the negotiated fallback
 - replay checks
 - handshake timeouts and rate limiting
 
@@ -96,7 +96,7 @@ Controls:
 
 - the trust tier is a **server property**, shown to users; the operator wears an explicit "this operator can read messages" badge
 - the client↔server channel uses the same v3 handshake, and the server has its own **TOFU-verified** identity/fingerprint (stable across restarts)
-- file downloads are access-checked server-side (`blob_bytes_for(member, hash)`): only channel members or DM participants can fetch a blob, despite global content-addressed dedup
+- file downloads are access-checked server-side (`plan_blob_read(member, hash)`): only channel members or DM participants can fetch a blob, despite global content-addressed dedup
 
 Residual limitation:
 

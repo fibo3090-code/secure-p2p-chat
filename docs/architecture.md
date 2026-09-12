@@ -65,8 +65,11 @@ core/src/
     framing.rs
     protocol.rs
   network/
-    discovery.rs
-    relay.rs
+    discovery.rs    optional mDNS advertisement/browse
+    nat.rs          local/public endpoint candidates for hole punching
+    punch.rs        TCP simultaneous-open hole punching
+    ratelimit.rs    per-IP connection budget (relay + community server)
+    relay.rs        rendezvous, hole-punch coordination, bridged fallback
     session.rs
   identity/
     mod.rs
@@ -93,15 +96,6 @@ client/src/
       tests.rs        ChatManager unit tests
     party_manager.rs  Party server client-side state and operations
     persistence.rs
-  gui/
-    app_ui.rs
-    chat_view.rs
-    dialogs.rs
-    help_view.rs
-    party_view.rs   Party server window (join, channels, members, DMs)
-    sidebar.rs
-    styling.rs
-    widgets.rs
   tui/
     app.rs          state machine, key routing, command execution
     command.rs      command language (TuiCommand) + parser + registry
@@ -111,7 +105,9 @@ client/src/
 client/tests/      integration tests (link against the client lib)
 
 server/src/
-  main.rs         TCP accept loop + server bootstrap
+  main.rs         binary entry point: argument parsing and bind
+  lib.rs          run_accept_loop + the module tree, so a test can stand a real
+                  server up in process
   state.rs        PartyState: members + roles, channels + access, DM threads,
                   history, file blobs/references, quotas, audit log, persistence
   dispatch.rs     request → response/broadcast routing
@@ -121,6 +117,8 @@ server/src/
 
 desktop/
   src-tauri/
+    src/main.rs   the desktop binary: calls into lib.rs
+    src/tests.rs  IPC-level bridge tests over Tauri's mock runtime
     src/lib.rs    the Tauri bridge core: Bridge state, run()/init, the background
                   poll loop that forwards toasts / fingerprint requests / party
                   events and persists history, and its own data dir
@@ -143,7 +141,7 @@ desktop/
 
 - parses CLI mode/launch flags
 - configures tracing
-- starts GUI or TUI
+- starts the ratatui TUI, or the relay server in `--relay-server` mode
 
 ### `client/src/app/chat_manager/`
 
@@ -235,6 +233,15 @@ desktop/
   reference counting and quotas, an audit log, all mirrored to embedded SQLite),
   request dispatcher, cross-connection broadcast hub, per-connection serve loop,
   and a persistent owner-only identity
+- **blob bytes never move under the state lock.** `dispatch::handle_request`
+  decides under the lock — access control is a question about state — and
+  returns a `Dispatch { deferred: Some(..) }`; `connection.rs` performs the read
+  or write on `spawn_blocking` once the lock is released. Uploads are three
+  phase on both the inline and the chunked path (`begin_upload` reserves the
+  storage and takes the bytes, `write_staging` hashes and fsyncs with no lock
+  held, `commit_upload` re-checks permission and renames into place), so one
+  member's 100 MiB transfer no longer stalls every other member's messages for
+  its duration
 
 ### `client/src/app/party_manager.rs`
 
@@ -250,8 +257,8 @@ desktop/
   transfers, help), auto-scrolling message view, toast stack, and a typed
   command language that exposes every action (so the app is fully usable
   from the keyboard or driven programmatically)
-- shares the same `ChatManager` backend as the GUI, including fingerprint
-  confirmation, encrypted-history persistence, and auto-rehost
+- shares the same `ChatManager` backend as the desktop app, including
+  fingerprint confirmation, encrypted-history persistence, and auto-rehost
 
 ### `desktop/src-tauri/src/lib.rs` (the Tauri bridge)
 

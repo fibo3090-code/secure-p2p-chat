@@ -50,7 +50,8 @@ predate tagged releases.
 - **A file upload that fails at the last moment no longer leaves its data on the
   server.** Uploads are also now counted against the storage limit while they
   are still arriving, so a burst of them can no longer fill the disk well past
-  the configured ceiling before being refused.
+  the configured ceiling before being refused. Re-uploading a file the server
+  already holds is still free, as it always was.
 - **Permission to post a file is re-checked when it finishes arriving**, not
   only when it starts. On a large upload those are minutes apart, and someone
   whose access was removed in between still had their file posted.
@@ -67,19 +68,30 @@ predate tagged releases.
   It used to just close, so an expired invite looked exactly like a broken
   relay — and the used-up slot was left behind, blocking that code from being
   reused.
-
-### Fixed
-
 - **A device on your network that changes address is listed at the new one.** It
   used to keep its old entry forever, and a machine on two networks was only
   ever shown on one of them. The list of nearby peers is also now capped, so
   nothing on the network can grow it without limit.
+- **The app came up as a blank window when run from source** (`tauri dev`
+  only — never in a release build). The content-security policy added in 1.16.0
+  blocked the script the dev server injects, so every screen was empty with
+  nothing on it to explain why. Packaged builds keep the strict policy.
+
+### Added
+
+- **Smoke tests that actually start the app.** Everything else tested pieces;
+  nothing loaded the page, which is how a blank window passed 844 tests and 15
+  CI checks. A headless browser now opens both the dev server and a production
+  build and checks the app mounted and logged nothing.
+- **Two more fuzz targets, at the earliest points a stranger can reach**: the
+  4-byte length prefix every packet starts with (before any handshake or
+  decryption) and the identity proof (read before any decision to trust a
+  peer). The seed corpus that makes those runs productive is now tracked in the
+  repository, with a test that fails if a seed stops being valid input.
+- **The minimum supported Rust version is now checked by CI**, rather than only
+  being written down.
 
 ### Changed
-
-- Updated the X25519 key-exchange and SQLite libraries. The key-exchange bump
-  also removes a duplicate copy of the underlying elliptic-curve implementation,
-  so there is now one rather than two compiled into every build.
 
 - Releases are now built, signed and verified before the release page becomes
   visible, and the provenance signature covers exactly what the build produced —
@@ -87,6 +99,32 @@ predate tagged releases.
   SECURITY.md for how to check it.
 - The minimum supported Rust version is now correctly declared as 1.89. It said
   1.86, which no longer built.
+- CI runs on Node 22 (Node 20 is out of support), gives every network-touching
+  step a timeout so a hung download fails instead of occupying a runner for six
+  hours, and no longer builds the whole workspace on three platforms to check a
+  Markdown file.
+
+### Dependencies
+
+- X25519 key exchange 2.0 → 3.0, which also removes a duplicate copy of the
+  underlying elliptic-curve implementation: there is now one rather than two
+  compiled into every build.
+- SQLite (`rusqlite`) 0.39 → 0.40, `mdns-sd` 0.20 → 0.21, `base64` 0.21 → 0.22.
+  `base64` is now built without its default features, so the app no longer
+  carries a second allocator-level code path it never calls.
+- Ten security advisories that had been accepted with a written justification
+  were withdrawn upstream in August and are no longer acknowledged here.
+
+### Documentation
+
+- **The design for server-side encryption tiers** (`docs/server_tiers.md`)
+  replaces the earlier asynchronous-delivery sketch. Direct peer-to-peer
+  messaging is unchanged and stays end-to-end encrypted; the proposal is about
+  what a *community server* can see, with three settings — none, private
+  messages only, or everything. It is a design, not a shipped feature.
+- Corrected the documented limit on message size. `MAX_TEXT_MESSAGE_BYTES`
+  (64 KiB) was described as a hard cap on a message; it is the threshold above
+  which a message is split, and the real ceiling is about 24 MiB.
 
 ## [1.16.2] - 2026-08-20
 

@@ -1,6 +1,6 @@
 # P2PEM — Encrypted P2P Messenger
 
-[![Version](https://img.shields.io/badge/version-1.15.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.16.2-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE.md)
 [![Security](https://img.shields.io/badge/security-self--assessed-yellow)](SECURITY.md)
 [![Rust](https://img.shields.io/badge/rust-1.89+-orange)](https://www.rust-lang.org/)
@@ -30,7 +30,8 @@ to use the desktop app.
 ## What you get
 
 - **End-to-end encryption** on every conversation — X25519 key agreement with
-  forward secrecy, AES-256-GCM, RSA-PSS identity proofs, automatic key rotation.
+  forward secrecy, AES-256-GCM, Ed25519 identity proofs (RSA-PSS fallback),
+  automatic key rotation.
 - **Verification you can actually do.** On first contact both sides see the same
   six digits and three emoji. Read them aloud over a call; if they match, nobody
   is in the middle. (The 64-character fingerprint and a colour grid are there

@@ -20,12 +20,21 @@ Run these before opening a PR:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace          # or: cargo test --workspace
+cargo test --workspace --doc           # nextest does not run doctests
 ```
 
-If you changed the Tauri desktop crate (`desktop/`), also run
-`cargo check -p p2pem-desktop` and `cd desktop && npm run build` (it has no
-automated tests). If you touch packaging or release files, validate the relevant
-scripts manually.
+If you changed anything under `desktop/`, also run the frontend gates — they are
+all enforced by CI:
+
+```bash
+cd desktop
+npm run lint      # a deliberately narrow rule set: bugs, not style
+npm test          # vitest: pure modules in node, React components in jsdom
+npm run build     # and commit the rebuilt desktop/dist/, which is tracked
+npm run smoke     # Playwright: the only gate that actually starts the app
+```
+
+If you touch packaging or release files, validate the relevant scripts manually.
 
 ## Bug Reports
 
@@ -42,7 +51,9 @@ Security issues must **not** be reported in public issues — see the [responsib
 - [ ] `cargo fmt --all -- --check` passes.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.
 - [ ] `cargo nextest run --workspace` (or `cargo test --workspace`) passes.
-- [ ] If `desktop/` changed: `cargo check -p p2pem-desktop` and `npm run build` pass.
+- [ ] `cargo test --workspace --doc` passes.
+- [ ] If `desktop/` changed: `npm run lint`, `npm test`, `npm run build` and
+      `npm run smoke` pass, and the rebuilt `desktop/dist/` is committed.
 - [ ] Relevant docs updated.
 - [ ] `CHANGELOG.md` updated for user-visible changes.
 

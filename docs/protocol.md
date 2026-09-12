@@ -8,8 +8,13 @@ This document describes the current wire behavior of the application. It should 
 PORT_DEFAULT: 12345
 MAX_PACKET_SIZE: 8 MiB
 FILE_CHUNK_SIZE: 64 KiB
-MAX_TEXT_MESSAGE_BYTES: 64 KiB   // hard cap on a single text message
-TEXT_CHUNK_BYTES: 48 KiB         // split threshold (headroom for metadata)
+MAX_TEXT_MESSAGE_BYTES: 64 KiB   // cap on ONE Text frame, and the threshold
+                                 // above which a message is chunked.
+                                 // NOT a cap on a message — see below.
+TEXT_CHUNK_BYTES: 48 KiB         // bytes per TextChunk (headroom for metadata)
+MAX_TEXT_CHUNKS: 512             // so one message tops out near 24 MiB
+MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT: 16
+MIN_PASSWORD_LEN: 12             // enforced in Identity::encrypt, not the UI
 AES_KEY_SIZE: 32
 AES_NONCE_SIZE: 12
 AES_GCM_TAG_SIZE: 16
@@ -32,8 +37,9 @@ MAX_MESSAGE_TEXT_BYTES: 64 KiB   // channel and DM text
 - Session establishment: X25519 ECDH
 - Key derivation: HKDF-SHA256
 - Transport encryption: AES-256-GCM
-- Long-term identity keys: RSA-2048
-- Identity proofs: RSA-PSS with SHA-256
+- Long-term identity keys: RSA-2048 (the fingerprint TOFU pins is derived from it)
+- Identity proofs: Ed25519 when both peers offer it, RSA-PSS with SHA-256
+  otherwise — see "Identity proof signatures" below
 - Chat history encryption: ChaCha20-Poly1305
 
 ## Framing
@@ -121,8 +127,10 @@ The proof contains:
 
 Current runtime support:
 
-- the wire keeps `signature_scheme`
-- the runtime currently advertises and accepts only `RSA-PSS`
+- the wire keeps `signature_scheme`, and peers negotiate it: `negotiate_signature_scheme`
+  picks **Ed25519** when both sides advertise it and falls back to **RSA-PSS**.
+  See "Identity proof signatures" below for the binding that makes the Ed25519
+  subkey speak for the RSA identity
 
 ## Message Types
 
@@ -162,10 +170,29 @@ Handshake-only messages without sequence numbers bypass that validation.
 
 Text larger than `TEXT_CHUNK_BYTES` (48 KiB) is split by the app layer into
 `TextChunk` messages (`message_id`, `chunk_index`, `total_chunks`, `text_part`) and
-reassembled by the receiver into one logical message. A single message is
-hard-capped at `MAX_TEXT_MESSAGE_BYTES` (64 KiB); encoding or decoding a larger one
-is rejected. Each chunk carries its own `seq`, so replay protection covers chunks
-exactly like file chunks.
+reassembled by the receiver into one logical message. Each chunk carries its own
+`seq`, so replay protection covers chunks exactly like file chunks.
+
+**The limits here are easy to misread, and this document used to state one of
+them wrongly.** `MAX_TEXT_MESSAGE_BYTES` (64 KiB) is **not** a cap on a message.
+It is two other things: the cap on a single `Text` *frame*, and the threshold
+above which a message is chunked instead. The real ceiling on one message is
+`MAX_TEXT_CHUNKS` × `TEXT_CHUNK_BYTES` — 512 × 48 KiB, or about **24 MiB** —
+enforced symmetrically, refused both on send and on decode. Anyone sizing a
+buffer or reasoning about memory from the 64 KiB figure alone is out by a factor
+of 384.
+
+Reassembly is bounded twice more, because a cap on one message is not a cap on
+what a peer can make you hold: `MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT` (16)
+partial messages per chat, and a 120-second timeout on each. Without those a
+peer could open buffers and simply sit on them.
+
+Every peer-supplied string is decoded **strictly**: invalid UTF-8 is refused, not
+repaired. `String::from_utf8_lossy` expands each invalid byte to three, and every
+cap above counts *wire* bytes, so lossy decoding let a 64 KiB frame become 192
+KiB in memory and the 512-chunk ceiling admit roughly 72 MiB against a documented
+24 MiB. It also made the decoder accept frames its own encoder could not
+reproduce. See `decode_text` in `core/src/core/protocol.rs`.
 
 ## Delivery receipts
 

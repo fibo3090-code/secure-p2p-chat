@@ -48,8 +48,8 @@ An accurate audit of what exists today (last verified against the codebase at
 
 Protocol v3 handshake (X25519 ECDH → HKDF-SHA256 → AES-256-GCM), TOFU fingerprint
 verification with a transcript-bound SAS, forward secrecy, replay protection,
-automatic rekeying, 1:1 text (chunked past 48 KiB, hard-capped at 64 KiB) + file
-transfer up to 10 GiB with an acceptance gate and either-side cancellation,
+automatic rekeying, 1:1 text (split into 48 KiB frames past 64 KiB, ceiling
+~24 MiB) + file transfer up to 10 GiB with an acceptance gate and either-side cancellation,
 delivery receipts (`Ack`), typing indicators, encrypted local history with a
 persisted read mark, opt-in mDNS LAN peer discovery, and signed invite links
 (multi-address, 30-day expiry). "Group chat" today is only client-side fan-out
@@ -349,8 +349,9 @@ text message; `DownloadFile { hash }` returns the bytes. The server stores each
 blob once, keyed by SHA-256, reference-counted, with the bytes on disk under
 `<data_dir>/blobs/<hash>` and metadata (`hash, size, mime, refcount`) in the
 `blobs` SQLite table. Downloads are access-checked
-(`PartyState::blob_bytes_for(member, hash)` — channel members or DM participants
-only), and total blob bytes are capped by an operator-adjustable server-wide
+(`PartyState::plan_blob_read(member, hash)` — channel members or DM participants
+only — which decides under the state lock and hands `connection.rs` a plan to
+read the bytes after releasing it), and total blob bytes are capped by an operator-adjustable server-wide
 ceiling (`MAX_TOTAL_BLOB_BYTES`, 1 GiB by default) as a stand-in until real
 quotas land. **Client wiring (done):** the desktop app can now share a
 file into a channel or DM (a paperclip in the composer → `PartyManager::send_file`

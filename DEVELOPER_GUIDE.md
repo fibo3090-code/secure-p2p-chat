@@ -76,7 +76,11 @@ GTK/webkit dev packages CI installs. The webview UI itself cannot be driven
 headlessly; it is covered by `npm test` + `npm run build` in `desktop/`.
 
 CI (`.github/workflows/ci.yml`) enforces formatting, clippy with warnings
-denied, tests on Ubuntu/Windows/macOS, and a locked Linux build verification.
+denied, tests on Ubuntu/Windows/macOS, a locked Linux build verification, a
+build at the declared MSRV, a `cargo check` of `core/fuzz/` (its own workspace,
+which `--workspace` does not reach), the frontend gates (`npm run lint`,
+`npm test`, `npm run build`) and the Playwright smoke tests, plus the
+supply-chain checks (`cargo-deny`, advisory review).
 The tag-based release workflow (`.github/workflows/release.yml`) publishes **one
 product**: P2PEM Desktop installers for Windows, macOS (both architectures), and
 Linux, built by `tauri-action`. A secondary **P2PEM Tools** archive per OS
@@ -104,8 +108,10 @@ The canonical module map and directory tree live in
 - `ChatManager` is the application source of truth.
 - Identity keys must remain encrypted on disk.
 - Transport sequence numbers are monotonic per active session/chat mapping.
-- Signed invite generation uses RSA-PSS over the application's serialized payload bytes.
-- The runtime currently supports RSA-PSS identity proofs only, even though the wire format keeps a `SignatureScheme` field.
+- Signed invite generation signs the application's serialized payload bytes.
+- Identity proofs are negotiated: both sides advertise their `SignatureScheme`s
+  and `negotiate_signature_scheme` picks **Ed25519** when both offer it,
+  falling back to RSA-PSS. Do not assume either one at a call site.
 
 ## Security-Sensitive Areas
 
@@ -116,7 +122,8 @@ Review carefully before changing:
 - `core/src/core/protocol.rs`
 - `core/src/identity/mod.rs`
 - `client/src/app/persistence.rs`
-- `server/src/state.rs` (Party access control, incl. `blob_bytes_for`)
+- `server/src/state.rs` (Party access control, incl. `plan_blob_read` and the
+  three-phase upload — `begin_upload` / `write_staging` / `commit_upload`)
 - `desktop/src-tauri/src/lib.rs` (the IPC boundary + CSP)
 
 When touching these:
@@ -144,6 +151,11 @@ When touching these:
 
 - Identity proofs and transport packets are authenticated with transcript-bound AAD.
 - The session key rotates automatically every 100 messages via a `Rekey` message (16-byte HKDF salt); both sides re-derive and the frame is not surfaced to the app. See `docs/protocol.md`.
-- Text over 48 KiB is chunked into `TextChunk` frames (hard cap 64 KiB); file chunks are 64 KiB. Both share the per-session replay `seq` namespace.
+- `MAX_TEXT_MESSAGE_BYTES` (64 KiB) is **not** a cap on a message: it is the cap
+  on one `Text` frame and the threshold above which a message is split into
+  `TextChunk` frames of `TEXT_CHUNK_BYTES` (48 KiB), up to `MAX_TEXT_CHUNKS`
+  (512) — so a message tops out near 24 MiB, refused symmetrically on send and
+  on decode. File chunks are 64 KiB. Both share the per-session replay `seq`
+  namespace.
 - Legacy invite format is still accepted for compatibility; the UI emits signed invites (v2 URL format carrying a v3 payload — see `docs/protocol.md`).
 - LAN discovery is optional and disabled by default because of privacy tradeoffs.

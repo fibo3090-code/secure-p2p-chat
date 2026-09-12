@@ -38,29 +38,31 @@ This document records the current UI/UX principles for the app and the main desi
   brand-compliance failures.
 - There is no cross-language token pipeline. The desktop app consumes the
   values as CSS custom properties (`desktop/src/app-system.css`,
-  `desktop/src/themes.css`), egui as `Color32` constants
-  (`client/src/gui/styling.rs`), and the TUI uses the flat accent only for
-  theme-neutral chrome. A test (`token_drift_tests` in
-  `client/src/gui/styling.rs`) asserts egui matches `design/tokens.json`, so
-  drift fails CI instead of going unnoticed.
+  `desktop/src/themes.css`); the TUI uses the flat accent only for
+  theme-neutral chrome. Each consumer has its own drift test against
+  `design/tokens.json` — `desktop/src/lib/tokens.test.js` for the CSS
+  properties and `token_drift_tests` in `client/src/tui/overlays.rs` for the
+  TUI — so drift fails CI instead of going unnoticed.
 - When changing brand colors: update `design/tokens.json` first, then each
-  consumer, then the drift test will confirm egui agrees.
+  consumer; the drift tests then confirm the consumers agree.
 
 ## Frontends
 
-There are three: the **egui** desktop GUI, the **ratatui** TUI, and the newer
-**Tauri + React desktop app** (`desktop/`), which realizes the designed tab-rail /
-list / content shell described in `docs/platform_spec.md` §10 and is meant to
-replace egui. All three drive the same `ChatManager`, so behavior stays consistent;
-the design intent (one mental model, Party as a tab rather than a floating window,
-overlays only for interruptive flows) is expressed most fully in the desktop app.
+There are two: the **Tauri + React desktop app** (`desktop/`) — the shipped
+product, which realizes the designed tab-rail / list / content shell described in
+`docs/platform_spec.md` §10 — and the **ratatui** TUI, for terminal and headless
+use. An earlier egui desktop GUI existed and has been deleted; there is one app
+on the releases page, so nobody has to guess which to install. Both frontends
+drive the same `ChatManager`, so behavior stays consistent; the design intent
+(one mental model, Party as a tab rather than a floating window, overlays only
+for interruptive flows) is expressed most fully in the desktop app.
 
 ## Current Gaps
 
 - Settings layout is still dense.
 - File transfer progress/cancellation UX is still limited.
 - Accessibility work is incomplete (the desktop app hand-rolls components; no headless a11y library yet).
-- Parity across the three frontends is functional, but not identical in polish; egui and the Tauri app coexist during the migration.
+- Parity between the desktop app and the TUI is functional, but not identical in polish; the TUI is deliberately narrower, covering the same actions through a typed command language rather than mirroring the layout.
 
 ## Design Change Rule
 

@@ -15,6 +15,7 @@ This is the canonical index for project documentation.
 - Architecture: [architecture.md](architecture.md)
 - Protocol: [protocol.md](protocol.md)
 - Platform plan & roadmap: [platform_spec.md](platform_spec.md)
+- Community-server encryption tiers (design, not shipped): [server_tiers.md](server_tiers.md)
 - Security posture: [../SECURITY.md](../SECURITY.md)
 - Threat model: [../THREAT_MODEL.md](../THREAT_MODEL.md)
 
