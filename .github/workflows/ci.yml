@@ -821,7 +821,11 @@ jobs:
           ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
         run: |
           url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfL -o actionlint.tar.gz "$url"
+          # `--proto '=https' --tlsv1.2`: -L follows redirects, so without this a
+          # redirect could downgrade the download to plaintext http. The sha256
+          # below would still catch it, but failing closed on the transport is
+          # cheaper than failing on the hash.
+          curl -sSfL --proto '=https' --tlsv1.2 -o actionlint.tar.gz "$url"
           echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
           sudo install -m 0755 actionlint /usr/local/bin/actionlint

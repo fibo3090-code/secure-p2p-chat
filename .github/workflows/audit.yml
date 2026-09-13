@@ -61,16 +61,30 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - name: Install frontend dependencies
-        run: npm ci
+        # `--ignore-scripts`: the only thing this job does with the tree is
+        # `npm audit`, which reads it. Running every dependency's install hooks
+        # first is backwards in the one workflow whose purpose is to decide
+        # whether those dependencies are trustworthy.
+        run: npm ci --ignore-scripts
         working-directory: desktop
 
       - name: Install gitleaks
         env:
           GITLEAKS_VERSION: 8.30.1
+          # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release's own
+          # checksums.txt. Same pattern as the actionlint install in ci.yml.
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         run: |
-          curl -sSfL \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin gitleaks
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          # `--proto '=https' --tlsv1.2`: -L follows redirects, so without this a
+          # redirect could downgrade the download to plaintext http.
+          curl -sSfL --proto '=https' --tlsv1.2 -o gitleaks.tar.gz "$url"
+          # This used to pipe curl straight into `sudo tar`, which extracts the
+          # bytes before anything can check them — the secret scanner was the
+          # one tool installed with no verification at all.
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          sudo tar -xzf gitleaks.tar.gz -C /usr/local/bin gitleaks
+          rm -f gitleaks.tar.gz
           gitleaks version
 
       # Each check runs even if an earlier one failed, and each appends to a
