@@ -471,22 +471,46 @@ jobs:
       # disk. The symptom is the worst kind: the app runs, and it is silently a
       # previous version of the UI.
       #
-      # Vite writes content-hashed filenames, so a source change that was not
-      # rebuilt shows up as a modified index.html plus an untracked asset —
-      # which is why this reads `git status`, not `git diff`. Linux only: this
-      # compares bytes, and there is no reason to make three platforms agree on
-      # them when one answers the question.
+      # What actually signals staleness is the **file list**. Vite writes
+      # content-hashed asset names, so any change to frontend source renames
+      # `index-<hash>.js`, which shows up as an untracked file plus a deleted
+      # one. That is the check; it cannot produce a false negative, because
+      # identical hashes mean identical bytes.
+      #
+      # The content comparison deliberately ignores whitespace. Vite's HTML
+      # emit is not byte-identical across platforms — a Linux build and a
+      # Windows build of the same commit differ in `dist/index.html` by
+      # whitespace alone, with every asset hash matching. Gating on bytes made
+      # this job permanently red on Linux for a bundle that was demonstrably
+      # current: a local rebuild reproduced the committed tree exactly. A
+      # whitespace difference in the wrapper HTML cannot mean the bundle is
+      # stale, and a check that fails for a reason it was not built to detect
+      # is one people learn to force past.
+      #
+      # Linux only: one platform answers the question, and the other two would
+      # only add ways for it to disagree with itself.
       - name: The committed bundle is not stale
         if: matrix.os == 'ubuntu-latest'
         working-directory: desktop
         run: |
-          if [ -n "$(git status --porcelain -- dist)" ]; then
+          added=$(git ls-files --others --exclude-standard -- dist)
+          removed=$(git diff --name-only --diff-filter=D -- dist)
+
+          if [ -n "$added" ] || [ -n "$removed" ]; then
             echo "::error::desktop/dist is stale — run 'npm run build' in desktop/ and commit the result"
-            git status --porcelain -- dist
-            git diff -- dist | head -50
+            [ -n "$added" ]   && { echo "assets a rebuild produced that are not committed:"; echo "$added"; }
+            [ -n "$removed" ] && { echo "committed assets a rebuild no longer produces:";    echo "$removed"; }
             exit 1
           fi
-          echo "committed bundle matches a fresh build"
+
+          if ! git diff --quiet --ignore-all-space --ignore-blank-lines \
+                 --ignore-cr-at-eol -- dist; then
+            echo "::error::desktop/dist differs from a fresh build by more than whitespace"
+            git diff --ignore-all-space --ignore-blank-lines --ignore-cr-at-eol -- dist | head -60
+            exit 1
+          fi
+
+          echo "committed bundle matches a fresh build (asset hashes identical)"
 
       # Everything above this line tests pieces. None of it notices if the
       # assembled app fails to come up — which is how a CSP change that left
