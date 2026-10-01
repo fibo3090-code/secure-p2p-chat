@@ -8,6 +8,8 @@
 Messages that go straight from your device to your friend's, end-to-end
 encrypted, with no account and no server holding your history. Built in Rust.
 
+![P2PEM desktop: a verified, end-to-end encrypted conversation](docs/images/desktop-chat.png)
+
 ## Install
 
 **[Download P2PEM Desktop](https://github.com/fibo3090-code/secure-p2p-chat/releases/latest)** — Windows, macOS, or Linux.
