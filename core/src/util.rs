@@ -236,6 +236,28 @@ fn is_forbidden_char(c: char) -> bool {
         || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
 }
 
+/// True when `name` contains a character that is invisible, or that changes how
+/// the text around it is drawn, rather than being part of the name.
+///
+/// That is control codes, the bidirectional overrides and isolates, and the
+/// zero-width and joiner characters. A display name containing one can pass
+/// for another (`ad\u{200B}min` renders as `admin`; `\u{202E}nimda` renders as
+/// `admin` too) or render as nothing at all, so names other people will read —
+/// community usernames and channel names — refuse them outright.
+pub fn has_hidden_characters(name: &str) -> bool {
+    name.chars().any(|c| {
+        is_forbidden_char(c)
+            || matches!(
+                c,
+                '\u{00AD}'                      // soft hyphen
+                    | '\u{180E}'                // Mongolian vowel separator
+                    | '\u{200B}'..='\u{200D}'  // zero-width space / (non-)joiner
+                    | '\u{2060}'..='\u{2064}'  // word joiner, invisible operators
+                    | '\u{FEFF}' // byte-order mark / zero-width no-break space
+            )
+    })
+}
+
 /// Reduce a peer-supplied name to something safe to create on this machine and
 /// honest to display.
 ///

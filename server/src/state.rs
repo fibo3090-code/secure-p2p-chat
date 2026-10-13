@@ -363,6 +363,9 @@ pub enum JoinError {
     UsernameTaken,
     EmptyUsername,
     UsernameTooLong,
+    /// Invisible or text-direction characters, which let one name pass for
+    /// another (see [`messenger_core::util::has_hidden_characters`]).
+    HiddenCharacters,
 }
 
 impl JoinError {
@@ -372,6 +375,9 @@ impl JoinError {
             JoinError::UsernameTaken => "username already taken",
             JoinError::EmptyUsername => "username must not be empty",
             JoinError::UsernameTooLong => "username is too long (max 32 characters)",
+            JoinError::HiddenCharacters => {
+                "username contains invisible or text-direction characters"
+            }
         }
     }
 }
@@ -403,6 +409,11 @@ fn password_matches(expected: Option<&str>, supplied: Option<&str>) -> bool {
 /// member cannot store or broadcast an oversized message. Applies to both channel
 /// posts and DMs.
 fn validate_message_text(text: &str) -> Result<(), String> {
+    // A blank message is stored, broadcast and shown as an empty bubble to
+    // everyone; no client sends one on purpose.
+    if text.trim().is_empty() {
+        return Err("message is empty".to_string());
+    }
     if text.len() > MAX_MESSAGE_TEXT_BYTES {
         return Err(format!(
             "message is too long (max {MAX_MESSAGE_TEXT_BYTES} bytes)"
@@ -738,6 +749,9 @@ impl PartyState {
         if username.chars().count() > MAX_USERNAME_CHARS {
             return Err(JoinError::UsernameTooLong);
         }
+        if messenger_core::util::has_hidden_characters(username) {
+            return Err(JoinError::HiddenCharacters);
+        }
         if !password_matches(self.password.as_deref(), password) {
             return Err(JoinError::WrongPassword);
         }
@@ -1014,6 +1028,9 @@ impl PartyState {
             return Err(format!(
                 "channel name is too long (max {MAX_CHANNEL_NAME_CHARS} characters)"
             ));
+        }
+        if messenger_core::util::has_hidden_characters(name) {
+            return Err("channel name contains invisible or text-direction characters".to_string());
         }
         if self
             .channels

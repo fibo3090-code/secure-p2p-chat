@@ -35,6 +35,9 @@ use rsa::RsaPrivateKey;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+/// The smallest upload chunk the client will use, whatever the server asks for.
+const MIN_UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
+
 /// What happened when the client tried to join a community server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartyJoinOutcome {
@@ -294,7 +297,10 @@ impl PartyServerConn {
             let _ = self.send(PartyRequest::CancelUpload { upload });
             return;
         };
-        let chunk = (chunk_size as usize).clamp(1, PARTY_CHUNK_BYTES);
+        // The server picks the chunk size, but not without limit: honouring a
+        // 1-byte (or 0-byte) answer turned one file into millions of queued
+        // requests on this side.
+        let chunk = (chunk_size as usize).clamp(MIN_UPLOAD_CHUNK_BYTES, PARTY_CHUNK_BYTES);
         for part in data.chunks(chunk) {
             let req = PartyRequest::UploadChunk {
                 upload,
@@ -1136,11 +1142,20 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             };
             // Out-of-order or duplicated chunk: the stream is no longer
             // reconstructible, so fail rather than assemble something wrong.
-            if offset != state.data.len() as u64 {
+            // Likewise a total no server could be storing, or more bytes than
+            // the total it announced — buffering toward either is the client
+            // filling its own memory on the server's say-so.
+            let grown = state.data.len() as u64 + data.len() as u64;
+            let refusal = if offset != state.data.len() as u64 {
+                Some("the server sent file data out of order")
+            } else if total > MAX_PARTY_FILE_BYTES || grown > total {
+                Some("the server sent more file data than the file can hold")
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
                 if let Some(state) = conn.chunked_downloads.remove(&hash) {
-                    let _ = state
-                        .tx
-                        .send(Err("the server sent file data out of order".to_string()));
+                    let _ = state.tx.send(Err(reason.to_string()));
                 }
                 return;
             }
@@ -2053,6 +2068,95 @@ mod tests {
         let thread = &mgr.server(id).unwrap().messages[&channel];
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].seq, 8, "the share's reply confirmed the post");
+    }
+
+    /// A server that asks for 1-byte (or 0-byte) upload chunks must not turn
+    /// one file into millions of queued requests on the client.
+    #[test]
+    fn a_tiny_upload_chunk_size_from_the_server_is_bounded() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
+        let size = MAX_INLINE_FILE_BYTES + 1;
+        mgr.send_file(id, channel, "f.bin".into(), "x".into(), vec![9u8; size])
+            .unwrap();
+        tx.send(Incoming::Response(PartyResponse::UploadReady {
+            upload: Uuid::new_v4(),
+            chunk_size: 0,
+        }))
+        .unwrap();
+        mgr.poll_events();
+        let mut chunks = 0usize;
+        let mut bytes = 0usize;
+        while let Ok(req) = out.try_recv() {
+            if let PartyRequest::UploadChunk { data, .. } = req {
+                chunks += 1;
+                bytes += data.len();
+            }
+        }
+        assert_eq!(bytes, size, "every byte is still sent");
+        assert!(
+            chunks <= size / (16 * 1024) + 1,
+            "{chunks} requests queued for one {size}-byte file"
+        );
+    }
+
+    /// A download the server claims is bigger than anything it may store is a
+    /// server lying about it; the client must not keep buffering toward it.
+    #[test]
+    fn a_download_claiming_more_than_the_server_ceiling_is_refused() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
+        let hash = "ab".repeat(32);
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().messages.insert(
+            channel,
+            vec![Envelope {
+                tier: TrustTier::Administered,
+                sender: Uuid::new_v4(),
+                channel,
+                seq: 1,
+                timestamp: 1,
+                payload: MessagePayload::File(FileMeta {
+                    hash: hash.clone(),
+                    name: "big".into(),
+                    size: MAX_PARTY_FILE_BYTES,
+                    mime: "x".into(),
+                }),
+            }],
+        );
+        let mut rx = mgr.request_download(id, hash.clone()).unwrap();
+        tx.send(Incoming::Response(PartyResponse::FileChunk {
+            hash,
+            offset: 0,
+            total: MAX_PARTY_FILE_BYTES * 1000,
+            data: vec![0u8; 1024],
+        }))
+        .unwrap();
+        mgr.poll_events();
+        assert!(
+            matches!(rx.try_recv(), Ok(Err(_))),
+            "the client kept downloading toward an impossible size"
+        );
+    }
+
+    /// Once the connection is gone, a post must fail and leave nothing on
+    /// screen — not sit there forever looking like it is being delivered.
+    #[test]
+    fn posting_after_the_connection_closed_shows_nothing() {
+        let (mut mgr, id, _tx, out) = manager_with_server();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
+        drop(out);
+        assert!(mgr.post(id, channel, "into the void".into()).is_err());
+        assert!(
+            mgr.server(id)
+                .unwrap()
+                .messages
+                .get(&channel)
+                .is_none_or(|t| t.is_empty()),
+            "an unsent post was left on screen"
+        );
     }
 
     /// A post the server refuses used to stay on screen looking delivered: the

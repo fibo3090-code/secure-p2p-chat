@@ -426,15 +426,18 @@ mod tests {
         };
         let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let (st, h) = (state.clone(), hub.clone());
-        let served = tokio::spawn(async move {
-            serve_connection(&mut server_stream, &server_priv, st, h).await
-        });
+        let served =
+            tokio::spawn(
+                async move { serve_connection(&mut server_stream, &server_priv, st, h).await },
+            );
         let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let mut alice = PartyClient::connect(client_stream, &alice_priv, Uuid::new_v4())
             .await
             .unwrap();
-        let PartyResponse::Joined { member_id: alice_id, .. } =
-            alice.join("alice", None).await.unwrap()
+        let PartyResponse::Joined {
+            member_id: alice_id,
+            ..
+        } = alice.join("alice", None).await.unwrap()
         else {
             panic!("alice did not join");
         };
