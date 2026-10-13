@@ -151,6 +151,15 @@ predate tagged releases.
   carries a second allocator-level code path it never calls.
 - Ten security advisories that had been accepted with a written justification
   were withdrawn upstream in August and are no longer acknowledged here.
+- Argon2 0.5 → 0.6 (the password hash that protects `identity.json`). Its
+  defaults and explicit parameters produce byte-identical keys to 0.5, so
+  existing identities keep unlocking. Tauri and nine other Rust crates move to
+  their latest minor releases; the five `unic-*` advisories they used to pull
+  in no longer apply and are no longer acknowledged.
+- The minimum supported Rust version is now 1.90, which the current Tauri
+  releases require.
+- Desktop front-end: React DOM 19.3, Vite 8.3, Vitest 5, lucide-react 1.46,
+  Testing Library DOM 10.4.2.
 
 ### Documentation
 
