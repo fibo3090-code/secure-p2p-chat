@@ -36,6 +36,14 @@ pub enum TrustTier {
 /// well under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
 pub const MAX_INLINE_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
+/// The `Error` a server answers a download with when the file is unknown *or*
+/// the member may not see it (deliberately the same answer).
+///
+/// Errors are not correlated with the request that caused them, so the client
+/// recognises a failed download by this text. Anything else — a refused
+/// channel name, a failed role change — must not fail a download in flight.
+pub const UNKNOWN_FILE_ERROR: &str = "unknown file";
+
 /// Bytes of file data carried by one [`PartyRequest::UploadChunk`] or
 /// [`PartyResponse::FileChunk`].
 ///

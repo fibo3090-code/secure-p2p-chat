@@ -329,8 +329,10 @@ impl ChatManager {
     /// so the session id alone would resolve to nothing.
     ///
     /// Unlike [`Self::chat_for_session`], an id that already names a chat wins:
-    /// UI callers may pass either end of the mapping.
-    fn resolve_display_chat_id(&self, chat_id: Uuid) -> Uuid {
+    /// UI callers may pass either end of the mapping. A UI holding an id whose
+    /// chat has disappeared (a reconnect folded into an existing conversation)
+    /// can follow it here to the conversation that took its place.
+    pub fn resolve_display_chat_id(&self, chat_id: Uuid) -> Uuid {
         if self.chats.contains_key(&chat_id) {
             return chat_id;
         }
@@ -808,6 +810,26 @@ impl ChatManager {
         }
 
         Ok(())
+    }
+}
+
+/// Dropping the manager ends its sessions.
+///
+/// Dropping a `SessionHandle` only closes the outbound channels, and the message
+/// loop does not treat that as a reason to stop — so without this every socket
+/// (and a listener parked in `accept()`) outlived the manager until the peer
+/// next spoke or the idle timeout fired, and the peer saw the conversation as
+/// still connected for that whole time.
+impl Drop for ChatManager {
+    fn drop(&mut self) {
+        for (_, task) in self.session_tasks.drain() {
+            task.abort();
+        }
+        for handle in self.outgoing_transfers.values() {
+            handle
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

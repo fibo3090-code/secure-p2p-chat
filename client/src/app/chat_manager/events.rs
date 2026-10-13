@@ -238,6 +238,7 @@ impl ChatManager {
                 sas,
                 chat_id,
             } => {
+                self.rejoin_existing_conversation(chat_id, &fingerprint);
                 self.handle_tofu_verification(chat_id, &fingerprint, &peer_name, &sas);
             }
 
@@ -417,6 +418,59 @@ impl ChatManager {
         {
             tracing::debug!("Removing consumed host placeholder chat {}", session_id);
             self.chats.remove(&session_id);
+        }
+    }
+
+    /// The dialing side of "a returning peer belongs in ONE conversation".
+    ///
+    /// Re-dialing a peer by address (or relay code) starts a fresh chat, because
+    /// nothing at dial time says who will answer. The host already routes a
+    /// returning peer back into its existing conversation by fingerprint; the
+    /// dialing side did not, so every reconnect left the user with a new, empty
+    /// "host:port" conversation beside the one holding their history — the two
+    /// sides of the same session disagreeing about which thread it was.
+    ///
+    /// Now that the peer's identity is verified, a fresh, empty chat whose peer
+    /// already has an idle conversation is folded into it: the session keeps
+    /// its id and is mapped to the existing conversation exactly as a host-side
+    /// session is (`chat_id_mapping`), so messages, sends, transfers and
+    /// teardown all route there. TOFU then runs against the existing
+    /// conversation's stored fingerprint, so the prompt is skipped only for a
+    /// peer the user already verified.
+    fn rejoin_existing_conversation(&mut self, session_id: Uuid, fingerprint: &str) {
+        let Some(fresh) = self.chats.get(&session_id) else {
+            return;
+        };
+        // A conversation that already belongs to this peer, or already has
+        // history of its own, is not a fresh dial.
+        if fresh.peer_fingerprint.is_some() || !fresh.messages.is_empty() {
+            return;
+        }
+        let transport = fresh.transport;
+        let Some(existing) = self
+            .chats
+            .iter()
+            .find(|(id, c)| {
+                **id != session_id
+                    && c.peer_fingerprint.as_deref() == Some(fingerprint)
+                    && !c.is_host_placeholder
+                    && !self.is_connected(id)
+            })
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        tracing::info!(%session_id, conversation = %existing, "Reconnected peer routed into its existing conversation");
+        self.chats.remove(&session_id);
+        self.chat_id_mapping.insert(existing, session_id);
+        if let Some(chat) = self.chats.get_mut(&existing) {
+            chat.transport = transport;
+            chat.reset_sequences();
+        }
+        for chat in self.contact_to_chat.values_mut() {
+            if *chat == session_id {
+                *chat = existing;
+            }
         }
     }
 

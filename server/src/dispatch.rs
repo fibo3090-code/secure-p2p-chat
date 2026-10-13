@@ -10,6 +10,7 @@
 
 use messenger_core::party::{
     ChannelKind, Envelope, PartyRequest, PartyResponse, UploadTarget, PARTY_CHUNK_BYTES,
+    UNKNOWN_FILE_ERROR,
 };
 use uuid::Uuid;
 
@@ -146,7 +147,7 @@ pub fn download_reply(
 /// may not see — deliberately the same, so the endpoint never confirms that a
 /// file it will not hand over exists.
 fn unknown_file() -> Dispatch {
-    Dispatch::reply(PartyResponse::Error("unknown file".to_string()))
+    Dispatch::reply(PartyResponse::Error(UNKNOWN_FILE_ERROR.to_string()))
 }
 
 /// How many rejected `Join` attempts a single connection may make before it is

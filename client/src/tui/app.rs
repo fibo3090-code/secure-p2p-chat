@@ -307,7 +307,12 @@ impl TuiApp {
             return;
         }
 
-        if let Some(selected) = selected_chat_id {
+        // Follow a selected chat that was folded into another conversation (a
+        // reconnect to a known peer), rather than landing on whichever chat now
+        // sits at its old position.
+        if let Some(selected) =
+            selected_chat_id.map(|id| self.chat_manager.resolve_display_chat_id(id))
+        {
             if let Some(new_idx) = self.chat_ids.iter().position(|id| *id == selected) {
                 self.chat_list_state.select(Some(new_idx));
                 return;
