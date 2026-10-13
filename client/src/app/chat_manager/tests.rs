@@ -371,21 +371,13 @@ fn placeholder_detection_works() {
     let port = 5001u16;
     assert!(!mgr.chats.values().any(|c| c.is_host_placeholder));
     let chat = Chat {
-        id: Uuid::new_v4(),
-        title: format!("Host on :{}", port),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
-        peer_fingerprint: None,
-        participants: Vec::new(),
-        messages: Vec::new(),
-        created_at: chrono::Utc::now(),
-        peer_typing: false,
-        typing_since: None,
-        send_seq: 0,
-        recv_seq: 0,
         is_host_placeholder: true,
-        read_count: 0,
-        title_is_custom: false,
+        ..Chat::new(
+            Uuid::new_v4(),
+            format!("Host on :{}", port),
+            ChatKind::Dm,
+            Transport::Direct,
+        )
     };
     let id = chat.id;
     mgr.chats.insert(id, chat);
@@ -401,23 +393,7 @@ fn test_tofu_logic() {
     let fingerprint2 = "fingerprint2".to_string();
 
     // 1. First Use: No fingerprint exists.
-    let chat = Chat {
-        id: chat_id,
-        title: "Test Chat".to_string(),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
-        peer_fingerprint: None,
-        participants: Vec::new(),
-        messages: Vec::new(),
-        created_at: chrono::Utc::now(),
-        peer_typing: false,
-        typing_since: None,
-        send_seq: 0,
-        recv_seq: 0,
-        is_host_placeholder: false,
-        read_count: 0,
-        title_is_custom: false,
-    };
+    let chat = Chat::new(chat_id, "Test Chat", ChatKind::Dm, Transport::Direct);
     // Add a dummy confirmation sender for the test
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.fingerprint_confirm_senders.insert(chat_id, tx);
@@ -491,23 +467,7 @@ fn test_regression_auto_trust_default_off() {
     let mut mgr = ChatManager::new(config);
     let chat_id = Uuid::new_v4();
 
-    let chat = Chat {
-        id: chat_id,
-        title: "Test Chat".to_string(),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
-        peer_fingerprint: None,
-        participants: Vec::new(),
-        messages: Vec::new(),
-        created_at: chrono::Utc::now(),
-        peer_typing: false,
-        typing_since: None,
-        send_seq: 0,
-        recv_seq: 0,
-        is_host_placeholder: false,
-        read_count: 0,
-        title_is_custom: false,
-    };
+    let chat = Chat::new(chat_id, "Test Chat", ChatKind::Dm, Transport::Direct);
 
     let (tx, _rx) = mpsc::unbounded_channel();
     mgr.fingerprint_confirm_senders.insert(chat_id, tx);

@@ -193,7 +193,7 @@ impl ChatManager {
                 .chats
                 .values()
                 .filter(|c| c.peer_fingerprint.as_deref() == Some(fp.as_str()))
-                .map(|c| *self.chat_id_mapping.get(&c.id).unwrap_or(&c.id))
+                .map(|c| self.session_for_chat(c.id))
                 .collect();
             for sid in session_ids {
                 // An in-flight receive from this peer must be failed *before*
@@ -203,16 +203,11 @@ impl ChatManager {
                 // orphaned temp spool, exactly as a mid-receive disconnect used
                 // to.
                 self.fail_incoming_transfers(sid, "blocked this contact");
-                let had_session = self.sessions.remove(&sid).is_some();
-                self.session_events.remove(&sid);
-                self.fingerprint_confirm_senders.remove(&sid);
-                self.drop_fingerprint_requests_for_session(sid);
+                let had_session = self.sessions.contains_key(&sid);
+                // Aborts the task too: a task parked on a socket read has
+                // nothing to send, so dropping its handles alone never stops it.
+                self.teardown_session(sid);
                 self.chat_id_mapping.retain(|_, v| *v != sid);
-                // Dropping the handle and the event receiver is not enough on
-                // its own: a task parked on a socket read has nothing to send,
-                // so it never notices and keeps the connection open for the
-                // life of the process. Abort it.
-                self.abort_session_task(sid);
                 if had_session {
                     tracing::info!(session = %sid, "Disconnected session of blocked contact");
                 }

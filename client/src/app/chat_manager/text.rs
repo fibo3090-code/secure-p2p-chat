@@ -87,20 +87,10 @@ impl ChatManager {
         const INCOMING_TEXT_TIMEOUT: Duration = Duration::from_secs(120);
 
         let now = std::time::Instant::now();
-        let stale_keys: Vec<(Uuid, Uuid)> = self
-            .incoming_text_messages
-            .iter()
-            .filter_map(|(key, pending)| {
-                if now.duration_since(pending.updated_at) >= INCOMING_TEXT_TIMEOUT {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (chat_id, _message_id) in stale_keys {
-            self.incoming_text_messages.remove(&(chat_id, _message_id));
+        let before = self.incoming_text_messages.len();
+        self.incoming_text_messages
+            .retain(|_, pending| now.duration_since(pending.updated_at) < INCOMING_TEXT_TIMEOUT);
+        for _ in self.incoming_text_messages.len()..before {
             self.add_toast(
                 ToastLevel::Warning,
                 "A large incoming message could not be completed and was discarded.".to_string(),
@@ -196,12 +186,8 @@ impl ChatManager {
             text.len()
         );
 
-        // Resolve chat_id through mapping (in case this is an incoming connection with a different chat_id)
-        let actual_session_chat_id = self
-            .chat_id_mapping
-            .get(&chat_id)
-            .copied()
-            .unwrap_or(chat_id);
+        // An incoming conversation on the host is served by a differently-keyed session.
+        let actual_session_chat_id = self.session_for_chat(chat_id);
 
         let has_session = self.chats.contains_key(&chat_id)
             && self.sessions.contains_key(&actual_session_chat_id);
@@ -256,13 +242,8 @@ impl ChatManager {
 
         // Add to local history
         let message_id = Uuid::new_v4();
-        chat.messages.push(Message {
-            id: message_id,
-            from_me: true,
-            content: MessageContent::Text { text },
-            timestamp: chrono::Utc::now(),
-            delivered: false,
-        });
+        chat.messages
+            .push(Message::sent(message_id, MessageContent::Text { text }));
 
         // Register for a delivery receipt: TextSendComplete will report the
         // wire seq for this message (frames drain FIFO per session), and the
@@ -277,47 +258,33 @@ impl ChatManager {
 
     /// Send typing start indicator
     pub fn send_typing_start(&mut self, chat_id: Uuid) -> Result<()> {
-        if !self.config.enable_typing_indicators {
-            return Ok(());
-        }
-
-        let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
-        let session = self
-            .sessions
-            .get(actual_id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-
-        let chat = self
-            .chats
-            .get_mut(&chat_id)
-            .ok_or_else(|| anyhow::anyhow!("Chat not found"))?;
-        chat.send_seq += 1;
-        session
-            .from_app_tx
-            .send(ProtocolMessage::TypingStart { seq: chat.send_seq })?;
-        Ok(())
+        self.send_typing(chat_id, true)
     }
 
     /// Send typing stop indicator
     pub fn send_typing_stop(&mut self, chat_id: Uuid) -> Result<()> {
+        self.send_typing(chat_id, false)
+    }
+
+    fn send_typing(&mut self, chat_id: Uuid, typing: bool) -> Result<()> {
         if !self.config.enable_typing_indicators {
             return Ok(());
         }
-
-        let actual_id = self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
         let session = self
             .sessions
-            .get(actual_id)
+            .get(&self.session_for_chat(chat_id))
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-
         let chat = self
             .chats
             .get_mut(&chat_id)
             .ok_or_else(|| anyhow::anyhow!("Chat not found"))?;
         chat.send_seq += 1;
-        session
-            .from_app_tx
-            .send(ProtocolMessage::TypingStop { seq: chat.send_seq })?;
+        let seq = chat.send_seq;
+        session.from_app_tx.send(if typing {
+            ProtocolMessage::TypingStart { seq }
+        } else {
+            ProtocolMessage::TypingStop { seq }
+        })?;
         Ok(())
     }
 }

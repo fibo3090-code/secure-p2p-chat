@@ -510,21 +510,13 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
 
         let chat = Chat {
-            id: Uuid::new_v4(),
-            title: "Test Chat".to_string(),
-            kind: crate::types::ChatKind::Dm,
-            transport: crate::types::Transport::Direct,
             peer_fingerprint: Some("abc123".to_string()),
-            participants: Vec::new(),
-            messages: Vec::new(),
-            created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
-            send_seq: 0,
-            recv_seq: 0,
-            is_host_placeholder: false,
-            read_count: 0,
-            title_is_custom: false,
+            ..Chat::new(
+                Uuid::new_v4(),
+                "Test Chat",
+                crate::types::ChatKind::Dm,
+                crate::types::Transport::Direct,
+            )
         };
 
         let history = HistoryFile::new(vec![chat.clone()]);
@@ -554,23 +546,12 @@ mod tests {
 
         manager.chats.insert(
             chat_id,
-            Chat {
-                id: chat_id,
-                title: "Chat".into(),
-                kind: crate::types::ChatKind::Dm,
-                transport: crate::types::Transport::Direct,
-                peer_fingerprint: None,
-                participants: Vec::new(),
-                messages: Vec::new(),
-                created_at: chrono::Utc::now(),
-                peer_typing: false,
-                typing_since: None,
-                send_seq: 0,
-                recv_seq: 0,
-                is_host_placeholder: false,
-                read_count: 0,
-                title_is_custom: false,
-            },
+            Chat::new(
+                chat_id,
+                "Chat",
+                crate::types::ChatKind::Dm,
+                crate::types::Transport::Direct,
+            ),
         );
 
         manager.contacts.insert(
@@ -647,12 +628,6 @@ mod tests {
         manager.chats.insert(
             chat_id,
             Chat {
-                id: chat_id,
-                title: "Test Chat".into(),
-                kind: crate::types::ChatKind::Dm,
-                transport: crate::types::Transport::Direct,
-                peer_fingerprint: None,
-                participants: Vec::new(),
                 messages: vec![Message {
                     id: Uuid::new_v4(),
                     from_me: true,
@@ -662,14 +637,12 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                     delivered: false,
                 }],
-                created_at: chrono::Utc::now(),
-                peer_typing: false,
-                typing_since: None,
-                send_seq: 0,
-                recv_seq: 0,
-                is_host_placeholder: false,
-                read_count: 0,
-                title_is_custom: false,
+                ..Chat::new(
+                    chat_id,
+                    "Test Chat",
+                    crate::types::ChatKind::Dm,
+                    crate::types::Transport::Direct,
+                )
             },
         );
 

@@ -58,7 +58,7 @@ impl ChatManager {
                 in_flight
             );
         }
-        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        let session_id = self.session_for_chat(chat_id);
         let (control_tx, file_tx) = self
             .sessions
             .get(&session_id)
@@ -94,17 +94,14 @@ impl ChatManager {
 
         // Add to local history.
         let message_id = Uuid::new_v4();
-        chat.messages.push(Message {
-            id: message_id,
-            from_me: true,
-            content: MessageContent::File {
+        chat.messages.push(Message::sent(
+            message_id,
+            MessageContent::File {
                 filename: filename.clone(),
                 size: file_size,
                 path: Some(path.clone()),
             },
-            timestamp: chrono::Utc::now(),
-            delivered: false,
-        });
+        ));
 
         // Track the transfer so the UI can show progress and cancel it.
         let transfer_id = Uuid::new_v4();
@@ -142,7 +139,12 @@ impl ChatManager {
         self.pending_file_sends
             .entry(session_id)
             .or_default()
-            .push_back((filename.clone(), transfer_id, chat_id, message_id));
+            .push_back(PendingFileSend {
+                filename: filename.clone(),
+                transfer_id,
+                chat_id,
+                message_id,
+            });
 
         // Stream the chunks off-thread so the send never holds the manager lock
         // for the (potentially multi-gigabyte) transfer and can be cancelled
@@ -245,47 +247,22 @@ impl ChatManager {
         let Some(state) = self.active_transfers.get(&transfer_id) else {
             return;
         };
-        if matches!(
-            state.status,
-            TransferStatus::Completed | TransferStatus::Failed(_) | TransferStatus::Cancelled
-        ) {
+        if !state.status.is_active() {
             return;
         }
         let chat_id = state.chat_id;
-        let filename = state.filename.clone();
-        let direction = state.direction;
 
-        match direction {
-            TransferDirection::Outgoing => {
-                // Stop the streaming task; it emits FileCancel itself. Drop the
-                // pending-delivery entry so no "not delivered" toast fires and
-                // no FileSendComplete is expected.
-                if let Some(handle) = self.outgoing_transfers.remove(&transfer_id) {
-                    handle.cancel.store(true, Ordering::Relaxed);
-                    if let Some(queue) = self.pending_file_sends.get_mut(&handle.session_id) {
-                        queue.retain(|(_, id, _, _)| *id != transfer_id);
-                    }
-                }
-            }
+        match state.direction {
+            // The streaming task emits FileCancel itself once it sees the flag.
+            TransferDirection::Outgoing => self.stop_outgoing_stream(transfer_id),
+            // Tell the sender to stop, then discard the partial file.
             TransferDirection::Incoming => {
-                // Tell the sender to stop, then discard the partial file.
-                let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
-                if let Some(session) = self.sessions.get(&session_id) {
-                    let _ = session
-                        .from_app_tx
-                        .send(ProtocolMessage::FileCancel { seq: 0 });
-                }
-                if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
-                    if let Err(e) = incoming.abort_cleanup() {
-                        tracing::warn!(%transfer_id, error = %e, "Failed to clean up cancelled transfer");
-                    }
-                }
+                self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
+                self.discard_spool(transfer_id, "cancelled");
             }
         }
 
-        if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
-            state.status = TransferStatus::Cancelled;
-        }
+        let filename = self.set_transfer_status(transfer_id, TransferStatus::Cancelled);
         self.add_toast(
             ToastLevel::Warning,
             format!("File transfer cancelled: {}", filename),
@@ -301,7 +278,7 @@ impl ChatManager {
         let mut failed_ids = Vec::new();
         for (transfer_id, handle) in &self.outgoing_transfers {
             if handle.failed.load(Ordering::Relaxed) {
-                failed_ids.push((*transfer_id, handle.session_id));
+                failed_ids.push(*transfer_id);
                 continue;
             }
             if let Some(state) = self.active_transfers.get_mut(transfer_id) {
@@ -313,21 +290,12 @@ impl ChatManager {
             }
         }
 
-        for (transfer_id, session_id) in failed_ids {
-            self.outgoing_transfers.remove(&transfer_id);
-            // Drop the pending-delivery entry so session teardown doesn't also
-            // report it as "not delivered".
-            if let Some(queue) = self.pending_file_sends.get_mut(&session_id) {
-                queue.retain(|(_, id, _, _)| *id != transfer_id);
-            }
-            let filename = self
-                .active_transfers
-                .get_mut(&transfer_id)
-                .map(|state| {
-                    state.status = TransferStatus::Failed("could not read the file".to_string());
-                    state.filename.clone()
-                })
-                .unwrap_or_default();
+        for transfer_id in failed_ids {
+            self.stop_outgoing_stream(transfer_id);
+            let filename = self.set_transfer_status(
+                transfer_id,
+                TransferStatus::Failed("could not read the file".to_string()),
+            );
             self.add_toast(
                 ToastLevel::Error,
                 format!("File send failed (could not read the file): {}", filename),
@@ -348,23 +316,9 @@ impl ChatManager {
             return;
         };
 
-        if let Some(handle) = self.outgoing_transfers.remove(&transfer_id) {
-            handle.cancel.store(true, Ordering::Relaxed);
-            if let Some(queue) = self.pending_file_sends.get_mut(&handle.session_id) {
-                queue.retain(|(_, id, _, _)| *id != transfer_id);
-            }
-        }
-        if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
-            let _ = incoming.abort_cleanup();
-        }
-        let filename = self
-            .active_transfers
-            .get_mut(&transfer_id)
-            .map(|s| {
-                s.status = TransferStatus::Cancelled;
-                s.filename.clone()
-            })
-            .unwrap_or_default();
+        self.stop_outgoing_stream(transfer_id);
+        self.discard_spool(transfer_id, "cancelled by the peer");
+        let filename = self.set_transfer_status(transfer_id, TransferStatus::Cancelled);
         self.add_toast(
             ToastLevel::Warning,
             format!("Peer cancelled the file transfer: {}", filename),
@@ -377,16 +331,17 @@ impl ChatManager {
         let Some(pending) = self.pending_file_sends.remove(&chat_id) else {
             return;
         };
-        for (filename, transfer_id, _chat, _message) in pending {
+        for PendingFileSend {
+            filename,
+            transfer_id,
+            ..
+        } in pending
+        {
             tracing::warn!(file = %filename, reason = %reason, "Outgoing file send interrupted");
             // Stop the streaming task and mark the transfer failed so its UI row
             // reflects the interruption instead of an eternal "in progress".
-            if let Some(handle) = self.outgoing_transfers.remove(&transfer_id) {
-                handle.cancel.store(true, Ordering::Relaxed);
-            }
-            if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
-                state.status = TransferStatus::Failed(reason.to_string());
-            }
+            self.stop_outgoing_stream(transfer_id);
+            self.set_transfer_status(transfer_id, TransferStatus::Failed(reason.to_string()));
             self.add_toast(
                 ToastLevel::Error,
                 format!(
@@ -413,32 +368,18 @@ impl ChatManager {
             .active_transfers
             .iter()
             .filter_map(|(id, t)| {
-                let active = matches!(
-                    t.status,
-                    TransferStatus::Pending
-                        | TransferStatus::AwaitingAcceptance
-                        | TransferStatus::InProgress
-                );
-                (t.chat_id == chat_id && t.direction == TransferDirection::Incoming && active)
-                    .then_some(*id)
+                (t.chat_id == chat_id
+                    && t.direction == TransferDirection::Incoming
+                    && t.status.is_active())
+                .then_some(*id)
             })
             .collect();
 
         for transfer_id in stranded {
             self.pending_file_end.remove(&transfer_id);
-            if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
-                if let Err(e) = incoming.abort_cleanup() {
-                    tracing::warn!(%transfer_id, error = %e, "Failed to clean up stranded transfer");
-                }
-            }
-            let filename = self
-                .active_transfers
-                .get_mut(&transfer_id)
-                .map(|t| {
-                    t.status = TransferStatus::Failed(reason.to_string());
-                    t.filename.clone()
-                })
-                .unwrap_or_default();
+            self.discard_spool(transfer_id, reason);
+            let filename =
+                self.set_transfer_status(transfer_id, TransferStatus::Failed(reason.to_string()));
             tracing::warn!(file = %filename, reason = %reason, "Incoming file transfer interrupted");
             self.add_toast(
                 ToastLevel::Error,
@@ -462,12 +403,7 @@ impl ChatManager {
             );
         }
 
-        for transfer_id in self.transfer_ids_for_chat_with_status(chat_id, |status| {
-            matches!(
-                status,
-                TransferStatus::Completed | TransferStatus::Failed(_) | TransferStatus::Cancelled
-            )
-        }) {
+        for transfer_id in self.transfer_ids_for_chat_with_status(chat_id, |s| !s.is_active()) {
             self.clear_transfer_state(transfer_id);
         }
 
@@ -557,21 +493,8 @@ impl ChatManager {
         // Tell the sender to stop, exactly as `cancel_transfer` does. Without
         // this, declining a 5 GB offer still pulls all 5 GB across the wire —
         // the decision only ever reached our own disk.
-        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
-        if let Some(session) = self.sessions.get(&session_id) {
-            let _ = session
-                .from_app_tx
-                .send(ProtocolMessage::FileCancel { seq: 0 });
-        }
-        if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
-            if let Err(e) = incoming.abort_cleanup() {
-                tracing::warn!(
-                    "Failed to clean up declined transfer {}: {}",
-                    transfer_id,
-                    e
-                );
-            }
-        }
+        self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
+        self.discard_spool(transfer_id, "declined");
         self.add_toast(
             ToastLevel::Info,
             format!("Declined incoming file: {}", filename),
@@ -594,17 +517,14 @@ impl ChatManager {
                 if let Some(mut transfer) = self.active_transfers.remove(&transfer_id) {
                     transfer.status = TransferStatus::Completed;
                     if let Some(chat) = self.chats.get_mut(&transfer.chat_id) {
-                        chat.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            from_me: false,
-                            content: MessageContent::File {
+                        chat.messages.push(Message::received(
+                            MessageContent::File {
                                 filename: transfer.filename.clone(),
                                 size: transfer.size,
                                 path: Some(final_path),
                             },
-                            timestamp: chrono::Utc::now(),
-                            delivered: false,
-                        });
+                            chrono::Utc::now(),
+                        ));
                     }
                     // Delivery receipt: the file is on disk, tell the sender.
                     if let Some(acked_seq) = ack_seq {
@@ -747,20 +667,54 @@ impl ChatManager {
     /// task first so a cancelled send does not keep reading from disk into a
     /// channel nobody is draining. Used when the conversation itself goes away.
     pub(super) fn clear_transfer_bookkeeping(&mut self, transfer_id: Uuid) {
-        if let Some(handle) = self.outgoing_transfers.remove(&transfer_id) {
-            handle.cancel.store(true, Ordering::Relaxed);
-        }
+        self.stop_outgoing_stream(transfer_id);
         self.active_transfers.remove(&transfer_id);
-        // Dropping the `IncomingFileSync` closes its handle but leaves the
-        // spooled `tmp_<uuid>_<name>` on disk. Tearing a conversation down
-        // mid-receive is exactly when nobody is left to notice, so the partial
-        // file would sit in the download directory indefinitely.
+        self.discard_spool(transfer_id, "conversation removed");
+        self.pending_file_end.remove(&transfer_id);
+    }
+
+    /// Stop an outgoing transfer's streaming task (it emits `FileCancel` once it
+    /// sees the flag) and drop its pending-send entry, so neither a
+    /// `FileSendComplete` nor a "may not have been delivered" toast follows for
+    /// a send that was deliberately ended. A no-op for anything else.
+    fn stop_outgoing_stream(&mut self, transfer_id: Uuid) {
+        let Some(handle) = self.outgoing_transfers.remove(&transfer_id) else {
+            return;
+        };
+        handle.cancel.store(true, Ordering::Relaxed);
+        if let Some(queue) = self.pending_file_sends.get_mut(&handle.session_id) {
+            queue.retain(|p| p.transfer_id != transfer_id);
+        }
+    }
+
+    /// Delete an incoming transfer's partial spool. A no-op for anything else.
+    ///
+    /// Dropping the `IncomingFileSync` alone closes its handle but leaves the
+    /// `tmp_<uuid>_<name>` file in the download directory — and the moments a
+    /// transfer is abandoned (cancel, decline, disconnect, a deleted
+    /// conversation) are exactly when nobody is left to notice it.
+    pub(super) fn discard_spool(&mut self, transfer_id: Uuid, why: &str) {
         if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
             if let Err(e) = incoming.abort_cleanup() {
-                tracing::warn!(%transfer_id, error = %e, "failed to clean up a discarded transfer");
+                tracing::warn!(%transfer_id, why, error = %e, "failed to delete a partial download");
             }
         }
-        self.pending_file_end.remove(&transfer_id);
+    }
+
+    /// Set a tracked transfer's status, returning its filename for the toast
+    /// that usually follows (empty if the transfer is no longer tracked).
+    pub(super) fn set_transfer_status(
+        &mut self,
+        transfer_id: Uuid,
+        status: TransferStatus,
+    ) -> String {
+        self.active_transfers
+            .get_mut(&transfer_id)
+            .map(|t| {
+                t.status = status;
+                t.filename.clone()
+            })
+            .unwrap_or_default()
     }
 
     /// Every tracked transfer belonging to a conversation, whatever its state.
@@ -797,16 +751,7 @@ impl ChatManager {
     ) -> Option<Uuid> {
         self.active_transfers
             .iter()
-            .find(|(_, t)| {
-                t.chat_id == chat_id
-                    && t.direction == direction
-                    && matches!(
-                        t.status,
-                        TransferStatus::Pending
-                            | TransferStatus::AwaitingAcceptance
-                            | TransferStatus::InProgress
-                    )
-            })
+            .find(|(_, t)| t.chat_id == chat_id && t.direction == direction && t.status.is_active())
             .map(|(id, _)| *id)
     }
 
