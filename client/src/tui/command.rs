@@ -314,8 +314,6 @@ pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
     }
 }
 
-/// Split a `host[:port]` token, defaulting the port when omitted.
-
 /// Parse a raw command-line string (with or without the leading `:`).
 pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
     let input = raw.trim().trim_start_matches(':').trim();
@@ -817,10 +815,12 @@ mod tests {
                 port: crate::PORT_DEFAULT,
             }
         );
+        // The brackets are address syntax, not part of the host: a socket
+        // cannot resolve "[::1]", only "::1".
         assert_eq!(
             parse_command(":connect [::1]:9000").unwrap(),
             TuiCommand::Connect {
-                host: "[::1]".into(),
+                host: "::1".into(),
                 port: 9000,
             }
         );
