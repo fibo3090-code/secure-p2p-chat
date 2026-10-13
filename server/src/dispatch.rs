@@ -60,23 +60,41 @@ pub enum Deferred {
 }
 
 impl Dispatch {
-    fn reply(resp: PartyResponse) -> Self {
+    /// A single reply to the requester, and nothing else.
+    pub fn reply(resp: PartyResponse) -> Self {
         Self {
             replies: vec![resp],
-            broadcast: Vec::new(),
-            directed: Vec::new(),
-            deferred: None,
+            ..Self::default()
         }
     }
 
     /// A dispatch whose whole effect happens after the lock is released.
     fn defer(work: Deferred) -> Self {
         Self {
-            replies: Vec::new(),
-            broadcast: Vec::new(),
-            directed: Vec::new(),
             deferred: Some(work),
+            ..Self::default()
         }
+    }
+
+    /// `Ok` for a successful administrative action, `Error` for a refused one.
+    fn outcome(result: Result<String, String>) -> Self {
+        Self::reply(match result {
+            Ok(msg) => PartyResponse::Ok(msg),
+            Err(e) => PartyResponse::Error(e),
+        })
+    }
+
+    /// A send the client is already showing was refused.
+    ///
+    /// `ActionFailed`, not `Error`: the client appends posts, DMs and uploads
+    /// optimistically, so a refusal has to be attributable to *that* message
+    /// or the row stays on screen looking delivered. `thread` is the channel or
+    /// DM thread it belongs to (`nil` when the server cannot tell).
+    pub fn action_failed(thread: Uuid, reason: String) -> Self {
+        Self::reply(PartyResponse::ActionFailed {
+            channel: thread,
+            reason,
+        })
     }
 }
 
@@ -94,23 +112,8 @@ pub fn upload_committed(
         // A file posted to a channel fans out exactly like a text post: broadcast
         // when the channel is open to everyone, directed at the readers when it
         // is not.
-        Ok((env, UploadTarget::Channel(_))) => channel_fanout(state, env),
-        Ok((env, UploadTarget::Dm(to))) => Dispatch {
-            replies: vec![PartyResponse::MessagePosted {
-                channel: env.channel,
-                seq: env.seq,
-            }],
-            broadcast: Vec::new(),
-            directed: dm_delivery(member, to, env),
-            deferred: None,
-        },
-        // `ActionFailed`, not `Error`: the client showed the file optimistically
-        // the moment it started sending, so a refusal has to be attributable to
-        // that message or the row stays on screen looking delivered.
-        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
-            channel: Uuid::nil(),
-            reason,
-        }),
+        Ok((env, target)) => posted(state, member, target, env),
+        Err(reason) => Dispatch::action_failed(Uuid::nil(), reason),
     }
 }
 
@@ -135,8 +138,15 @@ pub fn download_reply(
         // The read failed after access was granted — the blob's last reference
         // was deleted while this was in flight, or the file is gone. Same answer
         // as an unknown hash, which is also what it now is.
-        (None, _) => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
+        (None, _) => unknown_file(),
     }
+}
+
+/// The answer to a download of a file that does not exist *or* that the member
+/// may not see — deliberately the same, so the endpoint never confirms that a
+/// file it will not hand over exists.
+fn unknown_file() -> Dispatch {
+    Dispatch::reply(PartyResponse::Error("unknown file".to_string()))
 }
 
 /// How many rejected `Join` attempts a single connection may make before it is
@@ -199,6 +209,22 @@ impl ConnState {
     }
 }
 
+/// Ack a stored post and deliver it to everyone else who should see it — the
+/// channel's readers, or a DM's two ends.
+fn posted(state: &PartyState, member: Uuid, target: UploadTarget, env: Envelope) -> Dispatch {
+    match target {
+        UploadTarget::Channel(_) => channel_fanout(state, env),
+        UploadTarget::Dm(to) => Dispatch {
+            replies: vec![PartyResponse::MessagePosted {
+                channel: env.channel,
+                seq: env.seq,
+            }],
+            directed: dm_delivery(member, to, env),
+            ..Dispatch::default()
+        },
+    }
+}
+
 /// Where a stored DM envelope has to be delivered: to the recipient, and to the
 /// sender's *other* connections.
 ///
@@ -234,19 +260,17 @@ fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
         return Dispatch {
             replies: vec![ack],
             broadcast: vec![PartyResponse::Message(env)],
-            directed: Vec::new(),
-            deferred: None,
+            ..Dispatch::default()
         };
     }
     let readers = state.members_who_can_read(env.channel);
     Dispatch {
         replies: vec![ack],
-        broadcast: Vec::new(),
         directed: readers
             .into_iter()
             .map(|m| (m, PartyResponse::Message(env.clone())))
             .collect(),
-        deferred: None,
+        ..Dispatch::default()
     }
 }
 
@@ -270,366 +294,315 @@ fn channel_list_refresh(state: &PartyState, member: Uuid) -> Dispatch {
     Dispatch {
         replies: vec![PartyResponse::Channels(state.channels_for(member))],
         broadcast: vec![PartyResponse::DirectoryChanged],
-        directed: Vec::new(),
-        deferred: None,
+        ..Dispatch::default()
+    }
+}
+
+/// A channel-directory change that also carries a confirmation message.
+fn channel_change(state: &PartyState, member: Uuid, result: Result<String, String>) -> Dispatch {
+    match result {
+        Ok(msg) => {
+            let mut out = channel_list_refresh(state, member);
+            out.replies.push(PartyResponse::Ok(msg));
+            out
+        }
+        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+    }
+}
+
+/// Phase 1 of an inline upload (`PostFile` / `SendFileDm`): check it and take
+/// the bytes, deferring the write until the lock is released.
+///
+/// Inline uploads take the same three phases as chunked ones — see
+/// `begin_inline_upload` for why the 4 MiB cap is not reason enough to keep a
+/// second path. The minted id is tracked on the connection because the upload
+/// holds a storage reservation that a disconnect has to release.
+fn begin_inline_upload(
+    state: &mut PartyState,
+    conn: &mut ConnState,
+    member: Uuid,
+    target: UploadTarget,
+    name: String,
+    mime: String,
+    data: Vec<u8>,
+) -> Dispatch {
+    match state.begin_inline_upload(member, target, name, mime, data) {
+        Ok(staged) => {
+            conn.track_upload(staged.id());
+            Dispatch::defer(Deferred::Upload(Box::new(staged)))
+        }
+        Err(reason) => Dispatch::action_failed(upload_thread(member, target), reason),
+    }
+}
+
+/// Authorise a download (whole file when `offset` is `None`, one chunk
+/// otherwise); the read itself happens after the lock is released.
+fn plan_download(state: &PartyState, member: Uuid, hash: String, offset: Option<u64>) -> Dispatch {
+    match state.plan_blob_read(member, &hash, offset) {
+        Some(plan) => Dispatch::defer(Deferred::Download { hash, offset, plan }),
+        None => unknown_file(),
     }
 }
 
 /// Apply `req` to `state` for the connection `conn`, returning the responses to
 /// send back to that client. Newly posted messages are stored in `state`; the
 /// runtime is responsible for broadcasting them to other connections.
+///
+/// A connection must `Join` before anything else is honoured, and may join
+/// only once.
 pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRequest) -> Dispatch {
+    match (conn.member, req) {
+        (None, PartyRequest::Join { username, password }) => {
+            join(state, conn, &username, password.as_deref())
+        }
+        (None, _) => Dispatch::reply(PartyResponse::Error("join required".to_string())),
+        (Some(member), req) => handle_member_request(state, conn, member, req),
+    }
+}
+
+fn join(
+    state: &mut PartyState,
+    conn: &mut ConnState,
+    username: &str,
+    password: Option<&str>,
+) -> Dispatch {
+    // Rate limit: a connection gets a small number of rejected attempts and is
+    // then done. Otherwise one handshake buys unlimited password guesses down
+    // the same socket.
+    if conn.join_failures >= MAX_JOIN_ATTEMPTS {
+        return Dispatch::reply(PartyResponse::JoinRejected {
+            reason: "too many failed attempts on this connection — reconnect to try again"
+                .to_string(),
+        });
+    }
+    match state.join(username, password, conn.peer_fingerprint.clone()) {
+        Ok(id) => {
+            conn.member = Some(id);
+            Dispatch {
+                replies: vec![PartyResponse::Joined {
+                    member_id: id,
+                    server_name: state.name().to_string(),
+                    tier: state.tier(),
+                }],
+                // Everyone else's directory just went stale: either a new member
+                // appeared or a returning one came back online. Nothing used to
+                // announce this, so every client's member list was frozen at the
+                // moment *it* joined — new members never showed up and the
+                // online dots never changed.
+                broadcast: vec![PartyResponse::Members(state.members())],
+                ..Dispatch::default()
+            }
+        }
+        Err(e) => {
+            conn.join_failures = conn.join_failures.saturating_add(1);
+            Dispatch::reply(PartyResponse::JoinRejected {
+                reason: e.reason().to_string(),
+            })
+        }
+    }
+}
+
+/// Every request a joined member may make.
+fn handle_member_request(
+    state: &mut PartyState,
+    conn: &mut ConnState,
+    member: Uuid,
+    req: PartyRequest,
+) -> Dispatch {
     match req {
-        PartyRequest::Join { username, password } => {
-            if conn.member.is_some() {
-                return Dispatch::reply(PartyResponse::Error(
-                    "already joined on this connection".to_string(),
-                ));
+        PartyRequest::Join { .. } => Dispatch::reply(PartyResponse::Error(
+            "already joined on this connection".to_string(),
+        )),
+        PartyRequest::ListMembers => Dispatch::reply(PartyResponse::Members(state.members())),
+        // Filtered: a private channel does not advertise its existence to
+        // somebody who is not in it.
+        PartyRequest::ListChannels => {
+            Dispatch::reply(PartyResponse::Channels(state.channels_for(member)))
+        }
+        PartyRequest::PostMessage { channel, text } => {
+            match state.post_message(member, channel, text) {
+                // Ack the poster; deliver to everyone else who may read the
+                // channel (see `channel_fanout`).
+                Ok(env) => channel_fanout(state, env),
+                Err(e) => Dispatch::action_failed(channel, e),
             }
-            // Rate limit: a connection gets a small number of rejected attempts
-            // and is then done. Otherwise one handshake buys unlimited password
-            // guesses down the same socket.
-            if conn.join_failures >= MAX_JOIN_ATTEMPTS {
-                return Dispatch::reply(PartyResponse::JoinRejected {
-                    reason: "too many failed attempts on this connection — reconnect to try again"
-                        .to_string(),
-                });
+        }
+        PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
+            PartyResponse::History(state.history_since(member, channel, since_seq)),
+        ),
+        PartyRequest::SendDm { to, text } => match state.post_dm(member, to, text) {
+            // Ack the sender (who appends locally); deliver to the recipient and
+            // to the sender's *other* devices.
+            Ok(env) => posted(state, member, UploadTarget::Dm(to), env),
+            Err(e) => Dispatch::action_failed(upload_thread(member, UploadTarget::Dm(to)), e),
+        },
+        PartyRequest::FetchDmHistory { with, since_seq } => {
+            let thread = messenger_core::party::dm_thread_id(member, with);
+            Dispatch::reply(PartyResponse::History(state.dm_history(thread, since_seq)))
+        }
+        PartyRequest::PostFile {
+            channel,
+            name,
+            mime,
+            data,
+        } => begin_inline_upload(
+            state,
+            conn,
+            member,
+            UploadTarget::Channel(channel),
+            name,
+            mime,
+            data,
+        ),
+        PartyRequest::SendFileDm {
+            to,
+            name,
+            mime,
+            data,
+        } => begin_inline_upload(state, conn, member, UploadTarget::Dm(to), name, mime, data),
+        PartyRequest::DownloadFile { hash } => plan_download(state, member, hash, None),
+        PartyRequest::DownloadChunk { hash, offset } => {
+            plan_download(state, member, hash, Some(offset))
+        }
+
+        // --- Governance and file management ---------------------------------
+        //
+        // A new or changed channel alters what everyone may see, and private
+        // channels are filtered per member, so each connection needs its *own*
+        // view rather than one shared list (see `channel_list_refresh`).
+        PartyRequest::CreateChannel { name } => {
+            match state.create_channel_of_kind(member, &name, ChannelKind::Public, vec![]) {
+                Ok(_) => channel_list_refresh(state, member),
+                Err(e) => Dispatch::reply(PartyResponse::Error(e)),
             }
-            match state.join(
-                &username,
-                password.as_deref(),
-                conn.peer_fingerprint.clone(),
-            ) {
-                Ok(id) => {
-                    conn.member = Some(id);
-                    Dispatch {
-                        replies: vec![PartyResponse::Joined {
-                            member_id: id,
-                            server_name: state.name().to_string(),
-                            tier: state.tier(),
-                        }],
-                        // Everyone else's directory just went stale: either a new
-                        // member appeared or a returning one came back online.
-                        // Nothing used to announce this, so every client's member
-                        // list was frozen at the moment *it* joined — new members
-                        // never showed up and the online dots never changed.
-                        broadcast: vec![PartyResponse::Members(state.members())],
-                        directed: Vec::new(),
-                        deferred: None,
-                    }
-                }
-                Err(e) => {
-                    conn.join_failures = conn.join_failures.saturating_add(1);
-                    Dispatch::reply(PartyResponse::JoinRejected {
-                        reason: e.reason().to_string(),
-                    })
+        }
+        PartyRequest::CreateChannelOfKind {
+            name,
+            kind,
+            members,
+        } => match state.create_channel_of_kind(member, &name, kind, members) {
+            Ok(_) => channel_list_refresh(state, member),
+            Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+        },
+        PartyRequest::DeleteChannel { channel } => {
+            let result = state.delete_channel(member, channel);
+            channel_change(state, member, result)
+        }
+        PartyRequest::SetChannelAccess {
+            channel,
+            kind,
+            members,
+        } => {
+            let result = state.set_channel_access(member, channel, kind, members);
+            channel_change(state, member, result)
+        }
+        PartyRequest::SetRole {
+            member: target,
+            role,
+        } => match state.set_role(member, target, role) {
+            Ok(msg) => Dispatch {
+                // A role change alters what the member may *do* and what they
+                // may *see*: `channels_for` filters by role, so a demoted admin
+                // would keep listing private channels until something else
+                // happened to refresh them. The server still refuses the reads,
+                // so that is stale UI rather than a leak — but it is still
+                // wrong on screen.
+                replies: vec![
+                    PartyResponse::Members(state.members()),
+                    PartyResponse::Channels(state.channels_for(member)),
+                    PartyResponse::Ok(msg),
+                ],
+                broadcast: vec![
+                    PartyResponse::Members(state.members()),
+                    PartyResponse::DirectoryChanged,
+                ],
+                ..Dispatch::default()
+            },
+            Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+        },
+        PartyRequest::ListFiles => Dispatch::reply(PartyResponse::Files(state.files_for(member))),
+        PartyRequest::DeleteFile { hash, channel } => {
+            Dispatch::outcome(state.delete_file(member, &hash, channel))
+        }
+        PartyRequest::SetFilePermissions {
+            hash,
+            location,
+            member: target,
+            perms,
+        } => Dispatch::outcome(state.set_file_permissions(member, &hash, location, target, perms)),
+        PartyRequest::FetchAuditLog { limit } => {
+            match state.audit_log(member, limit.clamp(1, 1000) as usize) {
+                Ok(entries) => Dispatch::reply(PartyResponse::AuditLog(entries)),
+                Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+            }
+        }
+        PartyRequest::FetchQuota => Dispatch::reply(PartyResponse::Quota(state.quota_for(member))),
+
+        // --- Chunked upload -------------------------------------------------
+        PartyRequest::StartUpload {
+            name,
+            mime,
+            size,
+            target,
+        } => match state.start_upload(member, name, mime, size, target) {
+            Ok(upload) => {
+                conn.uploads.push(upload);
+                Dispatch::reply(PartyResponse::UploadReady {
+                    upload,
+                    chunk_size: PARTY_CHUNK_BYTES as u32,
+                })
+            }
+            Err(reason) => Dispatch::action_failed(upload_thread(member, target), reason),
+        },
+        PartyRequest::UploadChunk { upload, data } => {
+            match state.upload_chunk(member, upload, &data) {
+                Ok(()) => Dispatch::default(),
+                Err(reason) => {
+                    // A failed chunk ends the upload on *both* sides. Clearing
+                    // only the connection's id left the spool in `PartyState`
+                    // with nothing able to reach it — holding the member's
+                    // concurrency slot and its bytes until the connection
+                    // dropped. "chunk is too large" is the reachable case: it
+                    // returns before the state removes anything.
+                    state.cancel_upload(member, upload);
+                    conn.finish_upload(upload);
+                    Dispatch::reply(PartyResponse::Error(reason))
                 }
             }
         }
-
-        // Everything past this point requires a joined member.
-        other => {
-            let Some(member) = conn.member else {
-                return Dispatch::reply(PartyResponse::Error("join required".to_string()));
-            };
-            match other {
-                PartyRequest::Join { .. } => unreachable!("handled above"),
-                PartyRequest::ListMembers => {
-                    Dispatch::reply(PartyResponse::Members(state.members()))
-                }
-                // Filtered: a private channel does not advertise its existence to
-                // somebody who is not in it.
-                PartyRequest::ListChannels => {
-                    Dispatch::reply(PartyResponse::Channels(state.channels_for(member)))
-                }
-                PartyRequest::PostMessage { channel, text } => {
-                    match state.post_message(member, channel, text) {
-                        // Ack the poster; deliver to everyone else who may read
-                        // the channel (see `channel_fanout`).
-                        Ok(env) => channel_fanout(state, env),
-                        // `ActionFailed`, not `Error`: the client already put
-                        // this message on screen and must be able to tell that
-                        // *this* send was refused so it can take it back.
-                        Err(e) => {
-                            Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e })
-                        }
-                    }
-                }
-                PartyRequest::FetchHistory { channel, since_seq } => Dispatch::reply(
-                    PartyResponse::History(state.history_since(member, channel, since_seq)),
-                ),
-                PartyRequest::CreateChannel { name } => {
-                    match state.create_channel_of_kind(member, &name, ChannelKind::Public, vec![]) {
-                        Ok(_) => channel_list_refresh(state, member),
-                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                    }
-                }
-                PartyRequest::SendDm { to, text } => match state.post_dm(member, to, text) {
-                    // Ack the sender (who appends locally); deliver to the recipient
-                    // and to the sender's *other* devices.
-                    Ok(env) => Dispatch {
-                        replies: vec![PartyResponse::MessagePosted {
-                            channel: env.channel,
-                            seq: env.seq,
-                        }],
-                        broadcast: Vec::new(),
-                        directed: dm_delivery(member, to, env),
-                        deferred: None,
-                    },
-                    Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
-                        channel: messenger_core::party::dm_thread_id(member, to),
-                        reason: e,
-                    }),
-                },
-                PartyRequest::FetchDmHistory { with, since_seq } => {
-                    let thread = messenger_core::party::dm_thread_id(member, with);
-                    Dispatch::reply(PartyResponse::History(state.dm_history(thread, since_seq)))
-                }
-                // Inline uploads take the same three phases as chunked ones —
-                // see `begin_inline_upload` for why the 4 MiB cap is not reason
-                // enough to keep a second path.
-                PartyRequest::PostFile {
-                    channel,
-                    name,
-                    mime,
-                    data,
-                } => match state.begin_inline_upload(
-                    member,
-                    UploadTarget::Channel(channel),
-                    name,
-                    mime,
-                    data,
-                ) {
-                    Ok(staged) => {
-                        conn.track_upload(staged.id());
-                        Dispatch::defer(Deferred::Upload(Box::new(staged)))
-                    }
-                    Err(e) => Dispatch::reply(PartyResponse::ActionFailed { channel, reason: e }),
-                },
-                PartyRequest::SendFileDm {
-                    to,
-                    name,
-                    mime,
-                    data,
-                } => {
-                    match state.begin_inline_upload(member, UploadTarget::Dm(to), name, mime, data)
-                    {
-                        Ok(staged) => {
-                            conn.track_upload(staged.id());
-                            Dispatch::defer(Deferred::Upload(Box::new(staged)))
-                        }
-                        Err(e) => Dispatch::reply(PartyResponse::ActionFailed {
-                            channel: messenger_core::party::dm_thread_id(member, to),
-                            reason: e,
-                        }),
-                    }
-                }
-                PartyRequest::DownloadFile { hash } => {
-                    match state.plan_blob_read(member, &hash, None) {
-                        Some(plan) => Dispatch::defer(Deferred::Download {
-                            hash,
-                            offset: None,
-                            plan,
-                        }),
-                        // Same reply for unknown and access-denied, so the
-                        // endpoint never reveals a file the member isn't
-                        // allowed to see.
-                        None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
-                    }
-                }
-
-                // --- Governance and file management ---------------------------
-                PartyRequest::CreateChannelOfKind {
-                    name,
-                    kind,
-                    members,
-                } => match state.create_channel_of_kind(member, &name, kind, members) {
-                    // A new channel changes what everyone may see, and private
-                    // channels are filtered per member, so each connection needs
-                    // its *own* view rather than one shared list.
-                    Ok(_) => channel_list_refresh(state, member),
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                },
-                PartyRequest::DeleteChannel { channel } => {
-                    match state.delete_channel(member, channel) {
-                        Ok(msg) => {
-                            let mut out = channel_list_refresh(state, member);
-                            out.replies.push(PartyResponse::Ok(msg));
-                            out
-                        }
-                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                    }
-                }
-                PartyRequest::SetChannelAccess {
-                    channel,
-                    kind,
-                    members,
-                } => match state.set_channel_access(member, channel, kind, members) {
-                    Ok(msg) => {
-                        let mut out = channel_list_refresh(state, member);
-                        out.replies.push(PartyResponse::Ok(msg));
-                        out
-                    }
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                },
-                PartyRequest::SetRole {
-                    member: target,
-                    role,
-                } => match state.set_role(member, target, role) {
-                    Ok(msg) => Dispatch {
-                        // A role change alters what the member may *do* and what
-                        // they may *see*: `channels_for` filters by role, so a
-                        // demoted admin would keep listing private channels
-                        // until something else happened to refresh them. The
-                        // server still refuses the reads, so that is stale UI
-                        // rather than a leak — but it is still wrong on screen.
-                        replies: vec![
-                            PartyResponse::Members(state.members()),
-                            PartyResponse::Channels(state.channels_for(member)),
-                            PartyResponse::Ok(msg),
-                        ],
-                        broadcast: vec![
-                            PartyResponse::Members(state.members()),
-                            PartyResponse::DirectoryChanged,
-                        ],
-                        directed: Vec::new(),
-                        deferred: None,
-                    },
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                },
-                PartyRequest::ListFiles => {
-                    Dispatch::reply(PartyResponse::Files(state.files_for(member)))
-                }
-                PartyRequest::DeleteFile { hash, channel } => {
-                    match state.delete_file(member, &hash, channel) {
-                        Ok(msg) => Dispatch::reply(PartyResponse::Ok(msg)),
-                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                    }
-                }
-                PartyRequest::FetchAuditLog { limit } => {
-                    match state.audit_log(member, limit.clamp(1, 1000) as usize) {
-                        Ok(entries) => Dispatch::reply(PartyResponse::AuditLog(entries)),
-                        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                    }
-                }
-                PartyRequest::FetchQuota => {
-                    Dispatch::reply(PartyResponse::Quota(state.quota_for(member)))
-                }
-
-                // --- Chunked upload / download ------------------------------
-                PartyRequest::StartUpload {
-                    name,
-                    mime,
-                    size,
-                    target,
-                } => {
-                    match state.start_upload(member, name, mime, size, target) {
-                        Ok(upload) => {
-                            conn.uploads.push(upload);
-                            Dispatch::reply(PartyResponse::UploadReady {
-                                upload,
-                                chunk_size: PARTY_CHUNK_BYTES as u32,
-                            })
-                        }
-                        // `ActionFailed`, not `Error`: the client shows the file
-                        // optimistically the moment it starts sending, so a
-                        // refusal has to be attributable to that message.
-                        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
-                            channel: upload_thread(member, target),
-                            reason,
-                        }),
-                    }
-                }
-                PartyRequest::UploadChunk { upload, data } => {
-                    match state.upload_chunk(member, upload, &data) {
-                        Ok(()) => Dispatch::default(),
-                        Err(reason) => {
-                            // A failed chunk ends the upload on *both* sides.
-                            // Clearing only the connection's id left the spool
-                            // in `PartyState` with nothing able to reach it —
-                            // holding the member's concurrency slot and its
-                            // bytes until the connection dropped. "chunk is too
-                            // large" is the reachable case: it returns before
-                            // the state removes anything.
-                            state.cancel_upload(member, upload);
-                            conn.finish_upload(upload);
-                            Dispatch::reply(PartyResponse::Error(reason))
-                        }
-                    }
-                }
-                PartyRequest::FinishUpload { upload } => {
-                    // Phase 1 only: check it and take the bytes. The write is
-                    // deferred, because it is up to `MAX_PARTY_FILE_BYTES` of
-                    // hashing and I/O and doing it here does it with the state
-                    // lock held.
-                    //
-                    // The connection's own list is cleared *after* the call, not
-                    // before. Clearing it first meant an error path that left the
-                    // spool in `PartyState` also left the connection believing it
-                    // had nothing in flight — so the concurrency cap read zero
-                    // and the disconnect sweep, gated on this same list, never
-                    // ran.
-                    match state.begin_upload(member, upload) {
-                        // Stays listed on the connection until the deferred
-                        // phase finishes: between here and the commit it is a
-                        // *reservation*, and a disconnect in that window has to
-                        // release it. `connection.rs` clears it after.
-                        Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
-                        Err(reason) => {
-                            conn.finish_upload(upload);
-                            Dispatch::reply(PartyResponse::ActionFailed {
-                                channel: Uuid::nil(),
-                                reason,
-                            })
-                        }
-                    }
-                }
-                PartyRequest::CancelUpload { upload } => {
+        PartyRequest::FinishUpload { upload } => {
+            // Phase 1 only: check it and take the bytes. The write is deferred,
+            // because it is up to `MAX_PARTY_FILE_BYTES` of hashing and I/O and
+            // doing it here does it with the state lock held.
+            //
+            // The connection's own list is cleared *after* the call, not before.
+            // Clearing it first meant an error path that left the spool in
+            // `PartyState` also left the connection believing it had nothing in
+            // flight — so the concurrency cap read zero and the disconnect
+            // sweep, gated on this same list, never ran.
+            match state.begin_upload(member, upload) {
+                // Stays listed on the connection until the deferred phase
+                // finishes: between here and the commit it is a *reservation*,
+                // and a disconnect in that window has to release it.
+                // `connection.rs` clears it after.
+                Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
+                Err(reason) => {
                     conn.finish_upload(upload);
-                    state.cancel_upload(member, upload);
-                    Dispatch::default()
+                    Dispatch::action_failed(Uuid::nil(), reason)
                 }
-                // Re-sharing a file is an ordinary post that happens to reuse
-                // bytes the server already holds, so it fans out like one.
-                PartyRequest::ShareFile { hash, from, target } => {
-                    match state.share_file(member, &hash, from, target) {
-                        Ok(env) => match target {
-                            UploadTarget::Channel(_) => channel_fanout(state, env),
-                            UploadTarget::Dm(to) => Dispatch {
-                                replies: vec![PartyResponse::MessagePosted {
-                                    channel: env.channel,
-                                    seq: env.seq,
-                                }],
-                                broadcast: Vec::new(),
-                                directed: dm_delivery(member, to, env),
-                                deferred: None,
-                            },
-                        },
-                        Err(reason) => Dispatch::reply(PartyResponse::ActionFailed {
-                            channel: upload_thread(member, target),
-                            reason,
-                        }),
-                    }
-                }
-                PartyRequest::SetFilePermissions {
-                    hash,
-                    location,
-                    member: target,
-                    perms,
-                } => match state.set_file_permissions(member, &hash, location, target, perms) {
-                    Ok(msg) => Dispatch::reply(PartyResponse::Ok(msg)),
-                    Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-                },
-                PartyRequest::DownloadChunk { hash, offset } => {
-                    match state.plan_blob_read(member, &hash, Some(offset)) {
-                        Some(plan) => Dispatch::defer(Deferred::Download {
-                            hash,
-                            offset: Some(offset),
-                            plan,
-                        }),
-                        None => Dispatch::reply(PartyResponse::Error("unknown file".to_string())),
-                    }
-                }
+            }
+        }
+        PartyRequest::CancelUpload { upload } => {
+            conn.finish_upload(upload);
+            state.cancel_upload(member, upload);
+            Dispatch::default()
+        }
+        // Re-sharing a file is an ordinary post that happens to reuse bytes the
+        // server already holds, so it fans out like one.
+        PartyRequest::ShareFile { hash, from, target } => {
+            match state.share_file(member, &hash, from, target) {
+                Ok(env) => posted(state, member, target, env),
+                Err(reason) => Dispatch::action_failed(upload_thread(member, target), reason),
             }
         }
     }

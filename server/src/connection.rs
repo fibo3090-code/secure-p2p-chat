@@ -42,6 +42,75 @@ where
     (rd, seq, result)
 }
 
+/// Perform the I/O `handle_request` deferred, once the state lock is released,
+/// and produce the replies it leads to.
+///
+/// Anything that moves real bytes — a blob read, a blob write — is deliberately
+/// *not* done inside `handle_request`, because doing it there does it with the
+/// state mutex held and one member's 100 MiB transfer then stalls every other
+/// member's messages for its whole duration.
+///
+/// `spawn_blocking`, not `block_in_place`: this is ordinary file I/O with
+/// nothing borrowed from the state, so it belongs on the blocking pool, and
+/// unlike `block_in_place` it does not require a multi-threaded runtime (the
+/// tests run on a current-thread one).
+async fn perform_deferred(
+    work: Deferred,
+    state: &Mutex<PartyState>,
+    conn: &mut ConnState,
+) -> Dispatch {
+    match work {
+        Deferred::Download { hash, offset, plan } => {
+            let total = plan.total();
+            let bytes = tokio::task::spawn_blocking(move || plan.perform())
+                .await
+                .unwrap_or(None);
+            download_reply(hash, offset, total, bytes)
+        }
+        Deferred::Upload(staged) => {
+            let staged_id = staged.id();
+            let member = conn.member().unwrap_or_else(Uuid::nil);
+            // Phase 2: hash and write, off the lock.
+            let written = tokio::task::spawn_blocking(move || {
+                let mut staged = staged;
+                let outcome = staged.write_staging();
+                (staged, outcome)
+            })
+            .await;
+            let out = match written {
+                Ok((staged, Ok(()))) => {
+                    // Phase 3: re-check and commit, under the lock again. The
+                    // upload's own bytes are on disk by now; this only renames
+                    // and records, so the lock is held for a rename rather than
+                    // for a 100 MiB write.
+                    let mut st = state.lock().await;
+                    let committed = st.commit_upload(*staged);
+                    upload_committed(&st, member, committed)
+                }
+                Ok((staged, Err(reason))) => {
+                    state.lock().await.discard_upload(*staged);
+                    Dispatch::action_failed(Uuid::nil(), reason)
+                }
+                Err(_) => {
+                    // The blocking task panicked or was cancelled; the staged
+                    // upload went with it, so only the reservation is left to
+                    // release.
+                    state
+                        .lock()
+                        .await
+                        .cancel_connection_uploads(member, &[staged_id]);
+                    Dispatch::action_failed(
+                        Uuid::nil(),
+                        "the server could not store this file".to_string(),
+                    )
+                }
+            };
+            conn.finish_upload(staged_id);
+            out
+        }
+    }
+}
+
 /// Serve one client connection to completion (until the peer disconnects or a
 /// frame fails to authenticate). The server's identity (`server_privkey`) is
 /// TOFU-verified by the client; the client's handshake-verified fingerprint is
@@ -118,94 +187,13 @@ where
                         let mut st = state.lock().await;
                         handle_request(&mut st, &mut conn, req)
                     }
-                    None => Dispatch {
-                        replies: vec![PartyResponse::Error("malformed request".to_string())],
-                        ..Dispatch::default()
-                    },
+                    None => Dispatch::reply(PartyResponse::Error("malformed request".to_string())),
                 };
 
-                // The lock is released above. Anything that moves real bytes —
-                // a blob read, a blob write — was deliberately *not* done inside
-                // `handle_request`, because doing it there does it with the
-                // state mutex held and one member's 100 MiB transfer then stalls
-                // every other member's messages for its whole duration.
-                //
-                // `spawn_blocking`, not `block_in_place`: this is ordinary file
-                // I/O with nothing borrowed from the state, so it belongs on the
-                // blocking pool, and unlike `block_in_place` it does not require
-                // a multi-threaded runtime (the tests run on a current-thread
-                // one).
+                // The lock is released above; anything that moves real bytes
+                // happens now (see `perform_deferred`).
                 if let Some(work) = outcome.deferred.take() {
-                    let done = match work {
-                        Deferred::Download { hash, offset, plan } => {
-                            let total = plan.total();
-                            let bytes = tokio::task::spawn_blocking(move || plan.perform())
-                                .await
-                                .unwrap_or(None);
-                            download_reply(hash, offset, total, bytes)
-                        }
-                        Deferred::Upload(staged) => {
-                            let staged_id = staged.id();
-                            // Phase 2: hash and write, off the lock.
-                            let staged = tokio::task::spawn_blocking(move || {
-                                let mut staged = staged;
-                                let outcome = staged.write_staging();
-                                (staged, outcome)
-                            })
-                            .await;
-                            match staged {
-                                Ok((staged, Ok(()))) => {
-                                    // Phase 3: re-check and commit, under the
-                                    // lock again. The upload's own bytes are on
-                                    // disk by now; this only renames and records,
-                                    // so the lock is held for a rename rather
-                                    // than for a 100 MiB write.
-                                    let mut st = state.lock().await;
-                                    let committed = st.commit_upload(*staged);
-                                    let out = upload_committed(
-                                        &st,
-                                        conn.member().unwrap_or_else(Uuid::nil),
-                                        committed,
-                                    );
-                                    drop(st);
-                                    conn.finish_upload(staged_id);
-                                    out
-                                }
-                                Ok((staged, Err(reason))) => {
-                                    state.lock().await.discard_upload(*staged);
-                                    conn.finish_upload(staged_id);
-                                    Dispatch {
-                                        replies: vec![PartyResponse::ActionFailed {
-                                            channel: Uuid::nil(),
-                                            reason,
-                                        }],
-                                        ..Dispatch::default()
-                                    }
-                                }
-                                Err(_) => {
-                                    // The blocking task panicked or was
-                                    // cancelled; the staged upload went with it,
-                                    // so only the reservation is left to release.
-                                    state
-                                        .lock()
-                                        .await
-                                        .cancel_connection_uploads(
-                                            conn.member().unwrap_or_else(Uuid::nil),
-                                            &[staged_id],
-                                        );
-                                    conn.finish_upload(staged_id);
-                                    Dispatch {
-                                        replies: vec![PartyResponse::ActionFailed {
-                                            channel: Uuid::nil(),
-                                            reason: "the server could not store this file"
-                                                .to_string(),
-                                        }],
-                                        ..Dispatch::default()
-                                    }
-                                }
-                            }
-                        }
-                    };
+                    let done = perform_deferred(work, &state, &mut conn).await;
                     outcome.replies.extend(done.replies);
                     outcome.broadcast.extend(done.broadcast);
                     outcome.directed.extend(done.directed);
