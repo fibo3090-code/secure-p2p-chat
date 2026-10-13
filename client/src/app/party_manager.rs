@@ -426,27 +426,40 @@ impl PartyManager {
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<PartyRequest>();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Incoming>();
 
-        // Connection task: pump outgoing requests and forward incoming responses.
+        // Connection task: two independent pumps, one per direction.
+        //
+        // It used to be one loop that selected between "send the next request"
+        // and "read the next response", building a fresh read each iteration.
+        // `recv_framed` is not cancel-safe (a length prefix, then the body), so
+        // whenever a request won the race while a response was half-read, the
+        // bytes already consumed were thrown away, the next read failed to
+        // decrypt, and the connection dropped — reliably, while a large
+        // download streamed in and the user kept posting. The server hit and
+        // fixed the same bug (`server/src/connection.rs`). Separate pumps never
+        // abandon a read, and a slow write never stops the reading either.
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    outgoing = outgoing_rx.recv() => match outgoing {
-                        Some(req) => {
-                            if writer.send(&req).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break, // manager dropped this connection
-                    },
-                    incoming = reader.recv() => match incoming {
-                        Ok(resp) => {
-                            if incoming_tx.send(Incoming::Response(resp)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break, // server closed or a frame failed to authenticate
-                    },
+            let send_requests = async {
+                // Ends when the manager drops this connection, or the write fails.
+                while let Some(req) = outgoing_rx.recv().await {
+                    if writer.send(&req).await.is_err() {
+                        break;
+                    }
                 }
+            };
+            let forward_responses = async {
+                // Ends when the server closes, a frame fails to authenticate, or
+                // the manager stops listening.
+                while let Ok(resp) = reader.recv().await {
+                    if incoming_tx.send(Incoming::Response(resp)).is_err() {
+                        break;
+                    }
+                }
+            };
+            // Either direction ending ends the connection; dropping the other
+            // pump mid-frame is fine, because nothing reads after it.
+            tokio::select! {
+                _ = send_requests => {}
+                _ = forward_responses => {}
             }
             let _ = incoming_tx.send(Incoming::Disconnected);
         });

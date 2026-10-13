@@ -629,3 +629,84 @@ async fn the_server_keeps_serving_after_failed_connections() {
     })
     .await;
 }
+
+/// Regression test for the non-cancel-safe read in the client's connection
+/// task.
+///
+/// The task selected between "send the next request" and "read the next
+/// response", building a fresh read each time. `recv_framed` is not cancel-safe
+/// (length prefix, then body), so whenever a request won the race while a
+/// response was half-read, the consumed bytes were lost, the next read failed
+/// to decrypt, and the connection dropped. Large responses that arrive in
+/// pieces (download chunks) while the user keeps sending (posts) are exactly
+/// that interleaving. The server had and fixed the same bug.
+#[tokio::test]
+async fn sending_while_a_large_download_streams_in_keeps_the_connection() {
+    let server = start_server(None).await;
+    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
+    let (mut mgr, sid) = join(&server, "alice", None, &key).await;
+    pump_until(&mut mgr, "channel list", |m| {
+        channel_named(m, sid, "general").is_some()
+    })
+    .await;
+    let general = channel_named(&mgr, sid, "general").unwrap();
+
+    // A file past the inline limit, so it is uploaded and downloaded in chunks.
+    let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    mgr.send_file(
+        sid,
+        general,
+        "big.bin".into(),
+        "application/octet-stream".into(),
+        data.clone(),
+    )
+    .expect("upload");
+    pump_until(&mut mgr, "upload stored", |m| {
+        m.server(sid).unwrap().messages[&general]
+            .iter()
+            .any(|e| matches!(e.payload, MessagePayload::File(_)) && e.seq != 0)
+    })
+    .await;
+    let hash = messenger_core::party::blob_hash(&data);
+
+    let mut rx = mgr.request_download(sid, hash).expect("download");
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    let mut sent = 0;
+    let downloaded = loop {
+        mgr.poll_events();
+        if sent < 400 {
+            for _ in 0..4 {
+                mgr.post(sid, general, format!("while downloading {sent}"))
+                    .expect("post");
+                sent += 1;
+            }
+        }
+        match rx.try_recv() {
+            Ok(result) => break result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                break Err("the connection dropped mid-download".to_string())
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the download"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        downloaded.expect("download completes"),
+        data,
+        "the file came back intact"
+    );
+    pump_until(&mut mgr, "every post confirmed", |m| {
+        let s = m.server(sid).unwrap();
+        s.status == PartyStatus::Joined
+            && s.messages[&general]
+                .iter()
+                .filter(|e| matches!(e.payload, MessagePayload::Text(_)))
+                .all(|e| e.seq != 0)
+    })
+    .await;
+    assert_eq!(mgr.server(sid).unwrap().status, PartyStatus::Joined);
+}
