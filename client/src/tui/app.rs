@@ -2180,6 +2180,15 @@ mod tests {
         );
     }
 
+    fn queued_prompt(session_id: Uuid) -> crate::app::PendingFingerprint {
+        crate::app::PendingFingerprint {
+            fingerprint: "deadbeef".into(),
+            peer_name: "Peer".into(),
+            sas: String::new(),
+            session_id,
+        }
+    }
+
     #[test]
     fn fingerprint_accept_confirms_and_stores() {
         let mut app = app();
@@ -2189,6 +2198,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.chat_manager
             .add_fingerprint_confirm_sender_for_test(chat_id, tx);
+        // The overlay is always opened from the manager's queued prompt.
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(queued_prompt(chat_id));
         app.overlay = TuiOverlay::FingerprintVerify {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),

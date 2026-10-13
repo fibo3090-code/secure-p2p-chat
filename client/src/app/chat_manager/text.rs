@@ -186,6 +186,12 @@ impl ChatManager {
             text.len()
         );
 
+        // Refused here rather than trusted to every front-end: a blank message
+        // went over the wire and showed up as an empty bubble on both ends.
+        if text.trim().is_empty() {
+            bail!("Nothing to send — the message is empty.");
+        }
+
         // An incoming conversation on the host is served by a differently-keyed session.
         let actual_session_chat_id = self.session_for_chat(chat_id);
 

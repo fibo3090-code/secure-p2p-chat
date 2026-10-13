@@ -518,6 +518,12 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, tx);
     }
 
+    /// Helper to queue a TOFU prompt for testing the verification flow from a
+    /// front-end, the way a session's handshake would.
+    pub fn queue_fingerprint_prompt_for_test(&mut self, prompt: PendingFingerprint) {
+        self.queue_fingerprint_request(prompt);
+    }
+
     /// Rename a conversation/chat
     pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
         // Truncate by characters (not bytes) so multi-byte/emoji titles never
@@ -857,5 +863,7 @@ mod files;
 mod invites;
 mod text;
 
+#[cfg(test)]
+mod adversarial_tests;
 #[cfg(test)]
 mod tests;
