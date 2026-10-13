@@ -1227,27 +1227,6 @@ where
     .await
 }
 
-/// Extract sequence number from a ProtocolMessage
-/// Returns None if the message type doesn't have a sequence number (shouldn't happen in practice)
-fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
-    match msg {
-        ProtocolMessage::Version { .. } => None, // Handshake only
-        ProtocolMessage::EphemeralKey { .. } => None, // Handshake only
-        ProtocolMessage::SupportedSignatureSchemes { .. } => None, // Handshake only
-        ProtocolMessage::Text { seq, .. } => Some(*seq),
-        ProtocolMessage::TextChunk { seq, .. } => Some(*seq),
-        ProtocolMessage::FileMeta { seq, .. } => Some(*seq),
-        ProtocolMessage::FileChunk { seq, .. } => Some(*seq),
-        ProtocolMessage::FileEnd { seq } => Some(*seq),
-        ProtocolMessage::FileCancel { seq } => Some(*seq),
-        ProtocolMessage::Ping { seq } => Some(*seq),
-        ProtocolMessage::TypingStart { seq } => Some(*seq),
-        ProtocolMessage::TypingStop { seq } => Some(*seq),
-        ProtocolMessage::Rekey { seq, .. } => Some(*seq),
-        ProtocolMessage::Ack { seq, .. } => Some(*seq),
-    }
-}
-
 /// Validate message sequence number for replay attack protection
 ///
 /// Transport-layer validation ensures that:
@@ -1270,11 +1249,9 @@ fn validate_message_sequence(
     last_valid_seq: &mut u64,
 ) -> Result<(), String> {
     // Handshake messages don't have sequence numbers - always allow
-    if extract_sequence(msg).is_none() {
+    let Some(seq) = msg.seq() else {
         return Ok(());
-    }
-
-    let seq = extract_sequence(msg).unwrap();
+    };
 
     // Strict monotonic increase: new sequence must be strictly greater than last valid
     if seq <= *last_valid_seq {

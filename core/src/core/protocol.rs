@@ -245,7 +245,93 @@ fn decode_number_field(b: &[u8]) -> Option<&str> {
     decode_text(b)
 }
 
+/// A bounds-checked cursor over one binary frame.
+///
+/// Every read either yields exactly the bytes asked for or `None` — it never
+/// panics and never reads past the end — so a decoder arm is a straight line of
+/// `?`s instead of a running offset checked against `b.len()` by hand before
+/// every field. Trailing bytes after the last field are left unread, as they
+/// always were: the tagged format has never rejected them.
+struct Reader<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn new(frame: &'a [u8]) -> Self {
+        Self { rest: frame }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if n > self.rest.len() {
+            return None;
+        }
+        let (head, tail) = self.rest.split_at(n);
+        self.rest = tail;
+        Some(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        self.array::<1>().map(|[b]| b)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.array().map(u32::from_be_bytes)
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        self.array().map(u64::from_be_bytes)
+    }
+
+    /// A `u32` length prefix and the body it announces. The length is checked
+    /// against `allowed` *before* the body is sliced, so a hostile prefix is
+    /// refused without its claimed size ever mattering.
+    fn len_prefixed(&mut self, allowed: std::ops::RangeInclusive<usize>) -> Option<&'a [u8]> {
+        let len = self.u32()? as usize;
+        if !allowed.contains(&len) {
+            return None;
+        }
+        self.take(len)
+    }
+}
+
+/// Append `bytes` behind a big-endian `u32` length prefix — the encoder half of
+/// [`Reader::len_prefixed`].
+fn put_len_prefixed(v: &mut Vec<u8>, bytes: &[u8]) {
+    v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    v.extend_from_slice(bytes);
+}
+
+/// Parse a legacy ASCII arm whose payload is a single decimal number.
+fn legacy_number<T: std::str::FromStr>(field: &[u8]) -> Option<T> {
+    decode_number_field(field)?.trim().parse().ok()
+}
+
 impl ProtocolMessage {
+    /// The transport sequence number, for every variant that carries one.
+    /// Handshake-only variants have none.
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            Self::Text { seq, .. }
+            | Self::TextChunk { seq, .. }
+            | Self::FileMeta { seq, .. }
+            | Self::FileChunk { seq, .. }
+            | Self::FileEnd { seq }
+            | Self::FileCancel { seq }
+            | Self::Ping { seq }
+            | Self::TypingStart { seq }
+            | Self::TypingStop { seq }
+            | Self::Rekey { seq, .. }
+            | Self::Ack { seq, .. } => Some(*seq),
+            Self::Version { .. }
+            | Self::EphemeralKey { .. }
+            | Self::SupportedSignatureSchemes { .. } => None,
+        }
+    }
+
     /// Overwrite the transport sequence number on variants that carry one.
     ///
     /// The session message loop owns a single monotonic outgoing counter and
@@ -285,9 +371,7 @@ impl ProtocolMessage {
 
             Self::EphemeralKey { public_key } => {
                 v.push(1u8);
-                let len = (public_key.len() as u32).to_be_bytes();
-                v.extend_from_slice(&len);
-                v.extend_from_slice(public_key);
+                put_len_prefixed(&mut v, public_key);
             }
 
             Self::SupportedSignatureSchemes { schemes } => {
@@ -304,10 +388,7 @@ impl ProtocolMessage {
                 v.push(2u8);
                 v.extend_from_slice(&seq.to_be_bytes());
                 v.extend_from_slice(&timestamp.to_be_bytes());
-                let bytes = text.as_bytes();
-                let len = (bytes.len() as u32).to_be_bytes();
-                v.extend_from_slice(&len);
-                v.extend_from_slice(bytes);
+                put_len_prefixed(&mut v, text.as_bytes());
             }
 
             Self::TextChunk {
@@ -324,10 +405,7 @@ impl ProtocolMessage {
                 v.extend_from_slice(&timestamp.to_be_bytes());
                 v.extend_from_slice(&chunk_index.to_be_bytes());
                 v.extend_from_slice(&total_chunks.to_be_bytes());
-                let bytes = text_part.as_bytes();
-                let len = (bytes.len() as u32).to_be_bytes();
-                v.extend_from_slice(&len);
-                v.extend_from_slice(bytes);
+                put_len_prefixed(&mut v, text_part.as_bytes());
             }
 
             Self::FileMeta {
@@ -338,18 +416,13 @@ impl ProtocolMessage {
                 v.push(3u8);
                 v.extend_from_slice(&seq.to_be_bytes());
                 v.extend_from_slice(&size.to_be_bytes());
-                let fn_bytes = filename.as_bytes();
-                let len = (fn_bytes.len() as u32).to_be_bytes();
-                v.extend_from_slice(&len);
-                v.extend_from_slice(fn_bytes);
+                put_len_prefixed(&mut v, filename.as_bytes());
             }
 
             Self::FileChunk { chunk, seq } => {
                 v.push(4u8);
                 v.extend_from_slice(&seq.to_be_bytes());
-                let len = (chunk.len() as u32).to_be_bytes();
-                v.extend_from_slice(&len);
-                v.extend_from_slice(chunk);
+                put_len_prefixed(&mut v, chunk);
             }
 
             Self::FileEnd { seq } => {
@@ -380,9 +453,7 @@ impl ProtocolMessage {
             Self::Rekey { nonce, seq } => {
                 v.push(10u8);
                 v.extend_from_slice(&seq.to_be_bytes());
-                let len = (nonce.len() as u32).to_be_bytes();
-                v.extend_from_slice(&len);
-                v.extend_from_slice(nonce);
+                put_len_prefixed(&mut v, nonce);
             }
 
             Self::Ack { acked_seq, seq } => {
@@ -400,74 +471,62 @@ impl ProtocolMessage {
         if let Some(bin) = Self::from_binary_tagged(b) {
             return Some(bin);
         }
+        // Fallback: legacy ASCII-prefixed format for compatibility with tests
+        // and older peers. Kept limited and defensive to avoid DoS or injection.
+        Self::from_legacy_ascii(b)
+    }
 
-        // Fallback: legacy ASCII-prefixed format for compatibility with tests and older peers
-        // Keep legacy parsing limited and defensive to avoid DoS or injection.
-        if b.starts_with(b"VERSION:") {
-            let version_str = decode_number_field(&b[8..])?;
-            if let Ok(version) = version_str.trim().parse::<u8>() {
-                return Some(Self::Version { version });
-            }
-            return None;
+    /// The pre-binary ASCII format. Every prefix is distinct and none is a
+    /// prefix of another, so the first match decides the frame.
+    fn from_legacy_ascii(b: &[u8]) -> Option<Self> {
+        if let Some(rest) = b.strip_prefix(b"VERSION:") {
+            return legacy_number(rest).map(|version| Self::Version { version });
         }
 
-        if b.starts_with(b"EPHEMERAL_KEY:") {
-            let public_key_bytes = &b[14..];
-            if public_key_bytes.len() != 32 {
+        if let Some(public_key) = b.strip_prefix(b"EPHEMERAL_KEY:") {
+            if public_key.len() != 32 {
                 return None;
             }
-            let public_key = public_key_bytes.to_vec();
-            return Some(Self::EphemeralKey { public_key });
+            return Some(Self::EphemeralKey {
+                public_key: public_key.to_vec(),
+            });
         }
 
-        if b.starts_with(b"TEXT:") {
+        if let Some(rest) = b.strip_prefix(b"TEXT:") {
             if b.len() > crate::MAX_TEXT_MESSAGE_BYTES {
                 return None;
             }
-            let s = decode_text(&b[5..])?;
-            let parts: Vec<&str> = s.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                let seq = parts[0].parse::<u64>().ok()?;
-                let text = parts[1].to_string();
-                return Some(Self::Text {
-                    text,
-                    timestamp: crate::util::current_timestamp_millis(),
-                    seq,
-                });
-            }
-            return None;
+            let (seq, text) = decode_text(rest)?.split_once(':')?;
+            return Some(Self::Text {
+                text: text.to_string(),
+                timestamp: crate::util::current_timestamp_millis(),
+                seq: seq.parse().ok()?,
+            });
         }
 
-        if b.starts_with(b"FILE_META|") {
+        if let Some(rest) = b.strip_prefix(b"FILE_META|") {
             // The filename is kept, so this arm cannot be lossy either — see the
             // note on `decode_text`. It was the one legacy arm that retained the
             // string it decoded.
-            let s = decode_text(b)?;
-            let parts: Vec<&str> = s.splitn(4, '|').collect();
-            if parts.len() == 4 {
-                let seq = parts[1].parse::<u64>().ok()?;
-                let raw_filename = parts[2];
-                let filename = crate::util::sanitize_filename(raw_filename);
-                if let Ok(size) = parts[3].parse::<u64>() {
-                    if size > crate::MAX_FILE_SIZE {
-                        return None;
-                    }
-                    return Some(Self::FileMeta {
-                        filename,
-                        size,
-                        seq,
-                    });
-                }
+            let mut parts = decode_text(rest)?.splitn(3, '|');
+            let (seq, raw_filename, size) = (parts.next()?, parts.next()?, parts.next()?);
+            let seq = seq.parse::<u64>().ok()?;
+            let size = size.parse::<u64>().ok()?;
+            if size > crate::MAX_FILE_SIZE {
+                return None;
             }
-            return None;
+            return Some(Self::FileMeta {
+                filename: crate::util::sanitize_filename(raw_filename),
+                size,
+                seq,
+            });
         }
 
-        if b.starts_with(b"FILE_CHUNK:") {
-            let mut parts = b[11..].splitn(2, |&c| c == b':');
+        if let Some(rest) = b.strip_prefix(b"FILE_CHUNK:") {
+            let mut parts = rest.splitn(2, |&c| c == b':');
             let seq_bytes = parts.next()?;
             let chunk = parts.next()?;
-            let seq_str = std::str::from_utf8(seq_bytes).ok()?;
-            let seq = seq_str.parse::<u64>().ok()?;
+            let seq = std::str::from_utf8(seq_bytes).ok()?.parse::<u64>().ok()?;
             if chunk.len() > crate::FILE_CHUNK_SIZE {
                 return None;
             }
@@ -477,117 +536,57 @@ impl ProtocolMessage {
             });
         }
 
-        if b.starts_with(b"FILE_END:") {
-            let s = decode_number_field(&b[9..])?;
-            let seq = s.trim().parse::<u64>().ok()?;
-            return Some(Self::FileEnd { seq });
+        if let Some(rest) = b.strip_prefix(b"FILE_END:") {
+            return legacy_number(rest).map(|seq| Self::FileEnd { seq });
         }
-
-        if b.starts_with(b"PING:") {
-            let s = decode_number_field(&b[5..])?;
-            let seq = s.trim().parse::<u64>().ok()?;
-            return Some(Self::Ping { seq });
+        if let Some(rest) = b.strip_prefix(b"PING:") {
+            return legacy_number(rest).map(|seq| Self::Ping { seq });
         }
-
-        if b.starts_with(b"TYPING_START:") {
-            let s = decode_number_field(&b[13..])?;
-            let seq = s.trim().parse::<u64>().ok()?;
-            return Some(Self::TypingStart { seq });
+        if let Some(rest) = b.strip_prefix(b"TYPING_START:") {
+            return legacy_number(rest).map(|seq| Self::TypingStart { seq });
         }
-
-        if b.starts_with(b"TYPING_STOP:") {
-            let s = decode_number_field(&b[12..])?;
-            let seq = s.trim().parse::<u64>().ok()?;
-            return Some(Self::TypingStop { seq });
+        if let Some(rest) = b.strip_prefix(b"TYPING_STOP:") {
+            return legacy_number(rest).map(|seq| Self::TypingStop { seq });
         }
 
         None
     }
 
-    // Helper: parse the new binary tagged format; returns None if not matching
+    /// Parse the binary tagged format; `None` if the frame is not a valid one.
     fn from_binary_tagged(b: &[u8]) -> Option<Self> {
-        if b.is_empty() {
-            return None;
-        }
-        let t = b[0];
-        let mut cursor = 1usize;
-        match t {
-            0 => {
-                if cursor + 1 > b.len() {
-                    return None;
-                }
-                let version = b[cursor];
-                Some(Self::Version { version })
-            }
-            1 => {
-                if cursor + 4 > b.len() {
-                    return None;
-                }
-                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
-                // Cap to 256 to prevent huge allocations (X25519 is 32 bytes)
-                if len > 256 {
-                    return None;
-                }
-                cursor += 4;
-                if cursor + len > b.len() {
-                    return None;
-                }
-                let public_key = b[cursor..cursor + len].to_vec();
-                Some(Self::EphemeralKey { public_key })
-            }
+        let mut r = Reader::new(b);
+        let msg = match r.u8()? {
+            0 => Self::Version { version: r.u8()? },
+            // Capped at 256 to prevent huge allocations (X25519 is 32 bytes).
+            1 => Self::EphemeralKey {
+                public_key: r.len_prefixed(0..=256)?.to_vec(),
+            },
             9 => {
-                if cursor + 1 > b.len() {
-                    return None;
-                }
-                let count = b[cursor] as usize;
-                cursor += 1;
+                // At most 8 signature schemes: there are two today.
+                let count = r.u8()? as usize;
                 if count > 8 {
-                    // Cap to prevent abuse (reasonable max of 8 signature schemes)
                     return None;
                 }
-                if cursor + count > b.len() {
-                    return None;
+                Self::SupportedSignatureSchemes {
+                    schemes: r.take(count)?.to_vec(),
                 }
-                let schemes = b[cursor..cursor + count].to_vec();
-                Some(Self::SupportedSignatureSchemes { schemes })
             }
             2 => {
-                if cursor + 8 + 8 + 4 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let timestamp = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
-                cursor += 4;
-                if len > crate::MAX_TEXT_MESSAGE_BYTES {
-                    return None;
-                }
-                if cursor + len > b.len() {
-                    return None;
-                }
-                let text = decode_text(&b[cursor..cursor + len])?.to_string();
-                Some(Self::Text {
-                    text,
+                let seq = r.u64()?;
+                let timestamp = r.u64()?;
+                let text = r.len_prefixed(0..=crate::MAX_TEXT_MESSAGE_BYTES)?;
+                Self::Text {
+                    text: decode_text(text)?.to_string(),
                     timestamp,
                     seq,
-                })
+                }
             }
             11 => {
-                if cursor + 16 + 8 + 8 + 4 + 4 + 4 > b.len() {
-                    return None;
-                }
-                let message_id = uuid::Uuid::from_slice(&b[cursor..cursor + 16]).ok()?;
-                cursor += 16;
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let timestamp = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let chunk_index = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?);
-                cursor += 4;
-                let total_chunks = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?);
-                cursor += 4;
+                let message_id = uuid::Uuid::from_bytes(r.array()?);
+                let seq = r.u64()?;
+                let timestamp = r.u64()?;
+                let chunk_index = r.u32()?;
+                let total_chunks = r.u32()?;
                 // Reject a huge `total_chunks` here: the reassembler allocates one
                 // slot per chunk up front, so an unbounded value is a remote-OOM
                 // vector. A capped, non-zero, in-range index is required.
@@ -597,129 +596,55 @@ impl ProtocolMessage {
                 {
                     return None;
                 }
-                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
-                cursor += 4;
-                if len > crate::TEXT_CHUNK_BYTES {
-                    return None;
-                }
-                if cursor + len > b.len() {
-                    return None;
-                }
-                let text_part = decode_text(&b[cursor..cursor + len])?.to_string();
-                Some(Self::TextChunk {
+                let text_part = r.len_prefixed(0..=crate::TEXT_CHUNK_BYTES)?;
+                Self::TextChunk {
                     message_id,
                     chunk_index,
                     total_chunks,
-                    text_part,
+                    text_part: decode_text(text_part)?.to_string(),
                     timestamp,
                     seq,
-                })
+                }
             }
             3 => {
-                if cursor + 8 + 8 + 4 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let size = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
+                let seq = r.u64()?;
+                let size = r.u64()?;
                 if size > crate::MAX_FILE_SIZE {
                     return None;
                 }
-                cursor += 8;
-                let fn_len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
-                cursor += 4;
-                if cursor + fn_len > b.len() {
-                    return None;
-                }
-                let raw_filename = decode_text(&b[cursor..cursor + fn_len])?;
-                let filename = crate::util::sanitize_filename(raw_filename);
-                Some(Self::FileMeta {
-                    filename,
+                // No cap of its own: the frame (`MAX_PACKET_SIZE`) bounds it, and
+                // `sanitize_filename` bounds what is kept.
+                let raw_filename = decode_text(r.len_prefixed(0..=usize::MAX)?)?;
+                Self::FileMeta {
+                    filename: crate::util::sanitize_filename(raw_filename),
                     size,
                     seq,
-                })
+                }
             }
             4 => {
-                if cursor + 8 + 4 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
-                cursor += 4;
-                if len > crate::FILE_CHUNK_SIZE {
-                    return None;
-                }
-                if cursor + len > b.len() {
-                    return None;
-                }
-                let chunk = b[cursor..cursor + len].to_vec();
-                Some(Self::FileChunk { chunk, seq })
+                let seq = r.u64()?;
+                let chunk = r.len_prefixed(0..=crate::FILE_CHUNK_SIZE)?.to_vec();
+                Self::FileChunk { chunk, seq }
             }
-            5 => {
-                if cursor + 8 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                Some(Self::FileEnd { seq })
-            }
-            12 => {
-                if cursor + 8 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                Some(Self::FileCancel { seq })
-            }
-            6 => {
-                if cursor + 8 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                Some(Self::Ping { seq })
-            }
-            7 => {
-                if cursor + 8 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                Some(Self::TypingStart { seq })
-            }
-            8 => {
-                if cursor + 8 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                Some(Self::TypingStop { seq })
-            }
+            5 => Self::FileEnd { seq: r.u64()? },
+            12 => Self::FileCancel { seq: r.u64()? },
+            6 => Self::Ping { seq: r.u64()? },
+            7 => Self::TypingStart { seq: r.u64()? },
+            8 => Self::TypingStop { seq: r.u64()? },
             10 => {
-                if cursor + 8 + 4 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let nonce_len = u32::from_be_bytes(b[cursor..cursor + 4].try_into().ok()?) as usize;
-                cursor += 4;
-                // Nonce must be at least 16 bytes for sufficient entropy and at most 256 bytes
-                if !(16..=256).contains(&nonce_len) {
-                    return None;
-                }
-                if cursor + nonce_len > b.len() {
-                    return None;
-                }
-                let nonce = b[cursor..cursor + nonce_len].to_vec();
-                Some(Self::Rekey { nonce, seq })
+                let seq = r.u64()?;
+                // At least 16 bytes for sufficient entropy, at most 256.
+                let nonce = r.len_prefixed(16..=256)?.to_vec();
+                Self::Rekey { nonce, seq }
             }
             13 => {
-                if cursor + 8 + 8 > b.len() {
-                    return None;
-                }
-                let seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                cursor += 8;
-                let acked_seq = u64::from_be_bytes(b[cursor..cursor + 8].try_into().ok()?);
-                Some(Self::Ack { acked_seq, seq })
+                let seq = r.u64()?;
+                let acked_seq = r.u64()?;
+                Self::Ack { acked_seq, seq }
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some(msg)
     }
 }
 
