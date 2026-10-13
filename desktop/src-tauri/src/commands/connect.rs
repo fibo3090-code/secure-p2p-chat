@@ -32,7 +32,7 @@ pub(crate) async fn start_host(
     // Advertise on the LAN so nearby peers can find this host without typing
     // an address. Best-effort: hosting works fine without mDNS.
     if enable_mdns {
-        let mut slot = state.discovery.lock().unwrap();
+        let mut slot = crate::lock_or_recover(&state.discovery);
         if slot.is_none() {
             *slot = messenger_core::network::Discovery::new().ok();
         }
@@ -80,7 +80,7 @@ pub(crate) async fn list_discovered_peers(
         return Ok(serde_json::json!({ "enabled": false, "peers": [] }));
     }
     {
-        let mut slot = state.discovery.lock().unwrap();
+        let mut slot = crate::lock_or_recover(&state.discovery);
         if slot.is_none() {
             *slot = messenger_core::network::Discovery::new().ok();
         }
@@ -88,10 +88,7 @@ pub(crate) async fn list_discovered_peers(
             d.poll(&state.discovered);
         }
     }
-    let peers: Vec<serde_json::Value> = state
-        .discovered
-        .lock()
-        .unwrap()
+    let peers: Vec<serde_json::Value> = crate::lock_or_recover(&state.discovered)
         .iter()
         .map(|p| {
             serde_json::json!({
@@ -106,7 +103,7 @@ pub(crate) async fn list_discovered_peers(
 }
 
 /// Whether the conversation is locked (no new peer may connect; auto-rehost
-/// paused). Mirrors the egui menu-bar toggle.
+/// paused). Mirrors the terminal client's `:lock` toggle.
 #[tauri::command]
 pub(crate) async fn lock_state(state: tauri::State<'_, Bridge>) -> Result<bool, String> {
     ensure_ready(&state)?;
@@ -133,7 +130,7 @@ pub(crate) async fn set_locked(
     // from start_host would otherwise keep advertising name/fingerprint and a
     // now-dead address.
     if locked {
-        if let Some(d) = state.discovery.lock().unwrap().as_mut() {
+        if let Some(d) = crate::lock_or_recover(&state.discovery).as_mut() {
             if let Err(e) = d.unregister() {
                 tracing::warn!("mDNS unregister on lock failed: {e}");
             }
@@ -215,7 +212,7 @@ pub(crate) async fn confirm_fingerprint(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     let result = state
         .manager
         .lock()
@@ -225,7 +222,7 @@ pub(crate) async fn confirm_fingerprint(
     // Only clear the pending prompt on success. If confirmation failed, keep it so
     // `pending_fingerprint()` can still surface it and the user can retry.
     if result.is_ok() {
-        *state.pending_fp.lock().unwrap() = None;
+        *crate::lock_or_recover(&state.pending_fp) = None;
         // An accepted fingerprint is persisted onto the chat; save so trust survives a restart.
         persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     }
@@ -239,17 +236,7 @@ pub(crate) fn pending_fingerprint(state: tauri::State<'_, Bridge>) -> Option<ser
     if ensure_ready(&state).is_err() {
         return None;
     }
-    state
-        .pending_fp
-        .lock()
-        .unwrap()
-        .clone()
-        .map(|(fingerprint, peer_name, sas, chat_id)| {
-            serde_json::json!({
-                "fingerprint": fingerprint,
-                "peer_name": peer_name,
-                "sas": sas,
-                "chat_id": chat_id,
-            })
-        })
+    crate::lock_or_recover(&state.pending_fp)
+        .as_ref()
+        .map(fingerprint_prompt_json)
 }

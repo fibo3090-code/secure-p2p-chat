@@ -32,7 +32,7 @@ pub(crate) fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
     let id = crate::lock_identity(&state.identity);
     let st = if id.is_locked() {
         "unlock"
-    } else if *state.is_new.lock().unwrap() || *state.force_setup.lock().unwrap() {
+    } else if state.needs_password_setup() {
         "set_password"
     } else {
         "ready"
@@ -73,8 +73,7 @@ pub(crate) async fn unlock(
         id.decrypt(&password)
             .map_err(|_| "Wrong password".to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
-        *state.is_new.lock().unwrap() = false;
-        *state.force_setup.lock().unwrap() = false;
+        state.password_setup_done();
         key
     };
     let mut mgr = state.manager.lock().await;
@@ -88,7 +87,7 @@ pub(crate) async fn unlock(
 
 /// Honor `auto_host_on_startup` and `auto_connect` once the identity is
 /// unlocked and history (with its persisted config) is loaded — "open the app
-/// and be reachable / reconnected", matching the egui/TUI apps. Failures are
+/// and be reachable / reconnected", matching the terminal client. Failures are
 /// logged, never fatal to the unlock.
 async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
     let pk_result = crate::lock_identity(&state.identity).private_key();
@@ -123,13 +122,11 @@ pub(crate) async fn set_password(
         // `encrypt` enforces the length floor; the message it returns is
         // already user-facing, so pass it straight through to the screen.
         id.encrypt(&password).map_err(|e| e.to_string())?;
-        id.save(&state.identity_save_path())
-            .map_err(|e| e.to_string())?;
+        id.save(&state.identity_path).map_err(|e| e.to_string())?;
         // Decrypt in memory so we remain unlocked for this session.
         id.decrypt(&password).map_err(|e| e.to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
-        *state.is_new.lock().unwrap() = false;
-        *state.force_setup.lock().unwrap() = false;
+        state.password_setup_done();
         key
     };
     // Load any existing history the same way `unlock` does. Without this, the
@@ -163,7 +160,7 @@ pub(crate) async fn change_password(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let path = state.identity_save_path();
+    let path = state.identity_path.clone();
     // Argon2 at 64 MiB × 3 passes runs twice here (verify + re-wrap), which is
     // ~1s of CPU — off the async runtime so the UI keeps painting.
     let mut candidate = crate::lock_identity(&state.identity).clone();
@@ -196,8 +193,7 @@ pub(crate) fn set_display_name(
     {
         let mut id = crate::lock_identity(&state.identity);
         id.set_name(&name).map_err(|e| e.to_string())?;
-        id.save(&state.identity_save_path())
-            .map_err(|e| e.to_string())?;
+        id.save(&state.identity_path).map_err(|e| e.to_string())?;
     }
     Ok(auth_status(state))
 }
@@ -213,7 +209,7 @@ pub(crate) async fn export_identity<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<Option<String>, String> {
     ensure_ready(&state)?;
-    let source = state.identity_save_path();
+    let source = state.identity_path.clone();
     if !source.exists() {
         return Err("No identity file to back up yet".to_string());
     }
@@ -240,7 +236,7 @@ pub(crate) async fn export_identity<R: tauri::Runtime>(
 }
 
 /// Export a support bundle (state metadata + config, never key material) to
-/// `<data dir>/diagnostics/bundle-<stamp>/`, mirroring the egui app's export.
+/// `<data dir>/diagnostics/bundle-<stamp>/`, the same bundle the terminal client exports.
 /// Returns the bundle directory path.
 #[tauri::command]
 pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Result<String, String> {
@@ -271,7 +267,7 @@ pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Resul
             contacts: mgr.contacts.len(),
             sessions: mgr.sessions_len(),
             active_toasts: mgr.toasts.len(),
-            discovered_peers: state.discovered.lock().unwrap().len(),
+            discovered_peers: crate::lock_or_recover(&state.discovered).len(),
             config: p2pem_classic::support::DiagnosticsConfig::from(&mgr.config),
         }
     };

@@ -51,8 +51,7 @@ fn fresh_bridge(dir: &std::path::Path) -> Bridge {
         identity_path: history_path.with_file_name("identity.json"),
         parties_path: history_path.with_file_name("parties.json"),
         history_path,
-        is_new: StdMutex::new(true),
-        force_setup: StdMutex::new(true),
+        needs_password_setup: std::sync::atomic::AtomicBool::new(true),
         pending_fp: Arc::new(StdMutex::new(None)),
         init_error: None,
         saved_sig: Arc::new(StdMutex::new(None)),
@@ -334,8 +333,7 @@ fn locked_identity_requires_unlock() {
     let mut bridge = fresh_bridge(dir.path());
     identity.save(&bridge.identity_path).expect("save identity");
     bridge.identity = Arc::new(StdMutex::new(identity));
-    bridge.is_new = StdMutex::new(false);
-    bridge.force_setup = StdMutex::new(false);
+    bridge.needs_password_setup = std::sync::atomic::AtomicBool::new(false);
     let h = harness_with(bridge, dir);
 
     assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");

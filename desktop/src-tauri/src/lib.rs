@@ -1,13 +1,14 @@
 //! P2PEM desktop bridge (Phase 1).
 //!
 //! A thin Tauri layer over the existing, UI-agnostic `ChatManager` from the
-//! client crate. It mirrors what the egui `App` does — owns an `Identity` plus
-//! an `Arc<Mutex<ChatManager>>`, shares a single tokio runtime with Tauri, and
-//! runs a background poll loop that drains `SessionEvent`s and notifies the
-//! webview. The frontend (static `dist/`) talks to it over the commands below.
+//! client crate, driving it the same way the terminal client does — it owns an
+//! `Identity` plus an `Arc<Mutex<ChatManager>>`, shares a single tokio runtime
+//! with Tauri, and runs a background poll loop that drains `SessionEvent`s and
+//! notifies the webview. The frontend (static `dist/`) talks to it over the commands below.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use messenger_core::identity::Identity;
@@ -21,11 +22,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
-use p2pem_classic::app::ChatManager;
+use p2pem_classic::app::{ChatManager, PendingFingerprint};
 
-/// A pending TOFU fingerprint prompt held for the frontend to poll:
-/// `(fingerprint, peer_name, sas, session_id)`.
-type PendingFp = Arc<StdMutex<Option<(String, String, String, String)>>>;
+/// The TOFU prompt currently published to the frontend, held for it to poll.
+type PendingFp = Arc<StdMutex<Option<PendingFingerprint>>>;
 
 /// Shared application state managed by Tauri.
 struct Bridge {
@@ -46,10 +46,9 @@ struct Bridge {
     /// username, and the pinned server fingerprint, so joined communities survive
     /// a restart (one-click rejoin) and a changed server identity is detected.
     parties_path: PathBuf,
-    /// A brand-new identity with no password yet.
-    is_new: StdMutex<bool>,
-    /// Plaintext key present (no password set) — force a set-password step.
-    force_setup: StdMutex<bool>,
+    /// The identity has no password yet (brand new, or a plaintext key from an
+    /// older install), so a set-password step must come before anything else.
+    needs_password_setup: AtomicBool,
     /// Pending TOFU fingerprint request, held as queryable state so a missed
     /// `fingerprint-request` event never strands a session awaiting verification.
     pending_fp: PendingFp,
@@ -63,24 +62,37 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn identity_save_path(&self) -> PathBuf {
-        self.identity_path.clone()
+    fn needs_password_setup(&self) -> bool {
+        self.needs_password_setup.load(Ordering::SeqCst)
+    }
+
+    fn password_setup_done(&self) {
+        self.needs_password_setup.store(false, Ordering::SeqCst);
     }
 }
 
-/// Lock the identity mutex, recovering from poisoning instead of panicking.
+/// Lock a std mutex, recovering from poisoning instead of panicking.
 ///
 /// `Mutex::lock().unwrap()` turns one panic anywhere in the process into a
 /// permanent, cascading failure: every later access panics too, and in the poll
 /// loop that kills event processing entirely — the app looks frozen rather than
-/// reporting anything. The `Identity` behind this lock is only ever read or
-/// wholly replaced, so a poisoned lock does not imply torn state; carrying on is
-/// strictly better than dying.
-fn lock_identity(identity: &StdMutex<Identity>) -> std::sync::MutexGuard<'_, Identity> {
-    identity.lock().unwrap_or_else(|poisoned| {
-        tracing::warn!("identity mutex was poisoned by an earlier panic; recovering");
+/// reporting anything. Every std mutex in the bridge guards a value that is
+/// only ever read or wholly replaced, so a poisoned lock does not imply torn
+/// state; carrying on is strictly better than dying.
+fn lock_or_recover<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("a bridge mutex was poisoned by an earlier panic; recovering");
         poisoned.into_inner()
     })
+}
+
+/// Parse an id the frontend sent, as a command error the UI can show.
+fn parse_id(id: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(id).map_err(|e| e.to_string())
+}
+
+fn lock_identity(identity: &StdMutex<Identity>) -> MutexGuard<'_, Identity> {
+    lock_or_recover(identity)
 }
 
 /// Signature of the state as of the last successful save, shared between the
@@ -126,9 +138,7 @@ async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path, saved_s
     };
     let path = path.to_path_buf();
     match tokio::task::spawn_blocking(move || history.save_encrypted(&path, &key)).await {
-        Ok(Ok(())) => {
-            *saved_sig.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
-        }
+        Ok(Ok(())) => *lock_or_recover(saved_sig) = Some(sig),
         Ok(Err(e)) => tracing::warn!("desktop history save failed: {e}"),
         Err(e) => tracing::warn!("desktop history save task join failed: {e}"),
     }
@@ -174,6 +184,7 @@ fn state_signature(mgr: &ChatManager) -> u64 {
         c.name.hash(&mut h);
         c.fingerprint.hash(&mut h);
         c.address.hash(&mut h);
+        c.addresses.hash(&mut h);
         c.relay_server.hash(&mut h);
         c.relay_token.hash(&mut h);
         (c.trust_state as u8).hash(&mut h);
@@ -197,7 +208,7 @@ fn ensure_ready(state: &Bridge) -> Result<(), String> {
     if lock_identity(&state.identity).is_locked() {
         return Err("Unlock required".to_string());
     }
-    if *state.is_new.lock().unwrap() || *state.force_setup.lock().unwrap() {
+    if state.needs_password_setup() {
         return Err("Password setup required".to_string());
     }
     Ok(())
@@ -314,8 +325,8 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Surface ChatManager / core `tracing` logs to stdout (captured by
-    // `tauri dev`). Override with RUST_LOG. Without this the bridge is blind —
-    // the egui app installs its own subscriber, so we must too.
+    // `tauri dev`). Override with RUST_LOG. Without a subscriber of its own the
+    // bridge is blind.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -361,14 +372,14 @@ pub fn run() {
         .expect("error while running P2PEM");
 }
 
-/// Build the identity + manager, mirroring `gui::App::new`'s data-dir setup.
+/// Build the identity + manager from the desktop app's data directory.
 fn init_bridge() -> Bridge {
     // The data dir holds `identity.json` (this peer's key/fingerprint) and the
     // encrypted history. It uses the desktop app's OWN identifier ("P2PEM"), NOT
-    // the egui app's ("EncryptedMessenger"): sharing one dir made both apps load
-    // the same identity, so they were the same P2P peer and could not connect to
-    // each other (a connection between them was a self-connection). With distinct
-    // dirs the two apps are distinct peers and connect normally.
+    // the terminal client's ("EncryptedMessenger"): sharing one dir made both
+    // apps load the same identity, so they were the same P2P peer and could not
+    // connect to each other (a connection between them was a self-connection).
+    // With distinct dirs the two apps are distinct peers and connect normally.
     //
     // `P2PEM_DATA_DIR` overrides it, so extra instances can each run with their
     // own identity/history — handy for testing several peers on one machine:
@@ -415,8 +426,9 @@ fn init_bridge() -> Bridge {
 
     let identity_path = history_path.with_file_name("identity.json");
     let parties_path = history_path.with_file_name("parties.json");
-    // Plaintext key in hand (no password) ⇒ force a set-password step.
-    let force_setup = !identity.is_locked();
+    // A new identity, or a plaintext key in hand (no password), must get a
+    // password before anything else.
+    let needs_password_setup = is_new || !identity.is_locked();
 
     let mut chat_manager = ChatManager::new(Config::default());
     // So the manager can recognise the user's own invite link and refuse to add
@@ -433,8 +445,7 @@ fn init_bridge() -> Bridge {
         history_path,
         identity_path,
         parties_path,
-        is_new: StdMutex::new(is_new),
-        force_setup: StdMutex::new(force_setup),
+        needs_password_setup: AtomicBool::new(needs_password_setup),
         pending_fp: Arc::new(StdMutex::new(None)),
         init_error,
         saved_sig: Arc::new(StdMutex::new(None)),
@@ -564,107 +575,40 @@ impl PollContext {
     }
 }
 
+/// How often the auto-rehost check runs.
+const REHOST_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// What the poll loop remembers between ticks, so that it emits events and
+/// writes files only when something actually changed.
+#[derive(Default)]
+struct PollMemory {
+    last_ui_sig: Option<u64>,
+    last_party_sig: Option<u64>,
+    /// Session id of the TOFU prompt currently published to the frontend.
+    last_fp_session: Option<Uuid>,
+    /// Servers already recorded as Joined, so the saved-communities file is
+    /// touched once per join (to fill in the server's display name), not every
+    /// tick.
+    joined_recorded: std::collections::HashSet<Uuid>,
+}
+
 /// Periodically drain network events and notify the webview to refresh.
 fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
-    let PollContext {
-        manager,
-        party,
-        identity,
-        history_path,
-        parties_path,
-        pending_fp,
-        saved_sig,
-    } = ctx;
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
-        // Change-only event emission: the webview refetches on `state-updated`
-        // and `party-updated`, so an idle tick must not fire them.
-        let mut last_ui_sig: Option<u64> = None;
-        let mut last_party_sig: Option<u64> = None;
-        // Session id of the TOFU prompt currently published to the frontend, so
-        // the (now every-tick) peek only emits when the prompt actually changes.
-        let mut last_fp_session: Option<String> = None;
-        // Rate-limits the auto-rehost check (mirrors the egui app's 1.5s timer).
+        let mut memory = PollMemory::default();
         let mut last_rehost = std::time::Instant::now();
-        // Floor between poll-driven history writes — see the save site below.
+        // Floor between poll-driven history writes — see `save_history_if_changed`.
         let mut last_save = std::time::Instant::now() - HISTORY_SAVE_MIN_INTERVAL;
-        // Servers already recorded as Joined, so the saved-communities file is
-        // touched once per join (to fill in the server's display name), not every tick.
-        let mut joined_recorded: std::collections::HashSet<Uuid> = Default::default();
         loop {
             interval.tick().await;
-            // Drain Party/Community server events (joins, channel/member updates,
-            // incoming messages) so the webview's Communities pane stays live.
-            let party_sig;
-            {
-                let mut p = party.lock().await;
-                p.poll_events();
-                party_sig = party_signature(&p);
-                // A community is saved — and its fingerprint pinned — only once
-                // the server has actually accepted us. Pinning at connect time
-                // meant a typo'd address or a wrong password left a permanent
-                // entry behind for a community the user never joined.
-                for sid in p.server_ids() {
-                    if joined_recorded.contains(&sid) {
-                        continue;
-                    }
-                    if let Some(conn) = p.server(sid) {
-                        if conn.status == PartyStatus::Joined {
-                            joined_recorded.insert(sid);
-                            upsert_saved_party(
-                                &parties_path,
-                                SavedParty {
-                                    address: conn.address.clone(),
-                                    username: conn.username.clone(),
-                                    name: conn.server_name.clone(),
-                                    fingerprint: conn.server_fingerprint.clone(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            // Auto-rehost: with auto-host enabled, an accepted connection
-            // consumes the listening placeholder — without this, the app
-            // silently stops accepting new peers after the first one (the
-            // egui app has the same loop). No-op while the identity is
-            // locked (private key unavailable, config not loaded yet).
-            if last_rehost.elapsed() >= Duration::from_millis(1500) {
+            let party_sig = ctx.poll_parties(&mut memory.joined_recorded).await;
+            if last_rehost.elapsed() >= REHOST_CHECK_INTERVAL {
                 last_rehost = std::time::Instant::now();
-                let pk = {
-                    let id = lock_identity(&identity);
-                    if id.is_locked() {
-                        None
-                    } else {
-                        id.private_key().ok()
-                    }
-                };
-                if let Some(pk) = pk {
-                    let mut m = manager.lock().await;
-                    // Not gated on `auto_host_on_startup`: that setting decides
-                    // whether hosting begins at launch, not whether hosting the
-                    // user explicitly started survives its first peer. Gating on
-                    // it meant a user who clicked "Start hosting" with the
-                    // setting off accepted exactly one peer, ever.
-                    // `check_rehost_needed()` already requires `is_hosting` and
-                    // an unlocked conversation, so stopping/locking still stops.
-                    if m.check_rehost_needed() {
-                        // Rebind the port actually in use, not the settings
-                        // default — the user may have typed another one in the
-                        // Host pane, and rehosting elsewhere silently invalidates
-                        // the address they shared.
-                        let port = m.hosting_port.unwrap_or(m.config.listen_port);
-                        match m.start_host(port, pk).await {
-                            Ok(_) => {
-                                tracing::info!(port, "auto-rehosted after a consumed listener")
-                            }
-                            Err(e) => tracing::warn!("auto-rehost failed: {e}"),
-                        }
-                    }
-                }
+                ctx.auto_rehost().await;
             }
-            let (req, toasts, sig, ui_sig) = {
-                let mut m = manager.lock().await;
+            let (prompt, toasts, sig, ui_sig) = {
+                let mut m = ctx.manager.lock().await;
                 m.poll_session_events();
                 // Drain ChatManager's internal toasts (Connected, errors,
                 // "connection refused", …) so the webview can surface them.
@@ -676,27 +620,11 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                 // actually answers it. Taking it here meant `confirm_fingerprint`
                 // could no longer find the fingerprint to persist, and a second
                 // peer's prompt silently replaced the first one's.
-                let req = m.pending_fingerprint().cloned();
-                let sig = state_signature(&m);
-                let ui_sig = ui_signature(&m);
-                (req, toasts, sig, ui_sig)
+                let prompt = m.pending_fingerprint().cloned();
+                (prompt, toasts, state_signature(&m), ui_signature(&m))
             };
-            // Persist when the conversation surface changed (e.g. a received
-            // message). The marker is shared with the commands, which also save
-            // immediately — so a user action no longer costs a second identical
-            // rewrite of the whole encrypted history on the next tick.
-            //
-            // Coalesced: every save re-encrypts and fsyncs the WHOLE history, so
-            // saving once per message makes a long conversation cost O(n²) over
-            // its life — by message 10 000 each new line rewrites all 10 000.
-            // Batching them behind a floor turns a busy exchange into one write
-            // every few seconds. Nothing is risked beyond that window: the
-            // close handler flushes synchronously, and the marker means a
-            // deferred change is still pending, not lost.
-            let already_saved = *saved_sig.lock().unwrap_or_else(|e| e.into_inner()) == Some(sig);
-            if !already_saved && last_save.elapsed() >= HISTORY_SAVE_MIN_INTERVAL {
+            if ctx.save_history_if_changed(sig, last_save).await {
                 last_save = std::time::Instant::now();
-                persist_history(&manager, &history_path, &saved_sig).await;
             }
             for (level, message) in toasts {
                 let _ = app.emit(
@@ -704,55 +632,149 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                     serde_json::json!({ "level": level, "message": message }),
                 );
             }
-            // Publish whichever prompt is at the head of the manager's queue.
-            // Because we peek rather than take, this runs every tick — so the
-            // event only fires when the *identity* of the prompt changes, or a
-            // closed dialog would spring back open four times a second. When the
-            // user answers one, the next peer's prompt becomes the head and is
-            // emitted in its turn instead of being lost.
-            let head = req.as_ref().map(|p| p.session_id.to_string());
-            let fp_changed = head != last_fp_session;
-            if fp_changed {
-                last_fp_session = head.clone();
-                match &req {
-                    Some(pending) => {
-                        let id = pending.session_id.to_string();
-                        tracing::info!(peer = %pending.peer_name, session = %id, "TOFU fingerprint verification requested");
-                        // Persist it as queryable state first, then emit the event.
-                        *pending_fp.lock().unwrap_or_else(|e| e.into_inner()) = Some((
-                            pending.fingerprint.clone(),
-                            pending.peer_name.clone(),
-                            pending.sas.clone(),
-                            id.clone(),
-                        ));
-                        let _ = app.emit(
-                            "fingerprint-request",
-                            serde_json::json!({
-                                "fingerprint": pending.fingerprint,
-                                "peer_name": pending.peer_name,
-                                "sas": pending.sas,
-                                "chat_id": id,
-                            }),
-                        );
-                    }
-                    // The queue drained (answered, or the session died): clear
-                    // the queryable copy so the fallback poll stops resurfacing
-                    // a prompt nobody can answer any more.
-                    None => *pending_fp.lock().unwrap_or_else(|e| e.into_inner()) = None,
-                }
-            }
-            let had_fp_request = fp_changed && req.is_some();
+            let new_prompt =
+                ctx.publish_fingerprint_prompt(&app, prompt, &mut memory.last_fp_session);
             // Emit refresh events only when the rendered surface changed (or a
             // TOFU prompt appeared, so its fallback polling always runs).
-            if last_ui_sig != Some(ui_sig) || had_fp_request {
-                last_ui_sig = Some(ui_sig);
+            if memory.last_ui_sig != Some(ui_sig) || new_prompt {
+                memory.last_ui_sig = Some(ui_sig);
                 let _ = app.emit("state-updated", ());
             }
             // Nudge the Communities pane only when the directory/messages changed.
-            if last_party_sig != Some(party_sig) {
-                last_party_sig = Some(party_sig);
+            if memory.last_party_sig != Some(party_sig) {
+                memory.last_party_sig = Some(party_sig);
                 let _ = app.emit("party-updated", ());
             }
         }
     });
+}
+
+impl PollContext {
+    /// Drain Party/Community server events (joins, channel/member updates,
+    /// incoming messages) so the Communities pane stays live, and record newly
+    /// joined communities. Returns the Communities signature.
+    ///
+    /// A community is saved — and its fingerprint pinned — only once the server
+    /// has actually accepted us. Pinning at connect time meant a typo'd address
+    /// or a wrong password left a permanent entry behind for a community the
+    /// user never joined.
+    async fn poll_parties(&self, joined_recorded: &mut std::collections::HashSet<Uuid>) -> u64 {
+        let mut p = self.party.lock().await;
+        p.poll_events();
+        for sid in p.server_ids() {
+            let Some(conn) = p.server(sid) else { continue };
+            if conn.status != PartyStatus::Joined || !joined_recorded.insert(sid) {
+                continue;
+            }
+            upsert_saved_party(
+                &self.parties_path,
+                SavedParty {
+                    address: conn.address.clone(),
+                    username: conn.username.clone(),
+                    name: conn.server_name.clone(),
+                    fingerprint: conn.server_fingerprint.clone(),
+                },
+            );
+        }
+        party_signature(&p)
+    }
+
+    /// Re-open the listener after an accepted peer consumed it.
+    ///
+    /// Without this the app silently stops accepting new peers after the first
+    /// one. Not gated on `auto_host_on_startup`: that setting decides whether
+    /// hosting begins at launch, not whether hosting the user explicitly
+    /// started survives its first peer — gating on it meant a user who clicked
+    /// "Start hosting" with the setting off accepted exactly one peer, ever.
+    /// `check_rehost_needed()` already requires `is_hosting` and an unlocked
+    /// conversation, so stopping/locking still stops. A no-op while the
+    /// identity is locked (no private key, config not loaded yet).
+    async fn auto_rehost(&self) {
+        let pk = {
+            let id = lock_identity(&self.identity);
+            if id.is_locked() {
+                return;
+            }
+            match id.private_key() {
+                Ok(pk) => pk,
+                Err(_) => return,
+            }
+        };
+        let mut m = self.manager.lock().await;
+        if !m.check_rehost_needed() {
+            return;
+        }
+        // Rebind the port actually in use, not the settings default — the user
+        // may have typed another one in the Host pane, and rehosting elsewhere
+        // silently invalidates the address they shared.
+        let port = m.hosting_port.unwrap_or(m.config.listen_port);
+        match m.start_host(port, pk).await {
+            Ok(_) => tracing::info!(port, "auto-rehosted after a consumed listener"),
+            Err(e) => tracing::warn!("auto-rehost failed: {e}"),
+        }
+    }
+
+    /// Persist when the conversation surface changed (e.g. a received
+    /// message), at most once per `HISTORY_SAVE_MIN_INTERVAL`. Returns whether
+    /// it wrote.
+    ///
+    /// The marker is shared with the commands, which also save immediately, so
+    /// a user action does not cost a second identical rewrite on the next tick.
+    /// Coalesced because every save re-encrypts and fsyncs the WHOLE history:
+    /// saving once per message makes a long conversation cost O(n²) over its
+    /// life. Nothing is risked beyond that window — the close handler flushes
+    /// synchronously, and the marker means a deferred change is still pending,
+    /// not lost.
+    async fn save_history_if_changed(&self, sig: u64, last_save: std::time::Instant) -> bool {
+        let already_saved = *lock_or_recover(&self.saved_sig) == Some(sig);
+        if already_saved || last_save.elapsed() < HISTORY_SAVE_MIN_INTERVAL {
+            return false;
+        }
+        persist_history(&self.manager, &self.history_path, &self.saved_sig).await;
+        true
+    }
+
+    /// Publish whichever TOFU prompt is at the head of the manager's queue.
+    /// Returns `true` when a new prompt appeared.
+    ///
+    /// Because the loop peeks rather than takes, this runs every tick — so the
+    /// event only fires when the *identity* of the prompt changes, or a closed
+    /// dialog would spring back open four times a second. When the user
+    /// answers one, the next peer's prompt becomes the head and is emitted in
+    /// its turn instead of being lost.
+    fn publish_fingerprint_prompt(
+        &self,
+        app: &tauri::AppHandle,
+        prompt: Option<PendingFingerprint>,
+        last_session: &mut Option<Uuid>,
+    ) -> bool {
+        let head = prompt.as_ref().map(|p| p.session_id);
+        if head == *last_session {
+            return false;
+        }
+        *last_session = head;
+        let Some(prompt) = prompt else {
+            // The queue drained (answered, or the session died): clear the
+            // queryable copy so the fallback poll stops resurfacing a prompt
+            // nobody can answer any more.
+            *lock_or_recover(&self.pending_fp) = None;
+            return false;
+        };
+        tracing::info!(peer = %prompt.peer_name, session = %prompt.session_id, "TOFU fingerprint verification requested");
+        // Store it as queryable state first, then emit the event.
+        let payload = fingerprint_prompt_json(&prompt);
+        *lock_or_recover(&self.pending_fp) = Some(prompt);
+        let _ = app.emit("fingerprint-request", payload);
+        true
+    }
+}
+
+/// The shape the frontend expects for a TOFU prompt (event and poll alike).
+fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
+    serde_json::json!({
+        "fingerprint": prompt.fingerprint,
+        "peer_name": prompt.peer_name,
+        "sas": prompt.sas,
+        "chat_id": prompt.session_id.to_string(),
+    })
 }

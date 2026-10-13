@@ -5,7 +5,7 @@ use messenger_core::party::{ChannelKind, FilePermissions, Role, UploadTarget};
 
 // ── Communities (Party servers) ─────────────────────────────────────────────
 //
-// A thin bridge over `PartyManager`, mirroring the egui Party tab. Command
+// A thin bridge over `PartyManager`, the same one the terminal client drives. Command
 // params are single words (`server`, `channel`, …) to avoid the Tauri 2
 // arg-naming footgun where a snake_case param silently no-ops.
 
@@ -418,8 +418,8 @@ pub(crate) async fn party_history(
     state: tauri::State<'_, Bridge>,
 ) -> Result<Vec<PartyMessageDto>, String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let cid = parse_id(&channel)?;
     let party = state.party.lock().await;
     let conn = party
         .server(sid)
@@ -441,8 +441,8 @@ pub(crate) async fn party_post(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let cid = parse_id(&channel)?;
     state
         .party
         .lock()
@@ -459,7 +459,7 @@ pub(crate) async fn party_create_channel(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     state
         .party
         .lock()
@@ -477,8 +477,8 @@ pub(crate) async fn party_send_dm(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let to = Uuid::parse_str(&to).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let to = parse_id(&to)?;
     state
         .party
         .lock()
@@ -496,8 +496,8 @@ pub(crate) async fn party_dm_history(
     state: tauri::State<'_, Bridge>,
 ) -> Result<Vec<PartyMessageDto>, String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let peer = Uuid::parse_str(&peer).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let peer = parse_id(&peer)?;
     let mut party = state.party.lock().await;
     let _ = party.fetch_dm_history(sid, peer);
     let conn = party
@@ -518,7 +518,7 @@ pub(crate) async fn party_clear_error(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     state.party.lock().await.clear_server_error(sid);
     Ok(())
 }
@@ -636,7 +636,7 @@ pub(crate) async fn party_leave(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     let mut party = state.party.lock().await;
     let address = party.server(sid).map(|c| c.address.clone());
     if !party.remove_server(sid) {
@@ -663,7 +663,7 @@ pub(crate) async fn party_create_channel_kind(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     let kind = parse_kind(&kind)?;
     let members = parse_ids(&members)?;
     state
@@ -682,8 +682,8 @@ pub(crate) async fn party_delete_channel(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let cid = parse_id(&channel)?;
     state
         .party
         .lock()
@@ -702,8 +702,8 @@ pub(crate) async fn party_set_channel_access(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let cid = parse_id(&channel)?;
     let kind = parse_kind(&kind)?;
     let members = parse_ids(&members)?;
     state
@@ -723,8 +723,8 @@ pub(crate) async fn party_set_role(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let mid = Uuid::parse_str(&member).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let mid = parse_id(&member)?;
     let role = parse_role(&role)?;
     state
         .party
@@ -742,7 +742,7 @@ pub(crate) async fn party_refresh_files(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     state
         .party
         .lock()
@@ -764,11 +764,11 @@ pub(crate) async fn party_share_file(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let from = Uuid::parse_str(&from).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let from = parse_id(&from)?;
     let target = match (channel, peer) {
-        (Some(c), _) => UploadTarget::Channel(Uuid::parse_str(&c).map_err(|e| e.to_string())?),
-        (None, Some(p)) => UploadTarget::Dm(Uuid::parse_str(&p).map_err(|e| e.to_string())?),
+        (Some(c), _) => UploadTarget::Channel(parse_id(&c)?),
+        (None, Some(p)) => UploadTarget::Dm(parse_id(&p)?),
         (None, None) => return Err("no destination given".to_string()),
     };
     state
@@ -802,10 +802,10 @@ pub(crate) async fn party_set_file_permissions(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let loc = Uuid::parse_str(&location).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let loc = parse_id(&location)?;
     let member = match member {
-        Some(m) => Some(Uuid::parse_str(&m).map_err(|e| e.to_string())?),
+        Some(m) => Some(parse_id(&m)?),
         None => None,
     };
     state
@@ -836,8 +836,8 @@ pub(crate) async fn party_delete_file(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let loc = Uuid::parse_str(&location).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let loc = parse_id(&location)?;
     state
         .party
         .lock()
@@ -853,7 +853,7 @@ pub(crate) async fn party_refresh_audit(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     state
         .party
         .lock()
@@ -869,15 +869,13 @@ pub(crate) async fn party_clear_notice(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     state.party.lock().await.clear_notice(sid);
     Ok(())
 }
 
 fn parse_ids(ids: &[String]) -> Result<Vec<Uuid>, String> {
-    ids.iter()
-        .map(|s| Uuid::parse_str(s).map_err(|e| e.to_string()))
-        .collect()
+    ids.iter().map(|s| parse_id(s)).collect()
 }
 
 /// Open the native file picker (parented to the app window) and read the chosen
@@ -935,8 +933,8 @@ pub(crate) async fn party_send_file<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let cid = Uuid::parse_str(&channel).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let cid = parse_id(&channel)?;
     let Some((name, mime, data)) = pick_upload(window).await? else {
         return Ok(());
     };
@@ -957,8 +955,8 @@ pub(crate) async fn party_send_file_dm<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
-    let peer = Uuid::parse_str(&to).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
+    let peer = parse_id(&to)?;
     let Some((name, mime, data)) = pick_upload(window).await? else {
         return Ok(());
     };
@@ -988,7 +986,7 @@ pub(crate) async fn party_download_file<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let sid = Uuid::parse_str(&server).map_err(|e| e.to_string())?;
+    let sid = parse_id(&server)?;
     // Register the download and drop the party lock BEFORE awaiting, so the poll
     // loop can lock the manager, drain the FileData response, and complete us.
     let rx = state

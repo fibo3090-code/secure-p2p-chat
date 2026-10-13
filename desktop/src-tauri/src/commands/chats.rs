@@ -79,7 +79,7 @@ pub(crate) async fn list_conversations(
 #[tauri::command]
 pub(crate) async fn mark_read(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     ensure_ready(&state)?;
-    let chat_id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let chat_id = parse_id(&id)?;
     state.manager.lock().await.mark_chat_read(chat_id);
     // Like `send_message`, this fires often (every open, and again on each
     // arrival in the open thread) and a save rewrites the entire history. The
@@ -178,7 +178,7 @@ pub(crate) async fn cancel_transfer(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let transfer_id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let transfer_id = parse_id(&id)?;
     state.manager.lock().await.cancel_transfer(transfer_id);
     Ok(())
 }
@@ -190,7 +190,7 @@ pub(crate) async fn get_conversation(
     state: tauri::State<'_, Bridge>,
 ) -> Result<serde_json::Value, String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     let mgr = state.manager.lock().await;
     match mgr.get_chat(uuid) {
         Some(chat) => serde_json::to_value(chat).map_err(|e| e.to_string()),
@@ -205,7 +205,7 @@ pub(crate) async fn send_message(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state
         .manager
         .lock()
@@ -230,7 +230,7 @@ pub(crate) async fn send_file<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     let picked =
         crate::native_file_dialog(window, |d| d.set_title("Send a file").pick_file()).await?;
     let Some(path) = picked else {
@@ -254,7 +254,7 @@ pub(crate) async fn accept_transfer(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state
         .manager
         .lock()
@@ -273,7 +273,7 @@ pub(crate) async fn decline_transfer(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state
         .manager
         .lock()
@@ -291,8 +291,8 @@ async fn file_message_path(
     id: &str,
     msg: &str,
 ) -> Result<(PathBuf, bool), String> {
-    let chat_id = Uuid::parse_str(id).map_err(|e| e.to_string())?;
-    let msg_id = Uuid::parse_str(msg).map_err(|e| e.to_string())?;
+    let chat_id = parse_id(id)?;
+    let msg_id = parse_id(msg)?;
     let mgr = state.manager.lock().await;
     let chat = mgr
         .get_chat(chat_id)
@@ -543,7 +543,7 @@ pub(crate) async fn rename_chat(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state
         .manager
         .lock()
@@ -557,7 +557,7 @@ pub(crate) async fn rename_chat(
 #[tauri::command]
 pub(crate) async fn delete_chat(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state.manager.lock().await.delete_chat(uuid);
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
