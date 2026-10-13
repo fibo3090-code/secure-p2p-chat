@@ -1,0 +1,181 @@
+name: Scheduled Fuzz
+
+# The coverage-guided half of the fuzzing story, on a clock.
+#
+# `scripts/fuzz.sh` has existed for a while and nothing ever ran it. CI gained a
+# `cargo check` on `core/fuzz` — which was worth having, since renaming a
+# function the targets call had silently broken all of them — but "it still
+# compiles" is a long way from "it still finds nothing". A fuzz target that is
+# only ever compiled is a fuzz target nobody runs.
+#
+# Weekly rather than nightly, and per-target rather than one sweep, because
+# libFuzzer's value is cumulative: each target keeps its own corpus across runs,
+# so the interesting inputs discovered in week three are the starting material
+# for week four. A sweep in one job would share a cache key across five targets
+# and a wall-clock budget across five very different search spaces.
+#
+# The property tests in `core/tests/fuzz_parsers.rs` are the other half. They
+# run on stable, gate every pull request, and are what found the filename bypass
+# in GHSA-6q3g-734c-22jm. Neither replaces the other: proptest generates from a
+# grammar, libFuzzer mutates toward new coverage. This workflow does not change
+# that division — it just means the second half actually happens.
+on:
+  schedule:
+    # 04:00 UTC on Sundays.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Seconds to fuzz each target'
+        required: false
+        default: '900'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # Each target gets its own budget plus room to build a sanitizer binary from
+    # cold. The step timeout is the real bound on the fuzzing itself.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write # file the crash when one is found
+    strategy:
+      # A crash in one parser says nothing about the other four, and the run
+      # that finally finds a bug is exactly the run you most want the rest of
+      # the results from — the same reasoning `scripts/fuzz.sh` applies to its
+      # own sweep.
+      fail-fast: false
+      matrix:
+        target:
+          - protocol_frame
+          - party_frame
+          - filename
+          - framing
+          - identity_proof
+    steps:
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      # cargo-fuzz needs nightly: it builds with `-Z` flags for the sanitizer.
+      - name: Install nightly Rust
+        # dtolnay/rust-toolchain, stable branch (the action; the toolchain it
+        # installs is the `toolchain:` input below)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        # Swatinem/rust-cache v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: core/fuzz
+          key: fuzz-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        # taiki-e/install-action v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-fuzz
+
+      # The corpus is the whole point of running this repeatedly. libFuzzer's
+      # coverage feedback is cumulative, so a corpus thrown away between runs
+      # makes every run start from nothing — and for the bincode targets that is
+      # not merely slow but hopeless, because an enum variant is a little-endian
+      # u32 and four random bytes are essentially never a valid one.
+      #
+      # `restore-keys` so a run always starts from the most recent corpus it can
+      # find: the primary key carries the run number and therefore never hits,
+      # which is what makes the cache accumulate rather than freeze at whatever
+      # the first run happened to save.
+      #
+      # `cache/restore` + `cache/save` as two explicit steps rather than one
+      # `cache` step: the combined action saves in a post-job hook that is
+      # skipped when the job fails, and the run that crashes is the one whose
+      # corpus is most worth keeping.
+      - name: Restore corpus
+        # actions/cache/restore v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: core/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_number }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        id: fuzz
+        timeout-minutes: 40
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '900' }}
+        run: ./scripts/fuzz.sh "${{ matrix.target }}" "$SECONDS_PER_TARGET"
+
+      # A crashing input is the entire output of a fuzzing run that finds
+      # something, and it is not reconstructible from the log: libFuzzer prints
+      # a base64 blob and a stack trace, but the file under `artifacts/` is what
+      # reproduces it.
+      - name: Upload crash artifacts
+        if: failure()
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: core/fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # One issue per target, not per run: a weekly cron that files a fresh
+      # issue every Sunday for a bug already reported is a tracker nobody reads.
+      - name: File the crash
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+          TITLE: 'Fuzzing found a crash in ${{ matrix.target }}'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --state open --search "$TITLE in:title" \
+            --json number -q '.[0].number')
+
+          # printf rather than a heredoc: the body is indented to match the YAML
+          # block, and a heredoc would carry that indentation into the issue,
+          # where four leading spaces silently become a code block.
+          body=$(printf '%s\n' \
+            "The \`$TARGET\` fuzz target failed in [this run]($RUN_URL) against \`$GITHUB_SHA\`." \
+            "" \
+            "The reproducing input is attached to that run as \`fuzz-artifacts-$TARGET\`." \
+            "To reproduce locally, download and unpack it into" \
+            "\`core/fuzz/artifacts/$TARGET/\`, then:" \
+            "" \
+            '```sh' \
+            "cd core && cargo fuzz run $TARGET artifacts/$TARGET/<file>" \
+            '```' \
+            "" \
+            "These targets cover parsers that run **before** any trust decision," \
+            "so treat a crash here as security-relevant until shown otherwise —" \
+            "see SECURITY.md.")
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            echo "updated issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --body "$body"
+          fi
+
+      # The corpus is worth saving even when nothing crashed — that is the run
+      # where it grew. `always()` so a crash does not throw away the inputs that
+      # led to it.
+      - name: Save corpus
+        if: always()
+        # actions/cache/save v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: core/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_number }}

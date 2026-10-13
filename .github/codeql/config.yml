@@ -1,0 +1,43 @@
+name: P2PEM CodeQL configuration
+
+# Why this file exists.
+#
+# CodeQL was running under GitHub's default setup and had accumulated 43 open
+# alerts, of which essentially all were test fixtures. `rust/hard-coded-
+# cryptographic-value` fired on `let key = [7u8; AES_KEY_SIZE]` inside a
+# `#[cfg(test)]` module; `rust/cleartext-logging` fired on assertion messages in
+# `client/tests/party_e2e.rs`. Both queries are correct about what they see and
+# wrong about whether it matters: a hard-coded key in a test *is* the test.
+#
+# An alert queue that is 100% noise is not a mild annoyance, it is the failure
+# mode — it is a queue where a real finding has nowhere to appear. The fix is to
+# stop asking the question about code where the answer is always "yes, on
+# purpose", not to dismiss 43 alerts and let them come back.
+#
+# The trade-off is explicit: security queries no longer run over test code. That
+# is the right side of the trade for this repository, because the threat model
+# is about what a peer can do to a running client, and no test file is in that
+# path. `core/fuzz` is excluded for the same reason — a fuzz target's entire job
+# is to feed a parser hostile input.
+
+paths-ignore:
+  # Integration tests. Every crate's `tests/` directory.
+  - '**/tests/**'
+  # Fuzz targets and their seed corpora.
+  - 'core/fuzz/**'
+  # Example binaries — smoke harnesses, not shipped code.
+  - '**/examples/**'
+  # The committed Vite bundle. It is minified generated output; analysing it
+  # reports on rollup's code generation, not on anything anyone can fix here.
+  - 'desktop/dist/**'
+  # Frontend test helpers and Playwright specs.
+  - 'desktop/src/test/**'
+  - 'desktop/smoke/**'
+
+# The default suite plus `security-extended`. The default is tuned to keep
+# false positives low across every repository on GitHub; this one is a
+# cryptographic messenger where a missed finding costs more than a reviewed
+# false positive, and with test code out of scope there is now headroom to read
+# what the wider suite reports.
+queries:
+  - uses: security-extended

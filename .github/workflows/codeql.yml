@@ -1,0 +1,80 @@
+name: CodeQL
+
+# This replaces GitHub's default CodeQL setup.
+#
+# Default setup works and needs no file, which is exactly its limitation: it
+# analyses everything, and there is nowhere to say "not the test fixtures". The
+# result here was 43 open alerts that were essentially all test code — a queue
+# with nothing real in it, which is a queue nobody reads, which means the one
+# real finding that eventually arrives is not read either.
+#
+# Advanced setup is the same analysis with `.github/codeql/config.yml` applied.
+# The two are mutually exclusive: GitHub refuses SARIF from a workflow while
+# default setup is enabled, so default setup must be turned off in
+# Settings → Code security for this to upload anything.
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  schedule:
+    # Weekly, so the queries themselves being updated is noticed on code nobody
+    # is currently touching. CodeQL ships new queries continuously; a repository
+    # only ever scanned on diffs is only ever scanned with the queries that
+    # existed when the diff landed.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write # upload the SARIF
+      packages: read # fetch the CodeQL query packs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `build-mode: none` for all three, matching what default setup was
+          # doing. Rust and JS/TS are both analysed from source without a build,
+          # which is what makes this job cheap enough to run on every pull
+          # request — a full `cargo build` here would duplicate the 11 minutes
+          # Build Verification already spends.
+          - language: rust
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          # The workflows themselves. This is the query pack that would catch an
+          # expression injection in a `run:` block — relevant to a repository
+          # whose release workflow holds `id-token: write`.
+          - language: actions
+            build-mode: none
+    steps:
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        # github/codeql-action/init v3
+        uses: github/codeql-action/init@faaca9a8f6edddba5725ffe5adefdab6669a2eca
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/config.yml
+
+      - name: Analyze
+        # github/codeql-action/analyze v3
+        uses: github/codeql-action/analyze@faaca9a8f6edddba5725ffe5adefdab6669a2eca
+        with:
+          category: /language:${{ matrix.language }}
