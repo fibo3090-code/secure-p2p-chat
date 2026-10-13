@@ -616,14 +616,22 @@ impl AesCipher {
     /// * `aad` - Optional Additional Authenticated Data (binds authenticity context)
     pub fn encrypt(&self, plaintext: &[u8], aad: Option<&[u8]>) -> Vec<u8> {
         // Reserve the next counter value atomically without allowing wraparound.
-        let counter = self
-            .nonce_counter
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |current| current.checked_add(1),
-            )
-            .unwrap_or_else(|_| panic!("AES-GCM nonce counter exhausted; rekey required"));
+        // A hand-written CAS loop rather than `fetch_update` (deprecated on
+        // current stable) or `try_update` (newer than our MSRV).
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut counter = self.nonce_counter.load(SeqCst);
+        loop {
+            let next = counter
+                .checked_add(1)
+                .expect("AES-GCM nonce counter exhausted; rekey required");
+            match self
+                .nonce_counter
+                .compare_exchange_weak(counter, next, SeqCst, SeqCst)
+            {
+                Ok(_) => break,
+                Err(actual) => counter = actual,
+            }
+        }
 
         // Build nonce: session_id (4 bytes) || counter (8 bytes)
         let mut nonce_bytes = [0u8; crate::AES_NONCE_SIZE];
