@@ -1508,7 +1508,7 @@ fn held_offers_share_one_spool_cap_per_conversation() {
     let offer = files::MAX_UNACCEPTED_SPOOL_BYTES * 3 / 5;
     let chunk = vec![0u8; crate::FILE_CHUNK_SIZE];
     let mut seq = 0;
-    let mut frame = |mgr: &mut ChatManager, msg: ProtocolMessage| {
+    let frame = |mgr: &mut ChatManager, msg: ProtocolMessage| {
         mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(msg));
     };
     for name in ["first.bin", "second.bin"] {

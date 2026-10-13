@@ -319,25 +319,29 @@ impl ChatManager {
 
     /// Save chat history to file
     pub fn save_history(&self, path: &Path) -> Result<()> {
-        let mut history = HistoryFile::new(self.chats.values().cloned().collect());
-        history.contacts = self.contacts.values().cloned().collect();
-        history.config = self.config.clone();
-        history.contact_chat_map = self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
-        let key = self
-            .history_key
-            .ok_or_else(|| anyhow!("History encryption key not available"))?;
+        let (history, key) = self.history_snapshot()?;
         history.save_encrypted(path, &key)
     }
 
     /// Build a serializable snapshot for background persistence.
+    ///
+    /// Host placeholders are left out: one stands for a listener that is
+    /// running *now*. Saved, it came back after a restart as a "Host on :port"
+    /// conversation shown as waiting for a peer, with nothing listening.
     pub fn history_snapshot(&self) -> Result<(HistoryFile, [u8; 32])> {
-        let mut history = HistoryFile::new(self.chats.values().cloned().collect());
-        history.contacts = self.contacts.values().cloned().collect();
-        history.config = self.config.clone();
-        history.contact_chat_map = self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
         let key = self
             .history_key
             .ok_or_else(|| anyhow!("History encryption key not available"))?;
+        let chats = self
+            .chats
+            .values()
+            .filter(|c| !c.is_host_placeholder)
+            .cloned()
+            .collect();
+        let mut history = HistoryFile::new(chats);
+        history.contacts = self.contacts.values().cloned().collect();
+        history.config = self.config.clone();
+        history.contact_chat_map = self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
         Ok((history, key))
     }
 
@@ -364,7 +368,9 @@ impl ChatManager {
         self.contacts.clear();
         self.contact_to_chat.clear();
 
-        for chat in history.chats {
+        // A placeholder in the file was saved by an older build; it stands for
+        // a listener that died with that process.
+        for chat in history.chats.into_iter().filter(|c| !c.is_host_placeholder) {
             self.chats.insert(chat.id, chat);
         }
         for placeholder in placeholders {
@@ -392,6 +398,42 @@ mod tests {
     use rand::RngCore;
     use tempfile::NamedTempFile;
     use uuid::Uuid;
+
+    /// A host placeholder is a listener, not history: it is never saved, and
+    /// one saved by an older build is dropped on load rather than coming back
+    /// as a "waiting for peer" conversation with nothing listening.
+    #[test]
+    fn host_placeholders_are_not_history() {
+        let mut manager = ChatManager::new(Config::default());
+        manager.set_history_key([3u8; 32]);
+        let real = Uuid::new_v4();
+        manager.create_local_chat_for_test(real, "Alice".into());
+        let listener = Uuid::new_v4();
+        manager.create_local_chat_for_test(listener, "Host on :12345".into());
+        manager.get_chat_mut(listener).unwrap().is_host_placeholder = true;
+
+        let (history, _) = manager.history_snapshot().unwrap();
+        let saved: Vec<Uuid> = history.chats.iter().map(|c| c.id).collect();
+        assert_eq!(
+            saved,
+            vec![real],
+            "the listener was saved as a conversation"
+        );
+
+        // A file an older build wrote, with the placeholder in it.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut legacy = history;
+        legacy
+            .chats
+            .push(manager.get_chat(listener).unwrap().clone());
+        legacy.save_encrypted(temp_file.path(), &[3u8; 32]).unwrap();
+        let mut reloaded = ChatManager::new(Config::default());
+        reloaded.set_history_key([3u8; 32]);
+        reloaded
+            .load_history_auto(temp_file.path(), &[3u8; 32])
+            .unwrap();
+        assert_eq!(reloaded.chat_ids(), vec![real]);
+    }
 
     /// Loading history must *replace* in-memory state, not merge into it.
     /// Merging meant a deleted chat came back the moment a second load ran.
