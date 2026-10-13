@@ -1485,6 +1485,76 @@ fn manager_with_held_incoming_file(temp_dir: &std::path::Path) -> (ChatManager, 
     (mgr, chat_id, payload)
 }
 
+/// Held offers share one spool cap per conversation.
+///
+/// A fully received offer no longer blocks the next one, so the cap has to
+/// count everything waiting for the user's decision: per offer, a peer could
+/// queue as many just-under-the-cap files as it liked onto the disk of
+/// someone who had not agreed to receive any of them.
+#[test]
+fn held_offers_share_one_spool_cap_per_conversation() {
+    let temp_dir = tempdir().unwrap();
+    let mut mgr = ChatManager::new(Config {
+        download_dir: temp_dir.path().join("downloads"),
+        temp_dir: temp_dir.path().join("temp"),
+        auto_accept_files: false,
+        ..Config::default()
+    });
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".to_string());
+    let _app_rx = wire_session_for_test(&mut mgr, chat_id);
+
+    // Each offer is under the cap on its own; together they are over it.
+    let offer = files::MAX_UNACCEPTED_SPOOL_BYTES * 3 / 5;
+    let chunk = vec![0u8; crate::FILE_CHUNK_SIZE];
+    let mut seq = 0;
+    let mut frame = |mgr: &mut ChatManager, msg: ProtocolMessage| {
+        mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(msg));
+    };
+    for name in ["first.bin", "second.bin"] {
+        seq += 1;
+        frame(
+            &mut mgr,
+            ProtocolMessage::FileMeta {
+                filename: name.to_string(),
+                size: offer,
+                seq,
+            },
+        );
+        let mut left = offer as usize;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            left -= n;
+            seq += 1;
+            frame(
+                &mut mgr,
+                ProtocolMessage::FileChunk {
+                    chunk: chunk[..n].to_vec(),
+                    seq,
+                },
+            );
+        }
+        seq += 1;
+        frame(&mut mgr, ProtocolMessage::FileEnd { seq });
+    }
+
+    let status = |name: &str| {
+        mgr.active_transfers_snapshot()
+            .into_iter()
+            .find(|t| t.filename == name)
+            .map(|t| t.status)
+    };
+    assert_eq!(
+        status("first.bin"),
+        Some(TransferStatus::AwaitingAcceptance)
+    );
+    assert_eq!(
+        status("second.bin"),
+        Some(TransferStatus::Cancelled),
+        "the offer that took the conversation past the cap must be declined"
+    );
+}
+
 #[test]
 fn incoming_file_is_held_until_accepted() {
     let temp_dir = tempdir().unwrap();
@@ -2113,7 +2183,7 @@ fn disconnect_fails_an_in_flight_incoming_transfer() {
         state.status
     );
     assert!(
-        mgr.active_incoming_transfer_id_for_chat(incoming).is_none(),
+        mgr.streaming_transfer(incoming).is_none(),
         "the chat's incoming slot must be free so the peer can retry"
     );
 }

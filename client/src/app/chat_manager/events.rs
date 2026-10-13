@@ -603,11 +603,22 @@ impl ChatManager {
     /// The peer offered a file: register the transfer and open its spool.
     fn receive_file_offer(&mut self, chat_id: Uuid, filename: &str, size: u64) {
         tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
+        // A sender streams one file at a time, so a new offer means whatever
+        // was still streaming is over from its side; it will never finish.
+        if let Some(abandoned) = self.streaming_transfer(chat_id) {
+            tracing::warn!(%abandoned, "a new file offer arrived before the previous one finished");
+            self.pending_file_end.remove(&abandoned);
+            self.discard_spool(abandoned, "superseded");
+            self.set_transfer_status(
+                abandoned,
+                TransferStatus::Failed("the sender started another file".to_string()),
+            );
+        }
         let transfer_id = match self.start_receiving_file(chat_id, filename, size) {
             Ok(id) => id,
             Err(e) => {
                 tracing::error!("Failed to start receiving file: {}", e);
-                self.add_toast(ToastLevel::Error, format!("Failed to receive file: {}", e));
+                self.refuse_file_offer(chat_id, &e.to_string());
                 return;
             }
         };
@@ -621,16 +632,29 @@ impl ChatManager {
             Err(e) => {
                 tracing::error!("Failed to create incoming file: {}", e);
                 // Fail the transfer, or it stays "active" with no spool behind
-                // it and holds the conversation's only incoming slot forever.
+                // it and blocks the conversation's next offer forever.
                 self.set_transfer_status(transfer_id, TransferStatus::Failed(e.to_string()));
-                self.add_toast(ToastLevel::Error, format!("Failed to receive file: {}", e));
+                self.refuse_file_offer(chat_id, &e.to_string());
             }
         }
     }
 
+    /// We cannot take the file the peer just offered: drop whatever of it is
+    /// still to come, and tell the sender to stop rather than stream it all
+    /// across the wire for nothing.
+    fn refuse_file_offer(&mut self, chat_id: Uuid, reason: &str) {
+        self.incoming_streams.remove(&chat_id);
+        self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
+        self.add_toast(
+            ToastLevel::Error,
+            format!("Failed to receive file: {}", reason),
+        );
+    }
+
     /// Spool one chunk of the active incoming transfer.
     fn receive_file_chunk(&mut self, chat_id: Uuid, chunk: &[u8]) {
-        let Some(transfer_id) = self.active_incoming_transfer_id_for_chat(chat_id) else {
+        // Chunks of a refused, declined or failed offer have nowhere to go.
+        let Some(transfer_id) = self.streaming_transfer(chat_id) else {
             return;
         };
         // An offer the user has not accepted yet still spools to disk, because
@@ -665,14 +689,21 @@ impl ChatManager {
 
     /// The peer finished sending: finalize, or hold until the user decides.
     fn receive_file_end(&mut self, chat_id: Uuid, seq: u64) {
-        let Some(transfer_id) = self.active_incoming_transfer_id_for_chat(chat_id) else {
+        // The stream is over either way; the next offer starts a new one.
+        let Some(transfer_id) = self.incoming_streams.remove(&chat_id) else {
             return;
         };
-        let awaiting = self
+        let Some(status) = self
             .active_transfers
             .get(&transfer_id)
-            .is_some_and(|t| t.status == TransferStatus::AwaitingAcceptance);
-        if awaiting {
+            .map(|t| t.status.clone())
+        else {
+            return;
+        };
+        if !status.is_active() {
+            return; // declined or failed while it was still streaming
+        }
+        if status == TransferStatus::AwaitingAcceptance {
             // Fully received but not yet accepted: hold the spooled file (and
             // the FileEnd seq, for the eventual delivery receipt) until the user
             // decides.

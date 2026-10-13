@@ -5,14 +5,18 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// How much of an *unaccepted* incoming file may spool to disk before the offer
-/// is declined automatically.
+/// How much *unaccepted* incoming data one conversation may spool to disk —
+/// across every offer still waiting for the user's decision — before the offer
+/// that crosses it is declined automatically.
 ///
 /// With `auto_accept_files` off (the default) an incoming `FileMeta` is held in
 /// `AwaitingAcceptance` while the sender keeps streaming — the wire has no way
 /// to pause it. Without a ceiling a peer can therefore write up to
 /// `MAX_FILE_SIZE` (10 GiB) into the temp directory of someone who has not
-/// agreed to receive anything, and the first sign of it is a full disk.
+/// agreed to receive anything, and the first sign of it is a full disk. It
+/// counts every held offer in the conversation, not each one alone: a fully
+/// received offer no longer blocks the next, so a per-offer cap would let a
+/// peer queue as many just-under-the-cap files as it liked.
 pub const MAX_UNACCEPTED_SPOOL_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
 /// Arguments for [`ChatManager::spawn_file_stream`]. Grouped into a struct to
@@ -309,7 +313,9 @@ impl ChatManager {
         // Prefer an active incoming transfer (the common case: peer is the
         // sender and we are receiving); otherwise cancel our outgoing send.
         let target = self
-            .active_incoming_transfer_id_for_chat(chat_id)
+            .incoming_streams
+            .remove(&chat_id)
+            .filter(|id| self.is_active_transfer(*id))
             .or_else(|| self.active_outgoing_transfer_id_for_chat(chat_id));
         let Some(transfer_id) = target else {
             tracing::debug!(%chat_id, "FileCancel received with no active transfer");
@@ -364,6 +370,7 @@ impl ChatManager {
     /// incoming slot occupied so the peer could never retry the send.
     pub(super) fn fail_incoming_transfers(&mut self, session_id: Uuid, reason: &str) {
         let chat_id = self.resolve_display_chat_id(session_id);
+        self.incoming_streams.remove(&chat_id);
         let stranded: Vec<Uuid> = self
             .active_transfers
             .iter()
@@ -407,7 +414,9 @@ impl ChatManager {
             self.clear_transfer_state(transfer_id);
         }
 
-        if self.active_incoming_transfer_id_for_chat(chat_id).is_some() {
+        // Only a transfer still *streaming* blocks a new one: an offer that has
+        // fully arrived and is merely waiting for the user's decision does not.
+        if self.streaming_transfer(chat_id).is_some() {
             bail!("Another incoming file transfer is already in progress for this chat");
         }
 
@@ -435,6 +444,7 @@ impl ChatManager {
         };
 
         self.active_transfers.insert(transfer_id, state);
+        self.incoming_streams.insert(chat_id, transfer_id);
 
         if auto_accept {
             self.add_toast(ToastLevel::Info, format!("Receiving file: {}", filename));
@@ -627,13 +637,26 @@ impl ChatManager {
         anyhow!(message)
     }
 
-    /// Whether an offer still awaiting the user's decision has spooled more
-    /// than [`MAX_UNACCEPTED_SPOOL_BYTES`] to disk.
+    /// Whether `transfer_id`, an offer still awaiting the user's decision, has
+    /// taken its conversation's held data past [`MAX_UNACCEPTED_SPOOL_BYTES`].
     pub(super) fn unaccepted_spool_exceeded(&self, transfer_id: Uuid) -> bool {
-        self.active_transfers.get(&transfer_id).is_some_and(|t| {
-            t.status == TransferStatus::AwaitingAcceptance
-                && t.received > MAX_UNACCEPTED_SPOOL_BYTES
-        })
+        let Some(offer) = self.active_transfers.get(&transfer_id) else {
+            return false;
+        };
+        if offer.status != TransferStatus::AwaitingAcceptance {
+            return false;
+        }
+        let held: u64 = self
+            .active_transfers
+            .values()
+            .filter(|t| {
+                t.chat_id == offer.chat_id
+                    && t.direction == TransferDirection::Incoming
+                    && t.status == TransferStatus::AwaitingAcceptance
+            })
+            .map(|t| t.received)
+            .sum();
+        held > MAX_UNACCEPTED_SPOOL_BYTES
     }
 
     /// Decline an offer on the user's behalf because it has spooled too much
@@ -671,6 +694,7 @@ impl ChatManager {
         self.active_transfers.remove(&transfer_id);
         self.discard_spool(transfer_id, "conversation removed");
         self.pending_file_end.remove(&transfer_id);
+        self.incoming_streams.retain(|_, id| *id != transfer_id);
     }
 
     /// Stop an outgoing transfer's streaming task (it emits `FileCancel` once it
@@ -755,8 +779,19 @@ impl ChatManager {
             .map(|(id, _)| *id)
     }
 
-    pub(super) fn active_incoming_transfer_id_for_chat(&self, chat_id: Uuid) -> Option<Uuid> {
-        self.active_transfer_id_for_chat_dir(chat_id, TransferDirection::Incoming)
+    /// The incoming transfer the conversation's wire is streaming into, if it
+    /// is still live (a declined or failed one takes no more chunks).
+    pub(super) fn streaming_transfer(&self, chat_id: Uuid) -> Option<Uuid> {
+        self.incoming_streams
+            .get(&chat_id)
+            .copied()
+            .filter(|id| self.is_active_transfer(*id))
+    }
+
+    fn is_active_transfer(&self, transfer_id: Uuid) -> bool {
+        self.active_transfers
+            .get(&transfer_id)
+            .is_some_and(|t| t.status.is_active())
     }
 
     pub(super) fn active_outgoing_transfer_id_for_chat(&self, chat_id: Uuid) -> Option<Uuid> {

@@ -148,6 +148,15 @@ pub struct ChatManager {
     /// FileEnd's wire seq, for the delivery receipt) until the user accepts
     /// (finalize) or declines (delete).
     pending_file_end: HashMap<Uuid, u64>,
+    /// The incoming transfer each conversation's wire is streaming into right
+    /// now: set by `FileMeta`, cleared by `FileEnd` or `FileCancel`.
+    ///
+    /// `FileChunk` carries no transfer id, so this is the only thing that says
+    /// where a chunk belongs. Routing to "the active incoming transfer" instead
+    /// counted an offer held for the user's decision as active even after its
+    /// `FileEnd`, so a second file sent meanwhile was refused and its chunks
+    /// were written into the first file's spool — destroying it.
+    incoming_streams: HashMap<Uuid, Uuid>,
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
@@ -246,6 +255,7 @@ impl ChatManager {
             outgoing_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             pending_file_end: HashMap::new(),
+            incoming_streams: HashMap::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
@@ -761,6 +771,7 @@ impl ChatManager {
             }
         }
         self.pending_file_end.clear();
+        self.incoming_streams.clear();
         self.pending_text_sends.clear();
         self.awaiting_ack.clear();
         self.incoming_text_messages.clear();
