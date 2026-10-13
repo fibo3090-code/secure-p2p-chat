@@ -528,7 +528,10 @@ impl ChatManager {
     pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
         // Truncate by characters (not bytes) so multi-byte/emoji titles never
         // panic on a non-char-boundary slice.
-        let title: String = new_title.chars().take(50).collect();
+        let title: String = new_title.trim().chars().take(50).collect();
+        if title.is_empty() {
+            bail!("A conversation name cannot be empty");
+        }
 
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.title = title;

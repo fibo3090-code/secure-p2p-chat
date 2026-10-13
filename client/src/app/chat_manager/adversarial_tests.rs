@@ -457,6 +457,21 @@ fn renaming_keeps_whole_characters_and_refuses_unknown_chats() {
 }
 
 #[test]
+fn a_conversation_cannot_be_renamed_to_nothing() {
+    let dir = tempdir().unwrap();
+    let mut mgr = manager_in(dir.path());
+    let (chat, _rx) = chat_with_session(&mut mgr, "Mum");
+    for blank in ["", "   ", "\n\t"] {
+        assert!(
+            mgr.rename_chat(chat, blank.into()).is_err(),
+            "{blank:?} accepted"
+        );
+    }
+    assert_eq!(mgr.get_chat(chat).unwrap().title, "Mum");
+    assert!(!mgr.get_chat(chat).unwrap().title_is_custom);
+}
+
+#[test]
 fn sending_to_nothing_fails_instead_of_pretending() {
     let dir = tempdir().unwrap();
     let mut mgr = manager_in(dir.path());

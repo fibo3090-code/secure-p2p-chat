@@ -379,58 +379,86 @@ fn truncate_filename_bytes(name: &str, budget: usize) -> String {
 /// Supports:
 /// - `hostname:1234`
 /// - `127.0.0.1:1234`
-/// - `[::1]:1234`
-/// - `hostname` / `127.0.0.1` / `::1` when `default_port` is provided
+/// - `[::1]:1234` (and `[fe80::1%eth0]:1234`)
+/// - `hostname` / `127.0.0.1` / `::1` / `[::1]` when `default_port` is provided
+///
+/// The input is split into a host and an optional port by its shape, and both
+/// halves are then held to the same rules whatever the shape was: a host must
+/// be non-empty with no spaces or control characters, and a port must be plain
+/// digits in `1..=65535`. Checking each shape separately is how `[]:80` came to
+/// mean "the empty host", `:0` a dialable port, and — with a default port — a
+/// pasted `http://example.com:8080` a hostname that only failed much later,
+/// with a confusing DNS error.
 pub fn parse_host_port(input: &str, default_port: Option<u16>) -> Result<(String, u16)> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("Host cannot be empty"));
     }
+    if trimmed.contains("://") {
+        return Err(anyhow!("Enter an address like host:port, not a URL"));
+    }
 
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        let end = rest
-            .find(']')
+    let (host, port) = if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, suffix) = rest
+            .split_once(']')
             .ok_or_else(|| anyhow!("Invalid IPv6 address format; missing closing ']'"))?;
-        let host = &rest[..end];
-        let suffix = &rest[end + 1..];
-        if let Some(port_str) = suffix.strip_prefix(':') {
-            let port = port_str
-                .parse::<u16>()
-                .map_err(|_| anyhow!("Invalid port"))?;
-            return Ok((host.to_string(), port));
+        let port = match suffix {
+            "" => None,
+            _ => Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or_else(|| anyhow!("Invalid IPv6 endpoint suffix"))?,
+            ),
+        };
+        (host, port)
+    } else if trimmed.matches(':').count() > 1 {
+        // More than one colon and no brackets: only a bare IPv6 address, which
+        // cannot carry a port of its own.
+        if !is_ipv6_literal(trimmed) {
+            return Err(anyhow!(
+                "Not a valid address; write an IPv6 address with a port as [addr]:port"
+            ));
         }
-        if suffix.is_empty() {
-            if let Some(port) = default_port {
-                return Ok((host.to_string(), port));
-            }
-            return Err(anyhow!("Missing port"));
+        (trimmed, None)
+    } else {
+        match trimmed.rsplit_once(':') {
+            Some((host, port)) => (host.trim(), Some(port)),
+            None => (trimmed, None),
         }
-        return Err(anyhow!("Invalid IPv6 endpoint suffix"));
-    }
+    };
 
-    if trimmed.matches(':').count() > 1 {
-        if let Some(port) = default_port {
-            return Ok((trimmed.to_string(), port));
+    if host.is_empty() {
+        return Err(anyhow!("Host cannot be empty"));
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(anyhow!("Host cannot contain spaces"));
+    }
+    let port = match port {
+        Some(port) => parse_port(port)?,
+        None => {
+            default_port.ok_or_else(|| anyhow!("Invalid address format; expected host:port"))?
         }
-        return Err(anyhow!(
-            "IPv6 addresses must be bracketed when a port is required"
-        ));
-    }
+    };
+    Ok((host.to_string(), port))
+}
 
-    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
-        if !host.trim().is_empty() {
-            let port = port_str
-                .parse::<u16>()
-                .map_err(|_| anyhow!("Invalid port"))?;
-            return Ok((host.trim().to_string(), port));
-        }
+/// A port as a user types it: plain digits (no sign), and not 0, which cannot
+/// be dialled.
+fn parse_port(text: &str) -> Result<u16> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(anyhow!("Invalid port"));
     }
-
-    if let Some(port) = default_port {
-        return Ok((trimmed.to_string(), port));
+    match text.parse::<u16>() {
+        Ok(0) => Err(anyhow!("Port 0 cannot be dialled")),
+        Ok(port) => Ok(port),
+        Err(_) => Err(anyhow!("Invalid port (must be 1-65535)")),
     }
+}
 
-    Err(anyhow!("Invalid address format; expected host:port"))
+/// An IPv6 address, optionally with a `%zone` suffix.
+fn is_ipv6_literal(text: &str) -> bool {
+    let address = text.split_once('%').map_or(text, |(address, _)| address);
+    address.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 /// Render a normalized address string, adding brackets around IPv6 literals.
