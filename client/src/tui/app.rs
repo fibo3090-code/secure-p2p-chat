@@ -697,17 +697,9 @@ impl TuiApp {
     fn handle_overlay_key(&mut self, key: KeyEvent) {
         match self.overlay.clone() {
             TuiOverlay::Password { mode } => self.handle_password_key(key, mode),
-            TuiOverlay::FingerprintVerify {
-                chat_id,
-                fingerprint,
-                ..
-            } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    self.resolve_fingerprint(chat_id, &fingerprint, true)
-                }
-                KeyCode::Char('n') | KeyCode::Esc => {
-                    self.resolve_fingerprint(chat_id, &fingerprint, false)
-                }
+            TuiOverlay::FingerprintVerify { chat_id, .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.resolve_fingerprint(chat_id, true),
+                KeyCode::Char('n') | KeyCode::Esc => self.resolve_fingerprint(chat_id, false),
                 _ => {}
             },
             TuiOverlay::ConfirmQuit => match key.code {
@@ -1822,13 +1814,8 @@ impl TuiApp {
     // ---------------------------------------------------------------- fingerprint
 
     fn verify_pending(&mut self, accept: bool) {
-        if let TuiOverlay::FingerprintVerify {
-            chat_id,
-            fingerprint,
-            ..
-        } = self.overlay.clone()
-        {
-            self.resolve_fingerprint(chat_id, &fingerprint, accept);
+        if let TuiOverlay::FingerprintVerify { chat_id, .. } = self.overlay.clone() {
+            self.resolve_fingerprint(chat_id, accept);
         } else {
             self.toast(
                 ToastLevel::Info,
@@ -1837,16 +1824,15 @@ impl TuiApp {
         }
     }
 
-    fn resolve_fingerprint(&mut self, chat_id: Uuid, fingerprint: &str, accept: bool) {
+    fn resolve_fingerprint(&mut self, chat_id: Uuid, accept: bool) {
+        // `confirm_fingerprint` stores an accepted fingerprint on the right
+        // conversation itself (on the host that is not `chat_id`, which names
+        // the session).
         if accept {
             let _ = self.chat_manager.confirm_fingerprint(chat_id, true);
-            if let Some(chat) = self.chat_manager.chats.get_mut(&chat_id) {
-                chat.peer_fingerprint = Some(fingerprint.to_string());
-            }
             self.toast(ToastLevel::Success, "Fingerprint accepted".to_string());
         } else {
-            let _ = self.chat_manager.confirm_fingerprint(chat_id, false);
-            self.chat_manager.delete_chat(chat_id);
+            let _ = self.chat_manager.reject_fingerprint(chat_id);
             self.toast(ToastLevel::Warning, "Fingerprint rejected".to_string());
         }
         self.overlay = TuiOverlay::None;

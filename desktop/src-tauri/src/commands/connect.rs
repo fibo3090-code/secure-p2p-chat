@@ -213,12 +213,17 @@ pub(crate) async fn confirm_fingerprint(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
-    let result = state
-        .manager
-        .lock()
-        .await
-        .confirm_fingerprint(uuid, accept)
-        .map_err(|e| e.to_string());
+    let result = {
+        let mut mgr = state.manager.lock().await;
+        if accept {
+            mgr.confirm_fingerprint(uuid, true)
+        } else {
+            // Ends the session, and discards the conversation only if this
+            // connection created it (see `ChatManager::reject_fingerprint`).
+            mgr.reject_fingerprint(uuid)
+        }
+    }
+    .map_err(|e| e.to_string());
     // Only clear the pending prompt on success. If confirmation failed, keep it so
     // `pending_fingerprint()` can still surface it and the user can retry.
     if result.is_ok() {

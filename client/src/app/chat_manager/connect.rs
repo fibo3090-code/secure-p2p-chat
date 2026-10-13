@@ -46,6 +46,28 @@ impl ChatManager {
             .map_err(|e| anyhow!("Failed to send confirmation: {}", e))
     }
 
+    /// The user refused a peer's fingerprint: end the session, and discard the
+    /// conversation only if this connection created it.
+    ///
+    /// A first contact's conversation is empty and unverified, and nothing
+    /// should be left of it. But the same prompt appears when a *known*
+    /// conversation's key changes — the possible-impostor case — and there the
+    /// conversation and its history are the user's: refusing whoever answered
+    /// must not delete them. (The TUI used to delete unconditionally; the
+    /// desktop never did, leaving an empty dead conversation behind.)
+    pub fn reject_fingerprint(&mut self, session_id: Uuid) -> Result<()> {
+        let conversation = self.resolve_display_chat_id(session_id);
+        let created_by_this_connection = self
+            .chats
+            .get(&conversation)
+            .is_some_and(|c| c.peer_fingerprint.is_none() && c.messages.is_empty());
+        let answered = self.confirm_fingerprint(session_id, false);
+        if created_by_this_connection {
+            self.delete_chat(session_id);
+        }
+        answered
+    }
+
     /// Wire up a session and spawn the task that runs it.
     ///
     /// `run` receives the task's ends of the channels and returns the session

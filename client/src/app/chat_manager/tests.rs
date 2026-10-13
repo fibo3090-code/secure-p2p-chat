@@ -66,6 +66,45 @@ fn a_v1_link_containing_v2_by_chance_is_still_unsigned() {
     assert!(contact.name.ends_with("\u{FFFF}oé"));
 }
 
+/// Refusing a changed key must not cost the user their conversation.
+///
+/// The prompt that a first contact gets also appears when a *known*
+/// conversation's key changes — the possible-impostor case. Rejecting used to
+/// delete the conversation outright (TUI), history and all; only a
+/// conversation this connection created, still empty and unverified, may go.
+#[test]
+fn rejecting_a_changed_key_keeps_the_conversation() {
+    let mut mgr = ChatManager::default();
+
+    let known = Uuid::new_v4();
+    mgr.create_local_chat_for_test(known, "Mum".into());
+    {
+        let chat = mgr.get_chat_mut(known).unwrap();
+        chat.peer_fingerprint = Some("MUMS-REAL-KEY".into());
+        chat.messages.push(Message::received(
+            MessageContent::Text { text: "hi".into() },
+            chrono::Utc::now(),
+        ));
+    }
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(known, tx);
+    mgr.reject_fingerprint(known).unwrap();
+    assert!(
+        mgr.get_chat(known).is_some(),
+        "the conversation was deleted"
+    );
+
+    let fresh = Uuid::new_v4();
+    mgr.create_local_chat_for_test(fresh, "127.0.0.1:12345".into());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(fresh, tx);
+    mgr.reject_fingerprint(fresh).unwrap();
+    assert!(
+        mgr.get_chat(fresh).is_none(),
+        "a refused first contact leaves nothing behind"
+    );
+}
+
 #[test]
 fn parse_invite_placeholder_is_ignored() {
     let mgr = ChatManager::default();
