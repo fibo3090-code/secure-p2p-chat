@@ -42,6 +42,30 @@ fn v1_invite_link(name: &str, address: &str) -> String {
     format!("chat-p2p://invite/{}", encoded)
 }
 
+/// An unsigned v1 link is standard base64, which contains `/`, so it can carry
+/// `/v2/` by chance. Signed links used to be recognised by searching for that
+/// substring: such a v1 link was reported to the user as *signed*, and then
+/// failed to parse as the v2 it was not.
+#[test]
+fn a_v1_link_containing_v2_by_chance_is_still_unsigned() {
+    // U+FFFF, "o", then any character with a UTF-8 lead byte (here "é") encode
+    // as the bytes ..BF BF 6F C3.., which on the right 3-byte alignment is
+    // "/v2/" in base64. Try each alignment.
+    let link = (0..3)
+        .map(|pad| v1_invite_link(&format!("{}\u{FFFF}oé", "x".repeat(pad)), "10.0.0.1:12345"))
+        .find(|link| link.contains("/v2/"))
+        .expect("one alignment produces /v2/ in the payload");
+
+    assert!(
+        !ChatManager::invite_link_is_signed(&link),
+        "an unsigned link was reported as signed"
+    );
+    let contact = ChatManager::default()
+        .parse_invite_link(&link)
+        .expect("a valid v1 link still parses");
+    assert!(contact.name.ends_with("\u{FFFF}oé"));
+}
+
 #[test]
 fn parse_invite_placeholder_is_ignored() {
     let mgr = ChatManager::default();
