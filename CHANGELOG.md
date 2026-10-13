@@ -13,6 +13,15 @@ predate tagged releases.
 
 ### Security
 
+- **Community usernames and channel names can no longer hide characters.**
+  Invisible and text-direction characters let one name pass for another
+  (`ad\u{200B}min` displayed as "admin") or display as nothing at all.
+- **An unsigned invite link is no longer reported as signed.** Signed links
+  were recognised by searching for `/v2/`, which an unsigned link's payload can
+  contain by chance.
+- **A community server can no longer make the app use unbounded memory**, by
+  asking for 1-byte upload chunks (one request per byte) or announcing a
+  download larger than any server may store.
 - **A file arriving from a peer is now sanitised by the receiver as well as by
   the decoder.** Until now only one call, in the frame decoder, stood between a
   peer-chosen filename and the disk: the receiver kept the joined destination
@@ -47,6 +56,31 @@ predate tagged releases.
 
 ### Fixed
 
+- **Conversations no longer drop when both people send at once.** A message
+  that was half-received when the app started sending was thrown away, and the
+  connection died with "packet size exceeds limit". The same loop could also
+  stall for good when both sides sent a lot at the same moment (two file
+  transfers crossing), and a peer that vanished without closing the connection
+  was never noticed.
+- **Reconnecting to someone by address continues the same conversation** instead
+  of opening a second, empty one beside it.
+- **Refusing a changed safety code in the terminal app no longer deletes the
+  conversation** and its history. Refusing a brand-new contact in the desktop app
+  no longer leaves an empty conversation behind.
+- **Sending a second file before the first was accepted no longer destroys the
+  first.** Several offers can now wait for a decision at once; together they
+  are still capped at 64 MiB per conversation.
+- **Communities:** the connection no longer drops while a large file downloads
+  and you keep posting; a refused post or upload is taken off the screen
+  instead of someone else's message; a refused upload no longer sends its bytes
+  under the next upload; one server error no longer cancels every download in
+  progress; a member who disconnects while the server is writing to them is shown
+  offline and their upload space is released.
+- A "Host on :port" listener is no longer saved to history, where it came back
+  after a restart as a conversation waiting for a peer with nothing listening.
+- `:connect [::1]:port` works in the terminal app.
+- A relay host whose wait expired can no longer delete a new host's slot that
+  uses the same code.
 - **A file upload that fails at the last moment no longer leaves its data on the
   server.** Uploads are also now counted against the storage limit while they
   are still arriving, so a burst of them can no longer fill the disk well past
@@ -93,6 +127,9 @@ predate tagged releases.
 
 ### Changed
 
+- Blank messages (in conversations and communities) and blank conversation names
+  are refused. Addresses with port 0, an empty host, spaces, or a pasted URL are
+  refused when entered, rather than failing later with a confusing error.
 - Releases are now built, signed and verified before the release page becomes
   visible, and the provenance signature covers exactly what the build produced —
   including `SHA256SUMS`, which was previously the one unsigned file. See
