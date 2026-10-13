@@ -17,6 +17,9 @@ pub mod hub;
 pub mod identity;
 pub mod state;
 
+#[cfg(test)]
+mod adversarial_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 

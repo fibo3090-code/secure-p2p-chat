@@ -314,34 +314,6 @@ pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
     }
 }
 
-/// Split a `host[:port]` token, defaulting the port when omitted.
-fn split_host_port(target: &str) -> std::result::Result<(String, u16), String> {
-    if target.starts_with('[') {
-        if let Some((host, port_part)) = target.rsplit_once("]:") {
-            let port = port_part
-                .parse::<u16>()
-                .map_err(|_| format!("Invalid port in '{}'", target))?;
-            return Ok((format!("{}]", host), port));
-        }
-    }
-
-    if target.matches(':').count() > 1 {
-        return Ok((target.to_string(), crate::PORT_DEFAULT));
-    }
-
-    if let Some((h, p)) = target.rsplit_once(':') {
-        let port = p
-            .parse::<u16>()
-            .map_err(|_| format!("Invalid port in '{}'", target))?;
-        if h.trim().is_empty() {
-            return Err("Host cannot be empty".to_string());
-        }
-        Ok((h.to_string(), port))
-    } else {
-        Ok((target.to_string(), crate::PORT_DEFAULT))
-    }
-}
-
 /// Parse a raw command-line string (with or without the leading `:`).
 pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
     let input = raw.trim().trim_start_matches(':').trim();
@@ -369,7 +341,9 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
             let target = parts
                 .next()
                 .ok_or_else(|| "Usage: :connect <host[:port]>".to_string())?;
-            let (host, port) = split_host_port(target)?;
+            // The same parser every other connect path uses.
+            let (host, port) = crate::util::parse_host_port(target, Some(crate::PORT_DEFAULT))
+                .map_err(|e| format!("{e} in '{target}'"))?;
             Ok(TuiCommand::Connect { host, port })
         }
         "host-relay" => {
@@ -841,10 +815,12 @@ mod tests {
                 port: crate::PORT_DEFAULT,
             }
         );
+        // The brackets are address syntax, not part of the host: a socket
+        // cannot resolve "[::1]", only "::1".
         assert_eq!(
             parse_command(":connect [::1]:9000").unwrap(),
             TuiCommand::Connect {
-                host: "[::1]".into(),
+                host: "::1".into(),
                 port: 9000,
             }
         );

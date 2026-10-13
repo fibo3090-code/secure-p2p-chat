@@ -567,7 +567,7 @@ async fn host_flow(
             // relay. And the slot was left in the table either way, holding a
             // token nobody could re-register until the sweep found it.
             Ok(Err(_)) => {
-                pending.lock().await.remove(&token);
+                release_dead_slot(&pending, &token).await;
                 let reason = if waiting_since.elapsed() >= wait_timeout {
                     "Relay wait timed out"
                 } else {
@@ -577,8 +577,7 @@ async fn host_flow(
                 bail!("{reason}");
             }
             Err(_) => {
-                let mut guard = pending.lock().await;
-                guard.remove(&token);
+                release_dead_slot(&pending, &token).await;
                 send_relay_message(
                     &mut stream,
                     &RelayResponse::Error("Relay wait timed out".to_string()),
@@ -609,6 +608,26 @@ async fn host_flow(
     enable_keepalive(&peer_stream, "joiner");
     copy_bidirectional(&mut stream, &mut peer_stream).await?;
     Ok(())
+}
+
+/// Release a host's rendezvous slot once its wait is over — but only if the slot
+/// is still that host's.
+///
+/// By the time a wait ends, the slot may already be gone: the expiry sweep in
+/// `host_flow` removes aged-out slots, and the same token can then be
+/// registered again — typically by the same app retrying as its first wait ran
+/// out. Removing by token alone then deleted the *new* host's slot, and it
+/// waited out its whole timeout with nobody able to join it. A waiting host
+/// always holds its slot's receiver, so a slot whose receiver is gone is a dead
+/// one, and only a dead one is removed.
+async fn release_dead_slot(pending: &PendingMap, token: &str) {
+    let mut guard = pending.lock().await;
+    if guard
+        .get(token)
+        .is_some_and(|slot| slot.rendezvous_tx.is_closed())
+    {
+        guard.remove(token);
+    }
 }
 
 async fn join_flow(
@@ -726,6 +745,36 @@ async fn recv_relay_message<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream
 
 #[cfg(test)]
 mod tests {
+
+    /// A finished host releases only its own rendezvous slot. Removing by token
+    /// alone deleted a slot that a new host had registered with the same token
+    /// after the old one expired, leaving that host unreachable.
+    #[tokio::test]
+    async fn a_finished_wait_releases_only_a_dead_slot() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let token = "ab".repeat(RELAY_TOKEN_BYTES);
+
+        // A live host is waiting on this token (it holds the receiver).
+        let (tx, live_rx) = oneshot::channel();
+        pending.lock().await.insert(
+            token.clone(),
+            PendingRelay {
+                created_at: Instant::now(),
+                rendezvous_tx: tx,
+            },
+        );
+        release_dead_slot(&pending, &token).await;
+        assert!(
+            pending.lock().await.contains_key(&token),
+            "a waiting host's slot was released by somebody else's timeout"
+        );
+
+        // Once nobody waits on it, the slot is dead and is released.
+        drop(live_rx);
+        release_dead_slot(&pending, &token).await;
+        assert!(!pending.lock().await.contains_key(&token));
+    }
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

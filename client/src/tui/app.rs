@@ -307,7 +307,12 @@ impl TuiApp {
             return;
         }
 
-        if let Some(selected) = selected_chat_id {
+        // Follow a selected chat that was folded into another conversation (a
+        // reconnect to a known peer), rather than landing on whichever chat now
+        // sits at its old position.
+        if let Some(selected) =
+            selected_chat_id.map(|id| self.chat_manager.resolve_display_chat_id(id))
+        {
             if let Some(new_idx) = self.chat_ids.iter().position(|id| *id == selected) {
                 self.chat_list_state.select(Some(new_idx));
                 return;
@@ -692,17 +697,9 @@ impl TuiApp {
     fn handle_overlay_key(&mut self, key: KeyEvent) {
         match self.overlay.clone() {
             TuiOverlay::Password { mode } => self.handle_password_key(key, mode),
-            TuiOverlay::FingerprintVerify {
-                chat_id,
-                fingerprint,
-                ..
-            } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    self.resolve_fingerprint(chat_id, &fingerprint, true)
-                }
-                KeyCode::Char('n') | KeyCode::Esc => {
-                    self.resolve_fingerprint(chat_id, &fingerprint, false)
-                }
+            TuiOverlay::FingerprintVerify { chat_id, .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.resolve_fingerprint(chat_id, true),
+                KeyCode::Char('n') | KeyCode::Esc => self.resolve_fingerprint(chat_id, false),
                 _ => {}
             },
             TuiOverlay::ConfirmQuit => match key.code {
@@ -1817,13 +1814,8 @@ impl TuiApp {
     // ---------------------------------------------------------------- fingerprint
 
     fn verify_pending(&mut self, accept: bool) {
-        if let TuiOverlay::FingerprintVerify {
-            chat_id,
-            fingerprint,
-            ..
-        } = self.overlay.clone()
-        {
-            self.resolve_fingerprint(chat_id, &fingerprint, accept);
+        if let TuiOverlay::FingerprintVerify { chat_id, .. } = self.overlay.clone() {
+            self.resolve_fingerprint(chat_id, accept);
         } else {
             self.toast(
                 ToastLevel::Info,
@@ -1832,16 +1824,15 @@ impl TuiApp {
         }
     }
 
-    fn resolve_fingerprint(&mut self, chat_id: Uuid, fingerprint: &str, accept: bool) {
+    fn resolve_fingerprint(&mut self, chat_id: Uuid, accept: bool) {
+        // `confirm_fingerprint` stores an accepted fingerprint on the right
+        // conversation itself (on the host that is not `chat_id`, which names
+        // the session).
         if accept {
             let _ = self.chat_manager.confirm_fingerprint(chat_id, true);
-            if let Some(chat) = self.chat_manager.chats.get_mut(&chat_id) {
-                chat.peer_fingerprint = Some(fingerprint.to_string());
-            }
             self.toast(ToastLevel::Success, "Fingerprint accepted".to_string());
         } else {
-            let _ = self.chat_manager.confirm_fingerprint(chat_id, false);
-            self.chat_manager.delete_chat(chat_id);
+            let _ = self.chat_manager.reject_fingerprint(chat_id);
             self.toast(ToastLevel::Warning, "Fingerprint rejected".to_string());
         }
         self.overlay = TuiOverlay::None;
@@ -2189,6 +2180,15 @@ mod tests {
         );
     }
 
+    fn queued_prompt(session_id: Uuid) -> crate::app::PendingFingerprint {
+        crate::app::PendingFingerprint {
+            fingerprint: "deadbeef".into(),
+            peer_name: "Peer".into(),
+            sas: String::new(),
+            session_id,
+        }
+    }
+
     #[test]
     fn fingerprint_accept_confirms_and_stores() {
         let mut app = app();
@@ -2198,6 +2198,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.chat_manager
             .add_fingerprint_confirm_sender_for_test(chat_id, tx);
+        // The overlay is always opened from the manager's queued prompt.
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(queued_prompt(chat_id));
         app.overlay = TuiOverlay::FingerprintVerify {
             fingerprint: "deadbeef".into(),
             peer_name: "Peer".into(),

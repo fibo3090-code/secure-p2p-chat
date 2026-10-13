@@ -82,6 +82,17 @@ pub(crate) struct OutgoingTransfer {
     pub failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// An outgoing file whose final frame has not reached the wire yet. Resolved
+/// FIFO per session by `SessionEvent::FileSendComplete`, which is how the
+/// completion finds its tracked transfer and the message its delivery receipt
+/// belongs to.
+pub(crate) struct PendingFileSend {
+    pub filename: String,
+    pub transfer_id: Uuid,
+    pub chat_id: Uuid,
+    pub message_id: Uuid,
+}
+
 /// A TOFU verification the UI must resolve before a session becomes `Ready`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingFingerprint {
@@ -117,11 +128,8 @@ pub struct ChatManager {
     chat_id_mapping: HashMap<Uuid, Uuid>,
     active_transfers: HashMap<Uuid, FileTransferState>,
     /// Outgoing files queued on a session but whose final frame has not hit the
-    /// wire yet (FIFO per session; resolved by `SessionEvent::FileSendComplete`).
-    /// Each entry is `(filename, transfer_id, chat_id, message_id)` so the
-    /// completion can map back to its tracked transfer AND register the file
-    /// message for a delivery receipt.
-    pending_file_sends: HashMap<Uuid, VecDeque<(String, Uuid, Uuid, Uuid)>>,
+    /// wire yet, FIFO per session.
+    pending_file_sends: HashMap<Uuid, VecDeque<PendingFileSend>>,
     /// Outgoing text messages queued on a session but whose frame has not hit
     /// the wire yet (FIFO per session; resolved by `TextSendComplete`).
     /// Entries are `(chat_id, message_id)`.
@@ -133,13 +141,22 @@ pub struct ChatManager {
     /// The streaming task reports bytes sent via `progress` and stops when
     /// `cancel` is set; the poll loop mirrors both into `active_transfers`.
     outgoing_transfers: HashMap<Uuid, OutgoingTransfer>,
-    #[allow(dead_code)] // Reserved for future file transfer implementation
+    /// Open spool files for incoming transfers, keyed by transfer id.
     incoming_files: HashMap<Uuid, IncomingFileSync>,
     /// Incoming transfers whose `FileEnd` arrived while still awaiting the
     /// user's acceptance: the spooled file is complete and held (with the
     /// FileEnd's wire seq, for the delivery receipt) until the user accepts
     /// (finalize) or declines (delete).
     pending_file_end: HashMap<Uuid, u64>,
+    /// The incoming transfer each conversation's wire is streaming into right
+    /// now: set by `FileMeta`, cleared by `FileEnd` or `FileCancel`.
+    ///
+    /// `FileChunk` carries no transfer id, so this is the only thing that says
+    /// where a chunk belongs. Routing to "the active incoming transfer" instead
+    /// counted an offer held for the user's decision as active even after its
+    /// `FileEnd`, so a second file sent meanwhile was refused and its chunks
+    /// were written into the first file's spool — destroying it.
+    incoming_streams: HashMap<Uuid, Uuid>,
     incoming_text_messages: HashMap<(Uuid, Uuid), IncomingTextMessage>,
     pub toasts: Vec<Toast>,
     pub config: Config,
@@ -238,6 +255,7 @@ impl ChatManager {
             outgoing_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             pending_file_end: HashMap::new(),
+            incoming_streams: HashMap::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
             config,
@@ -319,15 +337,50 @@ impl ChatManager {
     /// Map a session id back to the chat the UI actually displays. For an
     /// incoming connection the host stores messages under the client's chat id,
     /// so the session id alone would resolve to nothing.
-    fn resolve_display_chat_id(&self, chat_id: Uuid) -> Uuid {
+    ///
+    /// Unlike [`Self::chat_for_session`], an id that already names a chat wins:
+    /// UI callers may pass either end of the mapping. A UI holding an id whose
+    /// chat has disappeared (a reconnect folded into an existing conversation)
+    /// can follow it here to the conversation that took its place.
+    pub fn resolve_display_chat_id(&self, chat_id: Uuid) -> Uuid {
         if self.chats.contains_key(&chat_id) {
             return chat_id;
         }
+        self.chat_for_session(chat_id)
+    }
+
+    /// The session serving a conversation.
+    ///
+    /// On the host, an incoming conversation is keyed by the *client's* chat id
+    /// while its session is keyed by the placeholder the peer connected
+    /// through; `chat_id_mapping` joins the two. Everywhere else they are the
+    /// same id.
+    pub(super) fn session_for_chat(&self, chat_id: Uuid) -> Uuid {
+        self.chat_id_mapping
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(chat_id)
+    }
+
+    /// The conversation a session's events belong to — the inverse of
+    /// [`Self::session_for_chat`].
+    pub(super) fn chat_for_session(&self, session_id: Uuid) -> Uuid {
         self.chat_id_mapping
             .iter()
-            .find(|(_, &session_id)| session_id == chat_id)
-            .map(|(&incoming_id, _)| incoming_id)
-            .unwrap_or(chat_id)
+            .find(|(_, &sid)| sid == session_id)
+            .map(|(&chat_id, _)| chat_id)
+            .unwrap_or(session_id)
+    }
+
+    /// Queue a control frame (receipt, cancel, typing) on the session serving
+    /// `chat_id`. Returns `false` when there is no session to carry it.
+    ///
+    /// The frame's own seq is a placeholder: the session loop stamps the real
+    /// wire sequence on every frame it writes.
+    pub(super) fn send_control(&self, chat_id: Uuid, frame: ProtocolMessage) -> bool {
+        self.sessions
+            .get(&self.session_for_chat(chat_id))
+            .is_some_and(|s| s.from_app_tx.send(frame).is_ok())
     }
 
     /// The TOFU prompt the user should answer next (oldest first), or `None`.
@@ -431,29 +484,11 @@ impl ChatManager {
         self.upnp_cancel = None;
         self.pending_upnp = None;
         self.external_address = None;
-        // Remove placeholder if exists
-        if let Some(id) = self
-            .chats
-            .values()
-            .find(|c| c.is_host_placeholder)
-            .map(|c| c.id)
-        {
-            self.toasts.push(Toast {
-                id: Uuid::new_v4(),
-                level: ToastLevel::Info,
-                message: "Stopped hosting".to_string(),
-                created_at: std::time::Instant::now(),
-                duration: Duration::from_secs(3),
-            });
-            self.chats.remove(&id);
-            // Abort first: the task is parked in `accept()` and would otherwise
-            // hold the listening port for the life of the process, so "stop
-            // hosting then start again" would fail to rebind.
-            self.abort_session_task(id);
-            self.sessions.remove(&id);
-            self.session_events.remove(&id);
-            self.fingerprint_confirm_senders.remove(&id);
-            self.drop_fingerprint_requests_for_session(id);
+        // The task is parked in `accept()` and holds the listening port until
+        // it is aborted, so "stop hosting then start again" relies on this.
+        if let Some(id) = self.host_placeholder_id() {
+            self.add_toast(ToastLevel::Info, "Stopped hosting".to_string());
+            self.remove_host_placeholder(id);
         }
     }
 
@@ -464,24 +499,8 @@ impl ChatManager {
 
     /// Helper to create a local chat for testing purposes without network sessions
     pub fn create_local_chat_for_test(&mut self, id: Uuid, title: String) {
-        let chat = Chat {
-            id,
-            title,
-            kind: ChatKind::Dm,
-            transport: Transport::Direct,
-            peer_fingerprint: None,
-            participants: Vec::new(),
-            messages: Vec::new(),
-            created_at: chrono::Utc::now(),
-            peer_typing: false,
-            typing_since: None,
-            send_seq: 0,
-            recv_seq: 0,
-            is_host_placeholder: false,
-            read_count: 0,
-            title_is_custom: false,
-        };
-        self.chats.insert(id, chat);
+        self.chats
+            .insert(id, Chat::new(id, title, ChatKind::Dm, Transport::Direct));
     }
 
     /// Helper to inject a mock session for testing
@@ -499,11 +518,20 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, tx);
     }
 
+    /// Helper to queue a TOFU prompt for testing the verification flow from a
+    /// front-end, the way a session's handshake would.
+    pub fn queue_fingerprint_prompt_for_test(&mut self, prompt: PendingFingerprint) {
+        self.queue_fingerprint_request(prompt);
+    }
+
     /// Rename a conversation/chat
     pub fn rename_chat(&mut self, chat_id: Uuid, new_title: String) -> Result<()> {
         // Truncate by characters (not bytes) so multi-byte/emoji titles never
         // panic on a non-char-boundary slice.
-        let title: String = new_title.chars().take(50).collect();
+        let title: String = new_title.trim().chars().take(50).collect();
+        if title.is_empty() {
+            bail!("A conversation name cannot be empty");
+        }
 
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.title = title;
@@ -562,27 +590,12 @@ impl ChatManager {
             return;
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            use notify_rust::Notification;
-            let _ = Notification::new()
-                .summary(title)
-                .body(body)
-                .icon("mail-message-new")
-                .timeout(5000)
-                .show();
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use notify_rust::{Notification, Timeout};
-            let _ = Notification::new()
-                .summary(title)
-                .body(body)
-                .icon("mail-message-new")
-                .timeout(Timeout::Milliseconds(5000))
-                .show();
-        }
+        let _ = notify_rust::Notification::new()
+            .summary(title)
+            .body(body)
+            .icon("mail-message-new")
+            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .show();
     }
 
     /// Get a chat by ID
@@ -602,8 +615,7 @@ impl ChatManager {
 
     /// Check if a chat has an active session.
     pub fn is_connected(&self, chat_id: &Uuid) -> bool {
-        let actual_id = self.chat_id_mapping.get(chat_id).unwrap_or(chat_id);
-        self.sessions.contains_key(actual_id)
+        self.sessions.contains_key(&self.session_for_chat(*chat_id))
     }
 
     /// Get all chat IDs
@@ -618,15 +630,9 @@ impl ChatManager {
 
     /// Queue a delivery receipt on the session serving `chat_id`, acknowledging
     /// the peer's frame with wire seq `acked_seq`. Best-effort: no session, no
-    /// receipt (the peer's message simply stays unmarked on their side). The
-    /// frame's own seq is stamped by the session loop like every message.
+    /// receipt (the peer's message simply stays unmarked on their side).
     pub(crate) fn send_ack_for_chat(&self, chat_id: Uuid, acked_seq: u64) {
-        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
-        if let Some(session) = self.sessions.get(&session_id) {
-            let _ = session
-                .from_app_tx
-                .send(ProtocolMessage::Ack { acked_seq, seq: 0 });
-        }
+        self.send_control(chat_id, ProtocolMessage::Ack { acked_seq, seq: 0 });
     }
 
     /// Transfers sorted by id, so an index-based selection (the TUI overlay) is
@@ -635,26 +641,6 @@ impl ChatManager {
         let mut v: Vec<_> = self.active_transfers.values().cloned().collect();
         v.sort_by_key(|t| t.id);
         v
-    }
-
-    /// Reset a conversation's replay-protection counters because a **new**
-    /// session is about to serve it.
-    ///
-    /// The wire sequence is per session and restarts at 1, but `recv_seq` lives
-    /// on the `Chat` and survives reconnects. Left alone, every frame the peer
-    /// sends after a reconnect is at or below the previous session's high-water
-    /// mark and is discarded as a replay — the peer's first N messages vanish
-    /// with only a log line, and they see them as sent.
-    ///
-    /// This does not weaken replay protection: it is enforced per session at the
-    /// transport layer (`last_valid_seq` in `run_message_loop`), on a key that
-    /// is itself unique per session. The chat-level counter is a second layer
-    /// that must be aligned with the session it is checking.
-    pub(super) fn reset_chat_sequences(&mut self, chat_id: Uuid) {
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.recv_seq = 0;
-            chat.send_seq = 0;
-        }
     }
 
     /// Stop the task driving a session, if one is still registered.
@@ -667,6 +653,40 @@ impl ChatManager {
         if let Some(task) = self.session_tasks.remove(&session_id) {
             task.abort();
         }
+    }
+
+    /// Stop a session and forget everything keyed by its id: the task, its
+    /// channels, a TOFU prompt it can no longer answer, and the sends waiting on
+    /// it for wire confirmation or a receipt (unacked messages simply stay
+    /// unmarked). Conversations and `chat_id_mapping` are left to the caller,
+    /// which knows whether the conversation outlives its session.
+    ///
+    /// Every way a session ends goes through here, so none of them can forget a
+    /// piece — a dead session's prompt left queued, for instance, sits at the
+    /// head of the queue and hides the next peer's.
+    pub(super) fn teardown_session(&mut self, session_id: Uuid) {
+        self.abort_session_task(session_id);
+        self.sessions.remove(&session_id);
+        self.session_events.remove(&session_id);
+        self.fingerprint_confirm_senders.remove(&session_id);
+        self.drop_fingerprint_requests_for_session(session_id);
+        self.pending_text_sends.remove(&session_id);
+        self.pending_file_sends.remove(&session_id);
+        self.awaiting_ack.retain(|(sid, _), _| *sid != session_id);
+    }
+
+    /// Remove a listening placeholder chat together with its session.
+    pub(super) fn remove_host_placeholder(&mut self, id: Uuid) {
+        self.chats.remove(&id);
+        self.teardown_session(id);
+    }
+
+    /// The placeholder chat of the current listener, if there is one.
+    pub(super) fn host_placeholder_id(&self) -> Option<Uuid> {
+        self.chats
+            .values()
+            .find(|c| c.is_host_placeholder)
+            .map(|c| c.id)
     }
 
     /// Register the task driving a session so it can be aborted on teardown.
@@ -690,7 +710,7 @@ impl ChatManager {
     /// while their client still showed them as sent.
     pub fn delete_chat(&mut self, chat_id: Uuid) {
         tracing::info!(chat_id = %chat_id, "Deleting chat");
-        let session_id = *self.chat_id_mapping.get(&chat_id).unwrap_or(&chat_id);
+        let session_id = self.session_for_chat(chat_id);
         // Callers may name either end of the mapping. The TUI's fingerprint
         // rejection passes the *session* id, so the incoming conversation that
         // session created has to go with it — otherwise rejecting a peer leaves
@@ -716,16 +736,9 @@ impl ChatManager {
         }
 
         self.chats.remove(&chat_id);
-        self.abort_session_task(session_id);
-        self.sessions.remove(&session_id);
-        self.session_events.remove(&session_id);
-        self.fingerprint_confirm_senders.remove(&session_id);
-        self.drop_fingerprint_requests_for_session(session_id);
+        self.teardown_session(session_id);
         self.chat_id_mapping
             .retain(|incoming, session| *incoming != chat_id && *session != session_id);
-        self.pending_text_sends.remove(&session_id);
-        self.pending_file_sends.remove(&session_id);
-        self.awaiting_ack.retain(|(sid, _), _| *sid != session_id);
 
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
         tracing::debug!(remaining_chats = %self.chats.len(), remaining_sessions = %self.sessions.len(), "Chat deleted");
@@ -767,6 +780,7 @@ impl ChatManager {
             }
         }
         self.pending_file_end.clear();
+        self.incoming_streams.clear();
         self.pending_text_sends.clear();
         self.awaiting_ack.clear();
         self.incoming_text_messages.clear();
@@ -819,6 +833,26 @@ impl ChatManager {
     }
 }
 
+/// Dropping the manager ends its sessions.
+///
+/// Dropping a `SessionHandle` only closes the outbound channels, and the message
+/// loop does not treat that as a reason to stop — so without this every socket
+/// (and a listener parked in `accept()`) outlived the manager until the peer
+/// next spoke or the idle timeout fired, and the peer saw the conversation as
+/// still connected for that whole time.
+impl Drop for ChatManager {
+    fn drop(&mut self) {
+        for (_, task) in self.session_tasks.drain() {
+            task.abort();
+        }
+        for handle in self.outgoing_transfers.values() {
+            handle
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl Default for ChatManager {
     fn default() -> Self {
         Self::new(Config::default())
@@ -832,5 +866,7 @@ mod files;
 mod invites;
 mod text;
 
+#[cfg(test)]
+mod adversarial_tests;
 #[cfg(test)]
 mod tests;

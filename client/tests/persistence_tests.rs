@@ -9,12 +9,7 @@ use uuid::Uuid;
 
 fn sample_chat(title: &str) -> Chat {
     Chat {
-        id: Uuid::new_v4(),
-        title: title.to_string(),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
         peer_fingerprint: Some("FE".repeat(32)),
-        participants: Vec::new(),
         messages: vec![Message {
             id: Uuid::new_v4(),
             from_me: true,
@@ -24,14 +19,12 @@ fn sample_chat(title: &str) -> Chat {
             timestamp: chrono::Utc::now(),
             delivered: false,
         }],
-        created_at: chrono::Utc::now(),
-        send_seq: 0,
-        recv_seq: 0,
-        peer_typing: false,
-        typing_since: None,
-        is_host_placeholder: false,
-        read_count: 0,
-        title_is_custom: false,
+        ..Chat::new(
+            Uuid::new_v4(),
+            title.to_string(),
+            ChatKind::Dm,
+            Transport::Direct,
+        )
     }
 }
 

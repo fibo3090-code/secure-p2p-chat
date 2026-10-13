@@ -52,7 +52,8 @@ impl ChatManager {
             .insert((session_id, seq), (chat_id, message_id));
     }
 
-    /// Consolidate Trust-On-First-Use (TOFU) verification logic
+    /// Trust-On-First-Use (TOFU): decide whether a peer's verified identity
+    /// may proceed on its own, must be confirmed by the user, or is refused.
     pub(super) fn handle_tofu_verification(
         &mut self,
         session_id: Uuid,
@@ -60,21 +61,15 @@ impl ChatManager {
         peer_name: &str,
         sas: &str,
     ) {
-        // Resolve the actual chat ID (important for host mode where session_id != chat_id)
-        let actual_chat_id = self
-            .chat_id_mapping
-            .iter()
-            .find(|(_, &sid)| sid == session_id)
-            .map(|(&cid, _)| cid)
-            .unwrap_or(session_id);
+        // On the host the session id is the placeholder's; the fingerprint
+        // belongs to the incoming conversation the peer created.
+        let chat_id = self.chat_for_session(session_id);
 
         // A blocked contact's fingerprint is refused outright: no prompt, no
         // auto-accept, and the session is told to abort.
         if self.is_fingerprint_blocked(fingerprint) {
             tracing::warn!(peer = %peer_name, "Rejected connection from blocked contact");
-            if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
-                let _ = tx.send(false);
-            }
+            self.answer_fingerprint_check(session_id, false);
             self.add_toast(
                 ToastLevel::Warning,
                 format!("Blocked contact {} tried to connect — refused", peer_name),
@@ -82,112 +77,93 @@ impl ChatManager {
             return;
         }
 
-        // Have we already *confirmed* this fingerprint elsewhere — another chat
-        // with this peer, or a contact whose fingerprint we actually verified?
-        // Then it's a returning peer under TOFU and we accept without another
-        // prompt. Computed before the mutable borrow below.
-        //
-        // A contact only counts when its trust state says the fingerprint was
-        // confirmed. Matching *any* contact meant that pasting an invite link
-        // pre-trusted whatever fingerprint it named: the peer then connected
-        // with no SAS prompt at all, which is the one check the whole product
-        // is built around. An imported contact starts `Unverified`, so it now
-        // has to pass verification like anyone else — and becomes `Verified`
-        // through `promote_contact_verified` once it does.
-        let known_trusted = self.chats.iter().any(|(id, c)| {
-            *id != actual_chat_id && c.peer_fingerprint.as_deref() == Some(fingerprint)
-        }) || self.contacts.values().any(|c| {
-            c.fingerprint.as_deref() == Some(fingerprint)
-                && matches!(c.trust_state, TrustState::Verified | TrustState::Trusted)
-        });
-
-        let chat = match self.chats.get_mut(&actual_chat_id) {
-            Some(c) => c,
-            None => {
-                tracing::error!("TOFU check failed: Chat {} not found", actual_chat_id);
-                return;
-            }
+        let Some(stored) = self.chats.get(&chat_id).map(|c| c.peer_fingerprint.clone()) else {
+            tracing::error!("TOFU check failed: Chat {} not found", chat_id);
+            return;
+        };
+        let prompt = PendingFingerprint {
+            fingerprint: fingerprint.to_string(),
+            peer_name: peer_name.to_string(),
+            sas: sas.to_string(),
+            session_id,
         };
 
-        match &chat.peer_fingerprint {
-            // CASE 1: No stored fingerprint. This is the FIRST USE.
-            None => {
-                tracing::info!(
-                    "Trust on First Use for chat {}. Requesting user confirmation.",
-                    actual_chat_id
-                );
-                // Auto-trust only if the user opted in, or this fingerprint is one
-                // we've already verified (a returning peer) — otherwise prompt.
-                if self.config.auto_trust_on_first_use || known_trusted {
-                    tracing::info!(
-                        "auto_trust_on_first_use enabled: auto-storing fingerprint for chat {}",
-                        actual_chat_id
-                    );
-                    chat.peer_fingerprint = Some(fingerprint.to_string());
-                    if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
-                        if let Err(e) = tx.send(true) {
-                            tracing::error!("Failed to auto-confirm fingerprint: {}", e);
-                        }
-                    }
-                    // The handshake confirmed this fingerprint; reflect it on
-                    // the matching contact (returning peer stays consistent).
-                    self.promote_contact_verified(actual_chat_id, fingerprint);
-                } else {
-                    // Request explicit user verification via UI.
-                    // Note: the prompt is keyed by SESSION ID because the
-                    // accept/reject decision must be sent to that session's task.
-                    // Queued, not assigned: two peers dialing a host at once
-                    // must each get their prompt rather than the second silently
-                    // replacing the first and stranding that session.
-                    self.queue_fingerprint_request(PendingFingerprint {
-                        fingerprint: fingerprint.to_string(),
-                        peer_name: peer_name.to_string(),
-                        sas: sas.to_string(),
-                        session_id,
-                    });
-                    let waiting = self.pending_fingerprint_count();
-                    self.add_toast(
-                        ToastLevel::Warning,
-                        if waiting > 1 {
-                            format!("Fingerprint verification required ({} waiting)", waiting)
-                        } else {
-                            "Fingerprint verification required".to_string()
-                        },
-                    );
-                }
+        match stored.as_deref() {
+            Some(known) if known == fingerprint => {
+                tracing::debug!(%chat_id, "Fingerprint matches stored value; proceeding");
+                self.answer_fingerprint_check(session_id, true);
             }
-            // CASE 2: Stored fingerprint matches the new one.
-            Some(stored_fp) if stored_fp == fingerprint => {
-                tracing::debug!(
-                    "Fingerprint matches stored value for chat {}. Proceeding automatically.",
-                    actual_chat_id
-                );
-                // Automatically confirm this connection using the session ID.
-                if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
-                    if let Err(e) = tx.send(true) {
-                        tracing::error!("Failed to auto-confirm fingerprint: {}", e);
-                    }
-                }
-            }
-            // CASE 3: Stored fingerprint MISMATCHES. Security alert!
-            Some(stored_fp) => {
+            Some(known) => {
                 tracing::warn!(
-                    "FINGERPRINT MISMATCH for chat {}! Stored: `{}`, New: `{}`",
-                    actual_chat_id,
-                    stored_fp,
-                    fingerprint
+                    %chat_id,
+                    stored = %known,
+                    new = %fingerprint,
+                    "FINGERPRINT MISMATCH"
                 );
-                // Trigger the UI dialog for manual verification using the session ID.
-                self.queue_fingerprint_request(PendingFingerprint {
-                    fingerprint: fingerprint.to_string(),
-                    peer_name: peer_name.to_string(),
-                    sas: sas.to_string(),
-                    session_id,
-                });
+                self.queue_fingerprint_request(prompt);
                 self.add_toast(
                     ToastLevel::Warning,
                     "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
                 );
+            }
+            // First use, but the user opted into auto-trust, or this is a peer
+            // already verified elsewhere — a returning peer under TOFU.
+            None if self.config.auto_trust_on_first_use
+                || self.fingerprint_known_trusted(fingerprint, chat_id) =>
+            {
+                tracing::info!(%chat_id, "Fingerprint trusted without a prompt");
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.peer_fingerprint = Some(fingerprint.to_string());
+                }
+                self.answer_fingerprint_check(session_id, true);
+                // Reflect it on the matching contact so a returning peer stays
+                // consistent.
+                self.promote_contact_verified(chat_id, fingerprint);
+            }
+            // First use: the user compares the safety code out of band. Keyed
+            // by SESSION id, because the answer goes to that session's task;
+            // queued, so two peers dialing a host at once each get a prompt.
+            None => {
+                tracing::info!(%chat_id, "Trust on first use: requesting user confirmation");
+                self.queue_fingerprint_request(prompt);
+                let waiting = self.pending_fingerprint_count();
+                self.add_toast(
+                    ToastLevel::Warning,
+                    if waiting > 1 {
+                        format!("Fingerprint verification required ({} waiting)", waiting)
+                    } else {
+                        "Fingerprint verification required".to_string()
+                    },
+                );
+            }
+        }
+    }
+
+    /// Has this fingerprint already been *confirmed* somewhere other than
+    /// `chat_id` — another conversation with this peer, or a contact whose
+    /// fingerprint was actually verified?
+    ///
+    /// A contact only counts when its trust state says so. Matching *any*
+    /// contact meant that pasting an invite link pre-trusted whatever
+    /// fingerprint it named: the peer then connected with no SAS prompt at all,
+    /// which is the one check the whole product is built around. An imported
+    /// contact starts `Unverified` and becomes `Verified` through
+    /// `promote_contact_verified` once the user accepts.
+    fn fingerprint_known_trusted(&self, fingerprint: &str, chat_id: Uuid) -> bool {
+        self.chats
+            .iter()
+            .any(|(id, c)| *id != chat_id && c.peer_fingerprint.as_deref() == Some(fingerprint))
+            || self.contacts.values().any(|c| {
+                c.fingerprint.as_deref() == Some(fingerprint)
+                    && matches!(c.trust_state, TrustState::Verified | TrustState::Trusted)
+            })
+    }
+
+    /// Tell a session task the outcome of its fingerprint check.
+    fn answer_fingerprint_check(&self, session_id: Uuid, accept: bool) {
+        if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
+            if let Err(e) = tx.send(accept) {
+                tracing::error!(%session_id, "Failed to answer the fingerprint check: {}", e);
             }
         }
     }
@@ -204,9 +180,7 @@ impl ChatManager {
 
             SessionEvent::Connected { peer } => {
                 tracing::info!("Session {} connected to {}", chat_id, peer);
-                // A "p2p:" label means the relay rendezvous hole punched a
-                // direct socket, so the chat is no longer relay-transported.
-                let hole_punched = peer.starts_with("p2p:");
+                let hole_punched = is_hole_punched(&peer);
                 if hole_punched {
                     self.add_toast(
                         ToastLevel::Success,
@@ -233,8 +207,7 @@ impl ChatManager {
                     // replay, silently swallowing the peer's first messages.
                     // Transport-layer replay protection is per session and
                     // still enforced in `run_message_loop`.
-                    chat.recv_seq = 0;
-                    chat.send_seq = 0;
+                    chat.reset_sequences();
                 }
             }
 
@@ -250,105 +223,12 @@ impl ChatManager {
                     incoming_chat_id,
                     chat_id,
                 );
-
-                // A returning peer belongs in the conversation it already has.
-                //
-                // The host keys incoming chats by the *client's* chat id, which
-                // is fresh whenever the client hasn't kept its own mapping — so
-                // every reconnect used to open another "Peer ab12cd34" and the
-                // history fragmented into a pile of near-identical threads. The
-                // fingerprint arrives verified (the identity proof was checked
-                // before this event), so it is the right key: prefer an existing
-                // conversation with that fingerprint over the id we were handed.
-                //
-                // Only an idle one, though — a chat with a live session belongs
-                // to a connection that is still running, and merging a second
-                // peer into it would cross two conversations together.
-                let incoming_chat_id = self
-                    .chats
-                    .iter()
-                    .find(|(id, c)| {
-                        c.peer_fingerprint.as_deref() == Some(fingerprint.as_str())
-                            && !c.is_host_placeholder
-                            && **id != chat_id
-                            && !self.is_connected(id)
-                    })
-                    .map(|(id, _)| *id)
-                    .unwrap_or(incoming_chat_id);
-
-                // Map incoming_chat_id to the session's chat_id (the placeholder host chat)
-                // This allows messages sent to incoming_chat_id to be routed to the session
-                self.chat_id_mapping.insert(incoming_chat_id, chat_id);
-                tracing::debug!(
-                    "Mapped incoming chat {} to session chat {}",
+                self.accept_incoming_connection(
+                    chat_id,
                     incoming_chat_id,
-                    chat_id
+                    &fingerprint,
+                    &peer_addr,
                 );
-
-                // Format a title using the peer's fingerprint instead of IP address
-                let title = format!(
-                    "Peer {}",
-                    crate::util::format_fingerprint_short(&fingerprint)
-                );
-
-                // Inherit the transport of the host session that accepted this peer:
-                // a relay-hosted listener (`start_host_via_relay`) must produce a
-                // Relay chat, not a hardcoded Direct one. Exception: a "p2p:"
-                // peer label means the rendezvous hole punched a direct socket,
-                // so the chat is Direct even though it started via the relay.
-                let inherited_transport = if peer_addr.starts_with("p2p:") {
-                    Transport::Direct
-                } else {
-                    self.chats
-                        .get(&chat_id)
-                        .map(|c| c.transport)
-                        .unwrap_or(Transport::Direct)
-                };
-
-                // Create a chat for this new connection, or (on reconnect, where
-                // the entry already exists) normalize its transport so it isn't
-                // left as a stale Direct — the same fix applied in connect_via_relay.
-                self.chats
-                    .entry(incoming_chat_id)
-                    .and_modify(|c| {
-                        c.transport = inherited_transport;
-                        // Reconnect onto an existing conversation: the peer's
-                        // wire sequence restarts at 1 for the new session, so a
-                        // leftover high-water mark would reject everything it
-                        // sends until it climbs past the old one.
-                        c.recv_seq = 0;
-                        c.send_seq = 0;
-                    })
-                    .or_insert_with(|| Chat {
-                        id: incoming_chat_id,
-                        title,
-                        kind: ChatKind::Dm,
-                        transport: inherited_transport,
-                        // Leave unset so TOFU actually runs for this incoming peer:
-                        // pre-filling the peer's own fingerprint made the check below
-                        // trivially "match" and silently auto-trust every caller.
-                        peer_fingerprint: None,
-                        participants: Vec::new(),
-                        messages: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        peer_typing: false,
-                        typing_since: None,
-                        send_seq: 0,
-                        recv_seq: 0,
-                        is_host_placeholder: false,
-                        read_count: 0,
-                        title_is_custom: false,
-                    });
-
-                // If this connection consumes a placeholder host chat, remove the placeholder
-                // so the UI shows only the real chat. Auto-rehost will spawn a new listener.
-                if let Some(placeholder) = self.chats.get(&chat_id) {
-                    if placeholder.is_host_placeholder {
-                        tracing::debug!("Removing consumed host placeholder chat {}", chat_id);
-                        self.chats.remove(&chat_id);
-                    }
-                }
-
                 self.handle_tofu_verification(chat_id, &fingerprint, &peer_addr, &sas);
             }
 
@@ -358,6 +238,7 @@ impl ChatManager {
                 sas,
                 chat_id,
             } => {
+                self.rejoin_existing_conversation(chat_id, &fingerprint);
                 self.handle_tofu_verification(chat_id, &fingerprint, &peer_name, &sas);
             }
 
@@ -366,426 +247,33 @@ impl ChatManager {
                 self.add_toast(ToastLevel::Success, "Connection established!".to_string());
             }
 
-            SessionEvent::MessageReceived(proto_msg) => {
-                tracing::debug!("Session {} received message: {:?}", chat_id, proto_msg);
-
-                // Find the actual chat to add the message to
-                // If this session is mapped from an incoming connection, use the incoming chat_id
-                // Otherwise use the session's chat_id
-                let actual_chat_id = self
-                    .chat_id_mapping
-                    .iter()
-                    .find(|(_, &session_id)| session_id == chat_id)
-                    .map(|(&incoming_id, _)| incoming_id)
-                    .unwrap_or(chat_id);
-
-                tracing::debug!("Message routed to actual_chat_id={}", actual_chat_id);
-
-                match proto_msg {
-                    ProtocolMessage::Text { text, seq, .. } => {
-                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                chat.messages.push(Message {
-                                    id: Uuid::new_v4(),
-                                    from_me: false,
-                                    content: MessageContent::Text { text: text.clone() },
-                                    timestamp: chrono::Utc::now(),
-                                    delivered: false,
-                                });
-
-                                // Clear typing indicator
-                                chat.peer_typing = false;
-                                chat.typing_since = None;
-                                // Delivery receipt for the sender.
-                                self.send_ack_for_chat(actual_chat_id, seq);
-                                // Desktop notification — suppressed when this
-                                // conversation is already on screen and focused.
-                                let preview = Self::preview_text_for_notification(&text);
-                                self.notify_incoming_message(actual_chat_id, &preview);
-
-                                tracing::info!("Added received message to chat {}", actual_chat_id);
-                            } else {
-                                tracing::warn!("Received message with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                            }
-                        } else {
-                            tracing::error!(
-                                "Chat {} not found for received message",
-                                actual_chat_id
-                            );
-                        }
-                    }
-                    ProtocolMessage::TextChunk {
-                        message_id,
-                        chunk_index,
-                        total_chunks,
-                        text_part,
-                        timestamp,
-                        seq,
-                    } => {
-                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                true
-                            } else {
-                                tracing::warn!("Received TextChunk with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if !valid_seq {
-                            return;
-                        }
-
-                        match self.register_incoming_text_chunk(
-                            actual_chat_id,
-                            message_id,
-                            chunk_index,
-                            total_chunks,
-                            text_part,
-                            timestamp,
-                        ) {
-                            Ok(Some((text, assembled_timestamp))) => {
-                                if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                                    chat.messages.push(Message {
-                                        id: Uuid::new_v4(),
-                                        from_me: false,
-                                        content: MessageContent::Text { text: text.clone() },
-                                        timestamp: assembled_timestamp,
-                                        delivered: false,
-                                    });
-                                    chat.peer_typing = false;
-                                    chat.typing_since = None;
-                                }
-                                // Delivery receipt: ack the final chunk's seq
-                                // (chunks arrive in order on the one stream).
-                                self.send_ack_for_chat(actual_chat_id, seq);
-
-                                let preview = Self::preview_text_for_notification(&text);
-                                self.notify_incoming_message(actual_chat_id, &preview);
-                                tracing::info!(
-                                    "Reassembled large text message {} for chat {}",
-                                    message_id,
-                                    actual_chat_id
-                                );
-                            }
-                            Ok(None) => {
-                                tracing::trace!(
-                                    "Buffered text chunk {}/{} for chat {}",
-                                    chunk_index + 1,
-                                    total_chunks,
-                                    actual_chat_id
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Discarding large text message {} for chat {}: {}",
-                                    message_id,
-                                    actual_chat_id,
-                                    e
-                                );
-                                self.incoming_text_messages
-                                    .remove(&(actual_chat_id, message_id));
-                                self.add_toast(
-                                    ToastLevel::Warning,
-                                    "A large incoming message could not be reconstructed."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::FileMeta {
-                        filename,
-                        size,
-                        seq,
-                    } => {
-                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                tracing::info!(
-                                    "Received file metadata: {} ({} bytes)",
-                                    filename,
-                                    size
-                                );
-
-                                match self.start_receiving_file(actual_chat_id, &filename, size) {
-                                    Ok(transfer_id) => {
-                                        // The directory is ours, the name is the
-                                        // peer's: passing them separately is what
-                                        // lets the receiver sanitise the name
-                                        // itself rather than trusting the decoder
-                                        // to have done it.
-                                        match IncomingFileSync::new(
-                                            &self.config.download_dir,
-                                            &filename,
-                                            size,
-                                        ) {
-                                            Ok(incoming) => {
-                                                self.incoming_files.insert(transfer_id, incoming);
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Failed to create incoming file: {}",
-                                                    e
-                                                );
-                                                self.add_toast(
-                                                    ToastLevel::Error,
-                                                    format!("Failed to receive file: {}", e),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to start receiving file: {}", e);
-                                        self.add_toast(
-                                            ToastLevel::Error,
-                                            format!("Failed to receive file: {}", e),
-                                        );
-                                    }
-                                }
-                            } else {
-                                tracing::warn!("Received FileMeta with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", chat_id, chat.recv_seq, seq);
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::FileChunk { chunk, seq } => {
-                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                true
-                            } else {
-                                tracing::warn!("Received file chunk with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if !valid_seq {
-                            return;
-                        }
-
-                        let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
-                        if let Some(transfer_id) = transfer_id {
-                            // An offer the user has not accepted yet still
-                            // spools to disk, because the sender streams
-                            // without waiting for a decision. Uncapped, that
-                            // means a peer can put up to MAX_FILE_SIZE (10 GiB)
-                            // on the disk while the accept/decline prompt is
-                            // still on screen. Past the cap the offer is
-                            // declined for them.
-                            if self.unaccepted_spool_exceeded(transfer_id) {
-                                self.auto_decline_oversized_offer(transfer_id);
-                                return;
-                            }
-                            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-                                transfer.seq += 1;
-                                tracing::debug!(
-                                    "Received file chunk {} ({} bytes)",
-                                    seq,
-                                    chunk.len()
-                                );
-
-                                if let Some(incoming) = self.incoming_files.get_mut(&transfer_id) {
-                                    if let Err(e) = incoming.write_chunk(&chunk) {
-                                        tracing::error!("Failed to write chunk: {}", e);
-                                        if let Some(transfer) =
-                                            self.active_transfers.get_mut(&transfer_id)
-                                        {
-                                            transfer.status = TransferStatus::Failed(e.to_string());
-                                        }
-                                        if let Some(incoming) =
-                                            self.incoming_files.remove(&transfer_id)
-                                        {
-                                            if let Err(cleanup_err) = incoming.abort_cleanup() {
-                                                tracing::warn!(
-                                                    "Failed to clean up aborted transfer {}: {}",
-                                                    transfer_id,
-                                                    cleanup_err
-                                                );
-                                            }
-                                        }
-                                        self.add_toast(
-                                            ToastLevel::Error,
-                                            format!("File transfer error: {}", e),
-                                        );
-                                    } else {
-                                        let bytes_received = incoming.bytes_received();
-                                        self.update_transfer_progress(transfer_id, bytes_received);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::FileEnd { seq } => {
-                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                true
-                            } else {
-                                tracing::warn!("Received FileEnd with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if !valid_seq {
-                            return;
-                        }
-
-                        let transfer_id = self.active_incoming_transfer_id_for_chat(actual_chat_id);
-                        if let Some(transfer_id) = transfer_id {
-                            let awaiting = self
-                                .active_transfers
-                                .get(&transfer_id)
-                                .is_some_and(|t| t.status == TransferStatus::AwaitingAcceptance);
-                            if awaiting {
-                                // Fully received but not yet accepted: hold the
-                                // spooled file (and the FileEnd seq, for the
-                                // eventual delivery receipt) until the user decides.
-                                tracing::info!(
-                                    "File fully received; holding until the user accepts"
-                                );
-                                self.pending_file_end.insert(transfer_id, seq);
-                            } else if self.active_transfers.contains_key(&transfer_id) {
-                                tracing::info!("File transfer completed");
-                                // Finalize only the matching transfer, not all incoming files.
-                                self.finalize_incoming_file(transfer_id, Some(seq));
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::FileCancel { seq } => {
-                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                true
-                            } else {
-                                tracing::warn!("Received FileCancel with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if valid_seq {
-                            tracing::info!(
-                                "Peer cancelled the file transfer for chat {}",
-                                actual_chat_id
-                            );
-                            self.handle_peer_file_cancel(actual_chat_id);
-                        }
-                    }
-
-                    ProtocolMessage::Ping { seq } => {
-                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                tracing::trace!("Received ping with seq {}", seq);
-                            } else {
-                                tracing::warn!("Received Ping with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::TypingStart { seq } => {
-                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                chat.peer_typing = true;
-                                chat.typing_since = Some(std::time::Instant::now());
-                            } else {
-                                tracing::warn!("Received TypingStart with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::TypingStop { seq } => {
-                        if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                chat.peer_typing = false;
-                                chat.typing_since = None;
-                            } else {
-                                tracing::warn!("Received TypingStop with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                            }
-                        }
-                    }
-
-                    ProtocolMessage::Ack { acked_seq, seq } => {
-                        let valid_seq = if let Some(chat) = self.chats.get_mut(&actual_chat_id) {
-                            if seq > chat.recv_seq {
-                                chat.recv_seq = seq;
-                                true
-                            } else {
-                                tracing::warn!("Received Ack with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.", actual_chat_id, chat.recv_seq, seq);
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if !valid_seq {
-                            return;
-                        }
-                        // Mark the acknowledged message as delivered. The key is
-                        // the SESSION id: that is where the wire seq was stamped.
-                        if let Some((target_chat, message_id)) =
-                            self.awaiting_ack.remove(&(chat_id, acked_seq))
-                        {
-                            if let Some(chat) = self.chats.get_mut(&target_chat) {
-                                if let Some(message) =
-                                    chat.messages.iter_mut().find(|m| m.id == message_id)
-                                {
-                                    message.delivered = true;
-                                    tracing::debug!(
-                                        "Message {} in chat {} marked delivered",
-                                        message_id,
-                                        target_chat
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                "Ack for unknown seq {} on session {} (already acked, or sent before restart)",
-                                acked_seq,
-                                chat_id
-                            );
-                        }
-                    }
-                    other => {
-                        tracing::warn!(
-                            "Received unhandled protocol message in message loop: {:?}",
-                            other
-                        );
-                    }
-                }
-            }
+            SessionEvent::MessageReceived(frame) => self.handle_peer_frame(chat_id, frame),
 
             SessionEvent::FileSendComplete { seq } => {
-                match self
+                let Some(PendingFileSend {
+                    filename,
+                    transfer_id,
+                    chat_id: target_chat,
+                    message_id,
+                }) = self
                     .pending_file_sends
                     .get_mut(&chat_id)
                     .and_then(|q| q.pop_front())
-                {
-                    Some((filename, transfer_id, target_chat, message_id)) => {
-                        tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
-                        // The stream finished; mark the tracked transfer done
-                        // and retire its live handle.
-                        self.outgoing_transfers.remove(&transfer_id);
-                        if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
-                            state.received = state.size;
-                            state.status = TransferStatus::Completed;
-                        }
-                        // Wait for the peer's receipt to mark it delivered.
-                        self.register_awaiting_ack(chat_id, seq, target_chat, message_id);
-                        self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
-                    }
-                    None => {
-                        tracing::warn!(seq = %seq, "FileSendComplete with no pending file send");
-                    }
+                else {
+                    tracing::warn!(seq = %seq, "FileSendComplete with no pending file send");
+                    return;
+                };
+                tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
+                // The stream finished; mark the tracked transfer done and retire
+                // its live handle.
+                self.outgoing_transfers.remove(&transfer_id);
+                if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
+                    state.received = state.size;
+                    state.status = TransferStatus::Completed;
                 }
+                // Wait for the peer's receipt to mark it delivered.
+                self.register_awaiting_ack(chat_id, seq, target_chat, message_id);
+                self.add_toast(ToastLevel::Success, format!("File sent: {}", filename));
             }
 
             SessionEvent::TextSendComplete { seq } => {
@@ -816,13 +304,8 @@ impl ChatManager {
                 // transfer is tracked under.
                 self.fail_incoming_transfers(chat_id, "connection lost");
 
-                // Clean up session (unacked messages simply stay unmarked).
-                self.sessions.remove(&chat_id);
-                self.session_events.remove(&chat_id);
+                self.teardown_session(chat_id);
                 self.chat_id_mapping.retain(|_, v| *v != chat_id);
-                self.pending_text_sends.remove(&chat_id);
-                self.awaiting_ack.retain(|(sid, _), _| *sid != chat_id);
-                self.fingerprint_confirm_senders.remove(&chat_id);
 
                 // A listener that died without ever accepting anyone leaves its
                 // placeholder chat behind, and `check_rehost_needed()` then
@@ -837,9 +320,6 @@ impl ChatManager {
                     tracing::info!(%chat_id, "Host placeholder removed: its listener is gone");
                     self.chats.remove(&chat_id);
                 }
-                // A pending TOFU prompt for a session that just died can never
-                // be answered; leaving it queued blocks the next peer's prompt.
-                self.drop_fingerprint_requests_for_session(chat_id);
             }
 
             SessionEvent::Error(err) => {
@@ -852,6 +332,410 @@ impl ChatManager {
                 tracing::warn!("Session {} warning: {}", chat_id, msg);
                 self.add_toast(ToastLevel::Warning, msg);
             }
+        }
+    }
+
+    /// A host listener accepted a peer: route the session into a conversation.
+    fn accept_incoming_connection(
+        &mut self,
+        session_id: Uuid,
+        offered_chat_id: Uuid,
+        fingerprint: &str,
+        peer_addr: &str,
+    ) {
+        // A returning peer belongs in the conversation it already has.
+        //
+        // The host keys incoming chats by the *client's* chat id, which is fresh
+        // whenever the client hasn't kept its own mapping — so every reconnect
+        // used to open another "Peer ab12cd34" and the history fragmented into a
+        // pile of near-identical threads. The fingerprint arrives verified (the
+        // identity proof was checked before this event), so it is the right key:
+        // prefer an existing conversation with that fingerprint over the id we
+        // were handed.
+        //
+        // Only an idle one, though — a chat with a live session belongs to a
+        // connection that is still running, and merging a second peer into it
+        // would cross two conversations together.
+        let chat_id = self
+            .chats
+            .iter()
+            .find(|(id, c)| {
+                c.peer_fingerprint.as_deref() == Some(fingerprint)
+                    && !c.is_host_placeholder
+                    && **id != session_id
+                    && !self.is_connected(id)
+            })
+            .map(|(id, _)| *id)
+            .unwrap_or(offered_chat_id);
+
+        // Messages sent to the conversation are routed to the session that
+        // accepted it (the placeholder host's).
+        self.chat_id_mapping.insert(chat_id, session_id);
+        tracing::debug!(
+            "Mapped incoming chat {} to session chat {}",
+            chat_id,
+            session_id
+        );
+
+        // Inherit the transport of the host session that accepted this peer: a
+        // relay-hosted listener must produce a Relay chat — unless the
+        // rendezvous hole punched a direct socket.
+        let transport = if is_hole_punched(peer_addr) {
+            Transport::Direct
+        } else {
+            self.chats
+                .get(&session_id)
+                .map(|c| c.transport)
+                .unwrap_or(Transport::Direct)
+        };
+
+        // Create the conversation, or (on reconnect) bring the existing one in
+        // line with its new session: the peer's wire sequence restarts at 1, so
+        // a leftover high-water mark would reject everything it sends until it
+        // climbs past the old one.
+        //
+        // A new chat starts with no `peer_fingerprint`, so TOFU actually runs:
+        // pre-filling the peer's own fingerprint made the check trivially
+        // "match" and silently auto-trusted every caller.
+        let title = format!(
+            "Peer {}",
+            crate::util::format_fingerprint_short(fingerprint)
+        );
+        self.chats
+            .entry(chat_id)
+            .and_modify(|c| {
+                c.transport = transport;
+                c.reset_sequences();
+            })
+            .or_insert_with(|| Chat::new(chat_id, title, ChatKind::Dm, transport));
+
+        // The listener's placeholder is consumed: the UI shows only the real
+        // conversation, and auto-rehost spawns a new listener.
+        if self
+            .chats
+            .get(&session_id)
+            .is_some_and(|c| c.is_host_placeholder)
+        {
+            tracing::debug!("Removing consumed host placeholder chat {}", session_id);
+            self.chats.remove(&session_id);
+        }
+    }
+
+    /// The dialing side of "a returning peer belongs in ONE conversation".
+    ///
+    /// Re-dialing a peer by address (or relay code) starts a fresh chat, because
+    /// nothing at dial time says who will answer. The host already routes a
+    /// returning peer back into its existing conversation by fingerprint; the
+    /// dialing side did not, so every reconnect left the user with a new, empty
+    /// "host:port" conversation beside the one holding their history — the two
+    /// sides of the same session disagreeing about which thread it was.
+    ///
+    /// Now that the peer's identity is verified, a fresh, empty chat whose peer
+    /// already has an idle conversation is folded into it: the session keeps
+    /// its id and is mapped to the existing conversation exactly as a host-side
+    /// session is (`chat_id_mapping`), so messages, sends, transfers and
+    /// teardown all route there. TOFU then runs against the existing
+    /// conversation's stored fingerprint, so the prompt is skipped only for a
+    /// peer the user already verified.
+    fn rejoin_existing_conversation(&mut self, session_id: Uuid, fingerprint: &str) {
+        let Some(fresh) = self.chats.get(&session_id) else {
+            return;
+        };
+        // A conversation that already belongs to this peer, or already has
+        // history of its own, is not a fresh dial.
+        if fresh.peer_fingerprint.is_some() || !fresh.messages.is_empty() {
+            return;
+        }
+        let transport = fresh.transport;
+        let Some(existing) = self
+            .chats
+            .iter()
+            .find(|(id, c)| {
+                **id != session_id
+                    && c.peer_fingerprint.as_deref() == Some(fingerprint)
+                    && !c.is_host_placeholder
+                    && !self.is_connected(id)
+            })
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        tracing::info!(%session_id, conversation = %existing, "Reconnected peer routed into its existing conversation");
+        self.chats.remove(&session_id);
+        self.chat_id_mapping.insert(existing, session_id);
+        if let Some(chat) = self.chats.get_mut(&existing) {
+            chat.transport = transport;
+            chat.reset_sequences();
+        }
+        for chat in self.contact_to_chat.values_mut() {
+            if *chat == session_id {
+                *chat = existing;
+            }
+        }
+    }
+
+    /// One application frame from the peer.
+    ///
+    /// The replay check runs here, once, before the frame is looked at: every
+    /// sequenced frame must climb above the last one accepted on this
+    /// conversation, whatever its kind. (The transport enforces the same rule
+    /// per session; this is the app-layer half.)
+    fn handle_peer_frame(&mut self, session_id: Uuid, frame: ProtocolMessage) {
+        tracing::debug!("Session {} received message: {:?}", session_id, frame);
+        let chat_id = self.chat_for_session(session_id);
+        let Some(chat) = self.chats.get_mut(&chat_id) else {
+            tracing::error!("Chat {} not found for received message", chat_id);
+            return;
+        };
+        if let Some(seq) = frame.seq() {
+            let last = chat.recv_seq;
+            if !chat.accept_seq(seq) {
+                tracing::warn!(
+                    "Received {:?} with invalid sequence number for chat {}. Expected > {}, got {}. Discarding.",
+                    frame, chat_id, last, seq
+                );
+                return;
+            }
+        }
+
+        match frame {
+            ProtocolMessage::Text { text, seq, .. } => {
+                self.receive_text(chat_id, text, chrono::Utc::now(), seq);
+            }
+            ProtocolMessage::TextChunk {
+                message_id,
+                chunk_index,
+                total_chunks,
+                text_part,
+                timestamp,
+                seq,
+            } => match self.register_incoming_text_chunk(
+                chat_id,
+                message_id,
+                chunk_index,
+                total_chunks,
+                text_part,
+                timestamp,
+            ) {
+                // Chunks arrive in order on the one stream, so the final
+                // chunk's seq is the one the receipt acknowledges.
+                Ok(Some((text, assembled_at))) => {
+                    tracing::info!(
+                        "Reassembled large text message {} for chat {}",
+                        message_id,
+                        chat_id
+                    );
+                    self.receive_text(chat_id, text, assembled_at, seq);
+                }
+                Ok(None) => tracing::trace!(
+                    "Buffered text chunk {}/{} for chat {}",
+                    chunk_index + 1,
+                    total_chunks,
+                    chat_id
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "Discarding large text message {} for chat {}: {}",
+                        message_id,
+                        chat_id,
+                        e
+                    );
+                    self.incoming_text_messages.remove(&(chat_id, message_id));
+                    self.add_toast(
+                        ToastLevel::Warning,
+                        "A large incoming message could not be reconstructed.".to_string(),
+                    );
+                }
+            },
+            ProtocolMessage::FileMeta { filename, size, .. } => {
+                self.receive_file_offer(chat_id, &filename, size);
+            }
+            ProtocolMessage::FileChunk { chunk, .. } => self.receive_file_chunk(chat_id, &chunk),
+            ProtocolMessage::FileEnd { seq } => self.receive_file_end(chat_id, seq),
+            ProtocolMessage::FileCancel { .. } => {
+                tracing::info!("Peer cancelled the file transfer for chat {}", chat_id);
+                self.handle_peer_file_cancel(chat_id);
+            }
+            ProtocolMessage::Ping { seq } => tracing::trace!("Received ping with seq {}", seq),
+            ProtocolMessage::TypingStart { .. } => {
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.peer_typing = true;
+                    chat.typing_since = Some(std::time::Instant::now());
+                }
+            }
+            ProtocolMessage::TypingStop { .. } => {
+                if let Some(chat) = self.chats.get_mut(&chat_id) {
+                    chat.clear_typing();
+                }
+            }
+            // Keyed by the SESSION id: that is where the wire seq was stamped.
+            ProtocolMessage::Ack { acked_seq, .. } => self.mark_delivered(session_id, acked_seq),
+            other => {
+                tracing::warn!(
+                    "Received unhandled protocol message in message loop: {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    /// Record a text message from the peer, acknowledge the frame `ack_seq`
+    /// that completed it, and notify (unless the conversation is on screen).
+    fn receive_text(
+        &mut self,
+        chat_id: Uuid,
+        text: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        ack_seq: u64,
+    ) {
+        let preview = Self::preview_text_for_notification(&text);
+        let Some(chat) = self.chats.get_mut(&chat_id) else {
+            return;
+        };
+        chat.messages
+            .push(Message::received(MessageContent::Text { text }, timestamp));
+        chat.clear_typing();
+        self.send_ack_for_chat(chat_id, ack_seq);
+        self.notify_incoming_message(chat_id, &preview);
+        tracing::info!("Added received message to chat {}", chat_id);
+    }
+
+    /// The peer offered a file: register the transfer and open its spool.
+    fn receive_file_offer(&mut self, chat_id: Uuid, filename: &str, size: u64) {
+        tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
+        // A sender streams one file at a time, so a new offer means whatever
+        // was still streaming is over from its side; it will never finish.
+        if let Some(abandoned) = self.streaming_transfer(chat_id) {
+            tracing::warn!(%abandoned, "a new file offer arrived before the previous one finished");
+            self.pending_file_end.remove(&abandoned);
+            self.discard_spool(abandoned, "superseded");
+            self.set_transfer_status(
+                abandoned,
+                TransferStatus::Failed("the sender started another file".to_string()),
+            );
+        }
+        let transfer_id = match self.start_receiving_file(chat_id, filename, size) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("Failed to start receiving file: {}", e);
+                self.refuse_file_offer(chat_id, &e.to_string());
+                return;
+            }
+        };
+        // The directory is ours, the name is the peer's: passing them separately
+        // is what lets the receiver sanitise the name itself rather than trusting
+        // the decoder to have done it.
+        match IncomingFileSync::new(&self.config.download_dir, filename, size) {
+            Ok(incoming) => {
+                self.incoming_files.insert(transfer_id, incoming);
+            }
+            Err(e) => {
+                tracing::error!("Failed to create incoming file: {}", e);
+                // Fail the transfer, or it stays "active" with no spool behind
+                // it and blocks the conversation's next offer forever.
+                self.set_transfer_status(transfer_id, TransferStatus::Failed(e.to_string()));
+                self.refuse_file_offer(chat_id, &e.to_string());
+            }
+        }
+    }
+
+    /// We cannot take the file the peer just offered: drop whatever of it is
+    /// still to come, and tell the sender to stop rather than stream it all
+    /// across the wire for nothing.
+    fn refuse_file_offer(&mut self, chat_id: Uuid, reason: &str) {
+        self.incoming_streams.remove(&chat_id);
+        self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
+        self.add_toast(
+            ToastLevel::Error,
+            format!("Failed to receive file: {}", reason),
+        );
+    }
+
+    /// Spool one chunk of the active incoming transfer.
+    fn receive_file_chunk(&mut self, chat_id: Uuid, chunk: &[u8]) {
+        // Chunks of a refused, declined or failed offer have nowhere to go.
+        let Some(transfer_id) = self.streaming_transfer(chat_id) else {
+            return;
+        };
+        // An offer the user has not accepted yet still spools to disk, because
+        // the sender streams without waiting for a decision. Uncapped, that
+        // means a peer can put up to MAX_FILE_SIZE (10 GiB) on the disk while
+        // the accept/decline prompt is still on screen. Past the cap the offer
+        // is declined for them.
+        if self.unaccepted_spool_exceeded(transfer_id) {
+            self.auto_decline_oversized_offer(transfer_id);
+            return;
+        }
+        if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+            transfer.seq += 1;
+        }
+        tracing::debug!("Received file chunk ({} bytes)", chunk.len());
+        let Some(incoming) = self.incoming_files.get_mut(&transfer_id) else {
+            return;
+        };
+        match incoming.write_chunk(chunk) {
+            Ok(()) => {
+                let bytes_received = incoming.bytes_received();
+                self.update_transfer_progress(transfer_id, bytes_received);
+            }
+            Err(e) => {
+                tracing::error!("Failed to write chunk: {}", e);
+                self.set_transfer_status(transfer_id, TransferStatus::Failed(e.to_string()));
+                self.discard_spool(transfer_id, "write failed");
+                self.add_toast(ToastLevel::Error, format!("File transfer error: {}", e));
+            }
+        }
+    }
+
+    /// The peer finished sending: finalize, or hold until the user decides.
+    fn receive_file_end(&mut self, chat_id: Uuid, seq: u64) {
+        // The stream is over either way; the next offer starts a new one.
+        let Some(transfer_id) = self.incoming_streams.remove(&chat_id) else {
+            return;
+        };
+        let Some(status) = self
+            .active_transfers
+            .get(&transfer_id)
+            .map(|t| t.status.clone())
+        else {
+            return;
+        };
+        if !status.is_active() {
+            return; // declined or failed while it was still streaming
+        }
+        if status == TransferStatus::AwaitingAcceptance {
+            // Fully received but not yet accepted: hold the spooled file (and
+            // the FileEnd seq, for the eventual delivery receipt) until the user
+            // decides.
+            tracing::info!("File fully received; holding until the user accepts");
+            self.pending_file_end.insert(transfer_id, seq);
+        } else {
+            tracing::info!("File transfer completed");
+            self.finalize_incoming_file(transfer_id, Some(seq));
+        }
+    }
+
+    /// The peer's delivery receipt for the frame we sent as `acked_seq`.
+    fn mark_delivered(&mut self, session_id: Uuid, acked_seq: u64) {
+        let Some((chat_id, message_id)) = self.awaiting_ack.remove(&(session_id, acked_seq)) else {
+            tracing::debug!(
+                "Ack for unknown seq {} on session {} (already acked, or sent before restart)",
+                acked_seq,
+                session_id
+            );
+            return;
+        };
+        if let Some(message) = self
+            .chats
+            .get_mut(&chat_id)
+            .and_then(|c| c.messages.iter_mut().find(|m| m.id == message_id))
+        {
+            message.delivered = true;
+            tracing::debug!(
+                "Message {} in chat {} marked delivered",
+                message_id,
+                chat_id
+            );
         }
     }
 
@@ -891,4 +775,10 @@ impl ChatManager {
             }
         }
     }
+}
+
+/// A `p2p:` peer label means the relay rendezvous hole punched a direct
+/// socket, so the conversation is direct even though it began via the relay.
+fn is_hole_punched(peer: &str) -> bool {
+    peer.starts_with("p2p:")
 }

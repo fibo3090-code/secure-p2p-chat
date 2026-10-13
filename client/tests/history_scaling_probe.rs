@@ -27,21 +27,9 @@ use uuid::Uuid;
 
 fn chat_with(messages: usize) -> Chat {
     let mut chat = Chat {
-        id: Uuid::new_v4(),
-        title: "Probe".to_string(),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
         peer_fingerprint: Some("FE".repeat(32)),
-        participants: Vec::new(),
         messages: Vec::with_capacity(messages),
-        created_at: chrono::Utc::now(),
-        send_seq: 0,
-        recv_seq: 0,
-        peer_typing: false,
-        typing_since: None,
-        is_host_placeholder: false,
-        read_count: 0,
-        title_is_custom: false,
+        ..Chat::new(Uuid::new_v4(), "Probe", ChatKind::Dm, Transport::Direct)
     };
     for i in 0..messages {
         chat.messages.push(Message {

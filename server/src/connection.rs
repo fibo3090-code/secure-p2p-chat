@@ -42,6 +42,75 @@ where
     (rd, seq, result)
 }
 
+/// Perform the I/O `handle_request` deferred, once the state lock is released,
+/// and produce the replies it leads to.
+///
+/// Anything that moves real bytes — a blob read, a blob write — is deliberately
+/// *not* done inside `handle_request`, because doing it there does it with the
+/// state mutex held and one member's 100 MiB transfer then stalls every other
+/// member's messages for its whole duration.
+///
+/// `spawn_blocking`, not `block_in_place`: this is ordinary file I/O with
+/// nothing borrowed from the state, so it belongs on the blocking pool, and
+/// unlike `block_in_place` it does not require a multi-threaded runtime (the
+/// tests run on a current-thread one).
+async fn perform_deferred(
+    work: Deferred,
+    state: &Mutex<PartyState>,
+    conn: &mut ConnState,
+) -> Dispatch {
+    match work {
+        Deferred::Download { hash, offset, plan } => {
+            let total = plan.total();
+            let bytes = tokio::task::spawn_blocking(move || plan.perform())
+                .await
+                .unwrap_or(None);
+            download_reply(hash, offset, total, bytes)
+        }
+        Deferred::Upload(staged) => {
+            let staged_id = staged.id();
+            let member = conn.member().unwrap_or_else(Uuid::nil);
+            // Phase 2: hash and write, off the lock.
+            let written = tokio::task::spawn_blocking(move || {
+                let mut staged = staged;
+                let outcome = staged.write_staging();
+                (staged, outcome)
+            })
+            .await;
+            let out = match written {
+                Ok((staged, Ok(()))) => {
+                    // Phase 3: re-check and commit, under the lock again. The
+                    // upload's own bytes are on disk by now; this only renames
+                    // and records, so the lock is held for a rename rather than
+                    // for a 100 MiB write.
+                    let mut st = state.lock().await;
+                    let committed = st.commit_upload(*staged);
+                    upload_committed(&st, member, committed)
+                }
+                Ok((staged, Err(reason))) => {
+                    state.lock().await.discard_upload(*staged);
+                    Dispatch::action_failed(Uuid::nil(), reason)
+                }
+                Err(_) => {
+                    // The blocking task panicked or was cancelled; the staged
+                    // upload went with it, so only the reservation is left to
+                    // release.
+                    state
+                        .lock()
+                        .await
+                        .cancel_connection_uploads(member, &[staged_id]);
+                    Dispatch::action_failed(
+                        Uuid::nil(),
+                        "the server could not store this file".to_string(),
+                    )
+                }
+            };
+            conn.finish_upload(staged_id);
+            out
+        }
+    }
+}
+
 /// Serve one client connection to completion (until the peer disconnects or a
 /// frame fails to authenticate). The server's identity (`server_privkey`) is
 /// TOFU-verified by the client; the client's handshake-verified fingerprint is
@@ -93,6 +162,14 @@ where
     // it left off, so no read is ever abandoned part-way.
     let mut pending = Box::pin(read_frame(rd, &cipher, &aad, recv_seq));
 
+    // How the connection ended. A failed write is recorded here rather than
+    // returned with `?`: returning early skipped the teardown below, so a
+    // client that vanished while the server was writing to it — someone
+    // closing their laptop mid-conversation — stayed registered in the hub
+    // (and so "online" forever, with every broadcast to it silently dropped)
+    // and kept its upload reservations until the server restarted.
+    let mut served: anyhow::Result<()> = Ok(());
+
     loop {
         // The read half and its sequence counter, handed back when a frame
         // completes, so the next read can be started after the branch body.
@@ -102,7 +179,10 @@ where
             // A broadcast pushed to us by another connection. `recv` IS
             // cancel-safe: a message is either taken from the queue or left in it.
             Some(push) = out_rx.recv() => {
-                send_framed(&mut wr, &cipher, &aad, &mut send_seq, &push.to_bytes()).await?;
+                if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &push.to_bytes()).await {
+                    served = Err(e);
+                    break;
+                }
             }
             // An incoming request from this client.
             (rd_back, seq_back, incoming) = &mut pending => {
@@ -118,94 +198,13 @@ where
                         let mut st = state.lock().await;
                         handle_request(&mut st, &mut conn, req)
                     }
-                    None => Dispatch {
-                        replies: vec![PartyResponse::Error("malformed request".to_string())],
-                        ..Dispatch::default()
-                    },
+                    None => Dispatch::reply(PartyResponse::Error("malformed request".to_string())),
                 };
 
-                // The lock is released above. Anything that moves real bytes —
-                // a blob read, a blob write — was deliberately *not* done inside
-                // `handle_request`, because doing it there does it with the
-                // state mutex held and one member's 100 MiB transfer then stalls
-                // every other member's messages for its whole duration.
-                //
-                // `spawn_blocking`, not `block_in_place`: this is ordinary file
-                // I/O with nothing borrowed from the state, so it belongs on the
-                // blocking pool, and unlike `block_in_place` it does not require
-                // a multi-threaded runtime (the tests run on a current-thread
-                // one).
+                // The lock is released above; anything that moves real bytes
+                // happens now (see `perform_deferred`).
                 if let Some(work) = outcome.deferred.take() {
-                    let done = match work {
-                        Deferred::Download { hash, offset, plan } => {
-                            let total = plan.total();
-                            let bytes = tokio::task::spawn_blocking(move || plan.perform())
-                                .await
-                                .unwrap_or(None);
-                            download_reply(hash, offset, total, bytes)
-                        }
-                        Deferred::Upload(staged) => {
-                            let staged_id = staged.id();
-                            // Phase 2: hash and write, off the lock.
-                            let staged = tokio::task::spawn_blocking(move || {
-                                let mut staged = staged;
-                                let outcome = staged.write_staging();
-                                (staged, outcome)
-                            })
-                            .await;
-                            match staged {
-                                Ok((staged, Ok(()))) => {
-                                    // Phase 3: re-check and commit, under the
-                                    // lock again. The upload's own bytes are on
-                                    // disk by now; this only renames and records,
-                                    // so the lock is held for a rename rather
-                                    // than for a 100 MiB write.
-                                    let mut st = state.lock().await;
-                                    let committed = st.commit_upload(*staged);
-                                    let out = upload_committed(
-                                        &st,
-                                        conn.member().unwrap_or_else(Uuid::nil),
-                                        committed,
-                                    );
-                                    drop(st);
-                                    conn.finish_upload(staged_id);
-                                    out
-                                }
-                                Ok((staged, Err(reason))) => {
-                                    state.lock().await.discard_upload(*staged);
-                                    conn.finish_upload(staged_id);
-                                    Dispatch {
-                                        replies: vec![PartyResponse::ActionFailed {
-                                            channel: Uuid::nil(),
-                                            reason,
-                                        }],
-                                        ..Dispatch::default()
-                                    }
-                                }
-                                Err(_) => {
-                                    // The blocking task panicked or was
-                                    // cancelled; the staged upload went with it,
-                                    // so only the reservation is left to release.
-                                    state
-                                        .lock()
-                                        .await
-                                        .cancel_connection_uploads(
-                                            conn.member().unwrap_or_else(Uuid::nil),
-                                            &[staged_id],
-                                        );
-                                    conn.finish_upload(staged_id);
-                                    Dispatch {
-                                        replies: vec![PartyResponse::ActionFailed {
-                                            channel: Uuid::nil(),
-                                            reason: "the server could not store this file"
-                                                .to_string(),
-                                        }],
-                                        ..Dispatch::default()
-                                    }
-                                }
-                            }
-                        }
-                    };
+                    let done = perform_deferred(work, &state, &mut conn).await;
                     outcome.replies.extend(done.replies);
                     outcome.broadcast.extend(done.broadcast);
                     outcome.directed.extend(done.directed);
@@ -220,7 +219,10 @@ where
                 }
 
                 for resp in outcome.replies {
-                    send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await?;
+                    if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await {
+                        served = Err(e);
+                        break;
+                    }
                 }
                 for resp in outcome.broadcast {
                     hub.broadcast_except(conn_id, resp);
@@ -230,6 +232,11 @@ where
                     // sender's *other* devices without duplicating it on the one
                     // that sent it (which already appended it optimistically).
                     hub.send_to_member_except(member, conn_id, resp);
+                }
+                // Fanned out first: what was stored should still reach everyone
+                // else even though this client's own reply could not be written.
+                if served.is_err() {
+                    break;
                 }
             }
         }
@@ -272,7 +279,7 @@ where
             hub.broadcast_all(PartyResponse::Members(directory));
         }
     }
-    Ok(())
+    served
 }
 
 #[cfg(test)]
@@ -341,6 +348,143 @@ mod tests {
             .await
             .expect("client handshake");
         (client, handle)
+    }
+
+    /// A server-side stream that, once `cut`, never yields another byte and
+    /// refuses every write: a client that has gone in the way that leaves the
+    /// server's read pending, so it only finds out by failing to write.
+    struct Severable {
+        inner: DuplexStream,
+        cut: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Severable {
+        fn is_cut(&self) -> bool {
+            self.cut.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tokio::io::AsyncRead for Severable {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.is_cut() {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Severable {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.is_cut() {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A client that vanishes while the server is writing to it must still be
+    /// torn down: unregistered from the hub, marked offline, its reservations
+    /// released.
+    ///
+    /// A failed write used to return straight out of the connection loop with
+    /// `?`, skipping all of that — the member stayed "online" forever (the hub
+    /// still listed the dead connection) and every broadcast to them was
+    /// silently dropped.
+    #[tokio::test]
+    async fn a_client_lost_during_a_write_is_still_torn_down() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+        let channel = state.lock().await.default_channel();
+
+        let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (server_stream, client_stream) = tokio::io::duplex(1 << 16);
+        let mut server_stream = Severable {
+            inner: server_stream,
+            cut: cut.clone(),
+        };
+        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (st, h) = (state.clone(), hub.clone());
+        let served =
+            tokio::spawn(
+                async move { serve_connection(&mut server_stream, &server_priv, st, h).await },
+            );
+        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let mut alice = PartyClient::connect(client_stream, &alice_priv, Uuid::new_v4())
+            .await
+            .unwrap();
+        let PartyResponse::Joined {
+            member_id: alice_id,
+            ..
+        } = alice.join("alice", None).await.unwrap()
+        else {
+            panic!("alice did not join");
+        };
+
+        let (mut bob, _b) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+        assert!(matches!(
+            bob.join("bob", None).await.unwrap(),
+            PartyResponse::Joined { .. }
+        ));
+        assert!(hub.member_is_connected(alice_id));
+
+        // Alice's link dies; the next thing the server writes to her fails.
+        cut.store(true, std::sync::atomic::Ordering::SeqCst);
+        let reply = request(
+            &mut bob,
+            PartyRequest::PostMessage {
+                channel,
+                text: "anyone there?".into(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, PartyResponse::MessagePosted { .. }));
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+            .await
+            .expect("the connection task ends")
+            .unwrap();
+        assert!(outcome.is_err(), "the failed write is still reported");
+        assert!(
+            !hub.member_is_connected(alice_id),
+            "the dead connection is still registered"
+        );
+        assert!(
+            !state
+                .lock()
+                .await
+                .members()
+                .iter()
+                .any(|m| m.id == alice_id && m.online),
+            "alice is still shown online"
+        );
     }
 
     /// A broadcast arriving while this client is mid-frame must not cost it the

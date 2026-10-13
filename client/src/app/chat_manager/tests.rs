@@ -42,6 +42,69 @@ fn v1_invite_link(name: &str, address: &str) -> String {
     format!("chat-p2p://invite/{}", encoded)
 }
 
+/// An unsigned v1 link is standard base64, which contains `/`, so it can carry
+/// `/v2/` by chance. Signed links used to be recognised by searching for that
+/// substring: such a v1 link was reported to the user as *signed*, and then
+/// failed to parse as the v2 it was not.
+#[test]
+fn a_v1_link_containing_v2_by_chance_is_still_unsigned() {
+    // U+FFFF, "o", then any character with a UTF-8 lead byte (here "é") encode
+    // as the bytes ..BF BF 6F C3.., which on the right 3-byte alignment is
+    // "/v2/" in base64. Try each alignment.
+    let link = (0..3)
+        .map(|pad| v1_invite_link(&format!("{}\u{FFFF}oé", "x".repeat(pad)), "10.0.0.1:12345"))
+        .find(|link| link.contains("/v2/"))
+        .expect("one alignment produces /v2/ in the payload");
+
+    assert!(
+        !ChatManager::invite_link_is_signed(&link),
+        "an unsigned link was reported as signed"
+    );
+    let contact = ChatManager::default()
+        .parse_invite_link(&link)
+        .expect("a valid v1 link still parses");
+    assert!(contact.name.ends_with("\u{FFFF}oé"));
+}
+
+/// Refusing a changed key must not cost the user their conversation.
+///
+/// The prompt that a first contact gets also appears when a *known*
+/// conversation's key changes — the possible-impostor case. Rejecting used to
+/// delete the conversation outright (TUI), history and all; only a
+/// conversation this connection created, still empty and unverified, may go.
+#[test]
+fn rejecting_a_changed_key_keeps_the_conversation() {
+    let mut mgr = ChatManager::default();
+
+    let known = Uuid::new_v4();
+    mgr.create_local_chat_for_test(known, "Mum".into());
+    {
+        let chat = mgr.get_chat_mut(known).unwrap();
+        chat.peer_fingerprint = Some("MUMS-REAL-KEY".into());
+        chat.messages.push(Message::received(
+            MessageContent::Text { text: "hi".into() },
+            chrono::Utc::now(),
+        ));
+    }
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(known, tx);
+    mgr.reject_fingerprint(known).unwrap();
+    assert!(
+        mgr.get_chat(known).is_some(),
+        "the conversation was deleted"
+    );
+
+    let fresh = Uuid::new_v4();
+    mgr.create_local_chat_for_test(fresh, "127.0.0.1:12345".into());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(fresh, tx);
+    mgr.reject_fingerprint(fresh).unwrap();
+    assert!(
+        mgr.get_chat(fresh).is_none(),
+        "a refused first contact leaves nothing behind"
+    );
+}
+
 #[test]
 fn parse_invite_placeholder_is_ignored() {
     let mgr = ChatManager::default();
@@ -371,21 +434,13 @@ fn placeholder_detection_works() {
     let port = 5001u16;
     assert!(!mgr.chats.values().any(|c| c.is_host_placeholder));
     let chat = Chat {
-        id: Uuid::new_v4(),
-        title: format!("Host on :{}", port),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
-        peer_fingerprint: None,
-        participants: Vec::new(),
-        messages: Vec::new(),
-        created_at: chrono::Utc::now(),
-        peer_typing: false,
-        typing_since: None,
-        send_seq: 0,
-        recv_seq: 0,
         is_host_placeholder: true,
-        read_count: 0,
-        title_is_custom: false,
+        ..Chat::new(
+            Uuid::new_v4(),
+            format!("Host on :{}", port),
+            ChatKind::Dm,
+            Transport::Direct,
+        )
     };
     let id = chat.id;
     mgr.chats.insert(id, chat);
@@ -401,23 +456,7 @@ fn test_tofu_logic() {
     let fingerprint2 = "fingerprint2".to_string();
 
     // 1. First Use: No fingerprint exists.
-    let chat = Chat {
-        id: chat_id,
-        title: "Test Chat".to_string(),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
-        peer_fingerprint: None,
-        participants: Vec::new(),
-        messages: Vec::new(),
-        created_at: chrono::Utc::now(),
-        peer_typing: false,
-        typing_since: None,
-        send_seq: 0,
-        recv_seq: 0,
-        is_host_placeholder: false,
-        read_count: 0,
-        title_is_custom: false,
-    };
+    let chat = Chat::new(chat_id, "Test Chat", ChatKind::Dm, Transport::Direct);
     // Add a dummy confirmation sender for the test
     let (tx, mut rx) = mpsc::unbounded_channel();
     mgr.fingerprint_confirm_senders.insert(chat_id, tx);
@@ -491,23 +530,7 @@ fn test_regression_auto_trust_default_off() {
     let mut mgr = ChatManager::new(config);
     let chat_id = Uuid::new_v4();
 
-    let chat = Chat {
-        id: chat_id,
-        title: "Test Chat".to_string(),
-        kind: ChatKind::Dm,
-        transport: Transport::Direct,
-        peer_fingerprint: None,
-        participants: Vec::new(),
-        messages: Vec::new(),
-        created_at: chrono::Utc::now(),
-        peer_typing: false,
-        typing_since: None,
-        send_seq: 0,
-        recv_seq: 0,
-        is_host_placeholder: false,
-        read_count: 0,
-        title_is_custom: false,
-    };
+    let chat = Chat::new(chat_id, "Test Chat", ChatKind::Dm, Transport::Direct);
 
     let (tx, _rx) = mpsc::unbounded_channel();
     mgr.fingerprint_confirm_senders.insert(chat_id, tx);
@@ -1525,6 +1548,76 @@ fn manager_with_held_incoming_file(temp_dir: &std::path::Path) -> (ChatManager, 
     (mgr, chat_id, payload)
 }
 
+/// Held offers share one spool cap per conversation.
+///
+/// A fully received offer no longer blocks the next one, so the cap has to
+/// count everything waiting for the user's decision: per offer, a peer could
+/// queue as many just-under-the-cap files as it liked onto the disk of
+/// someone who had not agreed to receive any of them.
+#[test]
+fn held_offers_share_one_spool_cap_per_conversation() {
+    let temp_dir = tempdir().unwrap();
+    let mut mgr = ChatManager::new(Config {
+        download_dir: temp_dir.path().join("downloads"),
+        temp_dir: temp_dir.path().join("temp"),
+        auto_accept_files: false,
+        ..Config::default()
+    });
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".to_string());
+    let _app_rx = wire_session_for_test(&mut mgr, chat_id);
+
+    // Each offer is under the cap on its own; together they are over it.
+    let offer = files::MAX_UNACCEPTED_SPOOL_BYTES * 3 / 5;
+    let chunk = vec![0u8; crate::FILE_CHUNK_SIZE];
+    let mut seq = 0;
+    let frame = |mgr: &mut ChatManager, msg: ProtocolMessage| {
+        mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(msg));
+    };
+    for name in ["first.bin", "second.bin"] {
+        seq += 1;
+        frame(
+            &mut mgr,
+            ProtocolMessage::FileMeta {
+                filename: name.to_string(),
+                size: offer,
+                seq,
+            },
+        );
+        let mut left = offer as usize;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            left -= n;
+            seq += 1;
+            frame(
+                &mut mgr,
+                ProtocolMessage::FileChunk {
+                    chunk: chunk[..n].to_vec(),
+                    seq,
+                },
+            );
+        }
+        seq += 1;
+        frame(&mut mgr, ProtocolMessage::FileEnd { seq });
+    }
+
+    let status = |name: &str| {
+        mgr.active_transfers_snapshot()
+            .into_iter()
+            .find(|t| t.filename == name)
+            .map(|t| t.status)
+    };
+    assert_eq!(
+        status("first.bin"),
+        Some(TransferStatus::AwaitingAcceptance)
+    );
+    assert_eq!(
+        status("second.bin"),
+        Some(TransferStatus::Cancelled),
+        "the offer that took the conversation past the cap must be declined"
+    );
+}
+
 #[test]
 fn incoming_file_is_held_until_accepted() {
     let temp_dir = tempdir().unwrap();
@@ -2153,7 +2246,7 @@ fn disconnect_fails_an_in_flight_incoming_transfer() {
         state.status
     );
     assert!(
-        mgr.active_incoming_transfer_id_for_chat(incoming).is_none(),
+        mgr.streaming_transfer(incoming).is_none(),
         "the chat's incoming slot must be free so the peer can retry"
     );
 }

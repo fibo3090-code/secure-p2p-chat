@@ -1227,27 +1227,6 @@ where
     .await
 }
 
-/// Extract sequence number from a ProtocolMessage
-/// Returns None if the message type doesn't have a sequence number (shouldn't happen in practice)
-fn extract_sequence(msg: &ProtocolMessage) -> Option<u64> {
-    match msg {
-        ProtocolMessage::Version { .. } => None, // Handshake only
-        ProtocolMessage::EphemeralKey { .. } => None, // Handshake only
-        ProtocolMessage::SupportedSignatureSchemes { .. } => None, // Handshake only
-        ProtocolMessage::Text { seq, .. } => Some(*seq),
-        ProtocolMessage::TextChunk { seq, .. } => Some(*seq),
-        ProtocolMessage::FileMeta { seq, .. } => Some(*seq),
-        ProtocolMessage::FileChunk { seq, .. } => Some(*seq),
-        ProtocolMessage::FileEnd { seq } => Some(*seq),
-        ProtocolMessage::FileCancel { seq } => Some(*seq),
-        ProtocolMessage::Ping { seq } => Some(*seq),
-        ProtocolMessage::TypingStart { seq } => Some(*seq),
-        ProtocolMessage::TypingStop { seq } => Some(*seq),
-        ProtocolMessage::Rekey { seq, .. } => Some(*seq),
-        ProtocolMessage::Ack { seq, .. } => Some(*seq),
-    }
-}
-
 /// Validate message sequence number for replay attack protection
 ///
 /// Transport-layer validation ensures that:
@@ -1270,11 +1249,9 @@ fn validate_message_sequence(
     last_valid_seq: &mut u64,
 ) -> Result<(), String> {
     // Handshake messages don't have sequence numbers - always allow
-    if extract_sequence(msg).is_none() {
+    let Some(seq) = msg.seq() else {
         return Ok(());
-    }
-
-    let seq = extract_sequence(msg).unwrap();
+    };
 
     // Strict monotonic increase: new sequence must be strictly greater than last valid
     if seq <= *last_valid_seq {
@@ -1335,92 +1312,307 @@ where
     Ok(())
 }
 
-/// Main message loop: send and receive encrypted messages with replay protection
-/// Encrypt and write one outbound application frame, first rotating the key if a
-/// host-initiated rekey is due. Shared by the control lane and the bounded
-/// file-data lane so both stamp the single monotonic outbound sequence and both
-/// surface `FileSendComplete` on the final file frame.
-#[allow(clippy::too_many_arguments)]
-async fn send_outbound_frame<S>(
-    stream: &mut S,
-    cipher: &mut AesCipher,
-    prev_cipher: &mut Option<AesCipher>,
-    transport_aad: &[u8],
-    to_app_tx: &mpsc::UnboundedSender<SessionEvent>,
-    sent_seq: &mut u64,
-    messages_since_rekey: &mut u64,
-    last_rekey_time: &mut std::time::Instant,
-    is_rekey_initiator: bool,
-    rekey_message_count: u64,
-    rekey_time_interval: std::time::Duration,
-    mut msg: ProtocolMessage,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    // Host-only rekey initiation (see initiate_rekey): rotate the key before
-    // sending this frame if we're due.
-    let should_rekey = is_rekey_initiator
-        && (*messages_since_rekey >= rekey_message_count
-            || last_rekey_time.elapsed() >= rekey_time_interval);
-    if should_rekey {
-        initiate_rekey(
-            stream,
-            cipher,
-            prev_cipher,
-            transport_aad,
-            sent_seq,
-            messages_since_rekey,
-            last_rekey_time,
-        )
-        .await
-        .map_err(|e| anyhow!("Network send error (rekey): {}", e))?;
-    }
+/// Rotate the session key after this many application frames…
+const REKEY_MESSAGE_COUNT: u64 = 100;
+/// …or after this long, whichever comes first.
+const REKEY_TIME_INTERVAL: Duration = Duration::from_secs(300);
 
-    // Stamp the next monotonic transport sequence onto every outgoing frame. The
-    // loop owns the outbound sequence space so application frames and interleaved
-    // Rekey frames form one strictly-increasing stream the peer's replay check
-    // accepts. Interleaving the two lanes is safe: each frame still gets the next
-    // seq in the order it is written.
-    *sent_seq += 1;
-    msg.set_seq(*sent_seq);
-    tracing::debug!("Sending message: {:?}", msg);
+/// How long the peer may stay silent before the session is considered dead.
+/// The peer's keep-alives arrive well inside it.
+const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-    let plaintext = msg.to_plain_bytes();
-    let encrypted = cipher.encrypt(&plaintext, Some(transport_aad));
-    send_packet(stream, &encrypted)
-        .await
-        .map_err(|e| anyhow!("Network send error: {}", e))?;
+/// Keep-alive pings run well inside the peer's idle window (2 pings per 300 s),
+/// so a quiet-but-healthy session is never torn down. Before this, two
+/// connected peers who simply didn't type for five minutes were disconnected by
+/// each side's receive timeout.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 
-    *messages_since_rekey += 1;
-    // Report the transport seq of load-bearing final frames back to the app:
-    // FileEnd ("queueing is not delivery"), and the frame carrying an outgoing
-    // text message (single frame, or the final chunk of a large one) so the app
-    // can correlate the peer's delivery receipt (`Ack { acked_seq }`) back to
-    // that message. Frames drain FIFO per lane, so order correlates.
-    match &msg {
-        ProtocolMessage::FileEnd { seq } => {
-            let _ = to_app_tx.send(SessionEvent::FileSendComplete { seq: *seq });
-        }
-        ProtocolMessage::Text { seq, .. } => {
-            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
-        }
-        ProtocolMessage::TextChunk {
-            seq,
-            chunk_index,
-            total_chunks,
-            ..
-        } if chunk_index + 1 == *total_chunks => {
-            let _ = to_app_tx.send(SessionEvent::TextSendComplete { seq: *seq });
-        }
-        _ => {}
-    }
-    Ok(())
+/// How many inbound frames may complete and wait while a write is blocked
+/// before the loop stops reading and simply waits for the write. Keeps an
+/// honest peer flowing (see [`write_while_reading`]) without letting one that
+/// never reads make us buffer without limit.
+const MAX_FRAMES_HELD_DURING_WRITE: usize = 16;
+
+/// What a received frame means for the loop.
+enum Received {
+    Continue,
+    Stop,
 }
 
+/// The per-session state every frame passes through, in either direction: the
+/// cipher (and the key retained across a rotation), both sequence counters and
+/// the rekey schedule.
+struct Transport<W> {
+    writer: W,
+    cipher: AesCipher,
+    /// The key in force *before* the most recent rotation, kept for a bounded
+    /// window so frames the peer sent under the old key (still in flight when
+    /// we rotated) remain decryptable. Cleared the moment a frame decrypts
+    /// under the current key — proof the peer has switched.
+    prev_cipher: Option<AesCipher>,
+    transport_aad: Vec<u8>,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    /// The outgoing sequence, stamped on every frame we send (Rekey included).
+    sent_seq: u64,
+    /// The last sequence accepted from the peer — transport-layer replay
+    /// protection, enforced before anything reaches the app.
+    last_valid_seq: u64,
+    messages_since_rekey: u64,
+    last_rekey_time: Instant,
+    /// Only the host initiates rekeys, so the two peers can never rekey
+    /// simultaneously and desync their keys (the client rekeys only in
+    /// response to a received `Rekey`). The role is fixed for the life of the
+    /// session and preserved across rekeys.
+    is_rekey_initiator: bool,
+}
+
+impl<W> Transport<W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    fn new(
+        writer: W,
+        cipher: AesCipher,
+        transport_aad: Vec<u8>,
+        to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    ) -> Self {
+        Self {
+            writer,
+            is_rekey_initiator: cipher.role() == NonceRole::Host,
+            cipher,
+            prev_cipher: None,
+            transport_aad,
+            to_app_tx,
+            sent_seq: 0,
+            last_valid_seq: 0,
+            messages_since_rekey: 0,
+            last_rekey_time: Instant::now(),
+        }
+    }
+
+    fn rekey_due(&self) -> bool {
+        self.is_rekey_initiator
+            && (self.messages_since_rekey >= REKEY_MESSAGE_COUNT
+                || self.last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL)
+    }
+
+    async fn rekey(&mut self) -> Result<()> {
+        initiate_rekey(
+            &mut self.writer,
+            &mut self.cipher,
+            &mut self.prev_cipher,
+            &self.transport_aad,
+            &mut self.sent_seq,
+            &mut self.messages_since_rekey,
+            &mut self.last_rekey_time,
+        )
+        .await
+        .map_err(|e| anyhow!("Network send error (rekey): {}", e))
+    }
+
+    /// Encrypt and write one outbound application frame, first rotating the
+    /// key if a host-initiated rekey is due. Used by the control lane and the
+    /// bounded file-data lane alike, so both stamp the single monotonic
+    /// outbound sequence and both surface their send confirmations.
+    async fn send(&mut self, mut msg: ProtocolMessage) -> Result<()> {
+        if self.rekey_due() {
+            self.rekey().await?;
+        }
+
+        // Interleaving the two lanes is safe: each frame still gets the next
+        // seq in the order it is written, so application frames and Rekey
+        // frames form one strictly-increasing stream the peer's replay check
+        // accepts.
+        self.sent_seq += 1;
+        msg.set_seq(self.sent_seq);
+        tracing::debug!("Sending message: {:?}", msg);
+
+        let encrypted = self
+            .cipher
+            .encrypt(&msg.to_plain_bytes(), Some(&self.transport_aad));
+        send_packet(&mut self.writer, &encrypted)
+            .await
+            .map_err(|e| anyhow!("Network send error: {}", e))?;
+        self.messages_since_rekey += 1;
+
+        // Report the transport seq of load-bearing final frames back to the
+        // app: FileEnd ("queueing is not delivery"), and the frame carrying an
+        // outgoing text message (single frame, or the final chunk of a large
+        // one) so the app can correlate the peer's delivery receipt
+        // (`Ack { acked_seq }`) back to that message. Frames drain FIFO per
+        // lane, so order correlates.
+        let confirmed = match msg {
+            ProtocolMessage::FileEnd { seq } => Some(SessionEvent::FileSendComplete { seq }),
+            ProtocolMessage::Text { seq, .. } => Some(SessionEvent::TextSendComplete { seq }),
+            ProtocolMessage::TextChunk {
+                seq,
+                chunk_index,
+                total_chunks,
+                ..
+            } if chunk_index + 1 == total_chunks => Some(SessionEvent::TextSendComplete { seq }),
+            _ => None,
+        };
+        if let Some(event) = confirmed {
+            let _ = self.to_app_tx.send(event);
+        }
+        Ok(())
+    }
+
+    /// Keep-alive: ping on the shared outbound sequence so the peer's idle timer
+    /// resets even when nobody is typing. If a rekey is due, the host rotates
+    /// instead — otherwise a silent-but-receiving host would never rekey (it
+    /// never sends), quietly weakening forward secrecy. The Rekey frame doubles
+    /// as keep-alive traffic.
+    async fn keep_alive(&mut self) -> Result<()> {
+        if self.rekey_due() {
+            return self.rekey().await;
+        }
+        self.sent_seq += 1;
+        let ping = ProtocolMessage::Ping { seq: self.sent_seq };
+        let encrypted = self
+            .cipher
+            .encrypt(&ping.to_plain_bytes(), Some(&self.transport_aad));
+        send_packet(&mut self.writer, &encrypted)
+            .await
+            .map_err(|e| anyhow!("Network send error (keep-alive): {}", e))?;
+        tracing::trace!("Keep-alive ping sent");
+        Ok(())
+    }
+
+    /// One frame off the wire: decrypt, check its sequence, and either act on
+    /// it here (`Rekey`, `Ping`) or hand it to the app.
+    fn receive(&mut self, encrypted: &[u8]) -> Result<Received> {
+        // Try the current key first. If it works, the peer has switched to it,
+        // so any retained previous key can be dropped (its in-flight window is
+        // closed). If it fails, fall back to the previous key for frames the
+        // peer sent under the old key before it processed our Rekey.
+        let decrypted = match self.cipher.decrypt(encrypted, Some(&self.transport_aad)) {
+            Some(plaintext) => {
+                self.prev_cipher = None;
+                Some(plaintext)
+            }
+            None => self
+                .prev_cipher
+                .as_ref()
+                .and_then(|pc| pc.decrypt(encrypted, Some(&self.transport_aad))),
+        };
+        let Some(plaintext) = decrypted else {
+            // Undecryptable under BOTH keys over a reliable, ordered stream
+            // means the channel is genuinely desynced or tampered with — it
+            // cannot recover, so fail closed instead of spinning on every
+            // subsequent (also-undecryptable) packet until the idle timeout.
+            tracing::error!("Decryption failed - possible tampering or key mismatch!");
+            let _ = self
+                .to_app_tx
+                .send(SessionEvent::Error("Decryption failed!".to_string()));
+            return Ok(Received::Stop);
+        };
+        let Some(msg) = ProtocolMessage::from_plain_bytes(&plaintext) else {
+            tracing::warn!("Failed to parse message from {} bytes", plaintext.len());
+            return Ok(Received::Continue);
+        };
+        tracing::debug!("Received message: {:?}", msg);
+
+        // Transport-layer replay protection: a replayed, duplicated or
+        // reordered frame is dropped before the app ever sees it.
+        if let Err(e) = validate_message_sequence(&msg, &mut self.last_valid_seq) {
+            tracing::warn!("Rejecting message due to invalid sequence: {}", e);
+            return Ok(Received::Continue);
+        }
+
+        match msg {
+            // Not surfaced to the app.
+            ProtocolMessage::Rekey { nonce, .. } => {
+                use crate::core::rekey_session_key;
+                let received_nonce: [u8; crate::REKEY_NONCE_SIZE] = nonce
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid nonce length"))?;
+                let next_key = rekey_session_key(&self.cipher.get_current_key(), &received_nonce);
+                // Keep the old key briefly so a reordered old-key frame still
+                // decrypts; dropped on the first new-key frame.
+                self.prev_cipher = Some(self.cipher.clone());
+                self.cipher = AesCipher::new_with_role(&next_key, self.cipher.role())?;
+                self.messages_since_rekey = 0;
+                self.last_rekey_time = Instant::now();
+                tracing::info!("Session key rotated (received Rekey message)");
+            }
+            // Keep-alive: transport plumbing that only exists to defeat the idle
+            // timeout. (The app layer also tolerates Ping for peers that still
+            // forward it.)
+            ProtocolMessage::Ping { .. } => tracing::trace!("Keep-alive ping received"),
+            msg => {
+                self.messages_since_rekey += 1;
+                self.to_app_tx
+                    .send(SessionEvent::MessageReceived(msg))
+                    .map_err(|e| anyhow!("Event channel closed: {}", e))?;
+            }
+        }
+        Ok(Received::Continue)
+    }
+}
+
+/// Read one frame, owning the read half for the duration and handing it back
+/// with the result — so the caller can hold a single read in flight across
+/// `select!` iterations (see `run_message_loop` for why that matters).
+async fn read_frame<R>(mut reader: R) -> (R, std::io::Result<Vec<u8>>)
+where
+    R: AsyncRead + Unpin,
+{
+    let result = recv_packet(&mut reader).await;
+    (reader, result)
+}
+
+/// Drive `write` to completion while keeping the in-flight read moving,
+/// queueing any frame that completes meanwhile in `inbox`.
+///
+/// A write blocks once the peer's receive buffer is full, and the peer only
+/// drains it by reading — which it cannot do while *it* is blocked writing to
+/// us. A loop that stops reading whenever it writes therefore deadlocks as
+/// soon as both peers push more than the pipe holds at the same moment (two
+/// file transfers crossing, or a burst of large messages each way): each waits
+/// for the other forever, with nothing reported. The cap
+/// ([`MAX_FRAMES_HELD_DURING_WRITE`]) bounds what a peer that never reads can
+/// make us hold; reading also stops after a read error, which is final.
+async fn write_while_reading<W, F, R>(
+    write: W,
+    pending_read: &mut std::pin::Pin<Box<F>>,
+    restart_read: impl Fn(R) -> F,
+    inbox: &mut std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+) -> W::Output
+where
+    W: std::future::Future,
+    F: std::future::Future<Output = (R, std::io::Result<Vec<u8>>)>,
+{
+    tokio::pin!(write);
+    loop {
+        let reading =
+            inbox.len() < MAX_FRAMES_HELD_DURING_WRITE && !matches!(inbox.back(), Some(Err(_)));
+        let reader = tokio::select! {
+            biased;
+            out = &mut write => return out,
+            (reader, frame) = pending_read.as_mut(), if reading => {
+                inbox.push_back(frame);
+                reader
+            }
+        };
+        *pending_read = Box::pin(restart_read(reader));
+    }
+}
+
+/// Everything the message loop can be woken by.
+enum LoopEvent {
+    Frame(std::io::Result<Vec<u8>>),
+    Send(ProtocolMessage),
+    KeepAlive,
+    IdleTimeout,
+}
+
+/// Main message loop: send and receive encrypted messages with replay
+/// protection, keep-alives and key rotation, until either side goes away.
 async fn run_message_loop<S>(
-    mut stream: S,
-    mut cipher: AesCipher,
+    stream: S,
+    cipher: AesCipher,
     transport_aad: Vec<u8>,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     mut from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
@@ -1429,44 +1621,10 @@ async fn run_message_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    const RECV_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
-                                                                                        // Keep-alive pings run well inside the peer's idle window (2 pings per
-                                                                                        // 300 s), so a quiet-but-healthy session is never torn down. Before this,
-                                                                                        // two connected peers who simply didn't type for five minutes were
-                                                                                        // disconnected by each side's receive timeout.
-    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
-
-    // Key rotation constants
-    const REKEY_MESSAGE_COUNT: u64 = 100; // Rekey every 100 messages
-    const REKEY_TIME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
-
     // Test hooks: integration tests shrink these windows (seconds) to verify the
     // keep-alive behavior in wall-clock-realistic time. Never set in production.
     let recv_idle_timeout = duration_from_env("P2PEM_TEST_IDLE_TIMEOUT_SECS", RECV_IDLE_TIMEOUT);
     let keepalive_interval = duration_from_env("P2PEM_TEST_KEEPALIVE_SECS", KEEPALIVE_INTERVAL);
-
-    // Track last valid sequence number to detect replays and out-of-order messages
-    // This is enforced at the transport layer, not just in the app layer
-    let mut last_valid_seq: u64 = 0;
-
-    // Dedicated counter for outgoing messages (including Rekey messages)
-    let mut sent_seq: u64 = 0;
-
-    // Track messages since last rekey for key rotation
-    let mut messages_since_rekey: u64 = 0;
-    let mut last_rekey_time = std::time::Instant::now();
-
-    // Only the host initiates rekeys, so the two peers can never rekey
-    // simultaneously and desync their keys (the client rekeys only in response
-    // to a received `Rekey`). Role is fixed for the life of the session and
-    // preserved across rekeys, so this is stable.
-    let is_rekey_initiator = cipher.role() == NonceRole::Host;
-
-    // The key in force *before* the most recent rotation, kept for a bounded
-    // window so frames the peer sent under the old key (still in flight when we
-    // rotated) remain decryptable. Cleared the moment a frame decrypts under the
-    // current key — proof the peer has switched and no old-key frames remain.
-    let mut prev_cipher: Option<AesCipher> = None;
 
     // First tick only after a full interval (interval() would fire immediately).
     let mut keepalive = tokio::time::interval_at(
@@ -1475,189 +1633,107 @@ where
     );
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // The in-flight read is kept alive ACROSS loop iterations.
+    //
+    // `select!` drops the futures of the branches that lose, and `recv_packet`
+    // is not cancel-safe: it reads a 4-byte length prefix and then the body.
+    // Building a fresh read every iteration meant that whenever a send, a file
+    // chunk or a keep-alive won the race while a frame was half-read, the bytes
+    // already taken off the socket were thrown away. The next read then parsed
+    // ciphertext as a length prefix and the session died on "packet size
+    // exceeds limit" — which needs nothing more than both peers sending at
+    // about the same time. The Party server hit and fixed the same thing
+    // (`server/src/connection.rs`).
+    //
+    // Splitting the stream lets one read stay pending while the write half
+    // serves the other branches (and keeps moving during writes, see
+    // `write_while_reading`); a cancelled poll of it resumes where it was.
+    let (reader, writer) = tokio::io::split(stream);
+    let mut transport = Transport::new(writer, cipher, transport_aad, to_app_tx.clone());
+    let mut pending_read = Box::pin(read_frame(reader));
+    let mut inbox = std::collections::VecDeque::new();
+
+    // Silence from the peer, measured from the last frame *received*. It used to
+    // be a timeout around each individual read, restarted on every iteration —
+    // so our own sends and keep-alive ticks kept re-arming it, and a peer that
+    // had gone away without closing the socket was never detected.
+    let idle = tokio::time::sleep(recv_idle_timeout);
+    tokio::pin!(idle);
+
     loop {
-        tokio::select! {
-            // Receive from network with timeout
-            result = tokio::time::timeout(recv_idle_timeout, recv_packet(&mut stream)) => {
-                match result {
-                    Ok(Ok(encrypted)) => {
-                        tracing::trace!("Received {} bytes encrypted", encrypted.len());
-
-                        // Try the current key first. If it works, the peer has
-                        // switched to it, so any retained previous key can be
-                        // dropped (its in-flight window is closed). If it fails,
-                        // fall back to the previous key for frames the peer sent
-                        // under the old key before it processed our Rekey.
-                        let decrypted = match cipher.decrypt(&encrypted, Some(&transport_aad)) {
-                            Some(pt) => {
-                                prev_cipher = None;
-                                Some(pt)
-                            }
-                            None => prev_cipher
-                                .as_ref()
-                                .and_then(|pc| pc.decrypt(&encrypted, Some(&transport_aad))),
-                        };
-
-                        if let Some(plaintext) = decrypted {
-                            tracing::trace!("Decrypted {} bytes", plaintext.len());
-
-                            if let Some(msg) = ProtocolMessage::from_plain_bytes(&plaintext) {
-                                tracing::debug!("Received message: {:?}", msg);
-
-                                // --- TRANSPORT-LAYER REPLAY PROTECTION ---
-                                // Extract sequence number from message and validate it
-                                match validate_message_sequence(&msg, &mut last_valid_seq) {
-                                    Ok(_) => {
-                                        // Sequence is valid
-                                        // Check if this is a rekey message and handle it
-                                        if let ProtocolMessage::Rekey { nonce, .. } = &msg {
-                                            // Handle rekeying
-                                            use crate::core::rekey_session_key;
-
-                                            let received_nonce: [u8; crate::REKEY_NONCE_SIZE] = nonce.as_slice().try_into()
-                                                .map_err(|_| anyhow!("Invalid nonce length"))?;
-
-                                            let current_key_bytes = cipher.get_current_key();
-                                            let next_key = rekey_session_key(&current_key_bytes, &received_nonce);
-                                            // Keep the old key briefly so any of our
-                                            // own not-yet-acknowledged frames or a
-                                            // reordered old-key frame still decrypt;
-                                            // dropped on the first new-key frame.
-                                            prev_cipher = Some(cipher.clone());
-                                            cipher = AesCipher::new_with_role(&next_key, cipher.role())?;
-                                            messages_since_rekey = 0;
-                                            last_rekey_time = std::time::Instant::now();
-                                            tracing::info!("Session key rotated (received Rekey message)");
-                                            // Don't emit the Rekey message to the app
-                                        } else if matches!(msg, ProtocolMessage::Ping { .. }) {
-                                            // Keep-alive: transport-level plumbing that
-                                            // only exists to defeat the idle timeout —
-                                            // consume it here. (The app layer also
-                                            // tolerates Ping for peers that still
-                                            // forward it.)
-                                            tracing::trace!("Keep-alive ping received");
-                                        } else {
-                                            // Track message count for rekeying
-                                            messages_since_rekey += 1;
-
-                                            // Emit the message
-                                            if let Err(e) = to_app_tx.send(SessionEvent::MessageReceived(msg)) {
-                                                tracing::error!("Failed to send MessageReceived event: {}", e);
-                                                return Err(anyhow!("Event channel closed: {}", e));
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        // Invalid sequence detected - replay attempt or out-of-order
-                                        tracing::warn!("Rejecting message due to invalid sequence: {}", e);
-                                        // Don't emit event, silently drop the message
-                                    }
-                                }
-                            } else {
-                                tracing::warn!("Failed to parse message from {} bytes", plaintext.len());
-                                tracing::debug!("Raw plaintext (truncated): {:.64}", String::from_utf8_lossy(&plaintext));
-                            }
-                        } else {
-                            // Undecryptable under BOTH the current and the retained
-                            // previous key over a reliable, ordered stream means the
-                            // channel is genuinely desynced or tampered with — it
-                            // cannot recover, so fail closed instead of spinning on
-                            // every subsequent (also-undecryptable) packet until the
-                            // idle timeout.
-                            tracing::error!("Decryption failed - possible tampering or key mismatch!");
-                            let _ = to_app_tx.send(SessionEvent::Error("Decryption failed!".to_string()));
-                            break;
-                        }
+        // Frames that completed during a write are handled first, in order.
+        let event = match inbox.pop_front() {
+            Some(frame) => LoopEvent::Frame(frame),
+            None => {
+                let mut finished = None;
+                let event = tokio::select! {
+                    (reader, frame) = &mut pending_read => {
+                        finished = Some(reader);
+                        LoopEvent::Frame(frame)
                     }
-                    Ok(Err(e)) => {
-                        let err_msg = format!("Network receive error: {}", e);
-                        tracing::error!("{}", err_msg);
-                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout occurred
-                        let err_msg = format!("Receive idle timeout ({}s)", recv_idle_timeout.as_secs());
-                        tracing::warn!("{}", err_msg);
-                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
-                        break;
-                    }
+                    _ = &mut idle => LoopEvent::IdleTimeout,
+                    // The control lane: text, typing, and file-transfer control
+                    // frames (FileCancel). Unbounded, so an abort is never stuck
+                    // behind queued bulk data.
+                    Some(msg) = from_app_rx.recv() => LoopEvent::Send(msg),
+                    // The bounded file-data lane: FileMeta/FileChunk/FileEnd.
+                    // Its capacity is what applies backpressure to the streaming
+                    // task, so a slow peer paces the disk reader instead of the
+                    // whole file piling up in memory.
+                    Some(msg) = file_rx.recv() => LoopEvent::Send(msg),
+                    _ = keepalive.tick() => LoopEvent::KeepAlive,
+                };
+                if let Some(reader) = finished {
+                    pending_read = Box::pin(read_frame(reader));
+                }
+                event
+            }
+        };
+
+        let written = match event {
+            LoopEvent::Frame(Ok(encrypted)) => {
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + recv_idle_timeout);
+                match transport.receive(&encrypted)? {
+                    Received::Continue => continue,
+                    Received::Stop => break,
                 }
             }
-
-            // Send from the control lane: text, typing, and file-transfer
-            // control frames (FileCancel). Unbounded, so an abort is never stuck
-            // behind queued bulk data.
-            Some(msg) = from_app_rx.recv() => {
-                if let Err(e) = send_outbound_frame(
-                    &mut stream, &mut cipher, &mut prev_cipher, &transport_aad,
-                    &to_app_tx, &mut sent_seq, &mut messages_since_rekey,
-                    &mut last_rekey_time, is_rekey_initiator,
-                    REKEY_MESSAGE_COUNT, REKEY_TIME_INTERVAL, msg,
-                ).await {
-                    tracing::error!("{}", e);
-                    let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
-                    break;
-                }
+            LoopEvent::Frame(Err(e)) => {
+                let err_msg = format!("Network receive error: {}", e);
+                tracing::error!("{}", err_msg);
+                let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                break;
             }
-
-            // Send from the bounded file-data lane: FileMeta/FileChunk/FileEnd.
-            // The bounded capacity is what applies backpressure to the streaming
-            // task, so a slow peer paces the disk reader instead of letting the
-            // whole file pile up in memory.
-            Some(msg) = file_rx.recv() => {
-                if let Err(e) = send_outbound_frame(
-                    &mut stream, &mut cipher, &mut prev_cipher, &transport_aad,
-                    &to_app_tx, &mut sent_seq, &mut messages_since_rekey,
-                    &mut last_rekey_time, is_rekey_initiator,
-                    REKEY_MESSAGE_COUNT, REKEY_TIME_INTERVAL, msg,
-                ).await {
-                    tracing::error!("{}", e);
-                    let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
-                    break;
-                }
+            LoopEvent::IdleTimeout => {
+                let err_msg = format!("Receive idle timeout ({}s)", recv_idle_timeout.as_secs());
+                tracing::warn!("{}", err_msg);
+                let _ = to_app_tx.send(SessionEvent::Error(err_msg));
+                break;
             }
-
-            // Keep-alive: ping on the shared outbound sequence so the peer's
-            // receive-idle timer resets even when nobody is typing. If a rekey
-            // is due, the host rotates here instead of pinging — otherwise a
-            // silent-but-receiving host would never rekey (its send branch
-            // never fires), quietly weakening forward secrecy. The Rekey frame
-            // doubles as keep-alive traffic.
-            _ = keepalive.tick() => {
-                let rekey_due = is_rekey_initiator
-                    && (messages_since_rekey >= REKEY_MESSAGE_COUNT
-                        || last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL);
-                if rekey_due {
-                    if let Err(e) = initiate_rekey(
-                        &mut stream,
-                        &mut cipher,
-                        &mut prev_cipher,
-                        &transport_aad,
-                        &mut sent_seq,
-                        &mut messages_since_rekey,
-                        &mut last_rekey_time,
-                    )
-                    .await
-                    {
-                        let err_msg = format!("Network send error (rekey): {}", e);
-                        tracing::error!("{}", err_msg);
-                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
-                        break;
-                    }
-                } else {
-                    sent_seq += 1;
-                    let ping = ProtocolMessage::Ping { seq: sent_seq };
-                    let encrypted = cipher.encrypt(&ping.to_plain_bytes(), Some(&transport_aad));
-                    if let Err(e) = send_packet(&mut stream, &encrypted).await {
-                        let err_msg = format!("Network send error (keep-alive): {}", e);
-                        tracing::error!("{}", err_msg);
-                        let _ = to_app_tx.send(SessionEvent::Error(err_msg));
-                        break;
-                    }
-                    tracing::trace!("Keep-alive ping sent");
-                }
+            LoopEvent::Send(msg) => {
+                write_while_reading(
+                    transport.send(msg),
+                    &mut pending_read,
+                    read_frame,
+                    &mut inbox,
+                )
+                .await
             }
+            LoopEvent::KeepAlive => {
+                write_while_reading(
+                    transport.keep_alive(),
+                    &mut pending_read,
+                    read_frame,
+                    &mut inbox,
+                )
+                .await
+            }
+        };
+        if let Err(e) = written {
+            tracing::error!("{}", e);
+            let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+            break;
         }
     }
 

@@ -129,7 +129,7 @@ pub(crate) async fn remove_contact(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state.manager.lock().await.remove_contact(uuid);
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
@@ -143,7 +143,7 @@ pub(crate) async fn block_contact(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state
         .manager
         .lock()
@@ -162,7 +162,7 @@ pub(crate) async fn unblock_contact(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     state
         .manager
         .lock()
@@ -188,7 +188,7 @@ pub(crate) async fn connect_contact(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let uuid = parse_id(&id)?;
     let pk = {
         let id = crate::lock_identity(&state.identity);
         id.private_key().map_err(|e| e.to_string())?

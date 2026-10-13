@@ -524,3 +524,49 @@ async fn messages_keep_flowing_across_a_rekey() {
     host.handle.abort();
     client.handle.abort();
 }
+
+/// Regression test for the non-cancel-safe receive in the message loop.
+///
+/// The loop selects between "read a frame" and "send a frame". It used to build
+/// a fresh read every iteration, so a send winning the race while a frame was
+/// half-read threw the consumed bytes away; the next read took ciphertext for a
+/// length prefix and the session died on "packet size exceeds limit". All it
+/// takes is both peers sending at once with frames larger than what the pipe
+/// delivers in one read — here, near-cap text frames through a 64 KiB duplex.
+#[tokio::test]
+async fn simultaneous_traffic_in_both_directions_keeps_framing_intact() {
+    let (mut host, mut client) = connect_pair().await;
+    reach_ready(&mut host, &mut client).await;
+
+    const COUNT: usize = 60;
+    let body = |side: &str, i: usize| format!("{side}-{i}-{}", "x".repeat(48 * 1024));
+    for i in 0..COUNT {
+        for (peer, side) in [(&host, "host"), (&client, "client")] {
+            peer.outbound
+                .send(ProtocolMessage::Text {
+                    text: body(side, i),
+                    timestamp: i as u64,
+                    seq: 0,
+                })
+                .unwrap();
+        }
+    }
+
+    for (peer, from, label) in [
+        (&mut client, "host", "client"),
+        (&mut host, "client", "host"),
+    ] {
+        for i in 0..COUNT {
+            match next_message(&mut peer.events, label).await {
+                ProtocolMessage::Text { text, .. } => assert!(
+                    text == body(from, i),
+                    "{label} received a corrupted or out-of-order frame at {i}"
+                ),
+                other => panic!("{label} expected Text {i}, got {other:?}"),
+            }
+        }
+    }
+
+    host.handle.abort();
+    client.handle.abort();
+}

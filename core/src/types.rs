@@ -50,6 +50,72 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// A new, empty conversation.
+    ///
+    /// `kind` and `transport` are required rather than defaulted: they drive
+    /// the badges the UI shows, and a constructor that guessed them is how a
+    /// relay conversation once came to be persisted as a direct one. Everything
+    /// else starts at its zero value — no fingerprint (so TOFU runs), no
+    /// messages, fresh sequence counters — and a placeholder host flips
+    /// `is_host_placeholder` itself.
+    pub fn new(id: Uuid, title: impl Into<String>, kind: ChatKind, transport: Transport) -> Self {
+        Self {
+            id,
+            title: title.into(),
+            kind,
+            transport,
+            peer_fingerprint: None,
+            participants: Vec::new(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            peer_typing: false,
+            typing_since: None,
+            send_seq: 0,
+            recv_seq: 0,
+            is_host_placeholder: false,
+            read_count: 0,
+            title_is_custom: false,
+        }
+    }
+
+    /// Accept `seq` as the next frame from the peer, or refuse it as a replay.
+    ///
+    /// Every sequenced frame must climb strictly above the last one accepted
+    /// on this conversation. This is the app-layer half of replay protection —
+    /// the transport enforces the same rule per session — and it is the one
+    /// place it is spelled out, rather than once per message kind.
+    pub fn accept_seq(&mut self, seq: u64) -> bool {
+        if seq <= self.recv_seq {
+            return false;
+        }
+        self.recv_seq = seq;
+        true
+    }
+
+    /// Reset both sequence counters because a **new** session is about to
+    /// serve this conversation.
+    ///
+    /// The wire sequence is per session and restarts at 1, but `recv_seq`
+    /// lives here and survives reconnects. Left alone, every frame the peer
+    /// sends after a reconnect is at or below the previous session's
+    /// high-water mark and is discarded as a replay — the peer's first N
+    /// messages vanish with only a log line, and they see them as sent.
+    ///
+    /// This does not weaken replay protection: it is enforced per session at
+    /// the transport layer (`last_valid_seq` in `run_message_loop`), on a key
+    /// that is itself unique per session. This counter is a second layer that
+    /// must be aligned with the session it is checking.
+    pub fn reset_sequences(&mut self) {
+        self.recv_seq = 0;
+        self.send_seq = 0;
+    }
+
+    /// The peer stopped typing (they sent a message, or said so).
+    pub fn clear_typing(&mut self) {
+        self.peer_typing = false;
+        self.typing_since = None;
+    }
+
     /// Messages received from the peer that the user has not seen yet. Own
     /// messages never count, so sending never badges your own conversation.
     pub fn unread_count(&self) -> usize {
@@ -103,6 +169,31 @@ pub struct Message {
     /// rather than an error state.
     #[serde(default)]
     pub delivered: bool,
+}
+
+impl Message {
+    /// A message this device sent. `id` is what the peer's delivery receipt
+    /// will be matched against, so the caller keeps it.
+    pub fn sent(id: Uuid, content: MessageContent) -> Self {
+        Self {
+            id,
+            from_me: true,
+            content,
+            timestamp: Utc::now(),
+            delivered: false,
+        }
+    }
+
+    /// A message the peer sent, stamped with when it was written.
+    pub fn received(content: MessageContent, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            from_me: false,
+            content,
+            timestamp,
+            delivered: false,
+        }
+    }
 }
 
 /// A contact (a known peer)
@@ -224,6 +315,17 @@ pub enum TransferStatus {
     Completed,
     Failed(String),
     Cancelled,
+}
+
+impl TransferStatus {
+    /// Still running — including an incoming offer held for the user's
+    /// decision, which owns its conversation's incoming slot just the same.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::AwaitingAcceptance | Self::InProgress
+        )
+    }
 }
 
 /// Session role

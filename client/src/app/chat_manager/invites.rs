@@ -2,13 +2,22 @@
 
 use super::*;
 
+/// Every invite link starts with this.
+const INVITE_PREFIX: &str = "chat-p2p://invite/";
+/// A signed (v2) invite link starts with this.
+const SIGNED_INVITE_PREFIX: &str = "chat-p2p://invite/v2/";
+
 impl ChatManager {
     /// Whether a link is the **signed** (v2+) invite format. An unsigned v1
     /// link carries no proof of who made it — anyone can mint one naming
     /// anybody — so callers surface that difference to the user instead of
     /// importing both silently.
+    ///
+    /// Decided by the prefix, not by searching for `/v2/`: a v1 payload is
+    /// standard base64, which contains `/`, so an unsigned link could carry
+    /// `/v2/` by chance — and then be reported as signed.
     pub fn invite_link_is_signed(link: &str) -> bool {
-        link.contains("/v2/")
+        link.trim().starts_with(SIGNED_INVITE_PREFIX)
     }
 
     /// Reject an invite whose `fingerprint` field does not match the key it
@@ -103,12 +112,9 @@ impl ChatManager {
 
         tracing::debug!("Parsing invite link");
 
-        // Check if this is a v2 (signed) or v1 (unsigned) invite
-        if link.contains("/v2/") {
+        let link = link.trim();
+        if let Some(encoded) = link.strip_prefix(SIGNED_INVITE_PREFIX) {
             // V2: Signed invite with RSA-PSS signature
-            let encoded = link
-                .strip_prefix("chat-p2p://invite/v2/")
-                .ok_or_else(|| anyhow::anyhow!("Invalid v2 invite link format"))?;
 
             // Decode URL-safe base64
             use base64::Engine;
@@ -264,7 +270,7 @@ impl ChatManager {
             );
 
             // Remove prefix if present
-            let encoded = link.strip_prefix("chat-p2p://invite/").unwrap_or(link);
+            let encoded = link.strip_prefix(INVITE_PREFIX).unwrap_or(link);
 
             // Decode base64
             use base64::Engine;

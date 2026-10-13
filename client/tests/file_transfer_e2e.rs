@@ -480,3 +480,76 @@ async fn sending_a_file_with_no_session_is_an_error() {
         .expect_err("no session means no send");
     assert!(!err.to_string().is_empty());
 }
+
+/// A second file sent while the first is still waiting for the user's decision
+/// must not touch the first.
+///
+/// `FileChunk` carries no transfer id, so the receiver routes chunks to the
+/// transfer currently streaming. An offer held for acceptance used to count as
+/// streaming even after its `FileEnd`, so the second offer was refused and its
+/// chunks were written into the *first* file's spool — overflowing its declared
+/// size, failing it, and deleting it.
+#[tokio::test]
+async fn a_second_offer_while_the_first_awaits_acceptance_leaves_both_intact() {
+    let mut p = connected_pair(false, false).await;
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let (first, first_bytes) = write_test_file(src_dir.path(), "first.bin", 200 * 1024);
+    let (second, second_bytes) = write_test_file(src_dir.path(), "second.bin", 150 * 1024);
+
+    p.host
+        .send_file(p.host_chat, first)
+        .await
+        .expect("send first");
+    // The sender finishes; the receiver holds the complete file, undecided.
+    pump_until(&mut p.host, &mut p.client, "first held", |h, c| {
+        transfers_for(h, p.host_chat)
+            .iter()
+            .any(|t| t.status == TransferStatus::Completed)
+            && c.active_transfers_snapshot()
+                .iter()
+                .any(|t| t.status == TransferStatus::AwaitingAcceptance && t.received == t.size)
+    })
+    .await;
+
+    p.host
+        .send_file(p.host_chat, second)
+        .await
+        .expect("send second");
+    pump_until(&mut p.host, &mut p.client, "second held too", |_, c| {
+        let held: Vec<_> = c
+            .active_transfers_snapshot()
+            .into_iter()
+            .filter(|t| t.status == TransferStatus::AwaitingAcceptance && t.received == t.size)
+            .collect();
+        held.len() == 2
+    })
+    .await;
+
+    for offer in p.client.active_transfers_snapshot() {
+        p.client.accept_incoming_file(offer.id).expect("accept");
+    }
+    pump_until(&mut p.host, &mut p.client, "both saved", |_, c| {
+        c.chats[&p.client_chat]
+            .messages
+            .iter()
+            .filter(|m| !m.from_me && matches!(m.content, MessageContent::File { .. }))
+            .count()
+            == 2
+    })
+    .await;
+    for (name, expected) in [("first.bin", &first_bytes), ("second.bin", &second_bytes)] {
+        let saved = p.client.chats[&p.client_chat]
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::File { filename, path, .. } if filename == name => path.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} was not saved"));
+        assert_eq!(
+            &std::fs::read(saved).expect("read saved"),
+            expected,
+            "{name} corrupted"
+        );
+    }
+}
