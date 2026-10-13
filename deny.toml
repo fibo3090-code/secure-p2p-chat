@@ -33,11 +33,10 @@ ignore = [
     # written at that time, which is the whole point of not leaving dead ones
     # here.
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (transitive, build-time only)
-    "RUSTSEC-2025-0075", # unic-* family unmaintained (transitive)
-    "RUSTSEC-2025-0080",
-    "RUSTSEC-2025-0081",
-    "RUSTSEC-2025-0098",
-    "RUSTSEC-2025-0100",
+    # RUSTSEC-2025-0075/-0080/-0081/-0098/-0100 (the unic-* family) were
+    # accepted here as unmaintained and transitive. The October 2026 Tauri
+    # minor bumps dropped the chain that reached them, so they stopped firing
+    # and the entries were removed.
     # quick-xml DoS-class issues (quadratic dup-attribute check / unbounded
     # NsReader allocation). The vulnerable 0.39.4 is reachable ONLY via
     # rfd -> wayland-client/protocols -> wayland-scanner, which is a proc macro:

@@ -141,6 +141,7 @@ check_errors.txt
 clippy_errors.txt
 AGENTS.md
 .superpowers/
+graphify-out/
 
 # Local Party/Community server state (contains the server identity key - never commit)
 party-data/
