@@ -290,6 +290,50 @@ fn blocked_contact_fingerprint_is_auto_rejected() {
     );
 }
 
+/// An invite may spell its fingerprint in any case (the binding check is
+/// case-insensitive), while a handshake always presents lowercase hex. Stored
+/// verbatim, blocking such a contact matched nothing and the peer still got
+/// through to the prompt.
+#[test]
+fn blocking_a_contact_imported_with_an_uppercase_fingerprint_holds() {
+    use crate::identity::Identity;
+
+    let mut mgr = ChatManager::new(Config::default());
+    let mallory = Identity::new_with_plaintext("Mallory".to_string()).unwrap();
+    let link = crate::identity::invite::resign_for_test(
+        &mallory.generate_signed_invite_link(None).unwrap(),
+        &mallory.private_key().unwrap(),
+        |p| p.fingerprint = p.fingerprint.to_ascii_uppercase(),
+    )
+    .unwrap();
+    let contact_id = mgr
+        .import_contact(mgr.parse_invite_link(&link).unwrap())
+        .unwrap();
+    mgr.block_contact(contact_id).unwrap();
+
+    let session_id = Uuid::new_v4();
+    let incoming = Uuid::new_v4();
+    mgr.create_local_chat_for_test(incoming, "Peer".into());
+    mgr.chat_id_mapping.insert(incoming, session_id);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(session_id, tx);
+
+    // Exactly what the session layer reports: lowercase hex.
+    mgr.handle_tofu_verification(session_id, &mallory.fingerprint, "Mallory", "");
+
+    assert!(mgr.pending_fingerprint().is_none());
+    assert_eq!(rx.try_recv().ok(), Some(false), "the block must hold");
+}
+
+/// A contact added by hand is stored in canonical form, so the comparisons
+/// that decide trust see the same string the handshake does.
+#[test]
+fn typed_fingerprints_are_stored_canonically() {
+    let mut mgr = ChatManager::new(Config::default());
+    let id = mgr.add_contact("Bob".into(), None, Some("  ABCDEF0123  ".into()), None);
+    assert_eq!(mgr.contacts[&id].fingerprint.as_deref(), Some("abcdef0123"));
+}
+
 #[test]
 fn blocking_tears_down_the_live_session_completely() {
     let mut mgr = ChatManager::new(Config::default());
@@ -729,47 +773,11 @@ fn parse_v2_signed_invite_rejects_tampered_signature() {
 /// valid, so parse-time expiry is exercised independently of signature checks.
 #[cfg(test)]
 fn resign_invite_with_timestamp(identity: &crate::identity::Identity, timestamp: u64) -> String {
-    use base64::Engine;
-
     let link = identity.generate_signed_invite_link(None).unwrap();
-    let encoded = link.strip_prefix("chat-p2p://invite/v2/").unwrap();
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .unwrap();
-
-    // Mirror the parser's payload struct so the signature covers bytes with
-    // the same field order it will re-serialize for verification.
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct Payload {
-        version: u32,
-        timestamp: u64,
-        nonce: String,
-        name: String,
-        address: Option<String>,
-        relay_server: Option<String>,
-        relay_token: Option<String>,
-        fingerprint: String,
-        public_key: String,
-    }
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct SignedInvite {
-        payload: Payload,
-        signature: Vec<u8>,
-    }
-
-    let mut invite: SignedInvite = serde_json::from_slice(&decoded).unwrap();
-    invite.payload.timestamp = timestamp;
-
-    let payload_json = serde_json::to_string(&invite.payload).unwrap();
-    invite.signature = crate::core::crypto::rsa_sign_pss(
-        &identity.private_key().unwrap(),
-        payload_json.as_bytes(),
-    )
-    .unwrap();
-
-    let re_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_string(&invite).unwrap());
-    format!("chat-p2p://invite/v2/{}", re_encoded)
+    crate::identity::invite::resign_for_test(&link, &identity.private_key().unwrap(), |p| {
+        p.timestamp = timestamp
+    })
+    .unwrap()
 }
 
 #[test]

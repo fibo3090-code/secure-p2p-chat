@@ -484,6 +484,20 @@ pub fn format_size(bytes: u64) -> String {
     format!("{:.2} {}", size, UNITS[unit_idx])
 }
 
+/// The one spelling of a fingerprint every comparison is made against:
+/// trimmed, lowercase hex — exactly what [`crate::core::fingerprint_pubkey`]
+/// produces for a key presented in a handshake.
+///
+/// Fingerprints also arrive from people: invite links (whose binding check is
+/// case-insensitive) and typed `:contact-add` arguments. Stored verbatim, an
+/// uppercase one never equalled the handshake's lowercase one, and the
+/// trust code compares exactly — so **blocking** such a contact blocked
+/// nothing, and a verified one was prompted for again. Normalise at the
+/// boundary instead of remembering to compare case-insensitively everywhere.
+pub fn canonical_fingerprint(fp: &str) -> String {
+    fp.trim().to_ascii_lowercase()
+}
+
 /// Format fingerprint for display (first 8 + last 8 chars)
 pub fn format_fingerprint_short(fp: &str) -> String {
     if fp.len() > 16 {

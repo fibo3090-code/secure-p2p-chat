@@ -8,6 +8,8 @@
 ///
 /// Identity is stored in a JSON file in the user's data directory.
 /// Keys are now encrypted with a password.
+pub mod invite;
+
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -513,35 +515,15 @@ impl Identity {
         relay_server: Option<String>,
         relay_token: Option<String>,
     ) -> Result<String> {
-        use serde::{Deserialize, Serialize};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut invite_nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut invite_nonce);
-        let nonce = hex::encode(invite_nonce);
 
-        // Create timestamp (current UTC Unix timestamp)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-
-        #[derive(Serialize, Deserialize, Clone)]
-        struct SignedInvitePayload {
-            version: u32,
-            timestamp: u64,
-            nonce: String, // Random per-invite nonce encoded as hex
-            name: String,
-            address: Option<String>,
-            relay_server: Option<String>,
-            relay_token: Option<String>,
-            fingerprint: String,
-            public_key: String,
-            // MUST stay last with this exact skip rule so pre-existing invites
-            // (no `addresses` key) re-serialize byte-identically and verify.
-            #[serde(default, skip_serializing_if = "Vec::is_empty")]
-            addresses: Vec<String>,
-        }
 
         // First candidate is the primary `address` for old-client back-compat;
         // only carry the full list when it adds something beyond that.
@@ -552,7 +534,7 @@ impl Identity {
             Vec::new()
         };
 
-        let payload = SignedInvitePayload {
+        let payload = invite::SignedInvitePayload {
             version: if !multi.is_empty() {
                 4
             } else if relay_server.is_some() || relay_token.is_some() {
@@ -561,7 +543,7 @@ impl Identity {
                 2
             },
             timestamp,
-            nonce,
+            nonce: hex::encode(invite_nonce),
             name: self.name.clone(),
             address: primary,
             relay_server,
@@ -570,29 +552,7 @@ impl Identity {
             public_key: self.public_key_pem.clone(),
             addresses: multi,
         };
-
-        // Serialize payload using the crate-local serde_json representation.
-        // Verification uses the same byte representation; this is deterministic for this app,
-        // but it is not a general-purpose RFC 8785 canonicalization scheme.
-        let payload_json = serde_json::to_string(&payload)?;
-        let payload_bytes = payload_json.as_bytes();
-
-        // Sign the payload using the identity's RSA private key
-        let privkey = self.private_key()?;
-        let signature = crate::core::crypto::rsa_sign_pss(&privkey, payload_bytes)?;
-
-        #[derive(Serialize, Deserialize)]
-        struct SignedInvite {
-            payload: SignedInvitePayload,
-            signature: Vec<u8>, // RSA-PSS signature over payload JSON
-        }
-
-        let signed_invite = SignedInvite { payload, signature };
-        let invite_json = serde_json::to_string(&signed_invite)?;
-
-        // Use URL-safe base64 encoding (RFC 4648)
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(invite_json);
-        Ok(format!("chat-p2p://invite/v2/{}", encoded))
+        invite::encode_signed(payload, &self.private_key()?)
     }
 
     /// Generate invite link for this identity (v1, unsigned - for backward compatibility)
@@ -600,19 +560,12 @@ impl Identity {
     /// DEPRECATED: Use generate_signed_invite_link() instead for security.
     /// This is kept for backward compatibility with existing invites.
     pub fn generate_invite_link(&self, address: Option<String>) -> Result<String> {
-        use serde_json::json;
-
-        let payload = json!({
-            "name": self.name,
-            "address": address,
-            "fingerprint": self.fingerprint,
-            "public_key": self.public_key_pem,
-        });
-
-        let json = serde_json::to_string(&payload)?;
-        // Use standard base64 for v1 (legacy)
-        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
-        Ok(format!("chat-p2p://invite/{}", encoded))
+        invite::encode_unsigned(&invite::InvitePayload {
+            name: self.name.clone(),
+            address,
+            fingerprint: self.fingerprint.clone(),
+            public_key: self.public_key_pem.clone(),
+        })
     }
 
     /// Load identity from file

@@ -361,7 +361,13 @@ impl ChatManager {
             self.chats.entry(placeholder.id).or_insert(placeholder);
         }
 
-        for contact in history.contacts {
+        for mut contact in history.contacts {
+            // Older builds stored fingerprints as typed or as the invite spelled
+            // them; every trust comparison is exact, so canonicalise on load.
+            contact.fingerprint = contact
+                .fingerprint
+                .as_deref()
+                .map(crate::util::canonical_fingerprint);
             self.contacts.insert(contact.id, contact);
         }
 
