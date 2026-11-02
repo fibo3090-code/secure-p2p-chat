@@ -11,6 +11,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 use zeroize::Zeroizing;
 
 use crate::core::{
@@ -95,8 +96,10 @@ pub async fn bind_host_listener(port: u16) -> Result<TcpListener> {
         .map_err(|e| anyhow!("Could not listen on port {}: {}", port, e))
 }
 
-/// Run host session on an already-bound listener: accept, handshake (v3),
-/// message loop. Use [`bind_host_listener`] to obtain the listener.
+/// Run host session on an already-bound listener: accept one peer, then the
+/// same handshake, verification and message loop as every other transport
+/// ([`run_host_session_over_stream`]). Use [`bind_host_listener`] to obtain the
+/// listener.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session(
     listener: TcpListener,
@@ -104,11 +107,11 @@ pub async fn run_host_session(
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     file_rx: mpsc::Receiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()> {
-    // 1. Report the port we actually bound (the caller may have asked for 0).
+    // Report the port we actually bound (the caller may have asked for 0).
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     tracing::info!("Host listening on port {}", port);
 
@@ -116,7 +119,6 @@ pub async fn run_host_session(
         .send(SessionEvent::Listening { port })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    // 2. Accept connection with rate limiting
     let (mut stream, peer_addr) = listener.accept().await?;
 
     // Release the port the instant we have our peer. A session serves exactly
@@ -126,7 +128,6 @@ pub async fn run_host_session(
     // still advertising the address as reachable.
     drop(listener);
 
-    // Check rate limit
     if is_rate_limited(peer_addr.ip()) {
         tracing::warn!(
             "Rejecting connection from {} due to rate limiting",
@@ -134,211 +135,22 @@ pub async fn run_host_session(
         );
         return Err(anyhow!("Connection rejected: rate limit exceeded"));
     }
-
     tracing::info!("Client connected from {}", peer_addr);
 
-    // --- HANDSHAKE v3 (ECDH First) ---
-
-    // 3. Send Protocol Version (u32, plaintext)
-    let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
-    send_packet(&mut stream, &version_bytes).await?;
-
-    // 4. Receive Protocol Version (u32, plaintext)
-    let client_version_bytes = recv_packet_with_timeout(&mut stream).await?;
-    if client_version_bytes.len() != 4 {
-        return Err(anyhow!("Invalid version packet length"));
-    }
-    // Fix: Use as_slice().try_into() to avoid consuming Vec
-    let client_version = u32::from_be_bytes(
-        client_version_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid version bytes"))?,
-    );
-    tracing::info!("Client protocol version: {}", client_version);
-
-    if client_version < 3 {
-        return Err(anyhow!(
-            "Client version {} too old (need v3+)",
-            client_version
-        ));
-    }
-
-    // 5. Generate Ephemeral Keys (X25519)
-    let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
-    let host_ephemeral_bytes = host_ephemeral_public.as_bytes();
-
-    // 6. Send Ephemeral Public Key (plaintext)
-    send_packet(&mut stream, host_ephemeral_bytes).await?;
-
-    // 7. Receive Ephemeral Public Key (plaintext)
-    let client_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
-    if client_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
-        return Err(anyhow!("Invalid ephemeral key length"));
-    }
-    let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
-
-    // 7.5. Negotiate Signature Scheme
-    // Ed25519 first, RSA-PSS retained for peers that predate it —
-    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
-    // so an older peer that advertises only RSA-PSS still connects.
-    let our_schemes = vec![
-        SignatureScheme::Ed25519.to_u8(),
-        SignatureScheme::RsaPss.to_u8(),
-    ];
-    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
-        schemes: our_schemes.clone(),
-    };
-    let schemes_bytes = schemes_msg.to_plain_bytes();
-    send_packet(&mut stream, &schemes_bytes).await?;
-
-    // Receive client's supported schemes
-    let client_schemes_bytes = recv_packet_with_timeout(&mut stream).await?;
-    let client_schemes = match ProtocolMessage::from_plain_bytes(&client_schemes_bytes) {
-        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
-        _ => {
-            tracing::warn!("Invalid or missing signature schemes from client");
-            return Err(anyhow!("Client did not send valid signature schemes"));
-        }
-    };
-
-    // Negotiate the best common scheme supported by both peers.
-    let selected_scheme = negotiate_signature_scheme(&our_schemes, &client_schemes)
-        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
-    tracing::debug!("Negotiated signature scheme: {}", selected_scheme.name());
-
-    // 8. Derive Session Key & Init Cipher
-    // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
-    let mut transcript = Vec::new();
-    transcript.extend_from_slice(&version_bytes); // Host Version
-    transcript.extend_from_slice(&client_version_bytes); // Client Version
-    transcript.extend_from_slice(host_ephemeral_bytes); // Host Ephemeral
-    transcript.extend_from_slice(&client_ephemeral_bytes); // Client Ephemeral
-    let salt = Sha256::digest(&transcript);
-
-    let aes_key = Zeroizing::new(derive_session_key(
-        host_ephemeral_secret,
-        &client_ephemeral_public,
-        Some(&salt),
-        HKDF_INFO,
-    )?);
-    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
-    let transcript_hash = salt.as_slice();
-    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
-    let transport_aad = labeled_aad(b"transport", transcript_hash);
-    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
-
-    // --- ENCRYPTED IDENTITY EXCHANGE ---
-
-    // 9. Create Identity Proof (using negotiated scheme)
-    // We sign our own ephemeral key to bind it to our identity (prevent MITM)
-    let signature = build_identity_signature(selected_scheme, &privkey, host_ephemeral_bytes)?;
-
-    let my_proof = IdentityProof {
-        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
-        signature,
-        version: PROTOCOL_VERSION as u32,
-        chat_id,
-        signature_scheme: selected_scheme,
-    };
-
-    // Serialize & Encrypt Proof
-    let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
-    send_packet(&mut stream, &encrypted_proof).await?;
-
-    // 10. Receive Client's Identity Proof (Encrypted)
-    let encrypted_client_proof = recv_packet_with_timeout(&mut stream).await?;
-    let client_proof_bytes = cipher
-        .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
-        .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
-    let client_proof: IdentityProof = decode_identity_proof(&client_proof_bytes)?;
-    if client_proof.signature_scheme != selected_scheme {
-        return Err(anyhow!(
-            "Client used unexpected signature scheme: expected {}, got {}",
-            selected_scheme,
-            client_proof.signature_scheme
-        ));
-    }
-
-    // 11. Verify Client Identity
-    // Verifies under whichever scheme the peer used; an Ed25519 proof is
-    // only accepted when its subkey is bound to the RSA identity that the
-    // fingerprint — and therefore TOFU — is derived from.
-    verify_identity_proof(&client_proof, &client_ephemeral_bytes)
-        .map_err(|e| anyhow!("Client identity verification failed: {}", e))?;
-
-    let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
-    tracing::debug!("Verified client identity: {}...", &client_fingerprint[..8]);
-
-    // Optional connection-password gate (inside the encrypted, authenticated
-    // tunnel, before the peer is surfaced for verification).
-    if let Err(e) = host_password_gate(
+    run_host_session_over_stream(
         &mut stream,
-        &cipher,
-        &transport_aad,
-        connection_password.as_deref(),
-    )
-    .await
-    {
-        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
-        return Err(e);
-    }
-
-    // 12. Display Fingerprint & Wait for Confirmation
-    to_app_tx
-        .send(SessionEvent::NewConnection {
-            peer_addr: peer_addr.to_string(),
-            fingerprint: client_fingerprint,
-            sas: crate::core::derive_sas(&transport_aad),
-            chat_id: client_proof.chat_id,
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    // Wait for user confirmation (up to 30 minutes) before proceeding
-    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
-        confirm_rx.recv().await
-    })
-    .await
-    {
-        Ok(Some(true)) => {
-            tracing::info!("User accepted fingerprint for chat {} (host)", chat_id);
-        }
-        Ok(Some(false)) => {
-            tracing::warn!("User rejected fingerprint for chat {} (host)", chat_id);
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
-            return Err(anyhow!("Fingerprint rejected by user"));
-        }
-        Ok(None) => {
-            let msg = "Confirmation channel closed";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification failed: channel closed"));
-        }
-        Err(_) => {
-            let msg = "Fingerprint verification timed out";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification timed out"));
-        }
-    }
-
-    // 13. Enter message loop
-    to_app_tx
-        .send(SessionEvent::Ready)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    run_message_loop(
-        stream,
-        cipher,
-        transport_aad,
+        peer_addr.to_string(),
+        privkey,
         to_app_tx,
         from_app_rx,
         file_rx,
+        confirm_rx,
+        chat_id,
+        connection_password,
     )
     .await
 }
 
-/// Run client session: connect, handshake (v3), message loop
-#[allow(clippy::too_many_arguments)]
 /// Attempt a TCP connection to each candidate in order, bounding every attempt
 /// with [`crate::CONNECT_ATTEMPT_TIMEOUT_SECS`] so one dead address (which
 /// would otherwise hang for the OS connect timeout) cannot stall the fallback
@@ -418,215 +230,23 @@ pub async fn run_client_session_multi(
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     file_rx: mpsc::Receiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()> {
-    // 1. Connect to the first reachable candidate
     let (mut stream, host, port) = connect_first_reachable(targets, &to_app_tx).await?;
     tracing::info!("Connected to {}:{}", host, port);
-    let host = host.as_str();
 
-    to_app_tx
-        .send(SessionEvent::Connected {
-            peer: format!("{}:{}", host, port),
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    // --- HANDSHAKE v3 (ECDH First) ---
-
-    // 2. Receive Host Protocol Version
-    let host_version_bytes = recv_packet_with_timeout(&mut stream).await?;
-    if host_version_bytes.len() != 4 {
-        return Err(anyhow!("Invalid version packet length"));
-    }
-    // Fix: Use as_slice().try_into() to copy bytes into array without consuming Vec
-    let host_version = u32::from_be_bytes(
-        host_version_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid version bytes"))?,
-    );
-    tracing::info!("Host protocol version: {}", host_version);
-
-    if host_version < 3 {
-        return Err(anyhow!("Host version {} too old (need v3+)", host_version));
-    }
-
-    // 3. Send Client Protocol Version
-    let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
-    send_packet(&mut stream, &version_bytes).await?;
-
-    // 4. Receive Host Ephemeral Public Key
-    let host_ephemeral_bytes = recv_packet_with_timeout(&mut stream).await?;
-    if host_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
-        return Err(anyhow!("Invalid ephemeral key length"));
-    }
-    let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
-
-    // 5. Generate Client Ephemeral Keys
-    let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
-    let client_ephemeral_bytes = client_ephemeral_public.as_bytes();
-
-    // 6. Send Client Ephemeral Public Key
-    send_packet(&mut stream, client_ephemeral_bytes).await?;
-
-    // 6.5. Negotiate Signature Scheme (Client side)
-    // Receive host's supported schemes
-    let host_schemes_bytes = recv_packet_with_timeout(&mut stream).await?;
-    let host_schemes = match ProtocolMessage::from_plain_bytes(&host_schemes_bytes) {
-        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
-        _ => {
-            tracing::warn!("Invalid or missing signature schemes from host");
-            return Err(anyhow!("Host did not send valid signature schemes"));
-        }
-    };
-
-    // Send our supported schemes (same as host: RSA-PSS only).
-    // Ed25519 first, RSA-PSS retained for peers that predate it —
-    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
-    // so an older peer that advertises only RSA-PSS still connects.
-    let our_schemes = vec![
-        SignatureScheme::Ed25519.to_u8(),
-        SignatureScheme::RsaPss.to_u8(),
-    ];
-    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
-        schemes: our_schemes.clone(),
-    };
-    let schemes_bytes = schemes_msg.to_plain_bytes();
-    send_packet(&mut stream, &schemes_bytes).await?;
-
-    // Negotiate the best common scheme
-    let selected_scheme = negotiate_signature_scheme(&host_schemes, &our_schemes)
-        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
-    tracing::debug!("Negotiated signature scheme: {}", selected_scheme.name());
-
-    // 7. Derive Session Key & Init Cipher
-    // Transcript for salt: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
-    // Note: host_version_bytes received first, version_bytes sent second.
-    // Order must match Host side: HostVersion || ClientVersion || HostEphemeral || ClientEphemeral
-    let mut transcript = Vec::new();
-    transcript.extend_from_slice(&host_version_bytes); // Host Version
-    transcript.extend_from_slice(&version_bytes); // Client Version
-    transcript.extend_from_slice(&host_ephemeral_bytes); // Host Ephemeral
-    transcript.extend_from_slice(client_ephemeral_bytes); // Client Ephemeral
-    let salt = Sha256::digest(&transcript);
-
-    let aes_key = Zeroizing::new(derive_session_key(
-        client_ephemeral_secret,
-        &host_ephemeral_public,
-        Some(&salt),
-        HKDF_INFO,
-    )?);
-    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
-    let transcript_hash = salt.as_slice();
-    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
-    let transport_aad = labeled_aad(b"transport", transcript_hash);
-    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
-
-    // --- ENCRYPTED IDENTITY EXCHANGE ---
-
-    // 8. Receive Host Identity Proof (Encrypted)
-    let encrypted_host_proof = recv_packet_with_timeout(&mut stream).await?;
-    let host_proof_bytes = cipher
-        .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
-        .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
-    let host_proof: IdentityProof = decode_identity_proof(&host_proof_bytes)?;
-    if host_proof.signature_scheme != selected_scheme {
-        return Err(anyhow!(
-            "Host used unexpected signature scheme: expected {}, got {}",
-            selected_scheme,
-            host_proof.signature_scheme
-        ));
-    }
-
-    // 9. Verify Host Identity
-    // Verifies under whichever scheme the peer used; an Ed25519 proof is
-    // only accepted when its subkey is bound to the RSA identity that the
-    // fingerprint — and therefore TOFU — is derived from.
-    verify_identity_proof(&host_proof, &host_ephemeral_bytes)
-        .map_err(|e| anyhow!("Host identity verification failed: {}", e))?;
-
-    let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
-    tracing::debug!("Verified host identity: {}...", &host_fingerprint[..8]);
-
-    // 10. Create Identity Proof (using negotiated scheme)
-    let signature = build_identity_signature(selected_scheme, &privkey, client_ephemeral_bytes)?;
-
-    let my_proof = IdentityProof {
-        public_key_pem: pem_encode_public(&RsaPublicKey::from(&privkey))?,
-        signature,
-        version: PROTOCOL_VERSION as u32,
-        chat_id,
-        signature_scheme: selected_scheme,
-    };
-
-    // Serialize & Encrypt Proof
-    let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
-    send_packet(&mut stream, &encrypted_proof).await?;
-
-    // Answer the host's optional connection-password gate before proceeding.
-    if let Err(e) = client_password_gate(
+    run_client_session_over_stream(
         &mut stream,
-        &cipher,
-        &transport_aad,
-        connection_password.as_deref(),
-    )
-    .await
-    {
-        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
-        return Err(e);
-    }
-
-    // 11. Display Fingerprint & Wait for Confirmation
-    to_app_tx
-        .send(SessionEvent::ShowFingerprintVerification {
-            fingerprint: host_fingerprint.clone(),
-            peer_name: host.to_string(),
-            sas: crate::core::derive_sas(&transport_aad),
-            chat_id,
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    // Wait up to 30 minutes for user confirmation
-    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
-        confirm_rx.recv().await
-    })
-    .await
-    {
-        Ok(Some(true)) => {
-            tracing::info!("User accepted fingerprint for chat {}", chat_id);
-        }
-        Ok(Some(false)) => {
-            tracing::warn!("User rejected fingerprint for chat {}", chat_id);
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
-            return Err(anyhow!("Fingerprint rejected by user"));
-        }
-        Ok(None) => {
-            let msg = "Confirmation channel closed";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification failed: channel closed"));
-        }
-        Err(_) => {
-            let msg = "Fingerprint verification timed out";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification timed out"));
-        }
-    }
-
-    // 12. Enter message loop
-    to_app_tx
-        .send(SessionEvent::Ready)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    run_message_loop(
-        stream,
-        cipher,
-        transport_aad,
+        format!("{}:{}", host, port),
+        privkey,
         to_app_tx,
         from_app_rx,
         file_rx,
+        confirm_rx,
+        chat_id,
+        connection_password,
     )
     .await
 }
@@ -737,11 +357,220 @@ fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> 
     }
 }
 
+/// The signature schemes we offer, best first. Ed25519 first, RSA-PSS retained
+/// for peers that predate it — [`negotiate_signature_scheme`] prefers Ed25519
+/// when both sides offer it, so an older peer that advertises only RSA-PSS
+/// still connects.
+const OFFERED_SCHEMES: [SignatureScheme; 2] = [SignatureScheme::Ed25519, SignatureScheme::RsaPss];
+
+/// Our protocol version as it goes on the wire (plaintext, big-endian u32).
+fn our_version_bytes() -> [u8; 4] {
+    (PROTOCOL_VERSION as u32).to_be_bytes()
+}
+
+/// The other side's name in error messages, from our role.
+fn peer_role_name(us: NonceRole) -> &'static str {
+    match us {
+        NonceRole::Host => "Client",
+        NonceRole::Client => "Host",
+    }
+}
+
+/// Check the peer's plaintext version packet, refusing anything before v3.
+fn check_peer_version(bytes: &[u8], us: NonceRole) -> Result<u32> {
+    let raw: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("Invalid version packet length"))?;
+    let version = u32::from_be_bytes(raw);
+    if version < 3 {
+        return Err(anyhow!(
+            "{} version {} too old (need v3+)",
+            peer_role_name(us),
+            version
+        ));
+    }
+    tracing::debug!("{} protocol version: {}", peer_role_name(us), version);
+    Ok(version)
+}
+
+/// Receive the peer's X25519 ephemeral key, returning the raw bytes (they go
+/// into the transcript and the identity proof) alongside the parsed key.
+async fn recv_peer_ephemeral<S>(stream: &mut S) -> Result<(Vec<u8>, X25519PublicKey)>
+where
+    S: AsyncRead + Unpin,
+{
+    let bytes = recv_packet_with_timeout(stream).await?;
+    if bytes.len() != crate::AES_KEY_SIZE {
+        return Err(anyhow!("Invalid ephemeral key length"));
+    }
+    let public = parse_x25519_public(&bytes)?;
+    Ok((bytes, public))
+}
+
+/// Exchange supported signature schemes and settle on one. The host speaks
+/// first; the client answers.
+async fn negotiate_schemes<S>(stream: &mut S, us: NonceRole) -> Result<SignatureScheme>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let ours: Vec<u8> = OFFERED_SCHEMES.iter().map(|s| s.to_u8()).collect();
+    let offer = ProtocolMessage::SupportedSignatureSchemes {
+        schemes: ours.clone(),
+    }
+    .to_plain_bytes();
+
+    if us == NonceRole::Host {
+        send_packet(stream, &offer).await?;
+    }
+    let theirs = match ProtocolMessage::from_plain_bytes(&recv_packet_with_timeout(stream).await?) {
+        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
+        _ => {
+            return Err(anyhow!(
+                "{} did not send valid signature schemes",
+                peer_role_name(us)
+            ))
+        }
+    };
+    if us == NonceRole::Client {
+        send_packet(stream, &offer).await?;
+    }
+
+    let selected = negotiate_signature_scheme(&ours, &theirs)
+        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
+    tracing::debug!("Negotiated signature scheme: {}", selected.name());
+    Ok(selected)
+}
+
+/// The keys a handshake produces before either identity is known.
+struct TunnelKeys {
+    cipher: AesCipher,
+    identity_proof_aad: Vec<u8>,
+    transport_aad: Vec<u8>,
+}
+
+/// Derive the session key and AADs from the ECDH result and the transcript.
+///
+/// The transcript order is fixed regardless of who computes it —
+/// `HostVersion || ClientVersion || HostEphemeral || ClientEphemeral` — so
+/// both peers hash identical bytes. That is why the arguments name roles, not
+/// "ours"/"theirs": the latter is exactly the swap that would desync the keys.
+fn derive_tunnel_keys(
+    our_secret: EphemeralSecret,
+    their_public: &X25519PublicKey,
+    host_version: &[u8],
+    client_version: &[u8],
+    host_ephemeral: &[u8],
+    client_ephemeral: &[u8],
+    us: NonceRole,
+) -> Result<TunnelKeys> {
+    let mut transcript = Vec::with_capacity(
+        host_version.len() + client_version.len() + host_ephemeral.len() + client_ephemeral.len(),
+    );
+    transcript.extend_from_slice(host_version);
+    transcript.extend_from_slice(client_version);
+    transcript.extend_from_slice(host_ephemeral);
+    transcript.extend_from_slice(client_ephemeral);
+    let salt = Sha256::digest(&transcript);
+
+    let aes_key = Zeroizing::new(derive_session_key(
+        our_secret,
+        their_public,
+        Some(&salt),
+        HKDF_INFO,
+    )?);
+    let keys = TunnelKeys {
+        cipher: AesCipher::new_with_role(&aes_key[..], us)?,
+        identity_proof_aad: labeled_aad(b"identity-proof", &salt),
+        transport_aad: labeled_aad(b"transport", &salt),
+    };
+    tracing::info!("Encrypted tunnel established (Forward Secrecy enabled)");
+    Ok(keys)
+}
+
+/// Sign our ephemeral key with our identity and send the proof, encrypted.
+async fn send_identity_proof<S>(
+    stream: &mut S,
+    keys: &TunnelKeys,
+    privkey: &RsaPrivateKey,
+    our_ephemeral: &[u8],
+    chat_id: uuid::Uuid,
+    scheme: SignatureScheme,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let proof = IdentityProof {
+        public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
+        signature: build_identity_signature(scheme, privkey, our_ephemeral)?,
+        version: PROTOCOL_VERSION as u32,
+        chat_id,
+        signature_scheme: scheme,
+    };
+    let encrypted = keys
+        .cipher
+        .encrypt(&bincode::serialize(&proof)?, Some(&keys.identity_proof_aad));
+    send_packet(stream, &encrypted).await?;
+    Ok(())
+}
+
+/// Receive, decrypt and verify the peer's identity proof against the
+/// ephemeral key they sent. Returns the proof only once it has verified.
+async fn recv_identity_proof<S>(
+    stream: &mut S,
+    keys: &TunnelKeys,
+    peer_ephemeral: &[u8],
+    scheme: SignatureScheme,
+    us: NonceRole,
+) -> Result<IdentityProof>
+where
+    S: AsyncRead + Unpin,
+{
+    let peer = peer_role_name(us);
+    let encrypted = recv_packet_with_timeout(stream).await?;
+    let bytes = keys
+        .cipher
+        .decrypt(&encrypted, Some(&keys.identity_proof_aad))
+        .ok_or_else(|| anyhow!("Failed to decrypt {} identity proof", peer.to_lowercase()))?;
+    let proof = decode_identity_proof(&bytes)?;
+    if proof.signature_scheme != scheme {
+        return Err(anyhow!(
+            "{} used unexpected signature scheme: expected {}, got {}",
+            peer,
+            scheme,
+            proof.signature_scheme
+        ));
+    }
+    // Verifies under whichever scheme the peer used; an Ed25519 proof is only
+    // accepted when its subkey is bound to the RSA identity that the
+    // fingerprint — and therefore TOFU — is derived from.
+    verify_identity_proof(&proof, peer_ephemeral)
+        .map_err(|e| anyhow!("{} identity verification failed: {}", peer, e))?;
+    Ok(proof)
+}
+
+impl TunnelKeys {
+    fn established(self, peer: &IdentityProof, scheme: SignatureScheme) -> EstablishedTunnel {
+        let peer_fingerprint = fingerprint_pubkey(peer.public_key_pem.as_bytes());
+        tracing::debug!("Verified peer identity: {}...", &peer_fingerprint[..8]);
+        EstablishedTunnel {
+            peer_fingerprint,
+            peer_chat_id: peer.chat_id,
+            cipher: self.cipher,
+            transport_aad: self.transport_aad,
+            signature_scheme: scheme,
+        }
+    }
+}
+
 /// Run the host side of the Protocol v3 handshake over `stream`: version exchange,
 /// X25519 ephemeral key exchange, session-key derivation, and the encrypted,
 /// transcript-bound identity-proof exchange. Returns the established tunnel and the
 /// peer's verified identity. The caller is responsible for trust policy (TOFU /
 /// server policy) and the message loop.
+///
+/// Wire order (the client mirrors it): send version, receive version, send
+/// ephemeral, receive ephemeral, send schemes, receive schemes, send proof,
+/// receive proof.
 pub async fn host_handshake<S>(
     stream: &mut S,
     privkey: &RsaPrivateKey,
@@ -750,121 +579,46 @@ pub async fn host_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
-    send_packet(stream, &version_bytes).await?;
+    const US: NonceRole = NonceRole::Host;
 
-    let client_version_bytes = recv_packet_with_timeout(stream).await?;
-    if client_version_bytes.len() != 4 {
-        return Err(anyhow!("Invalid version packet length"));
-    }
-    let client_version = u32::from_be_bytes(
-        client_version_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid version bytes"))?,
-    );
-    if client_version < 3 {
-        return Err(anyhow!(
-            "Client version {} too old (need v3+)",
-            client_version
-        ));
-    }
+    let host_version = our_version_bytes();
+    send_packet(stream, &host_version).await?;
+    let client_version = recv_packet_with_timeout(stream).await?;
+    check_peer_version(&client_version, US)?;
 
-    let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
-    let host_ephemeral_bytes = host_ephemeral_public.as_bytes();
-    send_packet(stream, host_ephemeral_bytes).await?;
+    let (host_secret, host_public) = generate_ephemeral_keypair();
+    send_packet(stream, host_public.as_bytes()).await?;
+    let (client_ephemeral, client_public) = recv_peer_ephemeral(stream).await?;
 
-    let client_ephemeral_bytes = recv_packet_with_timeout(stream).await?;
-    if client_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
-        return Err(anyhow!("Invalid ephemeral key length"));
-    }
-    let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
+    let scheme = negotiate_schemes(stream, US).await?;
 
-    // Ed25519 first, RSA-PSS retained for peers that predate it —
-    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
-    // so an older peer that advertises only RSA-PSS still connects.
-    let our_schemes = vec![
-        SignatureScheme::Ed25519.to_u8(),
-        SignatureScheme::RsaPss.to_u8(),
-    ];
-    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
-        schemes: our_schemes.clone(),
-    };
-    send_packet(stream, &schemes_msg.to_plain_bytes()).await?;
+    let keys = derive_tunnel_keys(
+        host_secret,
+        &client_public,
+        &host_version,
+        &client_version,
+        host_public.as_bytes(),
+        &client_ephemeral,
+        US,
+    )?;
 
-    let client_schemes_bytes = recv_packet_with_timeout(stream).await?;
-    let client_schemes = match ProtocolMessage::from_plain_bytes(&client_schemes_bytes) {
-        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
-        _ => return Err(anyhow!("Client did not send valid signature schemes")),
-    };
-    let selected_scheme = negotiate_signature_scheme(&our_schemes, &client_schemes)
-        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
-
-    let mut transcript = Vec::new();
-    transcript.extend_from_slice(&version_bytes);
-    transcript.extend_from_slice(&client_version_bytes);
-    transcript.extend_from_slice(host_ephemeral_bytes);
-    transcript.extend_from_slice(&client_ephemeral_bytes);
-    let salt = Sha256::digest(&transcript);
-
-    let aes_key = Zeroizing::new(derive_session_key(
-        host_ephemeral_secret,
-        &client_ephemeral_public,
-        Some(&salt),
-        HKDF_INFO,
-    )?);
-    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Host)?;
-    let transcript_hash = salt.as_slice();
-    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
-    let transport_aad = labeled_aad(b"transport", transcript_hash);
-
-    let signature = build_identity_signature(selected_scheme, privkey, host_ephemeral_bytes)?;
-
-    let my_proof = IdentityProof {
-        public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
-        signature,
-        version: PROTOCOL_VERSION as u32,
+    send_identity_proof(
+        stream,
+        &keys,
+        privkey,
+        host_public.as_bytes(),
         chat_id,
-        signature_scheme: selected_scheme,
-    };
-
-    let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
-    send_packet(stream, &encrypted_proof).await?;
-
-    let encrypted_client_proof = recv_packet_with_timeout(stream).await?;
-    let client_proof_bytes = cipher
-        .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
-        .ok_or_else(|| anyhow!("Failed to decrypt client identity proof"))?;
-    let client_proof: IdentityProof = decode_identity_proof(&client_proof_bytes)?;
-    if client_proof.signature_scheme != selected_scheme {
-        return Err(anyhow!(
-            "Client used unexpected signature scheme: expected {}, got {}",
-            selected_scheme,
-            client_proof.signature_scheme
-        ));
-    }
-
-    // Verifies under whichever scheme the peer used; an Ed25519 proof is only
-    // accepted when its subkey is bound to the RSA identity that the
-    // fingerprint — and therefore TOFU — is derived from.
-    verify_identity_proof(&client_proof, &client_ephemeral_bytes)
-        .map_err(|e| anyhow!("Client identity verification failed: {}", e))?;
-
-    let client_fingerprint = fingerprint_pubkey(client_proof.public_key_pem.as_bytes());
-
-    Ok(EstablishedTunnel {
-        peer_fingerprint: client_fingerprint,
-        peer_chat_id: client_proof.chat_id,
-        cipher,
-        transport_aad,
-        signature_scheme: selected_scheme,
-    })
+        scheme,
+    )
+    .await?;
+    let client_proof = recv_identity_proof(stream, &keys, &client_ephemeral, scheme, US).await?;
+    Ok(keys.established(&client_proof, scheme))
 }
 
 /// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
 /// [`host_handshake`]; returns the established tunnel and the host's verified
-/// identity (`peer_chat_id` is the host's advertised chat id).
+/// identity (`peer_chat_id` is the host's advertised chat id). The host proves
+/// its identity first, so the client verifies before revealing its own.
 pub async fn client_handshake<S>(
     stream: &mut S,
     privkey: &RsaPrivateKey,
@@ -873,113 +627,40 @@ pub async fn client_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let host_version_bytes = recv_packet_with_timeout(stream).await?;
-    if host_version_bytes.len() != 4 {
-        return Err(anyhow!("Invalid version packet length"));
-    }
-    let host_version = u32::from_be_bytes(
-        host_version_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid version bytes"))?,
-    );
-    if host_version < 3 {
-        return Err(anyhow!("Host version {} too old (need v3+)", host_version));
-    }
+    const US: NonceRole = NonceRole::Client;
 
-    let version_bytes = (PROTOCOL_VERSION as u32).to_be_bytes();
-    send_packet(stream, &version_bytes).await?;
+    let host_version = recv_packet_with_timeout(stream).await?;
+    check_peer_version(&host_version, US)?;
+    let client_version = our_version_bytes();
+    send_packet(stream, &client_version).await?;
 
-    let host_ephemeral_bytes = recv_packet_with_timeout(stream).await?;
-    if host_ephemeral_bytes.len() != crate::AES_KEY_SIZE {
-        return Err(anyhow!("Invalid ephemeral key length"));
-    }
-    let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
+    let (host_ephemeral, host_public) = recv_peer_ephemeral(stream).await?;
+    let (client_secret, client_public) = generate_ephemeral_keypair();
+    send_packet(stream, client_public.as_bytes()).await?;
 
-    let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
-    let client_ephemeral_bytes = client_ephemeral_public.as_bytes();
-    send_packet(stream, client_ephemeral_bytes).await?;
+    let scheme = negotiate_schemes(stream, US).await?;
 
-    let host_schemes_bytes = recv_packet_with_timeout(stream).await?;
-    let host_schemes = match ProtocolMessage::from_plain_bytes(&host_schemes_bytes) {
-        Some(ProtocolMessage::SupportedSignatureSchemes { schemes }) => schemes,
-        _ => return Err(anyhow!("Host did not send valid signature schemes")),
-    };
+    let keys = derive_tunnel_keys(
+        client_secret,
+        &host_public,
+        &host_version,
+        &client_version,
+        &host_ephemeral,
+        client_public.as_bytes(),
+        US,
+    )?;
 
-    // Ed25519 first, RSA-PSS retained for peers that predate it —
-    // `negotiate_signature_scheme` prefers Ed25519 when both sides offer it,
-    // so an older peer that advertises only RSA-PSS still connects.
-    let our_schemes = vec![
-        SignatureScheme::Ed25519.to_u8(),
-        SignatureScheme::RsaPss.to_u8(),
-    ];
-    let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
-        schemes: our_schemes.clone(),
-    };
-    send_packet(stream, &schemes_msg.to_plain_bytes()).await?;
-
-    let selected_scheme = negotiate_signature_scheme(&host_schemes, &our_schemes)
-        .ok_or_else(|| anyhow!("No common signature scheme found"))?;
-
-    let mut transcript = Vec::new();
-    transcript.extend_from_slice(&host_version_bytes);
-    transcript.extend_from_slice(&version_bytes);
-    transcript.extend_from_slice(&host_ephemeral_bytes);
-    transcript.extend_from_slice(client_ephemeral_bytes);
-    let salt = Sha256::digest(&transcript);
-
-    let aes_key = Zeroizing::new(derive_session_key(
-        client_ephemeral_secret,
-        &host_ephemeral_public,
-        Some(&salt),
-        HKDF_INFO,
-    )?);
-    let cipher = AesCipher::new_with_role(&aes_key[..], NonceRole::Client)?;
-    let transcript_hash = salt.as_slice();
-    let identity_proof_aad = labeled_aad(b"identity-proof", transcript_hash);
-    let transport_aad = labeled_aad(b"transport", transcript_hash);
-
-    let encrypted_host_proof = recv_packet_with_timeout(stream).await?;
-    let host_proof_bytes = cipher
-        .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
-        .ok_or_else(|| anyhow!("Failed to decrypt host identity proof"))?;
-    let host_proof: IdentityProof = decode_identity_proof(&host_proof_bytes)?;
-    if host_proof.signature_scheme != selected_scheme {
-        return Err(anyhow!(
-            "Host used unexpected signature scheme: expected {}, got {}",
-            selected_scheme,
-            host_proof.signature_scheme
-        ));
-    }
-
-    // Verifies under whichever scheme the peer used; an Ed25519 proof is only
-    // accepted when its subkey is bound to the RSA identity that the
-    // fingerprint — and therefore TOFU — is derived from.
-    verify_identity_proof(&host_proof, &host_ephemeral_bytes)
-        .map_err(|e| anyhow!("Host identity verification failed: {}", e))?;
-
-    let host_fingerprint = fingerprint_pubkey(host_proof.public_key_pem.as_bytes());
-
-    let signature = build_identity_signature(selected_scheme, privkey, client_ephemeral_bytes)?;
-
-    let my_proof = IdentityProof {
-        public_key_pem: pem_encode_public(&RsaPublicKey::from(privkey))?,
-        signature,
-        version: PROTOCOL_VERSION as u32,
+    let host_proof = recv_identity_proof(stream, &keys, &host_ephemeral, scheme, US).await?;
+    send_identity_proof(
+        stream,
+        &keys,
+        privkey,
+        client_public.as_bytes(),
         chat_id,
-        signature_scheme: selected_scheme,
-    };
-    let my_proof_bytes = bincode::serialize(&my_proof)?;
-    let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
-    send_packet(stream, &encrypted_proof).await?;
-
-    Ok(EstablishedTunnel {
-        peer_fingerprint: host_fingerprint,
-        peer_chat_id: host_proof.chat_id,
-        cipher,
-        transport_aad,
-        signature_scheme: selected_scheme,
-    })
+        scheme,
+    )
+    .await?;
+    Ok(keys.established(&host_proof, scheme))
 }
 
 /// Constant-time comparison so a wrong connection password cannot be recovered
@@ -1060,6 +741,83 @@ where
     Ok(())
 }
 
+/// How long a handshaken peer waits for the user to compare the SAS.
+const FINGERPRINT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Report a failure to the app before returning it, so the UI says *why* the
+/// connection went away rather than only that it did.
+fn reported<T>(to_app_tx: &mpsc::UnboundedSender<SessionEvent>, result: Result<T>) -> Result<T> {
+    if let Err(e) = &result {
+        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
+    }
+    result
+}
+
+/// Wait for the user's verdict on the peer's identity.
+async fn await_user_confirmation(
+    confirm_rx: &mut mpsc::UnboundedReceiver<bool>,
+    to_app_tx: &mpsc::UnboundedSender<SessionEvent>,
+    chat_id: uuid::Uuid,
+) -> Result<()> {
+    let (shown, error) =
+        match tokio::time::timeout(FINGERPRINT_CONFIRM_TIMEOUT, confirm_rx.recv()).await {
+            Ok(Some(true)) => {
+                tracing::info!("User accepted fingerprint for chat {}", chat_id);
+                return Ok(());
+            }
+            Ok(Some(false)) => ("Fingerprint rejected", "Fingerprint rejected by user"),
+            Ok(None) => (
+                "Confirmation channel closed",
+                "Fingerprint verification failed: channel closed",
+            ),
+            Err(_) => (
+                "Fingerprint verification timed out",
+                "Fingerprint verification timed out",
+            ),
+        };
+    tracing::warn!("{} (chat {})", error, chat_id);
+    let _ = to_app_tx.send(SessionEvent::Error(shown.to_string()));
+    Err(anyhow!(error))
+}
+
+/// Everything after the handshake and password gate, common to both roles:
+/// surface the peer for verification, wait for the user, then run the
+/// message loop.
+#[allow(clippy::too_many_arguments)]
+async fn verify_then_run<S>(
+    stream: &mut S,
+    tunnel: EstablishedTunnel,
+    prompt: SessionEvent,
+    chat_id: uuid::Uuid,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
+    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    to_app_tx
+        .send(prompt)
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+    await_user_confirmation(&mut confirm_rx, &to_app_tx, chat_id).await?;
+    to_app_tx
+        .send(SessionEvent::Ready)
+        .map_err(|e| anyhow!("Send error: {}", e))?;
+    run_message_loop(
+        stream,
+        tunnel.cipher,
+        tunnel.transport_aad,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+    )
+    .await
+}
+
+/// Host side of a P2P session over an already-connected stream (direct TCP,
+/// hole-punched socket or relay bridge): handshake, optional password gate,
+/// TOFU verification, message loop.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session_over_stream<S>(
     stream: &mut S,
@@ -1068,79 +826,49 @@ pub async fn run_host_session_over_stream<S>(
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     file_rx: mpsc::Receiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let EstablishedTunnel {
-        peer_fingerprint,
-        peer_chat_id,
-        cipher,
-        transport_aad,
-        signature_scheme: _,
-    } = host_handshake(stream, &privkey, chat_id).await?;
+    let tunnel = host_handshake(stream, &privkey, chat_id).await?;
 
-    // Optional connection-password gate (inside the encrypted, authenticated tunnel).
-    if let Err(e) = host_password_gate(
+    // Optional connection-password gate (inside the encrypted, authenticated
+    // tunnel, before the peer is surfaced for verification).
+    reported(
+        &to_app_tx,
+        host_password_gate(
+            stream,
+            &tunnel.cipher,
+            &tunnel.transport_aad,
+            connection_password.as_deref(),
+        )
+        .await,
+    )?;
+
+    let prompt = SessionEvent::NewConnection {
+        peer_addr: peer_label,
+        fingerprint: tunnel.peer_fingerprint.clone(),
+        sas: crate::core::derive_sas(&tunnel.transport_aad),
+        chat_id: tunnel.peer_chat_id,
+    };
+    verify_then_run(
         stream,
-        &cipher,
-        &transport_aad,
-        connection_password.as_deref(),
-    )
-    .await
-    {
-        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
-        return Err(e);
-    }
-
-    to_app_tx
-        .send(SessionEvent::NewConnection {
-            peer_addr: peer_label,
-            fingerprint: peer_fingerprint,
-            sas: crate::core::derive_sas(&transport_aad),
-            chat_id: peer_chat_id,
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
-        confirm_rx.recv().await
-    })
-    .await
-    {
-        Ok(Some(true)) => {}
-        Ok(Some(false)) => {
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
-            return Err(anyhow!("Fingerprint rejected by user"));
-        }
-        Ok(None) => {
-            let msg = "Confirmation channel closed";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification failed: channel closed"));
-        }
-        Err(_) => {
-            let msg = "Fingerprint verification timed out";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification timed out"));
-        }
-    }
-
-    to_app_tx
-        .send(SessionEvent::Ready)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-    run_message_loop(
-        stream,
-        cipher,
-        transport_aad,
+        tunnel,
+        prompt,
+        chat_id,
         to_app_tx,
         from_app_rx,
         file_rx,
+        confirm_rx,
     )
     .await
 }
 
+/// Client side of a P2P session over an already-connected stream. Mirror of
+/// [`run_host_session_over_stream`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_client_session_over_stream<S>(
     stream: &mut S,
@@ -1149,80 +877,48 @@ pub async fn run_client_session_over_stream<S>(
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
     file_rx: mpsc::Receiver<ProtocolMessage>,
-    mut confirm_rx: mpsc::UnboundedReceiver<bool>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let peer_name = peer_label.clone();
     to_app_tx
-        .send(SessionEvent::Connected { peer: peer_label })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-
-    let EstablishedTunnel {
-        peer_fingerprint: host_fingerprint,
-        peer_chat_id: _,
-        cipher,
-        transport_aad,
-        signature_scheme: _,
-    } = client_handshake(stream, &privkey, chat_id).await?;
-
-    // Answer the host's optional connection-password gate before proceeding.
-    if let Err(e) = client_password_gate(
-        stream,
-        &cipher,
-        &transport_aad,
-        connection_password.as_deref(),
-    )
-    .await
-    {
-        let _ = to_app_tx.send(SessionEvent::Error(e.to_string()));
-        return Err(e);
-    }
-
-    to_app_tx
-        .send(SessionEvent::ShowFingerprintVerification {
-            fingerprint: host_fingerprint,
-            peer_name,
-            sas: crate::core::derive_sas(&transport_aad),
-            chat_id,
+        .send(SessionEvent::Connected {
+            peer: peer_label.clone(),
         })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    match tokio::time::timeout(tokio::time::Duration::from_secs(1800), async {
-        confirm_rx.recv().await
-    })
-    .await
-    {
-        Ok(Some(true)) => {}
-        Ok(Some(false)) => {
-            let _ = to_app_tx.send(SessionEvent::Error("Fingerprint rejected".to_string()));
-            return Err(anyhow!("Fingerprint rejected by user"));
-        }
-        Ok(None) => {
-            let msg = "Confirmation channel closed";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification failed: channel closed"));
-        }
-        Err(_) => {
-            let msg = "Fingerprint verification timed out";
-            let _ = to_app_tx.send(SessionEvent::Error(msg.to_string()));
-            return Err(anyhow!("Fingerprint verification timed out"));
-        }
-    }
+    let tunnel = client_handshake(stream, &privkey, chat_id).await?;
 
-    to_app_tx
-        .send(SessionEvent::Ready)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
-    run_message_loop(
+    // Answer the host's optional connection-password gate before proceeding.
+    reported(
+        &to_app_tx,
+        client_password_gate(
+            stream,
+            &tunnel.cipher,
+            &tunnel.transport_aad,
+            connection_password.as_deref(),
+        )
+        .await,
+    )?;
+
+    let prompt = SessionEvent::ShowFingerprintVerification {
+        fingerprint: tunnel.peer_fingerprint.clone(),
+        peer_name: peer_label,
+        sas: crate::core::derive_sas(&tunnel.transport_aad),
+        chat_id,
+    };
+    verify_then_run(
         stream,
-        cipher,
-        transport_aad,
+        tunnel,
+        prompt,
+        chat_id,
         to_app_tx,
         from_app_rx,
         file_rx,
+        confirm_rx,
     )
     .await
 }
