@@ -951,7 +951,7 @@ trusting these numbers:
   in-memory `PartyState` (join/password/channels/history/DMs/persistence), the
   request dispatcher, and connection/broadcast end-to-end over the reused v3
   tunnel.
-- **Party files** (`server/src/state.rs`): content dedup, the storage ceiling,
+- **Party files** (`server/src/state/blobs.rs`): content dedup, the storage ceiling,
   filename sanitization against path traversal, download access control (channel
   member vs DM participant), and blobs + file messages surviving a reload.
 - **Relay** (`core/tests/relay_e2e.rs` + in-file): hole-punched direct sessions
