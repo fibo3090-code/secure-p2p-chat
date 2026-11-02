@@ -34,16 +34,16 @@ pub fn load_or_create_server_identity(data_dir: &Path) -> Result<RsaPrivateKey> 
     }
 }
 
-/// Write a private-key PEM with owner-only permissions where the platform allows.
+/// Write a private-key PEM: owner-only **from creation**, and atomically.
+///
+/// This used to `fs::write` and then `chmod 0600`. Under a typical 022 umask
+/// that left the server's private key world-readable (0644) for the window
+/// between the two calls, and a crash mid-write left a truncated PEM that the
+/// next start refuses to load. `write_file_atomic` creates the temp file 0600,
+/// fsyncs it and renames it into place, so neither state is ever observable.
 fn write_private_pem(path: &Path, pem: &str) -> Result<()> {
-    std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on {}", path.display()))?;
-    }
-    Ok(())
+    messenger_core::util::write_file_atomic(path, pem.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -88,5 +88,32 @@ mod tests {
         load_or_create_server_identity(dir.path()).unwrap();
         let meta = std::fs::metadata(dir.path().join(IDENTITY_FILE)).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A damaged key file must stop the server, never be silently replaced:
+    /// a new key is a new fingerprint, and every client that pinned the old
+    /// one would then be told the server is impersonating itself.
+    #[test]
+    fn a_damaged_identity_is_an_error_not_a_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(IDENTITY_FILE);
+        std::fs::write(&path, b"-----BEGIN PRIVATE KEY-----\ntrunc").unwrap();
+        assert!(load_or_create_server_identity(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\ntrunc",
+            "the damaged file must be left for the operator to inspect"
+        );
+    }
+
+    #[test]
+    fn creating_the_identity_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_server_identity(dir.path()).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![IDENTITY_FILE.to_string()]);
     }
 }
