@@ -13,6 +13,17 @@ predate tagged releases.
 
 ### Security
 
+- **Blocking a contact now holds even if their invite spelled the fingerprint
+  in capitals.** The invite's fingerprint check ignored case, but the contact
+  kept the fingerprint as written, and the block compared it exactly against
+  the lowercase one a connection presents — so the block matched nothing.
+  Fingerprints are now stored in one canonical form (on import, on manual add,
+  and on load for existing contacts), and the block check ignores case too.
+- **The community server's private key is no longer briefly world-readable.**
+  It was written and then restricted to the owner, which left it readable by
+  any local user in between; it is now created owner-only and written
+  atomically, so a crash can no longer leave a truncated key either.
+
 - **Community usernames and channel names can no longer hide characters.**
   Invisible and text-direction characters let one name pass for another
   (`ad\u{200B}min` displayed as "admin") or display as nothing at all.
@@ -55,6 +66,13 @@ predate tagged releases.
   about 160 GB of disk reads for one 100 MB file.
 
 ### Fixed
+
+- **Image previews no longer fail to appear while another file is
+  transferring.** Each progress update cancelled the preview being loaded and
+  marked it as already fetched, so it was never shown.
+- **Saving a community download in the terminal app no longer overwrites a
+  file** that appeared under the same name in the meantime, and no longer
+  freezes the interface while a large file is written.
 
 - **Conversations no longer drop when both people send at once.** A message
   that was half-received when the app started sending was thrown away, and the
@@ -126,6 +144,16 @@ predate tagged releases.
   being written down.
 
 ### Changed
+
+- **Internal cleanup, no behaviour change intended:** the P2P handshake now
+  exists once instead of three times (`core/src/network/session.rs`); the
+  invite-link format is defined once in `core/src/identity/invite.rs` instead of
+  in the generator, the parser and a test helper separately; the terminal app's
+  command handler is split into one method per command, and its usage errors
+  now come from the same table as `:help`; the community server's state module
+  is split into state, blob storage, database and tests. The connection prompt
+  now names the peer as `host:port` rather than the bare host, matching relayed
+  connections.
 
 - Blank messages (in conversations and communities) and blank conversation names
   are refused. Addresses with port 0, an empty host, spaces, or a pasted URL are
