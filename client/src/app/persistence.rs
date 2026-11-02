@@ -160,24 +160,8 @@ impl HistoryFile {
         Ok(history)
     }
 
-    /// Save history to JSON file (plaintext - NOT RECOMMENDED)
-    pub fn save(&self, path: &Path) -> Result<()> {
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let content = serde_json::to_string_pretty(&self)?;
-        std::fs::write(path, content)?;
-
-        tracing::warn!(
-            "Saved {} chats to UNENCRYPTED history - use save_encrypted instead!",
-            self.chats.len()
-        );
-        Ok(())
-    }
-
-    /// Save encrypted history to file (RECOMMENDED)
+    /// Save encrypted history to file. The only writer: plaintext history is
+    /// read solely to migrate it.
     pub fn save_encrypted(&self, path: &Path, key: &[u8; 32]) -> Result<()> {
         // Compact, not pretty: this JSON is encrypted immediately and never read
         // by a human, so the indentation was pure cost — it inflated the
@@ -563,8 +547,13 @@ mod tests {
 
         let history = HistoryFile::new(vec![chat.clone()]);
 
-        // Save
-        history.save(temp_file.path()).unwrap();
+        // Write a legacy plaintext file the way old versions did. There is no
+        // plaintext writer any more — only the migration path reads this format.
+        std::fs::write(
+            temp_file.path(),
+            serde_json::to_string_pretty(&history).unwrap(),
+        )
+        .unwrap();
 
         // Load
         let loaded = HistoryFile::load(temp_file.path()).unwrap();

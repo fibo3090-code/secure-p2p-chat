@@ -104,6 +104,8 @@ pub struct TuiApp {
     /// In-flight Party file downloads. `tick` polls them and writes finished
     /// downloads into the download directory.
     pending_party_downloads: Vec<PendingPartyDownload>,
+    /// Finished downloads being written to disk off the UI thread.
+    pending_party_saves: Vec<tokio::sync::oneshot::Receiver<crate::tui::downloads::SaveOutcome>>,
     last_save: Option<Instant>,
     last_rehost: Option<Instant>,
     typing_active: bool,
@@ -181,6 +183,7 @@ impl TuiApp {
             history_path,
             pending_command: None,
             pending_party_downloads: Vec::new(),
+            pending_party_saves: Vec::new(),
             last_save: None,
             last_rehost: None,
             typing_active: false,
@@ -211,53 +214,65 @@ impl TuiApp {
         }
     }
 
-    /// Drain finished Party file downloads: write the bytes into the download
-    /// directory under a sanitized, non-clobbering name and toast the outcome.
+    /// Drain finished Party file downloads: hand the bytes to a background
+    /// save (sanitized, non-clobbering name — see `tui::downloads`), then toast
+    /// each save as it completes.
     fn poll_party_downloads(&mut self) {
-        if self.pending_party_downloads.is_empty() {
-            return;
-        }
+        use tokio::sync::oneshot::error::TryRecvError;
+
         let download_dir = self.chat_manager.config.download_dir.clone();
         let mut i = 0;
         while i < self.pending_party_downloads.len() {
-            use tokio::sync::oneshot::error::TryRecvError;
-            match self.pending_party_downloads[i].0.try_recv() {
-                Err(TryRecvError::Empty) => i += 1,
-                Ok(result) => {
-                    let (_, name) = self.pending_party_downloads.remove(i);
-                    match result {
-                        Ok(data) => {
-                            // The name was chosen by another member: sanitize it
-                            // (defense in depth — the server sanitizes too) and
-                            // never overwrite an existing file.
-                            let safe = crate::util::sanitize_filename(&name);
-                            let path = unique_download_path(&download_dir, &safe);
-                            let write = std::fs::create_dir_all(&download_dir)
-                                .and_then(|_| std::fs::write(&path, &data));
-                            match write {
-                                Ok(()) => self.toast(
-                                    ToastLevel::Success,
-                                    format!("Saved '{}'", path.display()),
-                                ),
-                                Err(e) => self.toast(
-                                    ToastLevel::Error,
-                                    format!("Saving '{safe}' failed: {e}"),
-                                ),
-                            }
-                        }
-                        Err(reason) => self.toast(
-                            ToastLevel::Error,
-                            format!("Download of '{name}' failed: {reason}"),
-                        ),
-                    }
+            let outcome = match self.pending_party_downloads[i].0.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
                 }
-                Err(TryRecvError::Closed) => {
-                    let (_, name) = self.pending_party_downloads.remove(i);
-                    self.toast(
-                        ToastLevel::Error,
-                        format!("Download of '{name}' failed: connection closed"),
-                    );
+                Ok(result) => result,
+                Err(TryRecvError::Closed) => Err("connection closed".to_string()),
+            };
+            let (_, name) = self.pending_party_downloads.remove(i);
+            match outcome {
+                Ok(data) => {
+                    // The name was chosen by another member: sanitize it
+                    // (defense in depth — the server sanitizes too).
+                    let safe = crate::util::sanitize_filename(&name);
+                    self.pending_party_saves
+                        .push(crate::tui::downloads::spawn_save(
+                            download_dir.clone(),
+                            safe,
+                            data,
+                        ));
                 }
+                Err(reason) => self.toast(
+                    ToastLevel::Error,
+                    format!("Download of '{name}' failed: {reason}"),
+                ),
+            }
+        }
+
+        let mut i = 0;
+        while i < self.pending_party_saves.len() {
+            let saved = match self.pending_party_saves[i].try_recv() {
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(saved) => Some(saved),
+                Err(TryRecvError::Closed) => None,
+            };
+            self.pending_party_saves.remove(i);
+            match saved {
+                Some((_, Ok(path))) => {
+                    self.toast(ToastLevel::Success, format!("Saved '{}'", path.display()))
+                }
+                Some((name, Err(e))) => {
+                    self.toast(ToastLevel::Error, format!("Saving '{name}' failed: {e}"))
+                }
+                None => self.toast(
+                    ToastLevel::Error,
+                    "Saving a download failed: the writer stopped".to_string(),
+                ),
             }
         }
     }
@@ -2117,32 +2132,6 @@ impl TuiApp {
     }
 }
 
-/// A path under `dir` for `name` that does not collide with an existing file:
-/// `name`, then `name (2)`, `name (3)`, … so a download never silently
-/// overwrites something the user already has.
-fn unique_download_path(dir: &std::path::Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
-    let p = std::path::Path::new(name);
-    let stem = p
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("received_file");
-    let ext = p.extension().and_then(|e| e.to_str());
-    for n in 2.. {
-        let candidate = match ext {
-            Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
-            None => dir.join(format!("{stem} ({n})")),
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("the counter loop always returns")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2156,28 +2145,6 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn unique_download_path_never_clobbers() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = unique_download_path(dir.path(), "report.pdf");
-        assert_eq!(first, dir.path().join("report.pdf"));
-
-        std::fs::write(&first, b"one").unwrap();
-        let second = unique_download_path(dir.path(), "report.pdf");
-        assert_eq!(second, dir.path().join("report (2).pdf"));
-
-        std::fs::write(&second, b"two").unwrap();
-        let third = unique_download_path(dir.path(), "report.pdf");
-        assert_eq!(third, dir.path().join("report (3).pdf"));
-
-        // Extensionless names get the suffix too.
-        std::fs::write(dir.path().join("notes"), b"x").unwrap();
-        assert_eq!(
-            unique_download_path(dir.path(), "notes"),
-            dir.path().join("notes (2)")
-        );
     }
 
     fn queued_prompt(session_id: Uuid) -> crate::app::PendingFingerprint {

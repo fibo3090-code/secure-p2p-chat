@@ -1011,7 +1011,12 @@ pub(crate) async fn party_download_file<R: tauri::Runtime>(
             ))
         }
     };
-    let suggested = name;
+    // Another member chose this name. Sanitize it before it reaches the save
+    // dialog, as the TUI does: a dialog pre-filled with `../` segments, a
+    // Windows device name or a U+202E override (`photo_gnp.exe` rendering as
+    // `photo_exe.png`) is inviting the user to confirm something they cannot
+    // see.
+    let suggested = messenger_core::util::sanitize_filename(&name);
     let picked = crate::native_file_dialog(window, move |d| {
         d.set_title("Save file")
             .set_file_name(suggested)
