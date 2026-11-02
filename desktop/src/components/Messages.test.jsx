@@ -267,3 +267,44 @@ describe("ChatPane empty states", () => {
     expect(screen.getByText("Select a conversation")).toBeTruthy();
   });
 });
+
+describe("ChatPane image previews", () => {
+  const base = { draft: "", setDraft: () => {}, onSend: () => {}, onStart: () => {}, transfers: [] };
+  const image = { id: "img-1", kind: "file", from: "them", name: "cat.png", progress: 100, hasPath: true, t: "12:00" };
+  const other = (progress) => ({ id: "f-2", kind: "file", from: "me", name: "big.iso", progress, hasPath: false, t: "12:01" });
+
+  it("keeps a thumbnail fetched while another file's progress ticks", async () => {
+    // The preview effect re-runs whenever any file card's progress changes.
+    // It used to cancel the in-flight fetch on every re-run while leaving the
+    // id marked as requested, so the image was never shown at all.
+    let resolve;
+    const api = installApi({
+      filePreview: vi.fn(() => new Promise((r) => { resolve = r; })),
+    });
+    const { rerender } = render(
+      <ChatPane {...base} contact={contactFixture({ messages: [image, other(10)] })} />,
+    );
+    expect(api.filePreview).toHaveBeenCalledTimes(1);
+
+    rerender(<ChatPane {...base} contact={contactFixture({ messages: [image, other(20)] })} />);
+    resolve("data:image/png;base64,AAAA");
+
+    const img = await screen.findByAltText("cat.png");
+    expect(img.getAttribute("src")).toBe("data:image/png;base64,AAAA");
+    expect(api.filePreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a preview that lands after the user switched conversations", async () => {
+    const pending = [];
+    installApi({ filePreview: vi.fn(() => new Promise((r) => pending.push(r))) });
+    const { rerender } = render(
+      <ChatPane {...base} contact={contactFixture({ messages: [image] })} />,
+    );
+    // The other conversation happens to hold a card with the same id; its own
+    // fetch stays pending, so anything shown can only be the stale one.
+    rerender(<ChatPane {...base} contact={contactFixture({ id: "chat-2", messages: [{ ...image }] })} />);
+    pending[0]("data:image/png;base64,STALE");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByAltText("cat.png")).toBeNull();
+  });
+});
