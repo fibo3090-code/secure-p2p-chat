@@ -220,6 +220,9 @@ export default function App() {
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
+            // The user may have switched while this was in flight; showing it
+            // now would put A on screen with B as the recipient.
+            if (activeIdRef.current !== cur) return;
             setActive(chatToContact(chat, list.find((c) => c.id === cur)?.connected));
           }).catch(() => {});
         }
@@ -305,18 +308,29 @@ export default function App() {
     setDraft("");
     try {
       const chat = await api.getConversation(id);
+      // A slower response for an earlier click must not replace a later one.
+      if (activeIdRef.current !== id) return;
       setActive(chatToContact(chat, convs.find((c) => c.id === id)?.connected));
     } catch { /* ignore */ }
   }
 
   async function send() {
     const text = draft.trim();
-    if (!text || !activeId) return;
+    // Send to the conversation that is on screen, and only when it is the
+    // selected one. They can differ for a moment while a switch is loading;
+    // sending to `activeId` then delivered the text to a conversation other
+    // than the one the user was looking at (audit UI-02).
+    const target = active && active.id === activeId ? active.id : null;
+    if (!text || !target) return;
     setDraft("");
     // Restore the draft if the send fails, so a transient error doesn't lose
-    // what the user typed — they can just press Enter again.
-    try { await api.sendMessage(activeId, text); }
-    catch (e) { setDraft(text); toast(friendlyError(e), "error"); return; }
+    // what the user typed — but only into the conversation it was meant for.
+    try { await api.sendMessage(target, text); }
+    catch (e) {
+      if (activeIdRef.current === target) setDraft(text);
+      toast(friendlyError(e), "error");
+      return;
+    }
     refresh();
   }
 

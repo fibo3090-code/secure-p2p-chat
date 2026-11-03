@@ -80,6 +80,10 @@ predate tagged releases.
 
 ### Fixed
 
+- **A message could go to a conversation other than the one on screen.** When
+  you switched conversations quickly, a slow load of the previous one could
+  replace the screen while the message box still sent to the new one. The
+  app now ignores stale loads and only sends to the conversation shown.
 - **An unreadable history file is no longer replaced with an empty one.**
   If the history could not be read — written by a newer version, not fully
   downloaded from a cloud folder, damaged — the app carried on with no
