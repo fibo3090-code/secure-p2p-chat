@@ -46,6 +46,15 @@ ignore = [
     # resolves the fixed 0.41.0.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zvariant / zbus_names / zvariant_derive unmaintained as standalone crates
+    # (folded into zbus 6). Reached only via notify-rust 4.18.2 -> zbus 5, the
+    # Linux D-Bus desktop-notification path; notify-rust has no zbus-6 release
+    # yet, so there is no upgrade to take. Unmaintained, not vulnerable: the
+    # D-Bus peer is the local session bus, never a network party. Remove when
+    # notify-rust moves to zbus 6 (accepted 2026-11-03).
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
