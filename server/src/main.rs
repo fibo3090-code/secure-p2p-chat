@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     // connect, so it must stay stable across restarts.
     let privkey = Arc::new(identity::load_or_create_server_identity(&args.data_dir)?);
     let fingerprint =
-        fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes());
+        fingerprint_pubkey(pem_encode_public(&RsaPublicKey::from(&*privkey))?.as_bytes())?;
     let hub = Arc::new(Hub::new());
 
     let port = args.port;

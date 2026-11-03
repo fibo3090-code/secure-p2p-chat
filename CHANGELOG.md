@@ -13,6 +13,19 @@ predate tagged releases.
 
 ### Security
 
+- **A peer could impersonate any contact whose public key it knew.** A
+  public key was fingerprinted from the first key block found in its text,
+  while signatures were checked against the key the PEM parser returned, and
+  a key could carry a second block in front of the real one. A peer — or an
+  on-path relay — could therefore present a trusted contact's fingerprint
+  while signing with its own key, and be accepted with no safety-code prompt;
+  the same trick could take over a community member's (or the owner's) seat,
+  or make a "signed" invite redirect a verified contact. Fingerprints are now
+  computed from the parsed key, and a public key with anything but exactly one
+  key block is refused. Fingerprints of genuine keys are unchanged.
+- **A crafted unsigned invite link could crash the app** when pasted. Same
+  cause, same fix.
+
 - **Blocking a contact now holds even if their invite spelled the fingerprint
   in capitals.** The invite's fingerprint check ignored case, but the contact
   kept the fingerprint as written, and the block compared it exactly against

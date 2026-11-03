@@ -96,7 +96,8 @@ pub fn encode_unsigned(payload: &InvitePayload) -> Result<String> {
 /// self-attesting; the fingerprint is what every trust decision is made
 /// against, so a mismatch means one of them is a lie.
 pub fn check_fingerprint_binding(claimed: &str, public_key_pem: &str) -> Result<()> {
-    let derived = fingerprint_pubkey(public_key_pem.as_bytes());
+    let derived = fingerprint_pubkey(public_key_pem.as_bytes())
+        .map_err(|e| anyhow!("Invalid public key in invite: {}", e))?;
     if !derived.eq_ignore_ascii_case(claimed.trim()) {
         tracing::warn!(
             claimed = %claimed,
@@ -228,7 +229,7 @@ mod tests {
             address: Some("10.0.0.1:12345".into()),
             relay_server: None,
             relay_token: None,
-            fingerprint: fingerprint_pubkey(pem.as_bytes()),
+            fingerprint: fingerprint_pubkey(pem.as_bytes()).unwrap(),
             public_key: pem,
             addresses: Vec::new(),
         }
@@ -333,5 +334,48 @@ mod tests {
                 .fingerprint,
             canonical
         );
+    }
+
+    /// A signed invite whose `public_key` smuggles the victim's key in a
+    /// preamble, signed by the attacker and claiming the victim's fingerprint,
+    /// used to pass both the signature and the binding check — and then
+    /// refreshed the victim's verified contact with the attacker's address.
+    #[test]
+    fn an_invite_carrying_two_keys_is_refused() {
+        let victim = generate_rsa_keypair(2048).unwrap();
+        let attacker = generate_rsa_keypair(2048).unwrap();
+        let victim_pem = pem_encode_public(&rsa::RsaPublicKey::from(&victim)).unwrap();
+        let crafted = format!(
+            "x{}\n{}",
+            victim_pem.trim_end(),
+            pem_encode_public(&rsa::RsaPublicKey::from(&attacker)).unwrap()
+        );
+        let now = now_secs();
+        let mut forged = payload(&victim, now);
+        forged.public_key = crafted.clone();
+        forged.fingerprint = fingerprint_pubkey(victim_pem.as_bytes()).unwrap();
+        let link = encode_signed(forged.clone(), &attacker).unwrap();
+        assert!(decode_signed_at(&link, now).is_err());
+
+        let v1 = InvitePayload {
+            name: forged.name,
+            address: forged.address,
+            fingerprint: forged.fingerprint,
+            public_key: crafted,
+        };
+        assert!(decode_unsigned(&encode_unsigned(&v1).unwrap()).is_err());
+    }
+
+    /// A v1 invite is fingerprinted before any PEM parse; a key whose markers
+    /// are out of order used to panic the whole app.
+    #[test]
+    fn a_malformed_v1_key_is_an_error_not_a_crash() {
+        let v1 = InvitePayload {
+            name: "x".into(),
+            address: None,
+            fingerprint: "00".repeat(32),
+            public_key: "-----END PUBLIC KEY----------BEGIN PUBLIC KEY-----".into(),
+        };
+        assert!(decode_unsigned(&encode_unsigned(&v1).unwrap()).is_err());
     }
 }

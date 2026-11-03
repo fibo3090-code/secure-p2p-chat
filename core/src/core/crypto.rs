@@ -3,8 +3,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use ed25519_dalek::{
     Signature, Signer, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey,
 };
@@ -45,9 +43,32 @@ pub fn pem_encode_public(pubkey: &RsaPublicKey) -> Result<String> {
         .map_err(|e| anyhow!("PEM encode failed: {}", e))
 }
 
-/// Import RSA public key from PEM format
+const PUBLIC_KEY_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
+const PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
+
+/// Import an RSA public key from PEM — **strictly**: exactly one
+/// `PUBLIC KEY` block, with nothing around it but whitespace.
+///
+/// RFC 7468 lets a parser skip a free-text *preamble* before the block, and
+/// the `pem-rfc7468` decoder does: anything up to the first line break that is
+/// followed by `-----BEGIN `. A preamble can therefore carry a complete PEM
+/// block of its own, and a string holding two blocks meant one key to this
+/// parser and another to anything that scanned for the first `BEGIN` marker —
+/// which is how the fingerprint used to be computed. Every peer-supplied key
+/// (identity proofs, invites, community servers) passes through here, so a
+/// second block, a preamble or trailing text is refused outright.
 pub fn pem_decode_public(pem: &str) -> Result<RsaPublicKey> {
-    RsaPublicKey::from_public_key_pem(pem).map_err(|e| anyhow!("PEM decode failed: {}", e))
+    let trimmed = pem.trim();
+    let single_block = trimmed.starts_with(PUBLIC_KEY_BEGIN)
+        && trimmed.ends_with(PUBLIC_KEY_END)
+        && trimmed.matches(PUBLIC_KEY_BEGIN).count() == 1
+        && trimmed.matches(PUBLIC_KEY_END).count() == 1;
+    if !single_block {
+        return Err(anyhow!(
+            "PEM decode failed: expected exactly one PUBLIC KEY block and nothing else"
+        ));
+    }
+    RsaPublicKey::from_public_key_pem(trimmed).map_err(|e| anyhow!("PEM decode failed: {}", e))
 }
 
 /// Export RSA private key to PEM format
@@ -71,27 +92,33 @@ pub fn pem_decode_private(pem: &str) -> Result<RsaPrivateKey> {
 // side-channel out of the product entirely rather than relying on it being
 // "unused". Do not reintroduce RSA encryption/decryption; use the AEAD tunnel.
 
-/// Calculate SHA-256 fingerprint of public key PEM
-pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> String {
-    // Try to extract DER bytes from PEM and hash the canonical DER (SubjectPublicKeyInfo)
-    if let Ok(s) = std::str::from_utf8(pem_bytes) {
-        if let (Some(begin), Some(end)) = (
-            s.find("-----BEGIN PUBLIC KEY-----"),
-            s.find("-----END PUBLIC KEY-----"),
-        ) {
-            let body = &s[begin + "-----BEGIN PUBLIC KEY-----".len()..end];
-            // Remove whitespace/newlines from PEM body
-            let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-            if let Ok(der) = BASE64_STANDARD.decode(&b64) {
-                let hash = Sha256::digest(&der);
-                return hex::encode(hash);
-            }
-        }
-    }
+/// The fingerprint of a public key: lowercase hex SHA-256 of its
+/// SubjectPublicKeyInfo DER encoding.
+///
+/// Computed from the *parsed* key, so it always names the key that signatures
+/// are verified with. For any honestly encoded PEM this equals the hash of the
+/// PEM's base64 body (SPKI DER is canonical), so existing fingerprints, pins
+/// and verified contacts are unchanged.
+pub fn fingerprint_public_key(key: &RsaPublicKey) -> Result<String> {
+    let der = key
+        .to_public_key_der()
+        .map_err(|e| anyhow!("DER encode failed: {}", e))?;
+    Ok(hex::encode(Sha256::digest(der.as_bytes())))
+}
 
-    // Fallback: hash raw bytes
-    let hash = Sha256::digest(pem_bytes);
-    hex::encode(hash)
+/// The fingerprint of a PEM-encoded public key; see [`fingerprint_public_key`].
+///
+/// This used to hash the base64 text between the first `BEGIN` and the first
+/// `END` marker found anywhere in the string, falling back to hashing the raw
+/// bytes, while signatures were verified against whatever the PEM *parser*
+/// returned. The two disagreed on a crafted string (a preamble holding one key,
+/// the block proper holding another), so a peer could present someone else's
+/// fingerprint while signing with its own key — and a string whose `END`
+/// marker came first panicked the slice. Now there is one parse, and a
+/// malformed PEM is an error rather than a fingerprint of its bytes.
+pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> Result<String> {
+    let pem = std::str::from_utf8(pem_bytes).map_err(|e| anyhow!("PEM is not UTF-8: {}", e))?;
+    fingerprint_public_key(&pem_decode_public(pem)?)
 }
 
 // ============================================================================
@@ -853,8 +880,8 @@ mod tests {
         let pubkey = RsaPublicKey::from(&privkey);
         let pem = pem_encode_public(&pubkey).unwrap();
 
-        let fp1 = fingerprint_pubkey(pem.as_bytes());
-        let fp2 = fingerprint_pubkey(pem.as_bytes());
+        let fp1 = fingerprint_pubkey(pem.as_bytes()).unwrap();
+        let fp2 = fingerprint_pubkey(pem.as_bytes()).unwrap();
 
         assert_eq!(fp1, fp2);
         assert_eq!(fp1.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
@@ -1175,9 +1202,9 @@ mod tests {
     fn deriving_a_subkey_does_not_change_the_identity_fingerprint() {
         let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let pem = pem_encode_public(&RsaPublicKey::from(&identity)).unwrap();
-        let before = fingerprint_pubkey(pem.as_bytes());
+        let before = fingerprint_pubkey(pem.as_bytes()).unwrap();
         let _ = derive_ed25519_subkey(&identity).unwrap();
-        let after = fingerprint_pubkey(pem.as_bytes());
+        let after = fingerprint_pubkey(pem.as_bytes()).unwrap();
         assert_eq!(before, after);
     }
 
@@ -1370,6 +1397,68 @@ mod tests {
                 assert_eq!(decoded_schemes, schemes);
             }
             _ => panic!("Expected SupportedSignatureSchemes message"),
+        }
+    }
+
+    /// Two public keys in one string: one hidden in an RFC 7468 preamble,
+    /// one in the block proper. The fingerprint used to be read from the first
+    /// and signatures checked against the second, so a peer could present a
+    /// victim's fingerprint while signing with its own key.
+    fn two_key_pem() -> (String, RsaPublicKey, RsaPublicKey) {
+        let victim = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
+        let attacker = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
+        let crafted = format!(
+            "x{}\n{}",
+            pem_encode_public(&victim).unwrap().trim_end(),
+            pem_encode_public(&attacker).unwrap()
+        );
+        (crafted, victim, attacker)
+    }
+
+    #[test]
+    fn a_pem_with_a_second_key_in_its_preamble_is_refused() {
+        let (crafted, _, _) = two_key_pem();
+        assert!(pem_decode_public(&crafted).is_err());
+        assert!(fingerprint_pubkey(crafted.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn text_around_a_single_pem_block_is_refused() {
+        let key = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
+        let pem = pem_encode_public(&key).unwrap();
+        assert!(pem_decode_public(&format!("comment\n{pem}")).is_err());
+        assert!(pem_decode_public(&format!("{pem}trailing")).is_err());
+        // Surrounding whitespace and CRLF line endings are not an attack.
+        assert_eq!(pem_decode_public(&format!("  \n{pem}\n\n")).unwrap(), key);
+        assert_eq!(pem_decode_public(&pem.replace('\n', "\r\n")).unwrap(), key);
+    }
+
+    /// An END marker before the BEGIN marker used to make the fingerprint's
+    /// slice start past its end and panic — a crash from a pasted v1 invite.
+    #[test]
+    fn markers_in_the_wrong_order_are_an_error_not_a_panic() {
+        let s = "-----END PUBLIC KEY----------BEGIN PUBLIC KEY-----";
+        assert!(fingerprint_pubkey(s.as_bytes()).is_err());
+        assert!(fingerprint_pubkey(b"not a key at all").is_err());
+        assert!(fingerprint_pubkey(&[0xff, 0xfe]).is_err());
+    }
+
+    /// Existing fingerprints, pins and verified contacts must not move: for an
+    /// honestly encoded key the parsed-key fingerprint equals the hash of the
+    /// PEM's base64 body, which is what was stored before.
+    #[test]
+    fn honest_fingerprints_are_unchanged() {
+        use base64::Engine;
+        for _ in 0..3 {
+            let key = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
+            let pem = pem_encode_public(&key).unwrap();
+            let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .unwrap();
+            let legacy = hex::encode(Sha256::digest(&der));
+            assert_eq!(fingerprint_pubkey(pem.as_bytes()).unwrap(), legacy);
+            assert_eq!(fingerprint_public_key(&key).unwrap(), legacy);
         }
     }
 }

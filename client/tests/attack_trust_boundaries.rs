@@ -44,7 +44,7 @@ fn an_invite_whose_fingerprint_contradicts_its_key_is_refused() {
     let key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
     let pem = messenger_core::core::pem_encode_public(&rsa::RsaPublicKey::from(&key))
         .expect("encode public key");
-    let honest = messenger_core::core::fingerprint_pubkey(pem.as_bytes());
+    let honest = messenger_core::core::fingerprint_pubkey(pem.as_bytes()).unwrap();
     let forged = "ff".repeat(32);
     assert_ne!(honest, forged);
 

@@ -81,11 +81,13 @@ mod diagnostics {
         let manager = ChatManager::new(Config::default());
         // The fingerprint must be the one that belongs to the key in the link:
         // `parse_invite_link` refuses an invite whose two halves disagree.
-        const PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----";
+        // A real key: invites are fingerprinted from the parsed key, so a
+        // truncated placeholder PEM is refused.
+        const PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiCkJE4AgjmiHxvGso7R/\nDuw96YbDo3cRz1E7ShJzCSw7YnJapuV1yqxQN+hfPYoLrjoEDwa5DYPE8qVabfl4\ncwvKyECzoGM0duq8lxRD6/0CLAIlV7QUZla2Zu0Y6eJQ2KDf8fT/CLlZQxAJ8Rua\nXYDnjQTPhMIUfbZZFYSEBC/xhgvBP2wDVW/+E+5DUIy0VKvu1fEq+OEPrL3V6qcZ\nRlkO7OmIbfSlnx4kC4dGyqX360N7vf8GGycd1ADTWKzs0IAkNr3FOmEKTnSuABL+\nRM/QkXnZvmWWRYA5jlFgruDCfhnpq58Fn1IymsosFvHWWCBrADhR6YQEY6D3tP07\npQIDAQAB\n-----END PUBLIC KEY-----";
         let payload = serde_json::json!({
             "name": "Diag",
             "address": "172.20.0.5:6000",
-            "fingerprint": messenger_core::core::crypto::fingerprint_pubkey(PEM.as_bytes()),
+            "fingerprint": messenger_core::core::crypto::fingerprint_pubkey(PEM.as_bytes()).unwrap(),
             "public_key": PEM
         });
         let encoded = base64::engine::general_purpose::STANDARD

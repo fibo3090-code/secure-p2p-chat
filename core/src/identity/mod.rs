@@ -12,8 +12,6 @@ pub mod invite;
 
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit},
     ChaCha20Poly1305,
@@ -183,7 +181,7 @@ impl Identity {
         let public_key_pem = public_key.to_public_key_pem(LineEnding::LF)?;
 
         // Calculate fingerprint
-        let fingerprint = Self::calculate_fingerprint(&public_key_pem);
+        let fingerprint = Self::calculate_fingerprint(&public_key_pem)?;
 
         Ok(Self {
             id: Uuid::new_v4(),
@@ -214,7 +212,7 @@ impl Identity {
         let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
         let public_key_pem = public_key.to_public_key_pem(LineEnding::LF)?;
 
-        let fingerprint = Self::calculate_fingerprint(&public_key_pem);
+        let fingerprint = Self::calculate_fingerprint(&public_key_pem)?;
 
         Ok(Self {
             id: Uuid::new_v4(),
@@ -230,26 +228,10 @@ impl Identity {
         })
     }
 
-    /// Calculate SHA-256 fingerprint of public key
-    fn calculate_fingerprint(public_key_pem: &str) -> String {
-        // Prefer hashing canonical DER (SubjectPublicKeyInfo) extracted from PEM
-        if let Ok(s) = std::str::from_utf8(public_key_pem.as_bytes()) {
-            if let (Some(begin), Some(end)) = (
-                s.find("-----BEGIN PUBLIC KEY-----"),
-                s.find("-----END PUBLIC KEY-----"),
-            ) {
-                let body = &s[begin + "-----BEGIN PUBLIC KEY-----".len()..end];
-                let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-                if let Ok(der) = BASE64_STANDARD.decode(&b64) {
-                    let hash = Sha256::digest(&der);
-                    return hex::encode(hash);
-                }
-            }
-        }
-
-        // Fallback: hash raw PEM bytes
-        let result = Sha256::digest(public_key_pem.as_bytes());
-        hex::encode(result)
+    /// Calculate the fingerprint of a public key PEM. One implementation for
+    /// the whole crate: see [`crate::core::crypto::fingerprint_pubkey`].
+    fn calculate_fingerprint(public_key_pem: &str) -> Result<String> {
+        crate::core::crypto::fingerprint_pubkey(public_key_pem.as_bytes())
     }
 
     /// Encrypt the private key with a password.
@@ -725,6 +707,7 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use tempfile::tempdir;
 
     fn test_password() -> String {
@@ -762,7 +745,7 @@ mod tests {
         let public_key_pem = RsaPublicKey::from(&key)
             .to_public_key_pem(LineEnding::LF)
             .unwrap();
-        let fingerprint = Identity::calculate_fingerprint(&public_key_pem);
+        let fingerprint = Identity::calculate_fingerprint(&public_key_pem).unwrap();
         Identity {
             id: Uuid::nil(),
             name: "KAT".to_string(),
