@@ -12,6 +12,7 @@ import { Settings } from "./components/Settings.jsx";
 import { Parties } from "./components/Parties.jsx";
 import { Relays } from "./components/Relays.jsx";
 import { Toasts } from "./components/Toasts.jsx";
+import { HistoryBanner } from "./components/HistoryBanner.jsx";
 import { RenameDialog, ConfirmDelete, InfoDialog } from "./components/ChatDialogs.jsx";
 import { toast } from "./lib/toast.js";
 import { THEMES, loadTheme, saveTheme } from "./lib/themes.js";
@@ -173,6 +174,16 @@ export default function App() {
   }, []);
 
   const ready = auth?.state === "ready";
+
+  // An unreadable history file blocks saving until the user decides; ask once
+  // per unlock and keep the banner up until it is resolved.
+  const [historyIssue, setHistoryIssue] = useState(null);
+  useEffect(() => {
+    if (!ready) return;
+    api.historyStatus()
+      .then((s) => setHistoryIssue(s && s.error ? s : null))
+      .catch(() => {});
+  }, [ready]);
 
   // Tell the bridge what is on screen. ChatManager owns no window handle, so
   // without this it cannot tell a background message from one the user is
@@ -368,6 +379,13 @@ export default function App() {
         </div>
       </header>
 
+      {historyIssue && (
+        <HistoryBanner issue={historyIssue} onSetAside={async () => {
+          const moved = await api.setAsideHistory();
+          setHistoryIssue(null);
+          toast(moved ? `Old history kept as ${moved}` : "Started a new history", "info");
+        }} />
+      )}
       <div className="app-body">
         {/* role + label are explicit: <nav> carries the landmark implicitly, but
             an unlabelled one is announced only as "navigation", and this app has

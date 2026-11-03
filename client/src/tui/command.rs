@@ -63,6 +63,8 @@ pub enum TuiCommand {
     Rename(String),
     DeleteChat,
     ClearHistory,
+    /// Move an unreadable history file aside and start a new, empty one.
+    HistoryReset,
 
     // --- identity / security ---
     Identity,
@@ -267,6 +269,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("rename", ":rename <title>", "Rename the selected chat"),
     ("delete", ":delete", "Delete the selected chat"),
     ("clear-history", ":clear-history", "Erase all chats and contacts"),
+    (
+        "history-reset",
+        ":history-reset",
+        "Keep an unreadable history file aside and start a new one",
+    ),
     ("identity", ":identity", "Show your name, fingerprint and safety grid"),
     ("verify", ":verify <accept|reject>", "Answer a pending fingerprint check"),
     ("unlock", ":unlock [password]", "Unlock a password-protected identity"),
@@ -476,6 +483,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "rename" => C::Rename(a.text()?),
         "delete" => C::DeleteChat,
         "clear-history" => C::ClearHistory,
+        "history-reset" => C::HistoryReset,
 
         "identity" => C::Identity,
         "verify" => match a.word()?.to_ascii_lowercase().as_str() {

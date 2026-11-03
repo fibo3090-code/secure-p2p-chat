@@ -202,7 +202,41 @@ impl ChatManager {
     /// Load history from encrypted or plaintext file with automatic migration.
     /// If encrypted history exists, loads it. Otherwise tries plaintext (legacy) and migrates it.
     /// Returns Ok(true) if history was loaded, Ok(false) if no history exists.
+    ///
+    /// **A failed load blocks every later save** until the user decides what to
+    /// do (see [`Self::history_load_error`] and
+    /// [`Self::set_aside_unreadable_history`]). The callers used to log the
+    /// error and carry on with an empty, unlocked manager, and the next save —
+    /// on the desktop, the first poll tick — wrote that emptiness over the file.
+    /// Downgrading to an older build, a history file from a newer one, a cloud
+    /// placeholder that was not downloaded, or bit-rot was enough to lose every
+    /// conversation and contact.
     pub fn load_history_auto(&mut self, encrypted_path: &Path, key: &[u8; 32]) -> Result<bool> {
+        let result = self.load_history_auto_inner(encrypted_path, key);
+        match &result {
+            Ok(_) => self.history_load_error = None,
+            Err(e) => {
+                let reason = format!("{e:#}");
+                tracing::error!(
+                    path = %encrypted_path.display(),
+                    error = %reason,
+                    "history could not be loaded; saving is blocked so the file is not overwritten"
+                );
+                self.history_load_error = Some(reason);
+                self.add_toast(
+                    ToastLevel::Error,
+                    format!(
+                        "Your message history at {} could not be read. It has not been changed, \
+                         and nothing will be saved over it until you choose what to do.",
+                        encrypted_path.display()
+                    ),
+                );
+            }
+        }
+        result
+    }
+
+    fn load_history_auto_inner(&mut self, encrypted_path: &Path, key: &[u8; 32]) -> Result<bool> {
         // Try encrypted history first
         if encrypted_path.exists() {
             tracing::info!(
@@ -294,6 +328,38 @@ impl ChatManager {
         );
     }
 
+    /// Why the history could not be loaded, if it could not. While this is
+    /// `Some`, saving is refused; a front-end should tell the user and offer
+    /// [`Self::set_aside_unreadable_history`].
+    pub fn history_load_error(&self) -> Option<&str> {
+        self.history_load_error.as_deref()
+    }
+
+    /// Move an unreadable history file out of the way (renamed to
+    /// `<name>.unreadable-<timestamp>`, never deleted) and allow saving again,
+    /// so the user can start a fresh history without losing the old file —
+    /// it can still be opened by the build that wrote it.
+    pub fn set_aside_unreadable_history(
+        &mut self,
+        path: &Path,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let moved = if path.exists() {
+            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "history.json.enc".to_string());
+            let aside = path.with_file_name(format!("{file_name}.unreadable-{stamp}"));
+            std::fs::rename(path, &aside)?;
+            tracing::warn!(from = %path.display(), to = %aside.display(), "unreadable history set aside");
+            Some(aside)
+        } else {
+            None
+        };
+        self.history_load_error = None;
+        Ok(moved)
+    }
+
     /// Load encrypted chat history from file
     pub fn load_history_encrypted(&mut self, path: &Path, key: &[u8; 32]) -> Result<()> {
         let history = HistoryFile::load_encrypted(path, key)?;
@@ -313,6 +379,12 @@ impl ChatManager {
     /// running *now*. Saved, it came back after a restart as a "Host on :port"
     /// conversation shown as waiting for a peer, with nothing listening.
     pub fn history_snapshot(&self) -> Result<(HistoryFile, [u8; 32])> {
+        if let Some(reason) = &self.history_load_error {
+            anyhow::bail!(
+                "refusing to save: the history on disk could not be loaded ({reason}), \
+                 and saving would replace it"
+            );
+        }
         let key = self
             .history_key
             .ok_or_else(|| anyhow!("History encryption key not available"))?;
@@ -629,6 +701,68 @@ mod tests {
             .save_history(temp_file.path())
             .expect_err("should require key");
         assert!(err.to_string().contains("History encryption key"));
+    }
+
+    /// A history file that exists but cannot be read must never be replaced.
+    /// Every caller used to warn and carry on, and the next save wrote the
+    /// empty state the failed load left behind over every conversation.
+    #[test]
+    fn an_unreadable_history_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json.enc");
+        // Written with a different key: decrypts as garbage, like a file from
+        // another identity, a newer build, or bit-rot.
+        let mut other = ChatManager::new(Config::default());
+        other.set_history_key([7u8; 32]);
+        other.save_history(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let mut mgr = ChatManager::new(Config::default());
+        mgr.set_history_key([1u8; 32]);
+        assert!(mgr.load_history_auto(&path, &[1u8; 32]).is_err());
+        assert!(mgr.history_load_error().is_some());
+
+        assert!(mgr.save_history(&path).is_err(), "saving must be refused");
+        assert!(
+            mgr.history_snapshot().is_err(),
+            "background saves must be refused too"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "the file is untouched"
+        );
+
+        // Even an explicit "clear history" sets the unreadable file aside
+        // rather than writing over it.
+        mgr.clear_history(&path);
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".unreadable-"))
+                .map(|e| std::fs::read(e.path()).unwrap())
+                .collect::<Vec<_>>(),
+            vec![original],
+            "the unreadable file must survive, set aside, byte for byte"
+        );
+    }
+
+    #[test]
+    fn setting_an_unreadable_history_aside_keeps_it_and_allows_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json.enc");
+        std::fs::write(&path, b"not a history file at all").unwrap();
+
+        let mut mgr = ChatManager::new(Config::default());
+        mgr.set_history_key([1u8; 32]);
+        assert!(mgr.load_history_auto(&path, &[1u8; 32]).is_err());
+
+        let aside = mgr.set_aside_unreadable_history(&path).unwrap().unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), b"not a history file at all");
+        assert!(mgr.history_load_error().is_none());
+        mgr.save_history(&path).unwrap();
+        assert!(mgr.load_history_auto(&path, &[1u8; 32]).unwrap());
     }
 
     #[test]

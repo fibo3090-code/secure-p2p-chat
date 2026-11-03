@@ -257,6 +257,8 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::auth::my_identity,
         commands::auth::set_display_name,
         commands::auth::export_identity,
+        commands::auth::history_status,
+        commands::auth::set_aside_history,
         commands::auth::export_diagnostics,
         commands::auth::open_data_dir,
         commands::connect::lock_state,

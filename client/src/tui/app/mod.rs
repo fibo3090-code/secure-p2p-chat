@@ -487,6 +487,14 @@ impl TuiApp {
             self.status_line = "🔒 Identity locked — :unlock <password> to continue".to_string();
             return;
         }
+        // Saving is blocked while this holds, so it outranks everything else
+        // on the status line until the user deals with it.
+        if self.chat_manager.history_load_error().is_some() {
+            self.status_line = "⚠ History unreadable — nothing is being saved. \
+                 Restore the file, or :history-reset to keep it aside and start fresh"
+                .to_string();
+            return;
+        }
 
         let sessions = self.chat_manager.sessions_len();
         let chat_label = match self.selected_chat_id() {
@@ -1045,6 +1053,7 @@ impl TuiApp {
             TuiCommand::Rename(title) => self.cmd_rename(title),
             TuiCommand::DeleteChat => self.disconnect_selected(),
             TuiCommand::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
+            TuiCommand::HistoryReset => self.cmd_history_reset(),
 
             TuiCommand::Identity => {
                 Self::copy_to_clipboard(&self.identity.fingerprint);

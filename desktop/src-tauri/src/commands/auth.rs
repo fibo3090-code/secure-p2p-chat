@@ -198,6 +198,46 @@ pub(crate) fn set_display_name(
     Ok(auth_status(state))
 }
 
+/// Whether the history on disk failed to load this session.
+#[derive(serde::Serialize)]
+pub(crate) struct HistoryStatus {
+    /// `Some(reason)` when the file exists but could not be read. Saving is
+    /// blocked while this is set (see `ChatManager::history_load_error`), so
+    /// the UI must say so and offer [`set_aside_history`].
+    error: Option<String>,
+    /// Where the history lives, so the message can name the file.
+    path: String,
+}
+
+#[tauri::command]
+pub(crate) async fn history_status(
+    state: tauri::State<'_, Bridge>,
+) -> Result<HistoryStatus, String> {
+    ensure_ready(&state)?;
+    let mgr = state.manager.lock().await;
+    Ok(HistoryStatus {
+        error: mgr.history_load_error().map(str::to_string),
+        path: state.history_path.display().to_string(),
+    })
+}
+
+/// Move an unreadable history file aside (renamed, never deleted) and start a
+/// fresh history. Returns where the old file went.
+#[tauri::command]
+pub(crate) async fn set_aside_history(
+    state: tauri::State<'_, Bridge>,
+) -> Result<Option<String>, String> {
+    ensure_ready(&state)?;
+    let moved = state
+        .manager
+        .lock()
+        .await
+        .set_aside_unreadable_history(&state.history_path)
+        .map_err(|e| format!("Could not move the unreadable history aside: {e}"))?;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
+    Ok(moved.map(|p| p.display().to_string()))
+}
+
 /// Export a backup copy of the encrypted identity file (identity.json) to a
 /// user-chosen location. The file is already encrypted at rest (Argon2 +
 /// ChaCha20-Poly1305), so the copy is as safe as the original — but it IS the

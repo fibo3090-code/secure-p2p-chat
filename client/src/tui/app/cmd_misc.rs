@@ -118,4 +118,30 @@ impl TuiApp {
             }
         }
     }
+
+    /// `:history-reset` — move an unreadable history aside (renamed, never
+    /// deleted) so saving can resume.
+    pub(super) fn cmd_history_reset(&mut self) {
+        if self.chat_manager.history_load_error().is_none() {
+            self.toast(
+                ToastLevel::Info,
+                "Your history loaded normally; there is nothing to reset.".to_string(),
+            );
+            return;
+        }
+        let path = self.history_path.clone();
+        match self.chat_manager.set_aside_unreadable_history(&path) {
+            Ok(moved) => {
+                self.save_history_now();
+                let note = moved
+                    .map(|p| format!("Old history kept as {}", p.display()))
+                    .unwrap_or_else(|| "Started a new history".to_string());
+                self.toast(ToastLevel::Success, note);
+            }
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("Could not move the unreadable history aside: {e}"),
+            ),
+        }
+    }
 }

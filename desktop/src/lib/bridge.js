@@ -115,6 +115,8 @@ const realApi = {
   changePassword: (current, next) => invoke("change_password", { current, new: next }),
   setDisplayName: (name) => invoke("set_display_name", { name }),
   exportIdentity: () => invoke("export_identity"),
+  historyStatus: () => invoke("history_status"),
+  setAsideHistory: () => invoke("set_aside_history"),
   exportDiagnostics: () => invoke("export_diagnostics"),
   openDataDir: () => invoke("open_data_dir"),
   lockState: () => invoke("lock_state"),
@@ -305,6 +307,13 @@ function makeMock() {
     },
     setDisplayName: async (name) => ({ state: authState, name, fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
     exportIdentity: async () => "C:\\Users\\you\\p2pem-identity-backup.json",
+    // `?mockHistory=error` previews the unreadable-history banner.
+    historyStatus: async () => ({
+      error: new URLSearchParams(location.search).get("mockHistory") === "error"
+        ? "Unsupported history version: 9.0" : null,
+      path: "C:\\Users\\you\\AppData\\Roaming\\chat-p2p\\P2PEM\\data\\history.json.enc",
+    }),
+    setAsideHistory: async () => "C:\\Users\\you\\…\\history.json.enc.unreadable-20261103T120000Z",
     exportDiagnostics: async () => "C:\\Users\\you\\AppData\\P2PEM\\diagnostics\\bundle-mock",
     openDataDir: async () => "C:\\Users\\you\\AppData\\P2PEM",
     lockState: async () => mockSettings._locked || false,

@@ -80,6 +80,14 @@ predate tagged releases.
 
 ### Fixed
 
+- **An unreadable history file is no longer replaced with an empty one.**
+  If the history could not be read — written by a newer version, not fully
+  downloaded from a cloud folder, damaged — the app carried on with no
+  conversations and saved that emptiness over the file at the first
+  opportunity, losing every conversation, contact and verification. Now
+  nothing is saved over it: the app says so (a banner on desktop, the status
+  line in the terminal app) and lets you either restore the file or keep it
+  aside under a new name and start a new history.
 - **Image previews no longer fail to appear while another file is
   transferring.** Each progress update cancelled the preview being loaded and
   marked it as already fetched, so it was never shown.

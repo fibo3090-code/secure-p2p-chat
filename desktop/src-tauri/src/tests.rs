@@ -108,6 +108,11 @@ fn ready_harness() -> Harness {
 }
 
 impl Harness {
+    /// Where this harness's bridge keeps the encrypted history.
+    fn bridge_history_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("history.json.enc")
+    }
+
     /// Invoke a command over the mock IPC exactly like the webview would.
     fn ipc(&self, cmd: &str, args: Value) -> Result<Value, Value> {
         tauri::test::get_ipc_response(
@@ -317,6 +322,31 @@ fn unreadable_identity_reports_an_error_state_and_gates_everything() {
 
 /// The screen reads the floor from the bridge rather than hardcoding one, so
 /// `auth_status` has to report it.
+/// An existing history file that cannot be read must survive the unlock: the
+/// poll loop and every immediate save used to write the empty state over it.
+#[test]
+fn an_unreadable_history_survives_unlock_and_can_be_set_aside() {
+    let h = harness();
+    std::fs::write(&h.bridge_history_path(), b"written by a future version").unwrap();
+
+    h.ipc("set_password", json!({ "password": "bridge-test-passphrase" }))
+        .expect("set_password");
+    let status = h.ipc("history_status", json!({})).unwrap();
+    assert!(status["error"].is_string(), "the failure must be reported: {status}");
+
+    // A command that saves immediately must not touch the file.
+    h.ipc("set_display_name", json!({ "name": "Eve" })).unwrap();
+    assert_eq!(
+        std::fs::read(h.bridge_history_path()).unwrap(),
+        b"written by a future version"
+    );
+
+    let moved = h.ipc("set_aside_history", json!({})).unwrap();
+    let moved = moved.as_str().expect("the new location is returned");
+    assert_eq!(std::fs::read(moved).unwrap(), b"written by a future version");
+    assert!(h.ipc("history_status", json!({})).unwrap()["error"].is_null());
+}
+
 #[test]
 fn auth_status_publishes_the_password_floor() {
     let h = harness();

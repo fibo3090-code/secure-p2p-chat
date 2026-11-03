@@ -173,6 +173,16 @@ pub struct ChatManager {
     /// cannot consume a prompt it has not yet answered.
     fingerprint_verification_requests: VecDeque<PendingFingerprint>,
     pub history_key: Option<[u8; 32]>,
+    /// Why the history file on disk could not be loaded, if it could not.
+    ///
+    /// While this is set, nothing may be written to that file: the in-memory
+    /// state is empty only because the load failed, and saving it would
+    /// replace every conversation, contact and trust decision with nothing —
+    /// silently and atomically. It is the `identity.json` rule applied to the
+    /// history: never replace what merely failed to *load*. Cleared only by
+    /// [`ChatManager::set_aside_unreadable_history`], which moves the file out
+    /// of the way first, or by a later successful load.
+    pub(crate) history_load_error: Option<String>,
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
@@ -262,6 +272,7 @@ impl ChatManager {
             fingerprint_verification_requests: VecDeque::new(),
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
+            history_load_error: None,
             is_hosting: false,
             rehost_failures: 0,
             hosting_port: None,
@@ -788,6 +799,14 @@ impl ChatManager {
         self.fingerprint_verification_requests.clear();
 
         if !history_path.as_os_str().is_empty() && self.history_key.is_some() {
+            // An unreadable file is moved aside, not cleared over: "clear my
+            // history" must not also destroy history the app could not read.
+            if self.history_load_error.is_some() {
+                if let Err(e) = self.set_aside_unreadable_history(history_path) {
+                    tracing::error!(error = %e, "could not set the unreadable history aside; not saving");
+                    return;
+                }
+            }
             let _ = self.save_history(history_path);
             tracing::info!("History cleared and saved");
         } else {

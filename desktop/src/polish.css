@@ -301,3 +301,15 @@ button.set-row:hover { border-color: var(--border-2); }
   outline: 2px solid var(--text);
   outline-offset: 2px;
 }
+
+/* Unreadable-history banner (HistoryBanner.jsx): saving is blocked until the
+   user decides, so it must stay visible rather than be a passing toast. */
+.history-banner { display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px;
+  background: color-mix(in srgb, var(--warning) 14%, var(--bg));
+  border-bottom: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+  color: var(--text); font-size: 13px; line-height: 1.45; }
+.history-banner > svg { color: var(--warning); flex: none; margin-top: 2px; }
+.history-banner-body { flex: 1; min-width: 0; }
+.history-banner-detail { margin-top: 4px; color: var(--dim); overflow-wrap: anywhere; }
+.history-banner-err { margin-top: 4px; color: var(--danger); }
+.history-banner-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
