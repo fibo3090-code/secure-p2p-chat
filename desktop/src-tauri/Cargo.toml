@@ -8,9 +8,12 @@ license.workspace = true
 authors.workspace = true
 
 [lib]
-# The shared library the binary and (future) mobile entry points call into.
+# The library the binary calls into. Only `rlib`: the `staticlib`/`cdylib`
+# types exist for Tauri *mobile* entry points, which this project does not
+# ship, and they cost ~1.8 GB of build output per profile (audit DX-03). Add
+# them back when mobile work starts.
 name = "p2pem_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
