@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// Fingerprint equality for the trust paths in this file (remove, block,
+/// unblock). Stored contact fingerprints are canonical, but a block or a trust
+/// revocation that silently misses because one side was spelled in capitals
+/// is the failure that matters, so these compare without regard to case.
+fn same_fingerprint(stored: Option<&str>, fingerprint: &str) -> bool {
+    stored.is_some_and(|fp| fp.eq_ignore_ascii_case(fingerprint))
+}
+
 impl ChatManager {
     /// Parse an address of the form host:port
     /// Returns (host, port) or an error if the format is invalid.
@@ -22,6 +30,9 @@ impl ChatManager {
         public_key: Option<String>,
     ) -> Uuid {
         let id = Uuid::new_v4();
+        let fingerprint = fingerprint
+            .as_deref()
+            .map(crate::util::canonical_fingerprint);
         tracing::info!(id = %id, name = %name, has_address = %address.is_some(), has_fp = %fingerprint.is_some(), "Adding contact");
         let contact = Contact {
             id,
@@ -51,6 +62,10 @@ impl ChatManager {
     /// resolved by identity, not by name: an invite for a fingerprint we already
     /// have refreshes that contact instead of duplicating it.
     pub fn import_contact(&mut self, mut contact: Contact) -> Result<Uuid> {
+        contact.fingerprint = contact
+            .fingerprint
+            .as_deref()
+            .map(crate::util::canonical_fingerprint);
         if let Some(fp) = contact.fingerprint.as_deref() {
             if self
                 .my_fingerprint
@@ -141,10 +156,10 @@ impl ChatManager {
             let still_known = self
                 .contacts
                 .values()
-                .any(|c| c.fingerprint.as_deref() == Some(fp.as_str()));
+                .any(|c| same_fingerprint(c.fingerprint.as_deref(), &fp));
             if !still_known {
                 for chat in self.chats.values_mut() {
-                    if chat.peer_fingerprint.as_deref() == Some(fp.as_str()) {
+                    if same_fingerprint(chat.peer_fingerprint.as_deref(), &fp) {
                         chat.peer_fingerprint = None;
                     }
                 }
@@ -192,7 +207,7 @@ impl ChatManager {
             let session_ids: Vec<Uuid> = self
                 .chats
                 .values()
-                .filter(|c| c.peer_fingerprint.as_deref() == Some(fp.as_str()))
+                .filter(|c| same_fingerprint(c.peer_fingerprint.as_deref(), &fp))
                 .map(|c| self.session_for_chat(c.id))
                 .collect();
             for sid in session_ids {
@@ -228,7 +243,7 @@ impl ChatManager {
             contact.fingerprint.as_deref().is_some_and(|fp| {
                 self.chats
                     .values()
-                    .any(|c| c.peer_fingerprint.as_deref() == Some(fp))
+                    .any(|c| same_fingerprint(c.peer_fingerprint.as_deref(), fp))
             })
         };
         let contact = self
@@ -248,8 +263,11 @@ impl ChatManager {
 
     /// Whether a peer fingerprint belongs to a blocked contact.
     pub(super) fn is_fingerprint_blocked(&self, fingerprint: &str) -> bool {
+        // Case-insensitive on top of canonical storage: a block is the one
+        // comparison where a false negative lets someone in.
         self.contacts.values().any(|c| {
-            c.trust_state == TrustState::Blocked && c.fingerprint.as_deref() == Some(fingerprint)
+            c.trust_state == TrustState::Blocked
+                && same_fingerprint(c.fingerprint.as_deref(), fingerprint)
         })
     }
 

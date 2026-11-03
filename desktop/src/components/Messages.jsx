@@ -427,14 +427,20 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   // A peer-sent file the OS would execute, held for the user's confirmation.
   const [riskyOpen, setRiskyOpen] = useState(null);
   const requested = useRef(new Set());
+  const contactId = contact ? contact.id : null;
+  const messageCount = contact ? contact.messages.length : 0;
+  // The conversation on screen *now*, for async work started on an earlier
+  // render to check before it writes (see the preview effect below).
+  const visibleContact = useRef(contactId);
   useEffect(() => {
+    visibleContact.current = contactId;
     setShown(MSG_WINDOW);
     setPreviews({});
     requested.current = new Set();
-  }, [contact && contact.id]);
+  }, [contactId]);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [contact && contact.id, contact && contact.messages.length]);
+  }, [contactId, messageCount]);
   // Which file cards are currently previewable. Keying the effect on this —
   // rather than on the message count — means a card that becomes eligible
   // without the thread growing (it gains a path, or finishes) still gets its
@@ -451,27 +457,33 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
                      isImageName(m.name) && !requested.current.has(m.id));
     if (want.length === 0) return;
     want.forEach((m) => requested.current.add(m.id));
-    let cancelled = false;
+    const forContact = contact.id;
     (async () => {
       const updates = {};
       for (const m of want) {
-        try { updates[m.id] = await api.filePreview(contact.id, m.id); }
+        try { updates[m.id] = await api.filePreview(forContact, m.id); }
         catch { updates[m.id] = null; }
       }
+      // Dropped only if the user has since switched conversations. This used
+      // to be an effect-cleanup flag, so *any* re-run cancelled the write —
+      // and the effect re-runs whenever another file card's progress ticks.
+      // The ids were already in `requested`, so a thumbnail fetched during
+      // someone else's transfer was thrown away and never asked for again.
+      //
       // Bounded: `requested` still remembers what was asked for, so an evicted
       // preview is not re-fetched in a loop — it simply renders as a plain card
       // until the conversation is reopened.
-      if (!cancelled) setPreviews((p) => trimPreviews({ ...p, ...updates }));
+      if (visibleContact.current === forContact) {
+        setPreviews((p) => trimPreviews({ ...p, ...updates }));
+      }
     })();
-    return () => { cancelled = true; };
-  }, [contact && contact.id, previewKey, shown]);
+  }, [contactId, previewKey, shown]); // eslint-disable-line react-hooks/exhaustive-deps -- `contact` changes identity every poll; previewKey captures what matters
 
   // Opening a peer's file can mean running their code. The bridge refuses
   // those unless confirmed and tells us what it is, so the click turns into a
   // question instead of an execution.
   // useCallback, because these are the props `MessageItem`'s memo compares by
   // identity — recreating them each render would defeat it entirely.
-  const contactId = contact ? contact.id : null;
   const openFile = useCallback(async (m) => {
     try {
       const r = await api.openFile(contactId, m.id, false);

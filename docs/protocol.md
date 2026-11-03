@@ -24,7 +24,7 @@ HANDSHAKE_TIMEOUT_SECS: 15
 MAX_FILE_SIZE: 10 GiB
 ```
 
-Party server input caps (`server/src/state.rs`), enforced server-side:
+Party server input caps (`server/src/state/mod.rs`), enforced server-side:
 
 ```rust
 MAX_USERNAME_CHARS: 32

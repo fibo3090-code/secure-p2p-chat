@@ -1,0 +1,8 @@
+# Reviewed gitleaks findings, one fingerprint per line (commit:file:rule:line).
+#
+# A test fixture, not a key: the damaged-identity test in server/src/identity.rs
+# wrote a truncated PEM header ("BEGIN PRIVATE KEY" followed by "trunc") to check
+# that a corrupt server key is refused rather than replaced. The source now
+# builds that string at runtime; this entry covers the commit that held it as a
+# literal, which stays in the branch history.
+19e00af111f68408a44fdad3b894e4b633605427:server/src/identity.rs:private-key:100

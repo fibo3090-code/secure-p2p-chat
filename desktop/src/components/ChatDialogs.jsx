@@ -10,9 +10,11 @@ export function RenameDialog({ target, onClose, onSubmit }) {
   // while target was still null. The field opened empty, and on the second
   // open it showed whatever was typed the previous time, for a different
   // conversation. Sync on every open instead.
+  const targetId = target ? target.id : null;
+  const targetName = target ? target.name || "" : "";
   useEffect(() => {
-    if (target) setName(target.name || "");
-  }, [target && target.id, target && target.name]);
+    if (targetId !== null) setName(targetName);
+  }, [targetId, targetName]);
   if (!target) return null;
   return (
     <Modal open onClose={onClose} width={400} title="Rename conversation" icon="edit">

@@ -122,7 +122,7 @@ Review carefully before changing:
 - `core/src/core/protocol.rs`
 - `core/src/identity/mod.rs`
 - `client/src/app/persistence.rs`
-- `server/src/state.rs` (Party access control, incl. `plan_blob_read` and the
+- `server/src/state/` (Party access control, incl. `plan_blob_read` and the
   three-phase upload — `begin_upload` / `write_staging` / `commit_upload`)
 - `desktop/src-tauri/src/lib.rs` (the IPC boundary + CSP)
 

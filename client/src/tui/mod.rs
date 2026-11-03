@@ -1,5 +1,6 @@
 pub mod app;
 pub mod command;
+mod downloads;
 pub mod input;
 pub mod overlays;
 pub mod ui;

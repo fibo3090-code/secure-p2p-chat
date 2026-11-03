@@ -93,13 +93,14 @@ export function Creator({ open, onClose, initialMode }) {
 
   // The UPnP external address can resolve up to ~15s after hosting starts;
   // keep refreshing the shown addresses while the host pane is open.
+  const hosting = hostAddr !== null;
   useEffect(() => {
-    if (!open || !hostAddr) return;
+    if (!open || !hosting) return;
     const t = setInterval(async () => {
       try { setHostAddr(await api.myAddresses()); } catch { /* keep last */ }
     }, 3000);
     return () => clearInterval(t);
-  }, [open, hostAddr !== null]);
+  }, [open, hosting]);
 
   // Nearby peers (mDNS) for the direct-connect pane, refreshed while it is
   // open. Hidden entirely when the setting is off (nearby === null).

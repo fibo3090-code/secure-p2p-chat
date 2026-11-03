@@ -314,295 +314,194 @@ pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
     }
 }
 
+/// The arguments after a command word, with usage errors drawn from
+/// [`COMMANDS`] — so `:help` and the error for a malformed command can never
+/// disagree, which is what happened when each arm spelled its own.
+struct Args<'a> {
+    cmd: &'a str,
+    words: std::str::SplitWhitespace<'a>,
+    /// Everything after the command word, spaces preserved (trimmed).
+    rest: &'a str,
+}
+
+impl<'a> Args<'a> {
+    fn usage(&self) -> String {
+        match command_help(self.cmd) {
+            Some((_, usage, _)) => format!("Usage: {usage}"),
+            None => format!("Usage: :help {}", self.cmd),
+        }
+    }
+
+    /// The next word, if any.
+    fn next(&mut self) -> Option<&'a str> {
+        self.words.next()
+    }
+
+    /// The next word, or the command's usage as the error.
+    fn word(&mut self) -> Result<&'a str, String> {
+        self.words.next().ok_or_else(|| self.usage())
+    }
+
+    fn opt_string(&mut self) -> Option<String> {
+        self.words.next().map(str::to_string)
+    }
+
+    /// The whole remainder of the line (it may contain spaces), required.
+    fn text(&self) -> Result<String, String> {
+        non_empty(self.rest, || self.usage())
+    }
+
+    /// The remainder after `first` (a word already taken with [`Self::word`]),
+    /// required — for `<target> <free text>` commands.
+    fn text_after(&self, first: &str) -> Result<String, String> {
+        non_empty(self.rest[first.len()..].trim(), || self.usage())
+    }
+}
+
+fn non_empty(s: &str, usage: impl FnOnce() -> String) -> Result<String, String> {
+    if s.is_empty() {
+        Err(usage())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
 /// Parse a raw command-line string (with or without the leading `:`).
 pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
+    use TuiCommand as C;
+
     let input = raw.trim().trim_start_matches(':').trim();
     if input.is_empty() {
         return Err("Empty command. Try :help".to_string());
     }
+    let mut words = input.split_whitespace();
+    let cmd = words.next().unwrap_or_default();
+    let mut a = Args {
+        cmd,
+        words,
+        rest: input[cmd.len()..].trim(),
+    };
 
-    let mut parts = input.split_whitespace();
-    let cmd = parts.next().unwrap_or_default();
-    // Remainder of the line after the command word (preserves spaces).
-    let rest = input[cmd.len()..].trim().to_string();
-
-    match cmd {
-        "host" => {
-            let port = parts
-                .next()
+    Ok(match cmd {
+        "host" => C::Host(
+            a.next()
                 .map(|p| {
                     p.parse::<u16>()
                         .map_err(|_| "Invalid port. Example: :host 9000".to_string())
                 })
-                .transpose()?;
-            Ok(TuiCommand::Host(port))
-        }
+                .transpose()?,
+        ),
         "connect" => {
-            let target = parts
-                .next()
-                .ok_or_else(|| "Usage: :connect <host[:port]>".to_string())?;
+            let target = a.word()?;
             // The same parser every other connect path uses.
             let (host, port) = crate::util::parse_host_port(target, Some(crate::PORT_DEFAULT))
                 .map_err(|e| format!("{e} in '{target}'"))?;
-            Ok(TuiCommand::Connect { host, port })
+            C::Connect { host, port }
         }
-        "host-relay" => {
-            let relay = parts
-                .next()
-                .ok_or_else(|| "Usage: :host-relay <relay[:port]> [token]".to_string())?;
-            let token = parts.next().map(str::to_string);
-            Ok(TuiCommand::HostRelay {
-                relay: relay.to_string(),
-                token,
-            })
-        }
-        "connect-relay" => {
-            let relay = parts
-                .next()
-                .ok_or_else(|| "Usage: :connect-relay <relay[:port]> <token>".to_string())?;
-            let token = parts
-                .next()
-                .ok_or_else(|| "Usage: :connect-relay <relay[:port]> <token>".to_string())?;
-            Ok(TuiCommand::ConnectRelay {
-                relay: relay.to_string(),
-                token: token.to_string(),
-            })
-        }
-        "disconnect" => Ok(TuiCommand::Disconnect),
-        "stop-host" => Ok(TuiCommand::StopHost),
-        "connection-password" => Ok(TuiCommand::ConnectionPassword(
-            parts.next().map(str::to_string),
-        )),
-        "lock" => {
-            let arg = parts
-                .next()
-                .ok_or_else(|| "Usage: :lock <on|off>".to_string())?;
-            Ok(TuiCommand::Lock(parse_bool(arg)?))
-        }
+        "host-relay" => C::HostRelay {
+            relay: a.word()?.to_string(),
+            token: a.opt_string(),
+        },
+        "connect-relay" => C::ConnectRelay {
+            relay: a.word()?.to_string(),
+            token: a.word()?.to_string(),
+        },
+        "disconnect" => C::Disconnect,
+        "stop-host" => C::StopHost,
+        "connection-password" => C::ConnectionPassword(a.opt_string()),
+        "lock" => C::Lock(parse_bool(a.word()?)?),
 
-        "contacts" => Ok(TuiCommand::Contacts),
-        "contact-add" => {
-            let name = parts.next().ok_or_else(|| {
-                "Usage: :contact-add <name> <host:port> [fingerprint]".to_string()
-            })?;
-            let address = parts.next().ok_or_else(|| {
-                "Usage: :contact-add <name> <host:port> [fingerprint]".to_string()
-            })?;
-            let fingerprint = parts.next().map(str::to_string);
-            Ok(TuiCommand::ContactAdd {
-                name: name.to_string(),
-                address: address.to_string(),
-                fingerprint,
-            })
-        }
-        "contact-connect" => {
-            let target = parts
-                .next()
-                .ok_or_else(|| "Usage: :contact-connect <name|#>".to_string())?;
-            Ok(TuiCommand::ContactConnect(target.to_string()))
-        }
-        "contact-remove" => {
-            let target = parts
-                .next()
-                .ok_or_else(|| "Usage: :contact-remove <name|#>".to_string())?;
-            Ok(TuiCommand::ContactRemove(target.to_string()))
-        }
+        "contacts" => C::Contacts,
+        "contact-add" => C::ContactAdd {
+            name: a.word()?.to_string(),
+            address: a.word()?.to_string(),
+            fingerprint: a.opt_string(),
+        },
+        "contact-connect" => C::ContactConnect(a.word()?.to_string()),
+        "contact-remove" => C::ContactRemove(a.word()?.to_string()),
         "contact-rename" => {
-            let target = parts
-                .next()
-                .ok_or_else(|| "Usage: :contact-rename <name|#> <new name>".to_string())?;
-            let new_name = rest[target.len()..].trim().to_string();
-            if new_name.is_empty() {
-                return Err("Usage: :contact-rename <name|#> <new name>".to_string());
-            }
-            Ok(TuiCommand::ContactRename {
+            let target = a.word()?;
+            C::ContactRename {
                 target: target.to_string(),
-                new_name,
-            })
+                new_name: a.text_after(target)?,
+            }
         }
 
-        "invite" => {
-            let addr = parts.next().map(str::to_string);
-            Ok(TuiCommand::Invite(addr))
-        }
-        "invite-relay" => {
-            let relay = parts
-                .next()
-                .ok_or_else(|| "Usage: :invite-relay <relay[:port]>".to_string())?;
-            Ok(TuiCommand::InviteRelay(relay.to_string()))
-        }
-        "import" => {
-            if rest.is_empty() {
-                return Err("Usage: :import <invite-link>".to_string());
-            }
-            Ok(TuiCommand::Import(rest))
-        }
+        "invite" => C::Invite(a.opt_string()),
+        "invite-relay" => C::InviteRelay(a.word()?.to_string()),
+        "import" => C::Import(a.text()?),
 
-        "send" => {
-            if rest.is_empty() {
-                return Err("Usage: :send <path>".to_string());
-            }
-            Ok(TuiCommand::Send(rest))
-        }
-        "transfers" => Ok(TuiCommand::Transfers),
-        "accept" => Ok(TuiCommand::AcceptFile),
-        "decline" => Ok(TuiCommand::DeclineFile),
-        "name" => {
-            if rest.trim().is_empty() {
-                return Err("Usage: :name <display name>".to_string());
-            }
-            Ok(TuiCommand::Name(rest.trim().to_string()))
-        }
-        "backup" => {
-            if rest.trim().is_empty() {
-                return Err("Usage: :backup <destination path>".to_string());
-            }
-            Ok(TuiCommand::Backup(rest.trim().to_string()))
-        }
+        "send" => C::Send(a.text()?),
+        "transfers" => C::Transfers,
+        "accept" => C::AcceptFile,
+        "decline" => C::DeclineFile,
+        "name" => C::Name(a.text()?),
+        "backup" => C::Backup(a.text()?),
 
-        "party-connect" => {
-            let address = parts.next().ok_or_else(|| {
-                "Usage: :party-connect <host[:port]> <username> [password]".to_string()
-            })?;
-            let username = parts.next().ok_or_else(|| {
-                "Usage: :party-connect <host[:port]> <username> [password]".to_string()
-            })?;
-            let password = parts.next().map(str::to_string);
-            Ok(TuiCommand::PartyConnect {
-                address: address.to_string(),
-                username: username.to_string(),
-                password,
-            })
-        }
-        "party-trust" => Ok(TuiCommand::PartyTrust),
-        "party-post" => {
-            if rest.is_empty() {
-                return Err("Usage: :party-post <message>".to_string());
-            }
-            Ok(TuiCommand::PartyPost(rest))
-        }
+        "party-connect" => C::PartyConnect {
+            address: a.word()?.to_string(),
+            username: a.word()?.to_string(),
+            password: a.opt_string(),
+        },
+        "party-trust" => C::PartyTrust,
+        "party-post" => C::PartyPost(a.text()?),
         "party-dm" => {
-            let target = parts
-                .next()
-                .ok_or_else(|| "Usage: :party-dm <username|#> <message>".to_string())?;
-            let text = rest[target.len()..].trim().to_string();
-            if text.is_empty() {
-                return Err("Usage: :party-dm <username|#> <message>".to_string());
-            }
-            Ok(TuiCommand::PartyDm {
+            let target = a.word()?;
+            C::PartyDm {
                 target: target.to_string(),
-                text,
-            })
-        }
-        "party-create-channel" | "party-channel" => {
-            if rest.is_empty() {
-                return Err("Usage: :party-create-channel <name>".to_string());
+                text: a.text_after(target)?,
             }
-            Ok(TuiCommand::PartyCreateChannel(rest))
         }
-        "party-send-file" => {
-            if rest.is_empty() {
-                return Err("Usage: :party-send-file <path>".to_string());
-            }
-            Ok(TuiCommand::PartySendFile(rest))
-        }
-        "party-download" => {
-            if rest.is_empty() {
-                return Err("Usage: :party-download <name|hash>".to_string());
-            }
-            Ok(TuiCommand::PartyDownload(rest))
-        }
-        "party-status" => Ok(TuiCommand::PartyStatus),
-        "party" => Ok(TuiCommand::PartyPane),
-        "party-files" => Ok(TuiCommand::PartyFiles),
-        "party-audit" => Ok(TuiCommand::PartyAudit),
-        "party-delete-file" => {
-            if rest.is_empty() {
-                return Err("Usage: :party-delete-file <name|hash>".to_string());
-            }
-            Ok(TuiCommand::PartyDeleteFile(rest))
-        }
+        "party-create-channel" | "party-channel" => C::PartyCreateChannel(a.text()?),
+        "party-send-file" => C::PartySendFile(a.text()?),
+        "party-download" => C::PartyDownload(a.text()?),
+        "party-status" => C::PartyStatus,
+        "party" => C::PartyPane,
+        "party-files" => C::PartyFiles,
+        "party-audit" => C::PartyAudit,
+        "party-delete-file" => C::PartyDeleteFile(a.text()?),
         "party-delete-channel" => {
-            if rest.is_empty() {
-                return Err("Usage: :party-delete-channel <#channel>".to_string());
-            }
-            Ok(TuiCommand::PartyDeleteChannel(
-                rest.trim_start_matches('#').to_string(),
-            ))
+            C::PartyDeleteChannel(a.text()?.trim_start_matches('#').to_string())
         }
-        "party-role" => {
-            let username = parts
-                .next()
-                .ok_or_else(|| "Usage: :party-role <username> <guest|member|admin>".to_string())?;
-            let role = parts
-                .next()
-                .ok_or_else(|| "Usage: :party-role <username> <guest|member|admin>".to_string())?;
-            Ok(TuiCommand::PartyRole {
-                username: username.to_string(),
-                role: role.to_ascii_lowercase(),
-            })
-        }
-        "party-channel-access" => {
-            let usage = "Usage: :party-channel-access <#channel> <public|private|locked|announce> [members…]";
-            let channel = parts.next().ok_or_else(|| usage.to_string())?;
-            let kind = parts.next().ok_or_else(|| usage.to_string())?;
-            Ok(TuiCommand::PartyChannelAccess {
-                channel: channel.trim_start_matches('#').to_string(),
-                kind: kind.to_ascii_lowercase(),
-                members: parts.map(str::to_string).collect(),
-            })
-        }
+        "party-role" => C::PartyRole {
+            username: a.word()?.to_string(),
+            role: a.word()?.to_ascii_lowercase(),
+        },
+        "party-channel-access" => C::PartyChannelAccess {
+            channel: a.word()?.trim_start_matches('#').to_string(),
+            kind: a.word()?.to_ascii_lowercase(),
+            members: a.words.map(str::to_string).collect(),
+        },
 
-        "rename" => {
-            if rest.is_empty() {
-                return Err("Usage: :rename <new title>".to_string());
-            }
-            Ok(TuiCommand::Rename(rest))
-        }
-        "delete" => Ok(TuiCommand::DeleteChat),
-        "clear-history" => Ok(TuiCommand::ClearHistory),
+        "rename" => C::Rename(a.text()?),
+        "delete" => C::DeleteChat,
+        "clear-history" => C::ClearHistory,
 
-        "identity" => Ok(TuiCommand::Identity),
-        "verify" => {
-            let arg = parts
-                .next()
-                .ok_or_else(|| "Usage: :verify <accept|reject>".to_string())?;
-            match arg.to_ascii_lowercase().as_str() {
-                "accept" | "y" | "ok" => Ok(TuiCommand::Verify(true)),
-                "reject" | "n" | "deny" => Ok(TuiCommand::Verify(false)),
-                other => Err(format!("Expected accept or reject, got '{}'", other)),
-            }
-        }
-        "unlock" => Ok(TuiCommand::Unlock(parts.next().map(str::to_string))),
-        "set-password" => {
-            let pw = parts
-                .next()
-                .ok_or_else(|| "Usage: :set-password <password>".to_string())?;
-            Ok(TuiCommand::SetPassword(pw.to_string()))
-        }
+        "identity" => C::Identity,
+        "verify" => match a.word()?.to_ascii_lowercase().as_str() {
+            "accept" | "y" | "ok" => C::Verify(true),
+            "reject" | "n" | "deny" => C::Verify(false),
+            other => return Err(format!("Expected accept or reject, got '{}'", other)),
+        },
+        "unlock" => C::Unlock(a.opt_string()),
+        "set-password" => C::SetPassword(a.word()?.to_string()),
 
-        "settings" => Ok(TuiCommand::Settings),
+        "settings" => C::Settings,
         "set" => {
-            let key = parts
-                .next()
-                .ok_or_else(|| "Usage: :set <key> <value>".to_string())?;
-            let value = rest[key.len()..].trim().to_string();
-            if value.is_empty() {
-                return Err("Usage: :set <key> <value>".to_string());
-            }
-            Ok(TuiCommand::Set {
+            let key = a.word()?;
+            C::Set {
                 key: key.to_ascii_lowercase(),
-                value,
-            })
+                value: a.text_after(key)?,
+            }
         }
 
-        "diagnostics" | "diag" => Ok(TuiCommand::Diagnostics),
-        "logs" => Ok(TuiCommand::Logs),
-        "help" | "?" => Ok(TuiCommand::Help(parts.next().map(str::to_string))),
-        "quit" | "q" => Ok(TuiCommand::Quit),
-        "quit!" | "q!" => Ok(TuiCommand::ForceQuit),
-        _ => Err(format!("Unknown command: {}. Try :help", cmd)),
-    }
+        "diagnostics" | "diag" => C::Diagnostics,
+        "logs" => C::Logs,
+        "help" | "?" => C::Help(a.opt_string()),
+        "quit" | "q" => C::Quit,
+        "quit!" | "q!" => C::ForceQuit,
+        _ => return Err(format!("Unknown command: {}. Try :help", cmd)),
+    })
 }
 
 /// Valid keys for `:set`, exposed for validation and help.
@@ -831,5 +730,22 @@ mod tests {
         assert!(parse_setting_bool("on").unwrap());
         assert!(!parse_setting_bool("FALSE").unwrap());
         assert!(parse_setting_bool("maybe").is_err());
+    }
+
+    /// A malformed command answers with the same usage line `:help` shows.
+    #[test]
+    fn usage_errors_come_from_the_command_table() {
+        for raw in [
+            ":connect",
+            ":contact-add bob",
+            ":party-dm alice",
+            ":set theme",
+            ":party-channel",
+            ":party-channel-access #ops",
+        ] {
+            let err = parse_command(raw).unwrap_err();
+            let (_, usage, _) = command_help(raw.split_whitespace().next().unwrap()).unwrap();
+            assert_eq!(err, format!("Usage: {usage}"), "for {raw}");
+        }
     }
 }
