@@ -22,6 +22,10 @@ struct PendingPartyJoin {
     address: String,
     username: String,
     password: Option<String>,
+    /// The server fingerprint the user was shown and is about to accept. The
+    /// trust step requires the credential-bearing connection to present
+    /// exactly this key.
+    fingerprint: String,
 }
 use crate::identity::Identity;
 use crate::logbuf::LogBuffer;

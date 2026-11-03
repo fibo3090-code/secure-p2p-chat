@@ -327,12 +327,18 @@ fn unreadable_identity_reports_an_error_state_and_gates_everything() {
 #[test]
 fn an_unreadable_history_survives_unlock_and_can_be_set_aside() {
     let h = harness();
-    std::fs::write(&h.bridge_history_path(), b"written by a future version").unwrap();
+    std::fs::write(h.bridge_history_path(), b"written by a future version").unwrap();
 
-    h.ipc("set_password", json!({ "password": "bridge-test-passphrase" }))
-        .expect("set_password");
+    h.ipc(
+        "set_password",
+        json!({ "password": "bridge-test-passphrase" }),
+    )
+    .expect("set_password");
     let status = h.ipc("history_status", json!({})).unwrap();
-    assert!(status["error"].is_string(), "the failure must be reported: {status}");
+    assert!(
+        status["error"].is_string(),
+        "the failure must be reported: {status}"
+    );
 
     // A command that saves immediately must not touch the file.
     h.ipc("set_display_name", json!({ "name": "Eve" })).unwrap();
@@ -343,7 +349,10 @@ fn an_unreadable_history_survives_unlock_and_can_be_set_aside() {
 
     let moved = h.ipc("set_aside_history", json!({})).unwrap();
     let moved = moved.as_str().expect("the new location is returned");
-    assert_eq!(std::fs::read(moved).unwrap(), b"written by a future version");
+    assert_eq!(
+        std::fs::read(moved).unwrap(),
+        b"written by a future version"
+    );
     assert!(h.ipc("history_status", json!({})).unwrap()["error"].is_null());
 }
 

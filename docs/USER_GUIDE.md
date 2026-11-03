@@ -234,13 +234,24 @@ On startup the server prints its **fingerprint**. Share your address
 (`your-ip:port`) and that fingerprint with the people you invite; their app pins
 the fingerprint on first join and warns them if it ever changes.
 
-Joining from the app:
+Joining from the app is two steps, and nothing — not your username, not the
+password — is sent before the second:
 
-- **Desktop app**: Communities tab → enter the address, a username, and the
-  password if one is set. Rejoining later is one click (communities are
-  remembered).
-- **TUI**: `:party-connect <host[:port]> <username> [password]`
-- **Desktop app**: Communities → join form.
+1. Enter the address and a username (and the password if one is set).
+   The app connects only far enough to learn the server's fingerprint and
+   shows it to you.
+2. Check it against the fingerprint the operator gave you (the one their
+   server printed at startup). Only if it matches, confirm. The app then
+   joins **only if the server still presents that exact fingerprint**, and
+   remembers it for next time.
+
+- **Desktop app**: Communities tab → join form → "The fingerprint matches —
+  join". Rejoining later is one click (communities are remembered).
+- **TUI**: `:party-connect <host[:port]> <username> [password]`, compare the
+  fingerprint it shows, then `:party-trust`.
+
+Messages in a community are **not end-to-end encrypted**: the server stores
+them and its operator can read them (see the operator notes below).
 
 Operator notes:
 

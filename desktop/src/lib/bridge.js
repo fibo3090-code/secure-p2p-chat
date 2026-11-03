@@ -166,8 +166,11 @@ const realApi = {
   // `trust` is the second step of first-join verification: false asks the
   // bridge to stop and report the server fingerprint + SAS without sending
   // the credentials; true proceeds after the user has compared them.
-  partyJoin: (address, username, password, trust = false) =>
-    invoke("party_join", { address, username, password, trust }),
+  // `fingerprint`: null for the first step (learn the server's identity);
+  // the fingerprint the user accepted for the second, which the bridge then
+  // requires the credential-bearing connection to present.
+  partyJoin: (address, username, password, fingerprint = null) =>
+    invoke("party_join", { address, username, password, fingerprint }),
   partyList: () => invoke("party_list"),
   partyHistory: (server, channel) => invoke("party_history", { server, channel }),
   partyPost: (server, channel, text) => invoke("party_post", { server, channel, text }),
@@ -376,8 +379,8 @@ function makeMock() {
       signed: true,
     }),
     connectContact: ok,
-    partyJoin: async (address, username, password, trust = false) => {
-      if (!trust) return { status: "verify", fingerprint: "aa".repeat(32), sas: "123456 🎃🎈🎁" };
+    partyJoin: async (address, username, password, fingerprint = null) => {
+      if (!fingerprint) return { status: "verify", fingerprint: "aa".repeat(32), sas: "123456 🎃🎈🎁" };
       seedParty(address, username);
       return { status: "joined", server: partyState.servers[0].id, fingerprint: "aa".repeat(32) };
     },

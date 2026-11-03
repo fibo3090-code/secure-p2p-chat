@@ -38,6 +38,9 @@ use uuid::Uuid;
 /// The smallest upload chunk the client will use, whatever the server asks for.
 const MIN_UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
 
+/// Ceiling on reaching a community server: TCP connect plus the handshake.
+pub const PARTY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// What happened when the client tried to join a community server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartyJoinOutcome {
@@ -49,8 +52,14 @@ pub enum PartyJoinOutcome {
         fingerprint: String,
     },
     /// This address has never been joined before. Nothing was sent — not the
-    /// username, not the password. Show the fingerprint and SAS for an
-    /// out-of-band comparison, then call again with `trust_new_identity: true`.
+    /// username, not the password. Show the fingerprint for an out-of-band
+    /// comparison with the one the server prints at startup, then call again
+    /// with that fingerprint as `expected_fingerprint`.
+    ///
+    /// `sas` is this connection's short code. It is kept for diagnostics only:
+    /// the operator never sees it (the server does not display one), and it
+    /// belongs to a connection that is closed before the credentials are sent,
+    /// so it cannot be what the user compares.
     NeedsVerification { fingerprint: String, sas: String },
 }
 
@@ -378,15 +387,19 @@ impl PartyManager {
     /// credentials it was supposed to prove it deserved. The handshake is
     /// authenticated, so a mismatch here is the whole point of pinning.
     ///
-    /// When there is **no** pin — the first time this address is used —
-    /// `trust_new_identity` decides what happens. `false` (the default the UI
-    /// starts with) connects far enough to learn the server's fingerprint and
-    /// SAS, then hangs up without sending anything and returns
-    /// [`PartyJoinOutcome::NeedsVerification`]. A peer-to-peer first contact has
-    /// always stopped for the SAS prompt here; a community first contact used to
-    /// hand over the username and password to whatever key answered the address
-    /// and pin it afterwards, which is trust-on-first-use with the "trust" step
-    /// left out.
+    /// When there is **no** expected fingerprint — the first time this address
+    /// is used — it connects only far enough to learn the server's fingerprint,
+    /// hangs up without sending anything and returns
+    /// [`PartyJoinOutcome::NeedsVerification`]. The shell shows that fingerprint
+    /// for an out-of-band check against the one the operator's server prints at
+    /// startup, then calls again **passing the fingerprint the user accepted**.
+    ///
+    /// There is deliberately no "trust whatever answers" mode. The second call
+    /// opens a new connection, and the old `trust_new_identity: true` flag let
+    /// it send the credentials to whatever key answered *that* connection — the
+    /// verified fingerprint was never compared with it, so a man in the middle
+    /// could let the first connection through and intercept the second (audit
+    /// SRV-05 / TAURI-01 / TUI-02 / UI-01).
     pub async fn connect_and_join(
         &mut self,
         address: &str,
@@ -394,38 +407,51 @@ impl PartyManager {
         password: Option<String>,
         privkey: &RsaPrivateKey,
         expected_fingerprint: Option<&str>,
-        trust_new_identity: bool,
     ) -> Result<PartyJoinOutcome> {
         use messenger_core::party::PartyClient;
 
         self.last_error = None;
         let (host, port) = parse_host_port(address, Some(messenger_core::PORT_DEFAULT))?;
-        let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-        let client = PartyClient::connect(stream, privkey, Uuid::new_v4()).await?;
+        // Bounded: an address that silently drops packets used to hold the
+        // caller for the OS connect timeout (75 s or more), and both shells call
+        // this while holding their UI loop or the party lock (TUI-08, APP-10).
+        let client = tokio::time::timeout(PARTY_CONNECT_TIMEOUT, async {
+            let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+            PartyClient::connect(stream, privkey, Uuid::new_v4()).await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Could not reach {address} within {} seconds",
+                PARTY_CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
         let fingerprint = client.server_fingerprint().to_string();
-        match expected_fingerprint.filter(|p| !p.is_empty()) {
-            Some(pinned) if pinned != fingerprint => {
+        match expected_fingerprint
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            Some(expected) if !expected.eq_ignore_ascii_case(&fingerprint) => {
                 // Drop the connection without sending anything. `client` owns the
                 // stream, so returning here closes it.
                 bail!(
-                    "SECURITY: this server's identity changed since you last joined \
+                    "SECURITY: this server's identity is not the one you verified \
                      (expected {}…, got {}…). Your username and password were NOT sent. \
                      If the operator redeployed the server this may be expected — leave \
-                     the saved community and rejoin to trust the new identity. \
+                     the saved community and rejoin to verify the new identity. \
                      Otherwise, do not proceed.",
-                    &pinned[..16.min(pinned.len())],
+                    &expected[..16.min(expected.len())],
                     &fingerprint[..16.min(fingerprint.len())]
                 );
             }
-            Some(_) => {} // pinned and matching: proceed
-            None if !trust_new_identity => {
+            Some(_) => {} // verified (or pinned) and matching: proceed
+            None => {
                 // First contact with this address. Hang up before the `Join`
                 // frame — it carries the credentials — and let the shell show
-                // the SAS for an out-of-band check.
+                // the fingerprint for an out-of-band check.
                 let sas = client.sas().to_string();
                 return Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas });
             }
-            None => {} // the user has just confirmed this identity
         }
         let (mut reader, mut writer) = client.split();
 

@@ -17,14 +17,11 @@ impl TuiApp {
         };
         match self
             .party_manager
-            // No pin: the TUI has no saved-communities file (that is a
-            // desktop feature), so it shows the server fingerprint for
-            // the user to check by eye instead of comparing it to a
-            // stored one. Passing None is honest about that; it must
-            // never be a placeholder fingerprint that would "match".
-            // `false` stops before the credentials are sent so the user
-            // can compare the code first.
-            .connect_and_join(&address, &username, password.clone(), &privkey, None, false)
+            // No expected fingerprint yet: this stops before the credentials
+            // are sent and returns the server's fingerprint for the user to
+            // check. `:party-trust` then passes back exactly that fingerprint,
+            // so the connection that carries the password must present it.
+            .connect_and_join(&address, &username, password.clone(), &privkey, None)
             .await
         {
             Ok(PartyJoinOutcome::Joining { server_id, .. }) => {
@@ -40,20 +37,29 @@ impl TuiApp {
                     format!("Joining Party {address} as {username} (server fp {short}…)"),
                 );
             }
-            Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas }) => {
-                let short = &fingerprint[..fingerprint.len().min(16)];
+            Ok(PartyJoinOutcome::NeedsVerification { fingerprint, .. }) => {
+                // The full fingerprint, grouped for reading aloud: it is what
+                // the community server prints when it starts, so it is the
+                // one thing the operator can actually compare.
+                let grouped = fingerprint
+                    .as_bytes()
+                    .chunks(8)
+                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 self.toast(
                     ToastLevel::Warning,
                     format!(
-                        "Verify {address} before joining — code {sas} (fp {short}…). \
-                         Compare it with the operator, then run :party-trust. \
-                         Nothing has been sent yet."
+                        "Verify {address} before joining. Its fingerprint is {grouped}. \
+                         Check it matches the one the operator's server printed at \
+                         startup, then run :party-trust. Nothing has been sent yet."
                     ),
                 );
                 self.pending_party_join = Some(PendingPartyJoin {
                     address,
                     username,
                     password,
+                    fingerprint,
                 });
             }
             Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
@@ -81,8 +87,10 @@ impl TuiApp {
                 &pending.username,
                 pending.password,
                 &privkey,
-                None,
-                true,
+                // Exactly the fingerprint the user was shown: the connection
+                // that carries the credentials must present it, or nothing is
+                // sent.
+                Some(&pending.fingerprint),
             )
             .await
         {
@@ -93,8 +101,12 @@ impl TuiApp {
                     format!("Joining Party {} as {}", pending.address, pending.username),
                 );
             }
-            // `trust_new_identity: true` cannot ask again.
-            Ok(PartyJoinOutcome::NeedsVerification { .. }) => unreachable!(),
+            // With an expected fingerprint the manager never asks again; if it
+            // ever did, joining without a verified key is the wrong answer.
+            Ok(PartyJoinOutcome::NeedsVerification { .. }) => self.toast(
+                ToastLevel::Error,
+                "The server asked to be verified again; nothing was sent.".to_string(),
+            ),
             Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
         }
     }

@@ -39,6 +39,11 @@ const STATUS_LABEL = {
 const MAX_USERNAME_CHARS = 32;
 const MAX_CHANNEL_NAME_CHARS = 64;
 
+/// A 64-hex fingerprint in groups of eight, for reading aloud and comparing.
+function groupFingerprint(fp) {
+  return (fp || "").match(/.{1,8}/g)?.join(" ") ?? "";
+}
+
 function JoinForm({ onJoined, onCancel, initial }) {
   const [address, setAddress] = useState(initial?.address || "");
   const [username, setUsername] = useState(initial?.username || "");
@@ -59,7 +64,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
       .catch((e) => { setSaved([]); setErr(friendlyError(e)); });
   }, []);
 
-  async function joinWith(addr, user, pass, trust = false) {
+  async function joinWith(addr, user, pass, fingerprint = null) {
     setErr("");
     if (!addr.trim()) return setErr("Enter the server address.");
     if (!user.trim()) return setErr("Choose a username.");
@@ -67,7 +72,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
       return setErr(`Username must be ${MAX_USERNAME_CHARS} characters or fewer.`);
     setBusy(true);
     try {
-      const res = await api.partyJoin(addr.trim(), user.trim(), pass, trust);
+      const res = await api.partyJoin(addr.trim(), user.trim(), pass, fingerprint);
       if (res?.status === "verify") {
         setVerify({ address: addr.trim(), username: user.trim(), password: pass, ...res });
         return;
@@ -89,18 +94,19 @@ function JoinForm({ onJoined, onCancel, initial }) {
           <div className="chat-empty-h">Verify this community server</div>
           <div className="chat-empty-p">
             You have never joined <code>{verify.address}</code> before. Your username and
-            password have <strong>not</strong> been sent yet. Ask the operator to read out
-            their code and check it matches:
+            password have <strong>not</strong> been sent yet. Check that this fingerprint
+            matches the one the operator gave you — their server prints it every time it
+            starts:
           </div>
-          <div className="verify-sas">{verify.sas}</div>
-          <details className="party-verify-adv">
-            <summary>Advanced: full fingerprint</summary>
-            <code className="vf-fp-code">{verify.fingerprint}</code>
-          </details>
+          <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
+          <div className="chat-empty-p">
+            Messages in a community are <strong>not end-to-end encrypted</strong>: the
+            server stores them, and whoever runs it can read them.
+          </div>
           <div className="party-join">
             <Button icon="check" disabled={busy} full
-              onClick={() => joinWith(verify.address, verify.username, verify.password, true)}>
-              The code matches — join
+              onClick={() => joinWith(verify.address, verify.username, verify.password, verify.fingerprint)}>
+              The fingerprint matches — join
             </Button>
             <Button variant="ghost" full disabled={busy}
               onClick={() => { setVerify(null); setBusy(false); }}>

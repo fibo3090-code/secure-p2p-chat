@@ -304,16 +304,20 @@ pub(crate) struct PartyJoinDto {
 /// password*, so it must not be written to a server whose identity the user has
 /// not accepted. If this address has a pin, it is compared before the frame goes
 /// out. If it has none — a first join — the connection is made far enough to
-/// learn the server's fingerprint and SAS, then dropped, and the UI is asked to
-/// show them. Calling again with `trust: true` completes it. Previously the
-/// first join handed the credentials to whatever key answered and pinned it
-/// afterwards, which is trust-on-first-use without the trust step.
+/// learn the server's fingerprint, then dropped, and the UI is asked to show it.
+/// Calling again with `fingerprint` set to the one the user accepted completes
+/// the join, and only if the new connection presents exactly that key.
+///
+/// The second step used to be a bare `trust: true`, which sent the
+/// credentials to whatever key answered the *second* connection: the
+/// fingerprint the user had just verified was never compared with it (audit
+/// TAURI-01 / UI-01).
 #[tauri::command]
 pub(crate) async fn party_join(
     address: String,
     username: String,
     password: String,
-    trust: Option<bool>,
+    fingerprint: Option<String>,
     state: tauri::State<'_, Bridge>,
 ) -> Result<PartyJoinDto, String> {
     ensure_ready(&state)?;
@@ -333,18 +337,15 @@ pub(crate) async fn party_join(
     let pinned = saved
         .into_iter()
         .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
-        .map(|p| p.fingerprint);
+        .map(|p| p.fingerprint)
+        // No pin yet: the fingerprint the user verified in step one, if this
+        // is step two. A saved pin always wins — it is what was verified
+        // before, and the step-one prompt never appears for a pinned address.
+        .or_else(|| fingerprint.filter(|f| !f.trim().is_empty()));
 
     let mut party = state.party.lock().await;
     let outcome = party
-        .connect_and_join(
-            &address,
-            &username,
-            password,
-            &pk,
-            pinned.as_deref(),
-            trust.unwrap_or(false),
-        )
+        .connect_and_join(&address, &username, password, &pk, pinned.as_deref())
         .await
         .map_err(|e| e.to_string())?;
 

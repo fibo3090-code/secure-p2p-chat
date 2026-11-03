@@ -133,6 +133,19 @@ fn a_fresh_incoming_chat_holds_no_fingerprint() {
 
 // ── Community access control ────────────────────────────────────────────────
 
+/// Step one of a first join: connect without credentials and learn the
+/// server's fingerprint, as the user would see it before accepting.
+async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
+    match PartyManager::new()
+        .connect_and_join(address, "probe", None, key, None)
+        .await
+        .expect("first contact")
+    {
+        PartyJoinOutcome::NeedsVerification { fingerprint, .. } => fingerprint,
+        other => panic!("a first contact must stop for verification, got {other:?}"),
+    }
+}
+
 struct TestServer {
     address: String,
     _dir: tempfile::TempDir,
@@ -173,7 +186,13 @@ async fn join(server: &TestServer, username: &str) -> (PartyManager, Uuid) {
     let key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
     let mut mgr = PartyManager::new();
     let sid = match mgr
-        .connect_and_join(&server.address, username, None, &key, None, true)
+        .connect_and_join(
+            &server.address,
+            username,
+            None,
+            &key,
+            Some(&learn_fingerprint(&server.address, &key).await),
+        )
         .await
         .expect("join")
     {
@@ -438,7 +457,13 @@ async fn a_username_is_not_an_identity() {
     let impostor_key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
     let mut impostor = PartyManager::new();
     let outcome = impostor
-        .connect_and_join(&server.address, "owner", None, &impostor_key, None, true)
+        .connect_and_join(
+            &server.address,
+            "owner",
+            None,
+            &impostor_key,
+            Some(&learn_fingerprint(&server.address, &impostor_key).await),
+        )
         .await
         .expect("the connection itself succeeds");
     let imp_sid = match outcome {

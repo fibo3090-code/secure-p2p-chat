@@ -44,6 +44,19 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A server listening on an ephemeral loopback port, with durable state in a
 /// temp dir so the SQLite and blob-store paths are the ones under test.
+/// Step one of a first join: connect without credentials and learn the
+/// server's fingerprint, as the user would see it before accepting.
+async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
+    match PartyManager::new()
+        .connect_and_join(address, "probe", None, key, None)
+        .await
+        .expect("first contact")
+    {
+        PartyJoinOutcome::NeedsVerification { fingerprint, .. } => fingerprint,
+        other => panic!("a first contact must stop for verification, got {other:?}"),
+    }
+}
+
 struct TestServer {
     address: String,
     _dir: tempfile::TempDir,
@@ -96,14 +109,7 @@ async fn join(
 
     // Step one: no pin, no trust yet. Nothing is sent.
     let outcome = mgr
-        .connect_and_join(
-            &server.address,
-            username,
-            password.clone(),
-            key,
-            None,
-            false,
-        )
+        .connect_and_join(&server.address, username, password.clone(), key, None)
         .await
         .expect("first contact");
     let fingerprint = match outcome {
@@ -120,7 +126,7 @@ async fn join(
 
     // Step two: the user has compared the code.
     let server_id = match mgr
-        .connect_and_join(&server.address, username, password, key, None, true)
+        .connect_and_join(&server.address, username, password, key, Some(&fingerprint))
         .await
         .expect("join after verification")
     {
@@ -206,14 +212,7 @@ async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
     let fingerprint = mgr.server(sid).unwrap().server_fingerprint.clone();
     let key2 = generate_rsa_keypair(RSA_KEY_BITS).expect("second key");
     let sid2 = match fresh
-        .connect_and_join(
-            &server.address,
-            "bob",
-            None,
-            &key2,
-            Some(&fingerprint),
-            false,
-        )
+        .connect_and_join(&server.address, "bob", None, &key2, Some(&fingerprint))
         .await
         .expect("join with a matching pin")
     {
@@ -252,13 +251,15 @@ async fn a_changed_server_identity_is_refused_before_any_credential_is_sent() {
             Some("hunter2hunter2".to_string()),
             &key,
             Some(&wrong_pin),
-            false,
         )
         .await
         .expect_err("a mismatched pin must refuse");
 
     let msg = err.to_string();
-    assert!(msg.contains("identity changed"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("not the one you verified"),
+        "unexpected error: {msg}"
+    );
     assert!(
         msg.contains("NOT sent"),
         "the message must tell the user their credentials are safe: {msg}"
@@ -283,8 +284,7 @@ async fn a_wrong_server_password_is_refused_and_reported() {
             "alice",
             Some("wrong-password-entirely".to_string()),
             &key,
-            None,
-            true,
+            Some(&learn_fingerprint(&server.address, &key).await),
         )
         .await
         .expect("the connection itself succeeds")
