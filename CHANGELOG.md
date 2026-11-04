@@ -13,6 +13,16 @@ predate tagged releases.
 
 ### Security
 
+- **A frame you sent could be echoed back and accepted as your peer's.** Both
+  directions of a session share one key, so anyone on the path (a bridging
+  relay, hostile Wi-Fi) could reflect your own "yes" back to you as the
+  peer's reply, mark your messages delivered with your own receipts, or end
+  the session with your own key rotation. Each side now refuses frames that
+  carry its own direction bit, on direct sessions and community connections
+  alike. Wire-compatible with existing peers.
+- **A client could force the host to rotate keys.** Only the host rotates the
+  session key; a `Rekey` from the client is now ignored.
+
 - **A peer could impersonate any contact whose public key it knew.** A
   public key was fingerprinted from the first key block found in its text,
   while signatures were checked against the key the PEM parser returned, and

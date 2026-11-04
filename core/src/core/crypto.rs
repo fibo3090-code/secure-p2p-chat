@@ -692,6 +692,23 @@ impl AesCipher {
         output
     }
 
+    /// Decrypt a frame that must have been sent by the **other** side of the
+    /// session.
+    ///
+    /// Both directions share one key and one AAD; only the nonce's role bit
+    /// tells them apart, and plain [`decrypt`](Self::decrypt) ignores it. So a
+    /// frame we sent, echoed back by anyone on the path, authenticated as the
+    /// peer's — a user's own "yes" shown as the peer's reply, their own `Ack`
+    /// marking a message delivered, their own `Rekey` killing the session
+    /// (audit NET-01). Every tunnel receive goes through this.
+    pub fn decrypt_from_peer(&self, payload: &[u8], aad: Option<&[u8]>) -> Option<Vec<u8>> {
+        let first = *payload.first()?;
+        if first & 0x80 == self.role.nonce_bit() {
+            return None;
+        }
+        self.decrypt(payload, aad)
+    }
+
     /// Decrypt payload with optional AAD: nonce(AES_NONCE_SIZE) || ciphertext || tag(AES_GCM_TAG_SIZE)
     ///
     /// # Arguments

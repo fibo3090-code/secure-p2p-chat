@@ -529,7 +529,7 @@ where
     let encrypted = recv_packet_with_timeout(stream).await?;
     let bytes = keys
         .cipher
-        .decrypt(&encrypted, Some(&keys.identity_proof_aad))
+        .decrypt_from_peer(&encrypted, Some(&keys.identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt {} identity proof", peer.to_lowercase()))?;
     let proof = decode_identity_proof(&bytes)?;
     if proof.signature_scheme != scheme {
@@ -708,7 +708,7 @@ where
     send_packet(stream, &cipher.encrypt(&flag, Some(aad))).await?;
     let resp_ct = recv_packet_with_timeout(stream).await?;
     let resp = cipher
-        .decrypt(&resp_ct, Some(aad))
+        .decrypt_from_peer(&resp_ct, Some(aad))
         .ok_or_else(|| anyhow!("Failed to decrypt password response"))?;
     if let Some(pw) = expected {
         if !constant_time_eq(&resp, pw.as_bytes()) {
@@ -730,7 +730,7 @@ where
 {
     let flag_ct = recv_packet_with_timeout(stream).await?;
     let flag = cipher
-        .decrypt(&flag_ct, Some(aad))
+        .decrypt_from_peer(&flag_ct, Some(aad))
         .ok_or_else(|| anyhow!("Failed to decrypt password challenge"))?;
     let required = flag.first().copied() == Some(1);
     // Always reply (even empty) so the host's receive completes and both sides
@@ -1188,7 +1188,10 @@ where
         // so any retained previous key can be dropped (its in-flight window is
         // closed). If it fails, fall back to the previous key for frames the
         // peer sent under the old key before it processed our Rekey.
-        let decrypted = match self.cipher.decrypt(encrypted, Some(&self.transport_aad)) {
+        let decrypted = match self
+            .cipher
+            .decrypt_from_peer(encrypted, Some(&self.transport_aad))
+        {
             Some(plaintext) => {
                 self.prev_cipher = None;
                 Some(plaintext)
@@ -1196,7 +1199,7 @@ where
             None => self
                 .prev_cipher
                 .as_ref()
-                .and_then(|pc| pc.decrypt(encrypted, Some(&self.transport_aad))),
+                .and_then(|pc| pc.decrypt_from_peer(encrypted, Some(&self.transport_aad))),
         };
         let Some(plaintext) = decrypted else {
             // Undecryptable under BOTH keys over a reliable, ordered stream
@@ -1223,6 +1226,13 @@ where
         }
 
         match msg {
+            // Only the host rotates (see `is_rekey_initiator`). A client that
+            // sends `Rekey` anyway is not following the protocol, and obeying
+            // it would let it force rotations at will and desync the session
+            // (external review EXT-01). Ignore the frame, keep the session.
+            ProtocolMessage::Rekey { .. } if self.is_rekey_initiator => {
+                tracing::warn!("Ignoring Rekey from a peer that is not the initiator");
+            }
             // Not surfaced to the app.
             ProtocolMessage::Rekey { nonce, .. } => {
                 use crate::core::rekey_session_key;
@@ -1531,6 +1541,70 @@ mod tests {
         assert_eq!(host.get_current_key(), peer_next);
         assert_eq!(sent_seq, 6);
         assert_eq!(msgs, 0);
+    }
+
+    /// NET-01: one key and one AAD serve both directions, so a frame we sent,
+    /// echoed back by anyone on the path, used to be accepted as the peer's.
+    #[test]
+    fn a_reflected_frame_is_not_accepted_as_the_peers() {
+        let key = [5u8; crate::AES_KEY_SIZE];
+        let aad = b"transport-aad".to_vec();
+        let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), ours.clone(), aad.clone(), tx);
+
+        let mut echoed = ProtocolMessage::Text {
+            seq: 0,
+            text: "yes".into(),
+            timestamp: 0,
+        };
+        echoed.set_seq(7);
+        let frame = ours.encrypt(&echoed.to_plain_bytes(), Some(&aad));
+        assert!(matches!(transport.receive(&frame).unwrap(), Received::Stop));
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, SessionEvent::MessageReceived(_)),
+                "our own frame was surfaced as the peer's: {event:?}"
+            );
+        }
+
+        // The genuine peer's frame still goes through.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), ours, aad.clone(), tx);
+        let peer = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let frame = peer.encrypt(&echoed.to_plain_bytes(), Some(&aad));
+        assert!(matches!(
+            transport.receive(&frame).unwrap(),
+            Received::Continue
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionEvent::MessageReceived(ProtocolMessage::Text { .. })
+        ));
+    }
+
+    /// EXT-01: only the host rotates. A client's `Rekey` must not move the
+    /// host's key, or a misbehaving client could force rotations at will.
+    #[test]
+    fn the_host_ignores_a_rekey_from_the_client() {
+        let key = [6u8; crate::AES_KEY_SIZE];
+        let aad = b"transport-aad".to_vec();
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx);
+
+        let rekey = ProtocolMessage::Rekey {
+            seq: 1,
+            nonce: vec![9u8; crate::REKEY_NONCE_SIZE],
+        };
+        let frame = client.encrypt(&rekey.to_plain_bytes(), Some(&aad));
+        assert!(matches!(
+            transport.receive(&frame).unwrap(),
+            Received::Continue
+        ));
+        assert_eq!(transport.cipher.get_current_key(), key);
+        assert!(transport.prev_cipher.is_none());
     }
 
     #[tokio::test]
