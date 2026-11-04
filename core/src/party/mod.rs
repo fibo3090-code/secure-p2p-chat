@@ -1071,8 +1071,7 @@ mod tests {
     /// A session key for a test: generated, because a test needs *a* key
     /// shared by both ends, not a particular one.
     fn test_key() -> [u8; 32] {
-        let mut key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        let key: [u8; 32] = rand::random();
         key
     }
 

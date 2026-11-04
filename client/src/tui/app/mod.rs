@@ -1870,8 +1870,7 @@ mod tests {
         // `TuiApp::new` reads the machine's real data dir; whatever it found
         // there is not this test's business.
         app.chat_manager.history_load_error = None;
-        let mut key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        let key: [u8; 32] = rand::random();
         app.chat_manager.set_history_key(key);
         app.chat_manager
             .create_local_chat_for_test(Uuid::new_v4(), "A".into());

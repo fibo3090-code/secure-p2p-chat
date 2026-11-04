@@ -559,8 +559,7 @@ mod tests {
     /// what a test needs is *a* key (or two different ones), not a particular
     /// value.
     fn random_key() -> [u8; 32] {
-        let mut key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        let key: [u8; 32] = rand::random();
         key
     }
     use crate::app::ChatManager;

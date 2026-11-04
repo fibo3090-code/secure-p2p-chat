@@ -1970,8 +1970,7 @@ fn a_snapshot_taken_before_a_wipe_cannot_be_written_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let history_path = dir.path().join("history.json.enc");
     let identity_path = dir.path().join("identity.json");
-    let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+    let key: [u8; 32] = rand::random();
     let mut mgr = ChatManager::new(Config::default());
     mgr.set_history_key(key);
     mgr.create_local_chat_for_test(Uuid::new_v4(), "Chat".into());

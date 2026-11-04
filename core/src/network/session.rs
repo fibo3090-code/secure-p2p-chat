@@ -1753,8 +1753,7 @@ mod tests {
     /// echoed back by anyone on the path, used to be accepted as the peer's.
     #[test]
     fn a_reflected_frame_is_not_accepted_as_the_peers() {
-        let mut key = [0u8; crate::AES_KEY_SIZE];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut key);
+        let key: [u8; 32] = rand::random();
         let aad = b"transport-aad".to_vec();
         let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1794,17 +1793,18 @@ mod tests {
     /// host's key, or a misbehaving client could force rotations at will.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
-        let mut key = [0u8; crate::AES_KEY_SIZE];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut key);
+        let key: [u8; 32] = rand::random();
         let aad = b"transport-aad".to_vec();
         let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
         let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx);
 
-        let mut nonce = vec![0u8; crate::REKEY_NONCE_SIZE];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
-        let rekey = ProtocolMessage::Rekey { seq: 1, nonce };
+        let nonce: [u8; crate::REKEY_NONCE_SIZE] = rand::random();
+        let rekey = ProtocolMessage::Rekey {
+            seq: 1,
+            nonce: nonce.to_vec(),
+        };
         let frame = client.encrypt(&rekey.to_plain_bytes(), Some(&aad));
         assert!(matches!(
             transport.receive(&frame).unwrap(),
