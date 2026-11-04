@@ -813,7 +813,7 @@ fn non_public_channels_are_enforced_rather_than_decorative() {
             name: label.to_string(),
             kind,
             members: Vec::new(),
-            messages: Vec::new(),
+            history: History::new(),
         });
         assert!(
             state.post_message(bob, id, "hi".to_string()).is_err(),
@@ -3162,4 +3162,125 @@ fn oversized_file_metadata_from_an_older_server_is_repaired_on_load() {
     };
     let repaired = repair_envelope(env);
     assert!(encoded_len(&repaired) < 1024);
+}
+
+/// Collect a thread's whole history by paging, as a client does.
+fn page_all(mut fetch: impl FnMut(u64) -> Vec<Envelope>) -> Vec<u64> {
+    let mut since = 0;
+    let mut seqs = Vec::new();
+    loop {
+        let page = fetch(since);
+        let Some(last) = page.last() else { break };
+        since = last.seq;
+        seqs.extend(page.iter().map(|e| e.seq));
+    }
+    seqs
+}
+
+/// SRV-06: every message ever posted used to stay in memory for the life of
+/// the process and be deserialized at startup, so RSS and restart time grew
+/// with the community's whole history. A disk-backed server keeps only each
+/// thread's newest envelopes resident and pages older ones from SQLite.
+#[test]
+fn only_the_newest_history_stays_in_memory_and_older_pages_come_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let total = RESIDENT_HISTORY + 60;
+    let (alice, bob, chan);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        bob = s.join("bob", None, None).unwrap();
+        chan = s.default_channel();
+        for i in 0..total {
+            s.post_message(alice, chan, format!("c{i}")).unwrap();
+            s.post_dm(alice, bob, format!("d{i}")).unwrap();
+        }
+        assert_eq!(
+            s.channel(chan).unwrap().history.resident_len(),
+            RESIDENT_HISTORY
+        );
+        let thread = messenger_core::party::dm_thread_id(alice, bob);
+        assert_eq!(
+            s.dm_threads[&thread].history.resident_len(),
+            RESIDENT_HISTORY
+        );
+
+        // Paging from the start reaches back past what memory holds.
+        let all: Vec<u64> = (1..=total as u64).collect();
+        assert_eq!(page_all(|since| s.history_since(alice, chan, since)), all);
+        assert_eq!(page_all(|since| s.dm_history(thread, since)), all);
+    }
+
+    // A restart loads only the tail, and numbering carries on from the
+    // highest stored seq rather than from how many envelopes are resident.
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    assert_eq!(
+        s.channel(chan).unwrap().history.resident_len(),
+        RESIDENT_HISTORY
+    );
+    let next = s.post_message(alice, chan, "after restart".into()).unwrap();
+    assert_eq!(next.seq, total as u64 + 1);
+    assert_eq!(
+        page_all(|since| s.history_since(alice, chan, since)),
+        (1..=total as u64 + 1).collect::<Vec<_>>()
+    );
+    // A page entirely inside the resident tail is served from memory.
+    let recent = s.history_since(alice, chan, total as u64 - 3);
+    assert_eq!(recent.len(), 4);
+}
+
+/// The resident cap is a cache bound, not a retention rule: a small cap still
+/// serves every message, and access control still applies to disk pages.
+#[test]
+fn a_tiny_resident_cap_still_serves_everything_to_those_who_may_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    s.set_resident_history(3);
+    let alice = s.join("alice", None, None).unwrap();
+    let chan = s.default_channel();
+    for i in 0..20 {
+        s.post_message(alice, chan, format!("m{i}")).unwrap();
+    }
+    assert_eq!(s.channel(chan).unwrap().history.resident_len(), 3);
+    let texts: Vec<String> = s
+        .history_since(alice, chan, 0)
+        .into_iter()
+        .map(|e| match e.payload {
+            MessagePayload::Text(t) => t,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(texts, (0..20).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    // A stranger still gets nothing, from memory or disk.
+    assert!(s.history_since(Uuid::new_v4(), chan, 0).is_empty());
+}
+
+/// One damaged message row used to fail the whole load, so the server would
+/// not start at all. It is skipped instead.
+#[test]
+fn an_undecodable_stored_message_is_skipped_rather_than_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, chan);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        chan = s.default_channel();
+        s.post_message(alice, chan, "one".into()).unwrap();
+        s.post_message(alice, chan, "two".into()).unwrap();
+        s.db.as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET envelope = 'not json' WHERE seq = 1",
+                [],
+            )
+            .unwrap();
+    }
+    let mut s = PartyState::load("Srv", None, dir.path()).expect("the server still starts");
+    let seqs: Vec<u64> = s
+        .history_since(alice, chan, 0)
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(seqs, vec![2]);
+    assert_eq!(s.post_message(alice, chan, "three".into()).unwrap().seq, 3);
 }

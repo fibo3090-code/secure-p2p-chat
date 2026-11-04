@@ -26,6 +26,13 @@ predate tagged releases.
   existing databases), the member directory, private-channel lists and file
   listing are capped to fit, and a reply that still does not fit becomes an
   error instead of a disconnect.
+- **One community member can no longer flood everyone else.** Only channel
+  creation was rate-limited; any member could post maximum-size messages and
+  DMs, re-share files or change permissions as fast as their connection
+  allowed, each one written to disk while every other member waited. Each
+  member now has a budget for writes and for message text (generous for a
+  person, tight for a script); a message over it is refused and taken back
+  off the sender's screen with a "sending too fast" notice.
 
 - **A peer could impersonate any contact whose public key it knew.** A
   public key was fingerprinted from the first key block found in its text,
@@ -100,6 +107,14 @@ predate tagged releases.
   few commits, never corrupt the file), caches its statements, and commits
   each change — a DM, a channel deletion, an upload — as one transaction, so a
   crash part-way through can no longer leave half of it on disk.
+- **A community server's memory no longer grows with its entire history.**
+  Every message ever posted was kept in memory and re-read at every start.
+  The server now keeps only the newest few hundred messages of each channel
+  and conversation in memory and reads older pages from its database when
+  someone scrolls back; startup reads only those tails, and one damaged
+  message in the database is skipped instead of stopping the server from
+  starting. Catching up on a long channel no longer scans it from the first
+  message for every page.
 
 ### Fixed
 

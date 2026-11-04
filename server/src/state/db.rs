@@ -206,6 +206,7 @@ impl PartyState {
             .db
             .as_ref()
             .expect("reload_from_db requires an open database");
+        let resident = self.resident_history;
 
         let mut members = HashMap::new();
         {
@@ -258,13 +259,13 @@ impl PartyState {
                     .iter()
                     .filter_map(|s| Uuid::parse_str(s).ok())
                     .collect();
-                let messages = load_messages(conn, "messages", "channel_id", id)?;
+                let history = load_history(conn, ThreadTable::Channel(id), resident)?;
                 channels.push(Channel {
                     id,
                     name,
                     kind,
                     members,
-                    messages,
+                    history,
                 });
             }
         }
@@ -277,8 +278,8 @@ impl PartyState {
                 .collect::<Result<_, _>>()?;
             for id in ids {
                 let id = Uuid::parse_str(&id)?;
-                let messages = load_messages(conn, "dm_messages", "thread_id", id)?;
-                dm_threads.insert(id, DmThread { id, messages });
+                let history = load_history(conn, ThreadTable::Dm(id), resident)?;
+                dm_threads.insert(id, DmThread { id, history });
             }
         }
 
@@ -742,23 +743,104 @@ pub(super) fn sweep_staging_files(blob_dir: &Path) {
     }
 }
 
-pub(super) fn load_messages(
-    conn: &Connection,
-    table: &str,
-    key_col: &str,
-    key: Uuid,
-) -> anyhow::Result<Vec<Envelope>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT envelope FROM {table} WHERE {key_col} = ?1 ORDER BY seq ASC"
-    ))?;
-    let rows: Vec<String> = stmt
-        .query_map(params![key.to_string()], |r| r.get::<_, String>(0))?
-        .collect::<Result<_, _>>()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for json in rows {
-        out.push(repair_envelope(serde_json::from_str(&json)?));
+/// The two tables history lives in, with the thread each row is keyed by.
+///
+/// The table and column names are interpolated into SQL (an identifier cannot
+/// be bound as a parameter), so they come from this closed set and nowhere else
+/// — the same reasoning as [`CountedTable`].
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ThreadTable {
+    Channel(Uuid),
+    Dm(Uuid),
+}
+
+impl ThreadTable {
+    fn sql(self) -> (&'static str, &'static str, Uuid) {
+        match self {
+            ThreadTable::Channel(id) => ("messages", "channel_id", id),
+            ThreadTable::Dm(id) => ("dm_messages", "thread_id", id),
+        }
     }
-    Ok(out)
+}
+
+/// Decode stored envelope rows, skipping (and logging) any that will not parse.
+///
+/// One damaged row used to fail the whole load with `?`, which meant the server
+/// would not start at all. Its seq is simply absent from history; numbering is
+/// unaffected because it comes from the highest seq stored, not from a count.
+fn decode_rows(rows: Vec<(i64, String)>) -> Vec<Envelope> {
+    rows.into_iter()
+        .filter_map(|(seq, json)| match serde_json::from_str(&json) {
+            Ok(env) => Some(repair_envelope(env)),
+            Err(e) => {
+                tracing::error!(seq, error = %e, "skipping an undecodable stored message");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Load a thread for memory: its newest `resident` envelopes, and the highest
+/// seq it has ever stored.
+///
+/// Only the tail is read. Loading every envelope of every thread made startup
+/// time and resident memory grow with the community's entire history.
+pub(super) fn load_history(
+    conn: &Connection,
+    table: ThreadTable,
+    resident: usize,
+) -> anyhow::Result<History> {
+    let (table, key_col, key) = table.sql();
+    let key = key.to_string();
+    let last_seq: Option<i64> = conn
+        .prepare_cached(&format!(
+            "SELECT MAX(seq) FROM {table} WHERE {key_col} = ?1"
+        ))?
+        .query_row(params![key], |r| r.get(0))?;
+    let rows: Vec<(i64, String)> = conn
+        .prepare_cached(&format!(
+            "SELECT seq, envelope FROM {table} WHERE {key_col} = ?1 ORDER BY seq DESC LIMIT ?2"
+        ))?
+        .query_map(params![key, resident as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let complete = rows.len() < resident;
+    let mut tail = decode_rows(rows);
+    tail.reverse();
+    Ok(History::from_tail(
+        tail,
+        last_seq.unwrap_or(0).max(0) as u64,
+        complete,
+    ))
+}
+
+/// One page's worth of a thread's envelopes after `since_seq`, read from the
+/// database for a request that reaches past what memory holds.
+///
+/// At most [`MAX_HISTORY_BATCH`] rows; the caller still applies the byte
+/// budget (`take_history_page`).
+pub(super) fn load_page(
+    conn: &Connection,
+    table: ThreadTable,
+    since_seq: u64,
+) -> anyhow::Result<Vec<Envelope>> {
+    let (table, key_col, key) = table.sql();
+    let rows: Vec<(i64, String)> = conn
+        .prepare_cached(&format!(
+            "SELECT seq, envelope FROM {table} WHERE {key_col} = ?1 AND seq > ?2 \
+             ORDER BY seq ASC LIMIT ?3"
+        ))?
+        .query_map(
+            params![
+                key.to_string(),
+                i64::try_from(since_seq).unwrap_or(i64::MAX),
+                messenger_core::party::MAX_HISTORY_BATCH as i64
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<Result<_, _>>()?;
+    Ok(decode_rows(rows))
 }
 
 /// Bound the member-supplied strings of a stored file message.

@@ -472,38 +472,11 @@ impl PartyState {
         };
         self.record_file_ref(actor, &meta, location, is_dm);
 
-        let tier = self.tier;
         let envelope = if is_dm {
-            let thread = self.dm_threads.entry(location).or_insert_with(|| DmThread {
-                id: location,
-                messages: Vec::new(),
-            });
-            let seq = thread.messages.len() as u64 + 1;
-            let env = Envelope {
-                tier,
-                sender: actor,
-                channel: location,
-                seq,
-                timestamp: current_timestamp_millis(),
-                payload: MessagePayload::File(meta),
-            };
-            thread.messages.push(env.clone());
-            self.persist_dm(location, &env);
-            env
+            self.append_dm_message(actor, location, MessagePayload::File(meta))
         } else {
-            let chan = self.channel_mut(location).expect("checked above");
-            let seq = chan.messages.len() as u64 + 1;
-            let env = Envelope {
-                tier,
-                sender: actor,
-                channel: location,
-                seq,
-                timestamp: current_timestamp_millis(),
-                payload: MessagePayload::File(meta),
-            };
-            chan.messages.push(env.clone());
-            self.persist_message(&env);
-            env
+            self.append_channel_message(actor, location, MessagePayload::File(meta))
+                .expect("checked above")
         };
         let detail = format!("shared {} again", source.name);
         self.record_audit(actor, "file.share", &detail);
@@ -1341,23 +1314,9 @@ impl PartyState {
         channel: Uuid,
         meta: FileMeta,
     ) -> Result<Envelope, String> {
-        let tier = self.tier;
         self.record_file_ref(sender, &meta, channel, false);
-        let chan = self
-            .channel_mut(channel)
-            .ok_or_else(|| "channel no longer exists".to_string())?;
-        let seq = chan.messages.len() as u64 + 1;
-        let envelope = Envelope {
-            tier,
-            sender,
-            channel,
-            seq,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::File(meta),
-        };
-        chan.messages.push(envelope.clone());
-        self.persist_message(&envelope);
-        Ok(envelope)
+        self.append_channel_message(sender, channel, MessagePayload::File(meta))
+            .ok_or_else(|| "channel no longer exists".to_string())
     }
 
     /// Store a file and send it as a direct message to `to`. Returns the assigned
@@ -1382,27 +1341,8 @@ impl PartyState {
         meta: FileMeta,
     ) -> Result<Envelope, String> {
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        let tier = self.tier;
         self.record_file_ref(from, &meta, thread_id, true);
-        let thread = self
-            .dm_threads
-            .entry(thread_id)
-            .or_insert_with(|| DmThread {
-                id: thread_id,
-                messages: Vec::new(),
-            });
-        let seq = thread.messages.len() as u64 + 1;
-        let envelope = Envelope {
-            tier,
-            sender: from,
-            channel: thread_id,
-            seq,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::File(meta),
-        };
-        thread.messages.push(envelope.clone());
-        self.persist_dm(thread_id, &envelope);
-        Ok(envelope)
+        Ok(self.append_dm_message(from, thread_id, MessagePayload::File(meta)))
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.

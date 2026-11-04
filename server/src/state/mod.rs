@@ -38,12 +38,17 @@ use uuid::Uuid;
 
 mod blobs;
 mod db;
+mod history;
 #[cfg(test)]
 mod tests;
+mod write_rate;
 
 use blobs::*;
 pub use blobs::{BlobReadPlan, StagedUpload};
 use db::*;
+use history::{History, RESIDENT_HISTORY};
+use write_rate::WriteBuckets;
+pub use write_rate::{WriteRateLimit, DEFAULT_WRITE_RATE, WRITE_RATE_REFUSAL};
 
 /// Filename of the embedded SQLite database under the operator's data dir.
 const DB_FILE: &str = "party.db";
@@ -251,8 +256,9 @@ struct Channel {
     kind: ChannelKind,
     /// Explicit membership, consulted only for [`ChannelKind::Private`].
     members: Vec<Uuid>,
-    /// Durable history; index order is delivery order. `seq` is `index + 1`.
-    messages: Vec<Envelope>,
+    /// Durable history: the newest envelopes in memory, all of them in the
+    /// database. See [`History`].
+    history: History,
 }
 
 /// One share of a file into a channel or DM thread — the provenance record the
@@ -328,7 +334,7 @@ struct AuditRecord {
 /// A 1:1 direct-message thread, keyed by `messenger_core::party::dm_thread_id`.
 struct DmThread {
     id: Uuid,
-    messages: Vec<Envelope>,
+    history: History,
 }
 
 /// A content-addressed file blob. The bytes are deduplicated by content hash and
@@ -385,6 +391,9 @@ pub struct PartyState {
     max_blob_bytes: u64,
     /// Most members this server registers (see [`MAX_MEMBERS`]).
     max_members: usize,
+    /// How many of each thread's newest envelopes stay in memory when there is
+    /// a database to page older ones from (see [`History`]).
+    resident_history: usize,
     /// When present, mutations are mirrored to this database.
     db: Option<Connection>,
     /// When present, blob bytes are mirrored to files under this directory.
@@ -395,6 +404,8 @@ pub struct PartyState {
     /// restart forgiving it costs nothing, because [`MAX_CHANNELS`] still bounds
     /// the total and the channels already made are still there.
     channel_creations: HashMap<Uuid, Vec<Instant>>,
+    /// Per-member write budgets (see [`WriteRateLimit`]).
+    write_rate: WriteBuckets,
 }
 
 impl PartyState {
@@ -406,7 +417,7 @@ impl PartyState {
             name: "general".to_string(),
             kind: ChannelKind::Public,
             members: Vec::new(),
-            messages: Vec::new(),
+            history: History::new(),
         };
         Self {
             name: name.into(),
@@ -423,15 +434,52 @@ impl PartyState {
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             max_members: MAX_MEMBERS,
+            resident_history: RESIDENT_HISTORY,
             db: None,
             blob_dir: None,
             channel_creations: HashMap::new(),
+            write_rate: WriteBuckets::default(),
         }
     }
 
     /// Override the per-member storage allowance (bytes of distinct content).
     pub fn set_max_member_blob_bytes(&mut self, bytes: u64) {
         self.max_member_blob_bytes = bytes;
+    }
+
+    /// Override how many of each thread's newest envelopes stay in memory on
+    /// a disk-backed server. Older ones are read from the database on demand.
+    pub fn set_resident_history(&mut self, envelopes: usize) {
+        self.resident_history = envelopes.max(1);
+    }
+
+    /// How many envelopes a thread may keep in memory, or `None` (all of
+    /// them) when there is no database to page the rest from.
+    fn history_cap(&self) -> Option<usize> {
+        self.db.as_ref().map(|_| self.resident_history)
+    }
+
+    /// Replace the per-member write budget; `None` turns it off (for an
+    /// in-process caller or a test that drives thousands of posts).
+    pub fn set_write_rate_limit(&mut self, limit: Option<WriteRateLimit>) {
+        self.write_rate.set_limit(limit);
+    }
+
+    /// Spend one write carrying `text_bytes` from `member`'s budget, or refuse
+    /// it. The dispatcher calls this before every mutating request; the state
+    /// methods themselves are not limited, so in-process callers are not.
+    pub fn check_write_rate(&mut self, member: Uuid, text_bytes: usize) -> Result<(), String> {
+        self.check_write_rate_at(member, text_bytes, Instant::now())
+    }
+
+    /// [`Self::check_write_rate`] against a caller-supplied clock.
+    pub fn check_write_rate_at(
+        &mut self,
+        member: Uuid,
+        text_bytes: usize,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.write_rate.check(member, text_bytes, now)
     }
 
     /// Override the member ceiling. It may only be lowered: [`MAX_MEMBERS`] is
@@ -857,7 +905,7 @@ impl PartyState {
             name: name.to_string(),
             kind: ChannelKind::Public,
             members: Vec::new(),
-            messages: Vec::new(),
+            history: History::new(),
         };
         let info = ChannelInfo {
             id: channel.id,
@@ -1157,22 +1205,80 @@ impl PartyState {
         }
         validate_message_text(&text)?;
         self.member_can_post_to_channel(sender, channel)?;
-        let tier = self.tier;
-        let chan = self
-            .channel_mut(channel)
-            .ok_or_else(|| "unknown channel".to_string())?;
-        let seq = chan.messages.len() as u64 + 1;
+        self.append_channel_message(sender, channel, MessagePayload::Text(text))
+            .ok_or_else(|| "unknown channel".to_string())
+    }
+
+    /// Append a message to `channel` under the next sequence number, keep it
+    /// in memory (subject to the resident cap) and persist it. `None` for an
+    /// unknown channel. Every channel message — text, file, re-share — is
+    /// appended here, so numbering has one source.
+    fn append_channel_message(
+        &mut self,
+        sender: Uuid,
+        channel: Uuid,
+        payload: MessagePayload,
+    ) -> Option<Envelope> {
+        let (tier, cap) = (self.tier, self.history_cap());
+        let chan = self.channel_mut(channel)?;
         let envelope = Envelope {
             tier,
             sender,
             channel,
-            seq,
+            seq: chan.history.next_seq(),
             timestamp: current_timestamp_millis(),
-            payload: MessagePayload::Text(text),
+            payload,
         };
-        chan.messages.push(envelope.clone());
+        chan.history.push(envelope.clone(), cap);
         self.persist_message(&envelope);
-        Ok(envelope)
+        Some(envelope)
+    }
+
+    /// The DM twin of [`Self::append_channel_message`], creating the thread
+    /// on its first message.
+    fn append_dm_message(
+        &mut self,
+        sender: Uuid,
+        thread_id: Uuid,
+        payload: MessagePayload,
+    ) -> Envelope {
+        let (tier, cap) = (self.tier, self.history_cap());
+        let thread = self
+            .dm_threads
+            .entry(thread_id)
+            .or_insert_with(|| DmThread {
+                id: thread_id,
+                history: History::new(),
+            });
+        let envelope = Envelope {
+            tier,
+            sender,
+            channel: thread_id,
+            seq: thread.history.next_seq(),
+            timestamp: current_timestamp_millis(),
+            payload,
+        };
+        thread.history.push(envelope.clone(), cap);
+        self.persist_dm(thread_id, &envelope);
+        envelope
+    }
+
+    /// One page of a thread's history after `since_seq`: from memory when the
+    /// thread's resident tail covers it, from the database otherwise.
+    fn history_page(&self, table: ThreadTable, history: &History, since_seq: u64) -> Vec<Envelope> {
+        if !history.covers(since_seq) {
+            if let Some(conn) = &self.db {
+                match load_page(conn, table, since_seq) {
+                    Ok(rows) => return take_history_page(rows.iter()),
+                    Err(e) => {
+                        // Serve what memory has rather than nothing: the page
+                        // starts later than asked, but the client still moves.
+                        tracing::error!(error = %e, "could not read a history page from party.db");
+                    }
+                }
+            }
+        }
+        take_history_page(history.after(since_seq))
     }
 
     /// Channel history strictly after `since_seq` (offline catch-up), one page
@@ -1196,7 +1302,7 @@ impl PartyState {
             return Vec::new();
         }
         match self.channel(channel) {
-            Some(c) => take_history_page(c.messages.iter().filter(|m| m.seq > since_seq)),
+            Some(c) => self.history_page(ThreadTable::Channel(c.id), &c.history, since_seq),
             None => Vec::new(),
         }
     }
@@ -1214,33 +1320,14 @@ impl PartyState {
         }
         validate_message_text(&text)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        let tier = self.tier;
-        let thread = self
-            .dm_threads
-            .entry(thread_id)
-            .or_insert_with(|| DmThread {
-                id: thread_id,
-                messages: Vec::new(),
-            });
-        let seq = thread.messages.len() as u64 + 1;
-        let envelope = Envelope {
-            tier,
-            sender: from,
-            channel: thread_id,
-            seq,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::Text(text),
-        };
-        thread.messages.push(envelope.clone());
-        self.persist_dm(thread_id, &envelope);
-        Ok(envelope)
+        Ok(self.append_dm_message(from, thread_id, MessagePayload::Text(text)))
     }
 
     /// Direct-message history for a thread strictly after `since_seq`, paged the
     /// same way as [`Self::history_since`] and for the same reason.
     pub fn dm_history(&self, thread_id: Uuid, since_seq: u64) -> Vec<Envelope> {
         match self.dm_threads.get(&thread_id) {
-            Some(t) => take_history_page(t.messages.iter().filter(|m| m.seq > since_seq)),
+            Some(t) => self.history_page(ThreadTable::Dm(t.id), &t.history, since_seq),
             None => Vec::new(),
         }
     }
