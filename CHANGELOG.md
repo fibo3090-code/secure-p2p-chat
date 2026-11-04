@@ -13,6 +13,15 @@ predate tagged releases.
 
 ### Security
 
+- **One idle connection could make a host unreachable.** The listener accepted
+  a single connection and closed the port while that connection's handshake
+  ran, so a connection that sent nothing kept everyone else out for 15 seconds
+  at a time, indefinitely. The host now keeps listening while up to four
+  handshakes run, each with one overall 20-second deadline, and applies the
+  per-address rate limit before a connection takes a slot. A wrong connection
+  password no longer ends hosting; it is reported and the host keeps
+  listening.
+
 - **A frame you sent could be echoed back and accepted as your peer's.** Both
   directions of a session share one key, so anyone on the path (a bridging
   relay, hostile Wi-Fi) could reflect your own "yes" back to you as the

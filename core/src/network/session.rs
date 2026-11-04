@@ -96,10 +96,75 @@ pub async fn bind_host_listener(port: u16) -> Result<TcpListener> {
         .map_err(|e| anyhow!("Could not listen on port {}: {}", port, e))
 }
 
-/// Run host session on an already-bound listener: accept one peer, then the
-/// same handshake, verification and message loop as every other transport
-/// ([`run_host_session_over_stream`]). Use [`bind_host_listener`] to obtain the
-/// listener.
+/// Handshakes the host listener runs at once. Beyond this, new connections
+/// are closed on arrival until one finishes. Small on purpose: a host serves
+/// one peer per session, and this only has to outlast connections that open
+/// and then say nothing.
+pub const MAX_PENDING_HOST_HANDSHAKES: usize = 4;
+
+/// One deadline for a whole incoming handshake plus the password gate. The
+/// per-packet timeout alone let a connection that sent each packet just in
+/// time hold a slot for over a minute.
+pub const HOST_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A wrong connection password. Typed so the accept loop can tell the user
+/// about it without reporting every port scan.
+#[derive(Debug)]
+struct PasswordRefused;
+
+impl std::fmt::Display for PasswordRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Incorrect connection password")
+    }
+}
+
+impl std::error::Error for PasswordRefused {}
+
+/// Everything the host does before the peer is shown to the user: the
+/// handshake, then the optional password gate inside the tunnel.
+async fn host_preamble<S>(
+    stream: &mut S,
+    privkey: &RsaPrivateKey,
+    chat_id: uuid::Uuid,
+    connection_password: Option<&str>,
+) -> Result<EstablishedTunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let tunnel = host_handshake(stream, privkey, chat_id).await?;
+    host_password_gate(
+        stream,
+        &tunnel.cipher,
+        &tunnel.transport_aad,
+        connection_password,
+    )
+    .await?;
+    Ok(tunnel)
+}
+
+/// The prompt that surfaces an incoming peer for verification.
+fn new_connection_prompt(peer_label: String, tunnel: &EstablishedTunnel) -> SessionEvent {
+    SessionEvent::NewConnection {
+        peer_addr: peer_label,
+        fingerprint: tunnel.peer_fingerprint.clone(),
+        sas: crate::core::derive_sas(&tunnel.transport_aad),
+        chat_id: tunnel.peer_chat_id,
+    }
+}
+
+/// Run a host session on an already-bound listener: keep accepting until one
+/// peer completes the handshake (and password gate), then verification and the
+/// message loop as on every other transport. Use [`bind_host_listener`] to
+/// obtain the listener.
+///
+/// The listener used to be one-shot — accept, drop it, then handshake — so a
+/// single connection that sent nothing left the port closed for the whole
+/// handshake timeout, and reconnecting the moment it reopened kept the host
+/// unreachable indefinitely (audit NET-02). Now handshakes run concurrently
+/// (at most [`MAX_PENDING_HOST_HANDSHAKES`], each under
+/// [`HOST_HANDSHAKE_DEADLINE`]) while the listener stays open, and the per-IP
+/// rate limit is applied *before* a slot is spent. The listener is still
+/// released the moment a peer wins, so auto-rehost can bind again.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session(
     listener: TcpListener,
@@ -119,34 +184,82 @@ pub async fn run_host_session(
         .send(SessionEvent::Listening { port })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    let (mut stream, peer_addr) = listener.accept().await?;
+    type Attempt = (TcpStream, std::net::SocketAddr, Result<EstablishedTunnel>);
+    let mut pending: tokio::task::JoinSet<Attempt> = tokio::task::JoinSet::new();
+    let (mut stream, peer_addr, tunnel) = loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A transient EMFILE must not end hosting; back off
+                        // briefly so it cannot spin either.
+                        tracing::warn!("accept() failed: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                if is_rate_limited(addr.ip()) {
+                    tracing::warn!("Rejecting connection from {} due to rate limiting", addr);
+                    continue;
+                }
+                if pending.len() >= MAX_PENDING_HOST_HANDSHAKES {
+                    tracing::warn!("Too many handshakes in progress; closing {}", addr);
+                    continue;
+                }
+                let privkey = privkey.clone();
+                let password = connection_password.clone();
+                pending.spawn(async move {
+                    let mut stream = stream;
+                    let result = tokio::time::timeout(
+                        HOST_HANDSHAKE_DEADLINE,
+                        host_preamble(&mut stream, &privkey, chat_id, password.as_deref()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!(
+                            "Handshake did not finish within {}s",
+                            HOST_HANDSHAKE_DEADLINE.as_secs()
+                        ))
+                    });
+                    (stream, addr, result)
+                });
+            }
+            Some(done) = pending.join_next(), if !pending.is_empty() => {
+                match done {
+                    Ok((stream, addr, Ok(tunnel))) => break (stream, addr, tunnel),
+                    Ok((_, addr, Err(e))) => {
+                        if e.downcast_ref::<PasswordRefused>().is_some() {
+                            let _ = to_app_tx.send(SessionEvent::Warning(format!(
+                                "Refused a connection from {addr}: wrong connection password"
+                            )));
+                        }
+                        tracing::info!("Incoming handshake from {} failed: {}", addr, e);
+                    }
+                    Err(e) => tracing::warn!("Handshake task failed: {}", e),
+                }
+            }
+        }
+    };
 
     // Release the port the instant we have our peer. A session serves exactly
     // one connection, so holding the listener for the whole conversation only
-    // ever did one thing: make the auto-rehost's bind fail with EADDRINUSE, so
-    // the app silently stopped accepting anyone after the first peer while
-    // still advertising the address as reachable.
+    // ever did one thing: make the auto-rehost's bind fail with EADDRINUSE.
+    // The other half-finished handshakes are abandoned with it.
     drop(listener);
-
-    if is_rate_limited(peer_addr.ip()) {
-        tracing::warn!(
-            "Rejecting connection from {} due to rate limiting",
-            peer_addr
-        );
-        return Err(anyhow!("Connection rejected: rate limit exceeded"));
-    }
+    pending.abort_all();
     tracing::info!("Client connected from {}", peer_addr);
 
-    run_host_session_over_stream(
+    let prompt = new_connection_prompt(peer_addr.to_string(), &tunnel);
+    verify_then_run(
         &mut stream,
-        peer_addr.to_string(),
-        privkey,
+        tunnel,
+        prompt,
+        chat_id,
         to_app_tx,
         from_app_rx,
         file_rx,
         confirm_rx,
-        chat_id,
-        connection_password,
     )
     .await
 }
@@ -712,7 +825,7 @@ where
         .ok_or_else(|| anyhow!("Failed to decrypt password response"))?;
     if let Some(pw) = expected {
         if !constant_time_eq(&resp, pw.as_bytes()) {
-            return Err(anyhow!("Incorrect connection password"));
+            return Err(PasswordRefused.into());
         }
     }
     Ok(())
@@ -840,7 +953,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let tunnel = host_handshake(stream, &privkey, chat_id).await?;
-
     // Optional connection-password gate (inside the encrypted, authenticated
     // tunnel, before the peer is surfaced for verification).
     reported(
@@ -853,13 +965,7 @@ where
         )
         .await,
     )?;
-
-    let prompt = SessionEvent::NewConnection {
-        peer_addr: peer_label,
-        fingerprint: tunnel.peer_fingerprint.clone(),
-        sas: crate::core::derive_sas(&tunnel.transport_aad),
-        chat_id: tunnel.peer_chat_id,
-    };
+    let prompt = new_connection_prompt(peer_label, &tunnel);
     verify_then_run(
         stream,
         tunnel,
