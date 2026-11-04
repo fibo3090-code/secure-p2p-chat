@@ -66,14 +66,23 @@ Oversized packets are rejected.
 
 ### Protocol generation
 
-Current secure runtime behavior requires protocol version `>= 3`.
+Current peers announce version **4** and accept `>= 3`. v4 adds the
+ephemeral-key commitment (step 2 below); with a v3 peer on either side it is
+skipped, the handshake otherwise proceeds as before, and both apps warn that
+the safety code is a weak check for that peer and the fingerprint should be
+compared instead.
 
 ### Handshake flow
 
-1. Exchange protocol versions in plaintext.
-2. Exchange X25519 ephemeral public keys in plaintext. Each side rejects an
-   all-zero peer key on parse and a non-contributory shared secret at
-   agreement (low-order-point guard, RFC 7748 §6.1).
+1. Exchange protocol versions in plaintext (host first). Each side then knows
+   both versions; the commitment below is used when both are `>= 4`.
+2. Exchange X25519 ephemeral public keys in plaintext. **v4:** the client
+   first sends `SHA-256("p2pem-v4-ephemeral-commitment" || E_client)` (32
+   bytes); the host sends `E_host` only after receiving it; the client then
+   reveals `E_client`, and the host refuses the session unless it matches the
+   commitment. Each side rejects an all-zero peer key on parse and a
+   non-contributory shared secret at agreement (low-order-point guard,
+   RFC 7748 §6.1).
 3. Derive a shared session key using HKDF-SHA256.
 4. Establish encrypted transport with AES-256-GCM.
 5. Exchange encrypted `IdentityProof` messages inside that tunnel.
@@ -89,10 +98,18 @@ Current secure runtime behavior requires protocol version `>= 3`.
 Alongside the 64-char fingerprint, both peers derive an identical SAS from the
 handshake transport AAD (itself the transcript hash), via
 `HKDF-SHA256(info = "p2pem-sas-v1")`: six decimal digits (`NN-NN-NN`) plus
-three emoji from a fixed 32-entry table (~35 bits shown). Because it is bound
-to the transcript — which includes both ephemeral keys and both identity keys
-— an active MITM necessarily runs two *different* handshakes, so the two
-victims see two *different* SAS values. Reading the code aloud over any
+three emoji from a fixed 32-entry table (~35 bits shown). It is bound to the
+transcript — both versions and both ephemeral keys — so an active MITM runs
+two *different* handshakes and the two victims see two *different* SAS values
+unless the attacker can make them collide.
+
+The v4 commitment is what stops that. Without it the attacker, after seeing
+one victim's ephemeral key, could try keys of its own on the other connection
+until the codes matched (about 2^20 tries for the six digits — under a second
+— and about 2^35 for the whole code). With the client committed before the
+host reveals its key, each half of an interposed session fixes the attacker's
+key before the code it must match is known, so it gets one guess per attempt.
+Against a v3 peer there is no commitment, which is why the apps warn. Reading the code aloud over any
 out-of-band channel (a call, in person) therefore detects interception with
 far less friction than a full-fingerprint compare. The SAS is display-only
 verification aid: it is never sent on the wire, and trust is still pinned by

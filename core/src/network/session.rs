@@ -142,6 +142,13 @@ where
     Ok(tunnel)
 }
 
+/// Tell the user, before the prompt, that this peer's safety code is weak.
+fn warn_if_legacy_sas(to_app_tx: &mpsc::UnboundedSender<SessionEvent>, tunnel: &EstablishedTunnel) {
+    if !tunnel.sas_committed {
+        let _ = to_app_tx.send(SessionEvent::Warning(LEGACY_SAS_WARNING.to_string()));
+    }
+}
+
 /// The prompt that surfaces an incoming peer for verification.
 fn new_connection_prompt(peer_label: String, tunnel: &EstablishedTunnel) -> SessionEvent {
     SessionEvent::NewConnection {
@@ -250,6 +257,7 @@ pub async fn run_host_session(
     pending.abort_all();
     tracing::info!("Client connected from {}", peer_addr);
 
+    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = new_connection_prompt(peer_addr.to_string(), &tunnel);
     verify_then_run(
         &mut stream,
@@ -378,7 +386,46 @@ pub struct EstablishedTunnel {
     /// that varies by peer version, so it is what a diagnostic report needs to
     /// answer "why did this connection behave differently from that one".
     pub signature_scheme: SignatureScheme,
+    /// Whether the client committed to its ephemeral key before seeing the
+    /// host's (both peers v4+). Without the commitment a man in the middle can
+    /// try ephemeral keys until both victims' safety codes match, so the code
+    /// is only a weak check and the user is told to compare the fingerprint.
+    pub sas_committed: bool,
 }
+
+/// First protocol version in which the client commits to its ephemeral key.
+pub const SAS_COMMITMENT_VERSION: u32 = 4;
+
+/// Domain separator for the ephemeral-key commitment.
+const COMMITMENT_LABEL: &[u8] = b"p2pem-v4-ephemeral-commitment";
+
+/// The client's commitment to its ephemeral key, sent before it sees the
+/// host's. It is what stops a man in the middle from grinding its own key
+/// until both victims' safety codes match (audit CRYPTO-02): with the client
+/// committed first and the host's key fixed before the reveal, neither half
+/// of an interposed session leaves the attacker anything to search over.
+pub fn ephemeral_commitment(ephemeral: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(COMMITMENT_LABEL);
+    h.update(ephemeral);
+    h.finalize().into()
+}
+
+/// Check a revealed ephemeral key against the commitment received earlier.
+fn check_commitment(commitment: &[u8], ephemeral: &[u8]) -> Result<()> {
+    let expected = ephemeral_commitment(ephemeral);
+    if commitment.len() != expected.len() || !bool::from(expected.ct_eq(commitment)) {
+        return Err(anyhow!(
+            "Client's ephemeral key does not match its commitment"
+        ));
+    }
+    Ok(())
+}
+
+/// The warning shown before verifying a peer whose handshake had no
+/// commitment (a pre-v4 peer, or someone stripping the version on the path).
+pub const LEGACY_SAS_WARNING: &str = "This peer runs an older version, so its safety code is a \
+weak check. Compare the full fingerprint (advanced) instead, or ask them to update.";
 
 /// Sign our ephemeral key for the identity proof under the negotiated scheme.
 ///
@@ -479,6 +526,12 @@ const OFFERED_SCHEMES: [SignatureScheme; 2] = [SignatureScheme::Ed25519, Signatu
 /// Our protocol version as it goes on the wire (plaintext, big-endian u32).
 fn our_version_bytes() -> [u8; 4] {
     (PROTOCOL_VERSION as u32).to_be_bytes()
+}
+
+/// Whether this handshake uses the ephemeral-key commitment: both sides must
+/// speak v4+ (each knows both versions after the version exchange).
+fn uses_commitment(our_version: &[u8; 4], peer_version: u32) -> bool {
+    u32::from_be_bytes(*our_version).min(peer_version) >= SAS_COMMITMENT_VERSION
 }
 
 /// The other side's name in error messages, from our role.
@@ -666,6 +719,7 @@ impl TunnelKeys {
         self,
         peer: &IdentityProof,
         scheme: SignatureScheme,
+        sas_committed: bool,
     ) -> Result<EstablishedTunnel> {
         // Parsed by the same strict decoder `verify_identity_proof` used, so
         // the fingerprint names exactly the key the signature was checked with.
@@ -677,6 +731,7 @@ impl TunnelKeys {
             cipher: self.cipher,
             transport_aad: self.transport_aad,
             signature_scheme: scheme,
+            sas_committed,
         })
     }
 }
@@ -698,16 +753,41 @@ pub async fn host_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    host_handshake_as(stream, privkey, chat_id, our_version_bytes()).await
+}
+
+/// [`host_handshake`] announcing an arbitrary version — the real one in
+/// production, an older one in compatibility tests.
+async fn host_handshake_as<S>(
+    stream: &mut S,
+    privkey: &RsaPrivateKey,
+    chat_id: uuid::Uuid,
+    host_version: [u8; 4],
+) -> Result<EstablishedTunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     const US: NonceRole = NonceRole::Host;
 
-    let host_version = our_version_bytes();
     send_packet(stream, &host_version).await?;
     let client_version = recv_packet_with_timeout(stream).await?;
-    check_peer_version(&client_version, US)?;
+    let peer_version = check_peer_version(&client_version, US)?;
+    let committed = uses_commitment(&host_version, peer_version);
+
+    // v4: the client's commitment arrives before we reveal anything, so it
+    // cannot choose its key with ours in hand.
+    let commitment = if committed {
+        Some(recv_packet_with_timeout(stream).await?)
+    } else {
+        None
+    };
 
     let (host_secret, host_public) = generate_ephemeral_keypair();
     send_packet(stream, host_public.as_bytes()).await?;
     let (client_ephemeral, client_public) = recv_peer_ephemeral(stream).await?;
+    if let Some(commitment) = commitment {
+        check_commitment(&commitment, &client_ephemeral)?;
+    }
 
     let scheme = negotiate_schemes(stream, US).await?;
 
@@ -731,7 +811,7 @@ where
     )
     .await?;
     let client_proof = recv_identity_proof(stream, &keys, &client_ephemeral, scheme, US).await?;
-    keys.established(&client_proof, scheme)
+    keys.established(&client_proof, scheme, committed)
 }
 
 /// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
@@ -746,15 +826,33 @@ pub async fn client_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    client_handshake_as(stream, privkey, chat_id, our_version_bytes()).await
+}
+
+/// [`client_handshake`] announcing an arbitrary version (see
+/// [`host_handshake_as`]).
+async fn client_handshake_as<S>(
+    stream: &mut S,
+    privkey: &RsaPrivateKey,
+    chat_id: uuid::Uuid,
+    client_version: [u8; 4],
+) -> Result<EstablishedTunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     const US: NonceRole = NonceRole::Client;
 
     let host_version = recv_packet_with_timeout(stream).await?;
-    check_peer_version(&host_version, US)?;
-    let client_version = our_version_bytes();
+    let peer_version = check_peer_version(&host_version, US)?;
     send_packet(stream, &client_version).await?;
+    let committed = uses_commitment(&client_version, peer_version);
 
-    let (host_ephemeral, host_public) = recv_peer_ephemeral(stream).await?;
     let (client_secret, client_public) = generate_ephemeral_keypair();
+    if committed {
+        // Bind ourselves to this key before the host reveals its own.
+        send_packet(stream, &ephemeral_commitment(client_public.as_bytes())).await?;
+    }
+    let (host_ephemeral, host_public) = recv_peer_ephemeral(stream).await?;
     send_packet(stream, client_public.as_bytes()).await?;
 
     let scheme = negotiate_schemes(stream, US).await?;
@@ -779,7 +877,7 @@ where
         scheme,
     )
     .await?;
-    keys.established(&host_proof, scheme)
+    keys.established(&host_proof, scheme, committed)
 }
 
 /// Constant-time comparison so a wrong connection password cannot be recovered
@@ -965,6 +1063,7 @@ where
         )
         .await,
     )?;
+    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = new_connection_prompt(peer_label, &tunnel);
     verify_then_run(
         stream,
@@ -1016,6 +1115,7 @@ where
         .await,
     )?;
 
+    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = SessionEvent::ShowFingerprintVerification {
         fingerprint: tunnel.peer_fingerprint.clone(),
         peer_name: peer_label,
@@ -2047,6 +2147,104 @@ mod tests {
         assert_eq!(client.signature_scheme, SignatureScheme::Ed25519);
         assert_eq!(client.peer_fingerprint, expected_host_fp.unwrap());
         assert_eq!(host.peer_fingerprint, expected_client_fp.unwrap());
+    }
+
+    /// Run both handshake halves announcing the given versions.
+    async fn handshake_pair(
+        host_version: u32,
+        client_version: u32,
+    ) -> (Result<EstablishedTunnel>, Result<EstablishedTunnel>) {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            host_handshake_as(
+                &mut host_stream,
+                &host_priv,
+                uuid::Uuid::new_v4(),
+                host_version.to_be_bytes(),
+            )
+            .await
+        });
+        let client = client_handshake_as(
+            &mut client_stream,
+            &client_priv,
+            uuid::Uuid::new_v4(),
+            client_version.to_be_bytes(),
+        )
+        .await;
+        (host.await.unwrap(), client)
+    }
+
+    /// CRYPTO-02: two current peers use the commitment, and agree on the SAS.
+    #[tokio::test]
+    async fn current_peers_commit_to_their_ephemeral_keys() {
+        let (host, client) = handshake_pair(PROTOCOL_VERSION as u32, PROTOCOL_VERSION as u32).await;
+        let (host, client) = (host.unwrap(), client.unwrap());
+        assert!(host.sas_committed && client.sas_committed);
+        assert_eq!(
+            crate::core::derive_sas(&host.transport_aad),
+            crate::core::derive_sas(&client.transport_aad)
+        );
+    }
+
+    /// A v3 peer on either side still connects — without the commitment, which
+    /// both sides then report so the UI can warn that the code is weak.
+    #[tokio::test]
+    async fn a_v3_peer_still_connects_but_without_the_commitment() {
+        for (h, c) in [(3, PROTOCOL_VERSION as u32), (PROTOCOL_VERSION as u32, 3)] {
+            let (host, client) = handshake_pair(h, c).await;
+            let (host, client) = (host.unwrap(), client.unwrap());
+            assert!(
+                !host.sas_committed && !client.sas_committed,
+                "host v{h}, client v{c}"
+            );
+            assert_eq!(
+                crate::core::derive_sas(&host.transport_aad),
+                crate::core::derive_sas(&client.transport_aad)
+            );
+        }
+    }
+
+    /// The point of the commitment: a client that reveals a key other than the
+    /// one it committed to (a man in the middle that went shopping for a
+    /// matching code) is refused before any key is derived.
+    #[tokio::test]
+    async fn a_client_that_breaks_its_commitment_is_refused() {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut host_stream, mut wire) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            host_handshake(&mut host_stream, &host_priv, uuid::Uuid::new_v4()).await
+        });
+
+        let _host_version = recv_packet(&mut wire).await.unwrap();
+        send_packet(&mut wire, &our_version_bytes()).await.unwrap();
+        let (_, committed_key) = generate_ephemeral_keypair();
+        send_packet(&mut wire, &ephemeral_commitment(committed_key.as_bytes()))
+            .await
+            .unwrap();
+        let _host_ephemeral = recv_packet(&mut wire).await.unwrap();
+        let (_, other_key) = generate_ephemeral_keypair();
+        send_packet(&mut wire, other_key.as_bytes()).await.unwrap();
+
+        let Err(err) = host.await.unwrap() else {
+            panic!("a broken commitment must be refused");
+        };
+        assert!(err.to_string().contains("commitment"), "{err}");
+    }
+
+    /// The commitment is frozen wire format: changing the label or the hash
+    /// would make every v4 peer refuse every other.
+    #[test]
+    fn the_commitment_format_is_frozen() {
+        let c = ephemeral_commitment(&[0u8; 32]);
+        let mut h = Sha256::new();
+        h.update(b"p2pem-v4-ephemeral-commitment");
+        h.update([0u8; 32]);
+        assert_eq!(c.as_slice(), h.finalize().as_slice());
+        assert!(check_commitment(&c, &[0u8; 32]).is_ok());
+        assert!(check_commitment(&c, &[1u8; 32]).is_err());
+        assert!(check_commitment(&c[..31], &[0u8; 32]).is_err());
     }
 
     /// An Ed25519 proof is only worth anything with its binding: without one,

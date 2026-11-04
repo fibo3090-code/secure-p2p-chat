@@ -525,8 +525,13 @@ const SAS_EMOJI: [&str; 32] = [
 /// two distinct handshakes whose transcripts (ephemeral keys, identity keys)
 /// differ, so the two victims see different codes. Reading the code aloud on
 /// any out-of-band channel therefore detects an interposed session — far less
-/// friction than comparing a 64-character fingerprint. ~35 bits shown; the
-/// attacker gets one guess per connection attempt.
+/// friction than comparing a 64-character fingerprint. ~35 bits shown.
+///
+/// The "one guess per connection attempt" property depends on the v4
+/// ephemeral-key commitment (`network::session::ephemeral_commitment`):
+/// without it, a man in the middle that has seen one victim's key can try its
+/// own until both codes match. A v3 handshake has no commitment, and the
+/// session warns the user that the code is weak (audit CRYPTO-02).
 pub fn derive_sas(transcript_material: &[u8]) -> String {
     let hkdf = Hkdf::<Sha256>::new(None, transcript_material);
     let mut out = [0u8; 5];

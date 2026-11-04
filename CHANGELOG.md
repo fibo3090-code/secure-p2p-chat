@@ -13,6 +13,15 @@ predate tagged releases.
 
 ### Security
 
+- **The safety code could be forged by a man in the middle.** The six digits
+  and three emoji were derived from both sides' temporary keys with nothing
+  stopping an attacker from choosing its key after seeing the victim's, so it
+  could try keys until both victims saw the same code (well under a second for
+  the digits alone). Protocol v4 makes the connecting side commit to its key
+  before seeing the other's. Older (v3) peers still connect, but the app now
+  warns that their safety code is a weak check and the fingerprint should be
+  compared instead.
+
 - **One idle connection could make a host unreachable.** The listener accepted
   a single connection and closed the port while that connection's handshake
   ran, so a connection that sent nothing kept everyone else out for 15 seconds
