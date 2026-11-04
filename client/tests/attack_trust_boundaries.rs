@@ -148,12 +148,15 @@ async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
 
 struct TestServer {
     address: String,
+    /// The one-time owner claim token; the operator joins with it.
+    claim_token: Option<String>,
     _dir: tempfile::TempDir,
 }
 
 async fn start_server() -> TestServer {
     let dir = tempfile::tempdir().expect("dir");
     let state = PartyState::load("Attack Target", None, dir.path()).expect("state");
+    let claim_token = state.owner_claim_token().map(str::to_owned);
     let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS).expect("key"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -164,7 +167,11 @@ async fn start_server() -> TestServer {
     tokio::spawn(async move {
         let _ = run_accept_loop(listener, state, privkey, hub).await;
     });
-    TestServer { address, _dir: dir }
+    TestServer {
+        address,
+        claim_token,
+        _dir: dir,
+    }
 }
 
 async fn pump_until<F>(mgr: &mut PartyManager, label: &str, mut done: F)
@@ -183,13 +190,26 @@ where
 }
 
 async fn join(server: &TestServer, username: &str) -> (PartyManager, Uuid) {
+    join_with(server, username, None).await
+}
+
+/// Join as the community's owner: with the claim token as the password.
+async fn join_owner(server: &TestServer, username: &str) -> (PartyManager, Uuid) {
+    join_with(server, username, server.claim_token.clone()).await
+}
+
+async fn join_with(
+    server: &TestServer,
+    username: &str,
+    password: Option<String>,
+) -> (PartyManager, Uuid) {
     let key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
     let mut mgr = PartyManager::new();
     let sid = match mgr
         .connect_and_join(
             &server.address,
             username,
-            None,
+            password,
             &key,
             Some(&learn_fingerprint(&server.address, &key).await),
         )
@@ -213,7 +233,7 @@ async fn join(server: &TestServer, username: &str) -> (PartyManager, Uuid) {
 #[tokio::test]
 async fn a_content_hash_is_not_a_capability() {
     let server = start_server().await;
-    let (mut owner, owner_sid) = join(&server, "owner").await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
     let (mut intruder, intruder_sid) = join(&server, "intruder").await;
 
     pump_until(&mut owner, "members", |m| {
@@ -321,7 +341,7 @@ async fn a_content_hash_is_not_a_capability() {
 #[tokio::test]
 async fn a_member_cannot_escalate_or_depose_the_owner() {
     let server = start_server().await;
-    let (mut owner, owner_sid) = join(&server, "owner").await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
     let (mut member, member_sid) = join(&server, "member").await;
 
     pump_until(&mut owner, "members", |m| {
@@ -372,7 +392,7 @@ async fn a_member_cannot_escalate_or_depose_the_owner() {
 #[tokio::test]
 async fn a_guest_cannot_write_however_it_asks() {
     let server = start_server().await;
-    let (mut owner, owner_sid) = join(&server, "owner").await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
     let (mut guest, guest_sid) = join(&server, "guest").await;
 
     pump_until(&mut owner, "members", |m| {
@@ -446,7 +466,7 @@ async fn a_guest_cannot_write_however_it_asks() {
 #[tokio::test]
 async fn a_username_is_not_an_identity() {
     let server = start_server().await;
-    let (mut owner, owner_sid) = join(&server, "owner").await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
     pump_until(&mut owner, "joined", |m| {
         m.server(owner_sid).is_some_and(|s| s.member_id.is_some())
     })

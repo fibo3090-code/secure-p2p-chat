@@ -8,9 +8,13 @@
 //! Newly posted messages are fanned out to every *other* connected member.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::anyhow;
 use messenger_core::network::host_handshake;
-use messenger_core::party::{recv_framed, send_framed, FrameSeq, PartyRequest, PartyResponse};
+use messenger_core::party::{
+    recv_framed, send_framed, FrameSeq, PartyRequest, PartyResponse, MAX_PARTY_PAYLOAD_BYTES,
+};
 use rsa::RsaPrivateKey;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
@@ -21,6 +25,58 @@ use crate::dispatch::{
 };
 use crate::hub::Hub;
 use crate::state::PartyState;
+
+/// Timeouts applied to one connection.
+///
+/// There were none. Once its handshake completed a connection could sit
+/// unjoined forever, and a write to a client that had stopped reading blocked
+/// its task forever — so an unauthenticated peer could hold a task and a file
+/// descriptor per socket indefinitely, and one stuck client also held back the
+/// broadcasts of every message it posted.
+#[derive(Debug, Clone)]
+pub struct ConnectionLimits {
+    /// Ceiling on the whole v3 handshake. Each handshake read already has its
+    /// own timeout; this bounds the sum, so a peer that trickles bytes cannot
+    /// stretch it out.
+    pub handshake_timeout: Duration,
+    /// How long a connection may stay unjoined after its handshake. A client
+    /// joins in its first frame; one that has not by now is a probe, a scanner,
+    /// or someone holding sockets open.
+    pub join_timeout: Duration,
+    /// Ceiling on writing one frame. A client whose TCP window stays shut this
+    /// long has stopped reading, and is disconnected rather than waited on.
+    pub write_timeout: Duration,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: Duration::from_secs(messenger_core::HANDSHAKE_TIMEOUT_SECS + 5),
+            join_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Write one frame, giving up after `timeout`.
+async fn send_with_timeout<W>(
+    wr: &mut W,
+    cipher: &messenger_core::core::AesCipher,
+    aad: &[u8],
+    seq: &mut FrameSeq,
+    bytes: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, send_framed(wr, cipher, aad, seq, bytes)).await {
+        Ok(sent) => sent,
+        Err(_) => Err(anyhow!(
+            "timed out after {timeout:?} writing to a client that stopped reading"
+        )),
+    }
+}
 
 /// Read one frame, taking ownership of the read half and the sequence counter
 /// and handing both back with the result.
@@ -40,6 +96,45 @@ where
 {
     let result = recv_framed(&mut rd, cipher, aad, &mut seq).await;
     (rd, seq, result)
+}
+
+/// Encode a reply to this client, answering with an error instead when it is
+/// too large for one frame.
+///
+/// Defence in depth: every listing and page is budgeted to fit (see
+/// `take_history_page`), so this should never fire. But a reply that cannot be
+/// sent fails `send_packet`, and a failed send ends the connection — and a
+/// client that asks for the same thing again on reconnect then can never stay
+/// connected at all. An error the client can show is strictly better.
+fn encode_reply(resp: &PartyResponse) -> Vec<u8> {
+    let bytes = resp.to_bytes();
+    if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
+        return bytes;
+    }
+    tracing::error!(
+        size = bytes.len(),
+        limit = MAX_PARTY_PAYLOAD_BYTES,
+        "a reply was too large to send; answering with an error instead"
+    );
+    PartyResponse::Error("the server's reply was too large to send".to_string()).to_bytes()
+}
+
+/// Encode a pushed broadcast, or `None` when it is too large for one frame.
+///
+/// A broadcast too large to send would otherwise disconnect *every* online
+/// recipient at once. Dropping it costs them one live update, which they
+/// recover from history.
+fn encode_push(resp: &PartyResponse) -> Option<Vec<u8>> {
+    let bytes = resp.to_bytes();
+    if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
+        return Some(bytes);
+    }
+    tracing::error!(
+        size = bytes.len(),
+        limit = MAX_PARTY_PAYLOAD_BYTES,
+        "a broadcast was too large to send; dropping it"
+    );
+    None
 }
 
 /// Perform the I/O `handle_request` deferred, once the state lock is released,
@@ -111,11 +206,7 @@ async fn perform_deferred(
     }
 }
 
-/// Serve one client connection to completion (until the peer disconnects or a
-/// frame fails to authenticate). The server's identity (`server_privkey`) is
-/// TOFU-verified by the client; the client's handshake-verified fingerprint is
-/// bound to its membership on join. Once joined, the connection is registered with
-/// `hub` to receive broadcasts.
+/// Serve one client connection with the default [`ConnectionLimits`].
 pub async fn serve_connection<S>(
     stream: &mut S,
     server_privkey: &RsaPrivateKey,
@@ -125,13 +216,61 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let tunnel = host_handshake(stream, server_privkey, Uuid::new_v4()).await?;
+    serve_connection_with(
+        stream,
+        server_privkey,
+        state,
+        hub,
+        &ConnectionLimits::default(),
+    )
+    .await
+}
+
+/// Serve one client connection to completion (until the peer disconnects, a
+/// frame fails to authenticate, a timeout in `limits` expires, or the hub
+/// evicts it). The server's identity (`server_privkey`) is TOFU-verified by the
+/// client; the client's handshake-verified fingerprint is bound to its
+/// membership on join. Once joined, the connection is registered with `hub` to
+/// receive broadcasts.
+pub async fn serve_connection_with<S>(
+    stream: &mut S,
+    server_privkey: &RsaPrivateKey,
+    state: Arc<Mutex<PartyState>>,
+    hub: Arc<Hub>,
+    limits: &ConnectionLimits,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let tunnel = tokio::time::timeout(
+        limits.handshake_timeout,
+        host_handshake(stream, server_privkey, Uuid::new_v4()),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "handshake did not complete within {:?}",
+            limits.handshake_timeout
+        )
+    })??;
     let cipher = tunnel.cipher;
     let aad = tunnel.transport_aad;
     let conn_id = Uuid::new_v4();
+    let write_timeout = limits.write_timeout;
     // Bounded: an unbounded lane let a client that stopped reading its socket
     // accumulate every broadcast on our heap. See `hub::BROADCAST_QUEUE_DEPTH`.
     let (out_tx, mut out_rx) = mpsc::channel::<PartyResponse>(crate::hub::BROADCAST_QUEUE_DEPTH);
+    // The sender is *moved* into the hub on registration, never cloned.
+    //
+    // That is what makes eviction close the connection. The hub drops a
+    // connection whose queue is full; if this task still held its own copy of
+    // the sender, the receiver would never report closed and the connection
+    // would carry on — answering requests, receiving no broadcasts, DMs or
+    // directory changes ever again, with nothing to tell the client. With the
+    // hub holding the only sender, eviction closes the lane, `recv` returns
+    // `None` once the queue drains, and the loop ends so the client reconnects
+    // and catches up from history.
+    let mut out_tx = Some(out_tx);
     let mut conn = ConnState::with_fingerprint(tunnel.peer_fingerprint);
     let mut registered = false;
     // Per-direction frame counters: every Party frame carries a sequence inside
@@ -162,6 +301,11 @@ where
     // it left off, so no read is ever abandoned part-way.
     let mut pending = Box::pin(read_frame(rd, &cipher, &aad, recv_seq));
 
+    // The pre-join deadline. A `Sleep` polled by reference is cancel-safe, so
+    // it can sit in the select alongside the held read without disturbing it.
+    let join_deadline = tokio::time::sleep(limits.join_timeout);
+    tokio::pin!(join_deadline);
+
     // How the connection ended. A failed write is recorded here rather than
     // returned with `?`: returning early skipped the teardown below, so a
     // client that vanished while the server was writing to it — someone
@@ -174,15 +318,29 @@ where
         // The read half and its sequence counter, handed back when a frame
         // completes, so the next read can be started after the branch body.
         let mut finished = None;
+        let awaiting_join = conn.member().is_none();
 
         tokio::select! {
             // A broadcast pushed to us by another connection. `recv` IS
             // cancel-safe: a message is either taken from the queue or left in it.
-            Some(push) = out_rx.recv() => {
-                if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &push.to_bytes()).await {
+            push = out_rx.recv() => {
+                let Some(push) = push else {
+                    // Only the hub holds the sender, so this is an eviction
+                    // (see `out_tx` above).
+                    tracing::warn!(conn = %conn_id, "evicted for not reading broadcasts; closing so the client reconnects");
+                    served = Err(anyhow!("evicted: the client stopped reading broadcasts"));
+                    break;
+                };
+                let Some(bytes) = encode_push(&push) else { continue };
+                if let Err(e) = send_with_timeout(&mut wr, &cipher, &aad, &mut send_seq, &bytes, write_timeout).await {
                     served = Err(e);
                     break;
                 }
+            }
+            // Still not joined: a probe or a socket being held open.
+            () = &mut join_deadline, if awaiting_join => {
+                served = Err(anyhow!("did not join within {:?}", limits.join_timeout));
+                break;
             }
             // An incoming request from this client.
             (rd_back, seq_back, incoming) = &mut pending => {
@@ -213,13 +371,14 @@ where
                 // Register for broadcasts/DMs once this connection has joined.
                 if !registered {
                     if let Some(member) = conn.member() {
-                        hub.register(conn_id, member, out_tx.clone());
+                        let tx = out_tx.take().expect("registered at most once");
+                        hub.register(conn_id, member, tx);
                         registered = true;
                     }
                 }
 
                 for resp in outcome.replies {
-                    if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await {
+                    if let Err(e) = send_with_timeout(&mut wr, &cipher, &aad, &mut send_seq, &encode_reply(&resp), write_timeout).await {
                         served = Err(e);
                         break;
                     }
@@ -863,9 +1022,13 @@ mod tests {
         )
         .await;
 
-        // The first to join owns the server, so the owner can make a private
+        // The owner (who joins with the claim token) can make a private
         // channel; the other two are ordinary members.
-        let _owner_id = join_as(&mut owner, "owner").await;
+        let token = state.lock().await.owner_claim_token().unwrap().to_string();
+        match owner.join("owner", Some(token)).await.unwrap() {
+            PartyResponse::Joined { .. } => {}
+            other => panic!("expected Joined, got {other:?}"),
+        }
         let bob_id = join_as(&mut bob, "bob").await;
         let _carol_id = join_as(&mut carol, "carol").await;
 
@@ -1066,6 +1229,26 @@ mod tests {
     /// be told. Nothing announced this before, so a member who left showed as
     /// online in every other client until something else happened to refresh the
     /// directory — which, since nothing refreshed it either, meant forever.
+    /// A reply too large for a frame used to fail `send_packet` and end the
+    /// connection; a client that asked again on reconnect could then never stay
+    /// connected. It becomes an error the client can show, and an oversized
+    /// broadcast is dropped rather than disconnecting every recipient.
+    #[test]
+    fn an_oversized_reply_becomes_an_error_and_an_oversized_push_is_dropped() {
+        let huge = PartyResponse::Error("x".repeat(MAX_PARTY_PAYLOAD_BYTES));
+        let bytes = encode_reply(&huge);
+        assert!(bytes.len() <= MAX_PARTY_PAYLOAD_BYTES);
+        assert!(matches!(
+            PartyResponse::from_bytes(&bytes),
+            Some(PartyResponse::Error(ref m)) if m.contains("too large")
+        ));
+        assert!(encode_push(&huge).is_none());
+
+        let small = PartyResponse::Ok("fine".to_string());
+        assert_eq!(encode_reply(&small), small.to_bytes());
+        assert_eq!(encode_push(&small), Some(small.to_bytes()));
+    }
+
     #[tokio::test]
     async fn leaving_broadcasts_the_member_as_offline() {
         let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
@@ -1112,5 +1295,229 @@ mod tests {
 
         drop(alice);
         alice_srv.abort();
+    }
+
+    /// Spawn `serve_connection_with` over a duplex of `buffer` bytes, handing
+    /// back the server task so a test can watch it end.
+    fn spawn_with_limits(
+        server_priv: RsaPrivateKey,
+        state: Arc<Mutex<PartyState>>,
+        hub: Arc<Hub>,
+        buffer: usize,
+        limits: ConnectionLimits,
+    ) -> (DuplexStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let (mut server_stream, client_stream) = tokio::io::duplex(buffer);
+        let handle = tokio::spawn(async move {
+            serve_connection_with(&mut server_stream, &server_priv, state, hub, &limits).await
+        });
+        (client_stream, handle)
+    }
+
+    fn short_limits() -> ConnectionLimits {
+        ConnectionLimits {
+            handshake_timeout: std::time::Duration::from_millis(500),
+            join_timeout: std::time::Duration::from_millis(500),
+            write_timeout: std::time::Duration::from_millis(500),
+        }
+    }
+
+    /// SRV-02: when the hub evicted a connection whose queue was full, the task
+    /// still held its own copy of the sender, so the receiver never closed and
+    /// the connection carried on — answering requests but deaf to every
+    /// broadcast, DM and directory change, with nothing telling the client.
+    /// Eviction must close the connection so the client reconnects.
+    #[tokio::test]
+    async fn an_evicted_connection_is_closed_rather_than_left_deaf() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let hub = Arc::new(Hub::new());
+        let (stream, served) = spawn_with_limits(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state.clone(),
+            hub.clone(),
+            1 << 16,
+            ConnectionLimits::default(),
+        );
+        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let mut alice = PartyClient::connect(stream, &alice_priv, Uuid::new_v4())
+            .await
+            .unwrap();
+        let PartyResponse::Joined {
+            member_id: alice_id,
+            ..
+        } = alice.join("alice", None).await.unwrap()
+        else {
+            panic!("alice did not join");
+        };
+        // Registration happens after the reply is written; wait for it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !hub.member_is_connected(alice_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("alice registers");
+
+        // On this current-thread runtime the connection task cannot run while
+        // these pushes happen, so its queue fills and the hub evicts it.
+        for _ in 0..=crate::hub::BROADCAST_QUEUE_DEPTH {
+            hub.broadcast_all(PartyResponse::DirectoryChanged);
+        }
+        assert!(!hub.member_is_connected(alice_id), "evicted from the hub");
+
+        // The client drains what was queued and then sees the connection end.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if alice.recv().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the evicted connection must be closed");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), served)
+            .await
+            .expect("the connection task ends")
+            .unwrap();
+        assert!(outcome.unwrap_err().to_string().contains("evicted"));
+        // Torn down like any other disconnect: shown offline.
+        assert!(!state
+            .lock()
+            .await
+            .members()
+            .iter()
+            .any(|m| m.id == alice_id && m.online));
+    }
+
+    /// SRV-03: a connection that completed its handshake could sit unjoined
+    /// forever, holding a task and a file descriptor.
+    #[tokio::test]
+    async fn a_connection_that_never_joins_is_closed() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let (stream, served) = spawn_with_limits(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state,
+            Arc::new(Hub::new()),
+            1 << 16,
+            short_limits(),
+        );
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let mut client = PartyClient::connect(stream, &client_priv, Uuid::new_v4())
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+            .await
+            .expect("closed after the join deadline")
+            .unwrap();
+        assert!(outcome.unwrap_err().to_string().contains("did not join"));
+        assert!(client.recv().await.is_err(), "the client sees it close");
+    }
+
+    /// A joined connection is not subject to the join deadline.
+    #[tokio::test]
+    async fn a_joined_connection_outlives_the_join_deadline() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let (stream, served) = spawn_with_limits(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state,
+            Arc::new(Hub::new()),
+            1 << 16,
+            short_limits(),
+        );
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let mut client = PartyClient::connect(stream, &client_priv, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.join("alice", None).await.unwrap(),
+            PartyResponse::Joined { .. }
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(!served.is_finished(), "joined members may idle");
+        assert!(matches!(
+            request(&mut client, PartyRequest::ListChannels).await,
+            PartyResponse::Channels(_)
+        ));
+        served.abort();
+    }
+
+    /// A peer that opens a socket and never speaks is dropped at the handshake
+    /// deadline rather than held.
+    #[tokio::test]
+    async fn a_peer_that_never_handshakes_is_closed() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let (_silent, served) = spawn_with_limits(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state,
+            Arc::new(Hub::new()),
+            1 << 16,
+            short_limits(),
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+            .await
+            .expect("closed at the handshake deadline")
+            .unwrap();
+        assert!(outcome.is_err());
+    }
+
+    /// SRV-03: a write to a client that stopped reading blocked its task
+    /// forever. It now times out and the connection is torn down.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_disconnected_by_the_write_timeout() {
+        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        state.lock().await.set_write_rate_limit(None);
+        let hub = Arc::new(Hub::new());
+        let channel = state.lock().await.default_channel();
+
+        // A small pipe, so a handful of broadcasts fills it.
+        let (stream, served) = spawn_with_limits(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state.clone(),
+            hub.clone(),
+            4 * 1024,
+            short_limits(),
+        );
+        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let mut alice = PartyClient::connect(stream, &alice_priv, Uuid::new_v4())
+            .await
+            .unwrap();
+        let PartyResponse::Joined {
+            member_id: alice_id,
+            ..
+        } = alice.join("alice", None).await.unwrap()
+        else {
+            panic!("alice did not join");
+        };
+
+        let (mut bob, _b) = connect(
+            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            &generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
+            state.clone(),
+            hub.clone(),
+        )
+        .await;
+        assert!(matches!(
+            bob.join("bob", None).await.unwrap(),
+            PartyResponse::Joined { .. }
+        ));
+        // Alice never reads again. Far fewer broadcasts than the queue holds,
+        // so it is the write timeout — not eviction — that has to end this.
+        for i in 0..8 {
+            let reply = request(
+                &mut bob,
+                PartyRequest::PostMessage {
+                    channel,
+                    text: format!("{i}{}", "z".repeat(2048)),
+                },
+            )
+            .await;
+            assert!(matches!(reply, PartyResponse::MessagePosted { .. }));
+        }
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+            .await
+            .expect("the stuck write times out")
+            .unwrap();
+        assert!(outcome.unwrap_err().to_string().contains("timed out"));
+        assert!(!hub.member_is_connected(alice_id));
+        drop(alice);
     }
 }

@@ -160,9 +160,10 @@ pub struct Envelope {
 /// Role::Admin` reads as "at least an admin". Every check in the server is
 /// written that way.
 ///
-/// The server has exactly one [`Role::Owner`]: the first identity to join, which
-/// is the operator (they start the server, then join it). The owner cannot be
-/// demoted — otherwise an admin could strip the operator of their own server —
+/// The server has exactly one [`Role::Owner`]: the operator, who claims it by
+/// joining with the one-time owner claim token the server prints (or whose
+/// fingerprint the server was started with). Being first to join grants
+/// nothing. The owner cannot be demoted — otherwise an admin could strip the operator of their own server —
 /// and a second owner is never created.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Hash,
@@ -659,7 +660,103 @@ pub enum PartyResponse {
 /// send failed, the connection dropped, and the community became unjoinable
 /// with no error the user could see. History is paged instead — the client asks
 /// again with `since_seq` set to the last envelope it received.
+///
+/// A count alone does not bound a page, though: 200 envelopes of 64 KiB text
+/// are 12.8 MiB, well past the frame limit, so a page is also capped by its
+/// encoded size ([`HISTORY_PAGE_BYTES`]). See [`take_history_page`].
 pub const MAX_HISTORY_BATCH: usize = 200;
+
+/// Bytes a Party frame adds around its serialized payload: the frame sequence
+/// carried inside the encryption, the AES-GCM nonce and the tag.
+pub const PARTY_FRAME_OVERHEAD: usize =
+    PARTY_SEQ_BYTES + crate::AES_NONCE_SIZE + crate::AES_GCM_TAG_SIZE;
+
+/// The largest serialized request or response that still fits in one frame
+/// ([`crate::MAX_PACKET_SIZE`] less [`PARTY_FRAME_OVERHEAD`]).
+///
+/// Anything larger cannot be sent at all: `send_packet` refuses it, and on the
+/// server a refused send ends the connection.
+pub const MAX_PARTY_PAYLOAD_BYTES: usize = crate::MAX_PACKET_SIZE - PARTY_FRAME_OVERHEAD;
+
+/// Byte budget for the envelopes of one `History` page — half a frame, which
+/// leaves room for the response's own framing with a wide margin.
+///
+/// Pages used to be capped only by count, and one member posting about 130
+/// maximum-size messages was enough to make every page that covered them
+/// unsendable. Every client fetches history on join, and a reply that cannot
+/// be sent ends the connection, so the community became unjoinable for
+/// everyone, durably, until someone edited the database by hand.
+pub const HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Text that stands in for an envelope too large to fit in any page.
+///
+/// Nothing the server accepts today is that large — text is capped at 64 KiB
+/// and file metadata at a few hundred bytes — but a database written by an
+/// older server may hold one, and the alternative to a placeholder is a page
+/// that can never be sent and a history nobody can page past.
+pub const OVERSIZED_ENVELOPE_TEXT: &str = "[this message is too large to deliver]";
+
+/// Encoded size of `value` on the wire (bincode), for byte budgets.
+pub fn encoded_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    bincode::serialized_size(value)
+        .ok()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Build one `History` page from `envelopes` (ascending by seq, all after the
+/// requested `since_seq`): at most [`MAX_HISTORY_BATCH`] of them and at most
+/// [`HISTORY_PAGE_BYTES`] encoded, but always at least one when any remain, so
+/// paging can never stall.
+///
+/// An envelope that alone exceeds the budget is replaced by a placeholder with
+/// the same sequence number (see [`OVERSIZED_ENVELOPE_TEXT`]), so the client's
+/// next request starts after it.
+pub fn take_history_page<'a, I>(envelopes: I) -> Vec<Envelope>
+where
+    I: IntoIterator<Item = &'a Envelope>,
+{
+    let mut page = Vec::new();
+    let mut used = 0usize;
+    for env in envelopes.into_iter().take(MAX_HISTORY_BATCH) {
+        let mut size = encoded_len(env);
+        let env = if size > HISTORY_PAGE_BYTES {
+            let stub = Envelope {
+                payload: MessagePayload::Text(OVERSIZED_ENVELOPE_TEXT.to_string()),
+                ..env.clone()
+            };
+            size = encoded_len(&stub);
+            stub
+        } else {
+            env.clone()
+        };
+        if !page.is_empty() && used.saturating_add(size) > HISTORY_PAGE_BYTES {
+            break;
+        }
+        used = used.saturating_add(size);
+        page.push(env);
+    }
+    page
+}
+
+/// Whether the server may have more history after this page, so the client
+/// should ask again from its last seq.
+///
+/// A page is cut short either by count ([`MAX_HISTORY_BATCH`]) or by size
+/// ([`HISTORY_PAGE_BYTES`]). A page cut for size holds more than the budget
+/// less one envelope, and the largest envelope is tiny next to the budget, so
+/// "more than half the budget" recognises every such page. The cost of a false
+/// positive — a genuinely final page that happens to be large — is one empty
+/// reply; the cost of the old count-only test was that a client stopped
+/// paging at the first page the server had trimmed.
+pub fn history_page_may_continue(page: &[Envelope]) -> bool {
+    page.len() >= MAX_HISTORY_BATCH
+        || page
+            .iter()
+            .map(encoded_len)
+            .fold(0usize, usize::saturating_add)
+            > HISTORY_PAGE_BYTES / 2
+}
 
 impl PartyRequest {
     /// Serialize to bytes for transport inside the encrypted tunnel.
@@ -1324,5 +1421,59 @@ mod tests {
             PartyResponse::Members(ref m) if m.is_empty()
         ));
         server.await.unwrap();
+    }
+
+    fn text_envelope(seq: u64, text: String) -> Envelope {
+        Envelope {
+            tier: TrustTier::Administered,
+            sender: Uuid::nil(),
+            channel: Uuid::nil(),
+            seq,
+            timestamp: 0,
+            payload: MessagePayload::Text(text),
+        }
+    }
+
+    /// 200 envelopes of 64 KiB text are 12.8 MiB — far past the frame limit.
+    /// A page must stop at the byte budget, make progress, and fit in a frame.
+    #[test]
+    fn a_history_page_is_bounded_by_bytes_as_well_as_count() {
+        let all: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
+            .map(|seq| text_envelope(seq, "x".repeat(crate::MAX_TEXT_MESSAGE_BYTES)))
+            .collect();
+        let page = take_history_page(all.iter());
+        assert!(!page.is_empty());
+        assert!(page.len() < MAX_HISTORY_BATCH, "trimmed for size");
+        let frame = PartyResponse::History(page.clone()).to_bytes();
+        assert!(frame.len() <= MAX_PARTY_PAYLOAD_BYTES);
+        assert!(
+            history_page_may_continue(&page),
+            "a trimmed page tells the client to ask again"
+        );
+        // Contiguous from the start, so paging resumes exactly after it.
+        for (i, env) in page.iter().enumerate() {
+            assert_eq!(env.seq, i as u64 + 1);
+        }
+
+        // A small final page does not ask for more.
+        let small = take_history_page([text_envelope(1, "hi".to_string())].iter());
+        assert_eq!(small.len(), 1);
+        assert!(!history_page_may_continue(&small));
+    }
+
+    /// An envelope too large for any page (only an old database can hold one)
+    /// becomes a placeholder at the same seq instead of stalling paging.
+    #[test]
+    fn an_oversized_envelope_becomes_a_placeholder_rather_than_a_stuck_page() {
+        let huge = text_envelope(7, "x".repeat(HISTORY_PAGE_BYTES + 1));
+        let next = text_envelope(8, "after".to_string());
+        let page = take_history_page([huge, next].iter());
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].seq, 7);
+        assert_eq!(
+            page[0].payload,
+            MessagePayload::Text(OVERSIZED_ENVELOPE_TEXT.to_string())
+        );
+        assert_eq!(page[1].seq, 8);
     }
 }

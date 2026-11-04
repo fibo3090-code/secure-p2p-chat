@@ -18,17 +18,18 @@
 //! `Join`, `ListChannels`, `ListMembers`, so the server answers `Joined` first,
 //! while the channel list is still empty; seeding there meant the loop had
 //! nothing to iterate and no channel history was ever fetched at all. Responses
-//! are paged ([`MAX_HISTORY_BATCH`]), so a full page triggers a request for the
-//! next one.
+//! are paged (`MAX_HISTORY_BATCH` envelopes or `HISTORY_PAGE_BYTES`, whichever
+//! comes first), so a page the server cut short triggers a request for the next
+//! one (see [`history_page_may_continue`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, bail, Result};
 use messenger_core::party::{
-    blob_hash, dm_thread_id, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
-    FilePermissions, MemberInfo, MessagePayload, PartyRequest, PartyResponse, QuotaInfo, Role,
-    TrustTier, UploadTarget, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES,
-    PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
+    blob_hash, dm_thread_id, history_page_may_continue, AuditEntry, ChannelInfo, ChannelKind,
+    Envelope, FileEntry, FileMeta, FilePermissions, MemberInfo, MessagePayload, PartyRequest,
+    PartyResponse, QuotaInfo, Role, TrustTier, UploadTarget, MAX_INLINE_FILE_BYTES,
+    MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
 use rsa::RsaPrivateKey;
@@ -1117,7 +1118,10 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             }
         }
         PartyResponse::History(items) => {
-            let page_was_full = items.len() >= MAX_HISTORY_BATCH;
+            // A page is cut short by count *or* by size; asking again only
+            // after a full count stalled at the first page the server trimmed
+            // for size, so a channel of long messages never loaded past it.
+            let page_was_full = history_page_may_continue(&items);
             let threads: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
             // Which threads are DMs, and with whom: one hash per member per
             // page, not one per member per thread (PERF-05). Only needed to
@@ -1297,6 +1301,7 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
 mod tests {
     use super::*;
     use messenger_core::party::ChannelKind;
+    use messenger_core::party::{HISTORY_PAGE_BYTES, MAX_HISTORY_BATCH};
 
     /// Build a manager with one server connection wired to test channels, returning
     /// the server id, a sender to push server responses, and a receiver to observe
@@ -2012,6 +2017,48 @@ mod tests {
             mgr.server(id).unwrap().messages[&channel].len(),
             MAX_HISTORY_BATCH + 1,
             "a later page must not throw away the earlier one"
+        );
+    }
+
+    /// A page the server cut short for *size* has fewer than
+    /// `MAX_HISTORY_BATCH` envelopes, and the client used to treat that as the
+    /// end of history — so a channel of long messages never loaded past its
+    /// first few dozen. A page that is large asks for the next one too, and a
+    /// small short page still does not.
+    #[test]
+    fn a_page_trimmed_for_size_is_continued() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        let long = "x".repeat(60 * 1024);
+        let count = (HISTORY_PAGE_BYTES / long.len()) as u64; // ~68: well under 200
+        assert!((count as usize) < MAX_HISTORY_BATCH);
+        let page: Vec<Envelope> = (1..=count)
+            .map(|seq| envelope(channel, me, seq, &long))
+            .collect();
+        tx.send(Incoming::Response(PartyResponse::History(page)))
+            .unwrap();
+        mgr.poll_events();
+        let asked_again = std::iter::from_fn(|| out.try_recv().ok()).any(|r| {
+            matches!(r, PartyRequest::FetchHistory { channel: c, since_seq }
+                if c == channel && since_seq == count)
+        });
+        assert!(asked_again, "a page trimmed for size must be continued");
+
+        // A short, small page really is the end.
+        tx.send(Incoming::Response(PartyResponse::History(vec![envelope(
+            channel,
+            me,
+            count + 1,
+            "tail",
+        )])))
+        .unwrap();
+        mgr.poll_events();
+        assert!(
+            out.try_recv().is_err(),
+            "a small final page must not be followed by another request"
         );
     }
 

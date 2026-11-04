@@ -312,9 +312,9 @@ and `blobs` (`hash, size, mime, refcount`; the bytes themselves live under
   server-side check reads as `role >= Role::Admin`. A **guest** is read-only
   everywhere; a **member** posts, uploads and creates public channels; an
   **admin** manages channels, anyone's files, and the roles below their own; the
-  **owner** is the first identity to join — the operator starts the server and
-  then joins it, which is the only bootstrap that does not require an admin to
-  already exist. A role may only ever be granted *strictly below* the granter's
+  **owner** is the operator, who claims the seat by joining with the one-time
+  owner claim token the server prints at startup (or is named outright with
+  `--owner <fingerprint>`); being first to join grants nothing. A role may only ever be granted *strictly below* the granter's
   own, the owner cannot be demoted, and a second owner is never minted, so an
   admin cannot take the community from the person running it.
 - **`ChannelKind` is enforced.** It was previously stored, persisted, shipped to

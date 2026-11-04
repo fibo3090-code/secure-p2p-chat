@@ -218,22 +218,38 @@ Relay notes:
 
 Communities are self-hosted, multi-user rooms with channels, direct messages,
 file sharing, and durable history — members who were offline catch up when they
-reconnect. One person runs the server; friends join with just an address, an
-optional password, and a username.
+reconnect. One person runs the server; friends join with just an address, the
+community password, and a username.
 
 Start a server:
 
 ```bash
-cargo run --release -p messenger-server -- --name "Game Night" --port 12345
+cargo run --release -p messenger-server -- --name "Game Night" --port 12345 --password "<choose one>"
 ```
 
 Options (also settable via `PARTY_NAME`, `PARTY_PORT`, `PARTY_PASSWORD`,
-`PARTY_DATA_DIR` environment variables):
+`PARTY_OPEN`, `PARTY_OWNER`, `PARTY_DATA_DIR` environment variables):
 
 - `--name <NAME>` — the community name everyone sees (default: "Encrypted Messenger Party")
 - `--port <PORT>` — TCP port to listen on (default: 12345)
-- `--password <PASSWORD>` — require a password to join (omit for an open server)
+- `--password <PASSWORD>` — the password members join with. **Required**, unless
+  you pass `--open`
+- `--open` — run without a password, so anyone who can reach the port can join.
+  The server refuses to start with neither a password nor `--open`: on a public
+  address an open server is open to the whole internet
+- `--owner <FINGERPRINT>` — your own identity fingerprint (desktop: Settings →
+  Your identity; TUI: `:identity`). That identity becomes the owner when it
+  joins, and any other owner is moved to admin — which is also how to take back
+  a community whose ownership went to the wrong person
 - `--data-dir <DIR>` — where the database, file store, and server identity live (default: `party-data`)
+
+**Becoming the owner.** Being the first to join does *not* make you the owner —
+that used to hand the community to whoever reached the address first. Until the
+community has an owner (and unless you passed `--owner`), the server prints a
+one-time **owner claim token** at startup. Join with that token typed into the
+**password** field instead of the community password, and you become the owner;
+the token then stops working. A restart before it is used prints a new one.
+Until someone claims it, nobody can administer the community.
 
 On startup the server prints its **fingerprint**. Share your address
 (`your-ip:port`) and that fingerprint with the people you invite; their app pins
@@ -266,6 +282,10 @@ Operator notes:
   it is what enables offline delivery and history); tell your members
 - members are remembered by identity fingerprint, so someone who reconnects
   keeps their username and history
+- the server limits how fast each member can post, keeps only recent messages
+  in memory (older ones are read from `party.db` when someone scrolls back),
+  closes connections that never join within 30 seconds, and accepts at most
+  512 connections at once (32 from one address)
 
 ### Verify a new contact
 

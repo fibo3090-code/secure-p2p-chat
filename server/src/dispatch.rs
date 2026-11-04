@@ -403,6 +403,54 @@ fn join(
     }
 }
 
+/// The text bytes a request writes, if it is a write at all.
+///
+/// Every request that changes state is a write: posts, DMs, uploads, shares,
+/// and governance actions (which also cost an audit row each, and which a
+/// member could otherwise loop to push real admin actions out of the visible
+/// audit log). Reads are free, and so are the later steps of an upload that
+/// was already admitted — its chunks are bounded by the size it declared.
+fn write_cost(req: &PartyRequest) -> Option<usize> {
+    match req {
+        PartyRequest::PostMessage { text, .. } | PartyRequest::SendDm { text, .. } => {
+            Some(text.len())
+        }
+        PartyRequest::PostFile { .. }
+        | PartyRequest::SendFileDm { .. }
+        | PartyRequest::StartUpload { .. }
+        | PartyRequest::ShareFile { .. }
+        | PartyRequest::CreateChannel { .. }
+        | PartyRequest::CreateChannelOfKind { .. }
+        | PartyRequest::DeleteChannel { .. }
+        | PartyRequest::SetChannelAccess { .. }
+        | PartyRequest::SetRole { .. }
+        | PartyRequest::DeleteFile { .. }
+        | PartyRequest::SetFilePermissions { .. } => Some(0),
+        _ => None,
+    }
+}
+
+/// The answer to a write refused by the rate limit.
+///
+/// A send the client is already showing gets `ActionFailed`, exactly as any
+/// other refused send does, so the client takes the row back off the screen
+/// instead of leaving it looking delivered — and so the reply stays in step
+/// with the client's FIFO of awaited answers.
+fn rate_limited(member: Uuid, req: &PartyRequest, reason: String) -> Dispatch {
+    match req {
+        PartyRequest::PostMessage { channel, .. } | PartyRequest::PostFile { channel, .. } => {
+            Dispatch::action_failed(*channel, reason)
+        }
+        PartyRequest::SendDm { to, .. } | PartyRequest::SendFileDm { to, .. } => {
+            Dispatch::action_failed(upload_thread(member, UploadTarget::Dm(*to)), reason)
+        }
+        PartyRequest::StartUpload { target, .. } | PartyRequest::ShareFile { target, .. } => {
+            Dispatch::action_failed(upload_thread(member, *target), reason)
+        }
+        _ => Dispatch::reply(PartyResponse::Error(reason)),
+    }
+}
+
 /// Every request a joined member may make.
 fn handle_member_request(
     state: &mut PartyState,
@@ -410,6 +458,11 @@ fn handle_member_request(
     member: Uuid,
     req: PartyRequest,
 ) -> Dispatch {
+    if let Some(bytes) = write_cost(&req) {
+        if let Err(reason) = state.check_write_rate(member, bytes) {
+            return rate_limited(member, &req, reason);
+        }
+    }
     match req {
         PartyRequest::Join { .. } => Dispatch::reply(PartyResponse::Error(
             "already joined on this connection".to_string(),
@@ -622,6 +675,15 @@ mod tests {
         }
     }
 
+    /// Join as the Owner, presenting the owner claim token as the password.
+    fn joined_owner_id(state: &mut PartyState, conn: &mut ConnState, name: &str) -> Uuid {
+        let token = state.owner_claim_token().expect("no owner yet").to_string();
+        match &join(state, conn, name, Some(&token))[..] {
+            [PartyResponse::Joined { member_id, .. }] => *member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        }
+    }
+
     fn join(
         state: &mut PartyState,
         conn: &mut ConnState,
@@ -770,7 +832,7 @@ mod tests {
     fn a_private_channel_is_delivered_only_to_its_members() {
         let mut state = PartyState::new("Srv", None);
         let mut owner_conn = ConnState::default();
-        let owner = joined_id(&mut state, &mut owner_conn, "owner");
+        let owner = joined_owner_id(&mut state, &mut owner_conn, "owner");
         let mut bob_conn = ConnState::default();
         let bob = joined_id(&mut state, &mut bob_conn, "bob");
         let mut carol_conn = ConnState::default();
@@ -1127,5 +1189,73 @@ mod tests {
             "nothing to read for an unknown file"
         );
         assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
+    }
+
+    /// SRV-06: only channel creation was rate-limited, so one member could
+    /// post 64 KiB messages as fast as their link allowed, each committed under
+    /// the global lock. A refused post answers `ActionFailed` for its channel
+    /// — so the client retracts the row — and costs other members nothing.
+    #[test]
+    fn writes_past_the_per_member_budget_are_refused_as_failed_sends() {
+        let mut state = PartyState::new("Srv", None);
+        let mut alice = ConnState::default();
+        let mut bob = ConnState::default();
+        joined_id(&mut state, &mut alice, "alice");
+        let bob_id = joined_id(&mut state, &mut bob, "bob");
+        let channel = state.default_channel();
+        let post = |text: &str| PartyRequest::PostMessage {
+            channel,
+            text: text.to_string(),
+        };
+
+        let mut refused = None;
+        for i in 0..200 {
+            let out = handle_request(&mut state, &mut alice, post(&format!("spam {i}")));
+            if let [PartyResponse::ActionFailed { channel: c, reason }] = &out.replies[..] {
+                refused = Some((i, *c, reason.clone()));
+                break;
+            }
+        }
+        let (at, c, reason) = refused.expect("a flood must be refused");
+        // The burst, plus whatever trickled back in while the loop ran.
+        let burst = crate::state::DEFAULT_WRITE_RATE.burst as usize;
+        assert!(
+            (burst..burst + 10).contains(&at),
+            "refused after {at} posts"
+        );
+        assert_eq!(c, channel, "attributable to the channel the row is in");
+        assert_eq!(reason, crate::state::WRITE_RATE_REFUSAL);
+
+        // A refused DM is attributed to its thread, and governance gets an
+        // ordinary error.
+        let me = alice.member().unwrap();
+        let dm = handle_request(
+            &mut state,
+            &mut alice,
+            PartyRequest::SendDm {
+                to: bob_id,
+                text: "hi".into(),
+            },
+        );
+        assert!(matches!(
+            &dm.replies[..],
+            [PartyResponse::ActionFailed { channel: t, .. }]
+                if *t == messenger_core::party::dm_thread_id(me, bob_id)
+        ));
+        let gov = handle_request(
+            &mut state,
+            &mut alice,
+            PartyRequest::CreateChannel { name: "x".into() },
+        );
+        assert!(matches!(&gov.replies[..], [PartyResponse::Error(_)]));
+
+        // Reads are never limited, and bob's budget is his own.
+        let read = handle_request(&mut state, &mut alice, PartyRequest::ListMembers);
+        assert!(matches!(&read.replies[..], [PartyResponse::Members(_)]));
+        let out = handle_request(&mut state, &mut bob, post("still works"));
+        assert!(matches!(
+            &out.replies[..],
+            [PartyResponse::MessagePosted { .. }]
+        ));
     }
 }

@@ -59,12 +59,20 @@ async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
 
 struct TestServer {
     address: String,
+    /// The live server state, for tests that need to set up more than a
+    /// client could do quickly (thousands of messages, say).
+    state: Arc<Mutex<PartyState>>,
+    /// The one-time owner claim token the server printed at startup. The
+    /// operator joins with it in the password field; being first to join no
+    /// longer makes anyone the owner.
+    claim_token: Option<String>,
     _dir: tempfile::TempDir,
 }
 
 async fn start_server(password: Option<String>) -> TestServer {
     let dir = tempfile::tempdir().expect("server dir");
     let state = PartyState::load("Test Community", password, dir.path()).expect("load state");
+    let claim_token = state.owner_claim_token().map(str::to_owned);
     let state = Arc::new(Mutex::new(state));
     let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS).expect("server key"));
     let hub = Arc::new(Hub::new());
@@ -73,11 +81,17 @@ async fn start_server(password: Option<String>) -> TestServer {
         .await
         .expect("bind");
     let address = listener.local_addr().expect("addr").to_string();
+    let served = state.clone();
     tokio::spawn(async move {
-        let _ = run_accept_loop(listener, state, privkey, hub).await;
+        let _ = run_accept_loop(listener, served, privkey, hub).await;
     });
 
-    TestServer { address, _dir: dir }
+    TestServer {
+        address,
+        state,
+        claim_token,
+        _dir: dir,
+    }
 }
 
 /// Pump the manager until `done`, or fail rather than hang.
@@ -185,8 +199,8 @@ async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
     .await;
     assert_eq!(
         mgr.my_role(sid),
-        Some(Role::Owner),
-        "the first member to join owns the server — nothing else can bootstrap an admin"
+        Some(Role::Member),
+        "being first to join no longer makes anyone the owner"
     );
 
     mgr.create_channel(sid, "planning".to_string())
@@ -315,7 +329,8 @@ async fn a_wrong_server_password_is_refused_and_reported() {
 async fn a_private_channel_is_invisible_to_a_non_member() {
     let server = start_server(None).await;
     let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, owner_sid) = join(&server, "owner", None, &owner_key).await;
+    let (mut owner, owner_sid) =
+        join(&server, "owner", server.claim_token.clone(), &owner_key).await;
 
     let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
     let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
@@ -377,7 +392,7 @@ async fn a_private_channel_is_invisible_to_a_non_member() {
 async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it() {
     let server = start_server(None).await;
     let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, sid) = join(&server, "owner", None, &owner_key).await;
+    let (mut owner, sid) = join(&server, "owner", server.claim_token.clone(), &owner_key).await;
     pump_until(&mut owner, "channels", |m| {
         channel_named(m, sid, "general").is_some()
     })
@@ -508,7 +523,8 @@ async fn pump_for_download_result(
 async fn a_refused_post_is_removed_rather_than_left_looking_delivered() {
     let server = start_server(None).await;
     let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, owner_sid) = join(&server, "owner", None, &owner_key).await;
+    let (mut owner, owner_sid) =
+        join(&server, "owner", server.claim_token.clone(), &owner_key).await;
 
     let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
     let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
@@ -556,7 +572,8 @@ async fn a_refused_post_is_removed_rather_than_left_looking_delivered() {
 async fn a_member_cannot_grant_themselves_a_role() {
     let server = start_server(None).await;
     let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, owner_sid) = join(&server, "owner", None, &owner_key).await;
+    let (mut owner, owner_sid) =
+        join(&server, "owner", server.claim_token.clone(), &owner_key).await;
 
     let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
     let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
@@ -709,4 +726,75 @@ async fn sending_while_a_large_download_streams_in_keeps_the_connection() {
     })
     .await;
     assert_eq!(mgr.server(sid).unwrap().status, PartyStatus::Joined);
+}
+
+/// SRV-01, end to end: a channel full of maximum-size messages used to make
+/// the community unjoinable, because the first history page was over the frame
+/// limit and a reply that cannot be sent ends the connection. Pages are now
+/// budgeted by bytes, and the client keeps asking when a page was trimmed for
+/// size rather than only when it held 200 envelopes.
+#[tokio::test]
+async fn a_channel_of_maximum_size_messages_is_joinable_and_pages_to_the_end() {
+    let server = start_server(None).await;
+    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
+    let (mut alice, sid) = join(&server, "alice", None, &key).await;
+    pump_until(&mut alice, "channel list", |m| {
+        channel_named(m, sid, "general").is_some()
+    })
+    .await;
+    let general = channel_named(&alice, sid, "general").unwrap();
+    let alice_id = alice.server(sid).unwrap().member_id.unwrap();
+
+    // Well past what one count-capped page could have carried in a frame.
+    const POSTS: usize = 150;
+    {
+        let mut st = server.state.lock().await;
+        for i in 0..POSTS {
+            let mut text = format!("{i:04}");
+            text.push_str(&"m".repeat(messenger_core::MAX_TEXT_MESSAGE_BYTES - text.len()));
+            st.post_message(alice_id, general, text).expect("post");
+        }
+    }
+
+    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
+    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
+    pump_until(&mut bob, "every page arrives", |m| {
+        channel_named(m, bob_sid, "general")
+            .map(|c| texts_in(m, bob_sid, c).len() >= POSTS)
+            .unwrap_or(false)
+    })
+    .await;
+    let texts = texts_in(&bob, bob_sid, general);
+    assert_eq!(texts.len(), POSTS);
+    for (i, t) in texts.iter().enumerate() {
+        assert!(t.starts_with(&format!("{i:04}")), "in order");
+    }
+    assert_eq!(bob.server(bob_sid).unwrap().status, PartyStatus::Joined);
+}
+
+/// SRV-04, end to end: on a password-protected server, the operator joins
+/// with the one-time claim token in the password field and becomes the Owner;
+/// the token is then spent, and someone who joined first is not promoted.
+#[tokio::test]
+async fn the_owner_is_whoever_presents_the_claim_token_not_whoever_is_first() {
+    let password = Uuid::new_v4().to_string();
+    let server = start_server(Some(password.clone())).await;
+    let token = server
+        .claim_token
+        .clone()
+        .expect("a fresh server has no owner");
+
+    let early_key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
+    let (mut early, early_sid) =
+        join(&server, "early-bird", Some(password.clone()), &early_key).await;
+    pump_until(&mut early, "directory", |m| m.my_role(early_sid).is_some()).await;
+    assert_eq!(early.my_role(early_sid), Some(Role::Member));
+
+    let op_key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
+    let (mut op, op_sid) = join(&server, "operator", Some(token), &op_key).await;
+    pump_until(&mut op, "owner role", |m| {
+        m.my_role(op_sid) == Some(Role::Owner)
+    })
+    .await;
+    assert_eq!(server.state.lock().await.owner_claim_token(), None, "spent");
 }

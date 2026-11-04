@@ -65,7 +65,10 @@ struct Entry {
 /// It deliberately does not go wider than /64: /48 would put unrelated customers
 /// of one ISP into a single bucket, which turns a rate limit into collateral
 /// damage.
-fn limiter_key(ip: IpAddr) -> IpAddr {
+///
+/// Public so the community server's per-address *concurrency* cap groups
+/// addresses exactly the way this rate limit does.
+pub fn limiter_key(ip: IpAddr) -> IpAddr {
     match canonical_ip(ip) {
         IpAddr::V4(v4) => IpAddr::V4(v4),
         IpAddr::V6(v6) => {

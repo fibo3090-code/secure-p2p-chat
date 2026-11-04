@@ -432,8 +432,11 @@ server's `Message` broadcast — and both ends would accept it as new.
 ### Authorization model
 
 - **`Role`** — `Guest < Member < Admin < Owner`, ordered so checks read as
-  `role >= Role::Admin`. The **first identity to join becomes the Owner**; every
-  later one is a Member. A role may only be granted strictly below the granter's
+  `role >= Role::Admin`. Every new identity joins as a Member; **being first
+  grants nothing**. The Owner is the identity that joins presenting the
+  server's one-time owner claim token in `Join.password` (printed at startup
+  while there is no Owner, consumed on use), or the one named by the server's
+  `--owner <fingerprint>`. A role may only be granted strictly below the granter's
   own, the owner is never demoted, and a second owner is never created.
 - **`ChannelKind`** — `Public` (all read/write), `Locked` and `Announce` (all
   read, admins write), `Private` (only the channel's `members` list, plus admins).
@@ -517,11 +520,25 @@ Every `PartyResponse` variant, in wire order:
 
 ### History paging
 
-`FetchHistory` / `FetchDmHistory` return at most `MAX_HISTORY_BATCH` (200)
-envelopes; the client asks again with the last `seq` it received. A whole channel
-in one frame stopped fitting past `MAX_PACKET_SIZE` once history grew, and the
-send failure dropped the connection with nothing on screen to explain it. The
-client **merges** pages by server-assigned sequence rather than replacing.
+`FetchHistory` / `FetchDmHistory` return one page: at most `MAX_HISTORY_BATCH`
+(200) envelopes **and** at most `HISTORY_PAGE_BYTES` (4 MiB) of them encoded,
+always at least one when any remain (`take_history_page`). The client asks again
+with the last `seq` it received whenever `history_page_may_continue` says the
+page was cut short — by count, or by size (more than half the byte budget). A
+whole channel in one frame stopped fitting past `MAX_PACKET_SIZE` once history
+grew, and a count-only page did not fix it: 200 × 64 KiB of text is 12.8 MiB.
+The client **merges** pages by server-assigned sequence rather than replacing.
+
+Every other one-frame reply is bounded too: the directory (`MAX_MEMBERS`),
+private-channel member lists (`MAX_PRIVATE_CHANNEL_MEMBERS`) and `Files`
+(newest `MAX_FILE_LISTING` entries within `FILE_LISTING_BYTES`); file names and
+MIME types are reduced on arrival. A reply that still exceeds the frame is
+answered with `Error`, and an oversized broadcast is dropped, rather than
+ending the connection.
+
+Writes (posts, DMs, uploads, shares, governance) are rate-limited per member; a
+refused send is answered with `ActionFailed`, a refused governance request with
+`Error`.
 
 ### Files
 

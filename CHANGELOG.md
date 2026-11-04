@@ -55,6 +55,48 @@ predate tagged releases.
 - **A client could force the host to rotate keys.** Only the host rotates the
   session key; a `Rekey` from the client is now ignored.
 
+- **Whoever joined a new community first became its permanent owner** — and
+  servers were open by default, listening on every interface. Anyone who
+  reached the address before the operator (a scanner, anyone the address
+  leaked to) owned the community: appointed its admins, read its private
+  channels and audit log, and could not be removed without editing the
+  database. Being first now grants nothing. Until a community has an owner the
+  server prints a one-time owner claim token; the operator joins with it in the
+  password field. Alternatively `--owner <fingerprint>` names the owner
+  outright, and also moves ownership back from whoever holds it. A community
+  that predates roles is no longer handed to a random member either. The
+  server now refuses to start without a password unless `--open` is passed
+  explicitly.
+- **One community member could make a community permanently unjoinable.**
+  History pages were capped at 200 messages but not by size, so about 130
+  long posts made every page that covered them too large to send — and a
+  reply the server cannot send ends the connection. Every client fetches
+  history on join, so everyone was disconnected on joining, and the history
+  was durable, so it survived restarts. A file's MIME type was also stored
+  exactly as sent, so a single upload could do the same to the live broadcast,
+  disconnecting every online member at once. Pages are now limited by size as
+  well as count (and the apps keep paging when a page was trimmed), file
+  names and types are bounded when a file arrives (and repaired on load in
+  existing databases), the member directory, private-channel lists and file
+  listing are capped to fit, and a reply that still does not fit becomes an
+  error instead of a disconnect.
+- **One community member can no longer flood everyone else.** Only channel
+  creation was rate-limited; any member could post maximum-size messages and
+  DMs, re-share files or change permissions as fast as their connection
+  allowed, each one written to disk while every other member waited. Each
+  member now has a budget for writes and for message text (generous for a
+  person, tight for a script); a message over it is refused and taken back
+  off the sender's screen with a "sending too fast" notice.
+- **Anyone who could reach a community server could exhaust it without
+  joining.** Connections had no time limits and there was no cap on how many
+  could be open: a socket that finished the handshake and never joined was
+  held forever, so one address within the reconnect limit could use up the
+  server's file descriptors in under an hour, after which nobody could join.
+  Unjoined connections are now closed after 30 seconds, the handshake and
+  every write have deadlines, idle-but-dead connections are detected with TCP
+  keepalive, and the server caps connections overall (512) and per address
+  (32).
+
 - **A peer could impersonate any contact whose public key it knew.** A
   public key was fingerprinted from the first key block found in its text,
   while signatures were checked against the key the PEM parser returned, and
@@ -134,9 +176,32 @@ predate tagged releases.
   stalled the whole community for its duration. The bytes now move outside it.
 - **A download was reading the entire file for each small piece it sent** —
   about 160 GB of disk reads for one 100 MB file.
+- **A community server's database no longer syncs to disk several times per
+  message.** It ran SQLite in its slowest durable mode, one commit per
+  statement and a fresh parse of every statement, all while holding the lock
+  every member waits behind — enough to cap a whole community at a few dozen
+  to a hundred messages a second. It now uses write-ahead logging with
+  `synchronous=NORMAL` (safe against a crash; a power cut can lose the last
+  few commits, never corrupt the file), caches its statements, and commits
+  each change — a DM, a channel deletion, an upload — as one transaction, so a
+  crash part-way through can no longer leave half of it on disk.
+- **A community server's memory no longer grows with its entire history.**
+  Every message ever posted was kept in memory and re-read at every start.
+  The server now keeps only the newest few hundred messages of each channel
+  and conversation in memory and reads older pages from its database when
+  someone scrolls back; startup reads only those tails, and one damaged
+  message in the database is skipped instead of stopping the server from
+  starting. Catching up on a long channel no longer scans it from the first
+  message for every page.
 
 ### Fixed
 
+- **A slow community member's app could silently stop receiving messages.**
+  When a member fell 256 updates behind, the server stopped sending them
+  broadcasts, DMs and directory changes, but left the connection open and
+  kept answering their requests — so the app looked connected while nothing
+  new ever arrived, and they could be shown offline while still there. The
+  server now closes such a connection, so the app reconnects and catches up.
 - **TUI: a peer could be trusted by accident.** The fingerprint prompt opens on
   its own, under whatever you are typing, and `y` or `Enter` accepted it. It
   now takes `Ctrl+Y` / `Ctrl+N`; `Esc` puts it away without answering.
