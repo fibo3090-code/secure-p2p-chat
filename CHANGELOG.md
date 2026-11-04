@@ -212,6 +212,15 @@ predate tagged releases.
   step a timeout so a hung download fails instead of occupying a runner for six
   hours, and no longer builds the whole workspace on three platforms to check a
   Markdown file.
+- A change that touches only the desktop shell's Rust code (`desktop/src-tauri/`)
+  now also runs the frontend tests. Those include the check that the commands
+  the web UI calls match the names and arguments the Rust side declares, and it
+  used to be skipped for exactly the change most likely to break it.
+- The release workflow's desktop build no longer hands the Tauri build action a
+  release tag and token. Given those, the action tries to create the GitHub
+  release and upload to it itself, which the build jobs' read-only token cannot
+  do, and which would bypass the sign-then-publish step even if it could. It now
+  only builds; the attest job remains the one place that publishes.
 
 ### Dependencies
 
@@ -243,6 +252,23 @@ predate tagged releases.
 - Corrected the documented limit on message size. `MAX_TEXT_MESSAGE_BYTES`
   (64 KiB) was described as a hard cap on a message; it is the threshold above
   which a message is split, and the real ceiling is about 24 MiB.
+- **Verifying a new contact now starts with the six-digit + emoji code** in the
+  user guide, the tutorial and SECURITY.md, matching what both apps show. The
+  64-character fingerprint and the safety grid are described as the advanced
+  check. The tutorial's `y`/`n` keys are corrected to `Ctrl+Y`/`Ctrl+N`.
+- `docs/protocol.md` now lists every community (Party) request and response
+  and documents chunked upload and download, and per-file permissions, as they
+  ship. It previously said chunked transfer was not implemented.
+- The community server's build output is `target/release/server` (shipped as
+  `p2pem-server`), not `target/release/messenger-server` as the user guide said.
+- THREAT_MODEL no longer says invite expiry is unenforced. Signed invites are
+  refused after 30 days; what is missing is revocation before that.
+- CONTRIBUTING now has one command that runs the same checks as CI
+  (`cargo nextest run --workspace --profile ci`, doctests, and the frontend lint
+  and tests), and DEVELOPER_GUIDE, the PR template and the README agree with it.
+- Smaller corrections: `docs/platform_spec.md` "Current State" re-verified at
+  1.16.2, and stale egui references removed from `design/tokens.json` and the
+  desktop crate's `Cargo.toml`.
 
 ## [1.16.2] - 2026-08-20
 
