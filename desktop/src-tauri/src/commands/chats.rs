@@ -53,7 +53,9 @@ pub(crate) async fn list_conversations(
     for id in mgr.chat_ids() {
         if let Some(chat) = mgr.get_chat(id) {
             let last = chat.messages.last().map(|m| match &m.content {
-                MessageContent::Text { text } => text.clone(),
+                // The sidebar shows a line; a peer's 24 MiB message used to be
+                // shipped whole as the preview on every refresh (PERF-02).
+                MessageContent::Text { text } => preview_of(text),
                 MessageContent::File { filename, .. } => format!("📎 {}", filename),
             });
             out.push(ConvSummary {
@@ -183,7 +185,43 @@ pub(crate) async fn cancel_transfer(
     Ok(())
 }
 
-/// Return the full conversation (with messages) as JSON for the chat pane.
+/// Characters of the last message shown as a conversation's preview.
+pub(crate) const PREVIEW_CHARS: usize = 200;
+
+/// The start of `text`, cut on a character boundary, for the sidebar.
+pub(crate) fn preview_of(text: &str) -> String {
+    match text.char_indices().nth(PREVIEW_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// Bytes of one message's text sent to the chat pane. A peer can send a text
+/// of about 24 MiB (512 chunks); shipped whole, one such message made every
+/// refresh of that conversation move and parse tens of MB on the webview's
+/// main thread (PERF-02). The full text stays in the history.
+pub(crate) const MAX_DISPLAY_TEXT_BYTES: usize = 256 * 1024;
+
+/// `text` cut to [`MAX_DISPLAY_TEXT_BYTES`] on a character boundary, with a
+/// note saying how much was left out.
+pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_DISPLAY_TEXT_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut cut = MAX_DISPLAY_TEXT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let rest_kib = (text.len() - cut).div_ceil(1024);
+    std::borrow::Cow::Owned(format!(
+        "{}\n\n[… {rest_kib} KiB more not shown — the full message is kept in your history]",
+        &text[..cut]
+    ))
+}
+
+/// Return the conversation (with messages) as JSON for the chat pane. Every
+/// message is included; only oversized texts are cut (see
+/// [`MAX_DISPLAY_TEXT_BYTES`]).
 #[tauri::command]
 pub(crate) async fn get_conversation(
     id: String,
@@ -192,10 +230,27 @@ pub(crate) async fn get_conversation(
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
     let mgr = state.manager.lock().await;
-    match mgr.get_chat(uuid) {
-        Some(chat) => serde_json::to_value(chat).map_err(|e| e.to_string()),
-        None => Err("No such conversation".to_string()),
+    let chat = mgr
+        .get_chat(uuid)
+        .ok_or_else(|| "No such conversation".to_string())?;
+    let mut value = serde_json::to_value(chat).map_err(|e| e.to_string())?;
+    if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in messages {
+            // `MessageContent` is internally tagged: {"type":"text","text":…}.
+            if m.pointer("/content/type").and_then(|t| t.as_str()) != Some("text") {
+                continue;
+            }
+            let Some(text) = m.pointer_mut("/content/text") else {
+                continue;
+            };
+            if let Some(s) = text.as_str() {
+                if s.len() > MAX_DISPLAY_TEXT_BYTES {
+                    *text = serde_json::Value::String(display_text(s).into_owned());
+                }
+            }
+        }
     }
+    Ok(value)
 }
 
 #[tauri::command]
@@ -561,4 +616,24 @@ pub(crate) async fn delete_chat(id: String, state: tauri::State<'_, Bridge>) -> 
     state.manager.lock().await.delete_chat(uuid);
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    /// PERF-02: the sidebar preview and the chat pane must not carry a peer's
+    /// 24 MiB message whole; both cut on a character boundary.
+    #[test]
+    fn previews_and_displayed_texts_are_bounded() {
+        let huge = "ü".repeat(MAX_DISPLAY_TEXT_BYTES); // twice the cap in bytes
+        let preview = preview_of(&huge);
+        assert_eq!(preview.chars().count(), PREVIEW_CHARS + 1); // + the ellipsis
+        assert_eq!(preview_of("hi"), "hi");
+
+        let shown = display_text(&huge);
+        assert!(shown.len() < MAX_DISPLAY_TEXT_BYTES + 128);
+        assert!(shown.contains("KiB more not shown"));
+        assert!(matches!(display_text("hi"), std::borrow::Cow::Borrowed("hi")));
+    }
 }

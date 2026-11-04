@@ -235,6 +235,11 @@ export default function App() {
     if (!ready) return;
     refresh();
     const u1 = onBridge("state-updated", () => refresh());
+    // Only transfer progress moved: refetch the transfer list, not every
+    // conversation (PERF-01).
+    const u5 = onBridge("transfers-updated", () => {
+      api.listTransfers().then(setTransfers).catch(() => {});
+    });
     const u2 = onBridge("fingerprint-request", (e) => setFpReq(e.payload));
     const u3 = onBridge("toast", (e) => toast(e.payload.message, e.payload.level));
     // Communities unread total for the rail badge — computed here (not in the
@@ -242,7 +247,7 @@ export default function App() {
     const u4 = onBridge("party-updated", async () => {
       try { setPartyUnread(computeUnread(await api.partyList()).total); } catch { /* ignore */ }
     });
-    return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
+    return () => { [u1, u2, u3, u4, u5].forEach((u) => u.then((f) => f())); };
   }, [ready, refresh]);
 
   // Clear the read mark for the conversation the user is actually looking at.

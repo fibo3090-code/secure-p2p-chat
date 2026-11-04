@@ -113,6 +113,21 @@ predate tagged releases.
 
 ### Performance
 
+- **The desktop app no longer refetches every conversation four times a
+  second while a file transfers.** Transfer progress now has its own light
+  event; only the transfer list is refreshed. Message times use one cached
+  formatter instead of building one per message per refresh.
+- **One very large message no longer slows everything down.** The sidebar
+  preview is cut to 200 characters, the chat pane shows at most 256 KiB of a
+  message (with a note; the history keeps all of it), and the terminal client
+  draws at most 8 KiB of one.
+- **The terminal client no longer rewrites its whole history every 30
+  seconds.** It saves only when something changed, and writes in the
+  background instead of freezing the interface; saving also makes three fewer
+  full copies of the history.
+- **Joining a community with a long channel is no longer quadratic.** History
+  pages are merged in linear time.
+
 - **Sending or downloading a large file on a community server no longer slows
   the server down for everyone else.** Both moved their bytes while holding the
   lock that every other member's messages wait behind, so one 100 MB transfer

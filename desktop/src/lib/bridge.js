@@ -497,8 +497,20 @@ export function fmtTime(ts) {
   const d = parseStamp(ts);
   if (!d) return "";
   try {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return timeFormat().format(d);
   } catch { return ""; }
+}
+
+// One formatter, built on first use. `toLocaleTimeString` with an options
+// object constructs a new `Intl.DateTimeFormat` on every call, which is the
+// slow path in WebKitGTK and WKWebView — and it ran once per message per
+// refresh (PERF-01).
+let cachedTimeFormat = null;
+function timeFormat() {
+  if (!cachedTimeFormat) {
+    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return cachedTimeFormat;
 }
 
 // Compact "last activity" stamp for the conversation list: time-of-day for
