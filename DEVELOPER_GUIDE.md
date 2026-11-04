@@ -66,9 +66,13 @@ P2PEM_DATA_DIR=/tmp/p2pem-test cargo tauri dev   # from desktop/
 
 ## Quality Gates and CI
 
-The pre-PR check commands and the full PR checklist are in
-[CONTRIBUTING.md](CONTRIBUTING.md#local-workflow). Run the whole suite with
-`cargo nextest run --workspace` (or `cargo test --workspace`). The
+The local equivalent of CI is one command, kept in
+[CONTRIBUTING.md § Local Workflow](CONTRIBUTING.md#local-workflow) along with the
+PR checklist. Its test half is
+`cargo nextest run --workspace --profile ci` plus `cargo test --workspace --doc`
+(nextest does not run doctests) and, for the frontend,
+`cd desktop && npm run lint && npm test`. Use nextest rather than
+`cargo test --workspace`: the suite is written for one process per test. The
 `p2pem-desktop` bridge has its own integration tests
 (`desktop/src-tauri/src/tests.rs`) that drive the Tauri command layer over a
 mock runtime — no display needed, but compiling the crate requires the
@@ -136,8 +140,10 @@ When touching these:
 
 ## Release Checklist
 
-1. Run format, clippy, and tests — Rust (`cargo test --workspace`) **and**
-   frontend (`cd desktop && npm test`).
+1. Run the full local check from
+   [CONTRIBUTING.md § Local Workflow](CONTRIBUTING.md#local-workflow) (format,
+   clippy, `cargo nextest run --workspace --profile ci`, doctests, and the
+   frontend lint + tests), plus `npm run smoke` in `desktop/`.
 2. Update docs affected by the change.
 3. Rebuild and commit `desktop/dist/` if the frontend changed (it is tracked).
 4. Move relevant `CHANGELOG.md` entries out of `Unreleased` into the new version section.
