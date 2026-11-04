@@ -1290,7 +1290,31 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 ))
             };
         }
-        PartyResponse::Files(files) => conn.files = files,
+        PartyResponse::Files(files) => {
+            // A full listing may have been truncated by the server: ask for
+            // the rest. Only then — an older server never truncates and could
+            // not decode the paged request (audit SRV-01).
+            let full = files.len() >= messenger_core::party::MAX_FILE_LISTING;
+            conn.files = files;
+            if full {
+                let offset = u32::try_from(conn.files.len()).unwrap_or(u32::MAX);
+                let _ = conn.send(PartyRequest::ListFilesPage { offset });
+            }
+        }
+        PartyResponse::FilesPage {
+            files,
+            offset,
+            next,
+        } => {
+            // Only a page that continues what we hold; a stale one (the list
+            // was refreshed meanwhile) is dropped rather than spliced in.
+            if offset as usize == conn.files.len() {
+                conn.files.extend(files);
+                if let Some(next) = next {
+                    let _ = conn.send(PartyRequest::ListFilesPage { offset: next });
+                }
+            }
+        }
         PartyResponse::Quota(quota) => conn.quota = Some(quota),
         PartyResponse::AuditLog(entries) => conn.audit = entries,
         PartyResponse::Ok(message) => conn.last_notice = Some(message),
@@ -1856,6 +1880,58 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "merging {total} envelopes took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// SRV-01: a full `Files` reply may be truncated; the client pages on, and
+    /// only then (an older server never truncates and cannot decode it).
+    #[test]
+    fn a_full_file_listing_is_continued_page_by_page() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let entry = |i: usize| FileEntry {
+            hash: format!("{i:064x}"),
+            name: format!("f{i}"),
+            size: 1,
+            mime: "text/plain".into(),
+            uploader: Uuid::nil(),
+            uploader_name: "a".into(),
+            location: Uuid::nil(),
+            location_name: "#general".into(),
+            is_dm: false,
+            shared_at: 1,
+            can_delete: false,
+            perms: Default::default(),
+        };
+        let max = messenger_core::party::MAX_FILE_LISTING;
+        while out.try_recv().is_ok() {}
+
+        // A short listing is complete: nothing more is asked for.
+        tx.send(Incoming::Response(PartyResponse::Files(vec![entry(0)])))
+            .unwrap();
+        mgr.poll_events();
+        assert!(out.try_recv().is_err());
+
+        tx.send(Incoming::Response(PartyResponse::Files(
+            (0..max).map(entry).collect(),
+        )))
+        .unwrap();
+        mgr.poll_events();
+        assert_eq!(
+            out.try_recv().unwrap(),
+            PartyRequest::ListFilesPage { offset: max as u32 }
+        );
+
+        tx.send(Incoming::Response(PartyResponse::FilesPage {
+            files: (max..max + 3).map(entry).collect(),
+            offset: max as u32,
+            next: None,
+        }))
+        .unwrap();
+        mgr.poll_events();
+        assert_eq!(mgr.server(id).unwrap().files.len(), max + 3);
+        assert!(
+            out.try_recv().is_err(),
+            "the last page asks for nothing more"
         );
     }
 

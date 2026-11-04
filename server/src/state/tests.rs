@@ -3136,7 +3136,20 @@ fn the_file_listing_is_capped_to_fit_one_frame() {
     }
     let listing = state.files_for(alice);
     assert_eq!(listing.len(), MAX_FILE_LISTING);
-    assert!(PartyResponse::Files(listing).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+    assert!(PartyResponse::Files(listing.clone()).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+
+    // The rest is reachable page by page, with nothing repeated or skipped.
+    let (first, next) = state.files_page(alice, 0);
+    assert_eq!(first, listing);
+    assert_eq!(next, Some(MAX_FILE_LISTING));
+    let (rest, next) = state.files_page(alice, MAX_FILE_LISTING);
+    assert_eq!(rest.len(), 5);
+    assert_eq!(next, None);
+    let mut names: Vec<String> = first.iter().chain(&rest).map(|f| f.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), MAX_FILE_LISTING + 5);
+    assert_eq!(state.files_page(alice, 10_000), (Vec::new(), None));
 
     let mut items: Vec<String> = (0..10).map(|i| "z".repeat(100 + i)).collect();
     truncate_listing(&mut items, 100, 3 * 120);
@@ -3346,4 +3359,74 @@ fn an_undecodable_stored_message_is_skipped_rather_than_fatal() {
         .collect();
     assert_eq!(seqs, vec![2]);
     assert_eq!(s.post_message(alice, chan, "three".into()).unwrap().seq, 3);
+}
+
+/// SRV-06: without a retention period everything was kept forever. With one,
+/// old messages and file shares go — but each thread keeps its newest message,
+/// so numbering continues across a restart instead of reusing seqs clients
+/// already hold.
+#[test]
+fn retention_prunes_old_history_and_files_but_keeps_numbering() {
+    let dir = tempfile::tempdir().unwrap();
+    let channel;
+    let alice;
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        channel = s.default_channel();
+        for text in ["one", "two", "three"] {
+            s.post_message(alice, channel, text.to_string()).unwrap();
+        }
+        s.post_file(
+            alice,
+            channel,
+            "notes.txt".to_string(),
+            "text/plain".to_string(),
+            b"old notes".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(s.files_for(alice).len(), 1);
+
+        // Nothing happens without a retention period.
+        let later = messenger_core::util::current_timestamp_millis() + 3 * 86_400_000;
+        assert_eq!(s.prune_expired(later), PruneReport::default());
+
+        s.set_retention(Some(std::time::Duration::from_secs(86_400)));
+        let report = s.prune_expired(later);
+        // Three texts and the file message are old; the newest (the file
+        // message) is kept so the next seq is still known.
+        assert_eq!(report.messages, 3);
+        assert_eq!(report.files, 1);
+        assert!(s.files_for(alice).is_empty());
+        let left: Vec<u64> = s
+            .history_since(alice, channel, 0)
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(left, vec![4]);
+    }
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let left: Vec<u64> = s
+        .history_since(alice, channel, 0)
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(left, vec![4], "pruned rows stay pruned across a restart");
+    let next = s.post_message(alice, channel, "five".to_string()).unwrap();
+    assert_eq!(next.seq, 5, "numbering continues, never reusing a seq");
+}
+
+/// Retention also applies to a server without a database (in-memory history).
+#[test]
+fn retention_prunes_in_memory_history_too() {
+    let mut s = PartyState::new("Srv", None);
+    let alice = s.join("alice", None, None).unwrap();
+    let channel = s.default_channel();
+    for text in ["a", "b"] {
+        s.post_message(alice, channel, text.to_string()).unwrap();
+    }
+    s.set_retention(Some(std::time::Duration::from_secs(60)));
+    let report = s.prune_expired(messenger_core::util::current_timestamp_millis() + 120_000);
+    assert_eq!(report.messages, 1);
+    assert_eq!(s.history_since(alice, channel, 0).len(), 1);
 }

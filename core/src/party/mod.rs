@@ -428,6 +428,12 @@ pub enum PartyRequest {
         member: Option<Uuid>,
         perms: FilePermissions,
     },
+    /// The file listing from `offset` on (newest first). Sent by a client
+    /// only after a [`PartyResponse::Files`] came back holding exactly
+    /// [`MAX_FILE_LISTING`] entries, i.e. possibly truncated — so an older
+    /// server, which never truncates, is not sent a request it cannot decode
+    /// (audit SRV-01).
+    ListFilesPage { offset: u32 },
 }
 
 /// What a member may do with one shared file.
@@ -651,7 +657,23 @@ pub enum PartyResponse {
         total: u64,
         data: Vec<u8>,
     },
+    /// One page of the file listing (reply to [`PartyRequest::ListFilesPage`]
+    /// only, never unsolicited: an older client cannot decode it). `next` is
+    /// the offset to ask for to continue, `None` at the end.
+    FilesPage {
+        files: Vec<FileEntry>,
+        offset: u32,
+        next: Option<u32>,
+    },
 }
+
+/// Most entries one [`PartyResponse::Files`] or [`PartyResponse::FilesPage`]
+/// carries. A `Files` reply holding exactly this many may be truncated, which
+/// is the client's cue to page on with [`PartyRequest::ListFilesPage`].
+pub const MAX_FILE_LISTING: usize = 2_000;
+
+/// Byte budget for one file listing page — half a frame.
+pub const FILE_LISTING_BYTES: usize = 4 * 1024 * 1024;
 
 /// Most envelopes the server will put in one `History` response.
 ///
@@ -1077,6 +1099,7 @@ mod tests {
                 password: None,
             },
             PartyRequest::ListMembers,
+            PartyRequest::ListFilesPage { offset: 2_000 },
             PartyRequest::ListChannels,
             PartyRequest::PostMessage {
                 channel: Uuid::new_v4(),
@@ -1212,6 +1235,11 @@ mod tests {
             },
             PartyResponse::JoinRejected {
                 reason: "wrong password".to_string(),
+            },
+            PartyResponse::FilesPage {
+                files: Vec::new(),
+                offset: 2_000,
+                next: None,
             },
             PartyResponse::Members(vec![MemberInfo {
                 id: Uuid::new_v4(),

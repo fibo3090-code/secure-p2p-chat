@@ -100,6 +100,28 @@ impl History {
         self.resident.range(start..)
     }
 
+    /// Drop resident envelopes older than `cutoff_ms` (retention), always
+    /// keeping the newest one: it carries `last_seq`, and a thread whose every
+    /// envelope vanished would number its next message from 1 again on the
+    /// next restart — under seqs clients already hold. Returns how many went.
+    ///
+    /// `complete_from` needs no change: what was popped no longer exists
+    /// anywhere (retention deletes the same rows from the database), so
+    /// "everything from `complete_from` up is resident" still holds.
+    pub(super) fn prune_before(&mut self, cutoff_ms: u64) -> usize {
+        let mut pruned = 0;
+        while self.resident.len() > 1
+            && self
+                .resident
+                .front()
+                .is_some_and(|e| e.timestamp < cutoff_ms)
+        {
+            self.resident.pop_front();
+            pruned += 1;
+        }
+        pruned
+    }
+
     /// Envelopes currently held in memory (diagnostics and tests).
     pub(super) fn resident_len(&self) -> usize {
         self.resident.len()

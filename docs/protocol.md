@@ -481,6 +481,7 @@ index):
 | 23 | `DownloadChunk { hash, offset }` | One chunk of a stored file (`FileChunk`). |
 | 24 | `ShareFile { hash, from, target }` | Re-post a file already shared at `from`, without re-uploading it. |
 | 25 | `SetFilePermissions { hash, location, member, perms }` | Change what one share grants: the default (`member: None`) or one member's grant. |
+| 26 | `ListFilesPage { offset }` | The file listing from `offset` on. Sent only after a `Files` reply came back holding exactly `MAX_FILE_LISTING` (2,000) entries — an older server never truncates and cannot decode it. |
 
 `target` is an `UploadTarget`: `Channel(channel_id)` or `Dm(member_id)`.
 
@@ -507,6 +508,7 @@ Every `PartyResponse` variant, in wire order:
 | 14 | `DirectoryChanged` | Re-request `ListChannels`. |
 | 15 | `UploadReady { upload, chunk_size }` | A chunked upload was accepted; stream it. |
 | 16 | `FileChunk { hash, offset, total, data }` | One chunk of a download. |
+| 17 | `FilesPage { files, offset, next }` | Reply to `ListFilesPage` only (an older client cannot decode it). `next` is the offset to continue from, `None` at the end. Each page is bounded by 2,000 entries and 4 MiB. |
 
 - **`ActionFailed`** exists separately from `Error` because the client appends
   outgoing messages optimistically and has to know a refusal belongs to the

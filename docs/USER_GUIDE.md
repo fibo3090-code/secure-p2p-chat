@@ -241,6 +241,10 @@ Options (also settable via `PARTY_NAME`, `PARTY_PORT`, `PARTY_PASSWORD`,
   Your identity; TUI: `:identity`). That identity becomes the owner when it
   joins, and any other owner is moved to admin — which is also how to take back
   a community whose ownership went to the wrong person
+- `--retain-days <DAYS>` — delete messages and shared files older than this,
+  at startup and every hour. Each channel and DM keeps its newest message. Without
+  it, history is kept until someone deletes it — and everything the server keeps
+  is readable by whoever runs it or gets into it
 - `--data-dir <DIR>` — where the database, file store, and server identity live (default: `party-data`)
 
 **Becoming the owner.** Being the first to join does *not* make you the owner —

@@ -635,6 +635,27 @@ impl PartyState {
     /// Access follows the same rule as downloading: files shared in channels they
     /// can read, and in their own DM threads.
     pub fn files_for(&self, member: Uuid) -> Vec<FileEntry> {
+        self.files_page(member, 0).0
+    }
+
+    /// One page of [`Self::files_for`] from `offset` on, and the offset of the
+    /// next page (`None` at the end). Pages are bounded by
+    /// [`MAX_FILE_LISTING`] entries and [`FILE_LISTING_BYTES`], so every page
+    /// fits in a frame however many files are shared (audit SRV-01).
+    pub fn files_page(&self, member: Uuid, offset: usize) -> (Vec<FileEntry>, Option<usize>) {
+        let mut all = self.visible_files(member);
+        let total = all.len();
+        let mut page: Vec<FileEntry> = all.drain(offset.min(total)..).collect();
+        truncate_listing(&mut page, MAX_FILE_LISTING, FILE_LISTING_BYTES);
+        // Always make progress: a single entry larger than the budget (not
+        // possible with bounded names and MIME types, but cheap to rule out)
+        // must not make the client ask for the same page forever.
+        let end = offset.min(total) + page.len().max(usize::from(offset < total));
+        (page, (end < total).then_some(end))
+    }
+
+    /// Every file `member` may see, newest first, unbounded.
+    fn visible_files(&self, member: Uuid) -> Vec<FileEntry> {
         let mut out: Vec<FileEntry> = self
             .file_refs
             .iter()
@@ -670,10 +691,15 @@ impl PartyState {
                 }
             })
             .collect();
-        out.sort_by_key(|f| std::cmp::Reverse(f.shared_at));
-        // One frame carries the whole listing, and re-sharing is free, so the
-        // number of entries has no natural bound. Keep the newest that fit.
-        truncate_listing(&mut out, MAX_FILE_LISTING, FILE_LISTING_BYTES);
+        // Newest first; hash then location break ties, so the order — and
+        // with it every page boundary — is the same from one request to the
+        // next.
+        out.sort_by(|a, b| {
+            b.shared_at
+                .cmp(&a.shared_at)
+                .then_with(|| a.hash.cmp(&b.hash))
+                .then_with(|| a.location.cmp(&b.location))
+        });
         out
     }
 

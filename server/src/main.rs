@@ -62,6 +62,13 @@ struct Args {
     #[arg(long, env = "PARTY_OWNER", value_name = "FINGERPRINT")]
     owner: Option<String>,
 
+    /// Delete messages and shared files older than this many days (checked at
+    /// startup and every hour). Each channel and DM keeps its newest message.
+    /// Without it, history is kept forever.
+    #[arg(long, env = "PARTY_RETAIN_DAYS", value_name = "DAYS",
+          value_parser = clap::value_parser!(u32).range(1..=36500))]
+    retain_days: Option<u32>,
+
     /// Directory for durable state: member/channel/message database (party.db),
     /// the file blob store, and the server identity key.
     #[arg(long, env = "PARTY_DATA_DIR", default_value = "party-data")]
@@ -95,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
     // and auto-saved to the data dir).
     let mut loaded = PartyState::load(&args.name, args.password, &args.data_dir)?;
     loaded.set_owner_fingerprint(owner);
+    let retention = args
+        .retain_days
+        .map(|days| std::time::Duration::from_secs(u64::from(days) * 86_400));
+    loaded.set_retention(retention);
     let claim_token = loaded.owner_claim_token().map(str::to_owned);
     let state = Arc::new(Mutex::new(loaded));
 
@@ -126,6 +137,32 @@ async fn main() -> anyhow::Result<()> {
              and a restart issues a new one. Until then nobody can administer it. \
              (Or restart with --owner <your fingerprint>.)"
         );
+    }
+
+    match args.retain_days {
+        Some(days) => {
+            tracing::info!(days, "retention: messages and files older than this are deleted hourly");
+            let state = state.clone();
+            tokio::spawn(async move {
+                // The first tick fires immediately: prune at startup too.
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    every.tick().await;
+                    let now = messenger_core::util::current_timestamp_millis();
+                    let report = state.lock().await.prune_expired(now);
+                    if report.messages > 0 || report.files > 0 {
+                        tracing::info!(
+                            messages = report.messages,
+                            files = report.files,
+                            "retention: pruned expired history"
+                        );
+                    }
+                }
+            });
+        }
+        None => tracing::info!(
+            "no --retain-days: community history is kept until deleted (pass --retain-days to limit it)"
+        ),
     }
 
     run_accept_loop(listener, state, privkey, hub).await

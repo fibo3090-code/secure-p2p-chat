@@ -575,6 +575,14 @@ fn handle_member_request(
             Err(e) => Dispatch::reply(PartyResponse::Error(e)),
         },
         PartyRequest::ListFiles => Dispatch::reply(PartyResponse::Files(state.files_for(member))),
+        PartyRequest::ListFilesPage { offset } => {
+            let (files, next) = state.files_page(member, offset as usize);
+            Dispatch::reply(PartyResponse::FilesPage {
+                files,
+                offset,
+                next: next.and_then(|n| u32::try_from(n).ok()),
+            })
+        }
         PartyRequest::DeleteFile { hash, channel } => {
             Dispatch::outcome(state.delete_file(member, &hash, channel))
         }

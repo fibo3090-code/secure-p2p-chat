@@ -13,6 +13,14 @@ predate tagged releases.
 
 ### Security
 
+- **Community servers can now limit how long they keep history.**
+  `--retain-days <DAYS>` deletes messages and shared files older than that, at
+  startup and hourly (each channel and DM keeps its newest message, so
+  numbering never restarts). Without it, history is still kept indefinitely.
+- **A community's full file list is reachable again.** The listing was capped
+  to fit one frame; a client now pages through the rest. Older servers and
+  clients are unaffected.
+
 - **Community screens now say that the server's operator can read them.**
   Channel messages, community DMs and shared files are stored on the server
   unencrypted; the app said so only on the join screen. Every community view

@@ -124,11 +124,10 @@ pub const MAX_PRIVATE_CHANNEL_MEMBERS: usize = 1_000;
 pub const MAX_MIME_BYTES: usize = 255;
 /// What a missing or malformed MIME type is stored as.
 pub const FALLBACK_MIME: &str = "application/octet-stream";
-/// Most entries one `Files` listing carries, newest first.
-pub const MAX_FILE_LISTING: usize = 2_000;
-/// Byte budget for one `Files` listing. Shares are free (a re-share costs a
-/// reference, not storage), so the number of entries is otherwise unbounded.
-pub const FILE_LISTING_BYTES: usize = 4 * 1024 * 1024;
+/// Listing limits, shared with the client (it pages on when a reply is full).
+/// Shares are free (a re-share costs a reference, not storage), so the number
+/// of entries is otherwise unbounded.
+pub use messenger_core::party::{FILE_LISTING_BYTES, MAX_FILE_LISTING};
 
 /// Reduce a member-supplied MIME type to `type/subtype`, lowercase, or
 /// [`FALLBACK_MIME`] when it is not one.
@@ -417,6 +416,18 @@ pub struct PartyState {
     channel_creations: HashMap<Uuid, Vec<Instant>>,
     /// Per-member write budgets (see [`WriteRateLimit`]).
     write_rate: WriteBuckets,
+    /// How long messages and shared files are kept. `None` keeps everything
+    /// (see [`Self::prune_expired`]).
+    retention: Option<std::time::Duration>,
+}
+
+/// What one retention pass removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Messages deleted from the database (or from memory, without one).
+    pub messages: usize,
+    /// File shares removed; their bytes go once nothing else references them.
+    pub files: usize,
 }
 
 impl PartyState {
@@ -453,6 +464,7 @@ impl PartyState {
             blob_dir: None,
             channel_creations: HashMap::new(),
             write_rate: WriteBuckets::default(),
+            retention: None,
         }
     }
 
@@ -1317,6 +1329,72 @@ impl PartyState {
         self.member_can_post_to_channel(sender, channel)?;
         self.append_channel_message(sender, channel, MessagePayload::Text(text))
             .ok_or_else(|| "unknown channel".to_string())
+    }
+
+    /// How long the community keeps messages and shared files. Without a
+    /// limit everything is kept forever, which is what the audit found
+    /// (SRV-06): the database, and with it what a compromise exposes, grows
+    /// for as long as the server runs. The operator sets it (`--retain-days`);
+    /// [`Self::prune_expired`] applies it.
+    pub fn set_retention(&mut self, max_age: Option<std::time::Duration>) {
+        self.retention = max_age;
+    }
+
+    /// Delete messages and file shares older than the retention period.
+    /// Nothing happens without one.
+    ///
+    /// Each thread keeps its newest message whatever its age, so sequence
+    /// numbering continues where it was — clients merge on seq, and a thread
+    /// restarting at 1 would collide with what they already hold. Deleting old
+    /// envelopes does not renumber anything; a page simply starts later. A
+    /// shared file goes through the same release as a delete, so its bytes are
+    /// reclaimed when the last reference expires.
+    pub fn prune_expired(&mut self, now_ms: u64) -> PruneReport {
+        let Some(max_age) = self.retention else {
+            return PruneReport::default();
+        };
+        let cutoff = now_ms.saturating_sub(max_age.as_millis().min(u64::MAX as u128) as u64);
+        self.with_tx(|s| s.prune_expired_in_tx(cutoff))
+    }
+
+    fn prune_expired_in_tx(&mut self, cutoff: u64) -> PruneReport {
+        let mut report = PruneReport::default();
+        let mut resident_pruned = 0;
+        for chan in &mut self.channels {
+            resident_pruned += chan.history.prune_before(cutoff);
+        }
+        for thread in self.dm_threads.values_mut() {
+            resident_pruned += thread.history.prune_before(cutoff);
+        }
+        report.messages = match &self.db {
+            Some(conn) => db::prune_messages_before(conn, cutoff).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "retention: could not prune party.db messages");
+                0
+            }),
+            None => resident_pruned,
+        };
+
+        let expired: Vec<FileRef> = self
+            .file_refs
+            .iter()
+            .filter(|r| r.shared_at < cutoff)
+            .cloned()
+            .collect();
+        for entry in &expired {
+            self.file_refs.retain(|r| r.id != entry.id);
+            self.delete_file_ref_row(entry.id);
+            self.release_blob(&entry.hash);
+        }
+        report.files = expired.len();
+
+        if report.messages > 0 || report.files > 0 {
+            let detail = format!(
+                "retention removed {} messages and {} file shares",
+                report.messages, report.files
+            );
+            self.record_audit(Uuid::nil(), "retention.prune", &detail);
+        }
+        report
     }
 
     /// Append a message to `channel` under the next sequence number, keep it

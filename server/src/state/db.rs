@@ -671,6 +671,28 @@ pub(super) fn insert_channel_row(
     Ok(())
 }
 
+/// Delete channel and DM messages older than `cutoff_ms`, keeping each
+/// thread's newest row (it is where the next sequence number comes from on a
+/// restart). Returns how many rows went.
+pub(super) fn prune_messages_before(conn: &Connection, cutoff_ms: u64) -> rusqlite::Result<usize> {
+    let cutoff = cutoff_ms.min(i64::MAX as u64) as i64;
+    let channels = execute_cached(
+        conn,
+        "DELETE FROM messages
+          WHERE json_extract(envelope, '$.timestamp') < ?1
+            AND seq < (SELECT MAX(m.seq) FROM messages m WHERE m.channel_id = messages.channel_id)",
+        params![cutoff],
+    )?;
+    let dms = execute_cached(
+        conn,
+        "DELETE FROM dm_messages
+          WHERE json_extract(envelope, '$.timestamp') < ?1
+            AND seq < (SELECT MAX(d.seq) FROM dm_messages d WHERE d.thread_id = dm_messages.thread_id)",
+        params![cutoff],
+    )?;
+    Ok(channels + dms)
+}
+
 pub(super) fn insert_message_row(conn: &Connection, e: &Envelope) -> rusqlite::Result<()> {
     let json = serde_json::to_string(e).expect("Envelope serializes");
     execute_cached(
