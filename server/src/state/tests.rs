@@ -2877,3 +2877,45 @@ fn history_requires_membership() {
     let stranger = Uuid::new_v4();
     assert!(state.history_since(stranger, chan, 0).is_empty());
 }
+
+/// Every write used to be its own rollback-journal commit with
+/// `synchronous=FULL` — several fsyncs per post, all under the state lock.
+#[test]
+fn the_database_runs_in_wal_mode_with_normal_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let conn = s.db.as_ref().unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    // 1 == NORMAL.
+    let sync: i64 = conn
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sync, 1);
+}
+
+/// A mutation that writes several rows commits them together, and a helper
+/// that opens its own transaction still works when called inside one.
+#[test]
+fn multi_row_mutations_commit_as_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        bob = s.join("bob", None, None).unwrap();
+        // A DM writes its thread row and its message; here it runs inside an
+        // outer transaction, so the inner one must not try to nest.
+        s.with_tx(|s| {
+            s.post_dm(alice, bob, "inside".to_string()).unwrap();
+            assert!(!s.db.as_ref().unwrap().is_autocommit());
+        });
+        assert!(s.db.as_ref().unwrap().is_autocommit(), "committed");
+        s.post_dm(alice, bob, "outside".to_string()).unwrap();
+    }
+    let s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let thread = messenger_core::party::dm_thread_id(alice, bob);
+    assert_eq!(s.dm_history(thread, 0).len(), 2);
+}

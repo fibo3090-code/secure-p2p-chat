@@ -77,6 +77,15 @@ predate tagged releases.
   stalled the whole community for its duration. The bytes now move outside it.
 - **A download was reading the entire file for each small piece it sent** —
   about 160 GB of disk reads for one 100 MB file.
+- **A community server's database no longer syncs to disk several times per
+  message.** It ran SQLite in its slowest durable mode, one commit per
+  statement and a fresh parse of every statement, all while holding the lock
+  every member waits behind — enough to cap a whole community at a few dozen
+  to a hundred messages a second. It now uses write-ahead logging with
+  `synchronous=NORMAL` (safe against a crash; a power cut can lose the last
+  few commits, never corrupt the file), caches its statements, and commits
+  each change — a DM, a channel deletion, an upload — as one transaction, so a
+  crash part-way through can no longer leave half of it on disk.
 
 ### Fixed
 

@@ -380,6 +380,7 @@ impl PartyState {
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;
+        configure_connection(&conn)?;
         init_schema(&conn)?;
 
         // One-time migration from the interim JSON snapshot into SQLite.
@@ -561,6 +562,10 @@ impl PartyState {
     /// strictly below your own), and always refuses to change the owner's — an
     /// admin who could demote the owner would own the server.
     pub fn set_role(&mut self, actor: Uuid, target: Uuid, role: Role) -> Result<String, String> {
+        self.with_tx(|s| s.set_role_in_tx(actor, target, role))
+    }
+
+    fn set_role_in_tx(&mut self, actor: Uuid, target: Uuid, role: Role) -> Result<String, String> {
         let actor_role = self.role_of(actor);
         if !actor_role.is_admin() {
             return Err("only admins may change roles".to_string());
@@ -842,6 +847,17 @@ impl PartyState {
         creator: Uuid,
         name: &str,
         kind: ChannelKind,
+        members: Vec<Uuid>,
+        now: Instant,
+    ) -> Result<ChannelInfo, String> {
+        self.with_tx(|s| s.create_channel_of_kind_in_tx(creator, name, kind, members, now))
+    }
+
+    fn create_channel_of_kind_in_tx(
+        &mut self,
+        creator: Uuid,
+        name: &str,
+        kind: ChannelKind,
         mut members: Vec<Uuid>,
         now: Instant,
     ) -> Result<ChannelInfo, String> {
@@ -898,6 +914,16 @@ impl PartyState {
         actor: Uuid,
         channel: Uuid,
         kind: ChannelKind,
+        members: Vec<Uuid>,
+    ) -> Result<String, String> {
+        self.with_tx(|s| s.set_channel_access_in_tx(actor, channel, kind, members))
+    }
+
+    fn set_channel_access_in_tx(
+        &mut self,
+        actor: Uuid,
+        channel: Uuid,
+        kind: ChannelKind,
         mut members: Vec<Uuid>,
     ) -> Result<String, String> {
         if !self.role_of(actor).is_admin() {
@@ -932,6 +958,12 @@ impl PartyState {
     /// The last channel cannot be deleted: `default_channel` indexes
     /// `channels[0]`, and a server with no channels has nowhere to post.
     pub fn delete_channel(&mut self, actor: Uuid, channel: Uuid) -> Result<String, String> {
+        // One transaction: the blob refcounts released below and the rows
+        // removed with the channel must not be able to disagree after a crash.
+        self.with_tx(|s| s.delete_channel_in_tx(actor, channel))
+    }
+
+    fn delete_channel_in_tx(&mut self, actor: Uuid, channel: Uuid) -> Result<String, String> {
         if !self.role_of(actor).is_admin() {
             return Err("only admins may delete channels".to_string());
         }

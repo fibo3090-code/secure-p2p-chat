@@ -408,6 +408,16 @@ impl PartyState {
         from: Uuid,
         target: UploadTarget,
     ) -> Result<Envelope, String> {
+        self.with_tx(|s| s.share_file_in_tx(actor, hash, from, target))
+    }
+
+    fn share_file_in_tx(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        from: Uuid,
+        target: UploadTarget,
+    ) -> Result<Envelope, String> {
         let Some(source) = self
             .file_refs
             .iter()
@@ -514,6 +524,17 @@ impl PartyState {
         member: Option<Uuid>,
         perms: FilePermissions,
     ) -> Result<String, String> {
+        self.with_tx(|s| s.set_file_permissions_in_tx(actor, hash, location, member, perms))
+    }
+
+    fn set_file_permissions_in_tx(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        location: Uuid,
+        member: Option<Uuid>,
+        perms: FilePermissions,
+    ) -> Result<String, String> {
         let Some(index) = self
             .file_refs
             .iter()
@@ -600,6 +621,15 @@ impl PartyState {
     /// the reference and — once nothing else holds it — the bytes, after which
     /// the file card reports that the file was deleted.
     pub fn delete_file(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        location: Uuid,
+    ) -> Result<String, String> {
+        self.with_tx(|s| s.delete_file_in_tx(actor, hash, location))
+    }
+
+    fn delete_file_in_tx(
         &mut self,
         actor: Uuid,
         hash: &str,
@@ -979,6 +1009,16 @@ impl PartyState {
     /// removed from the server. Checking only on the way in would append a
     /// message that the current state forbids.
     pub fn commit_upload(
+        &mut self,
+        staged: StagedUpload,
+    ) -> Result<(Envelope, UploadTarget), String> {
+        // The blob row (or its refcount), the file reference and the message
+        // are one commit: a crash between them used to leave a refcount with
+        // no reference to release it, or a blob on disk with no row.
+        self.with_tx(|s| s.commit_upload_in_tx(staged))
+    }
+
+    fn commit_upload_in_tx(
         &mut self,
         mut staged: StagedUpload,
     ) -> Result<(Envelope, UploadTarget), String> {
