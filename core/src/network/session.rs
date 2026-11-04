@@ -1753,7 +1753,8 @@ mod tests {
     /// echoed back by anyone on the path, used to be accepted as the peer's.
     #[test]
     fn a_reflected_frame_is_not_accepted_as_the_peers() {
-        let key = [5u8; crate::AES_KEY_SIZE];
+        let mut key = [0u8; crate::AES_KEY_SIZE];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut key);
         let aad = b"transport-aad".to_vec();
         let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1793,7 +1794,8 @@ mod tests {
     /// host's key, or a misbehaving client could force rotations at will.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
-        let key = [6u8; crate::AES_KEY_SIZE];
+        let mut key = [0u8; crate::AES_KEY_SIZE];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut key);
         let aad = b"transport-aad".to_vec();
         let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
         let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();

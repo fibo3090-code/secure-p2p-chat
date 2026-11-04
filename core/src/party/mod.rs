@@ -949,6 +949,14 @@ mod tests {
     use super::*;
     use crate::core::NonceRole;
 
+    /// A session key for a test: generated, because a test needs *a* key
+    /// shared by both ends, not a particular one.
+    fn test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        key
+    }
+
     fn sample_envelope() -> Envelope {
         Envelope {
             tier: TrustTier::Administered,
@@ -1156,8 +1164,9 @@ mod tests {
 
     #[tokio::test]
     async fn framed_message_roundtrips_over_a_tunnel() {
-        let cipher = AesCipher::new_with_role(&[3u8; 32], NonceRole::Host).unwrap();
-        let peer = AesCipher::new_with_role(&[3u8; 32], NonceRole::Client).unwrap();
+        let key = test_key();
+        let cipher = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let aad = b"transport|party-test";
         let (mut a, mut b) = tokio::io::duplex(4096);
         let mut tx_seq = FrameSeq::new();
@@ -1193,8 +1202,9 @@ mod tests {
     /// the Party tunnel now does too.
     #[tokio::test]
     async fn a_replayed_party_frame_is_rejected() {
-        let cipher = AesCipher::new_with_role(&[7u8; 32], NonceRole::Host).unwrap();
-        let peer = AesCipher::new_with_role(&[7u8; 32], NonceRole::Client).unwrap();
+        let key = test_key();
+        let cipher = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let aad = b"transport|replay-test";
         let mut tx_seq = FrameSeq::new();
 
@@ -1228,7 +1238,8 @@ mod tests {
     /// used to authenticate as the other side's.
     #[tokio::test]
     async fn a_reflected_party_frame_is_rejected() {
-        let ours = AesCipher::new_with_role(&[9u8; 32], NonceRole::Client).unwrap();
+        let key = test_key();
+        let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let aad = b"transport|reflect-test";
         let mut tx_seq = FrameSeq::new();
         let mut captured: Vec<u8> = Vec::new();

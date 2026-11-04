@@ -188,6 +188,9 @@ pub struct ChatManager {
     /// and one late save would put a fresh history file back in the folder
     /// the user just emptied.
     pub(crate) data_wiped: bool,
+    /// Shared with every snapshot so a background write cannot outlive a
+    /// wipe — see `persistence::PersistGate`.
+    pub(crate) persist_gate: crate::app::persistence::PersistGate,
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
@@ -279,6 +282,7 @@ impl ChatManager {
             history_key: None,
             history_load_error: None,
             data_wiped: false,
+            persist_gate: Default::default(),
             is_hosting: false,
             rehost_failures: 0,
             hosting_port: None,
@@ -838,6 +842,10 @@ impl ChatManager {
         self.clear_history(std::path::Path::new(""));
         self.data_wiped = true;
         self.history_key = None;
+        // Waits for a background save already writing, and makes every later
+        // one refuse; held until the files are gone.
+        let mut gate = self.persist_gate.lock().unwrap_or_else(|e| e.into_inner());
+        *gate = true;
 
         // Only what this app writes is removed, and the folder itself only if
         // that leaves it empty: `P2PEM_DATA_DIR` can point anywhere, and
@@ -855,15 +863,15 @@ impl ChatManager {
         .filter(|d| !d.as_os_str().is_empty())
         {
             files.push(dir.join("parties.json"));
+            // A legacy plaintext history that was never migrated.
+            files.push(dir.join("history.json"));
             dirs.push(dir.join("diagnostics"));
             // Unreadable histories set aside by `set_aside_unreadable_history`.
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
-                    if name
-                        .to_string_lossy()
-                        .starts_with("history.json.enc.unreadable-")
-                    {
+                    let name = name.to_string_lossy();
+                    if name.starts_with("history.json") && name.contains(".unreadable-") {
                         files.push(entry.path());
                     }
                 }

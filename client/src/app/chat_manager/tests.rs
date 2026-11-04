@@ -1962,6 +1962,27 @@ fn delete_all_data_removes_files_and_clears_state() {
     assert!(!history_path.exists());
 }
 
+/// Both shells snapshot under the lock and write later, off it. A wipe that
+/// lands in between must not have the late write put the history back
+/// (Codex review on PR #191).
+#[test]
+fn a_snapshot_taken_before_a_wipe_cannot_be_written_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let history_path = dir.path().join("history.json.enc");
+    let identity_path = dir.path().join("identity.json");
+    let mut key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+    let mut mgr = ChatManager::new(Config::default());
+    mgr.set_history_key(key);
+    mgr.create_local_chat_for_test(Uuid::new_v4(), "Chat".into());
+
+    let (late, late_key) = mgr.history_snapshot().unwrap();
+    mgr.delete_all_data(dir.path(), &history_path, &identity_path)
+        .unwrap();
+    assert!(late.save_encrypted(&history_path, &late_key).is_err());
+    assert!(!history_path.exists());
+}
+
 /// `P2PEM_DATA_DIR` can point at a folder that holds other things too; the
 /// wipe removes what the app wrote and leaves the rest (and the folder).
 #[test]

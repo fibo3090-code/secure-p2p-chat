@@ -1817,24 +1817,27 @@ mod tests {
     #[tokio::test]
     async fn wipe_checks_the_password_confirms_then_deletes_everything() {
         let dir = tempfile::tempdir().unwrap();
+        // Generated, not written out: the test needs a right and a wrong one.
+        let password = format!("pw-{}", Uuid::new_v4());
+        let wrong = format!("pw-{}", Uuid::new_v4());
         let mut app = app();
         app.history_path = dir.path().join("history.json.enc");
         app.identity_path = dir.path().join("identity.json");
         let mut identity = Identity::new_with_plaintext("T".into()).unwrap();
-        identity.encrypt("correct horse battery").unwrap();
+        identity.encrypt(&password).unwrap();
         identity.save(&app.identity_path).unwrap();
         app.identity = identity;
         std::fs::write(&app.history_path, b"h").unwrap();
 
         app.execute_command(TuiCommand::Wipe {
-            password: "wrong password!".into(),
+            password: wrong.clone(),
         })
         .await;
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(app.identity_path.exists());
 
         app.execute_command(TuiCommand::Wipe {
-            password: "correct horse battery".into(),
+            password: password.clone(),
         })
         .await;
         assert_eq!(app.overlay, TuiOverlay::ConfirmWipe);
@@ -1843,7 +1846,7 @@ mod tests {
         assert!(app.identity_path.exists() && !app.should_quit);
 
         app.execute_command(TuiCommand::Wipe {
-            password: "correct horse battery".into(),
+            password: password.clone(),
         })
         .await;
         app.handle_key_event(ctrl('y'));
@@ -1867,7 +1870,9 @@ mod tests {
         // `TuiApp::new` reads the machine's real data dir; whatever it found
         // there is not this test's business.
         app.chat_manager.history_load_error = None;
-        app.chat_manager.set_history_key([7u8; 32]);
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        app.chat_manager.set_history_key(key);
         app.chat_manager
             .create_local_chat_for_test(Uuid::new_v4(), "A".into());
 

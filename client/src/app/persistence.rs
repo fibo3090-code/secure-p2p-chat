@@ -104,7 +104,21 @@ pub struct HistoryFile {
     /// Contact -> chat association map so we can reconnect automatically
     #[serde(default)]
     pub contact_chat_map: Vec<(Uuid, Uuid)>,
+    /// The owning manager's write gate, attached by `history_snapshot` (never
+    /// serialized). See [`PersistGate`].
+    #[serde(skip)]
+    pub(crate) gate: Option<PersistGate>,
 }
+
+/// Serialises history writes against [`ChatManager::delete_all_data`].
+///
+/// Both shells take a snapshot under the manager lock and write it later on
+/// the blocking pool, so a wipe could land between the two and the late write
+/// would put the history file straight back (Codex review on PR #191). A save
+/// holds this gate for its whole write and refuses once it reads `true`; the
+/// wipe sets it to `true` while holding it, so it waits for a write already
+/// under way and every later one is refused.
+pub type PersistGate = std::sync::Arc<std::sync::Mutex<bool>>;
 
 impl HistoryFile {
     pub fn new(chats: Vec<Chat>) -> Self {
@@ -114,6 +128,7 @@ impl HistoryFile {
             contacts: Vec::new(),
             config: Config::default(),
             contact_chat_map: Vec::new(),
+            gate: None,
         }
     }
 
@@ -172,6 +187,17 @@ impl HistoryFile {
         // then the tag — instead of JSON, ciphertext and a concatenated copy:
         // three full copies of the history less at peak (PERF-03). The bytes
         // on disk are identical (`nonce || ciphertext || tag`).
+        // Held to the end of the write: see `PersistGate`.
+        let _gate = match &self.gate {
+            Some(gate) => {
+                let held = gate.lock().unwrap_or_else(|e| e.into_inner());
+                if *held {
+                    anyhow::bail!("refusing to save: all data was deleted");
+                }
+                Some(held)
+            }
+            None => None,
+        };
         const NONCE: usize = 12;
         let mut output = vec![0u8; NONCE];
         serde_json::to_writer(&mut output, &self)?;
@@ -347,6 +373,17 @@ impl ChatManager {
         &mut self,
         path: &Path,
     ) -> Result<Option<std::path::PathBuf>> {
+        // `load_history_auto` reads the legacy plaintext `history.json` when
+        // the encrypted file is absent, so that is the file that failed in
+        // that case — set *it* aside, or the refusal is lifted while the
+        // unreadable file stays put and is ignored from then on (Codex review
+        // on PR #191).
+        let legacy = path.with_file_name("history.json");
+        let path = if !path.exists() && legacy.exists() {
+            legacy.as_path()
+        } else {
+            path
+        };
         let moved = if path.exists() {
             let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
             let file_name = path
@@ -456,6 +493,7 @@ impl ChatManager {
             .cloned()
             .collect();
         let mut history = HistoryFile::new(chats);
+        history.gate = Some(self.persist_gate.clone());
         history.contacts = self.contacts.values().cloned().collect();
         history.config = self.config.clone();
         history.contact_chat_map = self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
@@ -516,6 +554,15 @@ impl ChatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh history key for a test. Generated rather than written out:
+    /// what a test needs is *a* key (or two different ones), not a particular
+    /// value.
+    fn random_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        key
+    }
     use crate::app::ChatManager;
     use crate::types::{Chat, Message, MessageContent};
     use rand::RngCore;
@@ -769,18 +816,20 @@ mod tests {
     /// empty state the failed load left behind over every conversation.
     #[test]
     fn an_unreadable_history_is_never_overwritten() {
+        // Random keys: a test needs two different ones, not particular ones.
+        let (other_key, key) = (random_key(), random_key());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.json.enc");
         // Written with a different key: decrypts as garbage, like a file from
         // another identity, a newer build, or bit-rot.
         let mut other = ChatManager::new(Config::default());
-        other.set_history_key([7u8; 32]);
+        other.set_history_key(other_key);
         other.save_history(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
 
         let mut mgr = ChatManager::new(Config::default());
-        mgr.set_history_key([1u8; 32]);
-        assert!(mgr.load_history_auto(&path, &[1u8; 32]).is_err());
+        mgr.set_history_key(key);
+        assert!(mgr.load_history_auto(&path, &key).is_err());
         assert!(mgr.history_load_error().is_some());
 
         assert!(mgr.save_history(&path).is_err(), "saving must be refused");
@@ -811,19 +860,20 @@ mod tests {
 
     #[test]
     fn setting_an_unreadable_history_aside_keeps_it_and_allows_saving() {
+        let key = random_key();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.json.enc");
         std::fs::write(&path, b"not a history file at all").unwrap();
 
         let mut mgr = ChatManager::new(Config::default());
-        mgr.set_history_key([1u8; 32]);
-        assert!(mgr.load_history_auto(&path, &[1u8; 32]).is_err());
+        mgr.set_history_key(key);
+        assert!(mgr.load_history_auto(&path, &key).is_err());
 
         let aside = mgr.set_aside_unreadable_history(&path).unwrap().unwrap();
         assert_eq!(std::fs::read(&aside).unwrap(), b"not a history file at all");
         assert!(mgr.history_load_error().is_none());
         mgr.save_history(&path).unwrap();
-        assert!(mgr.load_history_auto(&path, &[1u8; 32]).unwrap());
+        assert!(mgr.load_history_auto(&path, &key).unwrap());
     }
 
     #[test]
@@ -921,5 +971,27 @@ mod tests {
             result.is_err(),
             "history_snapshot should fail if history_key is not set"
         );
+    }
+
+    /// When the encrypted file is absent, `load_history_auto` reads the legacy
+    /// plaintext `history.json`; if that is what failed, that is what has to
+    /// be set aside (Codex review on PR #191).
+    #[test]
+    fn an_unreadable_legacy_history_is_the_file_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("history.json.enc");
+        let legacy = dir.path().join("history.json");
+        std::fs::write(&legacy, b"{ not json").unwrap();
+        let key = random_key();
+
+        let mut mgr = ChatManager::new(Config::default());
+        assert!(mgr.load_history_auto(&encrypted, &key).is_err());
+        assert!(mgr.history_load_error().is_some());
+
+        let moved = mgr.set_aside_unreadable_history(&encrypted).unwrap();
+        let moved = moved.expect("the legacy file is moved");
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(&moved).unwrap(), b"{ not json");
+        assert!(mgr.history_load_error().is_none());
     }
 }
