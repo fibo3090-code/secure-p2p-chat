@@ -1107,45 +1107,62 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             let thread = conn.messages.entry(env.channel).or_default();
             // A live broadcast can race a history page carrying the same
             // envelope; both are keyed by the server-assigned sequence.
-            if !thread.iter().any(|e| e.seq == env.seq) {
+            // Confirmed envelopes sit in ascending seq order by position
+            // (pages are sorted on merge, broadcasts arrive in order), so a
+            // seq above the last confirmed one is new without a scan — the
+            // common case, which used to cost O(thread) per arrival (PERF-05).
+            let newest = thread.iter().rev().find(|e| e.seq != 0).map(|e| e.seq);
+            if newest.is_none_or(|n| env.seq > n) || !thread.iter().any(|e| e.seq == env.seq) {
                 thread.push(env);
             }
         }
         PartyResponse::History(items) => {
             let page_was_full = items.len() >= MAX_HISTORY_BATCH;
             let threads: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
+            // Which threads are DMs, and with whom: one hash per member per
+            // page, not one per member per thread (PERF-05). Only needed to
+            // ask for the next page.
+            let dm_peers: HashMap<Uuid, Uuid> = match conn.member_id {
+                Some(me) if page_was_full => conn
+                    .members
+                    .iter()
+                    .map(|m| (dm_thread_id(me, m.id), m.id))
+                    .collect(),
+                _ => HashMap::new(),
+            };
             for th in threads {
                 // Same sentinel, same reasoning as `Message` above: a history
                 // page is no more trustworthy than a broadcast.
-                let page: Vec<Envelope> = items
-                    .iter()
-                    .filter(|e| e.channel == th && e.seq != 0)
-                    .cloned()
-                    .collect();
+                let page = items.iter().filter(|e| e.channel == th && e.seq != 0);
                 let existing = conn.messages.entry(th).or_default();
                 // Merge rather than replace: history is paged now, so a later
                 // page must not throw away the earlier one. Server-assigned
                 // sequences are the identity; unconfirmed local sends (seq 0)
                 // are kept so a message in flight does not blink out.
+                //
+                // One set of known sequences per page, not a scan of the whole
+                // thread per envelope: that made joining a long channel
+                // quadratic, under the lock every party command needs
+                // (PERF-05). The sort only runs when something was added, and
+                // a stable sort of presorted runs is close to linear.
+                let mut known: HashSet<u64> =
+                    existing.iter().map(|e| e.seq).filter(|&s| s != 0).collect();
+                let before = existing.len();
                 for env in page {
-                    if !existing.iter().any(|e| e.seq == env.seq) {
-                        existing.push(env);
+                    if known.insert(env.seq) {
+                        existing.push(env.clone());
                     }
                 }
-                existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
+                if existing.len() != before {
+                    existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
+                }
 
                 // A full page means there is probably more behind it.
                 if page_was_full {
                     if let Some(last) = existing.iter().rfind(|e| e.seq > 0) {
                         let since_seq = last.seq;
-                        let dm_peer = conn.member_id.and_then(|me| {
-                            conn.members
-                                .iter()
-                                .map(|m| m.id)
-                                .find(|other| dm_thread_id(me, *other) == th)
-                        });
-                        let _ = conn.send(match dm_peer {
-                            Some(with) => PartyRequest::FetchDmHistory { with, since_seq },
+                        let _ = conn.send(match dm_peers.get(&th) {
+                            Some(&with) => PartyRequest::FetchDmHistory { with, since_seq },
                             None => PartyRequest::FetchHistory {
                                 channel: th,
                                 since_seq,
@@ -1799,6 +1816,41 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// PERF-05: paging through a long channel used to scan the whole thread
+    /// for every envelope of every page. The merge must stay correct (no
+    /// duplicates, ascending order, a live broadcast racing a page) and must
+    /// finish a 50k-message channel quickly even in a debug build.
+    #[test]
+    fn paging_a_long_channel_is_linear_and_deduplicated() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let total = 50_000u64;
+        for start in (1..=total).step_by(MAX_HISTORY_BATCH) {
+            let end = (start + MAX_HISTORY_BATCH as u64 - 1).min(total);
+            // A live broadcast of the page's last envelope arrives first.
+            tx.send(Incoming::Response(PartyResponse::Message(envelope(
+                channel, me, end, "live",
+            ))))
+            .unwrap();
+            let page = (start..=end)
+                .map(|s| envelope(channel, me, s, "x"))
+                .collect();
+            tx.send(Incoming::Response(PartyResponse::History(page)))
+                .unwrap();
+            mgr.poll_events();
+        }
+        let thread = mgr.server(id).unwrap().messages.get(&channel).unwrap();
+        assert_eq!(thread.len() as u64, total);
+        assert!(thread.windows(2).all(|w| w[0].seq < w[1].seq));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "merging {total} envelopes took {:?}",
+            started.elapsed()
         );
     }
 
