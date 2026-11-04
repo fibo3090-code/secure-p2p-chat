@@ -119,11 +119,17 @@ jobs:
               # area at once.
               .github/*|.config/*)
                 rust=true; frontend=true; echo "ci:       $f" ;;
-              # The Tauri shell is a Rust workspace member. `npm ci` in desktop/
-              # never compiles it, so it belongs to the Rust half despite living
-              # under desktop/.
+              # The Tauri shell is a Rust workspace member, so it needs the Rust
+              # half. It also needs the frontend half: the vitest invoke-contract
+              # test (src/lib/invokeContract.test.js) reads the Rust command
+              # signatures to check the keys bridge.js sends, and the CSP drift
+              # test reads tauri.conf.json. They are the only platform-independent
+              # check of that contract (the Rust bridge tests are compiled out on
+              # Windows and use hard-coded keys), so a src-tauri-only PR that
+              # renamed a command parameter used to merge green and ship an
+              # `invoke` that silently does nothing.
               desktop/src-tauri/*)
-                rust=true; echo "rust:     $f" ;;
+                rust=true; frontend=true; echo "rust+fe:  $f" ;;
               desktop/*)
                 frontend=true; echo "frontend: $f" ;;
               *.rs|Cargo.toml|Cargo.lock|*/Cargo.toml|deny.toml|rustfmt.toml|clippy.toml|scripts/*)
