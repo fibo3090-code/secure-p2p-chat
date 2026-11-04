@@ -80,6 +80,25 @@ predate tagged releases.
 
 ### Fixed
 
+- **TUI: a peer could be trusted by accident.** The fingerprint prompt opens on
+  its own, under whatever you are typing, and `y` or `Enter` accepted it. It
+  now takes `Ctrl+Y` / `Ctrl+N`; `Esc` puts it away without answering.
+- **TUI: dismissing the first-run password prompt lost everything.** No
+  identity was ever saved, so every launch was a new peer and the previous
+  history was overwritten. The prompt can no longer be dismissed (`Ctrl+Q`
+  quits).
+- **TUI: `:set-password` replaced the password without asking for the current
+  one.** It now only protects an unprotected identity; `:change-password
+  <current> <new>` changes an existing one.
+- **TUI: a multi-line paste was typed as keystrokes**, sending each line and
+  running any line that started with `:`. Bracketed paste now inserts text.
+- **TUI: a startup error or panic left the terminal in raw mode** on the
+  alternate screen, hiding the error message. The terminal is restored first.
+- **TUI: community messages could be posted but never read.** The `:party`
+  pane now lists channels and direct-message threads and shows their messages.
+- **TUI: joining a community froze the interface** until the connection
+  succeeded or timed out. It now connects in the background.
+
 - **A message could go to a conversation other than the one on screen.** When
   you switched conversations quickly, a slow load of the previous one could
   replace the screen while the message box still sent to the new one. The

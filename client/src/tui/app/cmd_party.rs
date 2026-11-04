@@ -5,6 +5,13 @@
 
 use super::*;
 
+/// A readable thread in a community: a channel or a DM with one member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PartyThread {
+    Channel { id: Uuid, name: String },
+    Dm { member: Uuid, name: String },
+}
+
 impl TuiApp {
     pub(super) async fn cmd_party_connect(
         &mut self,
@@ -15,29 +22,119 @@ impl TuiApp {
         let Some(privkey) = self.unlocked_private_key() else {
             return;
         };
-        match self
-            .party_manager
-            // No expected fingerprint yet: this stops before the credentials
-            // are sent and returns the server's fingerprint for the user to
-            // check. `:party-trust` then passes back exactly that fingerprint,
-            // so the connection that carries the password must present it.
-            .connect_and_join(&address, &username, password.clone(), &privkey, None)
-            .await
-        {
-            Ok(PartyJoinOutcome::Joining { server_id, .. }) => {
-                self.current_party = Some(server_id);
-                let fp = self
+        // No expected fingerprint yet: this stops before the credentials are
+        // sent and returns the server's fingerprint for the user to check.
+        // `:party-trust` then passes back exactly that fingerprint, so the
+        // connection that carries the password must present it.
+        self.start_party_dial(address, username, password, privkey, None);
+    }
+
+    pub(super) async fn cmd_party_trust(&mut self) {
+        if !self.require_unlocked() {
+            return;
+        }
+        if self.party_dial.is_some() {
+            self.toast(
+                ToastLevel::Warning,
+                "Already connecting to a community — wait for it to finish.".to_string(),
+            );
+            return;
+        }
+        let Some(pending) = self.pending_party_join.take() else {
+            self.toast(
+                ToastLevel::Error,
+                "No community server is waiting to be verified.".to_string(),
+            );
+            return;
+        };
+        let Some(privkey) = self.private_key() else {
+            return;
+        };
+        // Exactly the fingerprint the user was shown: the connection that
+        // carries the credentials must present it, or nothing is sent.
+        self.start_party_dial(
+            pending.address,
+            pending.username,
+            pending.password,
+            privkey,
+            Some(pending.fingerprint),
+        );
+    }
+
+    /// Run the network half of a join on the runtime, not in the UI loop: a
+    /// connect blocked every key and redraw for as long as the address took
+    /// to time out (TUI-08). `tick` picks the result up in `poll_party_dial`.
+    fn start_party_dial(
+        &mut self,
+        address: String,
+        username: String,
+        password: Option<String>,
+        privkey: rsa::RsaPrivateKey,
+        expected: Option<String>,
+    ) {
+        if self.party_dial.is_some() {
+            self.toast(
+                ToastLevel::Warning,
+                "Already connecting to a community — wait for it to finish.".to_string(),
+            );
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let target = address.clone();
+        tokio::spawn(async move {
+            let dialed = PartyManager::dial(&target, &privkey, expected.as_deref()).await;
+            let _ = tx.send(dialed);
+        });
+        self.toast(ToastLevel::Info, format!("Connecting to {address}…"));
+        self.party_dial = Some(PartyDialJob {
+            address,
+            username,
+            password,
+            rx,
+        });
+    }
+
+    pub(super) fn poll_party_dial(&mut self) {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(job) = self.party_dial.as_mut() else {
+            return;
+        };
+        let dialed = match job.rx.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Ok(dialed) => dialed,
+            Err(TryRecvError::Closed) => Err(anyhow::anyhow!("the connect task stopped")),
+        };
+        let PartyDialJob {
+            address,
+            username,
+            password,
+            ..
+        } = self.party_dial.take().expect("checked above");
+        match dialed {
+            Ok(PartyDial::Verified(verified)) => {
+                match self
                     .party_manager
-                    .server(server_id)
-                    .map(|s| s.server_fingerprint.clone())
-                    .unwrap_or_default();
-                let short = &fp[..fp.len().min(16)];
-                self.toast(
-                    ToastLevel::Info,
-                    format!("Joining Party {address} as {username} (server fp {short}…)"),
-                );
+                    .attach(&address, &username, password, *verified)
+                {
+                    Ok(PartyJoinOutcome::Joining {
+                        server_id,
+                        fingerprint,
+                    }) => {
+                        self.current_party = Some(server_id);
+                        let short = &fingerprint[..fingerprint.len().min(16)];
+                        self.toast(
+                            ToastLevel::Info,
+                            format!("Joining Party {address} as {username} (server fp {short}…)"),
+                        );
+                    }
+                    Ok(PartyJoinOutcome::NeedsVerification { .. }) => self.toast(
+                        ToastLevel::Error,
+                        "The server asked to be verified again; nothing was sent.".to_string(),
+                    ),
+                    Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
+                }
             }
-            Ok(PartyJoinOutcome::NeedsVerification { fingerprint, .. }) => {
+            Ok(PartyDial::NeedsVerification { fingerprint, .. }) => {
                 // The full fingerprint, grouped for reading aloud: it is what
                 // the community server prints when it starts, so it is the
                 // one thing the operator can actually compare.
@@ -66,51 +163,6 @@ impl TuiApp {
         }
     }
 
-    pub(super) async fn cmd_party_trust(&mut self) {
-        if !self.require_unlocked() {
-            return;
-        }
-        let Some(pending) = self.pending_party_join.take() else {
-            self.toast(
-                ToastLevel::Error,
-                "No community server is waiting to be verified.".to_string(),
-            );
-            return;
-        };
-        let Some(privkey) = self.private_key() else {
-            return;
-        };
-        match self
-            .party_manager
-            .connect_and_join(
-                &pending.address,
-                &pending.username,
-                pending.password,
-                &privkey,
-                // Exactly the fingerprint the user was shown: the connection
-                // that carries the credentials must present it, or nothing is
-                // sent.
-                Some(&pending.fingerprint),
-            )
-            .await
-        {
-            Ok(PartyJoinOutcome::Joining { server_id, .. }) => {
-                self.current_party = Some(server_id);
-                self.toast(
-                    ToastLevel::Info,
-                    format!("Joining Party {} as {}", pending.address, pending.username),
-                );
-            }
-            // With an expected fingerprint the manager never asks again; if it
-            // ever did, joining without a verified key is the wrong answer.
-            Ok(PartyJoinOutcome::NeedsVerification { .. }) => self.toast(
-                ToastLevel::Error,
-                "The server asked to be verified again; nothing was sent.".to_string(),
-            ),
-            Err(e) => self.toast(ToastLevel::Error, format!("Party connect failed: {e}")),
-        }
-    }
-
     pub(super) fn cmd_party_post(&mut self, text: String) {
         let Some(server_id) = self.current_party else {
             self.toast(
@@ -119,20 +171,96 @@ impl TuiApp {
             );
             return;
         };
-        let channel = self
-            .party_manager
-            .server(server_id)
-            .and_then(|s| s.channels.first().map(|c| c.id));
-        match channel {
-            Some(ch) => {
-                if let Err(e) = self.party_manager.post(server_id, ch, text) {
-                    self.toast(ToastLevel::Error, format!("Party post failed: {e}"));
-                }
+        // Into the thread selected in the Communities pane (`:party`), not
+        // always the first channel: posting used to ignore the selection.
+        let result = match self.selected_party_thread() {
+            Some(PartyThread::Channel { id, .. }) => self.party_manager.post(server_id, id, text),
+            Some(PartyThread::Dm { member, .. }) => {
+                self.party_manager.send_dm(server_id, member, text)
             }
-            None => self.toast(
-                ToastLevel::Warning,
-                "No channel available yet; try again in a moment".to_string(),
-            ),
+            None => {
+                self.toast(
+                    ToastLevel::Warning,
+                    "No channel available yet; try again in a moment".to_string(),
+                );
+                return;
+            }
+        };
+        if let Err(e) = result {
+            self.toast(ToastLevel::Error, format!("Party post failed: {e}"));
+        }
+    }
+
+    /// The threads of the selected community, in pane order: its channels,
+    /// then a DM thread with every other member.
+    pub(crate) fn party_threads(&self) -> Vec<PartyThread> {
+        let Some(conn) = self
+            .party_manager
+            .server_ids()
+            .get(self.party_sel)
+            .and_then(|id| self.party_manager.server(*id))
+        else {
+            return Vec::new();
+        };
+        let mut threads: Vec<PartyThread> = conn
+            .channels
+            .iter()
+            .map(|c| PartyThread::Channel {
+                id: c.id,
+                name: c.name.clone(),
+            })
+            .collect();
+        threads.extend(
+            conn.members
+                .iter()
+                .filter(|m| Some(m.id) != conn.member_id)
+                .map(|m| PartyThread::Dm {
+                    member: m.id,
+                    name: m.username.clone(),
+                }),
+        );
+        threads
+    }
+
+    pub(crate) fn selected_party_thread(&self) -> Option<PartyThread> {
+        let threads = self.party_threads();
+        let i = self.party_thread_sel.min(threads.len().saturating_sub(1));
+        threads.into_iter().nth(i)
+    }
+
+    /// Messages of the selected thread, oldest first.
+    pub(crate) fn selected_party_messages(&self) -> Vec<messenger_core::party::Envelope> {
+        let Some(server_id) = self.party_manager.server_ids().get(self.party_sel).copied() else {
+            return Vec::new();
+        };
+        match self.selected_party_thread() {
+            Some(PartyThread::Channel { id, .. }) => self
+                .party_manager
+                .server(server_id)
+                .and_then(|c| c.messages.get(&id).cloned())
+                .unwrap_or_default(),
+            Some(PartyThread::Dm { member, .. }) => {
+                self.party_manager.dm_messages(server_id, member)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Opening a DM thread fetches its history once (channels are fetched
+    /// when the channel list arrives).
+    pub(super) fn open_selected_party_thread(&mut self) {
+        let Some(server_id) = self.party_manager.server_ids().get(self.party_sel).copied() else {
+            return;
+        };
+        if let Some(PartyThread::Dm { member, .. }) = self.selected_party_thread() {
+            let _ = self.party_manager.fetch_dm_history(server_id, member);
+        }
+    }
+
+    /// The community the pane shows is the one commands act on.
+    pub(super) fn sync_current_party(&mut self) {
+        if let Some(id) = self.party_manager.server_ids().get(self.party_sel) {
+            self.current_party = Some(*id);
         }
     }
 
@@ -296,6 +424,16 @@ impl TuiApp {
         // by the time the first redraw lands rather than after a manual
         // refresh nobody would think to run.
         if let Some(id) = self.current_party {
+            // Open on the community the commands act on, not on whichever
+            // index the pane was last left at.
+            if let Some(i) = self
+                .party_manager
+                .server_ids()
+                .iter()
+                .position(|s| *s == id)
+            {
+                self.party_sel = i;
+            }
             let _ = self.party_manager.refresh_files(id);
         }
         self.overlay = TuiOverlay::Party;

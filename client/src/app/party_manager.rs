@@ -63,6 +63,29 @@ pub enum PartyJoinOutcome {
     NeedsVerification { fingerprint: String, sas: String },
 }
 
+/// The result of [`PartyManager::dial`]: either a connection whose identity
+/// matched the expected fingerprint, or a first contact to show the user.
+pub enum PartyDial {
+    Verified(Box<VerifiedParty>),
+    NeedsVerification { fingerprint: String, sas: String },
+}
+
+/// A handshaken connection whose server fingerprint matched the one the user
+/// verified. Only [`PartyManager::dial`] makes one, so holding it is proof the
+/// check ran; [`PartyManager::attach`] is the only thing that consumes it.
+pub struct VerifiedParty {
+    client: messenger_core::party::PartyClient<tokio::net::TcpStream>,
+    fingerprint: String,
+}
+
+impl std::fmt::Debug for VerifiedParty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedParty")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Connection lifecycle status for a joined server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartyStatus {
@@ -408,9 +431,27 @@ impl PartyManager {
         privkey: &RsaPrivateKey,
         expected_fingerprint: Option<&str>,
     ) -> Result<PartyJoinOutcome> {
+        self.last_error = None;
+        match Self::dial(address, privkey, expected_fingerprint).await? {
+            PartyDial::NeedsVerification { fingerprint, sas } => {
+                Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas })
+            }
+            PartyDial::Verified(verified) => self.attach(address, username, password, *verified),
+        }
+    }
+
+    /// The network half of [`connect_and_join`](Self::connect_and_join):
+    /// reach the server, complete the handshake and check its fingerprint.
+    /// It touches no manager state, so a shell can run it **without holding
+    /// its UI loop or the manager** and hand the result to
+    /// [`attach`](Self::attach) afterwards. Nothing is sent to the server.
+    pub async fn dial(
+        address: &str,
+        privkey: &RsaPrivateKey,
+        expected_fingerprint: Option<&str>,
+    ) -> Result<PartyDial> {
         use messenger_core::party::PartyClient;
 
-        self.last_error = None;
         let (host, port) = parse_host_port(address, Some(messenger_core::PORT_DEFAULT))?;
         // Bounded: an address that silently drops packets used to hold the
         // caller for the OS connect timeout (75 s or more), and both shells call
@@ -444,15 +485,35 @@ impl PartyManager {
                     &fingerprint[..16.min(fingerprint.len())]
                 );
             }
-            Some(_) => {} // verified (or pinned) and matching: proceed
+            Some(_) => Ok(PartyDial::Verified(Box::new(VerifiedParty {
+                client,
+                fingerprint,
+            }))),
             None => {
                 // First contact with this address. Hang up before the `Join`
                 // frame — it carries the credentials — and let the shell show
                 // the fingerprint for an out-of-band check.
                 let sas = client.sas().to_string();
-                return Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas });
+                Ok(PartyDial::NeedsVerification { fingerprint, sas })
             }
         }
+    }
+
+    /// The state half of [`connect_and_join`](Self::connect_and_join): take a
+    /// connection whose fingerprint [`dial`](Self::dial) has already checked,
+    /// send the `Join` (this is where the credentials go out) and register it.
+    pub fn attach(
+        &mut self,
+        address: &str,
+        username: &str,
+        password: Option<String>,
+        verified: VerifiedParty,
+    ) -> Result<PartyJoinOutcome> {
+        self.last_error = None;
+        let VerifiedParty {
+            client,
+            fingerprint,
+        } = verified;
         let (mut reader, mut writer) = client.split();
 
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<PartyRequest>();

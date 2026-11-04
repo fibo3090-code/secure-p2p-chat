@@ -368,10 +368,20 @@ On an empty `:` prompt the menu is hidden, so `↑`/`↓` recall previous comman
 Some commands open a focused, keyboard-driven panel:
 
 - **Fingerprint verification** — appears automatically on a new connection.
-  Compare the safety grid / 64-char fingerprint with your peer out of band,
-  then press `y` to accept or `n` to reject (or `:verify accept|reject`).
+  Compare the safety code with your peer out of band, then press `Ctrl+Y` to
+  accept or `Ctrl+N` to reject. Plain keys (including `Enter`) do nothing,
+  because the prompt can open while you are typing. `Esc` puts it away without
+  answering; answer later with `:verify accept|reject`.
 - **Password** — on startup, unlock an encrypted identity or set a password on
-  a new one. Reachable later via `:unlock` / `:set-password`.
+  a new one. The first-run prompt cannot be dismissed — nothing (identity or
+  history) can be saved without a password — so `Ctrl+Q` quits instead.
+  Change the password later with `:change-password <current> <new>`.
+- **Communities** (`:party`) — `←`/`→` switch community, `↑`/`↓` pick a
+  channel or a direct-message thread; its messages are shown, and
+  `:party-post` writes to it.
+
+Pasting text (bracketed paste) inserts it into the input field; a pasted
+newline is never treated as `Enter`, so a pasted `:command` line is not run.
 - **Contacts** (`:contacts`) — `↑`/`↓` to pick, `Enter` to connect.
 - **Settings** (`:settings`) — `Enter` toggles the selected option.
 - **Identity** (`:identity`), **Transfers** (`:transfers`), **Help** (`:help`),
@@ -408,7 +418,9 @@ Messaging & files
 Party servers
   :party-connect <host[:port]> <username> [password]
                                              join a Party server
-  :party-post <message>                     post to the current Party channel
+  :party                                    open the Communities pane (read threads)
+  :party-trust                              join after checking the fingerprint
+  :party-post <message>                     post to the thread selected in :party
   :party-dm <username|#> <message>          direct-message a Party member
   :party-create-channel <name>              create a Party channel
   :party-status                             show joined Party servers
@@ -417,7 +429,9 @@ Identity & security
   :identity                                 show your fingerprint + safety grid
   :verify <accept|reject>                   answer a pending fingerprint check
   :unlock [password]                        unlock a password-protected identity
-  :set-password <password>                  set or change your password
+  :set-password <password>                  set a password on an unprotected identity
+  :change-password <current> <new>          change your password
+  :history-reset                            set an unreadable history file aside
 
 Settings & app
   :settings                                 open the settings panel

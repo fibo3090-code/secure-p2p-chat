@@ -10,7 +10,8 @@ use crate::tui::app::{TuiApp, TuiCommand, TuiFocus, TuiMode};
 use anyhow::Result;
 use ratatui::prelude::*;
 use ratatui_crossterm::crossterm::{
-    event::{self, Event, KeyEventKind},
+    cursor::Show,
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -28,15 +29,64 @@ pub struct TuiLaunchConfig {
     pub port: u16,
 }
 
+/// Put the terminal back the way the shell expects it: cooked mode, main
+/// screen, bracketed paste off, cursor visible. Best effort — every step runs
+/// even if an earlier one fails, because a half-restored terminal is the
+/// failure being prevented.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
+}
+
+/// Owns the terminal's raw/alternate-screen state for the life of the TUI and
+/// restores it on drop — including the early returns. `TuiApp::new(logs)?` used
+/// to return *after* raw mode and the alternate screen were entered, so a
+/// startup error (an unreadable identity file is the realistic one) left the
+/// shell in raw mode on a blank screen with the error invisible (audit TUI-06).
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let guard = TerminalGuard;
+        // Bracketed paste makes a paste arrive as one `Event::Paste` instead of
+        // keystrokes. Without it every pasted newline was an Enter: each line
+        // was sent as a message, and a line starting with `:` ran as a command
+        // (`:send ~/.ssh/id_rsa`) — audit TUI-05.
+        //
+        // Mouse capture is intentionally NOT enabled — we handle no mouse
+        // events and capturing would block the terminal's native selection.
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// Restore the terminal before the default panic message is printed, so a
+/// panic is readable instead of being drawn into a raw alternate screen.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
+}
+
 /// Main entry point for the TUI.
 pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
-    enable_raw_mode()?;
-
-    // NOTE: mouse capture is intentionally NOT enabled — we handle no mouse
-    // events and capturing would block the terminal's native text selection/copy.
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    install_panic_hook();
+    let guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = TuiApp::new(logs)?;
@@ -45,9 +95,7 @@ pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
 
     let res = run_app(&mut terminal, app).await;
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    drop(guard);
 
     if let Err(err) = res {
         // The alternate screen is already torn down here, so stderr is the only
@@ -168,10 +216,11 @@ async fn run_app(
         if event::poll(Duration::from_millis(100))? {
             // On Windows, crossterm reports both key-press and key-release events;
             // only act on presses so each keystroke registers once.
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key_event(key);
-                }
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key_event(key),
+                // A paste is text, never keystrokes (see TerminalGuard).
+                Event::Paste(text) => app.handle_paste(&text),
+                _ => {}
             }
             if app.should_quit {
                 app.shutdown_save();

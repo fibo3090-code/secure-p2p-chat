@@ -174,7 +174,11 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
             ("↑/↓", "select chat / scroll messages / command history"),
             ("PgUp/PgDn", "scroll messages"),
             ("Ctrl+L", "copy logs to clipboard"),
-            ("y / n", "accept / reject in confirm & verify overlays"),
+            ("y / n", "confirm / cancel in confirm overlays"),
+            (
+                "Ctrl+Y / Ctrl+N",
+                "accept / reject a peer's identity (Esc = decide later)",
+            ),
             ("Esc", "close overlay / leave command mode"),
         ] {
             lines.push(Line::from(vec![
@@ -298,10 +302,18 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" y ", Style::default().bg(Color::Green).fg(Color::Black)),
+            Span::styled(
+                " Ctrl+Y ",
+                Style::default().bg(Color::Green).fg(Color::Black),
+            ),
             Span::raw(" accept   "),
-            Span::styled(" n ", Style::default().bg(Color::Red).fg(Color::White)),
-            Span::raw(" reject   (or :verify accept|reject)"),
+            Span::styled(" Ctrl+N ", Style::default().bg(Color::Red).fg(Color::White)),
+            Span::raw(" reject   "),
+            Span::styled(
+                " Esc ",
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ),
+            Span::raw(" later (:verify accept|reject)"),
         ])),
         rows[5],
     );
@@ -612,74 +624,133 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
         .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(rows[1]);
 
-    // Left: channels and members.
+    // Left: the threads — channels, then a DM with each member. ↑/↓ selects
+    // the one shown on the right (and that :party-post writes to).
+    let threads = app.party_threads();
+    let thread_sel = app.party_thread_sel.min(threads.len().saturating_sub(1));
+    let section = |label: &'static str| {
+        Line::styled(
+            label,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
     let mut left: Vec<Line> = Vec::new();
     left.push(Line::styled(
         format!("{}  ({})", conn.address, party_status_label(&conn.status)),
         Style::default().fg(Color::DarkGray),
     ));
     left.push(Line::raw(""));
-    left.push(Line::styled(
-        "CHANNELS",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ));
-    for c in &conn.channels {
-        // The kind is the access rule, so it belongs next to the name rather
-        // than being something you have to remember per channel.
-        let suffix = match c.kind {
-            messenger_core::party::ChannelKind::Public => String::new(),
-            other => format!("  ({})", other.label().to_lowercase()),
-        };
-        left.push(Line::raw(format!("  #{}{}", c.name, suffix)));
-    }
-    left.push(Line::raw(""));
-    left.push(Line::styled(
-        "MEMBERS",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ));
-    for m in &conn.members {
-        let dot = if m.online { "●" } else { "○" };
-        let me = if Some(m.id) == conn.member_id {
-            " (you)"
-        } else {
-            ""
-        };
-        let role = if m.role == messenger_core::party::Role::Member {
-            String::new()
-        } else {
-            format!("  [{}]", m.role.label().to_lowercase())
-        };
-        let style = if m.online {
+    left.push(section("CHANNELS"));
+    let mut dm_header_shown = false;
+    for (i, thread) in threads.iter().enumerate() {
+        let marker = if i == thread_sel { "▶ " } else { "  " };
+        let style = if i == thread_sel {
             Style::default()
+                .fg(BRAND_ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default()
         };
-        left.push(Line::styled(
-            format!("  {} {}{}{}", dot, m.username, me, role),
-            style,
-        ));
+        match thread {
+            crate::tui::app::PartyThread::Channel { id, name } => {
+                // The kind is the access rule, so it belongs next to the name.
+                let suffix = conn
+                    .channels
+                    .iter()
+                    .find(|c| c.id == *id)
+                    .map(|c| match c.kind {
+                        messenger_core::party::ChannelKind::Public => String::new(),
+                        other => format!("  ({})", other.label().to_lowercase()),
+                    })
+                    .unwrap_or_default();
+                left.push(Line::styled(format!("{marker}#{name}{suffix}"), style));
+            }
+            crate::tui::app::PartyThread::Dm { member, name } => {
+                if !dm_header_shown {
+                    left.push(Line::raw(""));
+                    left.push(section("DIRECT MESSAGES"));
+                    dm_header_shown = true;
+                }
+                let info = conn.members.iter().find(|m| m.id == *member);
+                let dot = if info.is_some_and(|m| m.online) {
+                    "●"
+                } else {
+                    "○"
+                };
+                let role = info
+                    .filter(|m| m.role != messenger_core::party::Role::Member)
+                    .map(|m| format!("  [{}]", m.role.label().to_lowercase()))
+                    .unwrap_or_default();
+                left.push(Line::styled(format!("{marker}{dot} {name}{role}"), style));
+            }
+        }
     }
     f.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), cols[0]);
 
-    // Right: shared files and storage.
+    // Right: the selected thread's messages, newest at the bottom, then a
+    // short files/quota summary.
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(7)])
+        .split(cols[1]);
+    let name_of = |id: uuid::Uuid| {
+        if Some(id) == conn.member_id {
+            "you".to_string()
+        } else {
+            conn.members
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.username.clone())
+                .unwrap_or_else(|| "?".to_string())
+        }
+    };
+    let messages = app.selected_party_messages();
+    let capacity = right_rows[0].height as usize;
+    let mut msg_lines: Vec<Line> = Vec::new();
+    if messages.is_empty() {
+        msg_lines.push(Line::styled(
+            "  no messages yet — :party-post <text> writes here",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    for env in messages
+        .iter()
+        .skip(messages.len().saturating_sub(capacity))
+    {
+        let body = match &env.payload {
+            messenger_core::party::MessagePayload::Text(t) => t.replace('\n', " ⏎ "),
+            messenger_core::party::MessagePayload::File(meta) => format!(
+                "📎 {} ({}) — :party-download {}",
+                meta.name,
+                crate::util::format_size(meta.size),
+                meta.name
+            ),
+        };
+        let pending = if env.seq == 0 { " (sending…)" } else { "" };
+        msg_lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", name_of(env.sender)),
+                Style::default().fg(BRAND_ACCENT),
+            ),
+            Span::raw(format!("{body}{pending}")),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(msg_lines).wrap(Wrap { trim: false }),
+        right_rows[0],
+    );
+
     let mut right: Vec<Line> = Vec::new();
-    right.push(Line::styled(
-        "SHARED FILES",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ));
+    right.push(section("SHARED FILES"));
     if conn.files.is_empty() {
         right.push(Line::styled(
             "  none visible — :party-files refreshes this",
             Style::default().fg(Color::DarkGray),
         ));
     } else {
-        for file in conn.files.iter().take(14) {
+        for file in conn.files.iter().take(3) {
             right.push(Line::raw(format!(
                 "  {:<24} {:>9}  {} · {}",
                 truncate(&file.name, 24),
@@ -688,15 +759,14 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
                 file.location_name
             )));
         }
-        if conn.files.len() > 14 {
+        if conn.files.len() > 3 {
             right.push(Line::styled(
-                format!("  … and {} more", conn.files.len() - 14),
+                format!("  … and {} more", conn.files.len() - 3),
                 Style::default().fg(Color::DarkGray),
             ));
         }
     }
     if let Some(q) = conn.quota {
-        right.push(Line::raw(""));
         let used = crate::util::format_size(q.used);
         let line = match q.limit {
             Some(limit) => format!(
@@ -716,17 +786,19 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
         right.push(Line::styled(line, Style::default().fg(Color::DarkGray)));
     }
     if let Some(err) = &conn.last_error {
-        right.push(Line::raw(""));
         right.push(Line::styled(
             format!("  {}", err),
             Style::default().fg(Color::Red),
         ));
     }
-    f.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), cols[1]);
+    f.render_widget(
+        Paragraph::new(right).wrap(Wrap { trim: false }),
+        right_rows[1],
+    );
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            "←/→ switch community · :party-files refresh · :party-role · :party-channel-access · Esc close",
+            "←/→ community · ↑/↓ thread · :party-post writes here · :party-files · Esc close",
             Style::default().fg(Color::DarkGray),
         )),
         rows[2],
