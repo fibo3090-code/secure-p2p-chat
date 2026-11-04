@@ -549,16 +549,22 @@ where
 }
 
 impl TunnelKeys {
-    fn established(self, peer: &IdentityProof, scheme: SignatureScheme) -> EstablishedTunnel {
-        let peer_fingerprint = fingerprint_pubkey(peer.public_key_pem.as_bytes());
+    fn established(
+        self,
+        peer: &IdentityProof,
+        scheme: SignatureScheme,
+    ) -> Result<EstablishedTunnel> {
+        // Parsed by the same strict decoder `verify_identity_proof` used, so
+        // the fingerprint names exactly the key the signature was checked with.
+        let peer_fingerprint = fingerprint_pubkey(peer.public_key_pem.as_bytes())?;
         tracing::debug!("Verified peer identity: {}...", &peer_fingerprint[..8]);
-        EstablishedTunnel {
+        Ok(EstablishedTunnel {
             peer_fingerprint,
             peer_chat_id: peer.chat_id,
             cipher: self.cipher,
             transport_aad: self.transport_aad,
             signature_scheme: scheme,
-        }
+        })
     }
 }
 
@@ -612,7 +618,7 @@ where
     )
     .await?;
     let client_proof = recv_identity_proof(stream, &keys, &client_ephemeral, scheme, US).await?;
-    Ok(keys.established(&client_proof, scheme))
+    keys.established(&client_proof, scheme)
 }
 
 /// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
@@ -660,7 +666,7 @@ where
         scheme,
     )
     .await?;
-    Ok(keys.established(&host_proof, scheme))
+    keys.established(&host_proof, scheme)
 }
 
 /// Constant-time comparison so a wrong connection password cannot be recovered
@@ -1859,8 +1865,8 @@ mod tests {
 
         assert_eq!(host.signature_scheme, SignatureScheme::Ed25519);
         assert_eq!(client.signature_scheme, SignatureScheme::Ed25519);
-        assert_eq!(client.peer_fingerprint, expected_host_fp);
-        assert_eq!(host.peer_fingerprint, expected_client_fp);
+        assert_eq!(client.peer_fingerprint, expected_host_fp.unwrap());
+        assert_eq!(host.peer_fingerprint, expected_client_fp.unwrap());
     }
 
     /// An Ed25519 proof is only worth anything with its binding: without one,
@@ -2207,5 +2213,34 @@ mod tests {
         // - Both sides independently track rekey schedule
         //
         // NOTE: Transport-layer replay protection is now implemented in Issue #6 Phase 2
+    }
+
+    /// A proof whose PEM carries the victim's key in a preamble and the
+    /// attacker's in the block, signed by the attacker, used to verify under
+    /// the attacker's key while fingerprinting as the victim — silent
+    /// impersonation of any peer whose public key is known. It must not verify.
+    #[test]
+    fn an_identity_proof_with_a_smuggled_second_key_is_rejected() {
+        let victim = RsaPublicKey::from(&crate::core::generate_rsa_keypair(2048).unwrap());
+        let attacker_priv = crate::core::generate_rsa_keypair(2048).unwrap();
+        let crafted = format!(
+            "x{}\n{}",
+            pem_encode_public(&victim).unwrap().trim_end(),
+            pem_encode_public(&RsaPublicKey::from(&attacker_priv)).unwrap()
+        );
+        let ephemeral = [7u8; 32];
+        for scheme in [SignatureScheme::RsaPss, SignatureScheme::Ed25519] {
+            let proof = IdentityProof {
+                public_key_pem: crafted.clone(),
+                signature: build_identity_signature(scheme, &attacker_priv, &ephemeral).unwrap(),
+                version: PROTOCOL_VERSION as u32,
+                chat_id: uuid::Uuid::nil(),
+                signature_scheme: scheme,
+            };
+            assert!(
+                verify_identity_proof(&proof, &ephemeral).is_err(),
+                "{scheme} proof with two keys must not verify"
+            );
+        }
     }
 }

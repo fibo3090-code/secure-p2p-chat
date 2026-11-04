@@ -8,6 +8,14 @@ This document consolidates the repository’s audit-oriented notes so that stale
 - keep a record of important quality/security reviews
 - avoid leaving stale standalone reports that contradict current code
 
+## Latest full audit (November 2026)
+
+A whole-codebase audit at v1.16.2 (`main` 62b952f): thirteen area reports,
+348 findings, a deduplicated priority list and a phased roadmap. **Start at
+[audit/2026-11/README.md](audit/2026-11/README.md).** Findings fixed since are
+marked there; keep that page current as items land rather than writing a new
+summary here.
+
 ## Consolidated Historical Notes
 
 ### Earlier repository state

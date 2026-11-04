@@ -22,7 +22,7 @@ This is the canonical index for project documentation.
 ## Planning and History
 
 - Release history: [../CHANGELOG.md](../CHANGELOG.md)
-- Audit history: [AUDITS.md](AUDITS.md)
+- Audit history: [AUDITS.md](AUDITS.md) — latest full audit and roadmap: [audit/2026-11/README.md](audit/2026-11/README.md)
 
 ## What Each Document Owns
 

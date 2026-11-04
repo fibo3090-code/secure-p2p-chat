@@ -6,8 +6,17 @@ use tempfile::tempdir;
 /// do not matter — what matters is that the fingerprint in the link is derived
 /// from *this* key, because `parse_invite_link` now rejects an invite whose
 /// fingerprint does not belong to the key it carries.
+/// A real RSA-2048 public key. It has to be one: an invite's key is parsed
+/// and fingerprinted from the parsed key, so a truncated placeholder is (rightly)
+/// refused rather than fingerprinted as raw text.
 const TEST_PUBKEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkq...
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiCkJE4AgjmiHxvGso7R/
+Duw96YbDo3cRz1E7ShJzCSw7YnJapuV1yqxQN+hfPYoLrjoEDwa5DYPE8qVabfl4
+cwvKyECzoGM0duq8lxRD6/0CLAIlV7QUZla2Zu0Y6eJQ2KDf8fT/CLlZQxAJ8Rua
+XYDnjQTPhMIUfbZZFYSEBC/xhgvBP2wDVW/+E+5DUIy0VKvu1fEq+OEPrL3V6qcZ
+RlkO7OmIbfSlnx4kC4dGyqX360N7vf8GGycd1ADTWKzs0IAkNr3FOmEKTnSuABL+
+RM/QkXnZvmWWRYA5jlFgruDCfhnpq58Fn1IymsosFvHWWCBrADhR6YQEY6D3tP07
+pQIDAQAB
 -----END PUBLIC KEY-----";
 
 /// A minimal contact, as an invite import would produce one.
@@ -34,7 +43,7 @@ fn v1_invite_link(name: &str, address: &str) -> String {
     let payload = serde_json::json!({
         "name": name,
         "address": address,
-        "fingerprint": crate::core::crypto::fingerprint_pubkey(TEST_PUBKEY_PEM.as_bytes()),
+        "fingerprint": crate::core::crypto::fingerprint_pubkey(TEST_PUBKEY_PEM.as_bytes()).unwrap(),
         "public_key": TEST_PUBKEY_PEM,
     });
     let json = serde_json::to_string(&payload).unwrap();
@@ -857,9 +866,7 @@ fn parse_v1_invite_link_still_works_with_warning() {
     assert_eq!(contact.address, Some("192.168.1.50:8001".to_string()));
     assert_eq!(
         contact.fingerprint,
-        Some(crate::core::crypto::fingerprint_pubkey(
-            TEST_PUBKEY_PEM.as_bytes()
-        ))
+        Some(crate::core::crypto::fingerprint_pubkey(TEST_PUBKEY_PEM.as_bytes()).unwrap())
     );
     // …and it is *not* signed, which is what the UI warns about.
     assert!(!ChatManager::invite_link_is_signed(&link));

@@ -58,6 +58,7 @@ mod tests {
                 .unwrap()
                 .as_bytes(),
         )
+        .unwrap()
     }
 
     #[test]
