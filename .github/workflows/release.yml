@@ -244,16 +244,21 @@ jobs:
       # `--locked`: without it a semver-compatible dependency published between
       # the tagged commit and this build ships inside a fully attested
       # installer, and the attestation says nothing about the difference.
+      #
+      # Build only. No `tagName`/`releaseName`/`releaseId` and no
+      # `GITHUB_TOKEN`: given a tag, tauri-action looks up or creates the
+      # GitHub release and uploads the bundles to it itself. Under this job's
+      # read-only token that fails (a draft is invisible to a non-writer, and
+      # creating or uploading needs `contents: write`); with a write token it
+      # would publish un-attested bytes behind `attest`'s back. Without those
+      # inputs the action skips every release call and just reports
+      # `artifactPaths`, which the next step stages for `attest`.
       - name: Build desktop installers
         id: tauri
         # tauri-apps/tauri-action v0.6.2
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: 'P2PEM ${{ github.ref_name }}'
           args: ${{ matrix.args }} --locked
 
       # tauri-action reports what it built as a JSON array of paths. Copying

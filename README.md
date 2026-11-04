@@ -83,11 +83,13 @@ cd desktop && npm ci && npx tauri build
 # Terminal client / relay
 cargo build --release -p p2pem-classic
 
-# Community server
+# Community server (builds target/release/server; shipped as p2pem-server)
 cargo build --release -p messenger-server
 
-# Everything, with tests
-cargo test --workspace && (cd desktop && npm test)
+# Everything, with tests: see CONTRIBUTING.md § Local Workflow for the
+# full CI-equivalent command
+cargo nextest run --workspace --profile ci && cargo test --workspace --doc \
+  && (cd desktop && npm run lint && npm test)
 ```
 
 The terminal UI is fully featured and keyboard-driven: press `:` for an

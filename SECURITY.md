@@ -190,7 +190,7 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
 
 The app uses TOFU (trust on first use).
 
-Users are responsible for verifying fingerprints on first contact using a separate trusted channel. Without that step, first-contact MITM remains possible.
+Users are responsible for verifying each new contact on first contact over a separate trusted channel: both sides read aloud the six-digit + three-emoji Short Authentication String the app shows, and accept only if it matches (the full fingerprint and safety grid remain available as an advanced, equivalent check). Without that step, first-contact MITM remains possible.
 
 ## What This App Does Not Claim
 

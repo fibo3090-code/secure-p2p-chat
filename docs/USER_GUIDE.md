@@ -40,8 +40,12 @@ cd desktop && npm ci && npx tauri build
 cargo build --release -p p2pem-classic     # target/release/p2pem-classic[.exe]
 
 # The community server
-cargo build --release -p messenger-server  # target/release/messenger-server[.exe]
+cargo build --release -p messenger-server  # target/release/server[.exe]
 ```
+
+The crate is called `messenger-server` but the binary it builds is `server`
+(`server.exe` on Windows). The P2PEM Tools archive ships the same program
+renamed to `p2pem-server`, so the two are interchangeable.
 
 ### Linux build prerequisites
 
@@ -129,7 +133,8 @@ Use this when both devices can reach each other directly.
 
 1. Host starts listening on a port.
 2. Connector enters the host address and port.
-3. Both sides verify fingerprints.
+3. Both sides compare the short code (six digits and three emoji) over a call
+   and accept only if it matches — see [Verify a new contact](#verify-a-new-contact).
 4. Chat normally.
 
 Desktop app:
@@ -262,21 +267,39 @@ Operator notes:
 - members are remembered by identity fingerprint, so someone who reconnects
   keeps their username and history
 
-### Verify fingerprints
+### Verify a new contact
 
-The app uses TOFU. First contact is only meaningful if you verify the fingerprint out of band.
+The app uses TOFU (trust on first use): the first connection to someone is only
+protected once you have checked, out of band, that nobody is sitting in the
+middle. The app makes that one short step.
 
-Good verification channels:
+When you connect to someone new, both screens show the same **short code: six
+digits and three emoji**. It is derived from this connection's handshake, so an
+attacker relaying between you would produce two *different* codes.
 
-- phone call
-- video call
-- in person
+1. Call the other person (phone, video, or in person — not a chat message over
+   the connection you are checking).
+2. Read the digits and the emoji aloud to each other.
+3. If they match exactly, accept: **Codes match — trust** in the desktop app,
+   `Ctrl+Y` in the terminal client.
+4. If they differ, **Reject** (`Ctrl+N` in the terminal client). Someone may
+   be intercepting the connection. Reconnect and compare again, ideally over a
+   different network, and do not accept until the codes match.
 
-If the fingerprint changes unexpectedly:
+Once accepted, the contact is remembered by its fingerprint and later
+connections do not ask again.
+
+**Advanced: the full fingerprint.** Under the code, the desktop app has a
+"Full fingerprint (advanced)" section with the 64-character fingerprint and a
+colour safety grid; the terminal client shows the grid in the same prompt, and
+`:identity` shows your own. Comparing those is an equivalent, slower check of
+the same thing; the short code is enough on its own.
+
+If a known contact's fingerprint changes unexpectedly:
 
 - stop
 - do not click through casually
-- verify again before trusting the peer
+- verify again, with the short code over a call, before trusting the peer
 
 ### Send messages
 
@@ -368,8 +391,9 @@ On an empty `:` prompt the menu is hidden, so `↑`/`↓` recall previous comman
 Some commands open a focused, keyboard-driven panel:
 
 - **Fingerprint verification** — appears automatically on a new connection.
-  Compare the safety code with your peer out of band, then press `Ctrl+Y` to
-  accept or `Ctrl+N` to reject. Plain keys (including `Enter`) do nothing,
+  Read the six-digit + emoji code aloud with your peer (the safety grid below
+  it is the advanced check), then press `Ctrl+Y` to accept or `Ctrl+N` to
+  reject. Plain keys (including `Enter`) do nothing,
   because the prompt can open while you are typing. `Esc` puts it away without
   answering; answer later with `:verify accept|reject`.
 - **Password** — on startup, unlock an encrypted identity or set a password on
@@ -507,7 +531,8 @@ The app also supports panic/crash logging to help support and debugging.
 
 - treat it as a real security event
 - do not accept it automatically
-- verify the new fingerprint through a trusted external channel
+- verify again through a trusted external channel: compare the short code
+  (six digits and three emoji) over a call, as for a new contact
 
 ### History does not load
 
