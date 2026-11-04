@@ -1022,9 +1022,13 @@ mod tests {
         )
         .await;
 
-        // The first to join owns the server, so the owner can make a private
+        // The owner (who joins with the claim token) can make a private
         // channel; the other two are ordinary members.
-        let _owner_id = join_as(&mut owner, "owner").await;
+        let token = state.lock().await.owner_claim_token().unwrap().to_string();
+        match owner.join("owner", Some(token)).await.unwrap() {
+            PartyResponse::Joined { .. } => {}
+            other => panic!("expected Joined, got {other:?}"),
+        }
         let bob_id = join_as(&mut bob, "bob").await;
         let _carol_id = join_as(&mut carol, "carol").await;
 

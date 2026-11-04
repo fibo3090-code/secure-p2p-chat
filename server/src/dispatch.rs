@@ -675,6 +675,15 @@ mod tests {
         }
     }
 
+    /// Join as the Owner, presenting the owner claim token as the password.
+    fn joined_owner_id(state: &mut PartyState, conn: &mut ConnState, name: &str) -> Uuid {
+        let token = state.owner_claim_token().expect("no owner yet").to_string();
+        match &join(state, conn, name, Some(&token))[..] {
+            [PartyResponse::Joined { member_id, .. }] => *member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        }
+    }
+
     fn join(
         state: &mut PartyState,
         conn: &mut ConnState,
@@ -823,7 +832,7 @@ mod tests {
     fn a_private_channel_is_delivered_only_to_its_members() {
         let mut state = PartyState::new("Srv", None);
         let mut owner_conn = ConnState::default();
-        let owner = joined_id(&mut state, &mut owner_conn, "owner");
+        let owner = joined_owner_id(&mut state, &mut owner_conn, "owner");
         let mut bob_conn = ConnState::default();
         let bob = joined_id(&mut state, &mut bob_conn, "bob");
         let mut carol_conn = ConnState::default();

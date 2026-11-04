@@ -222,6 +222,11 @@ fn password_matches(expected: Option<&str>, supplied: Option<&str>) -> bool {
     }
 }
 
+/// A fresh one-time owner claim token: 122 random bits as 32 hex characters.
+fn new_owner_claim_token() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
 /// Reject a message whose text payload exceeds [`MAX_MESSAGE_TEXT_BYTES`], so a
 /// member cannot store or broadcast an oversized message. Applies to both channel
 /// posts and DMs.
@@ -245,8 +250,9 @@ struct Member {
     fingerprint: Option<String>,
     /// Presence is runtime-only and not persisted; members start offline on load.
     online: bool,
-    /// Authority on this server. The first member to join becomes [`Role::Owner`]
-    /// — that is the operator, who starts the server and then joins it.
+    /// Authority on this server. Only the operator becomes [`Role::Owner`]:
+    /// by joining with the owner claim token, or from the configured owner
+    /// fingerprint (see [`PartyState::owner_claim_token`]).
     role: Role,
 }
 
@@ -394,6 +400,11 @@ pub struct PartyState {
     /// How many of each thread's newest envelopes stay in memory when there is
     /// a database to page older ones from (see [`History`]).
     resident_history: usize,
+    /// The fingerprint of the identity that owns this community, when the
+    /// operator configured one (see [`Self::set_owner_fingerprint`]).
+    owner_fingerprint: Option<String>,
+    /// The pending one-time owner claim (see [`Self::owner_claim_token`]).
+    owner_claim: Option<String>,
     /// When present, mutations are mirrored to this database.
     db: Option<Connection>,
     /// When present, blob bytes are mirrored to files under this directory.
@@ -435,6 +446,9 @@ impl PartyState {
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             max_members: MAX_MEMBERS,
             resident_history: RESIDENT_HISTORY,
+            owner_fingerprint: None,
+            // A fresh server has no members, so no Owner: it needs a claim.
+            owner_claim: Some(new_owner_claim_token()),
             db: None,
             blob_dir: None,
             channel_creations: HashMap::new(),
@@ -541,10 +555,11 @@ impl PartyState {
         if state.count_channels()? > 0 {
             // The database is authoritative; rebuild the in-memory model from it.
             state.reload_from_db()?;
-            // A community that predates roles reloads with nobody able to
-            // administer it; give it an owner rather than leaving governance
-            // permanently unreachable.
-            state.ensure_owner();
+            // A community with an Owner needs no claim; one without (fresh,
+            // or one that predates roles) keeps the token `new` issued. The
+            // old behaviour here — promoting the member with the lowest id —
+            // handed a random member a seat that cannot be taken back.
+            state.refresh_owner_claim();
         } else {
             // Fresh database: persist the seeded default `general` channel.
             let general = &state.channels[0];
@@ -577,6 +592,12 @@ impl PartyState {
     /// returning identity (matched by its handshake-verified fingerprint) or
     /// registers a new member with a unique, non-empty username. Returns the
     /// member id, marked online.
+    ///
+    /// Nobody becomes the Owner merely by being first. Ownership is granted
+    /// only to a join that proves it is the operator: one presenting the
+    /// one-time owner claim token in place of the password (see
+    /// [`Self::owner_claim_token`]), or one from the identity the operator
+    /// configured with [`Self::set_owner_fingerprint`].
     pub fn join(
         &mut self,
         username: &str,
@@ -593,7 +614,10 @@ impl PartyState {
         if messenger_core::util::has_hidden_characters(username) {
             return Err(JoinError::HiddenCharacters);
         }
-        if !password_matches(self.password.as_deref(), password) {
+        // The claim token stands in for the password: it is a stronger secret
+        // than any password, and the operator needs no separate field for it.
+        let claims_ownership = self.presents_owner_claim(password);
+        if !claims_ownership && !password_matches(self.password.as_deref(), password) {
             return Err(JoinError::WrongPassword);
         }
 
@@ -601,89 +625,175 @@ impl PartyState {
         // offline), so a reconnecting peer is recognised by its verified fingerprint
         // and reuses its existing membership — keeping its id and history — instead
         // of being locked out by its own offline entry as "username taken".
-        if let Some(fp) = fingerprint.as_deref() {
-            if let Some(existing) = self
-                .members
-                .values_mut()
+        let returning = fingerprint.as_deref().and_then(|fp| {
+            self.members
+                .values()
                 .find(|m| m.fingerprint.as_deref() == Some(fp))
-            {
-                existing.online = true;
-                return Ok(existing.id);
+                .map(|m| m.id)
+        });
+        let id = match returning {
+            Some(id) => {
+                if let Some(m) = self.members.get_mut(&id) {
+                    m.online = true;
+                }
+                id
             }
-        }
+            None => {
+                // A returning member above is always let back in; only a new
+                // one is refused at the ceiling.
+                if self.members.len() >= self.max_members {
+                    return Err(JoinError::ServerFull);
+                }
+                // New identity: the username must be free (case-insensitive).
+                if self
+                    .members
+                    .values()
+                    .any(|m| m.username.eq_ignore_ascii_case(username))
+                {
+                    return Err(JoinError::UsernameTaken);
+                }
+                let id = Uuid::new_v4();
+                let member = Member {
+                    id,
+                    username: username.to_string(),
+                    fingerprint,
+                    online: true,
+                    role: Role::Member,
+                };
+                self.persist_member(&member);
+                self.members.insert(id, member);
+                id
+            }
+        };
 
-        // A returning member above is always let back in; only a new one is
-        // refused at the ceiling.
-        if self.members.len() >= self.max_members {
-            return Err(JoinError::ServerFull);
-        }
-
-        // New identity: the username must be free (case-insensitive).
-        if self
-            .members
-            .values()
-            .any(|m| m.username.eq_ignore_ascii_case(username))
-        {
-            return Err(JoinError::UsernameTaken);
-        }
-
-        let id = Uuid::new_v4();
-        // The first identity through the door is the operator: they started the
-        // server, so they are the one who owns it. Everyone after is a member.
-        // Without this bootstrap nobody could ever administer anything, because
-        // only an admin can promote an admin.
-        let role = if self.members.is_empty() {
-            Role::Owner
+        if claims_ownership {
+            self.with_tx(|s| {
+                s.make_owner(
+                    id,
+                    "role.claim",
+                    "claimed ownership with the owner claim token",
+                )
+            });
         } else {
-            Role::Member
-        };
-        let member = Member {
-            id,
-            username: username.to_string(),
-            fingerprint,
-            online: true,
-            role,
-        };
-        self.persist_member(&member);
-        self.members.insert(id, member);
+            self.with_tx(|s| s.apply_configured_owner());
+        }
         Ok(id)
     }
 
-    /// Make sure a populated server has somebody who can administer it.
-    ///
-    /// `join` only appoints an owner when the member table is empty, which is
-    /// right for a fresh server and wrong for every existing one: a community
-    /// that predates roles reloads with every member defaulted to `Member`, and
-    /// since `set_role` requires an admin, nobody could ever be promoted. The
-    /// operator would be locked out of governance on their own server,
-    /// permanently, with no way back short of editing the database by hand.
-    ///
-    /// The choice has to be deterministic across restarts, and registration
-    /// order is not recorded, so the lowest member id wins. It is recorded in
-    /// the audit log, because silently handing someone ownership is exactly the
-    /// sort of thing an operator should be able to see happened.
-    fn ensure_owner(&mut self) {
-        if self.members.is_empty() || self.members.values().any(|m| m.role.is_admin()) {
-            return;
+    /// Whether `password` is the pending owner claim token. Constant-time, for
+    /// the same reason the password compare is.
+    fn presents_owner_claim(&self, password: Option<&str>) -> bool {
+        use subtle::ConstantTimeEq;
+        match (self.owner_claim.as_deref(), password.map(str::trim)) {
+            (Some(token), Some(supplied)) => {
+                token.len() == supplied.len()
+                    && bool::from(token.as_bytes().ct_eq(supplied.as_bytes()))
+            }
+            _ => false,
         }
-        let Some(&chosen) = self.members.keys().min() else {
+    }
+
+    /// Whether this community has an Owner.
+    pub fn has_owner(&self) -> bool {
+        self.members.values().any(|m| m.role == Role::Owner)
+    }
+
+    /// The one-time token that makes whoever joins with it the Owner, while
+    /// this community has no Owner and no configured owner fingerprint.
+    ///
+    /// The first identity to join used to become the permanent, undemotable
+    /// Owner, on servers that by default had no password and listened on every
+    /// interface — so whoever reached the address before the operator did (a
+    /// scanner, anyone the address leaked to) owned the community: appointed
+    /// its admins, read its private channels and audit log, and could not be
+    /// removed short of editing `party.db` by hand. The operator prints this
+    /// token at startup and enters it in the password field on their first
+    /// join. It is never persisted: a restart before it is used issues a new
+    /// one, and it disappears the moment an Owner exists.
+    pub fn owner_claim_token(&self) -> Option<&str> {
+        self.owner_claim.as_deref()
+    }
+
+    /// Name the identity that owns this community, by its fingerprint (the one
+    /// the operator's app shows as theirs). `None` clears it.
+    ///
+    /// That member becomes the Owner when they join — or now, if they already
+    /// have — and any other Owner is moved to Admin. This is the operator's
+    /// recovery path for a community whose ownership went to the wrong
+    /// identity (a squatter on an older server, or a lost key): the server's
+    /// configuration outranks any member, because whoever controls it already
+    /// controls the data.
+    pub fn set_owner_fingerprint(&mut self, fingerprint: Option<String>) {
+        self.owner_fingerprint = fingerprint
+            .map(|fp| messenger_core::util::canonical_fingerprint(&fp))
+            .filter(|fp| !fp.is_empty());
+        self.with_tx(|s| s.apply_configured_owner());
+        self.refresh_owner_claim();
+    }
+
+    /// Promote the configured owner if they are a member and not yet Owner.
+    fn apply_configured_owner(&mut self) {
+        let Some(fp) = self.owner_fingerprint.clone() else {
             return;
         };
-        let name = {
-            let m = self.members.get_mut(&chosen).expect("just selected");
-            m.role = Role::Owner;
-            m.username.clone()
+        let Some(id) = self
+            .members
+            .values()
+            .find(|m| m.fingerprint.as_deref() == Some(fp.as_str()))
+            .map(|m| m.id)
+        else {
+            return;
         };
-        if let Some(m) = self.members.get(&chosen) {
+        if self.role_of(id) != Role::Owner {
+            self.make_owner(
+                id,
+                "role.configured",
+                "is the owner configured by the operator",
+            );
+        }
+    }
+
+    /// Make `id` the Owner, moving any other Owner to Admin (a server has
+    /// exactly one), and record it.
+    fn make_owner(&mut self, id: Uuid, action: &str, why: &str) {
+        let previous: Vec<Uuid> = self
+            .members
+            .values()
+            .filter(|m| m.role == Role::Owner && m.id != id)
+            .map(|m| m.id)
+            .collect();
+        for other in previous {
+            if let Some(m) = self.members.get_mut(&other) {
+                m.role = Role::Admin;
+            }
+            if let Some(m) = self.members.get(&other) {
+                self.persist_member(m);
+            }
+            let detail = format!("{} is now Admin (ownership moved)", self.username_of(other));
+            self.record_audit(id, "role.owner_moved", &detail);
+        }
+        let Some(m) = self.members.get_mut(&id) else {
+            return;
+        };
+        m.role = Role::Owner;
+        let name = m.username.clone();
+        if let Some(m) = self.members.get(&id) {
             self.persist_member(m);
         }
-        tracing::info!(
-            member = %chosen,
-            username = %name,
-            "this community had no admin (it predates roles); promoting its first member to owner"
-        );
-        let detail = format!("{name} became Owner (no administrator existed)");
-        self.record_audit(chosen, "role.bootstrap", &detail);
+        tracing::info!(member = %id, username = %name, "{name} {why}");
+        self.record_audit(id, action, &format!("{name} {why}"));
+        self.refresh_owner_claim();
+    }
+
+    /// Issue a claim token when the community needs one (no Owner, no
+    /// configured owner), and drop it when it does not.
+    fn refresh_owner_claim(&mut self) {
+        let needed = !self.has_owner() && self.owner_fingerprint.is_none();
+        match (needed, self.owner_claim.is_some()) {
+            (true, false) => self.owner_claim = Some(new_owner_claim_token()),
+            (false, true) => self.owner_claim = None,
+            _ => {}
+        }
     }
 
     /// A member's role, or [`Role::Guest`] for an unknown id (fail closed).

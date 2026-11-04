@@ -159,9 +159,10 @@ pub struct Envelope {
 /// Role::Admin` reads as "at least an admin". Every check in the server is
 /// written that way.
 ///
-/// The server has exactly one [`Role::Owner`]: the first identity to join, which
-/// is the operator (they start the server, then join it). The owner cannot be
-/// demoted — otherwise an admin could strip the operator of their own server —
+/// The server has exactly one [`Role::Owner`]: the operator, who claims it by
+/// joining with the one-time owner claim token the server prints (or whose
+/// fingerprint the server was started with). Being first to join grants
+/// nothing. The owner cannot be demoted — otherwise an admin could strip the operator of their own server —
 /// and a second owner is never created.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Hash,

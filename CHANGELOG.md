@@ -13,6 +13,18 @@ predate tagged releases.
 
 ### Security
 
+- **Whoever joined a new community first became its permanent owner** — and
+  servers were open by default, listening on every interface. Anyone who
+  reached the address before the operator (a scanner, anyone the address
+  leaked to) owned the community: appointed its admins, read its private
+  channels and audit log, and could not be removed without editing the
+  database. Being first now grants nothing. Until a community has an owner the
+  server prints a one-time owner claim token; the operator joins with it in the
+  password field. Alternatively `--owner <fingerprint>` names the owner
+  outright, and also moves ownership back from whoever holds it. A community
+  that predates roles is no longer handed to a random member either. The
+  server now refuses to start without a password unless `--open` is passed
+  explicitly.
 - **One community member could make a community permanently unjoinable.**
   History pages were capped at 200 messages but not by size, so about 130
   long posts made every page that covered them too large to send — and a
