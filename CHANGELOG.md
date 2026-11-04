@@ -33,6 +33,15 @@ predate tagged releases.
   member now has a budget for writes and for message text (generous for a
   person, tight for a script); a message over it is refused and taken back
   off the sender's screen with a "sending too fast" notice.
+- **Anyone who could reach a community server could exhaust it without
+  joining.** Connections had no time limits and there was no cap on how many
+  could be open: a socket that finished the handshake and never joined was
+  held forever, so one address within the reconnect limit could use up the
+  server's file descriptors in under an hour, after which nobody could join.
+  Unjoined connections are now closed after 30 seconds, the handshake and
+  every write have deadlines, idle-but-dead connections are detected with TCP
+  keepalive, and the server caps connections overall (512) and per address
+  (32).
 
 - **A peer could impersonate any contact whose public key it knew.** A
   public key was fingerprinted from the first key block found in its text,
@@ -118,6 +127,12 @@ predate tagged releases.
 
 ### Fixed
 
+- **A slow community member's app could silently stop receiving messages.**
+  When a member fell 256 updates behind, the server stopped sending them
+  broadcasts, DMs and directory changes, but left the connection open and
+  kept answering their requests — so the app looked connected while nothing
+  new ever arrived, and they could be shown offline while still there. The
+  server now closes such a connection, so the app reconnects and catches up.
 - **TUI: a peer could be trusted by accident.** The fingerprint prompt opens on
   its own, under whatever you are typing, and `y` or `Enter` accepted it. It
   now takes `Ctrl+Y` / `Ctrl+N`; `Esc` puts it away without answering.
