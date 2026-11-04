@@ -30,6 +30,16 @@ Party server input caps (`server/src/state/mod.rs`), enforced server-side:
 MAX_USERNAME_CHARS: 32
 MAX_CHANNEL_NAME_CHARS: 64
 MAX_MESSAGE_TEXT_BYTES: 64 KiB   // channel and DM text
+MAX_CONCURRENT_UPLOADS: 4        // chunked uploads in flight per member
+```
+
+Party file constants (`core/src/party/mod.rs`):
+
+```rust
+MAX_INLINE_FILE_BYTES: 4 MiB     // PostFile / SendFileDm / DownloadFile
+PARTY_CHUNK_BYTES: 256 KiB       // UploadChunk / FileChunk payload
+MAX_PARTY_FILE_BYTES: 100 MiB    // any one file, inline or chunked
+MAX_HISTORY_BATCH: 200           // envelopes per History page
 ```
 
 ## Cryptographic Summary
@@ -413,23 +423,70 @@ server's `Message` broadcast — and both ends would accept it as new.
   `ListChannels` is filtered per member, so a private channel does not reveal its
   existence to a non-member.
 - **Files** are access-checked at the *download* endpoint against the `file_refs`
-  table: a member may fetch a blob only if some surviving reference to it sits in
-  a channel they may read or a DM thread they are in. Unknown and forbidden give
-  the same answer, so the endpoint never reveals a file's existence.
+  table: a member may fetch a blob only if at least one surviving reference to it
+  grants them `download` under the [per-file permission](#per-file-permissions)
+  rules. Unknown and forbidden give the same answer (`UNKNOWN_FILE_ERROR`), so
+  the endpoint never reveals a file's existence.
 
 ### Requests
 
-`Join`, `ListMembers`, `ListChannels`, `PostMessage`, `FetchHistory`, `SendDm`,
-`FetchDmHistory`, `CreateChannel`, `PostFile`, `SendFileDm`, `DownloadFile`,
-then the appended governance set: `CreateChannelOfKind`, `DeleteChannel`,
-`SetChannelAccess`, `SetRole`, `ListFiles`, `DeleteFile`, `FetchAuditLog`,
-`FetchQuota`.
+Every `PartyRequest` variant, in wire order (the number is the bincode variant
+index):
+
+| # | Variant | Purpose |
+|---|---------|---------|
+| 0 | `Join { username, password }` | Join with a username and the optional server password. Must come first; one per connection. |
+| 1 | `ListMembers` | Member directory (`Members`). |
+| 2 | `ListChannels` | Channel list, filtered for the caller (`Channels`). |
+| 3 | `PostMessage { channel, text }` | Post text to a channel. |
+| 4 | `FetchHistory { channel, since_seq }` | Channel history after `since_seq` (paged). |
+| 5 | `SendDm { to, text }` | Direct message to a member. |
+| 6 | `FetchDmHistory { with, since_seq }` | DM history with a member (paged). |
+| 7 | `CreateChannel { name }` | Create a public channel. |
+| 8 | `PostFile { channel, name, mime, data }` | Inline upload (≤ `MAX_INLINE_FILE_BYTES`) posted to a channel. |
+| 9 | `SendFileDm { to, name, mime, data }` | Inline upload sent as a DM. |
+| 10 | `DownloadFile { hash }` | Whole-blob download (`FileData`). Clients use it for inline-sized files. |
+| 11 | `CreateChannelOfKind { name, kind, members }` | Create a channel of a given `ChannelKind`; `members` seeds a private one. |
+| 12 | `DeleteChannel { channel }` | Delete a channel and its history (admins). |
+| 13 | `SetChannelAccess { channel, kind, members }` | Change a channel's kind or private membership (admins). |
+| 14 | `SetRole { member, role }` | Change a member's role, strictly below the caller's own. |
+| 15 | `ListFiles` | Every file the caller may see (`Files`; the Drive panel). |
+| 16 | `DeleteFile { hash, channel }` | Remove one share of a file (needs `delete` on it). |
+| 17 | `FetchAuditLog { limit }` | Governance log, newest first (admins; `limit` clamped to 1–1000). |
+| 18 | `FetchQuota` | The caller's storage use and allowance (`Quota`). |
+| 19 | `StartUpload { name, mime, size, target }` | Begin a chunked upload (see [Files](#files)). |
+| 20 | `UploadChunk { upload, data }` | One chunk of an upload, in order, ≤ `PARTY_CHUNK_BYTES`. |
+| 21 | `FinishUpload { upload }` | Commit an upload and post the file message. |
+| 22 | `CancelUpload { upload }` | Abandon an upload and discard its spool. |
+| 23 | `DownloadChunk { hash, offset }` | One chunk of a stored file (`FileChunk`). |
+| 24 | `ShareFile { hash, from, target }` | Re-post a file already shared at `from`, without re-uploading it. |
+| 25 | `SetFilePermissions { hash, location, member, perms }` | Change what one share grants: the default (`member: None`) or one member's grant. |
+
+`target` is an `UploadTarget`: `Channel(channel_id)` or `Dm(member_id)`.
 
 ### Responses
 
-`Joined`, `JoinRejected`, `Members`, `Channels`, `MessagePosted`, `Message`,
-`History`, `FileData`, `Error`, `ActionFailed`, then the appended set: `Files`,
-`Quota`, `AuditLog`, `Ok`, `DirectoryChanged`.
+Every `PartyResponse` variant, in wire order:
+
+| # | Variant | Meaning |
+|---|---------|---------|
+| 0 | `Joined { member_id, server_name, tier }` | Join accepted. |
+| 1 | `JoinRejected { reason }` | Join refused (bad password, username taken, too many attempts). |
+| 2 | `Members(Vec<MemberInfo>)` | Directory, with each member's `role` and online state. |
+| 3 | `Channels(Vec<ChannelInfo>)` | The caller's own view of the channel list. |
+| 4 | `MessagePosted { channel, seq }` | A post, DM, file or share was stored at `seq`. |
+| 5 | `Message(Envelope)` | One message: a live broadcast, or the echo of your own. |
+| 6 | `History(Vec<Envelope>)` | One page of channel or DM history. |
+| 7 | `FileData { hash, data }` | A whole blob (reply to `DownloadFile`). |
+| 8 | `Error(String)` | Non-fatal error not tied to a pending send. |
+| 9 | `ActionFailed { channel, reason }` | A send (post, DM, upload, share) was refused. |
+| 10 | `Files(Vec<FileEntry>)` | Reply to `ListFiles`; each entry carries the caller's `FilePermissions`. |
+| 11 | `Quota(QuotaInfo)` | Reply to `FetchQuota`. |
+| 12 | `AuditLog(Vec<AuditEntry>)` | Reply to `FetchAuditLog`. |
+| 13 | `Ok(String)` | A governance action succeeded, with a message worth showing. |
+| 14 | `DirectoryChanged` | Re-request `ListChannels`. |
+| 15 | `UploadReady { upload, chunk_size }` | A chunked upload was accepted; stream it. |
+| 16 | `FileChunk { hash, offset, total, data }` | One chunk of a download. |
 
 - **`ActionFailed`** exists separately from `Error` because the client appends
   outgoing messages optimistically and has to know a refusal belongs to the
@@ -451,14 +508,92 @@ client **merges** pages by server-assigned sequence rather than replacing.
 
 ### Files
 
-Uploads are inline, bounded by `MAX_INLINE_FILE_BYTES` (4 MiB); chunked transfer
-for larger files is not yet implemented. Blobs are content-addressed by SHA-256,
-deduplicated, and reference-counted per share. `DeleteFile` drops one reference
-and reclaims the bytes when the last one goes — but **leaves the message in
-history**, because sequence numbers are the identity clients merge on and
-removing an envelope would renumber the channel for everyone who already had it.
-Clients verify downloaded bytes against the requested hash; the hash *is* the
-integrity check.
+Blobs are content-addressed by SHA-256 (lowercase hex), deduplicated, and
+reference-counted per share. `DeleteFile` drops one reference and reclaims the
+bytes when the last one goes. It **leaves the message in history**, because
+sequence numbers are the identity clients merge on, and removing an envelope
+would renumber the channel for everyone who already had it. Clients verify
+downloaded bytes against the requested hash; the hash *is* the integrity check.
+
+Limits: `MAX_INLINE_FILE_BYTES` (4 MiB) for an inline upload, `PARTY_CHUNK_BYTES`
+(256 KiB) per chunk, and `MAX_PARTY_FILE_BYTES` (100 MiB) for any one file,
+inline or chunked. Storage is capped server-wide (1 GiB) and per member
+(128 MiB, admins exempt). Both caps count *distinct* content, so a file shared
+in three places costs its size once. Both clients choose inline or chunked by
+size.
+
+#### Inline upload
+
+`PostFile` / `SendFileDm` carry the bytes in the request. The server answers
+`MessagePosted` (and broadcasts the `Message`) or `ActionFailed`.
+
+#### Chunked upload
+
+1. **`StartUpload { name, mime, size, target }`.** The size is declared up
+   front, so the server can refuse **before any bytes move**. It refuses when the
+   caller is not a member, has a read-only role, may not post to the target
+   channel, or names an unknown DM recipient; when the file is empty, over
+   `MAX_PARTY_FILE_BYTES`, or over the member's storage allowance; and when the
+   member already has `MAX_CONCURRENT_UPLOADS` (4) uploads in flight. That count
+   comes from the server's own spools, not from what the connection believes it
+   has open. A refusal is `ActionFailed`.
+2. **`UploadReady { upload, chunk_size }`.** The upload id is **minted by the
+   server** (a random UUID) and bound to the uploader. Another member who names
+   it gets "no such upload".
+3. **`UploadChunk { upload, data }`**, in order, each ≤ `PARTY_CHUNK_BYTES`.
+   A successful chunk gets no reply. A chunk that is too large, or that would
+   take the upload past its declared size, cancels the upload on both sides and
+   is answered with `Error`. The server accumulates the content hash as chunks
+   arrive, so when the upload finishes it already knows whether it holds this
+   content.
+4. **`FinishUpload { upload }`.** Under the state lock, the server checks that
+   the assembled length equals the declared size (an incomplete upload is
+   discarded), checks that the member may still post to the target, and
+   reserves the storage (no reservation for content it already holds). It then
+   writes and fsyncs the blob with the lock released, re-checks the permission,
+   and commits. The reply is `MessagePosted` plus the broadcast, or
+   `ActionFailed`.
+5. **`CancelUpload { upload }`** discards the spool. A disconnect does the same
+   for every upload that connection had open, and releases their storage
+   reservations.
+
+#### Downloads
+
+`DownloadFile { hash }` returns the whole blob as `FileData`. Clients use it
+for files up to `MAX_INLINE_FILE_BYTES`. Larger files are fetched with
+`DownloadChunk { hash, offset }`, answered by `FileChunk { hash, offset, total,
+data }` carrying up to `PARTY_CHUNK_BYTES` from `offset`. `total` tells the
+client when to stop, and a short final chunk is normal. The client reassembles
+the chunks in order and checks the result against `hash`. Both forms are
+access-checked under the state lock before any byte is read: a member without
+`download` gets `UNKNOWN_FILE_ERROR`. The read itself happens after the lock is
+released, so a revocation takes effect at the next request.
+
+### Per-file permissions
+
+Every share (a `file_refs` row) carries `FilePermissions { view, download,
+delete, share }`. The four rights are separate: seeing that a file exists is not
+being able to fetch it, and neither implies being allowed to put it somewhere
+else. Grants are normalised so they stay coherent (`download` implies `view`,
+and `share` implies `download`). A new share's default grant is view + download.
+
+A member's effective rights on one share resolve in this order:
+
+1. An **admin** holds everything.
+2. Anyone who cannot **reach the location** (read the channel, or be in the DM
+   thread) holds nothing. That includes the uploader, so making a channel
+   private does not leave its files reachable by the people just excluded from
+   it.
+3. The **uploader** holds everything.
+4. Otherwise an explicit **per-member grant** overrides the share's **default**.
+5. A **guest** never holds `delete` or `share`, whatever was granted.
+
+`SetFilePermissions` is accepted only from the uploader or an admin, and only
+for rights the caller's own effective rights cover: you cannot delegate what you
+do not hold. `ShareFile` needs `share` on the named source share. Because content
+is addressed by hash, a re-share costs a new reference rather than a transfer.
+The new share starts at the default grant: you pass on the file, not your
+authority over it.
 
 ### Compatibility
 
