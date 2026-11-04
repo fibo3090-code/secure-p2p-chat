@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use messenger_core::network::host_handshake;
-use messenger_core::party::{recv_framed, send_framed, FrameSeq, PartyRequest, PartyResponse};
+use messenger_core::party::{
+    recv_framed, send_framed, FrameSeq, PartyRequest, PartyResponse, MAX_PARTY_PAYLOAD_BYTES,
+};
 use rsa::RsaPrivateKey;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
@@ -40,6 +42,45 @@ where
 {
     let result = recv_framed(&mut rd, cipher, aad, &mut seq).await;
     (rd, seq, result)
+}
+
+/// Encode a reply to this client, answering with an error instead when it is
+/// too large for one frame.
+///
+/// Defence in depth: every listing and page is budgeted to fit (see
+/// `take_history_page`), so this should never fire. But a reply that cannot be
+/// sent fails `send_packet`, and a failed send ends the connection — and a
+/// client that asks for the same thing again on reconnect then can never stay
+/// connected at all. An error the client can show is strictly better.
+fn encode_reply(resp: &PartyResponse) -> Vec<u8> {
+    let bytes = resp.to_bytes();
+    if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
+        return bytes;
+    }
+    tracing::error!(
+        size = bytes.len(),
+        limit = MAX_PARTY_PAYLOAD_BYTES,
+        "a reply was too large to send; answering with an error instead"
+    );
+    PartyResponse::Error("the server's reply was too large to send".to_string()).to_bytes()
+}
+
+/// Encode a pushed broadcast, or `None` when it is too large for one frame.
+///
+/// A broadcast too large to send would otherwise disconnect *every* online
+/// recipient at once. Dropping it costs them one live update, which they
+/// recover from history.
+fn encode_push(resp: &PartyResponse) -> Option<Vec<u8>> {
+    let bytes = resp.to_bytes();
+    if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
+        return Some(bytes);
+    }
+    tracing::error!(
+        size = bytes.len(),
+        limit = MAX_PARTY_PAYLOAD_BYTES,
+        "a broadcast was too large to send; dropping it"
+    );
+    None
 }
 
 /// Perform the I/O `handle_request` deferred, once the state lock is released,
@@ -179,7 +220,8 @@ where
             // A broadcast pushed to us by another connection. `recv` IS
             // cancel-safe: a message is either taken from the queue or left in it.
             Some(push) = out_rx.recv() => {
-                if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &push.to_bytes()).await {
+                let Some(bytes) = encode_push(&push) else { continue };
+                if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &bytes).await {
                     served = Err(e);
                     break;
                 }
@@ -219,7 +261,7 @@ where
                 }
 
                 for resp in outcome.replies {
-                    if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &resp.to_bytes()).await {
+                    if let Err(e) = send_framed(&mut wr, &cipher, &aad, &mut send_seq, &encode_reply(&resp)).await {
                         served = Err(e);
                         break;
                     }
@@ -1066,6 +1108,26 @@ mod tests {
     /// be told. Nothing announced this before, so a member who left showed as
     /// online in every other client until something else happened to refresh the
     /// directory — which, since nothing refreshed it either, meant forever.
+    /// A reply too large for a frame used to fail `send_packet` and end the
+    /// connection; a client that asked again on reconnect could then never stay
+    /// connected. It becomes an error the client can show, and an oversized
+    /// broadcast is dropped rather than disconnecting every recipient.
+    #[test]
+    fn an_oversized_reply_becomes_an_error_and_an_oversized_push_is_dropped() {
+        let huge = PartyResponse::Error("x".repeat(MAX_PARTY_PAYLOAD_BYTES));
+        let bytes = encode_reply(&huge);
+        assert!(bytes.len() <= MAX_PARTY_PAYLOAD_BYTES);
+        assert!(matches!(
+            PartyResponse::from_bytes(&bytes),
+            Some(PartyResponse::Error(ref m)) if m.contains("too large")
+        ));
+        assert!(encode_push(&huge).is_none());
+
+        let small = PartyResponse::Ok("fine".to_string());
+        assert_eq!(encode_reply(&small), small.to_bytes());
+        assert_eq!(encode_push(&small), Some(small.to_bytes()));
+    }
+
     #[tokio::test]
     async fn leaving_broadcasts_the_member_as_offline() {
         let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();

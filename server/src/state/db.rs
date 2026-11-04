@@ -310,7 +310,8 @@ impl PartyState {
                     hash,
                     BlobRecord {
                         size: size as u64,
-                        mime,
+                        // An older server stored whatever it was sent.
+                        mime: normalize_mime(&mime),
                         data: None,
                         refcount: refcount as u32,
                     },
@@ -755,9 +756,23 @@ pub(super) fn load_messages(
         .collect::<Result<_, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for json in rows {
-        out.push(serde_json::from_str(&json)?);
+        out.push(repair_envelope(serde_json::from_str(&json)?));
     }
     Ok(out)
+}
+
+/// Bound the member-supplied strings of a stored file message.
+///
+/// An older server stored a file's name and MIME type exactly as sent, so a
+/// database may hold an envelope whose metadata alone is megabytes — large
+/// enough to make every page or broadcast carrying it unsendable. Reducing it
+/// on load lets such a community be joined again without editing the database.
+pub(super) fn repair_envelope(mut env: Envelope) -> Envelope {
+    if let MessagePayload::File(meta) = &mut env.payload {
+        meta.name = sanitize_filename(&meta.name);
+        meta.mime = normalize_mime(&meta.mime);
+    }
+    env
 }
 
 /// One-time import of a legacy JSON snapshot into the (empty) database, in a single

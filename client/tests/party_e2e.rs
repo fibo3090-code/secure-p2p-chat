@@ -59,6 +59,9 @@ async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
 
 struct TestServer {
     address: String,
+    /// The live server state, for tests that need to set up more than a
+    /// client could do quickly (thousands of messages, say).
+    state: Arc<Mutex<PartyState>>,
     _dir: tempfile::TempDir,
 }
 
@@ -73,11 +76,16 @@ async fn start_server(password: Option<String>) -> TestServer {
         .await
         .expect("bind");
     let address = listener.local_addr().expect("addr").to_string();
+    let served = state.clone();
     tokio::spawn(async move {
-        let _ = run_accept_loop(listener, state, privkey, hub).await;
+        let _ = run_accept_loop(listener, served, privkey, hub).await;
     });
 
-    TestServer { address, _dir: dir }
+    TestServer {
+        address,
+        state,
+        _dir: dir,
+    }
 }
 
 /// Pump the manager until `done`, or fail rather than hang.
@@ -709,4 +717,48 @@ async fn sending_while_a_large_download_streams_in_keeps_the_connection() {
     })
     .await;
     assert_eq!(mgr.server(sid).unwrap().status, PartyStatus::Joined);
+}
+
+/// SRV-01, end to end: a channel full of maximum-size messages used to make
+/// the community unjoinable, because the first history page was over the frame
+/// limit and a reply that cannot be sent ends the connection. Pages are now
+/// budgeted by bytes, and the client keeps asking when a page was trimmed for
+/// size rather than only when it held 200 envelopes.
+#[tokio::test]
+async fn a_channel_of_maximum_size_messages_is_joinable_and_pages_to_the_end() {
+    let server = start_server(None).await;
+    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
+    let (mut alice, sid) = join(&server, "alice", None, &key).await;
+    pump_until(&mut alice, "channel list", |m| {
+        channel_named(m, sid, "general").is_some()
+    })
+    .await;
+    let general = channel_named(&alice, sid, "general").unwrap();
+    let alice_id = alice.server(sid).unwrap().member_id.unwrap();
+
+    // Well past what one count-capped page could have carried in a frame.
+    const POSTS: usize = 150;
+    {
+        let mut st = server.state.lock().await;
+        for i in 0..POSTS {
+            let mut text = format!("{i:04}");
+            text.push_str(&"m".repeat(messenger_core::MAX_TEXT_MESSAGE_BYTES - text.len()));
+            st.post_message(alice_id, general, text).expect("post");
+        }
+    }
+
+    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
+    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
+    pump_until(&mut bob, "every page arrives", |m| {
+        channel_named(m, bob_sid, "general")
+            .map(|c| texts_in(m, bob_sid, c).len() >= POSTS)
+            .unwrap_or(false)
+    })
+    .await;
+    let texts = texts_in(&bob, bob_sid, general);
+    assert_eq!(texts.len(), POSTS);
+    for (i, t) in texts.iter().enumerate() {
+        assert!(t.starts_with(&format!("{i:04}")), "in order");
+    }
+    assert_eq!(bob.server(bob_sid).unwrap().status, PartyStatus::Joined);
 }

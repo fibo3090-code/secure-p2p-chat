@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use messenger_core::party::{
-    blob_hash, AuditEntry, BlobHasher, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
-    FilePermissions, MemberInfo, MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget,
-    MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
+    blob_hash, encoded_len, take_history_page, AuditEntry, BlobHasher, ChannelInfo, ChannelKind,
+    Envelope, FileEntry, FileMeta, FilePermissions, MemberInfo, MessagePayload, QuotaInfo, Role,
+    TrustTier, UploadTarget, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
@@ -96,6 +96,75 @@ pub const MAX_CHANNEL_NAME_CHARS: usize = 64;
 /// paths agree, and bounds durable storage / broadcast fan-out per message.
 pub const MAX_MESSAGE_TEXT_BYTES: usize = messenger_core::MAX_TEXT_MESSAGE_BYTES;
 
+/// Most members one server will register.
+///
+/// The directory (`Members`) is one frame, sent on join and broadcast on every
+/// presence change, and it must fit in [`MAX_PARTY_PAYLOAD_BYTES`]. At most
+/// about 165 encoded bytes per member, 10,000 members are under 2 MiB. Without
+/// a ceiling an open server — where every new key is a new member — grew its
+/// directory until no client could receive it.
+pub const MAX_MEMBERS: usize = 10_000;
+/// Most members one private channel may list. The channel list (`Channels`)
+/// is one frame carrying every channel's membership; 128 channels of 1,000
+/// members encode to about 3 MiB.
+pub const MAX_PRIVATE_CHANNEL_MEMBERS: usize = 1_000;
+/// Longest MIME type the server stores, in bytes (RFC 6838 caps each half at
+/// 127 characters; a real type is a few dozen).
+///
+/// The type is copied into every file message, history page and `Files`
+/// listing, and it used to be stored exactly as sent: one upload with a MIME
+/// type just under 8 MiB made the live broadcast of its own message too large
+/// to send, disconnecting every online member, and every history page holding
+/// it unsendable for good.
+pub const MAX_MIME_BYTES: usize = 255;
+/// What a missing or malformed MIME type is stored as.
+pub const FALLBACK_MIME: &str = "application/octet-stream";
+/// Most entries one `Files` listing carries, newest first.
+pub const MAX_FILE_LISTING: usize = 2_000;
+/// Byte budget for one `Files` listing. Shares are free (a re-share costs a
+/// reference, not storage), so the number of entries is otherwise unbounded.
+pub const FILE_LISTING_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reduce a member-supplied MIME type to `type/subtype`, lowercase, or
+/// [`FALLBACK_MIME`] when it is not one.
+///
+/// Parameters (`; charset=...`) are dropped: no client uses them, and they are
+/// where an unbounded string would hide. The type is display metadata only —
+/// never a security decision — so normalising rather than refusing keeps an
+/// upload from a client with an odd guess working.
+pub fn normalize_mime(mime: &str) -> String {
+    let essence = mime.split(';').next().unwrap_or("").trim();
+    let restricted = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 127
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    match essence.split_once('/') {
+        Some((ty, sub)) if essence.len() <= MAX_MIME_BYTES && restricted(ty) && restricted(sub) => {
+            essence.to_ascii_lowercase()
+        }
+        _ => FALLBACK_MIME.to_string(),
+    }
+}
+
+/// Keep the leading entries of `items` that fit both `max_items` and
+/// `max_bytes` of encoded size, dropping the rest.
+fn truncate_listing<T: serde::Serialize>(items: &mut Vec<T>, max_items: usize, max_bytes: usize) {
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for item in items.iter().take(max_items) {
+        let size = encoded_len(item);
+        if used.saturating_add(size) > max_bytes {
+            break;
+        }
+        used += size;
+        keep += 1;
+    }
+    items.truncate(keep);
+}
+
 /// Why a join was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinError {
@@ -106,6 +175,8 @@ pub enum JoinError {
     /// Invisible or text-direction characters, which let one name pass for
     /// another (see [`messenger_core::util::has_hidden_characters`]).
     HiddenCharacters,
+    /// The server already has [`MAX_MEMBERS`] members.
+    ServerFull,
 }
 
 impl JoinError {
@@ -118,6 +189,7 @@ impl JoinError {
             JoinError::HiddenCharacters => {
                 "username contains invisible or text-direction characters"
             }
+            JoinError::ServerFull => "this server has reached its member limit",
         }
     }
 }
@@ -311,6 +383,8 @@ pub struct PartyState {
     max_member_blob_bytes: u64,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
     max_blob_bytes: u64,
+    /// Most members this server registers (see [`MAX_MEMBERS`]).
+    max_members: usize,
     /// When present, mutations are mirrored to this database.
     db: Option<Connection>,
     /// When present, blob bytes are mirrored to files under this directory.
@@ -348,6 +422,7 @@ impl PartyState {
             reservations: HashMap::new(),
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
+            max_members: MAX_MEMBERS,
             db: None,
             blob_dir: None,
             channel_creations: HashMap::new(),
@@ -357,6 +432,12 @@ impl PartyState {
     /// Override the per-member storage allowance (bytes of distinct content).
     pub fn set_max_member_blob_bytes(&mut self, bytes: u64) {
         self.max_member_blob_bytes = bytes;
+    }
+
+    /// Override the member ceiling. It may only be lowered: [`MAX_MEMBERS`] is
+    /// what keeps the directory inside one frame.
+    pub fn set_max_members(&mut self, members: usize) {
+        self.max_members = members.min(MAX_MEMBERS);
     }
 
     /// Override the total-blob-storage ceiling (bytes of distinct content). Used
@@ -481,6 +562,12 @@ impl PartyState {
                 existing.online = true;
                 return Ok(existing.id);
             }
+        }
+
+        // A returning member above is always let back in; only a new one is
+        // refused at the ceiling.
+        if self.members.len() >= self.max_members {
+            return Err(JoinError::ServerFull);
         }
 
         // New identity: the username must be free (case-insensitive).
@@ -858,7 +945,7 @@ impl PartyState {
         creator: Uuid,
         name: &str,
         kind: ChannelKind,
-        mut members: Vec<Uuid>,
+        members: Vec<Uuid>,
         now: Instant,
     ) -> Result<ChannelInfo, String> {
         let role = self.role_of(creator);
@@ -871,6 +958,8 @@ impl PartyState {
                 kind.label().to_lowercase()
             ));
         }
+        // Checked before the channel is made, so a refused list costs nothing.
+        let members = self.channel_member_list(creator, kind, members)?;
         // Checked before the channel is made, and recorded only once it is, so a
         // rejected name (duplicate, too long, over the server cap) costs the
         // member nothing against their allowance.
@@ -878,14 +967,6 @@ impl PartyState {
         let info = self.create_channel(name)?;
         self.record_channel_creation(creator, now);
         if kind != ChannelKind::Public {
-            if kind == ChannelKind::Private {
-                members.retain(|m| self.members.contains_key(m));
-                if !members.contains(&creator) {
-                    members.push(creator);
-                }
-            } else {
-                members.clear();
-            }
             let position = self
                 .channels
                 .iter()
@@ -908,6 +989,35 @@ impl PartyState {
         })
     }
 
+    /// The membership list a channel of `kind` will store: for a private
+    /// channel, the members named who actually exist, without duplicates,
+    /// always including `actor`; for every other kind, nobody.
+    ///
+    /// Capped at [`MAX_PRIVATE_CHANNEL_MEMBERS`], because every channel's list
+    /// travels in the one `Channels` frame and an unbounded one would make that
+    /// frame unsendable for everyone who can see the channel.
+    fn channel_member_list(
+        &self,
+        actor: Uuid,
+        kind: ChannelKind,
+        mut members: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, String> {
+        if kind != ChannelKind::Private {
+            return Ok(Vec::new());
+        }
+        let mut seen = std::collections::HashSet::new();
+        members.retain(|m| self.members.contains_key(m) && seen.insert(*m));
+        if !members.contains(&actor) {
+            members.push(actor);
+        }
+        if members.len() > MAX_PRIVATE_CHANNEL_MEMBERS {
+            return Err(format!(
+                "a private channel may have at most {MAX_PRIVATE_CHANNEL_MEMBERS} members"
+            ));
+        }
+        Ok(members)
+    }
+
     /// Change a channel's kind and private membership (admins only).
     pub fn set_channel_access(
         &mut self,
@@ -924,19 +1034,12 @@ impl PartyState {
         actor: Uuid,
         channel: Uuid,
         kind: ChannelKind,
-        mut members: Vec<Uuid>,
+        members: Vec<Uuid>,
     ) -> Result<String, String> {
         if !self.role_of(actor).is_admin() {
             return Err("only admins may change channel access".to_string());
         }
-        if kind == ChannelKind::Private {
-            members.retain(|m| self.members.contains_key(m));
-            if !members.contains(&actor) {
-                members.push(actor);
-            }
-        } else {
-            members.clear();
-        }
+        let members = self.channel_member_list(actor, kind, members)?;
         let Some(position) = self.channels.iter().position(|c| c.id == channel) else {
             return Err("unknown channel".to_string());
         };
@@ -1072,15 +1175,18 @@ impl PartyState {
         Ok(envelope)
     }
 
-    /// Channel history strictly after `since_seq` (offline catch-up), capped at
-    /// [`MAX_HISTORY_BATCH`] envelopes per call so the reply always fits in one
-    /// frame. The caller asks again with the last `seq` it received to page
-    /// through the rest.
+    /// Channel history strictly after `since_seq` (offline catch-up), one page
+    /// at a time: at most [`messenger_core::party::MAX_HISTORY_BATCH`] envelopes **and** at most
+    /// [`messenger_core::party::HISTORY_PAGE_BYTES`] of them (see [`take_history_page`]), so the reply
+    /// always fits in one frame. The caller asks again with the last `seq` it
+    /// received to page through the rest.
     ///
     /// Returning a whole channel at once meant that once its history exceeded
     /// `MAX_PACKET_SIZE` the response could not be sent at all: the send failed,
     /// the connection dropped, and the community became unjoinable with nothing
-    /// on screen to explain it.
+    /// on screen to explain it. Paging by count alone did not fix that — 200
+    /// envelopes of 64 KiB text are 12.8 MiB — which is why the byte budget
+    /// exists.
     ///
     /// Channels the member may not read (see [`Self::member_can_read_channel`])
     /// yield `[]` — the same as an unknown channel, so the reply does not reveal
@@ -1090,13 +1196,7 @@ impl PartyState {
             return Vec::new();
         }
         match self.channel(channel) {
-            Some(c) => c
-                .messages
-                .iter()
-                .filter(|m| m.seq > since_seq)
-                .take(MAX_HISTORY_BATCH)
-                .cloned()
-                .collect(),
+            Some(c) => take_history_page(c.messages.iter().filter(|m| m.seq > since_seq)),
             None => Vec::new(),
         }
     }
@@ -1140,13 +1240,7 @@ impl PartyState {
     /// same way as [`Self::history_since`] and for the same reason.
     pub fn dm_history(&self, thread_id: Uuid, since_seq: u64) -> Vec<Envelope> {
         match self.dm_threads.get(&thread_id) {
-            Some(t) => t
-                .messages
-                .iter()
-                .filter(|m| m.seq > since_seq)
-                .take(MAX_HISTORY_BATCH)
-                .cloned()
-                .collect(),
+            Some(t) => take_history_page(t.messages.iter().filter(|m| m.seq > since_seq)),
             None => Vec::new(),
         }
     }

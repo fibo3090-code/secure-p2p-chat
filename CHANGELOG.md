@@ -13,6 +13,20 @@ predate tagged releases.
 
 ### Security
 
+- **One community member could make a community permanently unjoinable.**
+  History pages were capped at 200 messages but not by size, so about 130
+  long posts made every page that covered them too large to send — and a
+  reply the server cannot send ends the connection. Every client fetches
+  history on join, so everyone was disconnected on joining, and the history
+  was durable, so it survived restarts. A file's MIME type was also stored
+  exactly as sent, so a single upload could do the same to the live broadcast,
+  disconnecting every online member at once. Pages are now limited by size as
+  well as count (and the apps keep paging when a page was trimmed), file
+  names and types are bounded when a file arrives (and repaired on load in
+  existing databases), the member directory, private-channel lists and file
+  listing are capped to fit, and a reply that still does not fit becomes an
+  error instead of a disconnect.
+
 - **A peer could impersonate any contact whose public key it knew.** A
   public key was fingerprinted from the first key block found in its text,
   while signatures were checked against the key the PEM parser returned, and

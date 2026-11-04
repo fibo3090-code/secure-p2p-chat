@@ -1,4 +1,5 @@
 use super::*;
+use messenger_core::party::{PartyResponse, MAX_HISTORY_BATCH, MAX_PARTY_PAYLOAD_BYTES};
 
 #[test]
 fn open_server_join_succeeds_and_lists_member() {
@@ -2918,4 +2919,247 @@ fn multi_row_mutations_commit_as_one_transaction() {
     let s = PartyState::load("Srv", None, dir.path()).unwrap();
     let thread = messenger_core::party::dm_thread_id(alice, bob);
     assert_eq!(s.dm_history(thread, 0).len(), 2);
+}
+
+/// SRV-01: a page was capped at 200 envelopes and nothing else, and 200
+/// envelopes of 64 KiB text are 12.8 MiB. About 130 maximum-size posts made
+/// every page covering them unsendable, every joining client was disconnected
+/// on its first history fetch, and the community stayed unjoinable across
+/// restarts. A channel full of maximum-size messages must still page in frames
+/// that fit, and paging must reach the end.
+#[test]
+fn a_channel_of_maximum_size_messages_still_pages_in_frames_that_fit() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let chan = state.default_channel();
+    let total = MAX_HISTORY_BATCH + 50;
+    for i in 0..total {
+        let mut text = format!("{i:04}");
+        text.push_str(&"x".repeat(MAX_MESSAGE_TEXT_BYTES - text.len()));
+        state.post_message(alice, chan, text).unwrap();
+    }
+
+    let mut since = 0u64;
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = state.history_since(alice, chan, since);
+        if page.is_empty() {
+            break;
+        }
+        pages += 1;
+        let frame = PartyResponse::History(page.clone()).to_bytes();
+        assert!(
+            frame.len() <= MAX_PARTY_PAYLOAD_BYTES,
+            "page {pages} is {} bytes, over the frame limit",
+            frame.len()
+        );
+        let more = messenger_core::party::history_page_may_continue(&page);
+        since = page.last().unwrap().seq;
+        seen.extend(page.into_iter().map(|e| e.seq));
+        if !more {
+            break;
+        }
+        assert!(pages < 100, "paging must terminate");
+    }
+    assert!(
+        pages > 2,
+        "the byte budget, not the count, split this channel"
+    );
+    assert_eq!(seen, (1..=total as u64).collect::<Vec<_>>());
+}
+
+/// The DM thread twin of the test above.
+#[test]
+fn dm_history_of_maximum_size_messages_fits_in_a_frame() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let bob = state.join("bob", None, None).unwrap();
+    for _ in 0..MAX_HISTORY_BATCH {
+        state
+            .post_dm(alice, bob, "y".repeat(MAX_MESSAGE_TEXT_BYTES))
+            .unwrap();
+    }
+    let thread = messenger_core::party::dm_thread_id(alice, bob);
+    let page = state.dm_history(thread, 0);
+    assert!(page.len() < MAX_HISTORY_BATCH);
+    assert!(PartyResponse::History(page).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+}
+
+/// One upload whose MIME type sat just under 8 MiB produced a broadcast
+/// *larger* than the request that created it, disconnecting every online
+/// member, and poisoned every history page that held it. The name and type are
+/// bounded on arrival, on both upload paths.
+#[test]
+fn file_names_and_mime_types_are_bounded_on_upload() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let chan = state.default_channel();
+    let huge_mime = format!("text/{}", "a".repeat(1024 * 1024));
+    let huge_name = "n".repeat(1024 * 1024);
+
+    let env = state
+        .post_file(
+            alice,
+            chan,
+            huge_name.clone(),
+            huge_mime.clone(),
+            b"x".to_vec(),
+        )
+        .unwrap();
+    let meta = file_payload(&env);
+    assert_eq!(meta.mime, FALLBACK_MIME);
+    assert!(meta.name.len() <= messenger_core::util::MAX_FILENAME_BYTES);
+    assert!(encoded_len(&env) < 1024, "the message stays small");
+
+    // The chunked path takes the same route.
+    let upload = state
+        .start_upload(alice, huge_name, huge_mime, 1, UploadTarget::Channel(chan))
+        .unwrap();
+    state.upload_chunk(alice, upload, b"y").unwrap();
+    let (env, _) = state.finish_upload(alice, upload).unwrap();
+    let meta = file_payload(&env);
+    assert_eq!(meta.mime, FALLBACK_MIME);
+    assert!(meta.name.len() <= messenger_core::util::MAX_FILENAME_BYTES);
+
+    // And so is the listing built from them.
+    for f in state.files_for(alice) {
+        assert!(f.mime.len() <= MAX_MIME_BYTES);
+    }
+}
+
+#[test]
+fn mime_types_are_normalised_to_type_and_subtype() {
+    assert_eq!(normalize_mime("image/png"), "image/png");
+    assert_eq!(normalize_mime(" Text/Plain; charset=utf-8 "), "text/plain");
+    assert_eq!(
+        normalize_mime("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    );
+    for bad in [
+        "",
+        "png",
+        "/png",
+        "image/",
+        "image/p ng",
+        "a/b/c",
+        "image/\u{202e}gnp",
+    ] {
+        assert_eq!(normalize_mime(bad), FALLBACK_MIME, "{bad:?}");
+    }
+    assert_eq!(
+        normalize_mime(&format!("a/{}", "b".repeat(200))),
+        FALLBACK_MIME
+    );
+}
+
+/// Re-sharing is free, so the number of file references has no natural bound,
+/// and `Files` is one frame. The listing keeps the newest that fit.
+#[test]
+fn the_file_listing_is_capped_to_fit_one_frame() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let chan = state.default_channel();
+    for i in 0..(MAX_FILE_LISTING + 5) {
+        state
+            .post_file(
+                alice,
+                chan,
+                format!("f{i}.txt"),
+                "text/plain".into(),
+                format!("{i}").into_bytes(),
+            )
+            .unwrap();
+    }
+    let listing = state.files_for(alice);
+    assert_eq!(listing.len(), MAX_FILE_LISTING);
+    assert!(PartyResponse::Files(listing).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+
+    let mut items: Vec<String> = (0..10).map(|i| "z".repeat(100 + i)).collect();
+    truncate_listing(&mut items, 100, 3 * 120);
+    assert_eq!(items.len(), 3, "the byte budget trims too");
+}
+
+/// The directory is one frame, so membership has a ceiling. A returning
+/// member is always let back in.
+#[test]
+fn membership_is_capped_but_returning_members_still_join() {
+    let mut state = PartyState::new("Open", None);
+    state.set_max_members(2);
+    let a = state.join("a", None, Some("fp-a".into())).unwrap();
+    state.join("b", None, Some("fp-b".into())).unwrap();
+    assert_eq!(
+        state.join("c", None, Some("fp-c".into())),
+        Err(JoinError::ServerFull)
+    );
+    assert_eq!(state.join("a", None, Some("fp-a".into())), Ok(a));
+
+    // The ceiling is a cap, not a knob: it cannot be raised past the frame.
+    state.set_max_members(usize::MAX);
+    assert_eq!(state.max_members, MAX_MEMBERS);
+    let directory: Vec<MemberInfo> = (0..MAX_MEMBERS)
+        .map(|_| MemberInfo {
+            id: Uuid::new_v4(),
+            username: "\u{1F600}".repeat(MAX_USERNAME_CHARS),
+            online: true,
+            role: Role::Member,
+        })
+        .collect();
+    assert!(PartyResponse::Members(directory).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+}
+
+/// Every channel's private membership travels in the one `Channels` frame.
+#[test]
+fn a_private_channel_member_list_is_capped_and_deduplicated() {
+    let mut state = PartyState::new("Open", None);
+    let owner = state.join("owner", None, None).unwrap();
+    let others: Vec<Uuid> = (0..MAX_PRIVATE_CHANNEL_MEMBERS)
+        .map(|i| state.join(&format!("m{i}"), None, None).unwrap())
+        .collect();
+    // `owner` plus every other member is one too many.
+    assert!(state
+        .create_channel_of_kind(owner, "big", ChannelKind::Private, others.clone())
+        .is_err());
+    let dupes = vec![others[0], others[0], others[1], owner];
+    let info = state
+        .create_channel_of_kind(owner, "small", ChannelKind::Private, dupes)
+        .unwrap();
+    assert_eq!(info.members.len(), 3, "duplicates are dropped");
+    assert!(state
+        .set_channel_access(owner, info.id, ChannelKind::Private, others)
+        .is_err());
+
+    // The worst case the caps allow still fits in a frame.
+    let channels: Vec<ChannelInfo> = (0..MAX_CHANNELS)
+        .map(|_| ChannelInfo {
+            id: Uuid::new_v4(),
+            name: "\u{1F600}".repeat(MAX_CHANNEL_NAME_CHARS),
+            kind: ChannelKind::Private,
+            members: (0..MAX_PRIVATE_CHANNEL_MEMBERS)
+                .map(|_| Uuid::new_v4())
+                .collect(),
+        })
+        .collect();
+    assert!(PartyResponse::Channels(channels).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+}
+
+/// A database written before names and types were bounded is repaired on
+/// load, so a poisoned community can be joined again without hand-editing it.
+#[test]
+fn oversized_file_metadata_from_an_older_server_is_repaired_on_load() {
+    let env = Envelope {
+        tier: TrustTier::Administered,
+        sender: Uuid::new_v4(),
+        channel: Uuid::new_v4(),
+        seq: 1,
+        timestamp: 0,
+        payload: MessagePayload::File(FileMeta {
+            hash: "00".repeat(32),
+            name: "n".repeat(100_000),
+            size: 1,
+            mime: format!("text/{}", "a".repeat(100_000)),
+        }),
+    };
+    let repaired = repair_envelope(env);
+    assert!(encoded_len(&repaired) < 1024);
 }

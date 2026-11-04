@@ -698,6 +698,9 @@ impl PartyState {
             })
             .collect();
         out.sort_by_key(|f| std::cmp::Reverse(f.shared_at));
+        // One frame carries the whole listing, and re-sharing is free, so the
+        // number of entries has no natural bound. Keep the newest that fit.
+        truncate_listing(&mut out, MAX_FILE_LISTING, FILE_LISTING_BYTES);
         out
     }
 
@@ -785,8 +788,12 @@ impl PartyState {
             id,
             PendingUpload {
                 uploader,
-                name,
-                mime,
+                // Bounded on arrival rather than at publish: both strings are
+                // copied into every message, page and listing that mentions the
+                // file, and until then they sit in memory on the uploader's
+                // behalf.
+                name: sanitize_filename(&name),
+                mime: normalize_mime(&mime),
                 declared: size,
                 target,
                 data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
@@ -927,6 +934,8 @@ impl PartyState {
     ) -> Result<StagedUpload, String> {
         let data = Self::check_inline_size(data)?;
         self.check_may_post_file(uploader, target)?;
+        // See `start_upload`: bounded before anything else copies them.
+        let (name, mime) = (sanitize_filename(&name), normalize_mime(&mime));
         // Capped at 4 MiB and already in hand, so hashing here costs
         // single-digit milliseconds — cheap enough to buy an exact answer to "do
         // we already hold this?", which is what keeps a re-upload of stored
