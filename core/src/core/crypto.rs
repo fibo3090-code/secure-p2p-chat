@@ -1425,7 +1425,9 @@ mod tests {
     #[test]
     fn text_around_a_single_pem_block_is_refused() {
         let key = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
-        let pem = pem_encode_public(&key).unwrap();
+        // `pem_encode_public` uses the platform line ending (CRLF on
+        // Windows); normalise so the CRLF case below is not `\r\r\n`.
+        let pem = pem_encode_public(&key).unwrap().replace("\r\n", "\n");
         assert!(pem_decode_public(&format!("comment\n{pem}")).is_err());
         assert!(pem_decode_public(&format!("{pem}trailing")).is_err());
         // Surrounding whitespace and CRLF line endings are not an attack.
