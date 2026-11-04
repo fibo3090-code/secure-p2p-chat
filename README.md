@@ -83,7 +83,7 @@ cd desktop && npm ci && npx tauri build
 # Terminal client / relay
 cargo build --release -p p2pem-classic
 
-# Community server
+# Community server (builds target/release/server; shipped as p2pem-server)
 cargo build --release -p messenger-server
 
 # Everything, with tests

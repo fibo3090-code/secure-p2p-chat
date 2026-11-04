@@ -40,8 +40,12 @@ cd desktop && npm ci && npx tauri build
 cargo build --release -p p2pem-classic     # target/release/p2pem-classic[.exe]
 
 # The community server
-cargo build --release -p messenger-server  # target/release/messenger-server[.exe]
+cargo build --release -p messenger-server  # target/release/server[.exe]
 ```
+
+The crate is called `messenger-server` but the binary it builds is `server`
+(`server.exe` on Windows). The P2PEM Tools archive ships the same program
+renamed to `p2pem-server`, so the two are interchangeable.
 
 ### Linux build prerequisites
 
