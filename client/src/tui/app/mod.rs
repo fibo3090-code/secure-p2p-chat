@@ -11,9 +11,10 @@ mod cmd_connect;
 mod cmd_contacts;
 mod cmd_misc;
 mod cmd_party;
+pub(crate) use cmd_party::PartyThread;
 
 use crate::app::chat_manager::ChatManager;
-use crate::app::party_manager::{PartyJoinOutcome, PartyManager};
+use crate::app::party_manager::{PartyDial, PartyJoinOutcome, PartyManager};
 
 /// A community join held at the verification step: the address and credentials
 /// the user typed, kept locally until they confirm the server's identity. They
@@ -22,6 +23,18 @@ struct PendingPartyJoin {
     address: String,
     username: String,
     password: Option<String>,
+    /// The server fingerprint the user was shown and is about to accept. The
+    /// trust step requires the credential-bearing connection to present
+    /// exactly this key.
+    fingerprint: String,
+}
+
+/// A community connect running off the UI loop (TUI-08). `tick` drains it.
+struct PartyDialJob {
+    address: String,
+    username: String,
+    password: Option<String>,
+    rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::app::party_manager::PartyDial>>,
 }
 use crate::identity::Identity;
 use crate::logbuf::LogBuffer;
@@ -96,6 +109,8 @@ pub struct TuiApp {
     pub transfer_sel: usize,
     /// Selected community in the Party pane.
     pub party_sel: usize,
+    /// Selected thread (a channel, then the DMs) in the selected community.
+    pub party_thread_sel: usize,
     pub contact_ids: Vec<Uuid>,
     pub contacts_list_state: ListState,
     pub settings_list_state: ListState,
@@ -106,12 +121,28 @@ pub struct TuiApp {
     identity_path: PathBuf,
     history_path: PathBuf,
     pending_command: Option<TuiCommand>,
+    /// A fingerprint prompt the user put away with Esc. It stays queued (the
+    /// peer is still waiting) and `:verify` still answers it; the overlay is
+    /// just not re-opened over the user's typing.
+    deferred_fingerprint: Option<Uuid>,
+    /// A community connect/trust in flight. One at a time: a second
+    /// `:party-connect` while one runs is refused rather than queued.
+    party_dial: Option<PartyDialJob>,
     /// In-flight Party file downloads. `tick` polls them and writes finished
     /// downloads into the download directory.
     pending_party_downloads: Vec<PendingPartyDownload>,
     /// Finished downloads being written to disk off the UI thread.
     pending_party_saves: Vec<tokio::sync::oneshot::Receiver<crate::tui::downloads::SaveOutcome>>,
     last_save: Option<Instant>,
+    /// `persisted_signature` at the last successful save: autosave skips the
+    /// write when it has not moved (PERF-03).
+    saved_signature: Option<u64>,
+    /// Set while a background autosave is writing, so two never overlap and
+    /// the save on exit can wait for the last one.
+    save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by a background autosave whose write failed; the next tick clears
+    /// `saved_signature` so the state is written again.
+    autosave_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_rehost: Option<Instant>,
     typing_active: bool,
     last_typing_activity: Option<Instant>,
@@ -178,6 +209,7 @@ impl TuiApp {
             overlay_scroll: 0,
             transfer_sel: 0,
             party_sel: 0,
+            party_thread_sel: 0,
             contact_ids: Vec::new(),
             contacts_list_state: ListState::default(),
             settings_list_state: ListState::default(),
@@ -187,9 +219,14 @@ impl TuiApp {
             identity_path,
             history_path,
             pending_command: None,
+            deferred_fingerprint: None,
             pending_party_downloads: Vec::new(),
             pending_party_saves: Vec::new(),
+            party_dial: None,
             last_save: None,
+            saved_signature: None,
+            save_in_flight: Default::default(),
+            autosave_failed: Default::default(),
             last_rehost: None,
             typing_active: false,
             last_typing_activity: None,
@@ -280,6 +317,8 @@ impl TuiApp {
                 ),
             }
         }
+
+        self.poll_party_dial();
     }
 
     /// At startup, greet the user with a password overlay when appropriate:
@@ -375,7 +414,12 @@ impl TuiApp {
         // can't quietly discard a verification a peer is still blocked on. Any
         // further peers waiting behind it get their turn on a later tick.
         if !self.overlay.is_open() {
-            if let Some(pending) = self.chat_manager.pending_fingerprint().cloned() {
+            if let Some(pending) = self
+                .chat_manager
+                .pending_fingerprint()
+                .filter(|p| Some(p.session_id) != self.deferred_fingerprint)
+                .cloned()
+            {
                 self.overlay = TuiOverlay::FingerprintVerify {
                     fingerprint: pending.fingerprint,
                     peer_name: pending.peer_name,
@@ -428,7 +472,17 @@ impl TuiApp {
             .set_ui_presence(active, self.selected_chat_id());
     }
 
+    /// Periodic save. It used to rewrite (clone, serialize, encrypt, fsync)
+    /// the whole history every 30 s whether or not anything had changed, on
+    /// the UI loop — tens of MB per tick for a long history, and a frozen
+    /// interface while it ran (PERF-03). Now it skips an unchanged state and
+    /// does the encrypt + write on the blocking pool; only the snapshot is
+    /// taken here.
     fn autosave(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.autosave_failed.swap(false, Ordering::SeqCst) {
+            self.saved_signature = None;
+        }
         if self.chat_manager.history_key.is_none() || self.chat_manager.chats.is_empty() {
             return;
         }
@@ -436,18 +490,60 @@ impl TuiApp {
             .last_save
             .map(|t| t.elapsed() >= AUTOSAVE_INTERVAL)
             .unwrap_or(true);
-        if due {
-            self.save_history_now();
-            self.last_save = Some(Instant::now());
+        if !due || self.save_in_flight.load(Ordering::SeqCst) {
+            return;
         }
+        self.last_save = Some(Instant::now());
+        let sig = self.chat_manager.persisted_signature();
+        if self.saved_signature == Some(sig) {
+            return;
+        }
+        let (history, key) = match self.chat_manager.history_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!("TUI history save skipped: {}", e);
+                return;
+            }
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime (unit tests): save inline.
+            match history.save_encrypted(&self.history_path, &key) {
+                Ok(()) => self.saved_signature = Some(sig),
+                Err(e) => tracing::warn!("TUI history save failed: {}", e),
+            }
+            return;
+        };
+        self.save_in_flight.store(true, Ordering::SeqCst);
+        let in_flight = self.save_in_flight.clone();
+        let path = self.history_path.clone();
+        // Recorded optimistically; a failed write clears it below so the next
+        // tick tries again.
+        self.saved_signature = Some(sig);
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.autosave_failed = failed.clone();
+        handle.spawn_blocking(move || {
+            if let Err(e) = history.save_encrypted(&path, &key) {
+                tracing::warn!("TUI history save failed: {}", e);
+                failed.store(true, Ordering::SeqCst);
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
     }
 
     fn save_history_now(&mut self) {
+        use std::sync::atomic::Ordering;
         if self.chat_manager.history_key.is_none() {
             return;
         }
-        if let Err(e) = self.chat_manager.save_history(&self.history_path) {
-            tracing::warn!("TUI history save failed: {}", e);
+        // Let a background autosave finish first, so it cannot land after
+        // (and over) this one.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.save_in_flight.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match self.chat_manager.save_history(&self.history_path) {
+            Ok(()) => self.saved_signature = Some(self.chat_manager.persisted_signature()),
+            Err(e) => tracing::warn!("TUI history save failed: {}", e),
         }
     }
 
@@ -485,6 +581,14 @@ impl TuiApp {
     fn refresh_status_line(&mut self) {
         if self.identity.is_locked() {
             self.status_line = "🔒 Identity locked — :unlock <password> to continue".to_string();
+            return;
+        }
+        // Saving is blocked while this holds, so it outranks everything else
+        // on the status line until the user deals with it.
+        if self.chat_manager.history_load_error().is_some() {
+            self.status_line = "⚠ History unreadable — nothing is being saved. \
+                 Restore the file, or :history-reset to keep it aside and start fresh"
+                .to_string();
             return;
         }
 
@@ -608,6 +712,27 @@ impl TuiApp {
 
     // ---------------------------------------------------------------- keys
 
+    /// A bracketed paste: inserted as text into whatever is being edited, never
+    /// replayed as keys. A paste cannot answer a prompt or confirm a dialog
+    /// (overlays ignore it), and in command mode it stays on one line so it
+    /// cannot submit the command or start another.
+    pub fn handle_paste(&mut self, text: &str) {
+        self.last_interaction = Some(Instant::now());
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.overlay.is_open() {
+            return;
+        }
+        if self.mode == TuiMode::Command {
+            let line = text.split('\n').collect::<Vec<_>>().join(" ");
+            self.command_field.insert_str(&line);
+            self.update_command_suggestions();
+            return;
+        }
+        self.focus = TuiFocus::Input;
+        self.input_field.insert_str(&text);
+        self.note_input_activity();
+    }
+
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         // Any keystroke means the user is at the terminal; `report_presence`
         // uses this to gate desktop notifications.
@@ -717,11 +842,28 @@ impl TuiApp {
     fn handle_overlay_key(&mut self, key: KeyEvent) {
         match self.overlay.clone() {
             TuiOverlay::Password { mode } => self.handle_password_key(key, mode),
-            TuiOverlay::FingerprintVerify { chat_id, .. } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.resolve_fingerprint(chat_id, true),
-                KeyCode::Char('n') | KeyCode::Esc => self.resolve_fingerprint(chat_id, false),
-                _ => {}
-            },
+            // This overlay opens on its own, under whatever the user is typing.
+            // Plain keys therefore answer nothing: `y`/Enter used to accept, so
+            // typing "hey" + Enter while a peer connected trusted an unverified
+            // key (audit TUI-01). Answering takes a chord nobody types by
+            // accident; Esc only puts the prompt away (it stays queued).
+            TuiOverlay::FingerprintVerify { chat_id, .. } => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Char('y') if ctrl => self.resolve_fingerprint(chat_id, true),
+                    KeyCode::Char('n') if ctrl => self.resolve_fingerprint(chat_id, false),
+                    KeyCode::Esc => {
+                        self.deferred_fingerprint = Some(chat_id);
+                        self.overlay = TuiOverlay::None;
+                        self.toast(
+                            ToastLevel::Warning,
+                            "Verification still pending — :verify accept|reject when ready"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             TuiOverlay::ConfirmQuit => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.save_history_now();
@@ -738,6 +880,15 @@ impl TuiApp {
                 }
                 _ => self.overlay = TuiOverlay::None,
             },
+            TuiOverlay::ConfirmWipe => {
+                if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.overlay = TuiOverlay::None;
+                    self.wipe_now();
+                } else {
+                    self.overlay = TuiOverlay::None;
+                    self.toast(ToastLevel::Info, "Nothing was deleted".to_string());
+                }
+            }
             TuiOverlay::Contacts => match key.code {
                 KeyCode::Esc => self.overlay = TuiOverlay::None,
                 KeyCode::Down => self.contacts_select_next(),
@@ -782,15 +933,32 @@ impl TuiApp {
                 }
             }
             // Communities pane: switch between the servers you have joined.
+            // ←/→ switch community, ↑/↓ pick the thread whose messages are
+            // shown (and that :party-post writes to).
             TuiOverlay::Party => {
                 let count = self.party_manager.server_ids().len();
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => self.overlay = TuiOverlay::None,
                     KeyCode::Right | KeyCode::Char('l') if count > 0 => {
                         self.party_sel = (self.party_sel + 1).min(count - 1);
+                        self.party_thread_sel = 0;
+                        self.sync_current_party();
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
                         self.party_sel = self.party_sel.saturating_sub(1);
+                        self.party_thread_sel = 0;
+                        self.sync_current_party();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = self.party_threads().len();
+                        if n > 0 {
+                            self.party_thread_sel = (self.party_thread_sel + 1).min(n - 1);
+                        }
+                        self.open_selected_party_thread();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.party_thread_sel = self.party_thread_sel.saturating_sub(1);
+                        self.open_selected_party_thread();
                     }
                     _ => {}
                 }
@@ -801,9 +969,24 @@ impl TuiApp {
 
     fn handle_password_key(&mut self, key: KeyEvent, mode: PasswordMode) {
         match key.code {
+            // The first-run prompt cannot be dismissed. `Identity::save`
+            // refuses a plaintext key, so an identity without a password is
+            // never written: dismissing the prompt meant a brand-new identity
+            // on every launch, and the old history overwritten by the next
+            // one's autosave (audit TUI-04 / JOURNEY-02). Ctrl+Q quits instead.
+            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.password_field.clear();
+                self.should_quit = true;
+            }
+            KeyCode::Esc if mode == PasswordMode::Set && !self.identity.is_encrypted() => {
+                self.toast(
+                    ToastLevel::Warning,
+                    "A password is needed before anything can be saved (Ctrl+Q quits)".to_string(),
+                );
+            }
             KeyCode::Esc => {
-                // Allow dismissing the "set password" prompt; unlocking is required
-                // for a locked identity, so closing it just leaves the app locked.
+                // Unlocking can be put off: closing the prompt leaves the app
+                // locked, and nothing is saved while it is.
                 self.password_field.clear();
                 self.overlay = TuiOverlay::None;
             }
@@ -1045,6 +1228,8 @@ impl TuiApp {
             TuiCommand::Rename(title) => self.cmd_rename(title),
             TuiCommand::DeleteChat => self.disconnect_selected(),
             TuiCommand::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
+            TuiCommand::HistoryReset => self.cmd_history_reset(),
+            TuiCommand::Wipe { password } => self.cmd_wipe(&password),
 
             TuiCommand::Identity => {
                 Self::copy_to_clipboard(&self.identity.fingerprint);
@@ -1053,6 +1238,7 @@ impl TuiApp {
             TuiCommand::Verify(accept) => self.verify_pending(accept),
             TuiCommand::Unlock(pw) => self.cmd_unlock(pw),
             TuiCommand::SetPassword(pw) => self.try_set_password(&pw),
+            TuiCommand::ChangePassword { current, new } => self.try_change_password(&current, &new),
 
             TuiCommand::Settings => {
                 self.settings_list_state.select(Some(0));
@@ -1124,7 +1310,16 @@ impl TuiApp {
     // ---------------------------------------------------------------- fingerprint
 
     fn verify_pending(&mut self, accept: bool) {
-        if let TuiOverlay::FingerprintVerify { chat_id, .. } = self.overlay.clone() {
+        // The head of the queue, whether or not its overlay is showing: Esc
+        // puts the overlay away without answering.
+        let target = match self.overlay.clone() {
+            TuiOverlay::FingerprintVerify { chat_id, .. } => Some(chat_id),
+            _ => self
+                .chat_manager
+                .pending_fingerprint()
+                .map(|p| p.session_id),
+        };
+        if let Some(chat_id) = target {
             self.resolve_fingerprint(chat_id, accept);
         } else {
             self.toast(
@@ -1135,6 +1330,9 @@ impl TuiApp {
     }
 
     fn resolve_fingerprint(&mut self, chat_id: Uuid, accept: bool) {
+        if self.deferred_fingerprint == Some(chat_id) {
+            self.deferred_fingerprint = None;
+        }
         // `confirm_fingerprint` stores an accepted fingerprint on the right
         // conversation itself (on the host that is not `chat_id`, which names
         // the session).
@@ -1180,36 +1378,62 @@ impl TuiApp {
             );
             return;
         }
-        // Migrate a plaintext key, or rotate an existing password.
-        let result = if self.identity.is_encrypted() {
-            // Rotate: decrypt is needed first; if locked we cannot rotate here.
-            if self.identity.is_locked() {
-                Err(anyhow::anyhow!("Unlock before changing the password"))
-            } else {
-                self.identity.encrypt(password)
-            }
-        } else {
-            self.identity.migrate_legacy_plaintext(password)
-        };
+        // Setting a password is for an identity that has none. Re-encrypting
+        // an already-protected identity here skipped the current-password
+        // check entirely — anyone at an unlocked terminal could replace the
+        // password (audit TUI-03). That is `:change-password`'s job.
+        if self.identity.is_encrypted() {
+            self.toast(
+                ToastLevel::Error,
+                "This identity already has a password — use :change-password <current> <new>"
+                    .to_string(),
+            );
+            return;
+        }
+        let result = self.identity.migrate_legacy_plaintext(password);
+        self.finish_password_update(result, password, "Password set");
+    }
 
-        match result.and_then(|()| self.identity.save(&self.identity_path)) {
-            Ok(()) => {
-                // Re-derive key requires the plaintext; encrypt() cleared it, so reload.
-                if let Ok(mut reloaded) = Identity::load(&self.identity_path) {
-                    if reloaded.decrypt(password).is_ok() {
-                        if let Ok(key) = reloaded.history_key() {
-                            self.chat_manager.set_history_key(key);
-                            let _ = self
-                                .chat_manager
-                                .load_history_auto(&self.history_path, &key);
-                        }
-                        self.identity = reloaded;
-                    }
-                }
+    fn try_change_password(&mut self, current: &str, new: &str) {
+        if new.chars().count() < crate::MIN_PASSWORD_LEN {
+            self.toast(
+                ToastLevel::Error,
+                format!(
+                    "Password must be at least {} characters",
+                    crate::MIN_PASSWORD_LEN
+                ),
+            );
+            return;
+        }
+        let result = self.identity.change_password(current, new);
+        self.finish_password_update(result, new, "Password changed");
+    }
+
+    /// Save the re-wrapped identity and re-derive the history key from it.
+    /// Success is reported only when every step worked: "Password set" used
+    /// to be shown even when the identity could not be reloaded afterwards.
+    fn finish_password_update(&mut self, result: anyhow::Result<()>, password: &str, done: &str) {
+        let outcome = result
+            .and_then(|()| self.identity.save(&self.identity_path))
+            .and_then(|()| {
+                // Re-deriving the key needs the plaintext, which encrypt()
+                // cleared, so reload and decrypt.
+                let mut reloaded = Identity::load(&self.identity_path)?;
+                reloaded.decrypt(password)?;
+                let key = reloaded.history_key()?;
+                Ok((reloaded, key))
+            });
+        match outcome {
+            Ok((reloaded, key)) => {
+                self.chat_manager.set_history_key(key);
+                let _ = self
+                    .chat_manager
+                    .load_history_auto(&self.history_path, &key);
+                self.identity = reloaded;
                 self.overlay = TuiOverlay::None;
-                self.toast(ToastLevel::Success, "Password set".to_string());
+                self.toast(ToastLevel::Success, done.to_string());
             }
-            Err(e) => self.toast(ToastLevel::Error, format!("Failed to set password: {}", e)),
+            Err(e) => self.toast(ToastLevel::Error, format!("Password not updated: {e}")),
         }
     }
 
@@ -1442,6 +1666,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     fn queued_prompt(session_id: Uuid) -> crate::app::PendingFingerprint {
         crate::app::PendingFingerprint {
             fingerprint: "deadbeef".into(),
@@ -1470,8 +1698,8 @@ mod tests {
             chat_id,
         };
 
-        // Pressing 'y' accepts.
-        app.handle_key_event(key('y'));
+        // Ctrl+Y accepts.
+        app.handle_key_event(ctrl('y'));
 
         assert!(rx.try_recv().unwrap());
         assert_eq!(app.overlay, TuiOverlay::None);
@@ -1497,11 +1725,175 @@ mod tests {
             chat_id,
         };
 
-        app.handle_key_event(key('n'));
+        app.handle_key_event(ctrl('n'));
 
         assert!(!rx.try_recv().unwrap());
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(app.chat_manager.get_chat(chat_id).is_none());
+    }
+
+    /// TUI-01: the prompt opens under whatever the user is typing, so plain
+    /// keys must answer nothing — "hey" + Enter used to trust the peer.
+    #[test]
+    fn typing_into_the_fingerprint_prompt_does_not_answer_it() {
+        let mut app = app();
+        let chat_id = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat_id, "Peer".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.chat_manager
+            .add_fingerprint_confirm_sender_for_test(chat_id, tx);
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(queued_prompt(chat_id));
+        app.overlay = TuiOverlay::FingerprintVerify {
+            fingerprint: "deadbeef".into(),
+            peer_name: "Peer".into(),
+            sas: String::new(),
+            chat_id,
+        };
+
+        for c in ['h', 'e', 'y', 'n'] {
+            app.handle_key_event(key(c));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(rx.try_recv().is_err(), "a plain key answered the prompt");
+        assert!(matches!(app.overlay, TuiOverlay::FingerprintVerify { .. }));
+
+        // Esc puts the prompt away without answering; it stays queued and
+        // the tick does not immediately pop it back up.
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(rx.try_recv().is_err());
+        assert!(app.chat_manager.pending_fingerprint().is_some());
+        app.tick();
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.chat_manager.get_chat(chat_id).is_some());
+    }
+
+    /// TUI-03: a pasted newline is not Enter. Pasting a block that happened
+    /// to contain ":clear-history\n" used to run it.
+    #[test]
+    fn a_paste_is_text_never_keystrokes() {
+        let mut app = app();
+        app.handle_paste(":clear-history\ny\n");
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert_eq!(app.mode, TuiMode::Normal);
+        assert_eq!(app.input_field.text(), ":clear-history\ny\n");
+
+        // In command mode a multi-line paste collapses to one line and is
+        // still not executed.
+        let mut app = self::app();
+        app.enter_command_mode();
+        app.handle_paste("quit\nnow");
+        assert_eq!(app.mode, TuiMode::Command);
+        assert!(!app.should_quit);
+        assert_eq!(app.command_field.text(), "quit now");
+    }
+
+    /// TUI-04 / JOURNEY-02: the first-run password prompt cannot be waved
+    /// away, because nothing — not the identity, not the history — can be
+    /// saved without it.
+    #[test]
+    fn the_first_run_password_prompt_cannot_be_dismissed() {
+        let mut app = app();
+        assert!(!app.identity.is_encrypted());
+        app.overlay = TuiOverlay::Password {
+            mode: PasswordMode::Set,
+        };
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.overlay,
+            TuiOverlay::Password {
+                mode: PasswordMode::Set
+            }
+        );
+        assert!(!app.should_quit);
+        app.handle_key_event(ctrl('q'));
+        assert!(app.should_quit);
+    }
+
+    /// JOURNEY-03: `:wipe` checks the password, asks once more (Ctrl+Y only),
+    /// then deletes everything and quits.
+    #[tokio::test]
+    async fn wipe_checks_the_password_confirms_then_deletes_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        // Generated, not written out: the test needs a right and a wrong one.
+        let password = format!("pw-{}", Uuid::new_v4());
+        let wrong = format!("pw-{}", Uuid::new_v4());
+        let mut app = app();
+        app.history_path = dir.path().join("history.json.enc");
+        app.identity_path = dir.path().join("identity.json");
+        let mut identity = Identity::new_with_plaintext("T".into()).unwrap();
+        identity.encrypt(&password).unwrap();
+        identity.save(&app.identity_path).unwrap();
+        app.identity = identity;
+        std::fs::write(&app.history_path, b"h").unwrap();
+
+        app.execute_command(TuiCommand::Wipe {
+            password: wrong.clone(),
+        })
+        .await;
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.identity_path.exists());
+
+        app.execute_command(TuiCommand::Wipe {
+            password: password.clone(),
+        })
+        .await;
+        assert_eq!(app.overlay, TuiOverlay::ConfirmWipe);
+        app.handle_key_event(key('y')); // plain y cancels
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.identity_path.exists() && !app.should_quit);
+
+        app.execute_command(TuiCommand::Wipe {
+            password: password.clone(),
+        })
+        .await;
+        app.handle_key_event(ctrl('y'));
+        assert!(app.should_quit);
+        assert!(!app.identity_path.exists());
+        assert!(!app.history_path.exists());
+        app.shutdown_save();
+        assert!(
+            !app.history_path.exists(),
+            "the exit save must not recreate it"
+        );
+    }
+
+    /// PERF-03: autosave rewrote the whole history every 30 s even when
+    /// nothing had changed. An unchanged state is not written again.
+    #[test]
+    fn autosave_skips_an_unchanged_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.history_path = dir.path().join("history.json.enc");
+        // `TuiApp::new` reads the machine's real data dir; whatever it found
+        // there is not this test's business.
+        app.chat_manager.history_load_error = None;
+        let key: [u8; 32] = rand::random();
+        app.chat_manager.set_history_key(key);
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "A".into());
+
+        app.last_save = None;
+        app.autosave();
+        assert!(app.history_path.exists(), "the first save is written");
+        std::fs::remove_file(&app.history_path).unwrap();
+
+        // Due again, nothing changed: no write.
+        app.last_save = None;
+        app.autosave();
+        assert!(
+            !app.history_path.exists(),
+            "an unchanged history was rewritten"
+        );
+
+        // A change is written.
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "B".into());
+        app.last_save = None;
+        app.autosave();
+        assert!(app.history_path.exists());
     }
 
     #[tokio::test]

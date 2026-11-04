@@ -182,6 +182,26 @@ fn render_chat_list(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.chat_list_state);
 }
 
+/// Bytes of one message's text drawn in the messages pane. A peer can send a
+/// text of about 24 MiB; drawn whole it was copied twice and word-wrapped on
+/// every 100 ms frame, which froze the terminal while that chat was selected
+/// (PERF-02). The full text stays in the history.
+const MAX_RENDER_TEXT_BYTES: usize = 8 * 1024;
+
+/// `text`, cut to [`MAX_RENDER_TEXT_BYTES`] on a character boundary with a
+/// note saying how much was left out.
+fn render_text(text: &str) -> String {
+    if text.len() <= MAX_RENDER_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut cut = MAX_RENDER_TEXT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let rest_kib = (text.len() - cut).div_ceil(1024);
+    format!("{} [… {rest_kib} KiB more not shown]", &text[..cut])
+}
+
 fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
@@ -212,7 +232,7 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             ("Peer ", Color::Green)
         };
         let mut content = match &msg.content {
-            MessageContent::Text { text } => text.clone(),
+            MessageContent::Text { text } => render_text(text),
             MessageContent::File { filename, size, .. } => {
                 format!("📎 {} ({})", filename, crate::util::format_size(*size))
             }
@@ -433,7 +453,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ui, wrapped_rows};
+    use super::{render_text, ui, wrapped_rows, MAX_RENDER_TEXT_BYTES};
     use crate::logbuf::LogBuffer;
     use crate::tui::app::{TuiApp, TuiFocus};
     use crate::tui::overlays::{PasswordMode, TuiOverlay};
@@ -479,6 +499,7 @@ mod tests {
             },
             TuiOverlay::ConfirmQuit,
             TuiOverlay::ConfirmClearHistory,
+            TuiOverlay::ConfirmWipe,
         ];
         for ov in overlays {
             let mut app = TuiApp::new(LogBuffer::new()).expect("app");
@@ -494,6 +515,15 @@ mod tests {
         app.chat_ids = vec![stale_id];
         app.chat_list_state.select(Some(0));
         draw_once(&mut app);
+    }
+
+    #[test]
+    fn a_huge_message_is_cut_for_drawing() {
+        let text = "é".repeat(20_000); // 40 KB, two bytes per char
+        let shown = render_text(&text);
+        assert!(shown.len() < MAX_RENDER_TEXT_BYTES + 64);
+        assert!(shown.ends_with("KiB more not shown]"));
+        assert_eq!(render_text("short"), "short");
     }
 
     #[test]

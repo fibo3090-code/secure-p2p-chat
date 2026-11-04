@@ -20,8 +20,9 @@ use uuid::Uuid;
 use crate::core::{recv_packet, send_packet, AesCipher};
 use crate::network::client_handshake;
 
-/// Trust tier of a server / stored message. A property of the server, surfaced
-/// prominently in the UI.
+/// Trust tier of a server / stored message. A property of the server. Only
+/// `Administered` exists today; both shells disclose it as "the operator can
+/// read messages" on every community screen rather than reading this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrustTier {
     /// Server stores plaintext; enables offline buffering, search, admin-read.
@@ -159,9 +160,10 @@ pub struct Envelope {
 /// Role::Admin` reads as "at least an admin". Every check in the server is
 /// written that way.
 ///
-/// The server has exactly one [`Role::Owner`]: the first identity to join, which
-/// is the operator (they start the server, then join it). The owner cannot be
-/// demoted — otherwise an admin could strip the operator of their own server —
+/// The server has exactly one [`Role::Owner`]: the operator, who claims it by
+/// joining with the one-time owner claim token the server prints (or whose
+/// fingerprint the server was started with). Being first to join grants
+/// nothing. The owner cannot be demoted — otherwise an admin could strip the operator of their own server —
 /// and a second owner is never created.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Hash,
@@ -426,6 +428,12 @@ pub enum PartyRequest {
         member: Option<Uuid>,
         perms: FilePermissions,
     },
+    /// The file listing from `offset` on (newest first). Sent by a client
+    /// only after a [`PartyResponse::Files`] came back holding exactly
+    /// [`MAX_FILE_LISTING`] entries, i.e. possibly truncated — so an older
+    /// server, which never truncates, is not sent a request it cannot decode
+    /// (audit SRV-01).
+    ListFilesPage { offset: u32 },
 }
 
 /// What a member may do with one shared file.
@@ -649,7 +657,23 @@ pub enum PartyResponse {
         total: u64,
         data: Vec<u8>,
     },
+    /// One page of the file listing (reply to [`PartyRequest::ListFilesPage`]
+    /// only, never unsolicited: an older client cannot decode it). `next` is
+    /// the offset to ask for to continue, `None` at the end.
+    FilesPage {
+        files: Vec<FileEntry>,
+        offset: u32,
+        next: Option<u32>,
+    },
 }
+
+/// Most entries one [`PartyResponse::Files`] or [`PartyResponse::FilesPage`]
+/// carries. A `Files` reply holding exactly this many may be truncated, which
+/// is the client's cue to page on with [`PartyRequest::ListFilesPage`].
+pub const MAX_FILE_LISTING: usize = 2_000;
+
+/// Byte budget for one file listing page — half a frame.
+pub const FILE_LISTING_BYTES: usize = 4 * 1024 * 1024;
 
 /// Most envelopes the server will put in one `History` response.
 ///
@@ -658,7 +682,103 @@ pub enum PartyResponse {
 /// send failed, the connection dropped, and the community became unjoinable
 /// with no error the user could see. History is paged instead — the client asks
 /// again with `since_seq` set to the last envelope it received.
+///
+/// A count alone does not bound a page, though: 200 envelopes of 64 KiB text
+/// are 12.8 MiB, well past the frame limit, so a page is also capped by its
+/// encoded size ([`HISTORY_PAGE_BYTES`]). See [`take_history_page`].
 pub const MAX_HISTORY_BATCH: usize = 200;
+
+/// Bytes a Party frame adds around its serialized payload: the frame sequence
+/// carried inside the encryption, the AES-GCM nonce and the tag.
+pub const PARTY_FRAME_OVERHEAD: usize =
+    PARTY_SEQ_BYTES + crate::AES_NONCE_SIZE + crate::AES_GCM_TAG_SIZE;
+
+/// The largest serialized request or response that still fits in one frame
+/// ([`crate::MAX_PACKET_SIZE`] less [`PARTY_FRAME_OVERHEAD`]).
+///
+/// Anything larger cannot be sent at all: `send_packet` refuses it, and on the
+/// server a refused send ends the connection.
+pub const MAX_PARTY_PAYLOAD_BYTES: usize = crate::MAX_PACKET_SIZE - PARTY_FRAME_OVERHEAD;
+
+/// Byte budget for the envelopes of one `History` page — half a frame, which
+/// leaves room for the response's own framing with a wide margin.
+///
+/// Pages used to be capped only by count, and one member posting about 130
+/// maximum-size messages was enough to make every page that covered them
+/// unsendable. Every client fetches history on join, and a reply that cannot
+/// be sent ends the connection, so the community became unjoinable for
+/// everyone, durably, until someone edited the database by hand.
+pub const HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Text that stands in for an envelope too large to fit in any page.
+///
+/// Nothing the server accepts today is that large — text is capped at 64 KiB
+/// and file metadata at a few hundred bytes — but a database written by an
+/// older server may hold one, and the alternative to a placeholder is a page
+/// that can never be sent and a history nobody can page past.
+pub const OVERSIZED_ENVELOPE_TEXT: &str = "[this message is too large to deliver]";
+
+/// Encoded size of `value` on the wire (bincode), for byte budgets.
+pub fn encoded_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    bincode::serialized_size(value)
+        .ok()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Build one `History` page from `envelopes` (ascending by seq, all after the
+/// requested `since_seq`): at most [`MAX_HISTORY_BATCH`] of them and at most
+/// [`HISTORY_PAGE_BYTES`] encoded, but always at least one when any remain, so
+/// paging can never stall.
+///
+/// An envelope that alone exceeds the budget is replaced by a placeholder with
+/// the same sequence number (see [`OVERSIZED_ENVELOPE_TEXT`]), so the client's
+/// next request starts after it.
+pub fn take_history_page<'a, I>(envelopes: I) -> Vec<Envelope>
+where
+    I: IntoIterator<Item = &'a Envelope>,
+{
+    let mut page = Vec::new();
+    let mut used = 0usize;
+    for env in envelopes.into_iter().take(MAX_HISTORY_BATCH) {
+        let mut size = encoded_len(env);
+        let env = if size > HISTORY_PAGE_BYTES {
+            let stub = Envelope {
+                payload: MessagePayload::Text(OVERSIZED_ENVELOPE_TEXT.to_string()),
+                ..env.clone()
+            };
+            size = encoded_len(&stub);
+            stub
+        } else {
+            env.clone()
+        };
+        if !page.is_empty() && used.saturating_add(size) > HISTORY_PAGE_BYTES {
+            break;
+        }
+        used = used.saturating_add(size);
+        page.push(env);
+    }
+    page
+}
+
+/// Whether the server may have more history after this page, so the client
+/// should ask again from its last seq.
+///
+/// A page is cut short either by count ([`MAX_HISTORY_BATCH`]) or by size
+/// ([`HISTORY_PAGE_BYTES`]). A page cut for size holds more than the budget
+/// less one envelope, and the largest envelope is tiny next to the budget, so
+/// "more than half the budget" recognises every such page. The cost of a false
+/// positive — a genuinely final page that happens to be large — is one empty
+/// reply; the cost of the old count-only test was that a client stopped
+/// paging at the first page the server had trimmed.
+pub fn history_page_may_continue(page: &[Envelope]) -> bool {
+    page.len() >= MAX_HISTORY_BATCH
+        || page
+            .iter()
+            .map(encoded_len)
+            .fold(0usize, usize::saturating_add)
+            > HISTORY_PAGE_BYTES / 2
+}
 
 impl PartyRequest {
     /// Serialize to bytes for transport inside the encrypted tunnel.
@@ -761,7 +881,8 @@ where
 {
     let ciphertext = recv_packet(stream).await?;
     let plaintext = cipher
-        .decrypt(&ciphertext, Some(transport_aad))
+        // Only the other side's frames: a reflected one of ours is refused.
+        .decrypt_from_peer(&ciphertext, Some(transport_aad))
         .ok_or_else(|| anyhow::anyhow!("failed to decrypt Party frame"))?;
     if plaintext.len() < PARTY_SEQ_BYTES {
         anyhow::bail!("Party frame is too short to carry a sequence number");
@@ -945,6 +1066,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::NonceRole;
+
+    /// A session key for a test: generated, because a test needs *a* key
+    /// shared by both ends, not a particular one.
+    fn test_key() -> [u8; 32] {
+        let key: [u8; 32] = rand::random();
+        key
+    }
 
     fn sample_envelope() -> Envelope {
         Envelope {
@@ -969,6 +1098,7 @@ mod tests {
                 password: None,
             },
             PartyRequest::ListMembers,
+            PartyRequest::ListFilesPage { offset: 2_000 },
             PartyRequest::ListChannels,
             PartyRequest::PostMessage {
                 channel: Uuid::new_v4(),
@@ -1105,6 +1235,11 @@ mod tests {
             PartyResponse::JoinRejected {
                 reason: "wrong password".to_string(),
             },
+            PartyResponse::FilesPage {
+                files: Vec::new(),
+                offset: 2_000,
+                next: None,
+            },
             PartyResponse::Members(vec![MemberInfo {
                 id: Uuid::new_v4(),
                 username: "alice".to_string(),
@@ -1153,7 +1288,9 @@ mod tests {
 
     #[tokio::test]
     async fn framed_message_roundtrips_over_a_tunnel() {
-        let cipher = AesCipher::new(&[3u8; 32]).unwrap();
+        let key = test_key();
+        let cipher = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let aad = b"transport|party-test";
         let (mut a, mut b) = tokio::io::duplex(4096);
         let mut tx_seq = FrameSeq::new();
@@ -1166,9 +1303,7 @@ mod tests {
         send_framed(&mut a, &cipher, aad, &mut tx_seq, &req.to_bytes())
             .await
             .unwrap();
-        let bytes = recv_framed(&mut b, &cipher, aad, &mut rx_seq)
-            .await
-            .unwrap();
+        let bytes = recv_framed(&mut b, &peer, aad, &mut rx_seq).await.unwrap();
         assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
 
         // A frame decrypted under the wrong AAD must fail to authenticate.
@@ -1181,7 +1316,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(recv_framed(&mut b, &cipher, b"wrong-aad", &mut rx_seq)
+        assert!(recv_framed(&mut b, &peer, b"wrong-aad", &mut rx_seq)
             .await
             .is_err());
     }
@@ -1191,7 +1326,9 @@ mod tests {
     /// the Party tunnel now does too.
     #[tokio::test]
     async fn a_replayed_party_frame_is_rejected() {
-        let cipher = AesCipher::new(&[7u8; 32]).unwrap();
+        let key = test_key();
+        let cipher = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let aad = b"transport|replay-test";
         let mut tx_seq = FrameSeq::new();
 
@@ -1209,16 +1346,41 @@ mod tests {
 
         let mut rx_seq = FrameSeq::new();
         let mut once = captured.as_slice();
-        recv_framed(&mut once, &cipher, aad, &mut rx_seq)
+        recv_framed(&mut once, &peer, aad, &mut rx_seq)
             .await
             .expect("the first delivery is accepted");
 
         // Same bytes again: authenticates fine, but the sequence has not moved.
         let mut again = captured.as_slice();
-        let err = recv_framed(&mut again, &cipher, aad, &mut rx_seq)
+        let err = recv_framed(&mut again, &peer, aad, &mut rx_seq)
             .await
             .expect_err("a replayed frame must be refused");
         assert!(err.to_string().contains("replayed or out-of-order"));
+    }
+
+    /// NET-01: both directions share a key, so a frame we sent, echoed back,
+    /// used to authenticate as the other side's.
+    #[tokio::test]
+    async fn a_reflected_party_frame_is_rejected() {
+        let key = test_key();
+        let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let aad = b"transport|reflect-test";
+        let mut tx_seq = FrameSeq::new();
+        let mut captured: Vec<u8> = Vec::new();
+        send_framed(
+            &mut captured,
+            &ours,
+            aad,
+            &mut tx_seq,
+            &PartyRequest::ListMembers.to_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut rx_seq = FrameSeq::new();
+        let mut echoed = captured.as_slice();
+        assert!(recv_framed(&mut echoed, &ours, aad, &mut rx_seq)
+            .await
+            .is_err());
     }
 
     #[test]
@@ -1286,5 +1448,59 @@ mod tests {
             PartyResponse::Members(ref m) if m.is_empty()
         ));
         server.await.unwrap();
+    }
+
+    fn text_envelope(seq: u64, text: String) -> Envelope {
+        Envelope {
+            tier: TrustTier::Administered,
+            sender: Uuid::nil(),
+            channel: Uuid::nil(),
+            seq,
+            timestamp: 0,
+            payload: MessagePayload::Text(text),
+        }
+    }
+
+    /// 200 envelopes of 64 KiB text are 12.8 MiB — far past the frame limit.
+    /// A page must stop at the byte budget, make progress, and fit in a frame.
+    #[test]
+    fn a_history_page_is_bounded_by_bytes_as_well_as_count() {
+        let all: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
+            .map(|seq| text_envelope(seq, "x".repeat(crate::MAX_TEXT_MESSAGE_BYTES)))
+            .collect();
+        let page = take_history_page(all.iter());
+        assert!(!page.is_empty());
+        assert!(page.len() < MAX_HISTORY_BATCH, "trimmed for size");
+        let frame = PartyResponse::History(page.clone()).to_bytes();
+        assert!(frame.len() <= MAX_PARTY_PAYLOAD_BYTES);
+        assert!(
+            history_page_may_continue(&page),
+            "a trimmed page tells the client to ask again"
+        );
+        // Contiguous from the start, so paging resumes exactly after it.
+        for (i, env) in page.iter().enumerate() {
+            assert_eq!(env.seq, i as u64 + 1);
+        }
+
+        // A small final page does not ask for more.
+        let small = take_history_page([text_envelope(1, "hi".to_string())].iter());
+        assert_eq!(small.len(), 1);
+        assert!(!history_page_may_continue(&small));
+    }
+
+    /// An envelope too large for any page (only an old database can hold one)
+    /// becomes a placeholder at the same seq instead of stalling paging.
+    #[test]
+    fn an_oversized_envelope_becomes_a_placeholder_rather_than_a_stuck_page() {
+        let huge = text_envelope(7, "x".repeat(HISTORY_PAGE_BYTES + 1));
+        let next = text_envelope(8, "after".to_string());
+        let page = take_history_page([huge, next].iter());
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].seq, 7);
+        assert_eq!(
+            page[0].payload,
+            MessagePayload::Text(OVERSIZED_ENVELOPE_TEXT.to_string())
+        );
+        assert_eq!(page[1].seq, 8);
     }
 }

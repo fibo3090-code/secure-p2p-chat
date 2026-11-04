@@ -8,9 +8,12 @@ license.workspace = true
 authors.workspace = true
 
 [lib]
-# The shared library the binary and (future) mobile entry points call into.
+# The library the binary calls into. Only `rlib`: the `staticlib`/`cdylib`
+# types exist for Tauri *mobile* entry points, which this project does not
+# ship, and they cost ~1.8 GB of build output per profile (audit DX-03). Add
+# them back when mobile work starts.
 name = "p2pem_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -24,9 +27,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # App orchestration lives in the client lib (ChatManager, persistence); the
-# bridge reuses it directly. NOTE (tech debt, see Phase 1 spec): this pulls in
-# egui/ratatui transitively. A later phase should extract ChatManager into a
-# UI-agnostic crate so the webview build doesn't compile the legacy GUIs.
+# bridge reuses it directly. ChatManager itself has no UI dependency, but the
+# crate also holds the terminal UI, so this pulls in ratatui and its crossterm
+# backend transitively (egui is gone; `cargo tree` must show none). Extracting
+# the app core into its own crate would drop them from the desktop build.
 p2pem-classic = { path = "../../client" }
 messenger-core = { workspace = true }
 

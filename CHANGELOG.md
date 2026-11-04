@@ -13,6 +13,98 @@ predate tagged releases.
 
 ### Security
 
+- **Community servers can now limit how long they keep history.**
+  `--retain-days <DAYS>` deletes messages and shared files older than that, at
+  startup and hourly (each channel and DM keeps its newest message, so
+  numbering never restarts). Without it, history is still kept indefinitely.
+- **A community's full file list is reachable again.** The listing was capped
+  to fit one frame; a client now pages through the rest. Older servers and
+  clients are unaffected.
+
+- **Community screens now say that the server's operator can read them.**
+  Channel messages, community DMs and shared files are stored on the server
+  unencrypted; the app said so only on the join screen. Every community view
+  now carries an "Operator can read messages" badge, community DMs carry a
+  note, and the README no longer claims every conversation is end-to-end
+  encrypted.
+- **"Delete Everything" now exists.** The guide described it, but nothing
+  implemented it. Settings → Delete all data (password plus typing `DELETE`)
+  and the terminal client's `:wipe` remove the identity, history, saved
+  communities and diagnostics, then quit; nothing written afterwards can put a
+  history file back. Only files the app wrote are removed, and the folder only
+  if that empties it. The guide now lists where each app keeps its data and
+  says plainly that uninstalling removes nothing.
+
+- **The safety code could be forged by a man in the middle.** The six digits
+  and three emoji were derived from both sides' temporary keys with nothing
+  stopping an attacker from choosing its key after seeing the victim's, so it
+  could try keys until both victims saw the same code (well under a second for
+  the digits alone). Protocol v4 makes the connecting side commit to its key
+  before seeing the other's. Older (v3) peers still connect, but the app now
+  warns that their safety code is a weak check and the fingerprint should be
+  compared instead.
+
+- **One idle connection could make a host unreachable.** The listener accepted
+  a single connection and closed the port while that connection's handshake
+  ran, so a connection that sent nothing kept everyone else out for 15 seconds
+  at a time, indefinitely. The host now keeps listening while up to four
+  handshakes run, each with one overall 20-second deadline, and applies the
+  per-address rate limit before a connection takes a slot. A wrong connection
+  password no longer ends hosting; it is reported and the host keeps
+  listening.
+
+- **A frame you sent could be echoed back and accepted as your peer's.** Both
+  directions of a session share one key, so anyone on the path (a bridging
+  relay, hostile Wi-Fi) could reflect your own "yes" back to you as the
+  peer's reply, mark your messages delivered with your own receipts, or end
+  the session with your own key rotation. Each side now refuses frames that
+  carry its own direction bit, on direct sessions and community connections
+  alike. Wire-compatible with existing peers.
+- **A client could force the host to rotate keys.** Only the host rotates the
+  session key; a `Rekey` from the client is now ignored.
+
+- **Whoever joined a new community first became its permanent owner** — and
+  servers were open by default, listening on every interface. Anyone who
+  reached the address before the operator (a scanner, anyone the address
+  leaked to) owned the community: appointed its admins, read its private
+  channels and audit log, and could not be removed without editing the
+  database. Being first now grants nothing. Until a community has an owner the
+  server prints a one-time owner claim token; the operator joins with it in the
+  password field. Alternatively `--owner <fingerprint>` names the owner
+  outright, and also moves ownership back from whoever holds it. A community
+  that predates roles is no longer handed to a random member either. The
+  server now refuses to start without a password unless `--open` is passed
+  explicitly.
+- **One community member could make a community permanently unjoinable.**
+  History pages were capped at 200 messages but not by size, so about 130
+  long posts made every page that covered them too large to send — and a
+  reply the server cannot send ends the connection. Every client fetches
+  history on join, so everyone was disconnected on joining, and the history
+  was durable, so it survived restarts. A file's MIME type was also stored
+  exactly as sent, so a single upload could do the same to the live broadcast,
+  disconnecting every online member at once. Pages are now limited by size as
+  well as count (and the apps keep paging when a page was trimmed), file
+  names and types are bounded when a file arrives (and repaired on load in
+  existing databases), the member directory, private-channel lists and file
+  listing are capped to fit, and a reply that still does not fit becomes an
+  error instead of a disconnect.
+- **One community member can no longer flood everyone else.** Only channel
+  creation was rate-limited; any member could post maximum-size messages and
+  DMs, re-share files or change permissions as fast as their connection
+  allowed, each one written to disk while every other member waited. Each
+  member now has a budget for writes and for message text (generous for a
+  person, tight for a script); a message over it is refused and taken back
+  off the sender's screen with a "sending too fast" notice.
+- **Anyone who could reach a community server could exhaust it without
+  joining.** Connections had no time limits and there was no cap on how many
+  could be open: a socket that finished the handshake and never joined was
+  held forever, so one address within the reconnect limit could use up the
+  server's file descriptors in under an hour, after which nobody could join.
+  Unjoined connections are now closed after 30 seconds, the handshake and
+  every write have deadlines, idle-but-dead connections are detected with TCP
+  keepalive, and the server caps connections overall (512) and per address
+  (32).
+
 - **A peer could impersonate any contact whose public key it knew.** A
   public key was fingerprinted from the first key block found in its text,
   while signatures were checked against the key the PEM parser returned, and
@@ -71,15 +163,84 @@ predate tagged releases.
 
 ### Performance
 
+- **The desktop app no longer refetches every conversation four times a
+  second while a file transfers.** Transfer progress now has its own light
+  event; only the transfer list is refreshed. Message times use one cached
+  formatter instead of building one per message per refresh.
+- **One very large message no longer slows everything down.** The sidebar
+  preview is cut to 200 characters, the chat pane shows at most 256 KiB of a
+  message (with a note; the history keeps all of it), and the terminal client
+  draws at most 8 KiB of one.
+- **The terminal client no longer rewrites its whole history every 30
+  seconds.** It saves only when something changed, and writes in the
+  background instead of freezing the interface; saving also makes three fewer
+  full copies of the history.
+- **Joining a community with a long channel is no longer quadratic.** History
+  pages are merged in linear time.
+
 - **Sending or downloading a large file on a community server no longer slows
   the server down for everyone else.** Both moved their bytes while holding the
   lock that every other member's messages wait behind, so one 100 MB transfer
   stalled the whole community for its duration. The bytes now move outside it.
 - **A download was reading the entire file for each small piece it sent** —
   about 160 GB of disk reads for one 100 MB file.
+- **A community server's database no longer syncs to disk several times per
+  message.** It ran SQLite in its slowest durable mode, one commit per
+  statement and a fresh parse of every statement, all while holding the lock
+  every member waits behind — enough to cap a whole community at a few dozen
+  to a hundred messages a second. It now uses write-ahead logging with
+  `synchronous=NORMAL` (safe against a crash; a power cut can lose the last
+  few commits, never corrupt the file), caches its statements, and commits
+  each change — a DM, a channel deletion, an upload — as one transaction, so a
+  crash part-way through can no longer leave half of it on disk.
+- **A community server's memory no longer grows with its entire history.**
+  Every message ever posted was kept in memory and re-read at every start.
+  The server now keeps only the newest few hundred messages of each channel
+  and conversation in memory and reads older pages from its database when
+  someone scrolls back; startup reads only those tails, and one damaged
+  message in the database is skipped instead of stopping the server from
+  starting. Catching up on a long channel no longer scans it from the first
+  message for every page.
 
 ### Fixed
 
+- **A slow community member's app could silently stop receiving messages.**
+  When a member fell 256 updates behind, the server stopped sending them
+  broadcasts, DMs and directory changes, but left the connection open and
+  kept answering their requests — so the app looked connected while nothing
+  new ever arrived, and they could be shown offline while still there. The
+  server now closes such a connection, so the app reconnects and catches up.
+- **TUI: a peer could be trusted by accident.** The fingerprint prompt opens on
+  its own, under whatever you are typing, and `y` or `Enter` accepted it. It
+  now takes `Ctrl+Y` / `Ctrl+N`; `Esc` puts it away without answering.
+- **TUI: dismissing the first-run password prompt lost everything.** No
+  identity was ever saved, so every launch was a new peer and the previous
+  history was overwritten. The prompt can no longer be dismissed (`Ctrl+Q`
+  quits).
+- **TUI: `:set-password` replaced the password without asking for the current
+  one.** It now only protects an unprotected identity; `:change-password
+  <current> <new>` changes an existing one.
+- **TUI: a multi-line paste was typed as keystrokes**, sending each line and
+  running any line that started with `:`. Bracketed paste now inserts text.
+- **TUI: a startup error or panic left the terminal in raw mode** on the
+  alternate screen, hiding the error message. The terminal is restored first.
+- **TUI: community messages could be posted but never read.** The `:party`
+  pane now lists channels and direct-message threads and shows their messages.
+- **TUI: joining a community froze the interface** until the connection
+  succeeded or timed out. It now connects in the background.
+
+- **A message could go to a conversation other than the one on screen.** When
+  you switched conversations quickly, a slow load of the previous one could
+  replace the screen while the message box still sent to the new one. The
+  app now ignores stale loads and only sends to the conversation shown.
+- **An unreadable history file is no longer replaced with an empty one.**
+  If the history could not be read — written by a newer version, not fully
+  downloaded from a cloud folder, damaged — the app carried on with no
+  conversations and saved that emptiness over the file at the first
+  opportunity, losing every conversation, contact and verification. Now
+  nothing is saved over it: the app says so (a banner on desktop, the status
+  line in the terminal app) and lets you either restore the file or keep it
+  aside under a new name and start a new history.
 - **Image previews no longer fail to appear while another file is
   transferring.** Each progress update cancelled the preview being loaded and
   marked it as already fetched, so it was never shown.
@@ -181,6 +342,15 @@ predate tagged releases.
   step a timeout so a hung download fails instead of occupying a runner for six
   hours, and no longer builds the whole workspace on three platforms to check a
   Markdown file.
+- A change that touches only the desktop shell's Rust code (`desktop/src-tauri/`)
+  now also runs the frontend tests. Those include the check that the commands
+  the web UI calls match the names and arguments the Rust side declares, and it
+  used to be skipped for exactly the change most likely to break it.
+- The release workflow's desktop build no longer hands the Tauri build action a
+  release tag and token. Given those, the action tries to create the GitHub
+  release and upload to it itself, which the build jobs' read-only token cannot
+  do, and which would bypass the sign-then-publish step even if it could. It now
+  only builds; the attest job remains the one place that publishes.
 
 ### Dependencies
 
@@ -212,6 +382,23 @@ predate tagged releases.
 - Corrected the documented limit on message size. `MAX_TEXT_MESSAGE_BYTES`
   (64 KiB) was described as a hard cap on a message; it is the threshold above
   which a message is split, and the real ceiling is about 24 MiB.
+- **Verifying a new contact now starts with the six-digit + emoji code** in the
+  user guide, the tutorial and SECURITY.md, matching what both apps show. The
+  64-character fingerprint and the safety grid are described as the advanced
+  check. The tutorial's `y`/`n` keys are corrected to `Ctrl+Y`/`Ctrl+N`.
+- `docs/protocol.md` now lists every community (Party) request and response
+  and documents chunked upload and download, and per-file permissions, as they
+  ship. It previously said chunked transfer was not implemented.
+- The community server's build output is `target/release/server` (shipped as
+  `p2pem-server`), not `target/release/messenger-server` as the user guide said.
+- THREAT_MODEL no longer says invite expiry is unenforced. Signed invites are
+  refused after 30 days; what is missing is revocation before that.
+- CONTRIBUTING now has one command that runs the same checks as CI
+  (`cargo nextest run --workspace --profile ci`, doctests, and the frontend lint
+  and tests), and DEVELOPER_GUIDE, the PR template and the README agree with it.
+- Smaller corrections: `docs/platform_spec.md` "Current State" re-verified at
+  1.16.2, and stale egui references removed from `design/tokens.json` and the
+  desktop crate's `Cargo.toml`.
 
 ## [1.16.2] - 2026-08-20
 

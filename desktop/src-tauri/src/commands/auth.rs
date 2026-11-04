@@ -198,6 +198,106 @@ pub(crate) fn set_display_name(
     Ok(auth_status(state))
 }
 
+/// Whether the history on disk failed to load this session.
+#[derive(serde::Serialize)]
+pub(crate) struct HistoryStatus {
+    /// `Some(reason)` when the file exists but could not be read. Saving is
+    /// blocked while this is set (see `ChatManager::history_load_error`), so
+    /// the UI must say so and offer [`set_aside_history`].
+    error: Option<String>,
+    /// Where the history lives, so the message can name the file.
+    path: String,
+}
+
+#[tauri::command]
+pub(crate) async fn history_status(
+    state: tauri::State<'_, Bridge>,
+) -> Result<HistoryStatus, String> {
+    ensure_ready(&state)?;
+    let mgr = state.manager.lock().await;
+    Ok(HistoryStatus {
+        error: mgr.history_load_error().map(str::to_string),
+        path: state.history_path.display().to_string(),
+    })
+}
+
+/// Move an unreadable history file aside (renamed, never deleted) and start a
+/// fresh history. Returns where the old file went.
+#[tauri::command]
+pub(crate) async fn set_aside_history(
+    state: tauri::State<'_, Bridge>,
+) -> Result<Option<String>, String> {
+    ensure_ready(&state)?;
+    let moved = state
+        .manager
+        .lock()
+        .await
+        .set_aside_unreadable_history(&state.history_path)
+        .map_err(|e| format!("Could not move the unreadable history aside: {e}"))?;
+    persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
+    Ok(moved.map(|p| p.display().to_string()))
+}
+
+/// What the user types to confirm deleting everything.
+pub(crate) const DELETE_CONFIRMATION: &str = "DELETE";
+
+/// Delete everything this app stores on this device — identity, encrypted
+/// history, saved communities, diagnostics — then quit (audit JOURNEY-03 /
+/// DOC-02: the guide promised this and nothing implemented it).
+///
+/// Guarded twice, because it cannot be undone and is the one action that
+/// destroys the identity itself: the password, checked against the file on
+/// disk, and the typed word `DELETE`. Communities and discovery are dropped
+/// first, then `ChatManager::delete_all_data` stops hosting and sessions,
+/// removes the files and refuses every later save, so the window-close flush
+/// cannot write a history file back.
+#[tauri::command]
+pub(crate) async fn delete_all_data<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    password: String,
+    confirm: String,
+    state: tauri::State<'_, Bridge>,
+) -> Result<(), String> {
+    ensure_ready(&state)?;
+    if confirm.trim() != DELETE_CONFIRMATION {
+        return Err(format!("Type {DELETE_CONFIRMATION} to confirm"));
+    }
+    let path = state.identity_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut on_disk = Identity::load(&path).map_err(|e| e.to_string())?;
+        on_disk
+            .decrypt(&password)
+            .map_err(|_| "Wrong password — nothing was deleted".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    {
+        let mut party = state.party.lock().await;
+        for id in party.server_ids() {
+            party.remove_server(id);
+        }
+    }
+    *crate::lock_or_recover(&state.discovery) = None;
+    let data_dir = state
+        .history_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    state
+        .manager
+        .lock()
+        .await
+        .delete_all_data(&data_dir, &state.history_path, &state.identity_path)
+        .map_err(|e| format!("Deleting data failed part-way: {e}"))?;
+    tracing::warn!("all local data deleted at the user's request; exiting");
+    // Not under the mock runtime: the test process is the app there.
+    #[cfg(not(test))]
+    app.exit(0);
+    let _ = app;
+    Ok(())
+}
+
 /// Export a backup copy of the encrypted identity file (identity.json) to a
 /// user-chosen location. The file is already encrypted at rest (Argon2 +
 /// ChaCha20-Poly1305), so the copy is as safe as the original — but it IS the

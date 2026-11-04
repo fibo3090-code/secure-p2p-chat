@@ -122,6 +122,32 @@ tokio-test = "0.4"
 tempfile = "3"
 proptest = "1"
 
+# Dev and test builds: optimise the crypto dependencies only. RSA key
+# generation and Argon2 were ~95% of all test time unoptimised; at opt-level 3
+# the core unit tests went from 133 s to 8 s (audit DX-01). The workspace's own
+# crates keep debug assertions and fast incremental builds.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.num-integer]
+opt-level = 3
+[profile.dev.package.num-traits]
+opt-level = 3
+
+# Line tables are enough for test-failure backtraces; full debuginfo made each
+# test binary ~240 MB and one build + test build ~18 GB (audit DX-03).
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = true

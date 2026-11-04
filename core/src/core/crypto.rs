@@ -525,8 +525,13 @@ const SAS_EMOJI: [&str; 32] = [
 /// two distinct handshakes whose transcripts (ephemeral keys, identity keys)
 /// differ, so the two victims see different codes. Reading the code aloud on
 /// any out-of-band channel therefore detects an interposed session — far less
-/// friction than comparing a 64-character fingerprint. ~35 bits shown; the
-/// attacker gets one guess per connection attempt.
+/// friction than comparing a 64-character fingerprint. ~35 bits shown.
+///
+/// The "one guess per connection attempt" property depends on the v4
+/// ephemeral-key commitment (`network::session::ephemeral_commitment`):
+/// without it, a man in the middle that has seen one victim's key can try its
+/// own until both codes match. A v3 handshake has no commitment, and the
+/// session warns the user that the code is weak (audit CRYPTO-02).
 pub fn derive_sas(transcript_material: &[u8]) -> String {
     let hkdf = Hkdf::<Sha256>::new(None, transcript_material);
     let mut out = [0u8; 5];
@@ -690,6 +695,23 @@ impl AesCipher {
         output.extend_from_slice(&nonce_bytes);
         output.extend_from_slice(&ciphertext);
         output
+    }
+
+    /// Decrypt a frame that must have been sent by the **other** side of the
+    /// session.
+    ///
+    /// Both directions share one key and one AAD; only the nonce's role bit
+    /// tells them apart, and plain [`decrypt`](Self::decrypt) ignores it. So a
+    /// frame we sent, echoed back by anyone on the path, authenticated as the
+    /// peer's — a user's own "yes" shown as the peer's reply, their own `Ack`
+    /// marking a message delivered, their own `Rekey` killing the session
+    /// (audit NET-01). Every tunnel receive goes through this.
+    pub fn decrypt_from_peer(&self, payload: &[u8], aad: Option<&[u8]>) -> Option<Vec<u8>> {
+        let first = *payload.first()?;
+        if first & 0x80 == self.role.nonce_bit() {
+            return None;
+        }
+        self.decrypt(payload, aad)
     }
 
     /// Decrypt payload with optional AAD: nonce(AES_NONCE_SIZE) || ciphertext || tag(AES_GCM_TAG_SIZE)

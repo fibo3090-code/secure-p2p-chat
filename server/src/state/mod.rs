@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use messenger_core::party::{
-    blob_hash, AuditEntry, BlobHasher, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
-    FilePermissions, MemberInfo, MessagePayload, QuotaInfo, Role, TrustTier, UploadTarget,
-    MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
+    blob_hash, encoded_len, take_history_page, AuditEntry, BlobHasher, ChannelInfo, ChannelKind,
+    Envelope, FileEntry, FileMeta, FilePermissions, MemberInfo, MessagePayload, QuotaInfo, Role,
+    TrustTier, UploadTarget, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES,
 };
 use messenger_core::util::{current_timestamp_millis, sanitize_filename};
 use rusqlite::{params, Connection};
@@ -38,12 +38,17 @@ use uuid::Uuid;
 
 mod blobs;
 mod db;
+mod history;
 #[cfg(test)]
 mod tests;
+mod write_rate;
 
 use blobs::*;
 pub use blobs::{BlobReadPlan, StagedUpload};
 use db::*;
+use history::{History, RESIDENT_HISTORY};
+use write_rate::WriteBuckets;
+pub use write_rate::{WriteRateLimit, DEFAULT_WRITE_RATE, WRITE_RATE_REFUSAL};
 
 /// Filename of the embedded SQLite database under the operator's data dir.
 const DB_FILE: &str = "party.db";
@@ -96,6 +101,74 @@ pub const MAX_CHANNEL_NAME_CHARS: usize = 64;
 /// paths agree, and bounds durable storage / broadcast fan-out per message.
 pub const MAX_MESSAGE_TEXT_BYTES: usize = messenger_core::MAX_TEXT_MESSAGE_BYTES;
 
+/// Most members one server will register.
+///
+/// The directory (`Members`) is one frame, sent on join and broadcast on every
+/// presence change, and it must fit in [`MAX_PARTY_PAYLOAD_BYTES`]. At most
+/// about 165 encoded bytes per member, 10,000 members are under 2 MiB. Without
+/// a ceiling an open server — where every new key is a new member — grew its
+/// directory until no client could receive it.
+pub const MAX_MEMBERS: usize = 10_000;
+/// Most members one private channel may list. The channel list (`Channels`)
+/// is one frame carrying every channel's membership; 128 channels of 1,000
+/// members encode to about 3 MiB.
+pub const MAX_PRIVATE_CHANNEL_MEMBERS: usize = 1_000;
+/// Longest MIME type the server stores, in bytes (RFC 6838 caps each half at
+/// 127 characters; a real type is a few dozen).
+///
+/// The type is copied into every file message, history page and `Files`
+/// listing, and it used to be stored exactly as sent: one upload with a MIME
+/// type just under 8 MiB made the live broadcast of its own message too large
+/// to send, disconnecting every online member, and every history page holding
+/// it unsendable for good.
+pub const MAX_MIME_BYTES: usize = 255;
+/// What a missing or malformed MIME type is stored as.
+pub const FALLBACK_MIME: &str = "application/octet-stream";
+/// Listing limits, shared with the client (it pages on when a reply is full).
+/// Shares are free (a re-share costs a reference, not storage), so the number
+/// of entries is otherwise unbounded.
+pub use messenger_core::party::{FILE_LISTING_BYTES, MAX_FILE_LISTING};
+
+/// Reduce a member-supplied MIME type to `type/subtype`, lowercase, or
+/// [`FALLBACK_MIME`] when it is not one.
+///
+/// Parameters (`; charset=...`) are dropped: no client uses them, and they are
+/// where an unbounded string would hide. The type is display metadata only —
+/// never a security decision — so normalising rather than refusing keeps an
+/// upload from a client with an odd guess working.
+pub fn normalize_mime(mime: &str) -> String {
+    let essence = mime.split(';').next().unwrap_or("").trim();
+    let restricted = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 127
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    match essence.split_once('/') {
+        Some((ty, sub)) if essence.len() <= MAX_MIME_BYTES && restricted(ty) && restricted(sub) => {
+            essence.to_ascii_lowercase()
+        }
+        _ => FALLBACK_MIME.to_string(),
+    }
+}
+
+/// Keep the leading entries of `items` that fit both `max_items` and
+/// `max_bytes` of encoded size, dropping the rest.
+fn truncate_listing<T: serde::Serialize>(items: &mut Vec<T>, max_items: usize, max_bytes: usize) {
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for item in items.iter().take(max_items) {
+        let size = encoded_len(item);
+        if used.saturating_add(size) > max_bytes {
+            break;
+        }
+        used += size;
+        keep += 1;
+    }
+    items.truncate(keep);
+}
+
 /// Why a join was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinError {
@@ -106,6 +179,8 @@ pub enum JoinError {
     /// Invisible or text-direction characters, which let one name pass for
     /// another (see [`messenger_core::util::has_hidden_characters`]).
     HiddenCharacters,
+    /// The server already has [`MAX_MEMBERS`] members.
+    ServerFull,
 }
 
 impl JoinError {
@@ -118,6 +193,7 @@ impl JoinError {
             JoinError::HiddenCharacters => {
                 "username contains invisible or text-direction characters"
             }
+            JoinError::ServerFull => "this server has reached its member limit",
         }
     }
 }
@@ -145,6 +221,11 @@ fn password_matches(expected: Option<&str>, supplied: Option<&str>) -> bool {
     }
 }
 
+/// A fresh one-time owner claim token: 122 random bits as 32 hex characters.
+fn new_owner_claim_token() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
 /// Reject a message whose text payload exceeds [`MAX_MESSAGE_TEXT_BYTES`], so a
 /// member cannot store or broadcast an oversized message. Applies to both channel
 /// posts and DMs.
@@ -168,8 +249,9 @@ struct Member {
     fingerprint: Option<String>,
     /// Presence is runtime-only and not persisted; members start offline on load.
     online: bool,
-    /// Authority on this server. The first member to join becomes [`Role::Owner`]
-    /// — that is the operator, who starts the server and then joins it.
+    /// Authority on this server. Only the operator becomes [`Role::Owner`]:
+    /// by joining with the owner claim token, or from the configured owner
+    /// fingerprint (see [`PartyState::owner_claim_token`]).
     role: Role,
 }
 
@@ -179,8 +261,9 @@ struct Channel {
     kind: ChannelKind,
     /// Explicit membership, consulted only for [`ChannelKind::Private`].
     members: Vec<Uuid>,
-    /// Durable history; index order is delivery order. `seq` is `index + 1`.
-    messages: Vec<Envelope>,
+    /// Durable history: the newest envelopes in memory, all of them in the
+    /// database. See [`History`].
+    history: History,
 }
 
 /// One share of a file into a channel or DM thread — the provenance record the
@@ -256,7 +339,7 @@ struct AuditRecord {
 /// A 1:1 direct-message thread, keyed by `messenger_core::party::dm_thread_id`.
 struct DmThread {
     id: Uuid,
-    messages: Vec<Envelope>,
+    history: History,
 }
 
 /// A content-addressed file blob. The bytes are deduplicated by content hash and
@@ -311,6 +394,16 @@ pub struct PartyState {
     max_member_blob_bytes: u64,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
     max_blob_bytes: u64,
+    /// Most members this server registers (see [`MAX_MEMBERS`]).
+    max_members: usize,
+    /// How many of each thread's newest envelopes stay in memory when there is
+    /// a database to page older ones from (see [`History`]).
+    resident_history: usize,
+    /// The fingerprint of the identity that owns this community, when the
+    /// operator configured one (see [`Self::set_owner_fingerprint`]).
+    owner_fingerprint: Option<String>,
+    /// The pending one-time owner claim (see [`Self::owner_claim_token`]).
+    owner_claim: Option<String>,
     /// When present, mutations are mirrored to this database.
     db: Option<Connection>,
     /// When present, blob bytes are mirrored to files under this directory.
@@ -321,6 +414,20 @@ pub struct PartyState {
     /// restart forgiving it costs nothing, because [`MAX_CHANNELS`] still bounds
     /// the total and the channels already made are still there.
     channel_creations: HashMap<Uuid, Vec<Instant>>,
+    /// Per-member write budgets (see [`WriteRateLimit`]).
+    write_rate: WriteBuckets,
+    /// How long messages and shared files are kept. `None` keeps everything
+    /// (see [`Self::prune_expired`]).
+    retention: Option<std::time::Duration>,
+}
+
+/// What one retention pass removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Messages deleted from the database (or from memory, without one).
+    pub messages: usize,
+    /// File shares removed; their bytes go once nothing else references them.
+    pub files: usize,
 }
 
 impl PartyState {
@@ -332,7 +439,7 @@ impl PartyState {
             name: "general".to_string(),
             kind: ChannelKind::Public,
             members: Vec::new(),
-            messages: Vec::new(),
+            history: History::new(),
         };
         Self {
             name: name.into(),
@@ -348,15 +455,63 @@ impl PartyState {
             reservations: HashMap::new(),
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
+            max_members: MAX_MEMBERS,
+            resident_history: RESIDENT_HISTORY,
+            owner_fingerprint: None,
+            // A fresh server has no members, so no Owner: it needs a claim.
+            owner_claim: Some(new_owner_claim_token()),
             db: None,
             blob_dir: None,
             channel_creations: HashMap::new(),
+            write_rate: WriteBuckets::default(),
+            retention: None,
         }
     }
 
     /// Override the per-member storage allowance (bytes of distinct content).
     pub fn set_max_member_blob_bytes(&mut self, bytes: u64) {
         self.max_member_blob_bytes = bytes;
+    }
+
+    /// Override how many of each thread's newest envelopes stay in memory on
+    /// a disk-backed server. Older ones are read from the database on demand.
+    pub fn set_resident_history(&mut self, envelopes: usize) {
+        self.resident_history = envelopes.max(1);
+    }
+
+    /// How many envelopes a thread may keep in memory, or `None` (all of
+    /// them) when there is no database to page the rest from.
+    fn history_cap(&self) -> Option<usize> {
+        self.db.as_ref().map(|_| self.resident_history)
+    }
+
+    /// Replace the per-member write budget; `None` turns it off (for an
+    /// in-process caller or a test that drives thousands of posts).
+    pub fn set_write_rate_limit(&mut self, limit: Option<WriteRateLimit>) {
+        self.write_rate.set_limit(limit);
+    }
+
+    /// Spend one write carrying `text_bytes` from `member`'s budget, or refuse
+    /// it. The dispatcher calls this before every mutating request; the state
+    /// methods themselves are not limited, so in-process callers are not.
+    pub fn check_write_rate(&mut self, member: Uuid, text_bytes: usize) -> Result<(), String> {
+        self.check_write_rate_at(member, text_bytes, Instant::now())
+    }
+
+    /// [`Self::check_write_rate`] against a caller-supplied clock.
+    pub fn check_write_rate_at(
+        &mut self,
+        member: Uuid,
+        text_bytes: usize,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.write_rate.check(member, text_bytes, now)
+    }
+
+    /// Override the member ceiling. It may only be lowered: [`MAX_MEMBERS`] is
+    /// what keeps the directory inside one frame.
+    pub fn set_max_members(&mut self, members: usize) {
+        self.max_members = members.min(MAX_MEMBERS);
     }
 
     /// Override the total-blob-storage ceiling (bytes of distinct content). Used
@@ -380,6 +535,7 @@ impl PartyState {
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;
+        configure_connection(&conn)?;
         init_schema(&conn)?;
 
         // One-time migration from the interim JSON snapshot into SQLite.
@@ -411,10 +567,11 @@ impl PartyState {
         if state.count_channels()? > 0 {
             // The database is authoritative; rebuild the in-memory model from it.
             state.reload_from_db()?;
-            // A community that predates roles reloads with nobody able to
-            // administer it; give it an owner rather than leaving governance
-            // permanently unreachable.
-            state.ensure_owner();
+            // A community with an Owner needs no claim; one without (fresh,
+            // or one that predates roles) keeps the token `new` issued. The
+            // old behaviour here — promoting the member with the lowest id —
+            // handed a random member a seat that cannot be taken back.
+            state.refresh_owner_claim();
         } else {
             // Fresh database: persist the seeded default `general` channel.
             let general = &state.channels[0];
@@ -447,6 +604,12 @@ impl PartyState {
     /// returning identity (matched by its handshake-verified fingerprint) or
     /// registers a new member with a unique, non-empty username. Returns the
     /// member id, marked online.
+    ///
+    /// Nobody becomes the Owner merely by being first. Ownership is granted
+    /// only to a join that proves it is the operator: one presenting the
+    /// one-time owner claim token in place of the password (see
+    /// [`Self::owner_claim_token`]), or one from the identity the operator
+    /// configured with [`Self::set_owner_fingerprint`].
     pub fn join(
         &mut self,
         username: &str,
@@ -463,7 +626,10 @@ impl PartyState {
         if messenger_core::util::has_hidden_characters(username) {
             return Err(JoinError::HiddenCharacters);
         }
-        if !password_matches(self.password.as_deref(), password) {
+        // The claim token stands in for the password: it is a stronger secret
+        // than any password, and the operator needs no separate field for it.
+        let claims_ownership = self.presents_owner_claim(password);
+        if !claims_ownership && !password_matches(self.password.as_deref(), password) {
             return Err(JoinError::WrongPassword);
         }
 
@@ -471,83 +637,175 @@ impl PartyState {
         // offline), so a reconnecting peer is recognised by its verified fingerprint
         // and reuses its existing membership — keeping its id and history — instead
         // of being locked out by its own offline entry as "username taken".
-        if let Some(fp) = fingerprint.as_deref() {
-            if let Some(existing) = self
-                .members
-                .values_mut()
+        let returning = fingerprint.as_deref().and_then(|fp| {
+            self.members
+                .values()
                 .find(|m| m.fingerprint.as_deref() == Some(fp))
-            {
-                existing.online = true;
-                return Ok(existing.id);
+                .map(|m| m.id)
+        });
+        let id = match returning {
+            Some(id) => {
+                if let Some(m) = self.members.get_mut(&id) {
+                    m.online = true;
+                }
+                id
             }
-        }
+            None => {
+                // A returning member above is always let back in; only a new
+                // one is refused at the ceiling.
+                if self.members.len() >= self.max_members {
+                    return Err(JoinError::ServerFull);
+                }
+                // New identity: the username must be free (case-insensitive).
+                if self
+                    .members
+                    .values()
+                    .any(|m| m.username.eq_ignore_ascii_case(username))
+                {
+                    return Err(JoinError::UsernameTaken);
+                }
+                let id = Uuid::new_v4();
+                let member = Member {
+                    id,
+                    username: username.to_string(),
+                    fingerprint,
+                    online: true,
+                    role: Role::Member,
+                };
+                self.persist_member(&member);
+                self.members.insert(id, member);
+                id
+            }
+        };
 
-        // New identity: the username must be free (case-insensitive).
-        if self
-            .members
-            .values()
-            .any(|m| m.username.eq_ignore_ascii_case(username))
-        {
-            return Err(JoinError::UsernameTaken);
-        }
-
-        let id = Uuid::new_v4();
-        // The first identity through the door is the operator: they started the
-        // server, so they are the one who owns it. Everyone after is a member.
-        // Without this bootstrap nobody could ever administer anything, because
-        // only an admin can promote an admin.
-        let role = if self.members.is_empty() {
-            Role::Owner
+        if claims_ownership {
+            self.with_tx(|s| {
+                s.make_owner(
+                    id,
+                    "role.claim",
+                    "claimed ownership with the owner claim token",
+                )
+            });
         } else {
-            Role::Member
-        };
-        let member = Member {
-            id,
-            username: username.to_string(),
-            fingerprint,
-            online: true,
-            role,
-        };
-        self.persist_member(&member);
-        self.members.insert(id, member);
+            self.with_tx(|s| s.apply_configured_owner());
+        }
         Ok(id)
     }
 
-    /// Make sure a populated server has somebody who can administer it.
-    ///
-    /// `join` only appoints an owner when the member table is empty, which is
-    /// right for a fresh server and wrong for every existing one: a community
-    /// that predates roles reloads with every member defaulted to `Member`, and
-    /// since `set_role` requires an admin, nobody could ever be promoted. The
-    /// operator would be locked out of governance on their own server,
-    /// permanently, with no way back short of editing the database by hand.
-    ///
-    /// The choice has to be deterministic across restarts, and registration
-    /// order is not recorded, so the lowest member id wins. It is recorded in
-    /// the audit log, because silently handing someone ownership is exactly the
-    /// sort of thing an operator should be able to see happened.
-    fn ensure_owner(&mut self) {
-        if self.members.is_empty() || self.members.values().any(|m| m.role.is_admin()) {
-            return;
+    /// Whether `password` is the pending owner claim token. Constant-time, for
+    /// the same reason the password compare is.
+    fn presents_owner_claim(&self, password: Option<&str>) -> bool {
+        use subtle::ConstantTimeEq;
+        match (self.owner_claim.as_deref(), password.map(str::trim)) {
+            (Some(token), Some(supplied)) => {
+                token.len() == supplied.len()
+                    && bool::from(token.as_bytes().ct_eq(supplied.as_bytes()))
+            }
+            _ => false,
         }
-        let Some(&chosen) = self.members.keys().min() else {
+    }
+
+    /// Whether this community has an Owner.
+    pub fn has_owner(&self) -> bool {
+        self.members.values().any(|m| m.role == Role::Owner)
+    }
+
+    /// The one-time token that makes whoever joins with it the Owner, while
+    /// this community has no Owner and no configured owner fingerprint.
+    ///
+    /// The first identity to join used to become the permanent, undemotable
+    /// Owner, on servers that by default had no password and listened on every
+    /// interface — so whoever reached the address before the operator did (a
+    /// scanner, anyone the address leaked to) owned the community: appointed
+    /// its admins, read its private channels and audit log, and could not be
+    /// removed short of editing `party.db` by hand. The operator prints this
+    /// token at startup and enters it in the password field on their first
+    /// join. It is never persisted: a restart before it is used issues a new
+    /// one, and it disappears the moment an Owner exists.
+    pub fn owner_claim_token(&self) -> Option<&str> {
+        self.owner_claim.as_deref()
+    }
+
+    /// Name the identity that owns this community, by its fingerprint (the one
+    /// the operator's app shows as theirs). `None` clears it.
+    ///
+    /// That member becomes the Owner when they join — or now, if they already
+    /// have — and any other Owner is moved to Admin. This is the operator's
+    /// recovery path for a community whose ownership went to the wrong
+    /// identity (a squatter on an older server, or a lost key): the server's
+    /// configuration outranks any member, because whoever controls it already
+    /// controls the data.
+    pub fn set_owner_fingerprint(&mut self, fingerprint: Option<String>) {
+        self.owner_fingerprint = fingerprint
+            .map(|fp| messenger_core::util::canonical_fingerprint(&fp))
+            .filter(|fp| !fp.is_empty());
+        self.with_tx(|s| s.apply_configured_owner());
+        self.refresh_owner_claim();
+    }
+
+    /// Promote the configured owner if they are a member and not yet Owner.
+    fn apply_configured_owner(&mut self) {
+        let Some(fp) = self.owner_fingerprint.clone() else {
             return;
         };
-        let name = {
-            let m = self.members.get_mut(&chosen).expect("just selected");
-            m.role = Role::Owner;
-            m.username.clone()
+        let Some(id) = self
+            .members
+            .values()
+            .find(|m| m.fingerprint.as_deref() == Some(fp.as_str()))
+            .map(|m| m.id)
+        else {
+            return;
         };
-        if let Some(m) = self.members.get(&chosen) {
+        if self.role_of(id) != Role::Owner {
+            self.make_owner(
+                id,
+                "role.configured",
+                "is the owner configured by the operator",
+            );
+        }
+    }
+
+    /// Make `id` the Owner, moving any other Owner to Admin (a server has
+    /// exactly one), and record it.
+    fn make_owner(&mut self, id: Uuid, action: &str, why: &str) {
+        let previous: Vec<Uuid> = self
+            .members
+            .values()
+            .filter(|m| m.role == Role::Owner && m.id != id)
+            .map(|m| m.id)
+            .collect();
+        for other in previous {
+            if let Some(m) = self.members.get_mut(&other) {
+                m.role = Role::Admin;
+            }
+            if let Some(m) = self.members.get(&other) {
+                self.persist_member(m);
+            }
+            let detail = format!("{} is now Admin (ownership moved)", self.username_of(other));
+            self.record_audit(id, "role.owner_moved", &detail);
+        }
+        let Some(m) = self.members.get_mut(&id) else {
+            return;
+        };
+        m.role = Role::Owner;
+        let name = m.username.clone();
+        if let Some(m) = self.members.get(&id) {
             self.persist_member(m);
         }
-        tracing::info!(
-            member = %chosen,
-            username = %name,
-            "this community had no admin (it predates roles); promoting its first member to owner"
-        );
-        let detail = format!("{name} became Owner (no administrator existed)");
-        self.record_audit(chosen, "role.bootstrap", &detail);
+        tracing::info!(member = %id, username = %name, "{name} {why}");
+        self.record_audit(id, action, &format!("{name} {why}"));
+        self.refresh_owner_claim();
+    }
+
+    /// Issue a claim token when the community needs one (no Owner, no
+    /// configured owner), and drop it when it does not.
+    fn refresh_owner_claim(&mut self) {
+        let needed = !self.has_owner() && self.owner_fingerprint.is_none();
+        match (needed, self.owner_claim.is_some()) {
+            (true, false) => self.owner_claim = Some(new_owner_claim_token()),
+            (false, true) => self.owner_claim = None,
+            _ => {}
+        }
     }
 
     /// A member's role, or [`Role::Guest`] for an unknown id (fail closed).
@@ -561,6 +819,10 @@ impl PartyState {
     /// strictly below your own), and always refuses to change the owner's — an
     /// admin who could demote the owner would own the server.
     pub fn set_role(&mut self, actor: Uuid, target: Uuid, role: Role) -> Result<String, String> {
+        self.with_tx(|s| s.set_role_in_tx(actor, target, role))
+    }
+
+    fn set_role_in_tx(&mut self, actor: Uuid, target: Uuid, role: Role) -> Result<String, String> {
         let actor_role = self.role_of(actor);
         if !actor_role.is_admin() {
             return Err("only admins may change roles".to_string());
@@ -765,7 +1027,7 @@ impl PartyState {
             name: name.to_string(),
             kind: ChannelKind::Public,
             members: Vec::new(),
-            messages: Vec::new(),
+            history: History::new(),
         };
         let info = ChannelInfo {
             id: channel.id,
@@ -842,7 +1104,18 @@ impl PartyState {
         creator: Uuid,
         name: &str,
         kind: ChannelKind,
-        mut members: Vec<Uuid>,
+        members: Vec<Uuid>,
+        now: Instant,
+    ) -> Result<ChannelInfo, String> {
+        self.with_tx(|s| s.create_channel_of_kind_in_tx(creator, name, kind, members, now))
+    }
+
+    fn create_channel_of_kind_in_tx(
+        &mut self,
+        creator: Uuid,
+        name: &str,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
         now: Instant,
     ) -> Result<ChannelInfo, String> {
         let role = self.role_of(creator);
@@ -855,6 +1128,8 @@ impl PartyState {
                 kind.label().to_lowercase()
             ));
         }
+        // Checked before the channel is made, so a refused list costs nothing.
+        let members = self.channel_member_list(creator, kind, members)?;
         // Checked before the channel is made, and recorded only once it is, so a
         // rejected name (duplicate, too long, over the server cap) costs the
         // member nothing against their allowance.
@@ -862,14 +1137,6 @@ impl PartyState {
         let info = self.create_channel(name)?;
         self.record_channel_creation(creator, now);
         if kind != ChannelKind::Public {
-            if kind == ChannelKind::Private {
-                members.retain(|m| self.members.contains_key(m));
-                if !members.contains(&creator) {
-                    members.push(creator);
-                }
-            } else {
-                members.clear();
-            }
             let position = self
                 .channels
                 .iter()
@@ -892,25 +1159,57 @@ impl PartyState {
         })
     }
 
+    /// The membership list a channel of `kind` will store: for a private
+    /// channel, the members named who actually exist, without duplicates,
+    /// always including `actor`; for every other kind, nobody.
+    ///
+    /// Capped at [`MAX_PRIVATE_CHANNEL_MEMBERS`], because every channel's list
+    /// travels in the one `Channels` frame and an unbounded one would make that
+    /// frame unsendable for everyone who can see the channel.
+    fn channel_member_list(
+        &self,
+        actor: Uuid,
+        kind: ChannelKind,
+        mut members: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, String> {
+        if kind != ChannelKind::Private {
+            return Ok(Vec::new());
+        }
+        let mut seen = std::collections::HashSet::new();
+        members.retain(|m| self.members.contains_key(m) && seen.insert(*m));
+        if !members.contains(&actor) {
+            members.push(actor);
+        }
+        if members.len() > MAX_PRIVATE_CHANNEL_MEMBERS {
+            return Err(format!(
+                "a private channel may have at most {MAX_PRIVATE_CHANNEL_MEMBERS} members"
+            ));
+        }
+        Ok(members)
+    }
+
     /// Change a channel's kind and private membership (admins only).
     pub fn set_channel_access(
         &mut self,
         actor: Uuid,
         channel: Uuid,
         kind: ChannelKind,
-        mut members: Vec<Uuid>,
+        members: Vec<Uuid>,
+    ) -> Result<String, String> {
+        self.with_tx(|s| s.set_channel_access_in_tx(actor, channel, kind, members))
+    }
+
+    fn set_channel_access_in_tx(
+        &mut self,
+        actor: Uuid,
+        channel: Uuid,
+        kind: ChannelKind,
+        members: Vec<Uuid>,
     ) -> Result<String, String> {
         if !self.role_of(actor).is_admin() {
             return Err("only admins may change channel access".to_string());
         }
-        if kind == ChannelKind::Private {
-            members.retain(|m| self.members.contains_key(m));
-            if !members.contains(&actor) {
-                members.push(actor);
-            }
-        } else {
-            members.clear();
-        }
+        let members = self.channel_member_list(actor, kind, members)?;
         let Some(position) = self.channels.iter().position(|c| c.id == channel) else {
             return Err("unknown channel".to_string());
         };
@@ -932,6 +1231,12 @@ impl PartyState {
     /// The last channel cannot be deleted: `default_channel` indexes
     /// `channels[0]`, and a server with no channels has nowhere to post.
     pub fn delete_channel(&mut self, actor: Uuid, channel: Uuid) -> Result<String, String> {
+        // One transaction: the blob refcounts released below and the rows
+        // removed with the channel must not be able to disagree after a crash.
+        self.with_tx(|s| s.delete_channel_in_tx(actor, channel))
+    }
+
+    fn delete_channel_in_tx(&mut self, actor: Uuid, channel: Uuid) -> Result<String, String> {
         if !self.role_of(actor).is_admin() {
             return Err("only admins may delete channels".to_string());
         }
@@ -1022,33 +1327,160 @@ impl PartyState {
         }
         validate_message_text(&text)?;
         self.member_can_post_to_channel(sender, channel)?;
-        let tier = self.tier;
-        let chan = self
-            .channel_mut(channel)
-            .ok_or_else(|| "unknown channel".to_string())?;
-        let seq = chan.messages.len() as u64 + 1;
+        self.append_channel_message(sender, channel, MessagePayload::Text(text))
+            .ok_or_else(|| "unknown channel".to_string())
+    }
+
+    /// How long the community keeps messages and shared files. Without a
+    /// limit everything is kept forever, which is what the audit found
+    /// (SRV-06): the database, and with it what a compromise exposes, grows
+    /// for as long as the server runs. The operator sets it (`--retain-days`);
+    /// [`Self::prune_expired`] applies it.
+    pub fn set_retention(&mut self, max_age: Option<std::time::Duration>) {
+        self.retention = max_age;
+    }
+
+    /// Delete messages and file shares older than the retention period.
+    /// Nothing happens without one.
+    ///
+    /// Each thread keeps its newest message whatever its age, so sequence
+    /// numbering continues where it was — clients merge on seq, and a thread
+    /// restarting at 1 would collide with what they already hold. Deleting old
+    /// envelopes does not renumber anything; a page simply starts later. A
+    /// shared file goes through the same release as a delete, so its bytes are
+    /// reclaimed when the last reference expires.
+    pub fn prune_expired(&mut self, now_ms: u64) -> PruneReport {
+        let Some(max_age) = self.retention else {
+            return PruneReport::default();
+        };
+        let cutoff = now_ms.saturating_sub(max_age.as_millis().min(u64::MAX as u128) as u64);
+        self.with_tx(|s| s.prune_expired_in_tx(cutoff))
+    }
+
+    fn prune_expired_in_tx(&mut self, cutoff: u64) -> PruneReport {
+        let mut report = PruneReport::default();
+        let mut resident_pruned = 0;
+        for chan in &mut self.channels {
+            resident_pruned += chan.history.prune_before(cutoff);
+        }
+        for thread in self.dm_threads.values_mut() {
+            resident_pruned += thread.history.prune_before(cutoff);
+        }
+        report.messages = match &self.db {
+            Some(conn) => db::prune_messages_before(conn, cutoff).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "retention: could not prune party.db messages");
+                0
+            }),
+            None => resident_pruned,
+        };
+
+        let expired: Vec<FileRef> = self
+            .file_refs
+            .iter()
+            .filter(|r| r.shared_at < cutoff)
+            .cloned()
+            .collect();
+        for entry in &expired {
+            self.file_refs.retain(|r| r.id != entry.id);
+            self.delete_file_ref_row(entry.id);
+            self.release_blob(&entry.hash);
+        }
+        report.files = expired.len();
+
+        if report.messages > 0 || report.files > 0 {
+            let detail = format!(
+                "retention removed {} messages and {} file shares",
+                report.messages, report.files
+            );
+            self.record_audit(Uuid::nil(), "retention.prune", &detail);
+        }
+        report
+    }
+
+    /// Append a message to `channel` under the next sequence number, keep it
+    /// in memory (subject to the resident cap) and persist it. `None` for an
+    /// unknown channel. Every channel message — text, file, re-share — is
+    /// appended here, so numbering has one source.
+    fn append_channel_message(
+        &mut self,
+        sender: Uuid,
+        channel: Uuid,
+        payload: MessagePayload,
+    ) -> Option<Envelope> {
+        let (tier, cap) = (self.tier, self.history_cap());
+        let chan = self.channel_mut(channel)?;
         let envelope = Envelope {
             tier,
             sender,
             channel,
-            seq,
+            seq: chan.history.next_seq(),
             timestamp: current_timestamp_millis(),
-            payload: MessagePayload::Text(text),
+            payload,
         };
-        chan.messages.push(envelope.clone());
+        chan.history.push(envelope.clone(), cap);
         self.persist_message(&envelope);
-        Ok(envelope)
+        Some(envelope)
     }
 
-    /// Channel history strictly after `since_seq` (offline catch-up), capped at
-    /// [`MAX_HISTORY_BATCH`] envelopes per call so the reply always fits in one
-    /// frame. The caller asks again with the last `seq` it received to page
-    /// through the rest.
+    /// The DM twin of [`Self::append_channel_message`], creating the thread
+    /// on its first message.
+    fn append_dm_message(
+        &mut self,
+        sender: Uuid,
+        thread_id: Uuid,
+        payload: MessagePayload,
+    ) -> Envelope {
+        let (tier, cap) = (self.tier, self.history_cap());
+        let thread = self
+            .dm_threads
+            .entry(thread_id)
+            .or_insert_with(|| DmThread {
+                id: thread_id,
+                history: History::new(),
+            });
+        let envelope = Envelope {
+            tier,
+            sender,
+            channel: thread_id,
+            seq: thread.history.next_seq(),
+            timestamp: current_timestamp_millis(),
+            payload,
+        };
+        thread.history.push(envelope.clone(), cap);
+        self.persist_dm(thread_id, &envelope);
+        envelope
+    }
+
+    /// One page of a thread's history after `since_seq`: from memory when the
+    /// thread's resident tail covers it, from the database otherwise.
+    fn history_page(&self, table: ThreadTable, history: &History, since_seq: u64) -> Vec<Envelope> {
+        if !history.covers(since_seq) {
+            if let Some(conn) = &self.db {
+                match load_page(conn, table, since_seq) {
+                    Ok(rows) => return take_history_page(rows.iter()),
+                    Err(e) => {
+                        // Serve what memory has rather than nothing: the page
+                        // starts later than asked, but the client still moves.
+                        tracing::error!(error = %e, "could not read a history page from party.db");
+                    }
+                }
+            }
+        }
+        take_history_page(history.after(since_seq))
+    }
+
+    /// Channel history strictly after `since_seq` (offline catch-up), one page
+    /// at a time: at most [`messenger_core::party::MAX_HISTORY_BATCH`] envelopes **and** at most
+    /// [`messenger_core::party::HISTORY_PAGE_BYTES`] of them (see [`take_history_page`]), so the reply
+    /// always fits in one frame. The caller asks again with the last `seq` it
+    /// received to page through the rest.
     ///
     /// Returning a whole channel at once meant that once its history exceeded
     /// `MAX_PACKET_SIZE` the response could not be sent at all: the send failed,
     /// the connection dropped, and the community became unjoinable with nothing
-    /// on screen to explain it.
+    /// on screen to explain it. Paging by count alone did not fix that — 200
+    /// envelopes of 64 KiB text are 12.8 MiB — which is why the byte budget
+    /// exists.
     ///
     /// Channels the member may not read (see [`Self::member_can_read_channel`])
     /// yield `[]` — the same as an unknown channel, so the reply does not reveal
@@ -1058,13 +1490,7 @@ impl PartyState {
             return Vec::new();
         }
         match self.channel(channel) {
-            Some(c) => c
-                .messages
-                .iter()
-                .filter(|m| m.seq > since_seq)
-                .take(MAX_HISTORY_BATCH)
-                .cloned()
-                .collect(),
+            Some(c) => self.history_page(ThreadTable::Channel(c.id), &c.history, since_seq),
             None => Vec::new(),
         }
     }
@@ -1082,39 +1508,14 @@ impl PartyState {
         }
         validate_message_text(&text)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        let tier = self.tier;
-        let thread = self
-            .dm_threads
-            .entry(thread_id)
-            .or_insert_with(|| DmThread {
-                id: thread_id,
-                messages: Vec::new(),
-            });
-        let seq = thread.messages.len() as u64 + 1;
-        let envelope = Envelope {
-            tier,
-            sender: from,
-            channel: thread_id,
-            seq,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::Text(text),
-        };
-        thread.messages.push(envelope.clone());
-        self.persist_dm(thread_id, &envelope);
-        Ok(envelope)
+        Ok(self.append_dm_message(from, thread_id, MessagePayload::Text(text)))
     }
 
     /// Direct-message history for a thread strictly after `since_seq`, paged the
     /// same way as [`Self::history_since`] and for the same reason.
     pub fn dm_history(&self, thread_id: Uuid, since_seq: u64) -> Vec<Envelope> {
         match self.dm_threads.get(&thread_id) {
-            Some(t) => t
-                .messages
-                .iter()
-                .filter(|m| m.seq > since_seq)
-                .take(MAX_HISTORY_BATCH)
-                .cloned()
-                .collect(),
+            Some(t) => self.history_page(ThreadTable::Dm(t.id), &t.history, since_seq),
             None => Vec::new(),
         }
     }

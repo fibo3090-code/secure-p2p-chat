@@ -12,6 +12,7 @@ import { Settings } from "./components/Settings.jsx";
 import { Parties } from "./components/Parties.jsx";
 import { Relays } from "./components/Relays.jsx";
 import { Toasts } from "./components/Toasts.jsx";
+import { HistoryBanner } from "./components/HistoryBanner.jsx";
 import { RenameDialog, ConfirmDelete, InfoDialog } from "./components/ChatDialogs.jsx";
 import { toast } from "./lib/toast.js";
 import { THEMES, loadTheme, saveTheme } from "./lib/themes.js";
@@ -174,6 +175,16 @@ export default function App() {
 
   const ready = auth?.state === "ready";
 
+  // An unreadable history file blocks saving until the user decides; ask once
+  // per unlock and keep the banner up until it is resolved.
+  const [historyIssue, setHistoryIssue] = useState(null);
+  useEffect(() => {
+    if (!ready) return;
+    api.historyStatus()
+      .then((s) => setHistoryIssue(s && s.error ? s : null))
+      .catch(() => {});
+  }, [ready]);
+
   // Tell the bridge what is on screen. ChatManager owns no window handle, so
   // without this it cannot tell a background message from one the user is
   // reading right now.
@@ -209,6 +220,9 @@ export default function App() {
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
+            // The user may have switched while this was in flight; showing it
+            // now would put A on screen with B as the recipient.
+            if (activeIdRef.current !== cur) return;
             setActive(chatToContact(chat, list.find((c) => c.id === cur)?.connected));
           }).catch(() => {});
         }
@@ -221,6 +235,11 @@ export default function App() {
     if (!ready) return;
     refresh();
     const u1 = onBridge("state-updated", () => refresh());
+    // Only transfer progress moved: refetch the transfer list, not every
+    // conversation (PERF-01).
+    const u5 = onBridge("transfers-updated", () => {
+      api.listTransfers().then(setTransfers).catch(() => {});
+    });
     const u2 = onBridge("fingerprint-request", (e) => setFpReq(e.payload));
     const u3 = onBridge("toast", (e) => toast(e.payload.message, e.payload.level));
     // Communities unread total for the rail badge — computed here (not in the
@@ -228,7 +247,7 @@ export default function App() {
     const u4 = onBridge("party-updated", async () => {
       try { setPartyUnread(computeUnread(await api.partyList()).total); } catch { /* ignore */ }
     });
-    return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
+    return () => { [u1, u2, u3, u4, u5].forEach((u) => u.then((f) => f())); };
   }, [ready, refresh]);
 
   // Clear the read mark for the conversation the user is actually looking at.
@@ -294,18 +313,29 @@ export default function App() {
     setDraft("");
     try {
       const chat = await api.getConversation(id);
+      // A slower response for an earlier click must not replace a later one.
+      if (activeIdRef.current !== id) return;
       setActive(chatToContact(chat, convs.find((c) => c.id === id)?.connected));
     } catch { /* ignore */ }
   }
 
   async function send() {
     const text = draft.trim();
-    if (!text || !activeId) return;
+    // Send to the conversation that is on screen, and only when it is the
+    // selected one. They can differ for a moment while a switch is loading;
+    // sending to `activeId` then delivered the text to a conversation other
+    // than the one the user was looking at (audit UI-02).
+    const target = active && active.id === activeId ? active.id : null;
+    if (!text || !target) return;
     setDraft("");
     // Restore the draft if the send fails, so a transient error doesn't lose
-    // what the user typed — they can just press Enter again.
-    try { await api.sendMessage(activeId, text); }
-    catch (e) { setDraft(text); toast(friendlyError(e), "error"); return; }
+    // what the user typed — but only into the conversation it was meant for.
+    try { await api.sendMessage(target, text); }
+    catch (e) {
+      if (activeIdRef.current === target) setDraft(text);
+      toast(friendlyError(e), "error");
+      return;
+    }
     refresh();
   }
 
@@ -368,6 +398,13 @@ export default function App() {
         </div>
       </header>
 
+      {historyIssue && (
+        <HistoryBanner issue={historyIssue} onSetAside={async () => {
+          const moved = await api.setAsideHistory();
+          setHistoryIssue(null);
+          toast(moved ? `Old history kept as ${moved}` : "Started a new history", "info");
+        }} />
+      )}
       <div className="app-body">
         {/* role + label are explicit: <nav> carries the landmark implicitly, but
             an unlabelled one is announced only as "navigation", and this app has

@@ -96,10 +96,82 @@ pub async fn bind_host_listener(port: u16) -> Result<TcpListener> {
         .map_err(|e| anyhow!("Could not listen on port {}: {}", port, e))
 }
 
-/// Run host session on an already-bound listener: accept one peer, then the
-/// same handshake, verification and message loop as every other transport
-/// ([`run_host_session_over_stream`]). Use [`bind_host_listener`] to obtain the
-/// listener.
+/// Handshakes the host listener runs at once. Beyond this, new connections
+/// are closed on arrival until one finishes. Small on purpose: a host serves
+/// one peer per session, and this only has to outlast connections that open
+/// and then say nothing.
+pub const MAX_PENDING_HOST_HANDSHAKES: usize = 4;
+
+/// One deadline for a whole incoming handshake plus the password gate. The
+/// per-packet timeout alone let a connection that sent each packet just in
+/// time hold a slot for over a minute.
+pub const HOST_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A wrong connection password. Typed so the accept loop can tell the user
+/// about it without reporting every port scan.
+#[derive(Debug)]
+struct PasswordRefused;
+
+impl std::fmt::Display for PasswordRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Incorrect connection password")
+    }
+}
+
+impl std::error::Error for PasswordRefused {}
+
+/// Everything the host does before the peer is shown to the user: the
+/// handshake, then the optional password gate inside the tunnel.
+async fn host_preamble<S>(
+    stream: &mut S,
+    privkey: &RsaPrivateKey,
+    chat_id: uuid::Uuid,
+    connection_password: Option<&str>,
+) -> Result<EstablishedTunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let tunnel = host_handshake(stream, privkey, chat_id).await?;
+    host_password_gate(
+        stream,
+        &tunnel.cipher,
+        &tunnel.transport_aad,
+        connection_password,
+    )
+    .await?;
+    Ok(tunnel)
+}
+
+/// Tell the user, before the prompt, that this peer's safety code is weak.
+fn warn_if_legacy_sas(to_app_tx: &mpsc::UnboundedSender<SessionEvent>, tunnel: &EstablishedTunnel) {
+    if !tunnel.sas_committed {
+        let _ = to_app_tx.send(SessionEvent::Warning(LEGACY_SAS_WARNING.to_string()));
+    }
+}
+
+/// The prompt that surfaces an incoming peer for verification.
+fn new_connection_prompt(peer_label: String, tunnel: &EstablishedTunnel) -> SessionEvent {
+    SessionEvent::NewConnection {
+        peer_addr: peer_label,
+        fingerprint: tunnel.peer_fingerprint.clone(),
+        sas: crate::core::derive_sas(&tunnel.transport_aad),
+        chat_id: tunnel.peer_chat_id,
+    }
+}
+
+/// Run a host session on an already-bound listener: keep accepting until one
+/// peer completes the handshake (and password gate), then verification and the
+/// message loop as on every other transport. Use [`bind_host_listener`] to
+/// obtain the listener.
+///
+/// The listener used to be one-shot — accept, drop it, then handshake — so a
+/// single connection that sent nothing left the port closed for the whole
+/// handshake timeout, and reconnecting the moment it reopened kept the host
+/// unreachable indefinitely (audit NET-02). Now handshakes run concurrently
+/// (at most [`MAX_PENDING_HOST_HANDSHAKES`], each under
+/// [`HOST_HANDSHAKE_DEADLINE`]) while the listener stays open, and the per-IP
+/// rate limit is applied *before* a slot is spent. The listener is still
+/// released the moment a peer wins, so auto-rehost can bind again.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session(
     listener: TcpListener,
@@ -119,34 +191,83 @@ pub async fn run_host_session(
         .send(SessionEvent::Listening { port })
         .map_err(|e| anyhow!("Send error: {}", e))?;
 
-    let (mut stream, peer_addr) = listener.accept().await?;
+    type Attempt = (TcpStream, std::net::SocketAddr, Result<EstablishedTunnel>);
+    let mut pending: tokio::task::JoinSet<Attempt> = tokio::task::JoinSet::new();
+    let (mut stream, peer_addr, tunnel) = loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A transient EMFILE must not end hosting; back off
+                        // briefly so it cannot spin either.
+                        tracing::warn!("accept() failed: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                if is_rate_limited(addr.ip()) {
+                    tracing::warn!("Rejecting connection from {} due to rate limiting", addr);
+                    continue;
+                }
+                if pending.len() >= MAX_PENDING_HOST_HANDSHAKES {
+                    tracing::warn!("Too many handshakes in progress; closing {}", addr);
+                    continue;
+                }
+                let privkey = privkey.clone();
+                let password = connection_password.clone();
+                pending.spawn(async move {
+                    let mut stream = stream;
+                    let result = tokio::time::timeout(
+                        HOST_HANDSHAKE_DEADLINE,
+                        host_preamble(&mut stream, &privkey, chat_id, password.as_deref()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!(
+                            "Handshake did not finish within {}s",
+                            HOST_HANDSHAKE_DEADLINE.as_secs()
+                        ))
+                    });
+                    (stream, addr, result)
+                });
+            }
+            Some(done) = pending.join_next(), if !pending.is_empty() => {
+                match done {
+                    Ok((stream, addr, Ok(tunnel))) => break (stream, addr, tunnel),
+                    Ok((_, addr, Err(e))) => {
+                        if e.downcast_ref::<PasswordRefused>().is_some() {
+                            let _ = to_app_tx.send(SessionEvent::Warning(format!(
+                                "Refused a connection from {addr}: wrong connection password"
+                            )));
+                        }
+                        tracing::info!("Incoming handshake from {} failed: {}", addr, e);
+                    }
+                    Err(e) => tracing::warn!("Handshake task failed: {}", e),
+                }
+            }
+        }
+    };
 
     // Release the port the instant we have our peer. A session serves exactly
     // one connection, so holding the listener for the whole conversation only
-    // ever did one thing: make the auto-rehost's bind fail with EADDRINUSE, so
-    // the app silently stopped accepting anyone after the first peer while
-    // still advertising the address as reachable.
+    // ever did one thing: make the auto-rehost's bind fail with EADDRINUSE.
+    // The other half-finished handshakes are abandoned with it.
     drop(listener);
-
-    if is_rate_limited(peer_addr.ip()) {
-        tracing::warn!(
-            "Rejecting connection from {} due to rate limiting",
-            peer_addr
-        );
-        return Err(anyhow!("Connection rejected: rate limit exceeded"));
-    }
+    pending.abort_all();
     tracing::info!("Client connected from {}", peer_addr);
 
-    run_host_session_over_stream(
+    warn_if_legacy_sas(&to_app_tx, &tunnel);
+    let prompt = new_connection_prompt(peer_addr.to_string(), &tunnel);
+    verify_then_run(
         &mut stream,
-        peer_addr.to_string(),
-        privkey,
+        tunnel,
+        prompt,
+        chat_id,
         to_app_tx,
         from_app_rx,
         file_rx,
         confirm_rx,
-        chat_id,
-        connection_password,
     )
     .await
 }
@@ -265,7 +386,46 @@ pub struct EstablishedTunnel {
     /// that varies by peer version, so it is what a diagnostic report needs to
     /// answer "why did this connection behave differently from that one".
     pub signature_scheme: SignatureScheme,
+    /// Whether the client committed to its ephemeral key before seeing the
+    /// host's (both peers v4+). Without the commitment a man in the middle can
+    /// try ephemeral keys until both victims' safety codes match, so the code
+    /// is only a weak check and the user is told to compare the fingerprint.
+    pub sas_committed: bool,
 }
+
+/// First protocol version in which the client commits to its ephemeral key.
+pub const SAS_COMMITMENT_VERSION: u32 = 4;
+
+/// Domain separator for the ephemeral-key commitment.
+const COMMITMENT_LABEL: &[u8] = b"p2pem-v4-ephemeral-commitment";
+
+/// The client's commitment to its ephemeral key, sent before it sees the
+/// host's. It is what stops a man in the middle from grinding its own key
+/// until both victims' safety codes match (audit CRYPTO-02): with the client
+/// committed first and the host's key fixed before the reveal, neither half
+/// of an interposed session leaves the attacker anything to search over.
+pub fn ephemeral_commitment(ephemeral: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(COMMITMENT_LABEL);
+    h.update(ephemeral);
+    h.finalize().into()
+}
+
+/// Check a revealed ephemeral key against the commitment received earlier.
+fn check_commitment(commitment: &[u8], ephemeral: &[u8]) -> Result<()> {
+    let expected = ephemeral_commitment(ephemeral);
+    if commitment.len() != expected.len() || !bool::from(expected.ct_eq(commitment)) {
+        return Err(anyhow!(
+            "Client's ephemeral key does not match its commitment"
+        ));
+    }
+    Ok(())
+}
+
+/// The warning shown before verifying a peer whose handshake had no
+/// commitment (a pre-v4 peer, or someone stripping the version on the path).
+pub const LEGACY_SAS_WARNING: &str = "This peer runs an older version, so its safety code is a \
+weak check. Compare the full fingerprint (advanced) instead, or ask them to update.";
 
 /// Sign our ephemeral key for the identity proof under the negotiated scheme.
 ///
@@ -366,6 +526,12 @@ const OFFERED_SCHEMES: [SignatureScheme; 2] = [SignatureScheme::Ed25519, Signatu
 /// Our protocol version as it goes on the wire (plaintext, big-endian u32).
 fn our_version_bytes() -> [u8; 4] {
     (PROTOCOL_VERSION as u32).to_be_bytes()
+}
+
+/// Whether this handshake uses the ephemeral-key commitment: both sides must
+/// speak v4+ (each knows both versions after the version exchange).
+fn uses_commitment(our_version: &[u8; 4], peer_version: u32) -> bool {
+    u32::from_be_bytes(*our_version).min(peer_version) >= SAS_COMMITMENT_VERSION
 }
 
 /// The other side's name in error messages, from our role.
@@ -529,7 +695,7 @@ where
     let encrypted = recv_packet_with_timeout(stream).await?;
     let bytes = keys
         .cipher
-        .decrypt(&encrypted, Some(&keys.identity_proof_aad))
+        .decrypt_from_peer(&encrypted, Some(&keys.identity_proof_aad))
         .ok_or_else(|| anyhow!("Failed to decrypt {} identity proof", peer.to_lowercase()))?;
     let proof = decode_identity_proof(&bytes)?;
     if proof.signature_scheme != scheme {
@@ -553,6 +719,7 @@ impl TunnelKeys {
         self,
         peer: &IdentityProof,
         scheme: SignatureScheme,
+        sas_committed: bool,
     ) -> Result<EstablishedTunnel> {
         // Parsed by the same strict decoder `verify_identity_proof` used, so
         // the fingerprint names exactly the key the signature was checked with.
@@ -564,6 +731,7 @@ impl TunnelKeys {
             cipher: self.cipher,
             transport_aad: self.transport_aad,
             signature_scheme: scheme,
+            sas_committed,
         })
     }
 }
@@ -585,16 +753,41 @@ pub async fn host_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    host_handshake_as(stream, privkey, chat_id, our_version_bytes()).await
+}
+
+/// [`host_handshake`] announcing an arbitrary version — the real one in
+/// production, an older one in compatibility tests.
+async fn host_handshake_as<S>(
+    stream: &mut S,
+    privkey: &RsaPrivateKey,
+    chat_id: uuid::Uuid,
+    host_version: [u8; 4],
+) -> Result<EstablishedTunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     const US: NonceRole = NonceRole::Host;
 
-    let host_version = our_version_bytes();
     send_packet(stream, &host_version).await?;
     let client_version = recv_packet_with_timeout(stream).await?;
-    check_peer_version(&client_version, US)?;
+    let peer_version = check_peer_version(&client_version, US)?;
+    let committed = uses_commitment(&host_version, peer_version);
+
+    // v4: the client's commitment arrives before we reveal anything, so it
+    // cannot choose its key with ours in hand.
+    let commitment = if committed {
+        Some(recv_packet_with_timeout(stream).await?)
+    } else {
+        None
+    };
 
     let (host_secret, host_public) = generate_ephemeral_keypair();
     send_packet(stream, host_public.as_bytes()).await?;
     let (client_ephemeral, client_public) = recv_peer_ephemeral(stream).await?;
+    if let Some(commitment) = commitment {
+        check_commitment(&commitment, &client_ephemeral)?;
+    }
 
     let scheme = negotiate_schemes(stream, US).await?;
 
@@ -618,7 +811,7 @@ where
     )
     .await?;
     let client_proof = recv_identity_proof(stream, &keys, &client_ephemeral, scheme, US).await?;
-    keys.established(&client_proof, scheme)
+    keys.established(&client_proof, scheme, committed)
 }
 
 /// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
@@ -633,15 +826,33 @@ pub async fn client_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    client_handshake_as(stream, privkey, chat_id, our_version_bytes()).await
+}
+
+/// [`client_handshake`] announcing an arbitrary version (see
+/// [`host_handshake_as`]).
+async fn client_handshake_as<S>(
+    stream: &mut S,
+    privkey: &RsaPrivateKey,
+    chat_id: uuid::Uuid,
+    client_version: [u8; 4],
+) -> Result<EstablishedTunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     const US: NonceRole = NonceRole::Client;
 
     let host_version = recv_packet_with_timeout(stream).await?;
-    check_peer_version(&host_version, US)?;
-    let client_version = our_version_bytes();
+    let peer_version = check_peer_version(&host_version, US)?;
     send_packet(stream, &client_version).await?;
+    let committed = uses_commitment(&client_version, peer_version);
 
-    let (host_ephemeral, host_public) = recv_peer_ephemeral(stream).await?;
     let (client_secret, client_public) = generate_ephemeral_keypair();
+    if committed {
+        // Bind ourselves to this key before the host reveals its own.
+        send_packet(stream, &ephemeral_commitment(client_public.as_bytes())).await?;
+    }
+    let (host_ephemeral, host_public) = recv_peer_ephemeral(stream).await?;
     send_packet(stream, client_public.as_bytes()).await?;
 
     let scheme = negotiate_schemes(stream, US).await?;
@@ -666,7 +877,7 @@ where
         scheme,
     )
     .await?;
-    keys.established(&host_proof, scheme)
+    keys.established(&host_proof, scheme, committed)
 }
 
 /// Constant-time comparison so a wrong connection password cannot be recovered
@@ -678,16 +889,30 @@ where
 /// concretely, a hand-written version's early `return` on a length mismatch is
 /// itself a timing signal — it answers "wrong length" faster than "wrong bytes",
 /// which hands an attacker the password's length for free before they start
-/// guessing its content. Here both operands are first hashed to a fixed 32
+/// guessing its content. Here both operands are first reduced to a fixed 32
 /// bytes, so the comparison is over equal-length inputs whatever was sent and
 /// the length never reaches a branch.
+///
+/// The reduction is Argon2id under a fresh random salt, at its minimum cost
+/// (8 KiB, one pass: microseconds). A fast hash such as SHA-256 did the same
+/// job, but it is the wrong primitive to put a password through, and code
+/// scanning rightly flags it; nothing here relies on Argon2's cost, only on
+/// it being a salted, fixed-length function of the input. The salt is per
+/// comparison, so nothing about either value can be precomputed or linked.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Hashing first is what makes the compare length-independent. It is not
-    // there to protect the password at rest (it never is at rest) — only to keep
-    // the length off the timing channel.
-    let ha = Sha256::digest(a);
-    let hb = Sha256::digest(b);
-    bool::from(ha.ct_eq(&hb))
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let salt: [u8; 16] = rand::random();
+    let Ok(params) = Params::new(Params::MIN_M_COST, Params::MIN_T_COST, 1, Some(32)) else {
+        return false;
+    };
+    let kdf = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let (mut ha, mut hb) = (Zeroizing::new([0u8; 32]), Zeroizing::new([0u8; 32]));
+    if kdf.hash_password_into(a, &salt, &mut ha[..]).is_err()
+        || kdf.hash_password_into(b, &salt, &mut hb[..]).is_err()
+    {
+        return false;
+    }
+    bool::from(ha.ct_eq(&hb[..]))
 }
 
 /// Host side of the optional connection-password gate, run over the established
@@ -708,11 +933,11 @@ where
     send_packet(stream, &cipher.encrypt(&flag, Some(aad))).await?;
     let resp_ct = recv_packet_with_timeout(stream).await?;
     let resp = cipher
-        .decrypt(&resp_ct, Some(aad))
+        .decrypt_from_peer(&resp_ct, Some(aad))
         .ok_or_else(|| anyhow!("Failed to decrypt password response"))?;
     if let Some(pw) = expected {
         if !constant_time_eq(&resp, pw.as_bytes()) {
-            return Err(anyhow!("Incorrect connection password"));
+            return Err(PasswordRefused.into());
         }
     }
     Ok(())
@@ -730,7 +955,7 @@ where
 {
     let flag_ct = recv_packet_with_timeout(stream).await?;
     let flag = cipher
-        .decrypt(&flag_ct, Some(aad))
+        .decrypt_from_peer(&flag_ct, Some(aad))
         .ok_or_else(|| anyhow!("Failed to decrypt password challenge"))?;
     let required = flag.first().copied() == Some(1);
     // Always reply (even empty) so the host's receive completes and both sides
@@ -840,7 +1065,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let tunnel = host_handshake(stream, &privkey, chat_id).await?;
-
     // Optional connection-password gate (inside the encrypted, authenticated
     // tunnel, before the peer is surfaced for verification).
     reported(
@@ -853,13 +1077,8 @@ where
         )
         .await,
     )?;
-
-    let prompt = SessionEvent::NewConnection {
-        peer_addr: peer_label,
-        fingerprint: tunnel.peer_fingerprint.clone(),
-        sas: crate::core::derive_sas(&tunnel.transport_aad),
-        chat_id: tunnel.peer_chat_id,
-    };
+    warn_if_legacy_sas(&to_app_tx, &tunnel);
+    let prompt = new_connection_prompt(peer_label, &tunnel);
     verify_then_run(
         stream,
         tunnel,
@@ -910,6 +1129,7 @@ where
         .await,
     )?;
 
+    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = SessionEvent::ShowFingerprintVerification {
         fingerprint: tunnel.peer_fingerprint.clone(),
         peer_name: peer_label,
@@ -1188,7 +1408,10 @@ where
         // so any retained previous key can be dropped (its in-flight window is
         // closed). If it fails, fall back to the previous key for frames the
         // peer sent under the old key before it processed our Rekey.
-        let decrypted = match self.cipher.decrypt(encrypted, Some(&self.transport_aad)) {
+        let decrypted = match self
+            .cipher
+            .decrypt_from_peer(encrypted, Some(&self.transport_aad))
+        {
             Some(plaintext) => {
                 self.prev_cipher = None;
                 Some(plaintext)
@@ -1196,7 +1419,7 @@ where
             None => self
                 .prev_cipher
                 .as_ref()
-                .and_then(|pc| pc.decrypt(encrypted, Some(&self.transport_aad))),
+                .and_then(|pc| pc.decrypt_from_peer(encrypted, Some(&self.transport_aad))),
         };
         let Some(plaintext) = decrypted else {
             // Undecryptable under BOTH keys over a reliable, ordered stream
@@ -1223,6 +1446,13 @@ where
         }
 
         match msg {
+            // Only the host rotates (see `is_rekey_initiator`). A client that
+            // sends `Rekey` anyway is not following the protocol, and obeying
+            // it would let it force rotations at will and desync the session
+            // (external review EXT-01). Ignore the frame, keep the session.
+            ProtocolMessage::Rekey { .. } if self.is_rekey_initiator => {
+                tracing::warn!("Ignoring Rekey from a peer that is not the initiator");
+            }
             // Not surfaced to the app.
             ProtocolMessage::Rekey { nonce, .. } => {
                 use crate::core::rekey_session_key;
@@ -1531,6 +1761,71 @@ mod tests {
         assert_eq!(host.get_current_key(), peer_next);
         assert_eq!(sent_seq, 6);
         assert_eq!(msgs, 0);
+    }
+
+    /// NET-01: one key and one AAD serve both directions, so a frame we sent,
+    /// echoed back by anyone on the path, used to be accepted as the peer's.
+    #[test]
+    fn a_reflected_frame_is_not_accepted_as_the_peers() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), ours.clone(), aad.clone(), tx);
+
+        let mut echoed = ProtocolMessage::Text {
+            seq: 0,
+            text: "yes".into(),
+            timestamp: 0,
+        };
+        echoed.set_seq(7);
+        let frame = ours.encrypt(&echoed.to_plain_bytes(), Some(&aad));
+        assert!(matches!(transport.receive(&frame).unwrap(), Received::Stop));
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, SessionEvent::MessageReceived(_)),
+                "our own frame was surfaced as the peer's: {event:?}"
+            );
+        }
+
+        // The genuine peer's frame still goes through.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), ours, aad.clone(), tx);
+        let peer = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let frame = peer.encrypt(&echoed.to_plain_bytes(), Some(&aad));
+        assert!(matches!(
+            transport.receive(&frame).unwrap(),
+            Received::Continue
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionEvent::MessageReceived(ProtocolMessage::Text { .. })
+        ));
+    }
+
+    /// EXT-01: only the host rotates. A client's `Rekey` must not move the
+    /// host's key, or a misbehaving client could force rotations at will.
+    #[test]
+    fn the_host_ignores_a_rekey_from_the_client() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx);
+
+        let nonce: [u8; crate::REKEY_NONCE_SIZE] = rand::random();
+        let rekey = ProtocolMessage::Rekey {
+            seq: 1,
+            nonce: nonce.to_vec(),
+        };
+        let frame = client.encrypt(&rekey.to_plain_bytes(), Some(&aad));
+        assert!(matches!(
+            transport.receive(&frame).unwrap(),
+            Received::Continue
+        ));
+        assert_eq!(transport.cipher.get_current_key(), key);
+        assert!(transport.prev_cipher.is_none());
     }
 
     #[tokio::test]
@@ -1867,6 +2162,104 @@ mod tests {
         assert_eq!(client.signature_scheme, SignatureScheme::Ed25519);
         assert_eq!(client.peer_fingerprint, expected_host_fp.unwrap());
         assert_eq!(host.peer_fingerprint, expected_client_fp.unwrap());
+    }
+
+    /// Run both handshake halves announcing the given versions.
+    async fn handshake_pair(
+        host_version: u32,
+        client_version: u32,
+    ) -> (Result<EstablishedTunnel>, Result<EstablishedTunnel>) {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            host_handshake_as(
+                &mut host_stream,
+                &host_priv,
+                uuid::Uuid::new_v4(),
+                host_version.to_be_bytes(),
+            )
+            .await
+        });
+        let client = client_handshake_as(
+            &mut client_stream,
+            &client_priv,
+            uuid::Uuid::new_v4(),
+            client_version.to_be_bytes(),
+        )
+        .await;
+        (host.await.unwrap(), client)
+    }
+
+    /// CRYPTO-02: two current peers use the commitment, and agree on the SAS.
+    #[tokio::test]
+    async fn current_peers_commit_to_their_ephemeral_keys() {
+        let (host, client) = handshake_pair(PROTOCOL_VERSION as u32, PROTOCOL_VERSION as u32).await;
+        let (host, client) = (host.unwrap(), client.unwrap());
+        assert!(host.sas_committed && client.sas_committed);
+        assert_eq!(
+            crate::core::derive_sas(&host.transport_aad),
+            crate::core::derive_sas(&client.transport_aad)
+        );
+    }
+
+    /// A v3 peer on either side still connects — without the commitment, which
+    /// both sides then report so the UI can warn that the code is weak.
+    #[tokio::test]
+    async fn a_v3_peer_still_connects_but_without_the_commitment() {
+        for (h, c) in [(3, PROTOCOL_VERSION as u32), (PROTOCOL_VERSION as u32, 3)] {
+            let (host, client) = handshake_pair(h, c).await;
+            let (host, client) = (host.unwrap(), client.unwrap());
+            assert!(
+                !host.sas_committed && !client.sas_committed,
+                "host v{h}, client v{c}"
+            );
+            assert_eq!(
+                crate::core::derive_sas(&host.transport_aad),
+                crate::core::derive_sas(&client.transport_aad)
+            );
+        }
+    }
+
+    /// The point of the commitment: a client that reveals a key other than the
+    /// one it committed to (a man in the middle that went shopping for a
+    /// matching code) is refused before any key is derived.
+    #[tokio::test]
+    async fn a_client_that_breaks_its_commitment_is_refused() {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut host_stream, mut wire) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            host_handshake(&mut host_stream, &host_priv, uuid::Uuid::new_v4()).await
+        });
+
+        let _host_version = recv_packet(&mut wire).await.unwrap();
+        send_packet(&mut wire, &our_version_bytes()).await.unwrap();
+        let (_, committed_key) = generate_ephemeral_keypair();
+        send_packet(&mut wire, &ephemeral_commitment(committed_key.as_bytes()))
+            .await
+            .unwrap();
+        let _host_ephemeral = recv_packet(&mut wire).await.unwrap();
+        let (_, other_key) = generate_ephemeral_keypair();
+        send_packet(&mut wire, other_key.as_bytes()).await.unwrap();
+
+        let Err(err) = host.await.unwrap() else {
+            panic!("a broken commitment must be refused");
+        };
+        assert!(err.to_string().contains("commitment"), "{err}");
+    }
+
+    /// The commitment is frozen wire format: changing the label or the hash
+    /// would make every v4 peer refuse every other.
+    #[test]
+    fn the_commitment_format_is_frozen() {
+        let c = ephemeral_commitment(&[0u8; 32]);
+        let mut h = Sha256::new();
+        h.update(b"p2pem-v4-ephemeral-commitment");
+        h.update([0u8; 32]);
+        assert_eq!(c.as_slice(), h.finalize().as_slice());
+        assert!(check_commitment(&c, &[0u8; 32]).is_ok());
+        assert!(check_commitment(&c, &[1u8; 32]).is_err());
+        assert!(check_commitment(&c[..31], &[0u8; 32]).is_err());
     }
 
     /// An Ed25519 proof is only worth anything with its binding: without one,

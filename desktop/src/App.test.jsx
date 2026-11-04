@@ -175,3 +175,37 @@ describe("App — navigation", () => {
     expect(await screen.findByText(/blind broker/)).toBeTruthy();
   });
 });
+
+describe("App — conversation switching", () => {
+  const bob = { ...conv, id: "chat-2", title: "Bob", last: "yo" };
+  const detail = (id, title) => ({
+    id, title, peer_fingerprint: "ab".repeat(32), participants: [],
+    created_at: new Date().toISOString(), is_host_placeholder: false,
+    messages: [{ id: `m-${id}`, from_me: false, content: { type: "text", text: `hi from ${title}` }, timestamp: new Date().toISOString() }],
+    kind: "dm", transport: "direct",
+  });
+
+  it("never sends to a conversation other than the one on screen", async () => {
+    // Opening Alice, then Bob, with Alice's fetch landing last used to put
+    // Alice on screen while the composer sent to Bob (audit UI-02).
+    const pending = {};
+    const api = readyApi({
+      listConversations: [conv, bob],
+      getConversation: (id) => new Promise((r) => { pending[id] = r; }),
+      sendMessage: vi.fn(async () => {}),
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await userEvent.click(await screen.findByRole("option", { name: /Bob/ }));
+    pending["chat-2"](detail("chat-2", "Bob"));
+    await screen.findByText("hi from Bob");
+    pending["chat-1"](detail("chat-1", "Alice"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText("hi from Alice")).toBeNull();
+
+    const box = document.getElementById("composer-input");
+    await userEvent.type(box, "for bob{Enter}");
+    await waitFor(() => expect(api.sendMessage).toHaveBeenCalled());
+    expect(api.sendMessage.mock.calls.every(([id]) => id === "chat-2")).toBe(true);
+  });
+});

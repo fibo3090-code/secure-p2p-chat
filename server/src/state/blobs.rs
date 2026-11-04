@@ -408,6 +408,16 @@ impl PartyState {
         from: Uuid,
         target: UploadTarget,
     ) -> Result<Envelope, String> {
+        self.with_tx(|s| s.share_file_in_tx(actor, hash, from, target))
+    }
+
+    fn share_file_in_tx(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        from: Uuid,
+        target: UploadTarget,
+    ) -> Result<Envelope, String> {
         let Some(source) = self
             .file_refs
             .iter()
@@ -462,38 +472,11 @@ impl PartyState {
         };
         self.record_file_ref(actor, &meta, location, is_dm);
 
-        let tier = self.tier;
         let envelope = if is_dm {
-            let thread = self.dm_threads.entry(location).or_insert_with(|| DmThread {
-                id: location,
-                messages: Vec::new(),
-            });
-            let seq = thread.messages.len() as u64 + 1;
-            let env = Envelope {
-                tier,
-                sender: actor,
-                channel: location,
-                seq,
-                timestamp: current_timestamp_millis(),
-                payload: MessagePayload::File(meta),
-            };
-            thread.messages.push(env.clone());
-            self.persist_dm(location, &env);
-            env
+            self.append_dm_message(actor, location, MessagePayload::File(meta))
         } else {
-            let chan = self.channel_mut(location).expect("checked above");
-            let seq = chan.messages.len() as u64 + 1;
-            let env = Envelope {
-                tier,
-                sender: actor,
-                channel: location,
-                seq,
-                timestamp: current_timestamp_millis(),
-                payload: MessagePayload::File(meta),
-            };
-            chan.messages.push(env.clone());
-            self.persist_message(&env);
-            env
+            self.append_channel_message(actor, location, MessagePayload::File(meta))
+                .expect("checked above")
         };
         let detail = format!("shared {} again", source.name);
         self.record_audit(actor, "file.share", &detail);
@@ -507,6 +490,17 @@ impl PartyState {
     /// uploader or an admin may change a share's permissions at all; holding
     /// `share` lets you spread a file, not re-write who else may do what.
     pub fn set_file_permissions(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        location: Uuid,
+        member: Option<Uuid>,
+        perms: FilePermissions,
+    ) -> Result<String, String> {
+        self.with_tx(|s| s.set_file_permissions_in_tx(actor, hash, location, member, perms))
+    }
+
+    fn set_file_permissions_in_tx(
         &mut self,
         actor: Uuid,
         hash: &str,
@@ -605,6 +599,15 @@ impl PartyState {
         hash: &str,
         location: Uuid,
     ) -> Result<String, String> {
+        self.with_tx(|s| s.delete_file_in_tx(actor, hash, location))
+    }
+
+    fn delete_file_in_tx(
+        &mut self,
+        actor: Uuid,
+        hash: &str,
+        location: Uuid,
+    ) -> Result<String, String> {
         let Some(index) = self
             .file_refs
             .iter()
@@ -632,6 +635,27 @@ impl PartyState {
     /// Access follows the same rule as downloading: files shared in channels they
     /// can read, and in their own DM threads.
     pub fn files_for(&self, member: Uuid) -> Vec<FileEntry> {
+        self.files_page(member, 0).0
+    }
+
+    /// One page of [`Self::files_for`] from `offset` on, and the offset of the
+    /// next page (`None` at the end). Pages are bounded by
+    /// [`MAX_FILE_LISTING`] entries and [`FILE_LISTING_BYTES`], so every page
+    /// fits in a frame however many files are shared (audit SRV-01).
+    pub fn files_page(&self, member: Uuid, offset: usize) -> (Vec<FileEntry>, Option<usize>) {
+        let mut all = self.visible_files(member);
+        let total = all.len();
+        let mut page: Vec<FileEntry> = all.drain(offset.min(total)..).collect();
+        truncate_listing(&mut page, MAX_FILE_LISTING, FILE_LISTING_BYTES);
+        // Always make progress: a single entry larger than the budget (not
+        // possible with bounded names and MIME types, but cheap to rule out)
+        // must not make the client ask for the same page forever.
+        let end = offset.min(total) + page.len().max(usize::from(offset < total));
+        (page, (end < total).then_some(end))
+    }
+
+    /// Every file `member` may see, newest first, unbounded.
+    fn visible_files(&self, member: Uuid) -> Vec<FileEntry> {
         let mut out: Vec<FileEntry> = self
             .file_refs
             .iter()
@@ -667,7 +691,15 @@ impl PartyState {
                 }
             })
             .collect();
-        out.sort_by_key(|f| std::cmp::Reverse(f.shared_at));
+        // Newest first; hash then location break ties, so the order — and
+        // with it every page boundary — is the same from one request to the
+        // next.
+        out.sort_by(|a, b| {
+            b.shared_at
+                .cmp(&a.shared_at)
+                .then_with(|| a.hash.cmp(&b.hash))
+                .then_with(|| a.location.cmp(&b.location))
+        });
         out
     }
 
@@ -755,8 +787,12 @@ impl PartyState {
             id,
             PendingUpload {
                 uploader,
-                name,
-                mime,
+                // Bounded on arrival rather than at publish: both strings are
+                // copied into every message, page and listing that mentions the
+                // file, and until then they sit in memory on the uploader's
+                // behalf.
+                name: sanitize_filename(&name),
+                mime: normalize_mime(&mime),
                 declared: size,
                 target,
                 data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
@@ -897,6 +933,8 @@ impl PartyState {
     ) -> Result<StagedUpload, String> {
         let data = Self::check_inline_size(data)?;
         self.check_may_post_file(uploader, target)?;
+        // See `start_upload`: bounded before anything else copies them.
+        let (name, mime) = (sanitize_filename(&name), normalize_mime(&mime));
         // Capped at 4 MiB and already in hand, so hashing here costs
         // single-digit milliseconds — cheap enough to buy an exact answer to "do
         // we already hold this?", which is what keeps a re-upload of stored
@@ -979,6 +1017,16 @@ impl PartyState {
     /// removed from the server. Checking only on the way in would append a
     /// message that the current state forbids.
     pub fn commit_upload(
+        &mut self,
+        staged: StagedUpload,
+    ) -> Result<(Envelope, UploadTarget), String> {
+        // The blob row (or its refcount), the file reference and the message
+        // are one commit: a crash between them used to leave a refcount with
+        // no reference to release it, or a blob on disk with no row.
+        self.with_tx(|s| s.commit_upload_in_tx(staged))
+    }
+
+    fn commit_upload_in_tx(
         &mut self,
         mut staged: StagedUpload,
     ) -> Result<(Envelope, UploadTarget), String> {
@@ -1292,23 +1340,9 @@ impl PartyState {
         channel: Uuid,
         meta: FileMeta,
     ) -> Result<Envelope, String> {
-        let tier = self.tier;
         self.record_file_ref(sender, &meta, channel, false);
-        let chan = self
-            .channel_mut(channel)
-            .ok_or_else(|| "channel no longer exists".to_string())?;
-        let seq = chan.messages.len() as u64 + 1;
-        let envelope = Envelope {
-            tier,
-            sender,
-            channel,
-            seq,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::File(meta),
-        };
-        chan.messages.push(envelope.clone());
-        self.persist_message(&envelope);
-        Ok(envelope)
+        self.append_channel_message(sender, channel, MessagePayload::File(meta))
+            .ok_or_else(|| "channel no longer exists".to_string())
     }
 
     /// Store a file and send it as a direct message to `to`. Returns the assigned
@@ -1333,27 +1367,8 @@ impl PartyState {
         meta: FileMeta,
     ) -> Result<Envelope, String> {
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        let tier = self.tier;
         self.record_file_ref(from, &meta, thread_id, true);
-        let thread = self
-            .dm_threads
-            .entry(thread_id)
-            .or_insert_with(|| DmThread {
-                id: thread_id,
-                messages: Vec::new(),
-            });
-        let seq = thread.messages.len() as u64 + 1;
-        let envelope = Envelope {
-            tier,
-            sender: from,
-            channel: thread_id,
-            seq,
-            timestamp: current_timestamp_millis(),
-            payload: MessagePayload::File(meta),
-        };
-        thread.messages.push(envelope.clone());
-        self.persist_dm(thread_id, &envelope);
-        Ok(envelope)
+        Ok(self.append_dm_message(from, thread_id, MessagePayload::File(meta)))
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.

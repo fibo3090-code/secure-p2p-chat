@@ -18,17 +18,18 @@
 //! `Join`, `ListChannels`, `ListMembers`, so the server answers `Joined` first,
 //! while the channel list is still empty; seeding there meant the loop had
 //! nothing to iterate and no channel history was ever fetched at all. Responses
-//! are paged ([`MAX_HISTORY_BATCH`]), so a full page triggers a request for the
-//! next one.
+//! are paged (`MAX_HISTORY_BATCH` envelopes or `HISTORY_PAGE_BYTES`, whichever
+//! comes first), so a page the server cut short triggers a request for the next
+//! one (see [`history_page_may_continue`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, bail, Result};
 use messenger_core::party::{
-    blob_hash, dm_thread_id, AuditEntry, ChannelInfo, ChannelKind, Envelope, FileEntry, FileMeta,
-    FilePermissions, MemberInfo, MessagePayload, PartyRequest, PartyResponse, QuotaInfo, Role,
-    TrustTier, UploadTarget, MAX_HISTORY_BATCH, MAX_INLINE_FILE_BYTES, MAX_PARTY_FILE_BYTES,
-    PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
+    blob_hash, dm_thread_id, history_page_may_continue, AuditEntry, ChannelInfo, ChannelKind,
+    Envelope, FileEntry, FileMeta, FilePermissions, MemberInfo, MessagePayload, PartyRequest,
+    PartyResponse, QuotaInfo, Role, TrustTier, UploadTarget, MAX_INLINE_FILE_BYTES,
+    MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
 use rsa::RsaPrivateKey;
@@ -37,6 +38,9 @@ use uuid::Uuid;
 
 /// The smallest upload chunk the client will use, whatever the server asks for.
 const MIN_UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Ceiling on reaching a community server: TCP connect plus the handshake.
+pub const PARTY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// What happened when the client tried to join a community server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,9 +53,38 @@ pub enum PartyJoinOutcome {
         fingerprint: String,
     },
     /// This address has never been joined before. Nothing was sent — not the
-    /// username, not the password. Show the fingerprint and SAS for an
-    /// out-of-band comparison, then call again with `trust_new_identity: true`.
+    /// username, not the password. Show the fingerprint for an out-of-band
+    /// comparison with the one the server prints at startup, then call again
+    /// with that fingerprint as `expected_fingerprint`.
+    ///
+    /// `sas` is this connection's short code. It is kept for diagnostics only:
+    /// the operator never sees it (the server does not display one), and it
+    /// belongs to a connection that is closed before the credentials are sent,
+    /// so it cannot be what the user compares.
     NeedsVerification { fingerprint: String, sas: String },
+}
+
+/// The result of [`PartyManager::dial`]: either a connection whose identity
+/// matched the expected fingerprint, or a first contact to show the user.
+pub enum PartyDial {
+    Verified(Box<VerifiedParty>),
+    NeedsVerification { fingerprint: String, sas: String },
+}
+
+/// A handshaken connection whose server fingerprint matched the one the user
+/// verified. Only [`PartyManager::dial`] makes one, so holding it is proof the
+/// check ran; [`PartyManager::attach`] is the only thing that consumes it.
+pub struct VerifiedParty {
+    client: messenger_core::party::PartyClient<tokio::net::TcpStream>,
+    fingerprint: String,
+}
+
+impl std::fmt::Debug for VerifiedParty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedParty")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Connection lifecycle status for a joined server.
@@ -378,15 +411,19 @@ impl PartyManager {
     /// credentials it was supposed to prove it deserved. The handshake is
     /// authenticated, so a mismatch here is the whole point of pinning.
     ///
-    /// When there is **no** pin — the first time this address is used —
-    /// `trust_new_identity` decides what happens. `false` (the default the UI
-    /// starts with) connects far enough to learn the server's fingerprint and
-    /// SAS, then hangs up without sending anything and returns
-    /// [`PartyJoinOutcome::NeedsVerification`]. A peer-to-peer first contact has
-    /// always stopped for the SAS prompt here; a community first contact used to
-    /// hand over the username and password to whatever key answered the address
-    /// and pin it afterwards, which is trust-on-first-use with the "trust" step
-    /// left out.
+    /// When there is **no** expected fingerprint — the first time this address
+    /// is used — it connects only far enough to learn the server's fingerprint,
+    /// hangs up without sending anything and returns
+    /// [`PartyJoinOutcome::NeedsVerification`]. The shell shows that fingerprint
+    /// for an out-of-band check against the one the operator's server prints at
+    /// startup, then calls again **passing the fingerprint the user accepted**.
+    ///
+    /// There is deliberately no "trust whatever answers" mode. The second call
+    /// opens a new connection, and the old `trust_new_identity: true` flag let
+    /// it send the credentials to whatever key answered *that* connection — the
+    /// verified fingerprint was never compared with it, so a man in the middle
+    /// could let the first connection through and intercept the second (audit
+    /// SRV-05 / TAURI-01 / TUI-02 / UI-01).
     pub async fn connect_and_join(
         &mut self,
         address: &str,
@@ -394,39 +431,90 @@ impl PartyManager {
         password: Option<String>,
         privkey: &RsaPrivateKey,
         expected_fingerprint: Option<&str>,
-        trust_new_identity: bool,
     ) -> Result<PartyJoinOutcome> {
+        self.last_error = None;
+        match Self::dial(address, privkey, expected_fingerprint).await? {
+            PartyDial::NeedsVerification { fingerprint, sas } => {
+                Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas })
+            }
+            PartyDial::Verified(verified) => self.attach(address, username, password, *verified),
+        }
+    }
+
+    /// The network half of [`connect_and_join`](Self::connect_and_join):
+    /// reach the server, complete the handshake and check its fingerprint.
+    /// It touches no manager state, so a shell can run it **without holding
+    /// its UI loop or the manager** and hand the result to
+    /// [`attach`](Self::attach) afterwards. Nothing is sent to the server.
+    pub async fn dial(
+        address: &str,
+        privkey: &RsaPrivateKey,
+        expected_fingerprint: Option<&str>,
+    ) -> Result<PartyDial> {
         use messenger_core::party::PartyClient;
 
-        self.last_error = None;
         let (host, port) = parse_host_port(address, Some(messenger_core::PORT_DEFAULT))?;
-        let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-        let client = PartyClient::connect(stream, privkey, Uuid::new_v4()).await?;
+        // Bounded: an address that silently drops packets used to hold the
+        // caller for the OS connect timeout (75 s or more), and both shells call
+        // this while holding their UI loop or the party lock (TUI-08, APP-10).
+        let client = tokio::time::timeout(PARTY_CONNECT_TIMEOUT, async {
+            let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+            PartyClient::connect(stream, privkey, Uuid::new_v4()).await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Could not reach {address} within {} seconds",
+                PARTY_CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
         let fingerprint = client.server_fingerprint().to_string();
-        match expected_fingerprint.filter(|p| !p.is_empty()) {
-            Some(pinned) if pinned != fingerprint => {
+        match expected_fingerprint
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            Some(expected) if !expected.eq_ignore_ascii_case(&fingerprint) => {
                 // Drop the connection without sending anything. `client` owns the
                 // stream, so returning here closes it.
                 bail!(
-                    "SECURITY: this server's identity changed since you last joined \
+                    "SECURITY: this server's identity is not the one you verified \
                      (expected {}…, got {}…). Your username and password were NOT sent. \
                      If the operator redeployed the server this may be expected — leave \
-                     the saved community and rejoin to trust the new identity. \
+                     the saved community and rejoin to verify the new identity. \
                      Otherwise, do not proceed.",
-                    &pinned[..16.min(pinned.len())],
+                    &expected[..16.min(expected.len())],
                     &fingerprint[..16.min(fingerprint.len())]
                 );
             }
-            Some(_) => {} // pinned and matching: proceed
-            None if !trust_new_identity => {
+            Some(_) => Ok(PartyDial::Verified(Box::new(VerifiedParty {
+                client,
+                fingerprint,
+            }))),
+            None => {
                 // First contact with this address. Hang up before the `Join`
                 // frame — it carries the credentials — and let the shell show
-                // the SAS for an out-of-band check.
+                // the fingerprint for an out-of-band check.
                 let sas = client.sas().to_string();
-                return Ok(PartyJoinOutcome::NeedsVerification { fingerprint, sas });
+                Ok(PartyDial::NeedsVerification { fingerprint, sas })
             }
-            None => {} // the user has just confirmed this identity
         }
+    }
+
+    /// The state half of [`connect_and_join`](Self::connect_and_join): take a
+    /// connection whose fingerprint [`dial`](Self::dial) has already checked,
+    /// send the `Join` (this is where the credentials go out) and register it.
+    pub fn attach(
+        &mut self,
+        address: &str,
+        username: &str,
+        password: Option<String>,
+        verified: VerifiedParty,
+    ) -> Result<PartyJoinOutcome> {
+        self.last_error = None;
+        let VerifiedParty {
+            client,
+            fingerprint,
+        } = verified;
         let (mut reader, mut writer) = client.split();
 
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<PartyRequest>();
@@ -1020,45 +1108,65 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             let thread = conn.messages.entry(env.channel).or_default();
             // A live broadcast can race a history page carrying the same
             // envelope; both are keyed by the server-assigned sequence.
-            if !thread.iter().any(|e| e.seq == env.seq) {
+            // Confirmed envelopes sit in ascending seq order by position
+            // (pages are sorted on merge, broadcasts arrive in order), so a
+            // seq above the last confirmed one is new without a scan — the
+            // common case, which used to cost O(thread) per arrival (PERF-05).
+            let newest = thread.iter().rev().find(|e| e.seq != 0).map(|e| e.seq);
+            if newest.is_none_or(|n| env.seq > n) || !thread.iter().any(|e| e.seq == env.seq) {
                 thread.push(env);
             }
         }
         PartyResponse::History(items) => {
-            let page_was_full = items.len() >= MAX_HISTORY_BATCH;
+            // A page is cut short by count *or* by size; asking again only
+            // after a full count stalled at the first page the server trimmed
+            // for size, so a channel of long messages never loaded past it.
+            let page_was_full = history_page_may_continue(&items);
             let threads: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
+            // Which threads are DMs, and with whom: one hash per member per
+            // page, not one per member per thread (PERF-05). Only needed to
+            // ask for the next page.
+            let dm_peers: HashMap<Uuid, Uuid> = match conn.member_id {
+                Some(me) if page_was_full => conn
+                    .members
+                    .iter()
+                    .map(|m| (dm_thread_id(me, m.id), m.id))
+                    .collect(),
+                _ => HashMap::new(),
+            };
             for th in threads {
                 // Same sentinel, same reasoning as `Message` above: a history
                 // page is no more trustworthy than a broadcast.
-                let page: Vec<Envelope> = items
-                    .iter()
-                    .filter(|e| e.channel == th && e.seq != 0)
-                    .cloned()
-                    .collect();
+                let page = items.iter().filter(|e| e.channel == th && e.seq != 0);
                 let existing = conn.messages.entry(th).or_default();
                 // Merge rather than replace: history is paged now, so a later
                 // page must not throw away the earlier one. Server-assigned
                 // sequences are the identity; unconfirmed local sends (seq 0)
                 // are kept so a message in flight does not blink out.
+                //
+                // One set of known sequences per page, not a scan of the whole
+                // thread per envelope: that made joining a long channel
+                // quadratic, under the lock every party command needs
+                // (PERF-05). The sort only runs when something was added, and
+                // a stable sort of presorted runs is close to linear.
+                let mut known: HashSet<u64> =
+                    existing.iter().map(|e| e.seq).filter(|&s| s != 0).collect();
+                let before = existing.len();
                 for env in page {
-                    if !existing.iter().any(|e| e.seq == env.seq) {
-                        existing.push(env);
+                    if known.insert(env.seq) {
+                        existing.push(env.clone());
                     }
                 }
-                existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
+                if existing.len() != before {
+                    existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
+                }
 
                 // A full page means there is probably more behind it.
                 if page_was_full {
                     if let Some(last) = existing.iter().rfind(|e| e.seq > 0) {
                         let since_seq = last.seq;
-                        let dm_peer = conn.member_id.and_then(|me| {
-                            conn.members
-                                .iter()
-                                .map(|m| m.id)
-                                .find(|other| dm_thread_id(me, *other) == th)
-                        });
-                        let _ = conn.send(match dm_peer {
-                            Some(with) => PartyRequest::FetchDmHistory { with, since_seq },
+                        let _ = conn.send(match dm_peers.get(&th) {
+                            Some(&with) => PartyRequest::FetchDmHistory { with, since_seq },
                             None => PartyRequest::FetchHistory {
                                 channel: th,
                                 since_seq,
@@ -1182,7 +1290,31 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 ))
             };
         }
-        PartyResponse::Files(files) => conn.files = files,
+        PartyResponse::Files(files) => {
+            // A full listing may have been truncated by the server: ask for
+            // the rest. Only then — an older server never truncates and could
+            // not decode the paged request (audit SRV-01).
+            let full = files.len() >= messenger_core::party::MAX_FILE_LISTING;
+            conn.files = files;
+            if full {
+                let offset = u32::try_from(conn.files.len()).unwrap_or(u32::MAX);
+                let _ = conn.send(PartyRequest::ListFilesPage { offset });
+            }
+        }
+        PartyResponse::FilesPage {
+            files,
+            offset,
+            next,
+        } => {
+            // Only a page that continues what we hold; a stale one (the list
+            // was refreshed meanwhile) is dropped rather than spliced in.
+            if offset as usize == conn.files.len() {
+                conn.files.extend(files);
+                if let Some(next) = next {
+                    let _ = conn.send(PartyRequest::ListFilesPage { offset: next });
+                }
+            }
+        }
         PartyResponse::Quota(quota) => conn.quota = Some(quota),
         PartyResponse::AuditLog(entries) => conn.audit = entries,
         PartyResponse::Ok(message) => conn.last_notice = Some(message),
@@ -1193,6 +1325,7 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
 mod tests {
     use super::*;
     use messenger_core::party::ChannelKind;
+    use messenger_core::party::{HISTORY_PAGE_BYTES, MAX_HISTORY_BATCH};
 
     /// Build a manager with one server connection wired to test channels, returning
     /// the server id, a sender to push server responses, and a receiver to observe
@@ -1715,6 +1848,93 @@ mod tests {
         );
     }
 
+    /// PERF-05: paging through a long channel used to scan the whole thread
+    /// for every envelope of every page. The merge must stay correct (no
+    /// duplicates, ascending order, a live broadcast racing a page) and must
+    /// finish a 50k-message channel quickly even in a debug build.
+    #[test]
+    fn paging_a_long_channel_is_linear_and_deduplicated() {
+        let (mut mgr, id, tx, _out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let total = 50_000u64;
+        for start in (1..=total).step_by(MAX_HISTORY_BATCH) {
+            let end = (start + MAX_HISTORY_BATCH as u64 - 1).min(total);
+            // A live broadcast of the page's last envelope arrives first.
+            tx.send(Incoming::Response(PartyResponse::Message(envelope(
+                channel, me, end, "live",
+            ))))
+            .unwrap();
+            let page = (start..=end)
+                .map(|s| envelope(channel, me, s, "x"))
+                .collect();
+            tx.send(Incoming::Response(PartyResponse::History(page)))
+                .unwrap();
+            mgr.poll_events();
+        }
+        let thread = mgr.server(id).unwrap().messages.get(&channel).unwrap();
+        assert_eq!(thread.len() as u64, total);
+        assert!(thread.windows(2).all(|w| w[0].seq < w[1].seq));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "merging {total} envelopes took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// SRV-01: a full `Files` reply may be truncated; the client pages on, and
+    /// only then (an older server never truncates and cannot decode it).
+    #[test]
+    fn a_full_file_listing_is_continued_page_by_page() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let entry = |i: usize| FileEntry {
+            hash: format!("{i:064x}"),
+            name: format!("f{i}"),
+            size: 1,
+            mime: "text/plain".into(),
+            uploader: Uuid::nil(),
+            uploader_name: "a".into(),
+            location: Uuid::nil(),
+            location_name: "#general".into(),
+            is_dm: false,
+            shared_at: 1,
+            can_delete: false,
+            perms: Default::default(),
+        };
+        let max = messenger_core::party::MAX_FILE_LISTING;
+        while out.try_recv().is_ok() {}
+
+        // A short listing is complete: nothing more is asked for.
+        tx.send(Incoming::Response(PartyResponse::Files(vec![entry(0)])))
+            .unwrap();
+        mgr.poll_events();
+        assert!(out.try_recv().is_err());
+
+        tx.send(Incoming::Response(PartyResponse::Files(
+            (0..max).map(entry).collect(),
+        )))
+        .unwrap();
+        mgr.poll_events();
+        assert_eq!(
+            out.try_recv().unwrap(),
+            PartyRequest::ListFilesPage { offset: max as u32 }
+        );
+
+        tx.send(Incoming::Response(PartyResponse::FilesPage {
+            files: (max..max + 3).map(entry).collect(),
+            offset: max as u32,
+            next: None,
+        }))
+        .unwrap();
+        mgr.poll_events();
+        assert_eq!(mgr.server(id).unwrap().files.len(), max + 3);
+        assert!(
+            out.try_recv().is_err(),
+            "the last page asks for nothing more"
+        );
+    }
+
     #[test]
     fn disconnect_marks_status() {
         let (mut mgr, id, tx, _out) = manager_with_server();
@@ -1873,6 +2093,48 @@ mod tests {
             mgr.server(id).unwrap().messages[&channel].len(),
             MAX_HISTORY_BATCH + 1,
             "a later page must not throw away the earlier one"
+        );
+    }
+
+    /// A page the server cut short for *size* has fewer than
+    /// `MAX_HISTORY_BATCH` envelopes, and the client used to treat that as the
+    /// end of history — so a channel of long messages never loaded past its
+    /// first few dozen. A page that is large asks for the next one too, and a
+    /// small short page still does not.
+    #[test]
+    fn a_page_trimmed_for_size_is_continued() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        let long = "x".repeat(60 * 1024);
+        let count = (HISTORY_PAGE_BYTES / long.len()) as u64; // ~68: well under 200
+        assert!((count as usize) < MAX_HISTORY_BATCH);
+        let page: Vec<Envelope> = (1..=count)
+            .map(|seq| envelope(channel, me, seq, &long))
+            .collect();
+        tx.send(Incoming::Response(PartyResponse::History(page)))
+            .unwrap();
+        mgr.poll_events();
+        let asked_again = std::iter::from_fn(|| out.try_recv().ok()).any(|r| {
+            matches!(r, PartyRequest::FetchHistory { channel: c, since_seq }
+                if c == channel && since_seq == count)
+        });
+        assert!(asked_again, "a page trimmed for size must be continued");
+
+        // A short, small page really is the end.
+        tx.send(Incoming::Response(PartyResponse::History(vec![envelope(
+            channel,
+            me,
+            count + 1,
+            "tail",
+        )])))
+        .unwrap();
+        mgr.poll_events();
+        assert!(
+            out.try_recv().is_err(),
+            "a small final page must not be followed by another request"
         );
     }
 

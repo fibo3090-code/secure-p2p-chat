@@ -40,8 +40,12 @@ cd desktop && npm ci && npx tauri build
 cargo build --release -p p2pem-classic     # target/release/p2pem-classic[.exe]
 
 # The community server
-cargo build --release -p messenger-server  # target/release/messenger-server[.exe]
+cargo build --release -p messenger-server  # target/release/server[.exe]
 ```
+
+The crate is called `messenger-server` but the binary it builds is `server`
+(`server.exe` on Windows). The P2PEM Tools archive ships the same program
+renamed to `p2pem-server`, so the two are interchangeable.
 
 ### Linux build prerequisites
 
@@ -129,7 +133,8 @@ Use this when both devices can reach each other directly.
 
 1. Host starts listening on a port.
 2. Connector enters the host address and port.
-3. Both sides verify fingerprints.
+3. Both sides compare the short code (six digits and three emoji) over a call
+   and accept only if it matches — see [Verify a new contact](#verify-a-new-contact).
 4. Chat normally.
 
 Desktop app:
@@ -213,34 +218,65 @@ Relay notes:
 
 Communities are self-hosted, multi-user rooms with channels, direct messages,
 file sharing, and durable history — members who were offline catch up when they
-reconnect. One person runs the server; friends join with just an address, an
-optional password, and a username.
+reconnect. One person runs the server; friends join with just an address, the
+community password, and a username.
 
 Start a server:
 
 ```bash
-cargo run --release -p messenger-server -- --name "Game Night" --port 12345
+cargo run --release -p messenger-server -- --name "Game Night" --port 12345 --password "<choose one>"
 ```
 
 Options (also settable via `PARTY_NAME`, `PARTY_PORT`, `PARTY_PASSWORD`,
-`PARTY_DATA_DIR` environment variables):
+`PARTY_OPEN`, `PARTY_OWNER`, `PARTY_DATA_DIR` environment variables):
 
 - `--name <NAME>` — the community name everyone sees (default: "Encrypted Messenger Party")
 - `--port <PORT>` — TCP port to listen on (default: 12345)
-- `--password <PASSWORD>` — require a password to join (omit for an open server)
+- `--password <PASSWORD>` — the password members join with. **Required**, unless
+  you pass `--open`
+- `--open` — run without a password, so anyone who can reach the port can join.
+  The server refuses to start with neither a password nor `--open`: on a public
+  address an open server is open to the whole internet
+- `--owner <FINGERPRINT>` — your own identity fingerprint (desktop: Settings →
+  Your identity; TUI: `:identity`). That identity becomes the owner when it
+  joins, and any other owner is moved to admin — which is also how to take back
+  a community whose ownership went to the wrong person
+- `--retain-days <DAYS>` — delete messages and shared files older than this,
+  at startup and every hour. Each channel and DM keeps its newest message. Without
+  it, history is kept until someone deletes it — and everything the server keeps
+  is readable by whoever runs it or gets into it
 - `--data-dir <DIR>` — where the database, file store, and server identity live (default: `party-data`)
+
+**Becoming the owner.** Being the first to join does *not* make you the owner —
+that used to hand the community to whoever reached the address first. Until the
+community has an owner (and unless you passed `--owner`), the server prints a
+one-time **owner claim token** at startup. Join with that token typed into the
+**password** field instead of the community password, and you become the owner;
+the token then stops working. A restart before it is used prints a new one.
+Until someone claims it, nobody can administer the community.
 
 On startup the server prints its **fingerprint**. Share your address
 (`your-ip:port`) and that fingerprint with the people you invite; their app pins
 the fingerprint on first join and warns them if it ever changes.
 
-Joining from the app:
+Joining from the app is two steps, and nothing — not your username, not the
+password — is sent before the second:
 
-- **Desktop app**: Communities tab → enter the address, a username, and the
-  password if one is set. Rejoining later is one click (communities are
-  remembered).
-- **TUI**: `:party-connect <host[:port]> <username> [password]`
-- **Desktop app**: Communities → join form.
+1. Enter the address and a username (and the password if one is set).
+   The app connects only far enough to learn the server's fingerprint and
+   shows it to you.
+2. Check it against the fingerprint the operator gave you (the one their
+   server printed at startup). Only if it matches, confirm. The app then
+   joins **only if the server still presents that exact fingerprint**, and
+   remembers it for next time.
+
+- **Desktop app**: Communities tab → join form → "The fingerprint matches —
+  join". Rejoining later is one click (communities are remembered).
+- **TUI**: `:party-connect <host[:port]> <username> [password]`, compare the
+  fingerprint it shows, then `:party-trust`.
+
+Messages in a community are **not end-to-end encrypted**: the server stores
+them and its operator can read them (see the operator notes below).
 
 Operator notes:
 
@@ -250,22 +286,44 @@ Operator notes:
   it is what enables offline delivery and history); tell your members
 - members are remembered by identity fingerprint, so someone who reconnects
   keeps their username and history
+- the server limits how fast each member can post, keeps only recent messages
+  in memory (older ones are read from `party.db` when someone scrolls back),
+  closes connections that never join within 30 seconds, and accepts at most
+  512 connections at once (32 from one address)
 
-### Verify fingerprints
+### Verify a new contact
 
-The app uses TOFU. First contact is only meaningful if you verify the fingerprint out of band.
+The app uses TOFU (trust on first use): the first connection to someone is only
+protected once you have checked, out of band, that nobody is sitting in the
+middle. The app makes that one short step.
 
-Good verification channels:
+When you connect to someone new, both screens show the same **short code: six
+digits and three emoji**. It is derived from this connection's handshake, so an
+attacker relaying between you would produce two *different* codes.
 
-- phone call
-- video call
-- in person
+1. Call the other person (phone, video, or in person — not a chat message over
+   the connection you are checking).
+2. Read the digits and the emoji aloud to each other.
+3. If they match exactly, accept: **Codes match — trust** in the desktop app,
+   `Ctrl+Y` in the terminal client.
+4. If they differ, **Reject** (`Ctrl+N` in the terminal client). Someone may
+   be intercepting the connection. Reconnect and compare again, ideally over a
+   different network, and do not accept until the codes match.
 
-If the fingerprint changes unexpectedly:
+Once accepted, the contact is remembered by its fingerprint and later
+connections do not ask again.
+
+**Advanced: the full fingerprint.** Under the code, the desktop app has a
+"Full fingerprint (advanced)" section with the 64-character fingerprint and a
+colour safety grid; the terminal client shows the grid in the same prompt, and
+`:identity` shows your own. Comparing those is an equivalent, slower check of
+the same thing; the short code is enough on its own.
+
+If a known contact's fingerprint changes unexpectedly:
 
 - stop
 - do not click through casually
-- verify again before trusting the peer
+- verify again, with the short code over a call, before trusting the peer
 
 ### Send messages
 
@@ -357,10 +415,21 @@ On an empty `:` prompt the menu is hidden, so `↑`/`↓` recall previous comman
 Some commands open a focused, keyboard-driven panel:
 
 - **Fingerprint verification** — appears automatically on a new connection.
-  Compare the safety grid / 64-char fingerprint with your peer out of band,
-  then press `y` to accept or `n` to reject (or `:verify accept|reject`).
+  Read the six-digit + emoji code aloud with your peer (the safety grid below
+  it is the advanced check), then press `Ctrl+Y` to accept or `Ctrl+N` to
+  reject. Plain keys (including `Enter`) do nothing,
+  because the prompt can open while you are typing. `Esc` puts it away without
+  answering; answer later with `:verify accept|reject`.
 - **Password** — on startup, unlock an encrypted identity or set a password on
-  a new one. Reachable later via `:unlock` / `:set-password`.
+  a new one. The first-run prompt cannot be dismissed — nothing (identity or
+  history) can be saved without a password — so `Ctrl+Q` quits instead.
+  Change the password later with `:change-password <current> <new>`.
+- **Communities** (`:party`) — `←`/`→` switch community, `↑`/`↓` pick a
+  channel or a direct-message thread; its messages are shown, and
+  `:party-post` writes to it.
+
+Pasting text (bracketed paste) inserts it into the input field; a pasted
+newline is never treated as `Enter`, so a pasted `:command` line is not run.
 - **Contacts** (`:contacts`) — `↑`/`↓` to pick, `Enter` to connect.
 - **Settings** (`:settings`) — `Enter` toggles the selected option.
 - **Identity** (`:identity`), **Transfers** (`:transfers`), **Help** (`:help`),
@@ -397,7 +466,9 @@ Messaging & files
 Party servers
   :party-connect <host[:port]> <username> [password]
                                              join a Party server
-  :party-post <message>                     post to the current Party channel
+  :party                                    open the Communities pane (read threads)
+  :party-trust                              join after checking the fingerprint
+  :party-post <message>                     post to the thread selected in :party
   :party-dm <username|#> <message>          direct-message a Party member
   :party-create-channel <name>              create a Party channel
   :party-status                             show joined Party servers
@@ -406,7 +477,9 @@ Identity & security
   :identity                                 show your fingerprint + safety grid
   :verify <accept|reject>                   answer a pending fingerprint check
   :unlock [password]                        unlock a password-protected identity
-  :set-password <password>                  set or change your password
+  :set-password <password>                  set a password on an unprotected identity
+  :change-password <current> <new>          change your password
+  :history-reset                            set an unreadable history file aside
 
 Settings & app
   :settings                                 open the settings panel
@@ -444,8 +517,28 @@ Use the TUI when you want:
 
 ### Resetting local state
 
-- `Settings -> Delete Everything` removes the messenger app data directory, including the encrypted identity, history, diagnostics, and password-protected local state.
-- On Windows, the uninstaller also offers the same full-data cleanup so a reinstall starts from a fresh identity.
+- **Desktop app:** Settings → Support → **Delete all data**. Enter your password
+  and type `DELETE`; the app removes your identity, encrypted history, saved
+  communities and diagnostics from this device, then quits. It cannot be undone.
+- **Terminal client:** `:wipe <password>`, then `Ctrl+Y` to confirm.
+- Files you downloaded and identity backups you exported are not touched —
+  delete those yourself.
+- **Uninstalling does not remove your data** on any platform. Delete all data
+  first, or remove the folder below by hand.
+
+Where each app keeps its data:
+
+| | Desktop app (`P2PEM`) | Terminal client (`EncryptedMessenger`) |
+|---|---|---|
+| Windows | `%APPDATA%\chat-p2p\P2PEM\data` | `%APPDATA%\chat-p2p\EncryptedMessenger\data` |
+| macOS | `~/Library/Application Support/com.chat-p2p.P2PEM` | `~/Library/Application Support/com.chat-p2p.EncryptedMessenger` |
+| Linux | `~/.local/share/p2pem` | `~/.local/share/encryptedmessenger` |
+
+The desktop app's web view also keeps a small profile (UI preferences such as
+the theme, no messages) under the platform's per-app WebView folder
+(`%LOCALAPPDATA%\com.chat-p2p.p2pem` on Windows,
+`~/Library/WebKit/com.chat-p2p.p2pem` on macOS,
+`~/.local/share/com.chat-p2p.p2pem` on Linux).
 
 ### Where diagnostics go
 
@@ -482,7 +575,8 @@ The app also supports panic/crash logging to help support and debugging.
 
 - treat it as a real security event
 - do not accept it automatically
-- verify the new fingerprint through a trusted external channel
+- verify again through a trusted external channel: compare the short code
+  (six digits and three emoji) over a call, as for a new contact
 
 ### History does not load
 

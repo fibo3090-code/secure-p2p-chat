@@ -151,48 +151,8 @@ async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path, saved_s
 /// count — are persisted without rewriting the encrypted history on every
 /// idle tick.
 fn state_signature(mgr: &ChatManager) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let ids = mgr.chat_ids();
-    let mut sig = ids.len() as u64;
-    for id in &ids {
-        if let Some(c) = mgr.get_chat(*id) {
-            let delivered = c.messages.iter().filter(|m| m.delivered).count() as u64;
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            // The title itself, not its length: renaming "Mum" to "Dad" changes
-            // nothing a length-only signature can see.
-            c.title.hash(&mut h);
-            c.peer_fingerprint.hash(&mut h);
-            sig = sig
-                .wrapping_mul(1_000_003)
-                .wrapping_add(c.messages.len() as u64)
-                .wrapping_add(delivered.wrapping_mul(65_537))
-                // The read mark is persisted state and drives the unread badge,
-                // so a change to it must both save and refresh the UI.
-                .wrapping_add((c.read_count as u64).wrapping_mul(31))
-                .wrapping_add(h.finish());
-        }
-    }
-    // Contacts are persisted inside the same encrypted history, so a signature
-    // that ignored them could not notice an imported invite, a block, or a
-    // fingerprint promoted to Verified — the poll loop simply never saved, and
-    // the change survived only as far as the next clean shutdown.
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    mgr.contacts.len().hash(&mut h);
-    for c in mgr.contacts.values() {
-        c.id.hash(&mut h);
-        c.name.hash(&mut h);
-        c.fingerprint.hash(&mut h);
-        c.address.hash(&mut h);
-        c.addresses.hash(&mut h);
-        c.relay_server.hash(&mut h);
-        c.relay_token.hash(&mut h);
-        (c.trust_state as u8).hash(&mut h);
-    }
-    let mut pairs: Vec<(Uuid, Uuid)> = mgr.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
-    pairs.sort();
-    pairs.hash(&mut h);
-    sig.wrapping_mul(31).wrapping_add(h.finish())
+    // One definition, shared with the terminal client's autosave.
+    mgr.persisted_signature()
 }
 
 /// Reject any post-auth command while the identity is still locked or a password
@@ -257,8 +217,11 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::auth::my_identity,
         commands::auth::set_display_name,
         commands::auth::export_identity,
+        commands::auth::history_status,
+        commands::auth::set_aside_history,
         commands::auth::export_diagnostics,
         commands::auth::open_data_dir,
+        commands::auth::delete_all_data,
         commands::connect::lock_state,
         commands::connect::set_locked,
         commands::chats::list_conversations,
@@ -471,9 +434,11 @@ fn ui_signature(mgr: &ChatManager) -> u64 {
             chat.peer_fingerprint.hash(&mut h);
         }
     }
+    // A transfer starting, finishing or failing changes what the chat pane
+    // shows; its byte count ticking up does not need the whole conversation
+    // refetched — that is `transfer_signature`'s job (PERF-01).
     for t in mgr.active_transfers_snapshot() {
         t.id.hash(&mut h);
-        t.received.hash(&mut h);
         std::mem::discriminant(&t.status).hash(&mut h);
     }
     mgr.is_hosting.hash(&mut h);
@@ -481,6 +446,22 @@ fn ui_signature(mgr: &ChatManager) -> u64 {
     mgr.external_address.is_some().hash(&mut h);
     mgr.is_conversation_locked().hash(&mut h);
     mgr.contacts.len().hash(&mut h);
+    h.finish()
+}
+
+/// Progress of the active transfers. While anything is in flight this moves
+/// every tick; when it is the *only* thing that moved, the poll loop emits the
+/// light `transfers-updated` (the frontend refetches the transfer list) instead
+/// of `state-updated`, which refetched every conversation and re-serialized the
+/// open one four times a second for the whole transfer (PERF-01).
+fn transfer_signature(mgr: &ChatManager) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for t in mgr.active_transfers_snapshot() {
+        t.id.hash(&mut h);
+        t.received.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -583,6 +564,7 @@ const REHOST_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
 #[derive(Default)]
 struct PollMemory {
     last_ui_sig: Option<u64>,
+    last_transfer_sig: Option<u64>,
     last_party_sig: Option<u64>,
     /// Session id of the TOFU prompt currently published to the frontend.
     last_fp_session: Option<Uuid>,
@@ -607,7 +589,7 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                 last_rehost = std::time::Instant::now();
                 ctx.auto_rehost().await;
             }
-            let (prompt, toasts, sig, ui_sig) = {
+            let (prompt, toasts, sig, ui_sig, transfer_sig) = {
                 let mut m = ctx.manager.lock().await;
                 m.poll_session_events();
                 // Drain ChatManager's internal toasts (Connected, errors,
@@ -621,7 +603,13 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                 // could no longer find the fingerprint to persist, and a second
                 // peer's prompt silently replaced the first one's.
                 let prompt = m.pending_fingerprint().cloned();
-                (prompt, toasts, state_signature(&m), ui_signature(&m))
+                (
+                    prompt,
+                    toasts,
+                    state_signature(&m),
+                    ui_signature(&m),
+                    transfer_signature(&m),
+                )
             };
             if ctx.save_history_if_changed(sig, last_save).await {
                 last_save = std::time::Instant::now();
@@ -636,9 +624,14 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                 ctx.publish_fingerprint_prompt(&app, prompt, &mut memory.last_fp_session);
             // Emit refresh events only when the rendered surface changed (or a
             // TOFU prompt appeared, so its fallback polling always runs).
+            let transfers_moved = memory.last_transfer_sig != Some(transfer_sig);
+            memory.last_transfer_sig = Some(transfer_sig);
             if memory.last_ui_sig != Some(ui_sig) || new_prompt {
                 memory.last_ui_sig = Some(ui_sig);
+                // A full refresh refetches the transfers too.
                 let _ = app.emit("state-updated", ());
+            } else if transfers_moved {
+                let _ = app.emit("transfers-updated", ());
             }
             // Nudge the Communities pane only when the directory/messages changed.
             if memory.last_party_sig != Some(party_sig) {

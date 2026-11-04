@@ -118,4 +118,75 @@ impl TuiApp {
             }
         }
     }
+
+    /// `:wipe <password>` — check the password against the identity on disk,
+    /// then ask once more (Ctrl+Y) before deleting everything.
+    pub(super) fn cmd_wipe(&mut self, password: &str) {
+        if !self.identity.is_encrypted() {
+            self.toast(
+                ToastLevel::Error,
+                "Set a password first; :wipe checks it before deleting anything.".to_string(),
+            );
+            return;
+        }
+        let checked = Identity::load(&self.identity_path).and_then(|mut id| id.decrypt(password));
+        match checked {
+            Ok(()) => self.overlay = TuiOverlay::ConfirmWipe,
+            Err(_) => self.toast(
+                ToastLevel::Error,
+                "Wrong password — nothing was deleted".to_string(),
+            ),
+        }
+    }
+
+    /// Delete everything and quit. `ChatManager::delete_all_data` stops
+    /// hosting and sessions and refuses every later save, so the save on the
+    /// way out cannot write a history file back.
+    pub(super) fn wipe_now(&mut self) {
+        for id in self.party_manager.server_ids() {
+            self.party_manager.remove_server(id);
+        }
+        let data_dir = self
+            .history_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let (history, identity) = (self.history_path.clone(), self.identity_path.clone());
+        match self
+            .chat_manager
+            .delete_all_data(&data_dir, &history, &identity)
+        {
+            Ok(()) => self.should_quit = true,
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("Deleting data failed part-way: {e}"),
+            ),
+        }
+    }
+
+    /// `:history-reset` — move an unreadable history aside (renamed, never
+    /// deleted) so saving can resume.
+    pub(super) fn cmd_history_reset(&mut self) {
+        if self.chat_manager.history_load_error().is_none() {
+            self.toast(
+                ToastLevel::Info,
+                "Your history loaded normally; there is nothing to reset.".to_string(),
+            );
+            return;
+        }
+        let path = self.history_path.clone();
+        match self.chat_manager.set_aside_unreadable_history(&path) {
+            Ok(moved) => {
+                self.save_history_now();
+                let note = moved
+                    .map(|p| format!("Old history kept as {}", p.display()))
+                    .unwrap_or_else(|| "Started a new history".to_string());
+                self.toast(ToastLevel::Success, note);
+            }
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("Could not move the unreadable history aside: {e}"),
+            ),
+        }
+    }
 }

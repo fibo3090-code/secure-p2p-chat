@@ -1,4 +1,18 @@
 use super::*;
+use messenger_core::party::{PartyResponse, MAX_HISTORY_BATCH, MAX_PARTY_PAYLOAD_BYTES};
+
+/// Join as the community's Owner the way the operator does: with the one-time
+/// owner claim token in place of the password. Being first no longer makes
+/// anyone the owner (SRV-04).
+fn join_owner(state: &mut PartyState, name: &str) -> Uuid {
+    let token = state
+        .owner_claim_token()
+        .expect("the community has no owner yet")
+        .to_string();
+    let id = state.join(name, Some(&token), None).unwrap();
+    assert_eq!(state.role_of(id), Role::Owner);
+    id
+}
 
 #[test]
 fn open_server_join_succeeds_and_lists_member() {
@@ -797,7 +811,7 @@ fn non_public_channels_are_enforced_rather_than_decorative() {
     let mut state = PartyState::new("Open", None);
     // The first member is the owner, so join a second one to test the
     // ordinary-member path.
-    let _owner = state.join("owner", None, None).unwrap();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let public = state.default_channel();
 
@@ -812,7 +826,7 @@ fn non_public_channels_are_enforced_rather_than_decorative() {
             name: label.to_string(),
             kind,
             members: Vec::new(),
-            messages: Vec::new(),
+            history: History::new(),
         });
         assert!(
             state.post_message(bob, id, "hi".to_string()).is_err(),
@@ -850,7 +864,7 @@ fn non_public_channels_are_enforced_rather_than_decorative() {
 #[test]
 fn admins_can_post_where_ordinary_members_cannot() {
     let mut state = PartyState::new("Open", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     assert_eq!(state.role_of(owner), Role::Owner);
 
     let announce = state
@@ -873,7 +887,7 @@ fn admins_can_post_where_ordinary_members_cannot() {
 #[test]
 fn private_channel_membership_grants_access() {
     let mut state = PartyState::new("Open", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
 
@@ -902,7 +916,7 @@ fn private_channel_membership_grants_access() {
 #[test]
 fn ordinary_members_may_only_create_public_channels() {
     let mut state = PartyState::new("Open", None);
-    let _owner = state.join("owner", None, None).unwrap();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
 
     assert!(state
@@ -930,7 +944,7 @@ fn blobs_in_unreadable_channels_are_not_downloadable() {
     let mut state = PartyState::new("Open", None);
     // The first member owns the server, and an admin can read every channel,
     // so the member under test has to be an ordinary one.
-    let _owner = state.join("owner", None, None).unwrap();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let chan = state.default_channel();
     let env = state
@@ -958,16 +972,48 @@ fn blobs_in_unreadable_channels_are_not_downloadable() {
     );
 }
 
-/// The operator starts the server and then joins it, so the first identity
-/// through the door owns it. Without this bootstrap nobody could administer
-/// anything, because only an admin can appoint one.
+/// SRV-04: the first identity through the door used to become the permanent,
+/// undemotable Owner — so whoever reached the address before the operator did
+/// owned the community. Being first now grants nothing; presenting the
+/// one-time owner claim token does, once.
 #[test]
-fn the_first_member_owns_the_server_and_the_rest_do_not() {
-    let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
-    let bob = state.join("bob", None, None).unwrap();
+fn being_first_grants_nothing_and_the_claim_token_grants_ownership_once() {
+    // Generated, not written down: a credential literal in a test is still a
+    // credential literal to a scanner.
+    let pw = Uuid::new_v4().to_string();
+    let mut state = PartyState::new("Srv", Some(pw.clone()));
+    let token = state.owner_claim_token().expect("no owner yet").to_string();
+
+    let squatter = state.join("squatter", Some(pw.as_str()), None).unwrap();
+    assert_eq!(state.role_of(squatter), Role::Member, "first is not owner");
+    assert!(!state.has_owner());
+
+    // A wrong token is just a wrong password.
+    assert_eq!(
+        state.join(
+            "guess",
+            Some(Uuid::new_v4().simple().to_string().as_str()),
+            None
+        ),
+        Err(JoinError::WrongPassword)
+    );
+
+    // The token stands in for the password, with surrounding whitespace from
+    // a paste tolerated.
+    let owner = state
+        .join("owner", Some(&format!(" {token}\n")), None)
+        .unwrap();
+    let bob = state.join("bob", Some(pw.as_str()), None).unwrap();
     assert_eq!(state.role_of(owner), Role::Owner);
     assert_eq!(state.role_of(bob), Role::Member);
+    assert_eq!(state.owner_claim_token(), None, "used up");
+    assert_eq!(
+        state.join("again", Some(&token), None),
+        Err(JoinError::WrongPassword),
+        "a spent token is not a password"
+    );
+    let log = state.audit_log(owner, 10).unwrap();
+    assert!(log.iter().any(|e| e.action == "role.claim"));
     assert_eq!(
         state.role_of(Uuid::new_v4()),
         Role::Guest,
@@ -980,7 +1026,7 @@ fn the_first_member_owns_the_server_and_the_rest_do_not() {
 #[test]
 fn role_changes_cannot_escalate_past_the_actor() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
 
@@ -1007,7 +1053,7 @@ fn role_changes_cannot_escalate_past_the_actor() {
 #[test]
 fn a_guest_cannot_write_anywhere() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     state.set_role(owner, bob, Role::Guest).unwrap();
     let chan = state.default_channel();
@@ -1032,7 +1078,7 @@ fn a_guest_cannot_write_anywhere() {
 fn deleting_the_last_reference_reclaims_the_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let a = state.default_channel();
     let b = state
         .create_channel_of_kind(owner, "second", ChannelKind::Public, vec![])
@@ -1078,7 +1124,7 @@ fn deleting_the_last_reference_reclaims_the_bytes() {
 #[test]
 fn only_the_uploader_or_an_admin_may_delete_a_file() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let chan = state.default_channel();
@@ -1120,7 +1166,7 @@ fn only_the_uploader_or_an_admin_may_delete_a_file() {
 #[test]
 fn deleting_a_file_revokes_access_but_keeps_history_intact() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let chan = state.default_channel();
     state
         .post_message(owner, chan, "before".to_string())
@@ -1156,7 +1202,7 @@ fn deleting_a_file_revokes_access_but_keeps_history_intact() {
 #[test]
 fn a_member_cannot_exceed_their_own_storage_allowance() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     state.set_max_member_blob_bytes(10);
     let chan = state.default_channel();
@@ -1217,7 +1263,7 @@ fn a_member_cannot_exceed_their_own_storage_allowance() {
 #[test]
 fn the_file_listing_respects_who_may_see_what() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let public = state.default_channel();
 
@@ -1278,7 +1324,7 @@ fn the_file_listing_respects_who_may_see_what() {
 #[test]
 fn governance_actions_are_audited_and_the_log_is_admin_only() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
 
     state.set_role(owner, bob, Role::Admin).unwrap();
@@ -1300,57 +1346,75 @@ fn governance_actions_are_audited_and_the_log_is_admin_only() {
     assert!(state.audit_log(bob, 50).is_err());
 }
 
-/// A community that predates roles must not reload with nobody able to
-/// administer it.
-///
-/// `join` only appoints an owner when the member table is empty, and the
-/// migration defaults existing rows to `Member`. Without a bootstrap the
-/// operator would be permanently locked out of governance on their own
-/// server, because `set_role` requires an admin that does not exist.
+/// A community that predates roles reloads with nobody able to administer it.
+/// It used to hand ownership to whichever member had the lowest id — a random
+/// member, permanently (SRV-20). Now it waits for the operator: a claim token
+/// is issued, and nobody is promoted until it is used.
 #[test]
-fn an_upgraded_server_with_no_admin_gets_an_owner() {
+fn an_upgraded_server_with_no_admin_waits_for_the_operator_to_claim_it() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, bob);
     {
         let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
-        alice = s.join("alice", None, None).unwrap();
+        alice = s.join("alice", None, Some("fp-alice".into())).unwrap();
         bob = s.join("bob", None, None).unwrap();
-        // Simulate the pre-roles state: everybody an ordinary member.
-        for id in [alice, bob] {
-            let m = s.members.get_mut(&id).unwrap();
-            m.role = Role::Member;
-            let snapshot = s.members.get(&id).unwrap();
-            s.persist_member(snapshot);
-        }
         assert!(!s.members.values().any(|m| m.role.is_admin()));
     }
 
-    let s = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owners: Vec<Uuid> = s
-        .members
-        .values()
-        .filter(|m| m.role == Role::Owner)
-        .map(|m| m.id)
-        .collect();
-    assert_eq!(owners.len(), 1, "exactly one owner is appointed");
-    // Deterministic, so a restart does not shuffle ownership around.
-    assert_eq!(owners[0], alice.min(bob));
-    // And it is recorded, because silently handing somebody ownership is
-    // the sort of thing an operator should be able to see happened.
-    let log = s.audit_log(owners[0], 10).unwrap();
-    assert!(log.iter().any(|e| e.action == "role.bootstrap"));
-
-    // A server that already has an admin is left alone.
-    let again = PartyState::load("Srv", None, dir.path()).unwrap();
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    assert!(!s.has_owner(), "nobody is promoted by accident");
+    let token = s
+        .owner_claim_token()
+        .expect("a claim is issued")
+        .to_string();
+    // The operator is an existing member: claiming promotes them in place.
     assert_eq!(
-        again
-            .members
-            .values()
-            .filter(|m| m.role == Role::Owner)
-            .count(),
-        1,
-        "the bootstrap does not run twice"
+        s.join("alice", Some(&token), Some("fp-alice".into())),
+        Ok(alice)
     );
+    assert_eq!(s.role_of(alice), Role::Owner);
+    assert_eq!(s.role_of(bob), Role::Member);
+
+    // It persists, and a restart issues no new token.
+    let again = PartyState::load("Srv", None, dir.path()).unwrap();
+    assert_eq!(again.role_of(alice), Role::Owner);
+    assert_eq!(again.owner_claim_token(), None);
+}
+
+/// `--owner <fingerprint>`: the configured identity becomes the Owner when it
+/// joins, no token is issued, and nobody else is promoted by joining first.
+#[test]
+fn a_configured_owner_fingerprint_owns_the_community() {
+    let mut state = PartyState::new("Srv", None);
+    state.set_owner_fingerprint(Some("  AB12CD  ".into()));
+    assert_eq!(state.owner_claim_token(), None, "no claim is needed");
+    let first = state.join("first", None, Some("ffff".into())).unwrap();
+    assert_eq!(state.role_of(first), Role::Member);
+    let op = state.join("op", None, Some("ab12cd".into())).unwrap();
+    assert_eq!(state.role_of(op), Role::Owner, "matched canonically");
+}
+
+/// The operator's recovery path: configuring their fingerprint on a community
+/// whose ownership went to someone else moves the seat to them and leaves the
+/// previous owner an admin, which the new owner may then demote.
+#[test]
+fn configuring_an_owner_recovers_a_squatted_community() {
+    let dir = tempfile::tempdir().unwrap();
+    let (squatter, op);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        squatter = join_owner(&mut s, "squatter");
+        op = s.join("op", None, Some("0a0a".into())).unwrap();
+        assert_eq!(s.role_of(op), Role::Member);
+    }
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    s.set_owner_fingerprint(Some("0A0A".into()));
+    assert_eq!(s.role_of(op), Role::Owner);
+    assert_eq!(s.role_of(squatter), Role::Admin, "exactly one owner");
+    assert!(s.set_role(op, squatter, Role::Member).is_ok());
+    let log = s.audit_log(op, 10).unwrap();
+    assert!(log.iter().any(|e| e.action == "role.configured"));
+    assert!(log.iter().any(|e| e.action == "role.owner_moved"));
 }
 
 /// The same content shared twice in one place is two shares, and both have
@@ -1362,7 +1426,7 @@ fn repeated_shares_of_one_file_survive_a_reload_individually() {
     let (owner, channel, hash);
     {
         let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
-        owner = s.join("owner", None, None).unwrap();
+        owner = join_owner(&mut s, "owner");
         channel = s.default_channel();
         let env = s
             .post_file(
@@ -1409,7 +1473,7 @@ fn governance_state_survives_a_reload() {
     let (owner, bob, private_id, hash);
     {
         let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
-        owner = s.join("owner", None, None).unwrap();
+        owner = join_owner(&mut s, "owner");
         bob = s.join("bob", None, None).unwrap();
         s.set_role(owner, bob, Role::Admin).unwrap();
         private_id = s
@@ -1455,7 +1519,7 @@ fn governance_state_survives_a_reload() {
 fn deleting_a_channel_reclaims_the_files_shared_in_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let extra = state
         .create_channel_of_kind(owner, "temp", ChannelKind::Public, vec![])
         .unwrap()
@@ -1489,7 +1553,7 @@ fn deleting_a_channel_reclaims_the_files_shared_in_it() {
 fn a_chunked_upload_round_trips_and_posts_a_file_message() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
 
     // Deliberately not a multiple of the chunk size, so the last chunk is
@@ -1546,7 +1610,7 @@ fn a_chunked_upload_round_trips_and_posts_a_file_message() {
 #[test]
 fn an_upload_that_exceeds_its_declared_size_is_dropped() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
     let upload = state
         .start_upload(
@@ -1568,7 +1632,7 @@ fn an_upload_that_exceeds_its_declared_size_is_dropped() {
 #[test]
 fn an_incomplete_upload_cannot_be_finished() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
     let upload = state
         .start_upload(
@@ -1589,7 +1653,7 @@ fn an_incomplete_upload_cannot_be_finished() {
 #[test]
 fn uploads_are_refused_up_front_on_size_quota_and_permission() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
     let octet = || "application/octet-stream".to_string();
@@ -1663,7 +1727,7 @@ fn uploads_are_refused_up_front_on_size_quota_and_permission() {
 #[test]
 fn uploads_are_owned_by_their_uploader_and_cleaned_up() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
     let upload = state
@@ -1702,7 +1766,7 @@ fn uploads_are_owned_by_their_uploader_and_cleaned_up() {
 #[test]
 fn an_upload_finished_short_does_not_leak_its_spool() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
     let _ = owner;
@@ -1796,7 +1860,7 @@ fn the_upload_cap_counts_what_the_server_is_holding() {
 fn a_chunked_read_returns_the_same_bytes_from_disk_as_from_memory() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
 
     // Two and a bit chunks, so offsets land mid-file and at the tail.
@@ -1875,7 +1939,7 @@ fn a_chunked_read_returns_the_same_bytes_from_disk_as_from_memory() {
 fn staged_uploads_are_counted_against_the_storage_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
     // Room for two of these and no more.
@@ -1949,7 +2013,7 @@ fn staged_uploads_are_counted_against_the_storage_ceiling() {
 fn a_deduplicated_chunked_reupload_succeeds_at_a_full_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
     let _ = owner;
@@ -2166,7 +2230,7 @@ fn identical_concurrent_uploads_do_not_delete_each_other() {
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
     // The first joiner is the Owner and cannot be demoted, so the two
     // uploaders are ordinary members joining after them.
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let alice = state.join("alice", None, None).unwrap();
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
@@ -2287,7 +2351,7 @@ fn startup_sweeps_staging_files_a_crash_left_behind() {
 fn permission_lost_during_the_write_refuses_the_commit() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let channel = state.default_channel();
@@ -2377,7 +2441,7 @@ fn permission_lost_during_the_write_refuses_the_commit() {
 #[test]
 fn a_strangers_finish_does_not_drop_your_upload() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
 
@@ -2403,7 +2467,7 @@ fn a_strangers_finish_does_not_drop_your_upload() {
 #[test]
 fn view_and_download_are_separate_rights() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let chan = state.default_channel();
     let env = state
@@ -2455,7 +2519,7 @@ fn view_and_download_are_separate_rights() {
 #[test]
 fn a_member_grant_overrides_the_default() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let chan = state.default_channel();
@@ -2503,7 +2567,7 @@ fn a_member_grant_overrides_the_default() {
 #[test]
 fn a_grant_cannot_exceed_what_the_granter_holds() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let chan = state.default_channel();
@@ -2538,7 +2602,7 @@ fn a_grant_cannot_exceed_what_the_granter_holds() {
 fn sharing_a_file_elsewhere_costs_a_reference_not_a_copy() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let first = state.default_channel();
     let second = state
@@ -2616,7 +2680,7 @@ fn sharing_a_file_elsewhere_costs_a_reference_not_a_copy() {
 #[test]
 fn a_grant_cannot_give_a_guest_write_rights() {
     let mut state = PartyState::new("Srv", None);
-    let owner = state.join("owner", None, None).unwrap();
+    let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let chan = state.default_channel();
     let env = state
@@ -2650,7 +2714,7 @@ fn file_permissions_survive_a_reload() {
     let (owner, bob, chan, hash);
     {
         let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
-        owner = s.join("owner", None, None).unwrap();
+        owner = join_owner(&mut s, "owner");
         bob = s.join("bob", None, None).unwrap();
         chan = s.default_channel();
         let env = s
@@ -2774,7 +2838,7 @@ fn channel_creation_is_capped() {
 #[test]
 fn a_member_cannot_burst_create_channels() {
     let mut state = PartyState::new("Open", None);
-    let _owner = state.join("owner", None, None).unwrap();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let now = Instant::now();
 
@@ -2802,7 +2866,7 @@ fn a_member_cannot_burst_create_channels() {
 #[test]
 fn the_channel_rate_limit_is_per_member() {
     let mut state = PartyState::new("Open", None);
-    let _owner = state.join("owner", None, None).unwrap();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let now = Instant::now();
@@ -2876,4 +2940,493 @@ fn history_requires_membership() {
 
     let stranger = Uuid::new_v4();
     assert!(state.history_since(stranger, chan, 0).is_empty());
+}
+
+/// Every write used to be its own rollback-journal commit with
+/// `synchronous=FULL` — several fsyncs per post, all under the state lock.
+#[test]
+fn the_database_runs_in_wal_mode_with_normal_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let conn = s.db.as_ref().unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    // 1 == NORMAL.
+    let sync: i64 = conn
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sync, 1);
+}
+
+/// A mutation that writes several rows commits them together, and a helper
+/// that opens its own transaction still works when called inside one.
+#[test]
+fn multi_row_mutations_commit_as_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        bob = s.join("bob", None, None).unwrap();
+        // A DM writes its thread row and its message; here it runs inside an
+        // outer transaction, so the inner one must not try to nest.
+        s.with_tx(|s| {
+            s.post_dm(alice, bob, "inside".to_string()).unwrap();
+            assert!(!s.db.as_ref().unwrap().is_autocommit());
+        });
+        assert!(s.db.as_ref().unwrap().is_autocommit(), "committed");
+        s.post_dm(alice, bob, "outside".to_string()).unwrap();
+    }
+    let s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let thread = messenger_core::party::dm_thread_id(alice, bob);
+    assert_eq!(s.dm_history(thread, 0).len(), 2);
+}
+
+/// SRV-01: a page was capped at 200 envelopes and nothing else, and 200
+/// envelopes of 64 KiB text are 12.8 MiB. About 130 maximum-size posts made
+/// every page covering them unsendable, every joining client was disconnected
+/// on its first history fetch, and the community stayed unjoinable across
+/// restarts. A channel full of maximum-size messages must still page in frames
+/// that fit, and paging must reach the end.
+#[test]
+fn a_channel_of_maximum_size_messages_still_pages_in_frames_that_fit() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let chan = state.default_channel();
+    let total = MAX_HISTORY_BATCH + 50;
+    for i in 0..total {
+        let mut text = format!("{i:04}");
+        text.push_str(&"x".repeat(MAX_MESSAGE_TEXT_BYTES - text.len()));
+        state.post_message(alice, chan, text).unwrap();
+    }
+
+    let mut since = 0u64;
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = state.history_since(alice, chan, since);
+        if page.is_empty() {
+            break;
+        }
+        pages += 1;
+        let frame = PartyResponse::History(page.clone()).to_bytes();
+        assert!(
+            frame.len() <= MAX_PARTY_PAYLOAD_BYTES,
+            "page {pages} is {} bytes, over the frame limit",
+            frame.len()
+        );
+        let more = messenger_core::party::history_page_may_continue(&page);
+        since = page.last().unwrap().seq;
+        seen.extend(page.into_iter().map(|e| e.seq));
+        if !more {
+            break;
+        }
+        assert!(pages < 100, "paging must terminate");
+    }
+    assert!(
+        pages > 2,
+        "the byte budget, not the count, split this channel"
+    );
+    assert_eq!(seen, (1..=total as u64).collect::<Vec<_>>());
+}
+
+/// The DM thread twin of the test above.
+#[test]
+fn dm_history_of_maximum_size_messages_fits_in_a_frame() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let bob = state.join("bob", None, None).unwrap();
+    for _ in 0..MAX_HISTORY_BATCH {
+        state
+            .post_dm(alice, bob, "y".repeat(MAX_MESSAGE_TEXT_BYTES))
+            .unwrap();
+    }
+    let thread = messenger_core::party::dm_thread_id(alice, bob);
+    let page = state.dm_history(thread, 0);
+    assert!(page.len() < MAX_HISTORY_BATCH);
+    assert!(PartyResponse::History(page).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+}
+
+/// One upload whose MIME type sat just under 8 MiB produced a broadcast
+/// *larger* than the request that created it, disconnecting every online
+/// member, and poisoned every history page that held it. The name and type are
+/// bounded on arrival, on both upload paths.
+#[test]
+fn file_names_and_mime_types_are_bounded_on_upload() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let chan = state.default_channel();
+    let huge_mime = format!("text/{}", "a".repeat(1024 * 1024));
+    let huge_name = "n".repeat(1024 * 1024);
+
+    let env = state
+        .post_file(
+            alice,
+            chan,
+            huge_name.clone(),
+            huge_mime.clone(),
+            b"x".to_vec(),
+        )
+        .unwrap();
+    let meta = file_payload(&env);
+    assert_eq!(meta.mime, FALLBACK_MIME);
+    assert!(meta.name.len() <= messenger_core::util::MAX_FILENAME_BYTES);
+    assert!(encoded_len(&env) < 1024, "the message stays small");
+
+    // The chunked path takes the same route.
+    let upload = state
+        .start_upload(alice, huge_name, huge_mime, 1, UploadTarget::Channel(chan))
+        .unwrap();
+    state.upload_chunk(alice, upload, b"y").unwrap();
+    let (env, _) = state.finish_upload(alice, upload).unwrap();
+    let meta = file_payload(&env);
+    assert_eq!(meta.mime, FALLBACK_MIME);
+    assert!(meta.name.len() <= messenger_core::util::MAX_FILENAME_BYTES);
+
+    // And so is the listing built from them.
+    for f in state.files_for(alice) {
+        assert!(f.mime.len() <= MAX_MIME_BYTES);
+    }
+}
+
+#[test]
+fn mime_types_are_normalised_to_type_and_subtype() {
+    assert_eq!(normalize_mime("image/png"), "image/png");
+    assert_eq!(normalize_mime(" Text/Plain; charset=utf-8 "), "text/plain");
+    assert_eq!(
+        normalize_mime("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    );
+    for bad in [
+        "",
+        "png",
+        "/png",
+        "image/",
+        "image/p ng",
+        "a/b/c",
+        "image/\u{202e}gnp",
+    ] {
+        assert_eq!(normalize_mime(bad), FALLBACK_MIME, "{bad:?}");
+    }
+    assert_eq!(
+        normalize_mime(&format!("a/{}", "b".repeat(200))),
+        FALLBACK_MIME
+    );
+}
+
+/// Re-sharing is free, so the number of file references has no natural bound,
+/// and `Files` is one frame. The listing keeps the newest that fit.
+#[test]
+fn the_file_listing_is_capped_to_fit_one_frame() {
+    let mut state = PartyState::new("Open", None);
+    let alice = state.join("alice", None, None).unwrap();
+    let chan = state.default_channel();
+    for i in 0..(MAX_FILE_LISTING + 5) {
+        state
+            .post_file(
+                alice,
+                chan,
+                format!("f{i}.txt"),
+                "text/plain".into(),
+                format!("{i}").into_bytes(),
+            )
+            .unwrap();
+    }
+    let listing = state.files_for(alice);
+    assert_eq!(listing.len(), MAX_FILE_LISTING);
+    assert!(PartyResponse::Files(listing.clone()).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+
+    // The rest is reachable page by page, with nothing repeated or skipped.
+    let (first, next) = state.files_page(alice, 0);
+    assert_eq!(first, listing);
+    assert_eq!(next, Some(MAX_FILE_LISTING));
+    let (rest, next) = state.files_page(alice, MAX_FILE_LISTING);
+    assert_eq!(rest.len(), 5);
+    assert_eq!(next, None);
+    let mut names: Vec<String> = first.iter().chain(&rest).map(|f| f.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), MAX_FILE_LISTING + 5);
+    assert_eq!(state.files_page(alice, 10_000), (Vec::new(), None));
+
+    let mut items: Vec<String> = (0..10).map(|i| "z".repeat(100 + i)).collect();
+    truncate_listing(&mut items, 100, 3 * 120);
+    assert_eq!(items.len(), 3, "the byte budget trims too");
+}
+
+/// The directory is one frame, so membership has a ceiling. A returning
+/// member is always let back in.
+#[test]
+fn membership_is_capped_but_returning_members_still_join() {
+    let mut state = PartyState::new("Open", None);
+    state.set_max_members(2);
+    let a = state.join("a", None, Some("fp-a".into())).unwrap();
+    state.join("b", None, Some("fp-b".into())).unwrap();
+    assert_eq!(
+        state.join("c", None, Some("fp-c".into())),
+        Err(JoinError::ServerFull)
+    );
+    assert_eq!(state.join("a", None, Some("fp-a".into())), Ok(a));
+
+    // The ceiling is a cap, not a knob: it cannot be raised past the frame.
+    state.set_max_members(usize::MAX);
+    assert_eq!(state.max_members, MAX_MEMBERS);
+    let directory: Vec<MemberInfo> = (0..MAX_MEMBERS)
+        .map(|_| MemberInfo {
+            id: Uuid::new_v4(),
+            username: "\u{1F600}".repeat(MAX_USERNAME_CHARS),
+            online: true,
+            role: Role::Member,
+        })
+        .collect();
+    assert!(PartyResponse::Members(directory).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+}
+
+/// Every channel's private membership travels in the one `Channels` frame.
+#[test]
+fn a_private_channel_member_list_is_capped_and_deduplicated() {
+    let mut state = PartyState::new("Open", None);
+    let owner = join_owner(&mut state, "owner");
+    let others: Vec<Uuid> = (0..MAX_PRIVATE_CHANNEL_MEMBERS)
+        .map(|i| state.join(&format!("m{i}"), None, None).unwrap())
+        .collect();
+    // `owner` plus every other member is one too many.
+    assert!(state
+        .create_channel_of_kind(owner, "big", ChannelKind::Private, others.clone())
+        .is_err());
+    let dupes = vec![others[0], others[0], others[1], owner];
+    let info = state
+        .create_channel_of_kind(owner, "small", ChannelKind::Private, dupes)
+        .unwrap();
+    assert_eq!(info.members.len(), 3, "duplicates are dropped");
+    assert!(state
+        .set_channel_access(owner, info.id, ChannelKind::Private, others)
+        .is_err());
+
+    // The worst case the caps allow still fits in a frame.
+    let channels: Vec<ChannelInfo> = (0..MAX_CHANNELS)
+        .map(|_| ChannelInfo {
+            id: Uuid::new_v4(),
+            name: "\u{1F600}".repeat(MAX_CHANNEL_NAME_CHARS),
+            kind: ChannelKind::Private,
+            members: (0..MAX_PRIVATE_CHANNEL_MEMBERS)
+                .map(|_| Uuid::new_v4())
+                .collect(),
+        })
+        .collect();
+    assert!(PartyResponse::Channels(channels).to_bytes().len() <= MAX_PARTY_PAYLOAD_BYTES);
+}
+
+/// A database written before names and types were bounded is repaired on
+/// load, so a poisoned community can be joined again without hand-editing it.
+#[test]
+fn oversized_file_metadata_from_an_older_server_is_repaired_on_load() {
+    let env = Envelope {
+        tier: TrustTier::Administered,
+        sender: Uuid::new_v4(),
+        channel: Uuid::new_v4(),
+        seq: 1,
+        timestamp: 0,
+        payload: MessagePayload::File(FileMeta {
+            hash: "00".repeat(32),
+            name: "n".repeat(100_000),
+            size: 1,
+            mime: format!("text/{}", "a".repeat(100_000)),
+        }),
+    };
+    let repaired = repair_envelope(env);
+    assert!(encoded_len(&repaired) < 1024);
+}
+
+/// Collect a thread's whole history by paging, as a client does.
+fn page_all(mut fetch: impl FnMut(u64) -> Vec<Envelope>) -> Vec<u64> {
+    let mut since = 0;
+    let mut seqs = Vec::new();
+    loop {
+        let page = fetch(since);
+        let Some(last) = page.last() else { break };
+        since = last.seq;
+        seqs.extend(page.iter().map(|e| e.seq));
+    }
+    seqs
+}
+
+/// SRV-06: every message ever posted used to stay in memory for the life of
+/// the process and be deserialized at startup, so RSS and restart time grew
+/// with the community's whole history. A disk-backed server keeps only each
+/// thread's newest envelopes resident and pages older ones from SQLite.
+#[test]
+fn only_the_newest_history_stays_in_memory_and_older_pages_come_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let total = RESIDENT_HISTORY + 60;
+    let (alice, bob, chan);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        bob = s.join("bob", None, None).unwrap();
+        chan = s.default_channel();
+        for i in 0..total {
+            s.post_message(alice, chan, format!("c{i}")).unwrap();
+            s.post_dm(alice, bob, format!("d{i}")).unwrap();
+        }
+        assert_eq!(
+            s.channel(chan).unwrap().history.resident_len(),
+            RESIDENT_HISTORY
+        );
+        let thread = messenger_core::party::dm_thread_id(alice, bob);
+        assert_eq!(
+            s.dm_threads[&thread].history.resident_len(),
+            RESIDENT_HISTORY
+        );
+
+        // Paging from the start reaches back past what memory holds.
+        let all: Vec<u64> = (1..=total as u64).collect();
+        assert_eq!(page_all(|since| s.history_since(alice, chan, since)), all);
+        assert_eq!(page_all(|since| s.dm_history(thread, since)), all);
+    }
+
+    // A restart loads only the tail, and numbering carries on from the
+    // highest stored seq rather than from how many envelopes are resident.
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    assert_eq!(
+        s.channel(chan).unwrap().history.resident_len(),
+        RESIDENT_HISTORY
+    );
+    let next = s.post_message(alice, chan, "after restart".into()).unwrap();
+    assert_eq!(next.seq, total as u64 + 1);
+    assert_eq!(
+        page_all(|since| s.history_since(alice, chan, since)),
+        (1..=total as u64 + 1).collect::<Vec<_>>()
+    );
+    // A page entirely inside the resident tail is served from memory.
+    let recent = s.history_since(alice, chan, total as u64 - 3);
+    assert_eq!(recent.len(), 4);
+}
+
+/// The resident cap is a cache bound, not a retention rule: a small cap still
+/// serves every message, and access control still applies to disk pages.
+#[test]
+fn a_tiny_resident_cap_still_serves_everything_to_those_who_may_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    s.set_resident_history(3);
+    let alice = s.join("alice", None, None).unwrap();
+    let chan = s.default_channel();
+    for i in 0..20 {
+        s.post_message(alice, chan, format!("m{i}")).unwrap();
+    }
+    assert_eq!(s.channel(chan).unwrap().history.resident_len(), 3);
+    let texts: Vec<String> = s
+        .history_since(alice, chan, 0)
+        .into_iter()
+        .map(|e| match e.payload {
+            MessagePayload::Text(t) => t,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(texts, (0..20).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    // A stranger still gets nothing, from memory or disk.
+    assert!(s.history_since(Uuid::new_v4(), chan, 0).is_empty());
+}
+
+/// One damaged message row used to fail the whole load, so the server would
+/// not start at all. It is skipped instead.
+#[test]
+fn an_undecodable_stored_message_is_skipped_rather_than_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, chan);
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        chan = s.default_channel();
+        s.post_message(alice, chan, "one".into()).unwrap();
+        s.post_message(alice, chan, "two".into()).unwrap();
+        s.db.as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET envelope = 'not json' WHERE seq = 1",
+                [],
+            )
+            .unwrap();
+    }
+    let mut s = PartyState::load("Srv", None, dir.path()).expect("the server still starts");
+    let seqs: Vec<u64> = s
+        .history_since(alice, chan, 0)
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(seqs, vec![2]);
+    assert_eq!(s.post_message(alice, chan, "three".into()).unwrap().seq, 3);
+}
+
+/// SRV-06: without a retention period everything was kept forever. With one,
+/// old messages and file shares go — but each thread keeps its newest message,
+/// so numbering continues across a restart instead of reusing seqs clients
+/// already hold.
+#[test]
+fn retention_prunes_old_history_and_files_but_keeps_numbering() {
+    let dir = tempfile::tempdir().unwrap();
+    let channel;
+    let alice;
+    {
+        let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+        alice = s.join("alice", None, None).unwrap();
+        channel = s.default_channel();
+        for text in ["one", "two", "three"] {
+            s.post_message(alice, channel, text.to_string()).unwrap();
+        }
+        s.post_file(
+            alice,
+            channel,
+            "notes.txt".to_string(),
+            "text/plain".to_string(),
+            b"old notes".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(s.files_for(alice).len(), 1);
+
+        // Nothing happens without a retention period.
+        let later = messenger_core::util::current_timestamp_millis() + 3 * 86_400_000;
+        assert_eq!(s.prune_expired(later), PruneReport::default());
+
+        s.set_retention(Some(std::time::Duration::from_secs(86_400)));
+        let report = s.prune_expired(later);
+        // Three texts and the file message are old; the newest (the file
+        // message) is kept so the next seq is still known.
+        assert_eq!(report.messages, 3);
+        assert_eq!(report.files, 1);
+        assert!(s.files_for(alice).is_empty());
+        let left: Vec<u64> = s
+            .history_since(alice, channel, 0)
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(left, vec![4]);
+    }
+    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let left: Vec<u64> = s
+        .history_since(alice, channel, 0)
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(left, vec![4], "pruned rows stay pruned across a restart");
+    let next = s.post_message(alice, channel, "five".to_string()).unwrap();
+    assert_eq!(next.seq, 5, "numbering continues, never reusing a seq");
+}
+
+/// Retention also applies to a server without a database (in-memory history).
+#[test]
+fn retention_prunes_in_memory_history_too() {
+    let mut s = PartyState::new("Srv", None);
+    let alice = s.join("alice", None, None).unwrap();
+    let channel = s.default_channel();
+    for text in ["a", "b"] {
+        s.post_message(alice, channel, text.to_string()).unwrap();
+    }
+    s.set_retention(Some(std::time::Duration::from_secs(60)));
+    let report = s.prune_expired(messenger_core::util::current_timestamp_millis() + 120_000);
+    assert_eq!(report.messages, 1);
+    assert_eq!(s.history_since(alice, channel, 0).len(), 1);
 }

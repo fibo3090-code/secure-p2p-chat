@@ -153,4 +153,22 @@ describe("Settings", () => {
     await userEvent.tab();
     expect(api.setDisplayName).not.toHaveBeenCalled();
   });
+
+  it("deletes everything only with the password and the typed word", async () => {
+    const api = installApi({ getSettings: settings, deleteAllData: undefined });
+    render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
+    await userEvent.click(await screen.findByText(/Delete…/));
+    const go = screen.getByRole("button", { name: /Delete everything/ });
+    expect(go.disabled).toBe(true);
+
+    await userEvent.type(screen.getByPlaceholderText("Your password"), "correct horse battery");
+    expect(go.disabled).toBe(true);
+    await userEvent.type(screen.getByLabelText("Type DELETE to confirm"), "delete");
+    expect(go.disabled).toBe(true); // the word is case-sensitive
+    await userEvent.clear(screen.getByLabelText("Type DELETE to confirm"));
+    await userEvent.type(screen.getByLabelText("Type DELETE to confirm"), "DELETE");
+    await userEvent.click(go);
+    expect(api.deleteAllData).toHaveBeenCalledWith("correct horse battery", "DELETE");
+    expect(await screen.findByText(/Everything has been deleted/)).toBeTruthy();
+  });
 });

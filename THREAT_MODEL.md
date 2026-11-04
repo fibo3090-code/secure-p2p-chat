@@ -94,7 +94,7 @@ Risks:
 
 Controls:
 
-- the trust tier is a **server property**, shown to users; the operator wears an explicit "this operator can read messages" badge
+- the trust tier is a **server property**, shown to users: every community screen in the desktop app carries an "Operator can read messages" badge (and community DMs a note saying they are not private from the server), the join and verify screens say so before anything is sent, and the terminal client shows the same warning in its Communities pane and on join
 - the client↔server channel uses the same v3 handshake, and the server has its own **TOFU-verified** identity/fingerprint (stable across restarts)
 - file downloads are access-checked server-side (`plan_blob_read(member, hash)`): only channel members or DM participants can fetch a blob, despite global content-addressed dedup
 
@@ -189,7 +189,7 @@ Limitation:
 
 - TOFU requires user action to be meaningful
 - no anonymity network or metadata-hiding transport
-- no invite revocation or expiry enforcement
+- no invite revocation before the 30-day expiry (signed invites are rejected at import once older than `INVITE_MAX_AGE_SECS`; legacy unsigned v1 links carry no timestamp and never expire)
 - no hardware-backed identity support
 - no post-quantum protection
 

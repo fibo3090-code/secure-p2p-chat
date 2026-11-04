@@ -108,6 +108,11 @@ fn ready_harness() -> Harness {
 }
 
 impl Harness {
+    /// Where this harness's bridge keeps the encrypted history.
+    fn bridge_history_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("history.json.enc")
+    }
+
     /// Invoke a command over the mock IPC exactly like the webview would.
     fn ipc(&self, cmd: &str, args: Value) -> Result<Value, Value> {
         tauri::test::get_ipc_response(
@@ -317,6 +322,92 @@ fn unreadable_identity_reports_an_error_state_and_gates_everything() {
 
 /// The screen reads the floor from the bridge rather than hardcoding one, so
 /// `auth_status` has to report it.
+/// An existing history file that cannot be read must survive the unlock: the
+/// poll loop and every immediate save used to write the empty state over it.
+#[test]
+fn an_unreadable_history_survives_unlock_and_can_be_set_aside() {
+    let h = harness();
+    std::fs::write(h.bridge_history_path(), b"written by a future version").unwrap();
+
+    h.ipc(
+        "set_password",
+        json!({ "password": "bridge-test-passphrase" }),
+    )
+    .expect("set_password");
+    let status = h.ipc("history_status", json!({})).unwrap();
+    assert!(
+        status["error"].is_string(),
+        "the failure must be reported: {status}"
+    );
+
+    // A command that saves immediately must not touch the file.
+    h.ipc("set_display_name", json!({ "name": "Eve" })).unwrap();
+    assert_eq!(
+        std::fs::read(h.bridge_history_path()).unwrap(),
+        b"written by a future version"
+    );
+
+    let moved = h.ipc("set_aside_history", json!({})).unwrap();
+    let moved = moved.as_str().expect("the new location is returned");
+    assert_eq!(
+        std::fs::read(moved).unwrap(),
+        b"written by a future version"
+    );
+    assert!(h.ipc("history_status", json!({})).unwrap()["error"].is_null());
+}
+
+/// JOURNEY-03 / DOC-02: deleting everything needs the password and the typed
+/// word, removes the files, and nothing written afterwards brings them back.
+#[test]
+fn delete_all_data_needs_the_password_and_the_word_then_removes_everything() {
+    let h = ready_harness();
+    let identity_path = h.bridge_history_path().with_file_name("identity.json");
+    // Settings save immediately, so this puts a history file on disk.
+    let settings = json!({ "settings": {
+        "enable_notifications": false,
+        "enable_typing_indicators": false,
+        "auto_host_on_startup": false,
+        "listen_port": 23456,
+        "enable_upnp": false,
+        "auto_accept_files": false,
+        "auto_connect": false,
+        "enable_mdns": false,
+    }});
+    h.ipc("update_settings", settings.clone()).unwrap();
+    std::fs::write(identity_path.with_file_name("parties.json"), b"[]").unwrap();
+    assert!(identity_path.exists() && h.bridge_history_path().exists());
+
+    let wrong_word = h
+        .ipc(
+            "delete_all_data",
+            json!({ "password": "bridge-test-passphrase", "confirm": "yes" }),
+        )
+        .expect_err("the typed confirmation is required");
+    assert!(err_text(&wrong_word).contains("DELETE"));
+    let wrong_password = h
+        .ipc(
+            "delete_all_data",
+            json!({ "password": "not-the-passphrase", "confirm": "DELETE" }),
+        )
+        .expect_err("the password is required");
+    assert!(err_text(&wrong_password).contains("nothing was deleted"));
+    assert!(identity_path.exists(), "a refused wipe must delete nothing");
+
+    h.ipc(
+        "delete_all_data",
+        json!({ "password": "bridge-test-passphrase", "confirm": "DELETE" }),
+    )
+    .expect("delete_all_data");
+    assert!(!identity_path.exists());
+    assert!(!h.bridge_history_path().exists());
+
+    // A save attempted afterwards (the close flush does exactly this) must
+    // not put the history back.
+    let _ = h.ipc("update_settings", settings);
+    assert!(!h.bridge_history_path().exists());
+    assert!(!identity_path.with_file_name("parties.json").exists());
+}
+
 #[test]
 fn auth_status_publishes_the_password_floor() {
     let h = harness();

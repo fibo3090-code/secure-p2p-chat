@@ -63,12 +63,22 @@ pub enum TuiCommand {
     Rename(String),
     DeleteChat,
     ClearHistory,
+    /// Move an unreadable history file aside and start a new, empty one.
+    HistoryReset,
+    /// Delete everything on this device (password-checked, then confirmed).
+    Wipe {
+        password: String,
+    },
 
     // --- identity / security ---
     Identity,
     Verify(bool),
     Unlock(Option<String>),
     SetPassword(String),
+    ChangePassword {
+        current: String,
+        new: String,
+    },
 
     // --- party servers ---
     PartyConnect {
@@ -267,10 +277,25 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("rename", ":rename <title>", "Rename the selected chat"),
     ("delete", ":delete", "Delete the selected chat"),
     ("clear-history", ":clear-history", "Erase all chats and contacts"),
+    (
+        "history-reset",
+        ":history-reset",
+        "Keep an unreadable history file aside and start a new one",
+    ),
+    (
+        "wipe",
+        ":wipe <password>",
+        "Delete your identity, history and communities from this device, then quit",
+    ),
     ("identity", ":identity", "Show your name, fingerprint and safety grid"),
     ("verify", ":verify <accept|reject>", "Answer a pending fingerprint check"),
     ("unlock", ":unlock [password]", "Unlock a password-protected identity"),
-    ("set-password", ":set-password <password>", "Set or change your password"),
+    ("set-password", ":set-password <password>", "Set a password on a new identity"),
+    (
+        "change-password",
+        ":change-password <current> <new>",
+        "Change your password (needs the current one)",
+    ),
     ("settings", ":settings", "Open the settings panel"),
     (
         "set",
@@ -476,6 +501,10 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "rename" => C::Rename(a.text()?),
         "delete" => C::DeleteChat,
         "clear-history" => C::ClearHistory,
+        "history-reset" => C::HistoryReset,
+        "wipe" => C::Wipe {
+            password: a.text()?,
+        },
 
         "identity" => C::Identity,
         "verify" => match a.word()?.to_ascii_lowercase().as_str() {
@@ -485,6 +514,10 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         },
         "unlock" => C::Unlock(a.opt_string()),
         "set-password" => C::SetPassword(a.word()?.to_string()),
+        "change-password" => C::ChangePassword {
+            current: a.word()?.to_string(),
+            new: a.word()?.to_string(),
+        },
 
         "settings" => C::Settings,
         "set" => {

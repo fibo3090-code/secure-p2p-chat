@@ -21,6 +21,11 @@ use uuid::Uuid;
 /// community server. Bounded, a stuck client is disconnected instead: it has
 /// already missed messages, and `FetchHistory` is how it catches up on
 /// reconnect.
+///
+/// Eviction closes the connection because the hub holds the connection's
+/// *only* sender: dropping it here makes the connection task's `recv` return
+/// `None`, and the task ends (see `connection::serve_connection_with`). Were
+/// the task to keep a copy, an evicted client would stay connected and deaf.
 pub const BROADCAST_QUEUE_DEPTH: usize = 256;
 
 struct Conn {

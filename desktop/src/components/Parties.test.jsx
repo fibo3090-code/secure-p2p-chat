@@ -82,11 +82,12 @@ describe("Parties — joining", () => {
     expect(api.partyJoin).toHaveBeenCalled();
   });
 
-  it("stops on a first join to show the code, and sends no credential until confirmed", async () => {
-    const partyJoin = vi.fn(async (_a, _u, _p, trust) =>
-      trust
-        ? { status: "joined", server: "s1", fingerprint: "aa".repeat(32) }
-        : { status: "verify", fingerprint: "aa".repeat(32), sas: "418 902 🎃🎈🎁" });
+  it("stops on a first join to show the fingerprint, and binds the join to it", async () => {
+    const fp = "0123abcd".repeat(8);
+    const partyJoin = vi.fn(async (_a, _u, _p, fingerprint) =>
+      fingerprint
+        ? { status: "joined", server: "s1", fingerprint }
+        : { status: "verify", fingerprint: fp, sas: "418 902 🎃🎈🎁" });
     installApi({ partyList: [], partySaved: [], partyJoin });
 
     render(<Parties />);
@@ -96,15 +97,22 @@ describe("Parties — joining", () => {
     await userEvent.click(screen.getByRole("button", { name: /Connect & join/ }));
 
     expect(await screen.findByText("Verify this community server")).toBeTruthy();
-    expect(screen.getByText("418 902 🎃🎈🎁")).toBeTruthy();
+    // What the operator can actually compare: the server's fingerprint, which
+    // it prints at startup. A per-connection code is never shown — the
+    // operator cannot see it, and it belongs to a connection that is closed.
+    expect(screen.getByText(fp.match(/.{8}/g).join(" "))).toBeTruthy();
+    expect(screen.queryByText("418 902 🎃🎈🎁")).toBeNull();
     // The sentence is split by a <strong>, so match on the rendered text.
     expect(document.body.textContent).toMatch(/have not been sent yet/);
+    expect(document.body.textContent).toMatch(/not end-to-end encrypted/);
     expect(partyJoin).toHaveBeenCalledTimes(1);
-    expect(partyJoin.mock.calls[0][3]).toBe(false);
+    expect(partyJoin.mock.calls[0][3]).toBeNull();
 
-    await userEvent.click(screen.getByRole("button", { name: /The code matches/ }));
+    await userEvent.click(screen.getByRole("button", { name: /The fingerprint matches/ }));
     await waitFor(() => expect(partyJoin).toHaveBeenCalledTimes(2));
-    expect(partyJoin.mock.calls[1][3]).toBe(true);
+    // Step two carries exactly the verified fingerprint, so the connection
+    // that sends the password must present that key.
+    expect(partyJoin.mock.calls[1][3]).toBe(fp);
   });
 
   it("backs out of verification without joining", async () => {
@@ -159,6 +167,14 @@ describe("Parties — a joined community", () => {
     });
     render(<Parties />);
     expect(await screen.findByText("welcome")).toBeTruthy();
+  });
+
+  // JOURNEY-04 / PRIV-01: the operator reads community traffic, so the
+  // conversation itself has to say so — not only the join screen.
+  it("says on screen that the operator can read the community", async () => {
+    installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
+    render(<Parties />);
+    expect(await screen.findByText("Operator can read messages")).toBeTruthy();
   });
 
   it("posts to the active channel and clears the composer", async () => {

@@ -115,8 +115,13 @@ const realApi = {
   changePassword: (current, next) => invoke("change_password", { current, new: next }),
   setDisplayName: (name) => invoke("set_display_name", { name }),
   exportIdentity: () => invoke("export_identity"),
+  historyStatus: () => invoke("history_status"),
+  setAsideHistory: () => invoke("set_aside_history"),
   exportDiagnostics: () => invoke("export_diagnostics"),
   openDataDir: () => invoke("open_data_dir"),
+  // Irreversible: the backend checks the password and the typed word, deletes
+  // the identity, history and saved communities, then quits.
+  deleteAllData: (password, confirm) => invoke("delete_all_data", { password, confirm }),
   lockState: () => invoke("lock_state"),
   setLocked: (locked) => invoke("set_locked", { locked }),
   listConversations: () => invoke("list_conversations"),
@@ -164,8 +169,11 @@ const realApi = {
   // `trust` is the second step of first-join verification: false asks the
   // bridge to stop and report the server fingerprint + SAS without sending
   // the credentials; true proceeds after the user has compared them.
-  partyJoin: (address, username, password, trust = false) =>
-    invoke("party_join", { address, username, password, trust }),
+  // `fingerprint`: null for the first step (learn the server's identity);
+  // the fingerprint the user accepted for the second, which the bridge then
+  // requires the credential-bearing connection to present.
+  partyJoin: (address, username, password, fingerprint = null) =>
+    invoke("party_join", { address, username, password, fingerprint }),
   partyList: () => invoke("party_list"),
   partyHistory: (server, channel) => invoke("party_history", { server, channel }),
   partyPost: (server, channel, text) => invoke("party_post", { server, channel, text }),
@@ -305,8 +313,19 @@ function makeMock() {
     },
     setDisplayName: async (name) => ({ state: authState, name, fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
     exportIdentity: async () => "C:\\Users\\you\\p2pem-identity-backup.json",
+    // `?mockHistory=error` previews the unreadable-history banner.
+    historyStatus: async () => ({
+      error: new URLSearchParams(location.search).get("mockHistory") === "error"
+        ? "Unsupported history version: 9.0" : null,
+      path: "C:\\Users\\you\\AppData\\Roaming\\chat-p2p\\P2PEM\\data\\history.json.enc",
+    }),
+    setAsideHistory: async () => "C:\\Users\\you\\…\\history.json.enc.unreadable-20261103T120000Z",
     exportDiagnostics: async () => "C:\\Users\\you\\AppData\\P2PEM\\diagnostics\\bundle-mock",
     openDataDir: async () => "C:\\Users\\you\\AppData\\P2PEM",
+    deleteAllData: async (password, confirm) => {
+      if (confirm !== "DELETE") throw new Error("Type DELETE to confirm");
+      if (!password) throw new Error("Wrong password — nothing was deleted");
+    },
     lockState: async () => mockSettings._locked || false,
     setLocked: async (locked) => { mockSettings._locked = locked; },
     listConversations: async () => summaries(),
@@ -367,8 +386,8 @@ function makeMock() {
       signed: true,
     }),
     connectContact: ok,
-    partyJoin: async (address, username, password, trust = false) => {
-      if (!trust) return { status: "verify", fingerprint: "aa".repeat(32), sas: "123456 🎃🎈🎁" };
+    partyJoin: async (address, username, password, fingerprint = null) => {
+      if (!fingerprint) return { status: "verify", fingerprint: "aa".repeat(32), sas: "123456 🎃🎈🎁" };
       seedParty(address, username);
       return { status: "joined", server: partyState.servers[0].id, fingerprint: "aa".repeat(32) };
     },
@@ -478,8 +497,20 @@ export function fmtTime(ts) {
   const d = parseStamp(ts);
   if (!d) return "";
   try {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return timeFormat().format(d);
   } catch { return ""; }
+}
+
+// One formatter, built on first use. `toLocaleTimeString` with an options
+// object constructs a new `Intl.DateTimeFormat` on every call, which is the
+// slow path in WebKitGTK and WKWebView — and it ran once per message per
+// refresh (PERF-01).
+let cachedTimeFormat = null;
+function timeFormat() {
+  if (!cachedTimeFormat) {
+    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return cachedTimeFormat;
 }
 
 // Compact "last activity" stamp for the conversation list: time-of-day for
