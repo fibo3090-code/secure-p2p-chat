@@ -634,6 +634,9 @@ mod size_tests {
         let shown = display_text(&huge);
         assert!(shown.len() < MAX_DISPLAY_TEXT_BYTES + 128);
         assert!(shown.contains("KiB more not shown"));
-        assert!(matches!(display_text("hi"), std::borrow::Cow::Borrowed("hi")));
+        assert!(matches!(
+            display_text("hi"),
+            std::borrow::Cow::Borrowed("hi")
+        ));
     }
 }
