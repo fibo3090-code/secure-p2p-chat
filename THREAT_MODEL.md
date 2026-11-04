@@ -189,7 +189,7 @@ Limitation:
 
 - TOFU requires user action to be meaningful
 - no anonymity network or metadata-hiding transport
-- no invite revocation or expiry enforcement
+- no invite revocation before the 30-day expiry (signed invites are rejected at import once older than `INVITE_MAX_AGE_SECS`; legacy unsigned v1 links carry no timestamp and never expire)
 - no hardware-backed identity support
 - no post-quantum protection
 
