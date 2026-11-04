@@ -379,6 +379,9 @@ impl ChatManager {
     /// running *now*. Saved, it came back after a restart as a "Host on :port"
     /// conversation shown as waiting for a peer, with nothing listening.
     pub fn history_snapshot(&self) -> Result<(HistoryFile, [u8; 32])> {
+        if self.data_wiped {
+            anyhow::bail!("refusing to save: all data was deleted");
+        }
         if let Some(reason) = &self.history_load_error {
             anyhow::bail!(
                 "refusing to save: the history on disk could not be loaded ({reason}), \

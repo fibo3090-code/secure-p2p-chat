@@ -235,8 +235,8 @@ tiers:
 
 - **Administered (default)** — client↔server is encrypted, but the server stores
   **plaintext**. This enables offline buffering, admin-read (clearly labeled),
-  search, and simple groups. The server wears an honest "this operator can read
-  messages" badge.
+  search, and simple groups. The app shows an "Operator can read messages"
+  badge on every community screen (desktop) and in the Communities pane (TUI).
 - **Private / E2EE (Phase 4)** — a per-channel **group key**; the server stores
   only ciphertext and never sees plaintext; admins cannot read. Offline buffering
   stores encrypted blobs. Group-key distribution and rotation on membership change

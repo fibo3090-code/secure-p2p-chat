@@ -493,8 +493,28 @@ Use the TUI when you want:
 
 ### Resetting local state
 
-- `Settings -> Delete Everything` removes the messenger app data directory, including the encrypted identity, history, diagnostics, and password-protected local state.
-- On Windows, the uninstaller also offers the same full-data cleanup so a reinstall starts from a fresh identity.
+- **Desktop app:** Settings → Support → **Delete all data**. Enter your password
+  and type `DELETE`; the app removes your identity, encrypted history, saved
+  communities and diagnostics from this device, then quits. It cannot be undone.
+- **Terminal client:** `:wipe <password>`, then `Ctrl+Y` to confirm.
+- Files you downloaded and identity backups you exported are not touched —
+  delete those yourself.
+- **Uninstalling does not remove your data** on any platform. Delete all data
+  first, or remove the folder below by hand.
+
+Where each app keeps its data:
+
+| | Desktop app (`P2PEM`) | Terminal client (`EncryptedMessenger`) |
+|---|---|---|
+| Windows | `%APPDATA%\chat-p2p\P2PEM\data` | `%APPDATA%\chat-p2p\EncryptedMessenger\data` |
+| macOS | `~/Library/Application Support/com.chat-p2p.P2PEM` | `~/Library/Application Support/com.chat-p2p.EncryptedMessenger` |
+| Linux | `~/.local/share/p2pem` | `~/.local/share/encryptedmessenger` |
+
+The desktop app's web view also keeps a small profile (UI preferences such as
+the theme, no messages) under the platform's per-app WebView folder
+(`%LOCALAPPDATA%\com.chat-p2p.p2pem` on Windows,
+`~/Library/WebKit/com.chat-p2p.p2pem` on macOS,
+`~/.local/share/com.chat-p2p.p2pem` on Linux).
 
 ### Where diagnostics go
 

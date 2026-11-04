@@ -261,6 +261,7 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         commands::auth::set_aside_history,
         commands::auth::export_diagnostics,
         commands::auth::open_data_dir,
+        commands::auth::delete_all_data,
         commands::connect::lock_state,
         commands::connect::set_locked,
         commands::chats::list_conversations,

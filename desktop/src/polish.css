@@ -313,3 +313,8 @@ button.set-row:hover { border-color: var(--border-2); }
 .history-banner-detail { margin-top: 4px; color: var(--dim); overflow-wrap: anywhere; }
 .history-banner-err { margin-top: 4px; color: var(--danger); }
 .history-banner-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* Community trust disclosure (audit JOURNEY-04 / PRIV-01). */
+.party-operator-badge { margin-left: 6px; font-family: var(--sans, inherit); white-space: nowrap; }
+.party-dm-note { display: flex; align-items: center; gap: 6px; margin: 0 16px 6px;
+  font-size: 12px; color: var(--warning); }

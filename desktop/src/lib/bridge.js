@@ -119,6 +119,9 @@ const realApi = {
   setAsideHistory: () => invoke("set_aside_history"),
   exportDiagnostics: () => invoke("export_diagnostics"),
   openDataDir: () => invoke("open_data_dir"),
+  // Irreversible: the backend checks the password and the typed word, deletes
+  // the identity, history and saved communities, then quits.
+  deleteAllData: (password, confirm) => invoke("delete_all_data", { password, confirm }),
   lockState: () => invoke("lock_state"),
   setLocked: (locked) => invoke("set_locked", { locked }),
   listConversations: () => invoke("list_conversations"),
@@ -319,6 +322,10 @@ function makeMock() {
     setAsideHistory: async () => "C:\\Users\\you\\…\\history.json.enc.unreadable-20261103T120000Z",
     exportDiagnostics: async () => "C:\\Users\\you\\AppData\\P2PEM\\diagnostics\\bundle-mock",
     openDataDir: async () => "C:\\Users\\you\\AppData\\P2PEM",
+    deleteAllData: async (password, confirm) => {
+      if (confirm !== "DELETE") throw new Error("Type DELETE to confirm");
+      if (!password) throw new Error("Wrong password — nothing was deleted");
+    },
     lockState: async () => mockSettings._locked || false,
     setLocked: async (locked) => { mockSettings._locked = locked; },
     listConversations: async () => summaries(),

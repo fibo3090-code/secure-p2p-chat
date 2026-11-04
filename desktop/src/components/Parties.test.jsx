@@ -169,6 +169,14 @@ describe("Parties — a joined community", () => {
     expect(await screen.findByText("welcome")).toBeTruthy();
   });
 
+  // JOURNEY-04 / PRIV-01: the operator reads community traffic, so the
+  // conversation itself has to say so — not only the join screen.
+  it("says on screen that the operator can read the community", async () => {
+    installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
+    render(<Parties />);
+    expect(await screen.findByText("Operator can read messages")).toBeTruthy();
+  });
+
   it("posts to the active channel and clears the composer", async () => {
     const api = installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
     render(<Parties />);

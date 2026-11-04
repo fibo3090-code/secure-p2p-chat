@@ -91,11 +91,83 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
   );
 }
 
+// Delete everything on this device. Two guards, because this is the one action
+// that destroys the identity itself and nothing can bring it back: the password
+// (checked by the backend against the file on disk) and the typed word.
+export const DELETE_WORD = "DELETE";
+
+function DeleteAllDialog({ open, onClose }) {
+  const [password, setPassword] = useState("");
+  const [word, setWord] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  useEffect(() => {
+    if (open) return;
+    setPassword(""); setWord(""); setErr(""); setBusy(false); setDone(false);
+  }, [open]);
+
+  if (!open) return null;
+  const ready = password && word === DELETE_WORD && !busy;
+
+  async function submit() {
+    if (!ready) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await api.deleteAllData(password, word);
+      // The app quits right after; this is what shows if it has not yet.
+      setDone(true);
+    } catch (e) {
+      setErr(friendlyError(e));
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <Modal open onClose={busy || done ? () => {} : onClose} width={460}
+      title="Delete all data on this device" icon="trash"
+      sub="Identity, messages, contacts and communities">
+      <div className="creator-pane">
+        {done ? (
+          <p className="creator-lead">Everything has been deleted. The app is closing.</p>
+        ) : (
+          <>
+            <p className="creator-lead">
+              This permanently deletes your identity (your keys and fingerprint),
+              every conversation and contact, your saved communities and the
+              diagnostics folder from this device, then closes the app. It cannot
+              be undone, and contacts will see a new, unverified person if you
+              start again. Files you downloaded and identity backups you exported
+              are not touched.
+            </p>
+            <PasswordInput value={password} autoFocus placeholder="Your password"
+              autoComplete="current-password"
+              onChange={(e) => setPassword(e.target.value)} />
+            <input className="input" value={word} aria-label={`Type ${DELETE_WORD} to confirm`}
+              placeholder={`Type ${DELETE_WORD} to confirm`}
+              onChange={(e) => setWord(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()} />
+            {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+              <Button variant="danger" icon="trash" onClick={submit} disabled={!ready}>
+                {busy ? "Deleting…" : "Delete everything"}
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
   const [s, setS] = useState(null);
   const [portDraft, setPortDraft] = useState("");
   const [nameDraft, setNameDraft] = useState(identity?.name || "");
   const [pwOpen, setPwOpen] = useState(false);
+  const [wipeOpen, setWipeOpen] = useState(false);
 
   useEffect(() => {
     api.getSettings().then((v) => { setS(v); setPortDraft(String(v.listen_port)); }).catch(() => {});
@@ -311,7 +383,20 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               <Icon name="folder" size={14} /> Open
             </button>
           </div>
+          <div className="set-row is-warn">
+            <span className="set-row-txt">
+              <span className="set-row-label">Delete all data</span>
+              <span className="set-row-hint">
+                Remove your identity, history, contacts and saved communities from
+                this device and close the app. Use this before giving the device away.
+              </span>
+            </span>
+            <button className="set-change" onClick={() => setWipeOpen(true)}>
+              <Icon name="trash" size={14} /> Delete…
+            </button>
+          </div>
         </section>
+        <DeleteAllDialog open={wipeOpen} onClose={() => setWipeOpen(false)} />
 
         <section className="set-block">
           <div className="set-h">How P2PEM works</div>

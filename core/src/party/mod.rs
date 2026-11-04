@@ -20,8 +20,9 @@ use uuid::Uuid;
 use crate::core::{recv_packet, send_packet, AesCipher};
 use crate::network::client_handshake;
 
-/// Trust tier of a server / stored message. A property of the server, surfaced
-/// prominently in the UI.
+/// Trust tier of a server / stored message. A property of the server. Only
+/// `Administered` exists today; both shells disclose it as "the operator can
+/// read messages" on every community screen rather than reading this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrustTier {
     /// Server stores plaintext; enables offline buffering, search, admin-read.

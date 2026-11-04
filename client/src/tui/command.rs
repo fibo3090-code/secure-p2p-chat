@@ -65,6 +65,10 @@ pub enum TuiCommand {
     ClearHistory,
     /// Move an unreadable history file aside and start a new, empty one.
     HistoryReset,
+    /// Delete everything on this device (password-checked, then confirmed).
+    Wipe {
+        password: String,
+    },
 
     // --- identity / security ---
     Identity,
@@ -277,6 +281,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "history-reset",
         ":history-reset",
         "Keep an unreadable history file aside and start a new one",
+    ),
+    (
+        "wipe",
+        ":wipe <password>",
+        "Delete your identity, history and communities from this device, then quit",
     ),
     ("identity", ":identity", "Show your name, fingerprint and safety grid"),
     ("verify", ":verify <accept|reject>", "Answer a pending fingerprint check"),
@@ -493,6 +502,9 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "delete" => C::DeleteChat,
         "clear-history" => C::ClearHistory,
         "history-reset" => C::HistoryReset,
+        "wipe" => C::Wipe {
+            password: a.text()?,
+        },
 
         "identity" => C::Identity,
         "verify" => match a.word()?.to_ascii_lowercase().as_str() {

@@ -46,6 +46,9 @@ pub enum TuiOverlay {
     },
     ConfirmQuit,
     ConfirmClearHistory,
+    /// `:wipe` after the password checked out: the last step before deleting
+    /// everything. Only Ctrl+Y proceeds.
+    ConfirmWipe,
 }
 
 impl TuiOverlay {
@@ -112,6 +115,14 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             f,
             "Clear all history?",
             "This erases ALL chats and contacts. (y = erase, n = cancel)",
+            area,
+        ),
+        TuiOverlay::ConfirmWipe => render_confirm(
+            f,
+            "Delete ALL data?",
+            "This permanently deletes your identity, every chat and contact, saved \
+             communities and diagnostics from this device, then quits. It cannot be \
+             undone.\n\nCtrl+Y = delete everything · any other key = cancel",
             area,
         ),
     }
@@ -564,9 +575,11 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
                  Join one with:\n  \
                  :party-connect <host[:port]> <username> [password]\n\n\
                  The first time you connect to an address you will be shown the \
-                 server's code to check with its operator; run :party-trust to \
-                 accept it. Nothing — not your username, not the password — is \
-                 sent before you do.",
+                 server's fingerprint to check with its operator; run :party-trust \
+                 to accept it. Nothing — not your username, not the password — is \
+                 sent before you do.\n\n\
+                 Communities are not end-to-end encrypted: the server's operator \
+                 can read every message, DM and file posted there.",
             )
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::Gray)),
@@ -610,6 +623,13 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
             Span::styled(format!(" {} ", name), style)
         })
         .collect();
+    let mut tabs = tabs;
+    // Always visible: community traffic is stored readable by the operator
+    // (audit JOURNEY-04 / PRIV-01), and a DM here looks like any other.
+    tabs.push(Span::styled(
+        "  ⚠ operator can read messages, DMs and files",
+        Style::default().fg(Color::Yellow),
+    ));
     f.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
 
     let Some(conn) = servers

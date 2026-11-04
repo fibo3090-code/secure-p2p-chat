@@ -13,6 +13,20 @@ predate tagged releases.
 
 ### Security
 
+- **Community screens now say that the server's operator can read them.**
+  Channel messages, community DMs and shared files are stored on the server
+  unencrypted; the app said so only on the join screen. Every community view
+  now carries an "Operator can read messages" badge, community DMs carry a
+  note, and the README no longer claims every conversation is end-to-end
+  encrypted.
+- **"Delete Everything" now exists.** The guide described it, but nothing
+  implemented it. Settings → Delete all data (password plus typing `DELETE`)
+  and the terminal client's `:wipe` remove the identity, history, saved
+  communities and diagnostics, then quit; nothing written afterwards can put a
+  history file back. Only files the app wrote are removed, and the folder only
+  if that empties it. The guide now lists where each app keeps its data and
+  says plainly that uninstalling removes nothing.
+
 - **The safety code could be forged by a man in the middle.** The six digits
   and three emoji were derived from both sides' temporary keys with nothing
   stopping an attacker from choosing its key after seeing the victim's, so it

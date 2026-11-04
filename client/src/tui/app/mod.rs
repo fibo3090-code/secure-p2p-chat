@@ -816,6 +816,15 @@ impl TuiApp {
                 }
                 _ => self.overlay = TuiOverlay::None,
             },
+            TuiOverlay::ConfirmWipe => {
+                if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.overlay = TuiOverlay::None;
+                    self.wipe_now();
+                } else {
+                    self.overlay = TuiOverlay::None;
+                    self.toast(ToastLevel::Info, "Nothing was deleted".to_string());
+                }
+            }
             TuiOverlay::Contacts => match key.code {
                 KeyCode::Esc => self.overlay = TuiOverlay::None,
                 KeyCode::Down => self.contacts_select_next(),
@@ -1156,6 +1165,7 @@ impl TuiApp {
             TuiCommand::DeleteChat => self.disconnect_selected(),
             TuiCommand::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
             TuiCommand::HistoryReset => self.cmd_history_reset(),
+            TuiCommand::Wipe { password } => self.cmd_wipe(&password),
 
             TuiCommand::Identity => {
                 Self::copy_to_clipboard(&self.identity.fingerprint);
@@ -1736,6 +1746,51 @@ mod tests {
         assert!(!app.should_quit);
         app.handle_key_event(ctrl('q'));
         assert!(app.should_quit);
+    }
+
+    /// JOURNEY-03: `:wipe` checks the password, asks once more (Ctrl+Y only),
+    /// then deletes everything and quits.
+    #[tokio::test]
+    async fn wipe_checks_the_password_confirms_then_deletes_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.history_path = dir.path().join("history.json.enc");
+        app.identity_path = dir.path().join("identity.json");
+        let mut identity = Identity::new_with_plaintext("T".into()).unwrap();
+        identity.encrypt("correct horse battery").unwrap();
+        identity.save(&app.identity_path).unwrap();
+        app.identity = identity;
+        std::fs::write(&app.history_path, b"h").unwrap();
+
+        app.execute_command(TuiCommand::Wipe {
+            password: "wrong password!".into(),
+        })
+        .await;
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.identity_path.exists());
+
+        app.execute_command(TuiCommand::Wipe {
+            password: "correct horse battery".into(),
+        })
+        .await;
+        assert_eq!(app.overlay, TuiOverlay::ConfirmWipe);
+        app.handle_key_event(key('y')); // plain y cancels
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.identity_path.exists() && !app.should_quit);
+
+        app.execute_command(TuiCommand::Wipe {
+            password: "correct horse battery".into(),
+        })
+        .await;
+        app.handle_key_event(ctrl('y'));
+        assert!(app.should_quit);
+        assert!(!app.identity_path.exists());
+        assert!(!app.history_path.exists());
+        app.shutdown_save();
+        assert!(
+            !app.history_path.exists(),
+            "the exit save must not recreate it"
+        );
     }
 
     #[tokio::test]

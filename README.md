@@ -31,29 +31,35 @@ to use the desktop app.
 
 ## What you get
 
-- **End-to-end encryption** on every conversation — X25519 key agreement with
+- **End-to-end encryption** on every direct conversation — X25519 key agreement with
   forward secrecy, AES-256-GCM, Ed25519 identity proofs (RSA-PSS fallback),
   automatic key rotation.
 - **Verification you can actually do.** On first contact both sides see the same
   six digits and three emoji. Read them aloud over a call; if they match, nobody
   is in the middle. (The 64-character fingerprint and a colour grid are there
   too, one click away, for people who want them.)
-- **Nothing stored anywhere but your device.** No account, no sign-up, no server
-  copy of your messages. Identity and history are encrypted at rest with
-  Argon2id + ChaCha20-Poly1305.
+- **Direct conversations are stored only on your device.** No account, no
+  sign-up, no server copy of your direct messages. Identity and history are
+  encrypted at rest with Argon2id + ChaCha20-Poly1305, and Settings → Delete all
+  data removes them.
 - **Direct connections**, with an optional self-hosted relay when NATs get in
   the way. The relay coordinates a hole punch first and only forwards bytes as a
   fallback — and it only ever sees ciphertext.
 - **Files, large messages, delivery receipts, typing indicators**, and optional
   LAN peer discovery (off by default — it announces your presence).
 - **Communities**: a self-hosted server for channels, DMs, and shared files when
-  you want a group that works while people are offline.
+  you want a group that works while people are offline. These are **not**
+  end-to-end encrypted — see below.
 
 ## Honest limitations
 
 Worth knowing before you switch to it:
 
 - **No mobile client.** Desktop only.
+- **Communities are readable by whoever runs the server.** Channel messages,
+  community DMs and shared files are stored on the server unencrypted, so its
+  operator — or anyone who gets into it or its backups — can read them. The app
+  says so on every community screen. For something private, talk directly.
 - **Direct conversations have no offline delivery.** Both people have to be
   online at the same time. Only the community server buffers messages.
 - **Reaching someone across the internet needs setup** — a port forward, UPnP,

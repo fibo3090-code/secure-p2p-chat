@@ -1954,6 +1954,41 @@ fn delete_all_data_removes_files_and_clears_state() {
     assert!(mgr.contacts.is_empty());
     assert!(mgr.contact_to_chat.is_empty());
     assert!(mgr.pending_fingerprint().is_none());
+
+    // The shells flush history on close; after a wipe that must not put a
+    // file back.
+    assert!(mgr.data_wiped());
+    assert!(mgr.save_history(&history_path).is_err());
+    assert!(!history_path.exists());
+}
+
+/// `P2PEM_DATA_DIR` can point at a folder that holds other things too; the
+/// wipe removes what the app wrote and leaves the rest (and the folder).
+#[test]
+fn delete_all_data_never_removes_files_it_did_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+    let history_path = data_dir.join("history.json.enc");
+    let identity_path = data_dir.join("identity.json");
+    std::fs::write(&history_path, b"h").unwrap();
+    std::fs::write(&identity_path, b"i").unwrap();
+    std::fs::write(data_dir.join("parties.json"), b"p").unwrap();
+    std::fs::write(
+        data_dir.join("history.json.enc.unreadable-20261104T000000Z"),
+        b"u",
+    )
+    .unwrap();
+    std::fs::write(data_dir.join("thesis.docx"), b"mine").unwrap();
+
+    let mut mgr = ChatManager::new(Config::default());
+    mgr.delete_all_data(&data_dir, &history_path, &identity_path)
+        .unwrap();
+
+    let left: Vec<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["thesis.docx".to_string()]);
 }
 
 #[test]

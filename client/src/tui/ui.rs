@@ -479,6 +479,7 @@ mod tests {
             },
             TuiOverlay::ConfirmQuit,
             TuiOverlay::ConfirmClearHistory,
+            TuiOverlay::ConfirmWipe,
         ];
         for ov in overlays {
             let mut app = TuiApp::new(LogBuffer::new()).expect("app");

@@ -183,6 +183,11 @@ pub struct ChatManager {
     /// [`ChatManager::set_aside_unreadable_history`], which moves the file out
     /// of the way first, or by a later successful load.
     pub(crate) history_load_error: Option<String>,
+    /// Set by [`ChatManager::delete_all_data`]. From then on nothing is ever
+    /// saved again: the shells still flush history on close and on a timer,
+    /// and one late save would put a fresh history file back in the folder
+    /// the user just emptied.
+    pub(crate) data_wiped: bool,
     /// Tracks if the application intends to be hosting.
     /// Used for auto-rehosting if the placeholder connection is consumed.
     pub is_hosting: bool,
@@ -273,6 +278,7 @@ impl ChatManager {
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
             history_load_error: None,
+            data_wiped: false,
             is_hosting: false,
             rehost_failures: 0,
             hosting_port: None,
@@ -814,7 +820,11 @@ impl ChatManager {
         }
     }
 
-    /// Delete all data including identity file. Used for complete data wipe.
+    /// Delete everything this app keeps: identity, history, saved communities
+    /// and diagnostics. Sessions and hosting stop first, and the manager
+    /// refuses every later save (see `data_wiped`), so the shell's closing
+    /// flush cannot recreate what was just removed. The caller exits after.
+    ///
     pub fn delete_all_data(
         &mut self,
         data_dir: &std::path::Path,
@@ -823,32 +833,66 @@ impl ChatManager {
     ) -> Result<()> {
         tracing::warn!("Deleting ALL data including identity");
 
-        // First clear all in-memory state
+        self.stop_hosting();
+        // In-memory state (this also ends every session).
         self.clear_history(std::path::Path::new(""));
+        self.data_wiped = true;
+        self.history_key = None;
 
-        let history_under_data_dir = history_path.parent() == Some(data_dir);
-        let identity_under_data_dir = identity_path.parent() == Some(data_dir);
-        if !data_dir.as_os_str().is_empty()
-            && history_under_data_dir
-            && identity_under_data_dir
-            && data_dir.exists()
+        // Only what this app writes is removed, and the folder itself only if
+        // that leaves it empty: `P2PEM_DATA_DIR` can point anywhere, and
+        // "delete my data" must never become `rm -r` of a folder the user
+        // shares with other things.
+        let mut files = vec![history_path.to_path_buf(), identity_path.to_path_buf()];
+        let mut dirs = Vec::new();
+        for dir in [
+            history_path.parent(),
+            identity_path.parent(),
+            Some(data_dir),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|d| !d.as_os_str().is_empty())
         {
-            std::fs::remove_dir_all(data_dir)?;
-            tracing::info!("App data directory deleted: {}", data_dir.display());
-            return Ok(());
+            files.push(dir.join("parties.json"));
+            dirs.push(dir.join("diagnostics"));
+            // Unreadable histories set aside by `set_aside_unreadable_history`.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name
+                        .to_string_lossy()
+                        .starts_with("history.json.enc.unreadable-")
+                    {
+                        files.push(entry.path());
+                    }
+                }
+            }
         }
-
-        if history_path.exists() {
-            std::fs::remove_file(history_path)?;
-            tracing::info!("History file deleted: {}", history_path.display());
+        files.sort();
+        files.dedup();
+        for file in files.iter().filter(|f| f.is_file()) {
+            std::fs::remove_file(file)?;
+            tracing::info!("Deleted {}", file.display());
         }
-
-        if identity_path.exists() {
-            std::fs::remove_file(identity_path)?;
-            tracing::info!("Identity file deleted: {}", identity_path.display());
+        for dir in dirs.iter().filter(|d| d.is_dir()) {
+            std::fs::remove_dir_all(dir)?;
         }
-
+        if !data_dir.as_os_str().is_empty() && data_dir.is_dir() {
+            match std::fs::remove_dir(data_dir) {
+                Ok(()) => tracing::info!("App data directory deleted: {}", data_dir.display()),
+                Err(e) => tracing::warn!(
+                    "Left {} in place (it holds files this app did not create): {e}",
+                    data_dir.display()
+                ),
+            }
+        }
         Ok(())
+    }
+
+    /// Whether [`delete_all_data`](Self::delete_all_data) has run.
+    pub fn data_wiped(&self) -> bool {
+        self.data_wiped
     }
 }
 
