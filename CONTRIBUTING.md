@@ -14,25 +14,40 @@ Before changing code, read the doc that matches the kind of change you are makin
 
 ## Local Workflow
 
-Run these before opening a PR:
+This is the local equivalent of CI's test gates. Run it from the repository
+root before opening a PR:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace          # or: cargo test --workspace
-cargo test --workspace --doc           # nextest does not run doctests
+cargo fmt --all -- --check \
+  && cargo clippy --workspace --all-targets -- -D warnings \
+  && cargo nextest run --workspace --profile ci \
+  && cargo test --workspace --doc \
+  && (cd desktop && npm ci && npm run lint && npm test)
 ```
 
-If you changed anything under `desktop/`, also run the frontend gates — they are
-all enforced by CI:
+- `--profile ci` matters. It is the profile CI uses (`.config/nextest.toml`:
+  every test printed, no fail-fast, hung tests terminated). Use nextest, not
+  `cargo test --workspace`: the suite is written for one process per test, and
+  some relay tests read a process-global environment variable.
+- `cargo test --workspace --doc` is there because nextest does not run
+  doctests.
+- Prerequisites: `cargo install cargo-nextest --locked`, Node 22 (what CI
+  uses), and on Linux the WebKitGTK dev packages listed in
+  [USER_GUIDE § Linux build prerequisites](docs/USER_GUIDE.md#linux-build-prerequisites).
+  `--workspace` compiles the Tauri desktop crate, which needs them.
+
+If you changed anything under `desktop/`, CI also runs these. Run them too:
 
 ```bash
 cd desktop
-npm run lint      # a deliberately narrow rule set: bugs, not style
-npm test          # vitest: pure modules in node, React components in jsdom
 npm run build     # and commit the rebuilt desktop/dist/, which is tracked
 npm run smoke     # Playwright: the only gate that actually starts the app
+                  # (first time: npm run smoke:install)
 ```
+
+CI additionally runs checks you rarely need locally: `cargo deny check`,
+`cargo check --manifest-path core/fuzz/Cargo.toml --all-targets` (the fuzz
+targets are their own workspace), an MSRV build, `npm audit` and a secret scan.
 
 If you touch packaging or release files, validate the relevant scripts manually.
 
@@ -50,10 +65,11 @@ Security issues must **not** be reported in public issues — see the [responsib
 - [ ] Tests added or updated, or rationale provided.
 - [ ] `cargo fmt --all -- --check` passes.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- [ ] `cargo nextest run --workspace` (or `cargo test --workspace`) passes.
+- [ ] `cargo nextest run --workspace --profile ci` passes.
 - [ ] `cargo test --workspace --doc` passes.
-- [ ] If `desktop/` changed: `npm run lint`, `npm test`, `npm run build` and
-      `npm run smoke` pass, and the rebuilt `desktop/dist/` is committed.
+- [ ] `npm run lint` and `npm test` pass in `desktop/`.
+- [ ] If `desktop/` changed: `npm run build` and `npm run smoke` pass, and the
+      rebuilt `desktop/dist/` is committed.
 - [ ] Relevant docs updated.
 - [ ] `CHANGELOG.md` updated for user-visible changes.
 

@@ -218,7 +218,7 @@ export function BackupPrompt({ onExport, onSkip }) {
         <div className="onb-fhint">
           The backup file is already encrypted with the password you just chose,
           so it is exactly as safe as the original. You still need that password
-          to use it.
+          to use it. It holds your identity only — not your message history.
         </div>
         {done
           ? <code className="onb-fp-code">Saved to {done}</code>

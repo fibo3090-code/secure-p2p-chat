@@ -134,6 +134,15 @@ pub struct TuiApp {
     /// Finished downloads being written to disk off the UI thread.
     pending_party_saves: Vec<tokio::sync::oneshot::Receiver<crate::tui::downloads::SaveOutcome>>,
     last_save: Option<Instant>,
+    /// `persisted_signature` at the last successful save: autosave skips the
+    /// write when it has not moved (PERF-03).
+    saved_signature: Option<u64>,
+    /// Set while a background autosave is writing, so two never overlap and
+    /// the save on exit can wait for the last one.
+    save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by a background autosave whose write failed; the next tick clears
+    /// `saved_signature` so the state is written again.
+    autosave_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_rehost: Option<Instant>,
     typing_active: bool,
     last_typing_activity: Option<Instant>,
@@ -215,6 +224,9 @@ impl TuiApp {
             pending_party_saves: Vec::new(),
             party_dial: None,
             last_save: None,
+            saved_signature: None,
+            save_in_flight: Default::default(),
+            autosave_failed: Default::default(),
             last_rehost: None,
             typing_active: false,
             last_typing_activity: None,
@@ -460,7 +472,17 @@ impl TuiApp {
             .set_ui_presence(active, self.selected_chat_id());
     }
 
+    /// Periodic save. It used to rewrite (clone, serialize, encrypt, fsync)
+    /// the whole history every 30 s whether or not anything had changed, on
+    /// the UI loop — tens of MB per tick for a long history, and a frozen
+    /// interface while it ran (PERF-03). Now it skips an unchanged state and
+    /// does the encrypt + write on the blocking pool; only the snapshot is
+    /// taken here.
     fn autosave(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.autosave_failed.swap(false, Ordering::SeqCst) {
+            self.saved_signature = None;
+        }
         if self.chat_manager.history_key.is_none() || self.chat_manager.chats.is_empty() {
             return;
         }
@@ -468,18 +490,60 @@ impl TuiApp {
             .last_save
             .map(|t| t.elapsed() >= AUTOSAVE_INTERVAL)
             .unwrap_or(true);
-        if due {
-            self.save_history_now();
-            self.last_save = Some(Instant::now());
+        if !due || self.save_in_flight.load(Ordering::SeqCst) {
+            return;
         }
+        self.last_save = Some(Instant::now());
+        let sig = self.chat_manager.persisted_signature();
+        if self.saved_signature == Some(sig) {
+            return;
+        }
+        let (history, key) = match self.chat_manager.history_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!("TUI history save skipped: {}", e);
+                return;
+            }
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime (unit tests): save inline.
+            match history.save_encrypted(&self.history_path, &key) {
+                Ok(()) => self.saved_signature = Some(sig),
+                Err(e) => tracing::warn!("TUI history save failed: {}", e),
+            }
+            return;
+        };
+        self.save_in_flight.store(true, Ordering::SeqCst);
+        let in_flight = self.save_in_flight.clone();
+        let path = self.history_path.clone();
+        // Recorded optimistically; a failed write clears it below so the next
+        // tick tries again.
+        self.saved_signature = Some(sig);
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.autosave_failed = failed.clone();
+        handle.spawn_blocking(move || {
+            if let Err(e) = history.save_encrypted(&path, &key) {
+                tracing::warn!("TUI history save failed: {}", e);
+                failed.store(true, Ordering::SeqCst);
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
     }
 
     fn save_history_now(&mut self) {
+        use std::sync::atomic::Ordering;
         if self.chat_manager.history_key.is_none() {
             return;
         }
-        if let Err(e) = self.chat_manager.save_history(&self.history_path) {
-            tracing::warn!("TUI history save failed: {}", e);
+        // Let a background autosave finish first, so it cannot land after
+        // (and over) this one.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.save_in_flight.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match self.chat_manager.save_history(&self.history_path) {
+            Ok(()) => self.saved_signature = Some(self.chat_manager.persisted_signature()),
+            Err(e) => tracing::warn!("TUI history save failed: {}", e),
         }
     }
 
@@ -816,6 +880,15 @@ impl TuiApp {
                 }
                 _ => self.overlay = TuiOverlay::None,
             },
+            TuiOverlay::ConfirmWipe => {
+                if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.overlay = TuiOverlay::None;
+                    self.wipe_now();
+                } else {
+                    self.overlay = TuiOverlay::None;
+                    self.toast(ToastLevel::Info, "Nothing was deleted".to_string());
+                }
+            }
             TuiOverlay::Contacts => match key.code {
                 KeyCode::Esc => self.overlay = TuiOverlay::None,
                 KeyCode::Down => self.contacts_select_next(),
@@ -1156,6 +1229,7 @@ impl TuiApp {
             TuiCommand::DeleteChat => self.disconnect_selected(),
             TuiCommand::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
             TuiCommand::HistoryReset => self.cmd_history_reset(),
+            TuiCommand::Wipe { password } => self.cmd_wipe(&password),
 
             TuiCommand::Identity => {
                 Self::copy_to_clipboard(&self.identity.fingerprint);
@@ -1736,6 +1810,86 @@ mod tests {
         assert!(!app.should_quit);
         app.handle_key_event(ctrl('q'));
         assert!(app.should_quit);
+    }
+
+    /// JOURNEY-03: `:wipe` checks the password, asks once more (Ctrl+Y only),
+    /// then deletes everything and quits.
+    #[tokio::test]
+    async fn wipe_checks_the_password_confirms_then_deletes_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.history_path = dir.path().join("history.json.enc");
+        app.identity_path = dir.path().join("identity.json");
+        let mut identity = Identity::new_with_plaintext("T".into()).unwrap();
+        identity.encrypt("correct horse battery").unwrap();
+        identity.save(&app.identity_path).unwrap();
+        app.identity = identity;
+        std::fs::write(&app.history_path, b"h").unwrap();
+
+        app.execute_command(TuiCommand::Wipe {
+            password: "wrong password!".into(),
+        })
+        .await;
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.identity_path.exists());
+
+        app.execute_command(TuiCommand::Wipe {
+            password: "correct horse battery".into(),
+        })
+        .await;
+        assert_eq!(app.overlay, TuiOverlay::ConfirmWipe);
+        app.handle_key_event(key('y')); // plain y cancels
+        assert_eq!(app.overlay, TuiOverlay::None);
+        assert!(app.identity_path.exists() && !app.should_quit);
+
+        app.execute_command(TuiCommand::Wipe {
+            password: "correct horse battery".into(),
+        })
+        .await;
+        app.handle_key_event(ctrl('y'));
+        assert!(app.should_quit);
+        assert!(!app.identity_path.exists());
+        assert!(!app.history_path.exists());
+        app.shutdown_save();
+        assert!(
+            !app.history_path.exists(),
+            "the exit save must not recreate it"
+        );
+    }
+
+    /// PERF-03: autosave rewrote the whole history every 30 s even when
+    /// nothing had changed. An unchanged state is not written again.
+    #[test]
+    fn autosave_skips_an_unchanged_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.history_path = dir.path().join("history.json.enc");
+        // `TuiApp::new` reads the machine's real data dir; whatever it found
+        // there is not this test's business.
+        app.chat_manager.history_load_error = None;
+        app.chat_manager.set_history_key([7u8; 32]);
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "A".into());
+
+        app.last_save = None;
+        app.autosave();
+        assert!(app.history_path.exists(), "the first save is written");
+        std::fs::remove_file(&app.history_path).unwrap();
+
+        // Due again, nothing changed: no write.
+        app.last_save = None;
+        app.autosave();
+        assert!(
+            !app.history_path.exists(),
+            "an unchanged history was rewritten"
+        );
+
+        // A change is written.
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "B".into());
+        app.last_save = None;
+        app.autosave();
+        assert!(app.history_path.exists());
     }
 
     #[tokio::test]

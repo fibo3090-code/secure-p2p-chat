@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Protocol version for forward compatibility
 ///
 /// Version 3: ECDH-first handshake (Encrypted Identity Exchange)
-pub const PROTOCOL_VERSION: u8 = 3;
+/// v4 adds the ephemeral-key commitment that makes the SAS sound (audit
+/// CRYPTO-02); v3 peers are still accepted, with a warning.
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Protocol messages exchanged between peers
 #[derive(Serialize, Deserialize, Clone, PartialEq)]

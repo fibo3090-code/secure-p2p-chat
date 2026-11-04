@@ -114,19 +114,25 @@ out of the path. If the punch fails, the relay forwards the already encrypted
 session traffic instead. Either way it never terminates chat encryption for
 you (set `P2PEM_NO_HOLEPUNCH=1` to always use forwarding).
 
-## 4. Verify fingerprints before trusting the connection
+## 4. Compare the short code before trusting the connection
 
 This is the most important manual security step.
 
-Each peer has a fingerprint. Verify that fingerprint over a separate trusted channel:
+On a new connection both sides see the same **short code: six digits and three
+emoji**. Read it aloud to each other over a separate trusted channel:
 
 - phone call
 - video call
 - in person
 
+If it matches, nobody is in the middle; accept. If it differs, someone may be
+intercepting the connection; reject it and reconnect.
+
 Do not skip this just because the app connected successfully. The app uses TOFU, so first contact only becomes meaningful if you verify the other side out of band.
 
-In the TUI a verification overlay opens automatically on a new connection: compare the safety grid / fingerprint, then press `y` to accept or `n` to reject (equivalently `:verify accept` / `:verify reject`).
+In the TUI a verification overlay opens automatically on a new connection with the code at the top: compare it, then press `Ctrl+Y` to accept or `Ctrl+N` to reject (equivalently `:verify accept` / `:verify reject`). In the desktop app, click **Codes match — trust** or **Reject**.
+
+Advanced: the 64-character fingerprint and the colour safety grid are an equivalent, slower check. The desktop app shows them under "Full fingerprint (advanced)"; the TUI shows the grid below the code.
 
 If the fingerprint changes unexpectedly later:
 
@@ -196,7 +202,7 @@ On the second machine:
 :connect 192.168.1.40:12345
 ```
 
-Then accept the fingerprint overlay (`y`) on both sides and start chatting.
+Then compare the short code on both screens, accept the verification overlay (`Ctrl+Y`) on both sides, and start chatting.
 
 ## 8. Export diagnostics when something breaks
 

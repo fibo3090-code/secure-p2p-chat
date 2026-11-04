@@ -100,8 +100,8 @@ function JoinForm({ onJoined, onCancel, initial }) {
           </div>
           <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
           <div className="chat-empty-p">
-            Messages in a community are <strong>not end-to-end encrypted</strong>: the
-            server stores them, and whoever runs it can read them.
+            Messages, DMs and files you post in a community are <strong>not end-to-end
+            encrypted</strong>: they are stored on the server readable by its operator.
           </div>
           <div className="party-join">
             <Button icon="check" disabled={busy} full
@@ -124,9 +124,11 @@ function JoinForm({ onJoined, onCancel, initial }) {
         <span className="chat-empty-ic"><Icon name="users" size={28} /></span>
         <div className="chat-empty-h">Join a community</div>
         <div className="chat-empty-p">
-          Communities are administered, multi-channel rooms that keep history, served by the
-          <code> messenger-server</code> crate. The first time you join one you will be asked to
-          check its code with the operator before anything is sent.
+          Communities are administered, multi-channel rooms that keep history on a
+          server someone runs. <strong>They are not end-to-end encrypted:</strong> the
+          operator can read every message, DM and file posted there. The first time you
+          join one you will be asked to check its fingerprint with the operator before
+          anything is sent.
         </div>
         {saved.length > 0 && (
           <div className="party-saved">
@@ -605,6 +607,13 @@ export function Parties() {
                   {STATUS_LABEL[server?.status] || server?.status}
                   {server?.status_detail ? `: ${server.status_detail}` : ""}
                 </span>
+                {/* Always on screen, not only at join time: community traffic is
+                    stored readable by the operator, and a DM here looks like
+                    any other DM (audit JOURNEY-04 / PRIV-01). */}
+                <span className="set-badge is-warn party-operator-badge"
+                  title="Messages, DMs and files in this community are stored on the server unencrypted. Whoever runs it — or gets into it — can read them.">
+                  Operator can read messages
+                </span>
               </div>
             </div>
           </div>
@@ -686,6 +695,13 @@ export function Parties() {
               </div>
             </div>
 
+            {dm && (
+              <div className="party-dm-note" role="note">
+                <Icon name="alert" size={13} /> Community DMs are not private from the
+                server: its operator can read them. For a private conversation, connect
+                to this person directly.
+              </div>
+            )}
             <div className="composer">
               <button className="composer-clip" onClick={sendFile} title="Share a file"
                 disabled={!canSend}>

@@ -12,8 +12,9 @@
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo nextest run --workspace` (or `cargo test --workspace`)
-- [ ] If `desktop/` changed: `cargo check -p p2pem-desktop` and `npm run build`
+- [ ] `cargo nextest run --workspace --profile ci` and `cargo test --workspace --doc`
+- [ ] `cd desktop && npm run lint && npm test`
+- [ ] If `desktop/` changed: `npm run build` (rebuilt `desktop/dist/` committed) and `npm run smoke`
 - [ ] Manual smoke test performed when relevant
 
 ## Docs And Release Notes

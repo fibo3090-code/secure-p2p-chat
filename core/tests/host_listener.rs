@@ -1,5 +1,6 @@
 //! Host-listener lifecycle: binding is the caller's business, and the port is
-//! released the moment a peer is accepted.
+//! released the moment a peer completes the handshake — not before, or one
+//! connection that never speaks closes the port for everyone (audit NET-02).
 //!
 //! Both properties exist because of one bug: `run_host_session` used to bind the
 //! port itself and hold the listener for the whole conversation. After the first
@@ -10,7 +11,9 @@
 //! peer, ever, and said nothing about it.
 
 use messenger_core::core::generate_rsa_keypair;
-use messenger_core::network::{bind_host_listener, run_host_session};
+use messenger_core::network::{
+    bind_host_listener, run_client_session_over_stream, run_host_session,
+};
 use messenger_core::types::SessionEvent;
 use messenger_core::RSA_KEY_BITS;
 use std::time::Duration;
@@ -18,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 /// Try to bind `port` for up to ~2s. The release happens on the session task's
-/// timeline (right after `accept()` returns), so a single immediate attempt
+/// timeline (right after a handshake completes), so a single immediate attempt
 /// would be racy; a bounded retry is not.
 async fn rebind_within(port: u16) -> bool {
     for _ in 0..100 {
@@ -31,7 +34,7 @@ async fn rebind_within(port: u16) -> bool {
 }
 
 #[tokio::test]
-async fn host_releases_the_listening_port_once_a_peer_is_accepted() {
+async fn host_keeps_its_port_through_idle_connections_and_releases_it_for_a_peer() {
     let listener = bind_host_listener(0)
         .await
         .expect("binding an ephemeral port");
@@ -60,12 +63,40 @@ async fn host_releases_the_listening_port_once_a_peer_is_accepted() {
         other => panic!("expected Listening, got {other:?}"),
     }
 
-    // A peer connects. It never completes the handshake — irrelevant here: what
-    // matters is that `accept()` returned, which is the point the listener must
-    // be released.
-    let peer = TcpStream::connect(("127.0.0.1", port))
+    // A connection that never speaks must NOT take the port with it.
+    let idle = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connecting to the host");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        bind_host_listener(port).await.is_err(),
+        "an idle connection must not make the host give up its port"
+    );
+
+    // A real peer completes the handshake (and the password gate): now the
+    // listener is released.
+    let mut peer = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connecting to the host");
+    let client_key = generate_rsa_keypair(RSA_KEY_BITS).expect("keypair");
+    let (client_tx, _client_rx) = mpsc::unbounded_channel();
+    let (_client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (_client_file, client_file_rx) = mpsc::channel(4);
+    let (_client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
+    let client = tokio::spawn(async move {
+        run_client_session_over_stream(
+            &mut peer,
+            "host".into(),
+            client_key,
+            client_tx,
+            client_out_rx,
+            client_file_rx,
+            client_confirm_rx,
+            uuid::Uuid::new_v4(),
+            None,
+        )
+        .await
+    });
 
     assert!(
         rebind_within(port).await,
@@ -73,7 +104,8 @@ async fn host_releases_the_listening_port_once_a_peer_is_accepted() {
          auto-rehost after the first peer fails with EADDRINUSE"
     );
 
-    drop(peer);
+    drop(idle);
+    client.abort();
     session.abort();
 }
 

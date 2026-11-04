@@ -119,6 +119,9 @@ const realApi = {
   setAsideHistory: () => invoke("set_aside_history"),
   exportDiagnostics: () => invoke("export_diagnostics"),
   openDataDir: () => invoke("open_data_dir"),
+  // Irreversible: the backend checks the password and the typed word, deletes
+  // the identity, history and saved communities, then quits.
+  deleteAllData: (password, confirm) => invoke("delete_all_data", { password, confirm }),
   lockState: () => invoke("lock_state"),
   setLocked: (locked) => invoke("set_locked", { locked }),
   listConversations: () => invoke("list_conversations"),
@@ -319,6 +322,10 @@ function makeMock() {
     setAsideHistory: async () => "C:\\Users\\you\\…\\history.json.enc.unreadable-20261103T120000Z",
     exportDiagnostics: async () => "C:\\Users\\you\\AppData\\P2PEM\\diagnostics\\bundle-mock",
     openDataDir: async () => "C:\\Users\\you\\AppData\\P2PEM",
+    deleteAllData: async (password, confirm) => {
+      if (confirm !== "DELETE") throw new Error("Type DELETE to confirm");
+      if (!password) throw new Error("Wrong password — nothing was deleted");
+    },
     lockState: async () => mockSettings._locked || false,
     setLocked: async (locked) => { mockSettings._locked = locked; },
     listConversations: async () => summaries(),
@@ -490,8 +497,20 @@ export function fmtTime(ts) {
   const d = parseStamp(ts);
   if (!d) return "";
   try {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return timeFormat().format(d);
   } catch { return ""; }
+}
+
+// One formatter, built on first use. `toLocaleTimeString` with an options
+// object constructs a new `Intl.DateTimeFormat` on every call, which is the
+// slow path in WebKitGTK and WKWebView — and it ran once per message per
+// refresh (PERF-01).
+let cachedTimeFormat = null;
+function timeFormat() {
+  if (!cachedTimeFormat) {
+    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return cachedTimeFormat;
 }
 
 // Compact "last activity" stamp for the conversation list: time-of-day for

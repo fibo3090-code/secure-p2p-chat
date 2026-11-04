@@ -570,3 +570,73 @@ async fn simultaneous_traffic_in_both_directions_keeps_framing_intact() {
     host.handle.abort();
     client.handle.abort();
 }
+
+/// NET-02: the host listener used to be one-shot. A connection that opened
+/// and said nothing took the only slot and closed the port for the whole
+/// handshake timeout; reconnecting the moment it reopened kept the host
+/// unreachable. A real peer must get through while such connections idle.
+#[tokio::test]
+async fn silent_connections_do_not_lock_a_real_peer_out_of_the_host() {
+    use messenger_core::network::{bind_host_listener, run_client_session, run_host_session};
+
+    let listener = bind_host_listener(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host_key = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+    let client_key = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+
+    let (host_tx, mut host_events) = mpsc::unbounded_channel();
+    let (_host_out, host_out_rx) = mpsc::unbounded_channel();
+    let (_host_file, host_file_rx) = mpsc::channel(4);
+    let (_host_confirm, host_confirm_rx) = mpsc::unbounded_channel();
+    let host = tokio::spawn(run_host_session(
+        listener,
+        host_key,
+        host_tx,
+        host_out_rx,
+        host_file_rx,
+        host_confirm_rx,
+        uuid::Uuid::new_v4(),
+        None,
+    ));
+    wait_until(&mut host_events, "listening", |e| {
+        matches!(e, SessionEvent::Listening { .. })
+    })
+    .await;
+
+    // Two connections that never speak (under the per-IP rate limit).
+    let _idle_a = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _idle_b = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+
+    let (client_tx, _client_events) = mpsc::unbounded_channel();
+    let (_client_out, client_out_rx) = mpsc::unbounded_channel();
+    let (_client_file, client_file_rx) = mpsc::channel(4);
+    let (_client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
+    let client = tokio::spawn(run_client_session(
+        "127.0.0.1",
+        port,
+        client_key,
+        client_tx,
+        client_out_rx,
+        client_file_rx,
+        client_confirm_rx,
+        uuid::Uuid::new_v4(),
+        None,
+    ));
+
+    // Well inside the 15 s an idle connection used to hold the port for.
+    let ev = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_until(&mut host_events, "real peer", |e| {
+            matches!(e, SessionEvent::NewConnection { .. })
+        }),
+    )
+    .await
+    .expect("the real peer was locked out by idle connections");
+    assert!(matches!(ev, SessionEvent::NewConnection { .. }));
+    host.abort();
+    client.abort();
+}

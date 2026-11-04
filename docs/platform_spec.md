@@ -42,11 +42,13 @@ Guiding decisions:
 ## 2. Current State
 
 An accurate audit of what exists today (last verified against the codebase at
-**1.15.0**, 2026-08-03).
+**1.16.2**, 2026-11-04). [architecture.md](architecture.md) and
+[protocol.md](protocol.md) own the detail; this section is the summary.
 
 ### P2P — mature
 
-Protocol v3 handshake (X25519 ECDH → HKDF-SHA256 → AES-256-GCM), TOFU fingerprint
+Protocol v3 handshake (X25519 ECDH → HKDF-SHA256 → AES-256-GCM), identity proofs
+signed with Ed25519 when both peers offer it (RSA-PSS otherwise), TOFU fingerprint
 verification with a transcript-bound SAS, forward secrecy, replay protection,
 automatic rekeying, 1:1 text (split into 48 KiB frames past 64 KiB, ceiling
 ~24 MiB) + file transfer up to 10 GiB with an acceptance gate and either-side cancellation,
@@ -84,9 +86,13 @@ real TCP listener with a persistent owner-only identity, applies requests to an
 in-memory `PartyState`, fans out live broadcasts across connections, serves
 channels and server-routed DMs with offline history catch-up, and persists state
 to an embedded SQLite database (with file bytes in a content-addressed blob store
-on disk). A client can join, chat in channels, DM, create channels, and — from the
-desktop app — share and download files, via the desktop **Communities** tab or TUI
-commands.
+on disk). Server-enforced roles (Guest < Member < Admin < Owner, first joiner is
+Owner), channel kinds (Public / Locked / Announce / Private), chunked file
+transfer up to 100 MiB, per-file permissions, re-sharing without re-uploading,
+and per-member plus server-wide storage allowances all ship (1.16.0). A client
+can join, chat in channels, DM, create channels, and share and download files,
+via the desktop **Communities** tab or the TUI (`:party`, `:party-send-file`,
+`:party-download`).
 
 ### Current UI — one desktop app (Tauri/React) plus a ratatui TUI
 
@@ -229,8 +235,8 @@ tiers:
 
 - **Administered (default)** — client↔server is encrypted, but the server stores
   **plaintext**. This enables offline buffering, admin-read (clearly labeled),
-  search, and simple groups. The server wears an honest "this operator can read
-  messages" badge.
+  search, and simple groups. The app shows an "Operator can read messages"
+  badge on every community screen (desktop) and in the Communities pane (TUI).
 - **Private / E2EE (Phase 4)** — a per-channel **group key**; the server stores
   only ciphertext and never sees plaintext; admins cannot read. Offline buffering
   stores encrypted blobs. Group-key distribution and rotation on membership change
@@ -306,9 +312,9 @@ and `blobs` (`hash, size, mime, refcount`; the bytes themselves live under
   server-side check reads as `role >= Role::Admin`. A **guest** is read-only
   everywhere; a **member** posts, uploads and creates public channels; an
   **admin** manages channels, anyone's files, and the roles below their own; the
-  **owner** is the first identity to join — the operator starts the server and
-  then joins it, which is the only bootstrap that does not require an admin to
-  already exist. A role may only ever be granted *strictly below* the granter's
+  **owner** is the operator, who claims the seat by joining with the one-time
+  owner claim token the server prints at startup (or is named outright with
+  `--owner <fingerprint>`); being first to join grants nothing. A role may only ever be granted *strictly below* the granter's
   own, the owner cannot be demoted, and a second owner is never minted, so an
   admin cannot take the community from the person running it.
 - **`ChannelKind` is enforced.** It was previously stored, persisted, shipped to

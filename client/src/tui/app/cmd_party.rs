@@ -124,7 +124,10 @@ impl TuiApp {
                         let short = &fingerprint[..fingerprint.len().min(16)];
                         self.toast(
                             ToastLevel::Info,
-                            format!("Joining Party {address} as {username} (server fp {short}…)"),
+                            format!(
+                                "Joining Party {address} as {username} (server fp {short}…). \
+                                 Its operator can read what you post there, DMs included."
+                            ),
                         );
                     }
                     Ok(PartyJoinOutcome::NeedsVerification { .. }) => self.toast(

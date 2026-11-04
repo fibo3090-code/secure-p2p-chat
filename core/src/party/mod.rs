@@ -20,8 +20,9 @@ use uuid::Uuid;
 use crate::core::{recv_packet, send_packet, AesCipher};
 use crate::network::client_handshake;
 
-/// Trust tier of a server / stored message. A property of the server, surfaced
-/// prominently in the UI.
+/// Trust tier of a server / stored message. A property of the server. Only
+/// `Administered` exists today; both shells disclose it as "the operator can
+/// read messages" on every community screen rather than reading this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrustTier {
     /// Server stores plaintext; enables offline buffering, search, admin-read.
@@ -858,7 +859,8 @@ where
 {
     let ciphertext = recv_packet(stream).await?;
     let plaintext = cipher
-        .decrypt(&ciphertext, Some(transport_aad))
+        // Only the other side's frames: a reflected one of ours is refused.
+        .decrypt_from_peer(&ciphertext, Some(transport_aad))
         .ok_or_else(|| anyhow::anyhow!("failed to decrypt Party frame"))?;
     if plaintext.len() < PARTY_SEQ_BYTES {
         anyhow::bail!("Party frame is too short to carry a sequence number");
@@ -1042,6 +1044,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::NonceRole;
 
     fn sample_envelope() -> Envelope {
         Envelope {
@@ -1250,7 +1253,8 @@ mod tests {
 
     #[tokio::test]
     async fn framed_message_roundtrips_over_a_tunnel() {
-        let cipher = AesCipher::new(&[3u8; 32]).unwrap();
+        let cipher = AesCipher::new_with_role(&[3u8; 32], NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&[3u8; 32], NonceRole::Client).unwrap();
         let aad = b"transport|party-test";
         let (mut a, mut b) = tokio::io::duplex(4096);
         let mut tx_seq = FrameSeq::new();
@@ -1263,9 +1267,7 @@ mod tests {
         send_framed(&mut a, &cipher, aad, &mut tx_seq, &req.to_bytes())
             .await
             .unwrap();
-        let bytes = recv_framed(&mut b, &cipher, aad, &mut rx_seq)
-            .await
-            .unwrap();
+        let bytes = recv_framed(&mut b, &peer, aad, &mut rx_seq).await.unwrap();
         assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
 
         // A frame decrypted under the wrong AAD must fail to authenticate.
@@ -1278,7 +1280,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(recv_framed(&mut b, &cipher, b"wrong-aad", &mut rx_seq)
+        assert!(recv_framed(&mut b, &peer, b"wrong-aad", &mut rx_seq)
             .await
             .is_err());
     }
@@ -1288,7 +1290,8 @@ mod tests {
     /// the Party tunnel now does too.
     #[tokio::test]
     async fn a_replayed_party_frame_is_rejected() {
-        let cipher = AesCipher::new(&[7u8; 32]).unwrap();
+        let cipher = AesCipher::new_with_role(&[7u8; 32], NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&[7u8; 32], NonceRole::Client).unwrap();
         let aad = b"transport|replay-test";
         let mut tx_seq = FrameSeq::new();
 
@@ -1306,16 +1309,40 @@ mod tests {
 
         let mut rx_seq = FrameSeq::new();
         let mut once = captured.as_slice();
-        recv_framed(&mut once, &cipher, aad, &mut rx_seq)
+        recv_framed(&mut once, &peer, aad, &mut rx_seq)
             .await
             .expect("the first delivery is accepted");
 
         // Same bytes again: authenticates fine, but the sequence has not moved.
         let mut again = captured.as_slice();
-        let err = recv_framed(&mut again, &cipher, aad, &mut rx_seq)
+        let err = recv_framed(&mut again, &peer, aad, &mut rx_seq)
             .await
             .expect_err("a replayed frame must be refused");
         assert!(err.to_string().contains("replayed or out-of-order"));
+    }
+
+    /// NET-01: both directions share a key, so a frame we sent, echoed back,
+    /// used to authenticate as the other side's.
+    #[tokio::test]
+    async fn a_reflected_party_frame_is_rejected() {
+        let ours = AesCipher::new_with_role(&[9u8; 32], NonceRole::Client).unwrap();
+        let aad = b"transport|reflect-test";
+        let mut tx_seq = FrameSeq::new();
+        let mut captured: Vec<u8> = Vec::new();
+        send_framed(
+            &mut captured,
+            &ours,
+            aad,
+            &mut tx_seq,
+            &PartyRequest::ListMembers.to_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut rx_seq = FrameSeq::new();
+        let mut echoed = captured.as_slice();
+        assert!(recv_framed(&mut echoed, &ours, aad, &mut rx_seq)
+            .await
+            .is_err());
     }
 
     #[test]

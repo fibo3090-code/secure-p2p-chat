@@ -13,6 +13,48 @@ predate tagged releases.
 
 ### Security
 
+- **Community screens now say that the server's operator can read them.**
+  Channel messages, community DMs and shared files are stored on the server
+  unencrypted; the app said so only on the join screen. Every community view
+  now carries an "Operator can read messages" badge, community DMs carry a
+  note, and the README no longer claims every conversation is end-to-end
+  encrypted.
+- **"Delete Everything" now exists.** The guide described it, but nothing
+  implemented it. Settings → Delete all data (password plus typing `DELETE`)
+  and the terminal client's `:wipe` remove the identity, history, saved
+  communities and diagnostics, then quit; nothing written afterwards can put a
+  history file back. Only files the app wrote are removed, and the folder only
+  if that empties it. The guide now lists where each app keeps its data and
+  says plainly that uninstalling removes nothing.
+
+- **The safety code could be forged by a man in the middle.** The six digits
+  and three emoji were derived from both sides' temporary keys with nothing
+  stopping an attacker from choosing its key after seeing the victim's, so it
+  could try keys until both victims saw the same code (well under a second for
+  the digits alone). Protocol v4 makes the connecting side commit to its key
+  before seeing the other's. Older (v3) peers still connect, but the app now
+  warns that their safety code is a weak check and the fingerprint should be
+  compared instead.
+
+- **One idle connection could make a host unreachable.** The listener accepted
+  a single connection and closed the port while that connection's handshake
+  ran, so a connection that sent nothing kept everyone else out for 15 seconds
+  at a time, indefinitely. The host now keeps listening while up to four
+  handshakes run, each with one overall 20-second deadline, and applies the
+  per-address rate limit before a connection takes a slot. A wrong connection
+  password no longer ends hosting; it is reported and the host keeps
+  listening.
+
+- **A frame you sent could be echoed back and accepted as your peer's.** Both
+  directions of a session share one key, so anyone on the path (a bridging
+  relay, hostile Wi-Fi) could reflect your own "yes" back to you as the
+  peer's reply, mark your messages delivered with your own receipts, or end
+  the session with your own key rotation. Each side now refuses frames that
+  carry its own direction bit, on direct sessions and community connections
+  alike. Wire-compatible with existing peers.
+- **A client could force the host to rotate keys.** Only the host rotates the
+  session key; a `Rekey` from the client is now ignored.
+
 - **Whoever joined a new community first became its permanent owner** — and
   servers were open by default, listening on every interface. Anyone who
   reached the address before the operator (a scanner, anyone the address
@@ -112,6 +154,21 @@ predate tagged releases.
   which let it steer which message a "not sent" error took off your screen.
 
 ### Performance
+
+- **The desktop app no longer refetches every conversation four times a
+  second while a file transfers.** Transfer progress now has its own light
+  event; only the transfer list is refreshed. Message times use one cached
+  formatter instead of building one per message per refresh.
+- **One very large message no longer slows everything down.** The sidebar
+  preview is cut to 200 characters, the chat pane shows at most 256 KiB of a
+  message (with a note; the history keeps all of it), and the terminal client
+  draws at most 8 KiB of one.
+- **The terminal client no longer rewrites its whole history every 30
+  seconds.** It saves only when something changed, and writes in the
+  background instead of freezing the interface; saving also makes three fewer
+  full copies of the history.
+- **Joining a community with a long channel is no longer quadratic.** History
+  pages are merged in linear time.
 
 - **Sending or downloading a large file on a community server no longer slows
   the server down for everyone else.** Both moved their bytes while holding the
@@ -277,6 +334,15 @@ predate tagged releases.
   step a timeout so a hung download fails instead of occupying a runner for six
   hours, and no longer builds the whole workspace on three platforms to check a
   Markdown file.
+- A change that touches only the desktop shell's Rust code (`desktop/src-tauri/`)
+  now also runs the frontend tests. Those include the check that the commands
+  the web UI calls match the names and arguments the Rust side declares, and it
+  used to be skipped for exactly the change most likely to break it.
+- The release workflow's desktop build no longer hands the Tauri build action a
+  release tag and token. Given those, the action tries to create the GitHub
+  release and upload to it itself, which the build jobs' read-only token cannot
+  do, and which would bypass the sign-then-publish step even if it could. It now
+  only builds; the attest job remains the one place that publishes.
 
 ### Dependencies
 
@@ -308,6 +374,23 @@ predate tagged releases.
 - Corrected the documented limit on message size. `MAX_TEXT_MESSAGE_BYTES`
   (64 KiB) was described as a hard cap on a message; it is the threshold above
   which a message is split, and the real ceiling is about 24 MiB.
+- **Verifying a new contact now starts with the six-digit + emoji code** in the
+  user guide, the tutorial and SECURITY.md, matching what both apps show. The
+  64-character fingerprint and the safety grid are described as the advanced
+  check. The tutorial's `y`/`n` keys are corrected to `Ctrl+Y`/`Ctrl+N`.
+- `docs/protocol.md` now lists every community (Party) request and response
+  and documents chunked upload and download, and per-file permissions, as they
+  ship. It previously said chunked transfer was not implemented.
+- The community server's build output is `target/release/server` (shipped as
+  `p2pem-server`), not `target/release/messenger-server` as the user guide said.
+- THREAT_MODEL no longer says invite expiry is unenforced. Signed invites are
+  refused after 30 days; what is missing is revocation before that.
+- CONTRIBUTING now has one command that runs the same checks as CI
+  (`cargo nextest run --workspace --profile ci`, doctests, and the frontend lint
+  and tests), and DEVELOPER_GUIDE, the PR template and the README agree with it.
+- Smaller corrections: `docs/platform_spec.md` "Current State" re-verified at
+  1.16.2, and stale egui references removed from `design/tokens.json` and the
+  desktop crate's `Cargo.toml`.
 
 ## [1.16.2] - 2026-08-20
 
