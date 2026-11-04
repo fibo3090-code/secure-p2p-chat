@@ -261,7 +261,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               <span className="set-row-hint">
                 {backedUp
                   ? `Last saved ${new Date(s.identity_backed_up_at).toLocaleString()}. Save a fresh copy if you have changed devices.`
-                  : "Save an encrypted copy of your identity file. Without it (and your password), a lost disk means a lost identity — there is no reset."}
+                  : "Save an encrypted copy of your identity file (your keys — not your message history). Without it (and your password), a lost disk means a lost identity — there is no reset."}
               </span>
             </span>
             <button className="set-change" onClick={async () => {
