@@ -1802,10 +1802,9 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx);
 
-        let rekey = ProtocolMessage::Rekey {
-            seq: 1,
-            nonce: vec![9u8; crate::REKEY_NONCE_SIZE],
-        };
+        let mut nonce = vec![0u8; crate::REKEY_NONCE_SIZE];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
+        let rekey = ProtocolMessage::Rekey { seq: 1, nonce };
         let frame = client.encrypt(&rekey.to_plain_bytes(), Some(&aad));
         assert!(matches!(
             transport.receive(&frame).unwrap(),
