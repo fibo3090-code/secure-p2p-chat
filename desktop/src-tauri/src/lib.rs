@@ -151,48 +151,8 @@ async fn persist_history(manager: &Arc<Mutex<ChatManager>>, path: &Path, saved_s
 /// count — are persisted without rewriting the encrypted history on every
 /// idle tick.
 fn state_signature(mgr: &ChatManager) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let ids = mgr.chat_ids();
-    let mut sig = ids.len() as u64;
-    for id in &ids {
-        if let Some(c) = mgr.get_chat(*id) {
-            let delivered = c.messages.iter().filter(|m| m.delivered).count() as u64;
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            // The title itself, not its length: renaming "Mum" to "Dad" changes
-            // nothing a length-only signature can see.
-            c.title.hash(&mut h);
-            c.peer_fingerprint.hash(&mut h);
-            sig = sig
-                .wrapping_mul(1_000_003)
-                .wrapping_add(c.messages.len() as u64)
-                .wrapping_add(delivered.wrapping_mul(65_537))
-                // The read mark is persisted state and drives the unread badge,
-                // so a change to it must both save and refresh the UI.
-                .wrapping_add((c.read_count as u64).wrapping_mul(31))
-                .wrapping_add(h.finish());
-        }
-    }
-    // Contacts are persisted inside the same encrypted history, so a signature
-    // that ignored them could not notice an imported invite, a block, or a
-    // fingerprint promoted to Verified — the poll loop simply never saved, and
-    // the change survived only as far as the next clean shutdown.
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    mgr.contacts.len().hash(&mut h);
-    for c in mgr.contacts.values() {
-        c.id.hash(&mut h);
-        c.name.hash(&mut h);
-        c.fingerprint.hash(&mut h);
-        c.address.hash(&mut h);
-        c.addresses.hash(&mut h);
-        c.relay_server.hash(&mut h);
-        c.relay_token.hash(&mut h);
-        (c.trust_state as u8).hash(&mut h);
-    }
-    let mut pairs: Vec<(Uuid, Uuid)> = mgr.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
-    pairs.sort();
-    pairs.hash(&mut h);
-    sig.wrapping_mul(31).wrapping_add(h.finish())
+    // One definition, shared with the terminal client's autosave.
+    mgr.persisted_signature()
 }
 
 /// Reject any post-auth command while the identity is still locked or a password

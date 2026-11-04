@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{
-    aead::{Aead, AeadCore},
+    aead::{Aead, AeadCore, AeadInPlace},
     ChaCha20Poly1305, KeyInit,
 };
 use rand::rngs::OsRng;
@@ -167,17 +167,21 @@ impl HistoryFile {
         // by a human, so the indentation was pure cost — it inflated the
         // plaintext, the ciphertext, and every rewrite of the file. The whole
         // history is re-serialized on each change, so the saving compounds.
-        let json = serde_json::to_string(&self)?;
-
+        //
+        // One buffer end to end — nonce, then the JSON encrypted in place,
+        // then the tag — instead of JSON, ciphertext and a concatenated copy:
+        // three full copies of the history less at peak (PERF-03). The bytes
+        // on disk are identical (`nonce || ciphertext || tag`).
+        const NONCE: usize = 12;
+        let mut output = vec![0u8; NONCE];
+        serde_json::to_writer(&mut output, &self)?;
         let cipher = ChaCha20Poly1305::new(key.into());
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher
-            .encrypt(&nonce, json.as_bytes())
+        output[..NONCE].copy_from_slice(&nonce);
+        let tag = cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut output[NONCE..])
             .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-
-        // Format: nonce (12 bytes) || ciphertext
-        let mut output = nonce.to_vec();
-        output.extend_from_slice(&ciphertext);
+        output.extend_from_slice(&tag);
 
         // Atomic + fsynced, with 0600 from creation on Unix. The old path wrote
         // a temp file and renamed but never flushed it, so a power loss could
@@ -365,6 +369,60 @@ impl ChatManager {
         let history = HistoryFile::load_encrypted(path, key)?;
         self.apply_history(history);
         Ok(())
+    }
+
+    /// A cheap fingerprint of everything that is persisted: chats (count,
+    /// titles, trust, messages, delivery, read marks), contacts and their
+    /// association with chats, and the config. Both shells compare it with the
+    /// value at the last save and skip the write when nothing changed — every
+    /// save re-encrypts and fsyncs the whole history (PERF-03).
+    pub fn persisted_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let ids = self.chat_ids();
+        let mut sig = ids.len() as u64;
+        for id in &ids {
+            if let Some(c) = self.get_chat(*id) {
+                let delivered = c.messages.iter().filter(|m| m.delivered).count() as u64;
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // The title itself, not its length: renaming "Mum" to "Dad"
+                // changes nothing a length-only signature can see.
+                c.title.hash(&mut h);
+                c.peer_fingerprint.hash(&mut h);
+                sig = sig
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(c.messages.len() as u64)
+                    .wrapping_add(delivered.wrapping_mul(65_537))
+                    // The read mark is persisted and drives the unread badge.
+                    .wrapping_add((c.read_count as u64).wrapping_mul(31))
+                    .wrapping_add(h.finish());
+            }
+        }
+        // Contacts live in the same encrypted file, so a signature that
+        // ignored them could not notice an imported invite, a block, or a
+        // fingerprint promoted to Verified.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.contacts.len().hash(&mut h);
+        for c in self.contacts.values() {
+            c.id.hash(&mut h);
+            c.name.hash(&mut h);
+            c.fingerprint.hash(&mut h);
+            c.address.hash(&mut h);
+            c.addresses.hash(&mut h);
+            c.relay_server.hash(&mut h);
+            c.relay_token.hash(&mut h);
+            (c.trust_state as u8).hash(&mut h);
+        }
+        let mut pairs: Vec<(Uuid, Uuid)> =
+            self.contact_to_chat.iter().map(|(k, v)| (*k, *v)).collect();
+        pairs.sort();
+        pairs.hash(&mut h);
+        // Config is small; hashing its serialization keeps a new field from
+        // being silently left out.
+        serde_json::to_vec(&self.config)
+            .unwrap_or_default()
+            .hash(&mut h);
+        sig.wrapping_mul(31).wrapping_add(h.finish())
     }
 
     /// Save chat history to file
