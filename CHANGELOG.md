@@ -11,6 +11,23 @@ predate tagged releases.
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-11-09
+
+> **Community server operators: a restart on this version needs a flag.** The
+> server now refuses to start without `--password` (or `PARTY_PASSWORD`) unless
+> `--open` is passed explicitly, and the first member to join no longer becomes
+> the owner. On startup an unowned community prints a one-time owner claim
+> token; join with it in the password field, or start the server with
+> `--owner <fingerprint>`. Existing owners keep their role.
+>
+> **Upgrade everyone you verify safety codes with.** Protocol v4 makes the
+> six-digit + emoji code sound against a man in the middle. A v3 (1.16.x) peer
+> still connects, but the app warns that its code is a weak check — compare the
+> full fingerprint with them instead until they update.
+>
+> The Communities wire format is compatible both ways: clients and servers on
+> 1.16.x and 1.17.0 can be mixed.
+
 ### Security
 
 - **The community server's bundled SQLite is updated to 3.54.1**
@@ -343,8 +360,8 @@ predate tagged releases.
   visible, and the provenance signature covers exactly what the build produced —
   including `SHA256SUMS`, which was previously the one unsigned file. See
   SECURITY.md for how to check it.
-- The minimum supported Rust version is now correctly declared as 1.89. It said
-  1.86, which no longer built.
+- The declared minimum supported Rust version had gone stale: it said 1.86,
+  which no longer built. It is now 1.90 (see Dependencies) and CI checks it.
 - CI runs on Node 22 (Node 20 is out of support), gives every network-touching
   step a timeout so a hung download fails instead of occupying a runner for six
   hours, and no longer builds the whole workspace on three platforms to check a
@@ -364,7 +381,7 @@ predate tagged releases.
 - X25519 key exchange 2.0 → 3.0, which also removes a duplicate copy of the
   underlying elliptic-curve implementation: there is now one rather than two
   compiled into every build.
-- SQLite (`rusqlite`) 0.39 → 0.40, `mdns-sd` 0.20 → 0.21, `base64` 0.21 → 0.22.
+- SQLite (`rusqlite`) 0.39 → 0.41 (see Security), `mdns-sd` 0.20 → 0.21, `base64` 0.21 → 0.22.
   `base64` is now built without its default features, so the app no longer
   carries a second allocator-level code path it never calls.
 - Ten security advisories that had been accepted with a written justification
@@ -1588,7 +1605,8 @@ predate tagged releases.
 - Basic chat functionality, end-to-end encryption (RSA + AES-GCM), file
   transfer, a simple GUI, and message history persistence.
 
-[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.2...HEAD
+[Unreleased]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.17.0...HEAD
+[1.17.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.2...v1.17.0
 [1.16.2]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.1...v1.16.2
 [1.16.1]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.16.0...v1.16.1
 [1.16.0]: https://github.com/fibo3090-code/secure-p2p-chat/compare/v1.15.0...v1.16.0
