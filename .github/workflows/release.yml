@@ -245,6 +245,13 @@ jobs:
       # the tagged commit and this build ships inside a fully attested
       # installer, and the attestation says nothing about the difference.
       #
+      # It is a *cargo* flag, so it goes after the `--` that ends the Tauri
+      # CLI's own options. tauri-action runs `npm run tauri build -- <args>`, and
+      # npm consumes that `--` itself, so a bare `--locked` reaches
+      # `tauri build` as an option it does not have and every desktop leg exits
+      # 2 before compiling anything — which is how v1.17.0's first run failed.
+      # The second `--` is not a typo.
+      #
       # Build only. No `tagName`/`releaseName`/`releaseId` and no
       # `GITHUB_TOKEN`: given a tag, tauri-action looks up or creates the
       # GitHub release and uploads the bundles to it itself. Under this job's
@@ -259,7 +266,7 @@ jobs:
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         with:
           projectPath: desktop
-          args: ${{ matrix.args }} --locked
+          args: ${{ matrix.args }} -- --locked
 
       # tauri-action reports what it built as a JSON array of paths. Copying
       # those rather than globbing the bundle tree is what keeps this honest:
