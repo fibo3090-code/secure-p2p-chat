@@ -13,6 +13,13 @@ predate tagged releases.
 
 ### Security
 
+- **The community server's bundled SQLite is updated to 3.54.1**
+  (`rusqlite` 0.41 / `libsqlite3-sys` 0.39.1) for RUSTSEC-2026-0459
+  (CVE-2026-119375): SQLite before 3.54.0 could return uninitialized memory
+  when opening a database whose `-wal` file has a different page size. Only the
+  server links SQLite, and only a `party.db` someone else could write was
+  exposed.
+
 - **Community servers can now limit how long they keep history.**
   `--retain-days <DAYS>` deletes messages and shared files older than that, at
   startup and hourly (each channel and DM keeps its newest message, so
