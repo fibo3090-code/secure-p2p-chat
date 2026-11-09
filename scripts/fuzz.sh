@@ -20,6 +20,13 @@
 #     `~/.cargo/bin` fixes it; `+nightly` alone does not.
 #   - `core/fuzz` is its own workspace on purpose, so a sanitizer build never
 #     ends up in the path of an ordinary `cargo build`.
+#   - `cargo fuzz` builds for the triple *it* was compiled for unless told
+#     otherwise. A musl build of cargo-fuzz (what `cargo-binstall` fetches from
+#     the GitHub release) therefore built for `x86_64-unknown-linux-musl`, where
+#     the sanitizer refuses the static libc and nightly has no `core`, and every
+#     scheduled run failed to compile while reporting "found a crash". The
+#     target is pinned to the toolchain's own host instead (override with
+#     `P2PEM_FUZZ_TRIPLE`).
 
 set -euo pipefail
 
@@ -53,6 +60,12 @@ if ! command -v cargo-fuzz >/dev/null 2>&1; then
     exit 1
 fi
 
+TRIPLE="${P2PEM_FUZZ_TRIPLE:-$(rustc -vV | sed -n 's/^host: //p')}"
+if [ -z "$TRIPLE" ]; then
+    echo "error: could not determine the toolchain's host triple (set P2PEM_FUZZ_TRIPLE)" >&2
+    exit 1
+fi
+
 # Corpora live here and are reused across runs. libFuzzer's coverage feedback is
 # cumulative, so a corpus thrown away after every run makes each one start from
 # nothing — which for a decoder guarded by length checks means starting from
@@ -79,7 +92,7 @@ run_one() {
         cp -n "${SEED_ROOT}/${name}"/* "$corpus"/ 2>/dev/null || true
     fi
     echo "── fuzzing ${name} for ${SECONDS_PER_TARGET}s ─────────────────────────"
-    cargo fuzz run "$name" "$corpus" -- \
+    cargo fuzz run --target "$TRIPLE" "$name" "$corpus" -- \
         -max_total_time="$SECONDS_PER_TARGET" \
         -max_len="$MAX_LEN" \
         -print_final_stats=1
