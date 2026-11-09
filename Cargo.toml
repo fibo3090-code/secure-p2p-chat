@@ -84,7 +84,7 @@ ratatui-crossterm = { version = "0.1.0", features = ["crossterm_0_29"] }
 # the unstable `cfg_select`. That stopped being true — 0.38.2 defines its own
 # `cfg_select!` macro, "Just to keep MSRV low" — and was doubly stale once the
 # floor moved to 1.89.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Utilities
 anyhow = "1"
