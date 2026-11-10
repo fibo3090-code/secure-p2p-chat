@@ -289,6 +289,13 @@ jobs:
           jq -r '.[]' artifacts.json > artifacts.txt
           count=0
           while IFS= read -r bundle; do
+            # The Windows runner's jq is a native jq.exe, which writes text
+            # mode: every line ends `\r\n`, and `read -r` keeps the `\r`. The
+            # path then names a file that does not exist, and the check below
+            # fails on an installer that was built a moment ago (v1.17.0's
+            # second run, windows-x64 only). Strip it here rather than with
+            # `jq --binary`, so the fix does not depend on which jq a runner has.
+            bundle="${bundle%$'\r'}"
             [ -n "$bundle" ] || continue
             if [ ! -e "$bundle" ]; then
               echo "::error::tauri-action reported $bundle, which does not exist"
