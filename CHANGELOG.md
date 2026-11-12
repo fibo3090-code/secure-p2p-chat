@@ -11,6 +11,19 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Dependencies
+
+- UPnP port mapping (`igd-next`) 0.17 → 0.18. `mdns-sd`, `uuid`, `serde_json`,
+  `arboard`, `open`, `log`, `unicode-width`, `tauri-build`, `tauri-plugin-log`
+  and `proptest` move to their latest compatible releases.
+- Desktop front-end: lucide-react 1.70, and the Tauri CLI moves to 2.12 to
+  match the Tauri crate and `@tauri-apps/api`.
+- Development tooling only, nothing that ships: jsdom 30, Playwright 1.64,
+  `@vitejs/plugin-react` 6.1.2, Vitest 5.1. The Vitest, `undici`,
+  `brace-expansion` and `zod` updates clear five advisories in the test and
+  build tooling; `npm audit` now reports none, with or without dev
+  dependencies.
+
 ## [1.17.0] - 2026-11-09
 
 > **Community server operators: a restart on this version needs a flag.** The
