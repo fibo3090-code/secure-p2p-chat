@@ -96,7 +96,7 @@ argon2 = "0.6"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # File dialogs
-rfd = "0.17.2"
+rfd = "0.18.0"
 
 # Open files
 open = "5"
