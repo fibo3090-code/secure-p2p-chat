@@ -122,7 +122,8 @@ impl History {
         pruned
     }
 
-    /// Envelopes currently held in memory (diagnostics and tests).
+    /// Envelopes currently held in memory (tests).
+    #[cfg(test)]
     pub(super) fn resident_len(&self) -> usize {
         self.resident.len()
     }
