@@ -1,10 +1,7 @@
 //! Property tests over the contact store.
 //!
-//! The original test drove `add` and `remove` with random names and asserted the
-//! map grew and shrank. That is a test of `HashMap`, not of this app: names are
-//! the one field with no rules attached to it.
-//!
-//! What actually carries weight here is the **trust lifecycle**, because the
+//! Not "add and remove keep the map consistent" — that is a test of `HashMap`,
+//! and names are the one field with no rules attached to them. What carries weight here is the **trust lifecycle**, because the
 //! contact store is where trust decisions are recorded and every one of them has
 //! an invariant that a bug would break silently:
 //!
@@ -63,27 +60,6 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
-
-    /// Adding and removing stays consistent for any names, including empty ones
-    /// and ones that differ only by case or whitespace.
-    #[test]
-    fn add_and_remove_is_consistent(names in proptest::collection::vec(".{0,32}", 0..50)) {
-        let mut manager = ChatManager::new(Config::default());
-        let mut ids = Vec::new();
-
-        for name in names {
-            ids.push(manager.add_contact(name, None, None, None));
-        }
-
-        prop_assert_eq!(manager.contacts.len(), ids.len());
-        for id in &ids {
-            prop_assert!(manager.contacts.contains_key(id));
-        }
-        for id in ids {
-            manager.remove_contact(id);
-        }
-        prop_assert!(manager.contacts.is_empty());
-    }
 
     /// A contact added by hand starts Unverified, whatever it is called.
     #[test]

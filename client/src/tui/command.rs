@@ -781,4 +781,84 @@ mod tests {
             assert_eq!(err, format!("Usage: {usage}"), "for {raw}");
         }
     }
+
+    #[test]
+    fn parses_explicit_ports_help_and_channel_aliases() {
+        assert_eq!(parse_command(":help").unwrap(), TuiCommand::Help(None));
+        assert_eq!(
+            parse_command(":connect 127.0.0.1:9001").unwrap(),
+            TuiCommand::Connect {
+                host: "127.0.0.1".into(),
+                port: 9001,
+            }
+        );
+        for alias in [":party-create-channel ops", ":party-channel ops"] {
+            assert_eq!(
+                parse_command(alias).unwrap(),
+                TuiCommand::PartyCreateChannel("ops".into()),
+                "{alias}"
+            );
+        }
+    }
+
+    /// A connect command is only ever built from something a socket can dial.
+    #[test]
+    fn a_connect_to_an_undialable_address_is_refused() {
+        for line in [
+            ":connect :abc",
+            ":connect host:0",
+            ":connect host:99999",
+            ":connect []:80",
+            ":connect http://example.com:80",
+        ] {
+            assert!(
+                !matches!(parse_command(line), Ok(TuiCommand::Connect { .. })),
+                "{line:?} produced a connect command"
+            );
+        }
+    }
+
+    /// Whatever is typed at the prompt, the parser answers with a command or
+    /// an error — never a panic.
+    #[test]
+    fn edge_inputs_are_answered_not_crashed_on() {
+        for line in [
+            "",
+            "::",
+            ": ",
+            ":connect :",
+            ":connect [",
+            ":host 99999",
+            ":host -1",
+            ":host abc",
+            ":set notifications maybe",
+            &format!(":rename {}", "😀".repeat(10_000)),
+            &":".repeat(10_000),
+            "\u{0}\u{1}\u{7f}",
+        ] {
+            let _ = parse_command(line);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn any_typed_line_parses_or_errors(line in ".{0,200}") {
+            let _ = parse_command(&line);
+            let _ = parse_command(&format!(":{line}"));
+        }
+
+        /// Random text rarely spells a command, so walk the real command words
+        /// with arbitrary arguments rather than hoping to hit them.
+        #[test]
+        fn every_command_word_survives_any_arguments(
+            idx in 0usize..64,
+            args in "[ -~\u{00A0}-\u{FFFF}]{0,80}",
+        ) {
+            let words: Vec<&str> = COMMANDS.iter().map(|c| c.0).collect();
+            let word = words[idx % words.len()];
+            let _ = parse_command(&format!(":{word} {args}"));
+        }
+    }
 }

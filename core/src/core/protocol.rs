@@ -782,28 +782,112 @@ mod tests {
         assert!(ProtocolMessage::from_plain_bytes(&[13u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
     }
 
+    /// Every per-field cap, pinned from both sides. Checking only "cap + 1 is
+    /// refused" passes for a cap set too *low* — a decoder that refused every
+    /// near-limit frame would drop real messages and still be green — so each
+    /// limit is asserted as "exactly at the cap decodes, one past it does not".
     #[test]
-    fn oversized_payloads_are_rejected() {
-        // FileMeta with size above MAX_FILE_SIZE must not decode.
-        let bad = ProtocolMessage::FileMeta {
+    fn every_field_cap_admits_its_limit_and_refuses_one_past_it() {
+        let text = |n: usize| ProtocolMessage::Text {
+            text: "a".repeat(n),
+            timestamp: 1,
+            seq: 1,
+        };
+        let text_chunk = |n: usize| ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index: 0,
+            total_chunks: 1,
+            text_part: "a".repeat(n),
+            timestamp: 1,
+            seq: 1,
+        };
+        let file_meta = |size: u64| ProtocolMessage::FileMeta {
             filename: "x".to_string(),
-            size: crate::MAX_FILE_SIZE + 1,
+            size,
             seq: 1,
         };
-        assert!(ProtocolMessage::from_plain_bytes(&bad.to_plain_bytes()).is_none());
-
-        // FileChunk larger than FILE_CHUNK_SIZE must not decode.
-        let bad_chunk = ProtocolMessage::FileChunk {
-            chunk: vec![0u8; crate::FILE_CHUNK_SIZE + 1],
+        let file_chunk = |n: usize| ProtocolMessage::FileChunk {
+            chunk: vec![0u8; n],
             seq: 1,
         };
-        assert!(ProtocolMessage::from_plain_bytes(&bad_chunk.to_plain_bytes()).is_none());
+        let cases: [(&str, ProtocolMessage, ProtocolMessage); 4] = [
+            (
+                "Text",
+                text(crate::MAX_TEXT_MESSAGE_BYTES),
+                text(crate::MAX_TEXT_MESSAGE_BYTES + 1),
+            ),
+            (
+                "TextChunk",
+                text_chunk(crate::TEXT_CHUNK_BYTES),
+                text_chunk(crate::TEXT_CHUNK_BYTES + 1),
+            ),
+            (
+                "FileMeta",
+                file_meta(crate::MAX_FILE_SIZE),
+                file_meta(crate::MAX_FILE_SIZE + 1),
+            ),
+            (
+                "FileChunk",
+                file_chunk(crate::FILE_CHUNK_SIZE),
+                file_chunk(crate::FILE_CHUNK_SIZE + 1),
+            ),
+        ];
+        for (what, at_cap, over) in cases {
+            assert_eq!(
+                ProtocolMessage::from_plain_bytes(&at_cap.to_plain_bytes()).as_ref(),
+                Some(&at_cap),
+                "{what} at its cap must decode unchanged"
+            );
+            assert!(
+                ProtocolMessage::from_plain_bytes(&over.to_plain_bytes()).is_none(),
+                "{what} one past its cap must be refused"
+            );
+        }
 
         // EphemeralKey longer than the 256-byte cap must not decode.
         let bad_eph = ProtocolMessage::EphemeralKey {
             public_key: vec![0u8; 300],
         };
         assert!(ProtocolMessage::from_plain_bytes(&bad_eph.to_plain_bytes()).is_none());
+    }
+
+    /// The legacy ASCII arms carry the same caps as the binary ones: a legacy
+    /// peer is still a remote peer.
+    #[test]
+    fn legacy_arms_enforce_the_binary_arms_limits() {
+        // A legacy text frame far past the cap.
+        let mut huge_text = b"TEXT:1:".to_vec();
+        huge_text.extend(std::iter::repeat_n(b'a', crate::MAX_TEXT_MESSAGE_BYTES + 1));
+        assert!(ProtocolMessage::from_plain_bytes(&huge_text).is_none());
+
+        // A legacy ephemeral key must be exactly 32 bytes, neither side of it.
+        for len in [31usize, 33, 8 * 1024 * 1024] {
+            let mut frame = b"EPHEMERAL_KEY:".to_vec();
+            frame.extend(std::iter::repeat_n(b'A', len));
+            assert!(
+                ProtocolMessage::from_plain_bytes(&frame).is_none(),
+                "a {len}-byte legacy ephemeral key was accepted"
+            );
+        }
+        let mut exact = b"EPHEMERAL_KEY:".to_vec();
+        exact.extend_from_slice(&[7u8; 32]);
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(&exact),
+            Some(ProtocolMessage::EphemeralKey {
+                public_key: vec![7u8; 32]
+            })
+        );
+
+        // A legacy FILE_META sanitises its name exactly as the binary arm does,
+        // and a non-numeric size is refused rather than defaulted.
+        match ProtocolMessage::from_plain_bytes(b"FILE_META|0|../../evil|100") {
+            Some(ProtocolMessage::FileMeta { filename, size, .. }) => {
+                assert_eq!(filename, crate::util::sanitize_filename("../../evil"));
+                assert_eq!(size, 100);
+            }
+            other => panic!("legacy FILE_META should parse and sanitise, got {other:?}"),
+        }
+        assert!(ProtocolMessage::from_plain_bytes(b"FILE_META|0|name|not_a_number").is_none());
     }
 
     #[test]
