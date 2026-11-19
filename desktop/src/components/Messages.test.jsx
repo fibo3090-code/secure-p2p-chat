@@ -43,12 +43,20 @@ describe("rowStatusLabel", () => {
 
   it("says out loud everything the row only draws as an icon", () => {
     const label = rowStatusLabel(
-      convFixture({ trust: "unverified", transport: "relay", state: "hosting", kind: "group" }),
+      convFixture({ trust: "unverified", transport: "relay", state: "offline", kind: "group" }),
     );
     expect(label).toContain("not verified");
     expect(label).toContain("over a relay");
-    expect(label).toContain("hosting");
+    expect(label).toContain("offline");
     expect(label).toContain("group");
+    expect(rowStatusLabel(convFixture({ trust: "verified", state: "connected" }))).toContain("verified");
+  });
+
+  it("does not call a listener unverified: there is nobody to verify yet", () => {
+    // A warning that shows up where nothing is wrong is one people learn to skip.
+    const label = rowStatusLabel(convFixture({ trust: "unverified", state: "hosting" }));
+    expect(label).toContain("hosting");
+    expect(label).not.toContain("verified");
   });
 });
 
@@ -247,7 +255,7 @@ describe("ChatPane file cards", () => {
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ dir: "/home/me/Elsewhere" })] })} />);
     // Hardcoding "Downloads" was wrong for anyone who picked another folder, and
     // this card is the only place the app ever says.
-    expect(document.body.textContent).toContain("saved to /home/me/Elsewhere");
+    expect(document.body.textContent).toContain("Saved to /home/me/Elsewhere");
   });
 });
 

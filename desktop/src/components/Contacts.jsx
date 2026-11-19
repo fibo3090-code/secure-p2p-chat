@@ -1,7 +1,7 @@
 // Contacts directory — saved peers (from invite links), with connect + import.
 import { useCallback, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { cx, Avatar, Button, IconButton, Input, Modal, TrustBadge } from "./ui.jsx";
+import { cx, Avatar, Button, Modal, Page, OverflowMenu } from "./ui.jsx";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
@@ -73,64 +73,77 @@ export function Contacts({ onConnected }) {
     catch (e) { setErr(friendlyError(e)); }
   }
 
+  const verifiedCount = contacts.filter((c) => c.trust === "verified" || c.trust === "trusted").length;
   return (
-    <div className="chat-pane">
-      <header className="chat-head">
-        <div className="chat-head-l">
-          <div className="chat-head-info">
-            <div className="chat-head-name">Contacts</div>
-            <div className="chat-head-sub mono">{contacts.length} saved</div>
+    <Page title="Contacts"
+      sub={contacts.length === 0 ? "People you add from an invite link"
+        : `${contacts.length} saved · ${verifiedCount} verified`}>
+      <form className="contact-import" onSubmit={(e) => { e.preventDefault(); importLink(); }}>
+        <label className="field-label" htmlFor="invite-link">Add someone from their invite link</label>
+        <div className="creator-row">
+          <input id="invite-link" className="input is-mono" value={link}
+            placeholder="Paste an invite link (chat-p2p://invite/…)"
+            onChange={(e) => setLink(e.target.value)} />
+          <Button icon="userPlus" type="submit">Add</Button>
+        </div>
+        <p className="field-hint">
+          A link tells the app how to reach someone. It is not proof of who they are — you
+          still compare the safety code the first time you connect.
+        </p>
+        {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+      </form>
+
+      <div className="list-card" role="list" aria-label="Contacts">
+        {contacts.length === 0 && (
+          <div className="list-empty">
+            <Icon name="user" size={22} />
+            <span>No contacts yet. Paste an invite link above to add your first one.</span>
           </div>
-        </div>
-      </header>
-
-      <div className="contacts-pane">
-        <div className="creator-row contact-import">
-          <Input value={link} placeholder="Paste an invite link to add a contact…"
-            onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && importLink()} />
-          <Button icon="plus" onClick={importLink}>Add</Button>
-        </div>
-        {err && <div className="onb-err" style={{ marginTop: 12 }}><Icon name="alert" size={13} /> {err}</div>}
-
-        <div className="contacts-grid contact-grid-tight">
-          {contacts.length === 0 && (
-            <div className="conv-empty">No contacts yet — add one with an invite link.</div>
-          )}
-          {contacts.map((c) => (
-            <div key={c.id} className="contact-card">
-              <div className="contact-card-top">
-                <Avatar name={c.name} size={42} />
-                <div className="contact-card-id">
-                  <div className="contact-card-name">{c.name}</div>
-                  <span className="contact-card-addr">{c.address || "no saved address"}</span>
+        )}
+        {contacts.map((c) => {
+          const blocked = c.trust === "blocked";
+          const verified = c.trust === "verified" || c.trust === "trusted";
+          // How you would reach them, in words. "No way to reach them", in
+          // Title Case next to an amber dot, read like a fault in the app.
+          const reach = blocked ? "Blocked"
+            : !c.reachable ? "No saved address"
+              : c.relay_only ? "Reachable via relay" : "Reachable directly";
+          return (
+            <div key={c.id} className={cx("contact-row", blocked && "is-blocked")} role="listitem">
+              <Avatar name={c.name} size={42} />
+              <div className="contact-row-main">
+                <div className="contact-row-l1">
+                  <span className="contact-row-name">{c.name}</span>
+                  <span className={cx("trust-word", blocked ? "is-blocked" : verified ? "is-ok" : "is-warn")}>
+                    <Icon name={blocked ? "ban" : verified ? "shieldCheck" : "shieldAlert"} size={13} />
+                    {blocked ? "Blocked" : verified ? "Verified" : "Not verified"}
+                  </span>
                 </div>
-                <TrustBadge trust={c.trust} mini />
-              </div>
-              <div className="contact-card-fp">
-                <span className="vf-grid-label">Fingerprint</span>
-                <code>{c.fingerprint || "not verified yet"}</code>
-              </div>
-              <div className="contact-card-foot">
-                <span className="contact-state">
-                  <span className={cx("state-dot", c.reachable ? "state-offline" : "state-connecting")} />
-                  {c.reachable ? (c.relay_only ? "ready · via relay" : "ready") : "no way to reach them"}
-                </span>
-                <div className="contact-card-actions">
-                  {/* A contact imported from a relay invite has no direct
-                      address but is still dialable through its relay token —
-                      `reachable` covers both, `address` only covered one. */}
-                  <IconButton name="send" label="Connect" onClick={() => connect(c.id)}
-                    disabled={!c.reachable || c.trust === "blocked"} />
-                  <IconButton name="copy" label="Copy fingerprint" disabled={!c.fingerprint}
-                    onClick={() => copyFingerprint(c)} />
-                  <IconButton name={c.trust === "blocked" ? "check" : "x"}
-                    label={c.trust === "blocked" ? "Unblock" : "Block"} onClick={() => toggleBlock(c)} />
-                  <IconButton name="trash" label="Delete contact" onClick={() => setDeleteTarget(c)} />
+                <div className="contact-row-l2">
+                  <span>{c.address || reach}</span>
+                  {c.address && <><span className="chat-dot" aria-hidden="true">·</span><span>{reach}</span></>}
                 </div>
+                <code className="contact-row-fp" title="Fingerprint">{c.fingerprint || "not verified yet"}</code>
+              </div>
+              <div className="contact-row-actions">
+                {/* A contact imported from a relay invite has no direct
+                    address but is still dialable through its relay token —
+                    `reachable` covers both, `address` only covered one. */}
+                <Button size="sm" variant="ghost" icon="plug"
+                  title={c.reachable ? `Connect to ${c.name}` : "No saved address for this contact"}
+                  onClick={() => connect(c.id)} disabled={!c.reachable || blocked}>
+                  Connect
+                </Button>
+                <OverflowMenu label={`More actions for ${c.name}`} items={[
+                  { icon: "copy", label: "Copy fingerprint", disabled: !c.fingerprint, onClick: () => copyFingerprint(c) },
+                  { icon: blocked ? "check" : "ban", label: blocked ? "Unblock" : "Block", onClick: () => toggleBlock(c) },
+                  "sep",
+                  { icon: "trash", label: "Delete contact", danger: true, onClick: () => setDeleteTarget(c) },
+                ]} />
               </div>
             </div>
-          ))}
-        </div>
+          );
+        })}
       </div>
 
       {deleteTarget && (
@@ -161,6 +174,6 @@ export function Contacts({ onConnected }) {
           </div>
         </Modal>
       )}
-    </div>
+    </Page>
   );
 }

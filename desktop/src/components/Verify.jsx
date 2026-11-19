@@ -9,6 +9,25 @@ function group(fp) {
   return (fp || "").replace(/(.{4})/g, "$1 ").trim();
 }
 
+// The safety code, laid out for reading aloud: digits in two groups, emoji
+// apart. A screen reader gets the digits one by one rather than "four hundred
+// and eighteen", which is not how two people compare a code.
+function SasCode({ sas }) {
+  const [digits, emoji] = splitSas(sas);
+  const spoken = `${digits.replace(/\s/g, "").split("").join(" ")}${emoji ? `, then ${emoji}` : ""}`;
+  return (
+    <div className="verify-sas" role="img" aria-label={`Safety code: ${spoken}`}>
+      <span className="verify-sas-digits" aria-hidden="true">{digits}</span>
+      {emoji && <span className="verify-sas-emoji" aria-hidden="true">{emoji}</span>}
+    </div>
+  );
+}
+
+function splitSas(sas) {
+  const m = String(sas || "").match(/^([\d\s]+)(.*)$/u);
+  return m ? [m[1].trim(), m[2].trim()] : [String(sas || ""), ""];
+}
+
 export function Verify({ req, onClose }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -39,7 +58,7 @@ export function Verify({ req, onClose }) {
     // which reads as a bug. The only ways out are Verify and Reject.
     <Modal open={!!req} onClose={onClose} width={440} title={`Verify ${req.peer_name}`} icon="fingerprint"
       dismissable={false}
-      sub="Trust on first use — confirm out of band">
+      sub={`First connection — check it's really ${req.peer_name.split(" ")[0]}`}>
       <div className="verify-body">
         {req.sas ? (
           <>
@@ -48,7 +67,7 @@ export function Verify({ req, onClose }) {
                 Reading it aloud is far less error-prone than a 64-char hex
                 compare, so it leads and the grid/hex become the backstop. */}
             <div className="verify-sas-label">Read this aloud with {req.peer_name.split(" ")[0]}:</div>
-            <div className="verify-sas">{req.sas}</div>
+            <SasCode sas={req.sas} />
             <div className="verify-hint">
               It must match on both screens. If the codes differ, someone may be
               intercepting the connection — reject it.
@@ -70,14 +89,16 @@ export function Verify({ req, onClose }) {
           </>
         )}
         {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
-        {/* Both outcomes are real choices, so neither is styled as an
-            afterthought — rejecting a connection you could not verify is the
-            correct action, not an edge case. */}
+        {/* Both outcomes are real choices, so neither is an afterthought —
+            rejecting a connection you could not verify is the correct action,
+            not an edge case. Reject is the tinted danger button rather than a
+            solid red one: two full-strength buttons side by side read as an
+            alarm, and nothing here is wrong yet. */}
         <div className="verify-actions">
+          <Button variant="danger-ghost" icon="x" disabled={busy} onClick={() => decide(false)}>Reject</Button>
           <Button icon="shieldCheck" disabled={busy} onClick={() => decide(true)}>
             {busy ? "Working…" : "Codes match — trust"}
           </Button>
-          <Button variant="danger" icon="x" disabled={busy} onClick={() => decide(false)}>Reject</Button>
         </div>
         {/* Escape hatch, shown only after a failed decision. The dialog is
             otherwise undismissable so a pending prompt can't be waved away by

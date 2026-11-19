@@ -2,6 +2,7 @@
 // password capture wired to the bridge. Also the app's boot screen: the first
 // thing a user ever sees is `BootScreen`, so it has to be able to explain
 // itself when the bridge is slow or fails rather than render nothing.
+import { Logo } from "./Logo.jsx";
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Button, PasswordInput } from "./ui.jsx";
@@ -11,7 +12,7 @@ import { friendlyError } from "../lib/bridge.js";
 function Brand({ sub }) {
   return (
     <div className="brand">
-      <span className="brand-mark"><Icon name="shieldCheck" size={26} /></span>
+      <span className="brand-mark"><Logo size={56} /></span>
       <div>
         <div className="brand-name">P2PEM</div>
         <div className="brand-sub">{sub || "Encrypted peer-to-peer messenger"}</div>

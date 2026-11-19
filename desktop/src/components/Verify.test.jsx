@@ -45,7 +45,11 @@ describe("Verify", () => {
 
   it("leads with the safety code and demotes the fingerprint to advanced", () => {
     render(<Verify req={req} onClose={() => {}} />);
-    expect(screen.getByText("418 902 🎃🎈🎁")).toBeTruthy();
+    // Digits and emoji are laid out apart for reading aloud; both are shown,
+    // and a screen reader gets the digits one at a time.
+    expect(screen.getByText("418 902")).toBeTruthy();
+    expect(screen.getByText("🎃🎈🎁")).toBeTruthy();
+    expect(screen.getByRole("img", { name: /Safety code: 4 1 8 9 0 2, then 🎃🎈🎁/ })).toBeTruthy();
     expect(screen.getByText(/Read this aloud with Alice/)).toBeTruthy();
     // The 64-char compare is the backstop, not the instruction.
     expect(screen.getByText(/Full fingerprint \(advanced\)/)).toBeTruthy();

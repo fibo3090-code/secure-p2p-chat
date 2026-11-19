@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onBridge, summaryToConv, chatToContact, friendlyError } from "./lib/bridge.js";
 import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
+import { Logo } from "./components/Logo.jsx";
 import { cx, Avatar } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
 import { BootScreen, LockScreen, SetPasswordScreen, BackupPrompt } from "./components/Onboarding.jsx";
@@ -359,8 +360,8 @@ export default function App() {
               title bar any more: the window already has one, and ours only held
               controls that each had a better home (theme → Settings, new
               conversation → the list header, the peer gate → the rail foot). */}
-          <div className="rail-brand" aria-hidden="true" title="P2PEM">
-            <Icon name="shieldCheck" size={20} />
+          <div className="rail-brand" title="P2PEM">
+            <Logo size={36} title="P2PEM" />
           </div>
           <div className="rail-nav">
             <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}

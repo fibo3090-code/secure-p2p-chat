@@ -226,3 +226,61 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub, 
     </div>
   );
 }
+
+/// One page template for every full-width destination (Contacts, Relays,
+/// Communities, Settings). Each used to lay itself out differently — a centred
+/// form, an offset column, cards packed top-left — so the app read as several
+/// tools sharing a sidebar. Title + one plain-language subtitle, actions on the
+/// right, and one content column.
+export function Page({ title, sub, actions, wide, children, bodyClass }) {
+  return (
+    <div className="page">
+      <header className="page-head">
+        <div className="page-head-txt">
+          <h1 className="page-title">{title}</h1>
+          {sub && <p className="page-sub">{sub}</p>}
+        </div>
+        {actions && <div className="page-actions">{actions}</div>}
+      </header>
+      <div className="page-scroll">
+        <div className={cx("page-body", wide && "is-wide", bodyClass)}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/// A ⋯ menu with labelled items. Secondary and destructive actions live here
+/// instead of a row of look-alike icon buttons, where "block" (an ✕) sat next
+/// to "delete" (a bin) with nothing but a tooltip to tell them apart.
+/// `items`: `{ icon, label, onClick, danger, disabled }`, or `"sep"`.
+export function OverflowMenu({ label = "More actions", items }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("mousedown", onDown); window.removeEventListener("keydown", onKey); };
+  }, [open]);
+  return (
+    <div className="pop-wrap" ref={ref}>
+      <IconButton name="more" label={label} active={open} aria-haspopup="menu" aria-expanded={open}
+        onClick={() => setOpen((o) => !o)} />
+      {open && (
+        <div className="pop-menu" role="menu">
+          {items.filter(Boolean).map((it, i) => (it === "sep"
+            ? <div key={`sep${i}`} className="pop-sep" role="separator" />
+            : (
+              <button key={it.label} role="menuitem" className={cx(it.danger && "is-danger")}
+                disabled={it.disabled}
+                onClick={() => { setOpen(false); it.onClick && it.onClick(); }}>
+                {it.icon && <Icon name={it.icon} size={15} />} {it.label}
+              </button>
+            )))}
+        </div>
+      )}
+    </div>
+  );
+}

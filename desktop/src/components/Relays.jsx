@@ -8,7 +8,7 @@
 // states rather than fabricated data.
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { Button, Input } from "./ui.jsx";
+import { Button, Input, Page } from "./ui.jsx";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
@@ -73,55 +73,55 @@ export function Relays({ onConnected }) {
   }
 
   return (
-    <div className="relay-pane">
-      <div className="rl-scroll">
-        <header className="rl-head">
-          <div>
-            <h2>Relays</h2>
-            <p>A relay is a blind broker for peers that can't dial each other directly — no port-forwarding. It forwards bytes only; your chat stays end-to-end encrypted and fingerprint-verified.</p>
-          </div>
-        </header>
+    <Page title="Relays"
+      sub="Reach someone when neither of you can accept a direct connection — no port forwarding needed.">
+      <div className="callout is-ok">
+        <Icon name="lock" size={16} />
+        <p>
+          A relay is a blind broker: it forwards bytes only. Your conversation stays
+          end-to-end encrypted and fingerprint-verified, and the relay never sees
+          what you say.
+        </p>
+      </div>
 
-        <section className="rl-connect">
-          <div className="rl-block-head">
-            <h3>Pair through a relay</h3>
-          </div>
-          <p className="creator-lead" style={{ marginBottom: 10 }}>Both peers use the same relay address. The host opens a session to get a token; the other peer connects with that token.</p>
-          <div className="creator-row" style={{ marginBottom: 8 }}>
-            <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="relay.example.com:9000" />
+      <section className="card">
+        <h2 className="card-title">Pair through a relay</h2>
+        <p className="card-lead">
+          Both of you use the same relay address. One person opens a session and gets a
+          token; the other connects with that token.
+        </p>
+        <div className="field">
+          <label className="field-label" htmlFor="relay-host">Relay address</label>
+          <div className="creator-row">
+            <Input id="relay-host" mono value={host} onChange={(e) => setHost(e.target.value)} placeholder="relay.example.com:9000" />
             <Button variant="ghost" icon="satellite" onClick={openHost} disabled={busy}>Host</Button>
           </div>
+          <p className="field-hint">Hosting opens a session on this relay and gives you a token to share.</p>
+        </div>
+        {hostToken && (
+          <div className="field">
+            <span className="field-label">Share this token with your peer, along with <code>{host.trim()}</code></span>
+            <Copyable value={hostToken} />
+          </div>
+        )}
+        <div className="field">
+          <label className="field-label" htmlFor="relay-token">Token from your peer</label>
           <div className="creator-row">
-            <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="connection token"
+            <Input id="relay-token" mono value={token} onChange={(e) => setToken(e.target.value)} placeholder="connection token"
               onKeyDown={(e) => e.key === "Enter" && pair()} />
             <Button icon="swap" onClick={pair} disabled={busy}>Connect</Button>
           </div>
-          {hostToken && (
-            <div style={{ marginTop: 12 }}>
-              <p className="creator-lead" style={{ marginBottom: 6 }}><strong>Share this token</strong> alongside <code>{host.trim()}</code>:</p>
-              <Copyable value={hostToken} />
-            </div>
-          )}
-        </section>
+        </div>
+      </section>
 
-        <section className="rl-block">
-          <div className="rl-block-head">
-            <h3>Saved relays</h3>
-          </div>
-          <div className="rl-empty">
-            <Icon name="globe" size={18} />
-            <span>Saved relays and live routes aren't tracked yet — pair above to start a relayed session.</span>
-          </div>
-        </section>
-
-        <section className="rl-block">
-          <div className="rl-block-head">
-            <h3>Run your own relay</h3>
-          </div>
-          <p className="creator-lead" style={{ marginBottom: 8 }}>Host a relay on a machine both peers can reach (a VPS, or a LAN box). It stores nothing.</p>
-          <Copyable value={LOCAL_RELAY_CMD} />
-        </section>
-      </div>
-    </div>
+      <section className="card">
+        <h2 className="card-title">Run your own relay</h2>
+        <p className="card-lead">
+          Host one on a machine you both can reach — a small VPS or a box on your network.
+          It stores nothing.
+        </p>
+        <Copyable value={LOCAL_RELAY_CMD} />
+      </section>
+    </Page>
   );
 }

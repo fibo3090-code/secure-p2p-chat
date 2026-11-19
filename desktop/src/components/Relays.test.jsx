@@ -88,9 +88,11 @@ describe("Relays", () => {
     expect(toasts().at(-1).level).toBe("error");
   });
 
-  it("shows an explicit empty state rather than inventing saved relays", () => {
+  it("does not invent saved relays it does not track", () => {
+    // Saved relays and live routes are not tracked, so the page must not show
+    // a list (or a placeholder apologising for one) as if they were.
     render(<Relays />);
-    expect(screen.getByText(/aren't tracked yet/)).toBeTruthy();
+    expect(screen.queryByText(/Saved relays/i)).toBeNull();
   });
 
   it("offers a runnable command for a self-hosted relay", () => {
