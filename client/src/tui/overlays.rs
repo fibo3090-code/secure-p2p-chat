@@ -85,7 +85,7 @@ fn ratatui_color(c: crate::colorgrid::Rgb) -> Color {
 /// Used only for UI chrome (borders, key-hint labels) that previously used an
 /// arbitrary `Color::Cyan` — semantic colors (success/warning/error/info) are
 /// untouched, since they carry meaning rather than brand.
-pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x3e, 0x8d, 0xd2);
+pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x4a, 0x68, 0xec);
 
 /// Render the active overlay over `area`. No-op when none is open.
 pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {

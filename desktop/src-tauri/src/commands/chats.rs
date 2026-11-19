@@ -7,6 +7,9 @@ pub(crate) struct ConvSummary {
     id: String,
     title: String,
     last: Option<String>,
+    /// Whether the newest message is the user's own, so the list can prefix the
+    /// preview with "You:" — without it a row cannot say whose turn it is.
+    last_from_me: bool,
     connected: bool,
     placeholder: bool,
     kind: &'static str,
@@ -62,6 +65,7 @@ pub(crate) async fn list_conversations(
                 id: id.to_string(),
                 title: chat.title.clone(),
                 last,
+                last_from_me: chat.messages.last().is_some_and(|m| m.from_me),
                 connected: mgr.is_connected(&id),
                 placeholder: chat.is_host_placeholder,
                 kind: kind_str(chat.kind),

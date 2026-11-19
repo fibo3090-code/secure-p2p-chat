@@ -33,6 +33,9 @@ const alice = {
 
 beforeEach(() => installApi({ listContacts: [] }));
 
+// Secondary actions live behind the row's ⋯ menu.
+const openMenu = () => userEvent.click(screen.getByRole("button", { name: /More actions for/ }));
+
 describe("Contacts", () => {
   it("says there is nothing here rather than showing an empty grid", async () => {
     render(<Contacts />);
@@ -44,10 +47,11 @@ describe("Contacts", () => {
     render(<Contacts />);
     expect(await screen.findByText("Alice")).toBeTruthy();
     expect(screen.getByText("192.168.1.21:12345")).toBeTruthy();
-    // The badge is icon-only in `mini` form, so assert the state it encodes
-    // rather than a label that is deliberately not drawn.
-    expect(document.querySelector(".trust-badge.trust-ok")).toBeTruthy();
-    expect(screen.getByText("a".repeat(64))).toBeTruthy();
+    // Trust is a word on the row, not an unexplained glyph.
+    expect(screen.getByText("Verified")).toBeTruthy();
+    // The full fingerprint is one action away, not a third line of hex.
+    await openMenu();
+    expect(screen.getByRole("menuitem", { name: "Copy fingerprint" }).disabled).toBe(false);
   });
 
   it("imports an invite link and reloads the list", async () => {
@@ -79,13 +83,17 @@ describe("Contacts", () => {
     const api = installApi({ listContacts: [alice] });
     render(<Contacts />);
     await screen.findByText("Alice");
-    await userEvent.click(screen.getByRole("button", { name: "Block" }));
+    await openMenu();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Block" }));
     expect(api.blockContact).toHaveBeenCalledWith("c1");
 
     installApi({ listContacts: [{ ...alice, trust: "blocked", blocked: true }] });
     render(<Contacts />);
-    const unblock = await screen.findAllByRole("button", { name: "Unblock" });
-    await userEvent.click(unblock[0]);
+    // Wait for the second list to load: until then only the first row exists.
+    await screen.findByText("Blocked", { selector: ".trust-word" });
+    const menus = screen.getAllByRole("button", { name: /More actions for Alice/ });
+    await userEvent.click(menus.at(-1));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Unblock" }));
     expect(bridge.api.unblockContact).toHaveBeenCalledWith("c1");
   });
 
@@ -94,14 +102,15 @@ describe("Contacts", () => {
     render(<Contacts />);
     await screen.findByText("Alice");
     expect(screen.getByRole("button", { name: "Connect" }).disabled).toBe(true);
-    expect(screen.getByText(/no way to reach them/)).toBeTruthy();
+    expect(screen.getByText(/No saved address/)).toBeTruthy();
   });
 
   it("confirms a delete, and admits it discards the verified fingerprint", async () => {
     const api = installApi({ listContacts: [alice] });
     render(<Contacts />);
     await screen.findByText("Alice");
-    await userEvent.click(screen.getByRole("button", { name: "Delete contact" }));
+    await openMenu();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Delete contact" }));
 
     const dialog = screen.getByRole("dialog", { name: "Delete contact" });
     expect(within(dialog).getByText(/compare the safety code with them again/)).toBeTruthy();
@@ -115,7 +124,8 @@ describe("Contacts", () => {
     installApi({ listContacts: [{ ...alice, trust: "blocked", blocked: true }] });
     render(<Contacts />);
     await screen.findByText("Alice");
-    await userEvent.click(screen.getByRole("button", { name: "Delete contact" }));
+    await openMenu();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Delete contact" }));
     // The block lives only on the contact, so deleting it silently unblocks.
     expect(screen.getByText(/lets them connect to you again/)).toBeTruthy();
   });
@@ -124,7 +134,8 @@ describe("Contacts", () => {
     const api = installApi({ listContacts: [alice] });
     render(<Contacts />);
     await screen.findByText("Alice");
-    await userEvent.click(screen.getByRole("button", { name: "Delete contact" }));
+    await openMenu();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Delete contact" }));
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(api.removeContact).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();

@@ -168,7 +168,7 @@ describe("App — navigation", () => {
   it("switches panes without losing the shell", async () => {
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
-    expect(await screen.findByText(/identity · privacy · hosting/)).toBeTruthy();
+    expect(await screen.findByRole("navigation", { name: "Settings sections" })).toBeTruthy();
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeTruthy();
 
     await userEvent.click(screen.getByRole("button", { name: "Relays" }));

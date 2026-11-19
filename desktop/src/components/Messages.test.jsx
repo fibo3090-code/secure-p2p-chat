@@ -43,12 +43,20 @@ describe("rowStatusLabel", () => {
 
   it("says out loud everything the row only draws as an icon", () => {
     const label = rowStatusLabel(
-      convFixture({ trust: "unverified", transport: "relay", state: "hosting", kind: "group" }),
+      convFixture({ trust: "unverified", transport: "relay", state: "offline", kind: "group" }),
     );
     expect(label).toContain("not verified");
     expect(label).toContain("over a relay");
-    expect(label).toContain("hosting");
+    expect(label).toContain("offline");
     expect(label).toContain("group");
+    expect(rowStatusLabel(convFixture({ trust: "verified", state: "connected" }))).toContain("verified");
+  });
+
+  it("does not call a listener unverified: there is nobody to verify yet", () => {
+    // A warning that shows up where nothing is wrong is one people learn to skip.
+    const label = rowStatusLabel(convFixture({ trust: "unverified", state: "hosting" }));
+    expect(label).toContain("hosting");
+    expect(label).not.toContain("verified");
   });
 });
 
@@ -104,13 +112,25 @@ describe("ChatPane composer", () => {
     onStart: () => {},
   };
 
-  it("disables the composer and explains why when there is no session", () => {
+  it("replaces the composer with an explanation when there is no session", () => {
     render(<ChatPane {...base} contact={contactFixture({ state: "offline", messages: [] })} />);
-    const box = screen.getByRole("textbox");
     // A send that cannot be delivered must never look like it worked: the
-    // backend errors, and the composer refuses the keystroke in the first place.
-    expect(box.disabled).toBe(true);
-    expect(screen.getByRole("status").textContent).toMatch(/Not connected/);
+    // backend errors, and offline there is no message box to type into at all.
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.getByRole("status").textContent).toMatch(/is offline/);
+    // With no saved contact behind it, there is nothing to redial — so no
+    // Reconnect button that could only fail; the way out is the invite link.
+    expect(screen.queryByRole("button", { name: /Reconnect/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Copy invite link/ })).toBeTruthy();
+  });
+
+  it("offers Reconnect when the conversation has a reachable contact", async () => {
+    const onReconnect = vi.fn();
+    const contact = contactFixture({ state: "offline", messages: [] });
+    render(<ChatPane {...base} contact={contact}
+      reconnectContact={{ id: "k1", reachable: true, trust: "verified" }} onReconnect={onReconnect} />);
+    await userEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+    expect(onReconnect).toHaveBeenCalledWith(contact);
   });
 
   it("sends on Enter when connected, and not on Shift+Enter", async () => {
@@ -247,7 +267,7 @@ describe("ChatPane file cards", () => {
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ dir: "/home/me/Elsewhere" })] })} />);
     // Hardcoding "Downloads" was wrong for anyone who picked another folder, and
     // this card is the only place the app ever says.
-    expect(document.body.textContent).toContain("saved to /home/me/Elsewhere");
+    expect(document.body.textContent).toContain("Saved to /home/me/Elsewhere");
   });
 });
 

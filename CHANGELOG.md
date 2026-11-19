@@ -11,6 +11,35 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Changed
+
+- **Desktop app redesign.** The shell, conversation list and thread, every
+  full-width page and the main dialogs were reworked against today's best chat
+  apps:
+  - The app carries its real logo (the bubble from the app icon), and its accent
+    is taken from it: a blue-indigo with white ink.
+  - The design-system typefaces (IBM Plex Sans, Space Grotesk, IBM Plex Mono)
+    are bundled locally. Nothing is fetched from a third party.
+  - Sent messages are filled bubbles, grouped by turn, with the time and
+    delivery ticks inside.
+  - File cards are one line, and a received program (`.exe`, `.lnk`, …) is
+    labelled as one before anyone clicks it.
+  - The app-wide title bar is gone. Accepting new peers is a labelled switch in
+    the sidebar, and the theme lives in Settings.
+  - Trust is said in words ("Verified" / "Not verified"), with an encryption note
+    at the top of every direct conversation and a verdict in Conversation info.
+  - The verification dialog shows the safety code laid out for reading aloud and
+    the route (direct or relay). It warns, with trusting made deliberate, when a
+    contact you verified presents a different key.
+  - Offline conversations end in one action: Reconnect, or Copy invite link when
+    there is no saved address. A listening conversation shows the addresses to
+    share, an invite link and Stop listening.
+  - Contacts, Relays, Communities and Settings share one page template (Settings
+    has a section index). New connection keeps its Direct / Via relay choice
+    under Dial and Host, with the action in a footer.
+  - Daylight was redesigned, and every text colour holds at least 4.5:1 in all
+    five themes.
+
 ### Dependencies
 
 - UPnP port mapping (`igd-next`) 0.17 → 0.18. `mdns-sd`, `uuid`, `serde_json`,

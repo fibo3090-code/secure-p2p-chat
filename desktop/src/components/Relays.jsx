@@ -8,8 +8,7 @@
 // states rather than fabricated data.
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { Button, Input } from "./ui.jsx";
-import { api, friendlyError } from "../lib/bridge.js";
+import { Button, Page } from "./ui.jsx";
 import { toast } from "../lib/toast.js";
 
 // The crate that actually provides `--relay-server` (see client/src/main.rs).
@@ -40,88 +39,43 @@ function Copyable({ value }) {
   );
 }
 
-export function Relays({ onConnected }) {
-  const [host, setHost] = useState("");
-  const [token, setToken] = useState("");
-  const [hostToken, setHostToken] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function pair() {
-    if (busy) return;
-    if (!host.trim()) return toast("Enter the relay address.", "error");
-    if (!token.trim()) return toast("Enter the connection token your peer shared.", "error");
-    setBusy(true);
-    try {
-      await api.connectViaRelay(host.trim(), token.trim());
-      toast(`Connecting via relay ${host.trim()}…`, "success");
-      onConnected && onConnected();
-    } catch (e) { toast(friendlyError(e), "error"); }
-    finally { setBusy(false); }
-  }
-
-  async function openHost() {
-    if (busy) return;
-    if (!host.trim()) return toast("Enter the relay address to broker through.", "error");
-    setBusy(true);
-    setHostToken("");
-    try {
-      const t = await api.hostViaRelay(host.trim());
-      setHostToken(t);
-      toast("Relay session open — share the token with your peer", "success");
-    } catch (e) { toast(friendlyError(e), "error"); }
-    finally { setBusy(false); }
-  }
-
+// Pairing through a relay lives in New connection ("Via relay"), next to
+// every other way of starting a conversation; this page explains what a relay
+// is and how to run one, and sends you there. Two forms doing the same job in
+// two places was a choice the user should never have had to make.
+export function Relays({ onPair }) {
   return (
-    <div className="relay-pane">
-      <div className="rl-scroll">
-        <header className="rl-head">
-          <div>
-            <h2>Relays</h2>
-            <p>A relay is a blind broker for peers that can't dial each other directly — no port-forwarding. It forwards bytes only; your chat stays end-to-end encrypted and fingerprint-verified.</p>
-          </div>
-        </header>
-
-        <section className="rl-connect">
-          <div className="rl-block-head">
-            <h3>Pair through a relay</h3>
-          </div>
-          <p className="creator-lead" style={{ marginBottom: 10 }}>Both peers use the same relay address. The host opens a session to get a token; the other peer connects with that token.</p>
-          <div className="creator-row" style={{ marginBottom: 8 }}>
-            <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="relay.example.com:9000" />
-            <Button variant="ghost" icon="satellite" onClick={openHost} disabled={busy}>Host</Button>
-          </div>
-          <div className="creator-row">
-            <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="connection token"
-              onKeyDown={(e) => e.key === "Enter" && pair()} />
-            <Button icon="swap" onClick={pair} disabled={busy}>Connect</Button>
-          </div>
-          {hostToken && (
-            <div style={{ marginTop: 12 }}>
-              <p className="creator-lead" style={{ marginBottom: 6 }}><strong>Share this token</strong> alongside <code>{host.trim()}</code>:</p>
-              <Copyable value={hostToken} />
-            </div>
-          )}
-        </section>
-
-        <section className="rl-block">
-          <div className="rl-block-head">
-            <h3>Saved relays</h3>
-          </div>
-          <div className="rl-empty">
-            <Icon name="globe" size={18} />
-            <span>Saved relays and live routes aren't tracked yet — pair above to start a relayed session.</span>
-          </div>
-        </section>
-
-        <section className="rl-block">
-          <div className="rl-block-head">
-            <h3>Run your own relay</h3>
-          </div>
-          <p className="creator-lead" style={{ marginBottom: 8 }}>Host a relay on a machine both peers can reach (a VPS, or a LAN box). It stores nothing.</p>
-          <Copyable value={LOCAL_RELAY_CMD} />
-        </section>
+    <Page title="Relays"
+      sub="Reach someone when neither of you can accept a direct connection — no port forwarding needed.">
+      <div className="callout is-ok">
+        <Icon name="lock" size={16} />
+        <p>
+          A relay is a blind broker: it forwards bytes only. Your conversation stays
+          end-to-end encrypted and fingerprint-verified, and the relay never sees
+          what you say.
+        </p>
       </div>
-    </div>
+
+      <section className="card">
+        <h2 className="card-title">Talk through a relay</h2>
+        <p className="card-lead">
+          One of you opens a session on a relay and shares the token it gives; the other
+          connects with that token. Both happen in New connection, with “Via relay” selected.
+        </p>
+        <div className="card-actions is-start">
+          <Button icon="satellite" onClick={() => onPair && onPair("connect")}>Connect with a token</Button>
+          <Button variant="ghost" icon="radio" onClick={() => onPair && onPair("host")}>Open a relay session</Button>
+        </div>
+      </section>
+
+      <section className="card">
+        <h2 className="card-title">Run your own relay</h2>
+        <p className="card-lead">
+          Host one on a machine you both can reach — a small VPS or a box on your network.
+          It stores nothing.
+        </p>
+        <Copyable value={LOCAL_RELAY_CMD} />
+      </section>
+    </Page>
   );
 }

@@ -212,25 +212,38 @@ function makeMock() {
     enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
     auto_accept_files: false, auto_connect: false, enable_mdns: false,
   };
+  // Timestamps spread over two days so the preview shows day separators,
+  // grouping and relative times the way a real history does.
+  const ago = (min) => new Date(Date.now() - min * 60_000).toISOString();
   const chats = {
     "11111111-1111-1111-1111-111111111111": {
       id: "11111111-1111-1111-1111-111111111111", title: "Alice", peer_fingerprint: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
-      participants: [], created_at: now, is_host_placeholder: false,
+      participants: [], created_at: ago(1500), is_host_placeholder: false, transport: "direct",
       messages: [
-        { id: "m1", from_me: false, content: { type: "text", text: "hey! is this thing encrypted end to end?" }, timestamp: now },
-        { id: "m2", from_me: true, content: { type: "text", text: "yep — X25519 + AES-GCM. fingerprint verified ✔" }, timestamp: now },
-        { id: "m3", from_me: false, content: { type: "text", text: "slick. sending you the file now" }, timestamp: now },
-        { id: "m3a", from_me: false, content: { type: "file", filename: "roadmap.pdf", size: 248000, path: "/mock/roadmap.pdf" }, timestamp: now },
+        { id: "m0a", from_me: false, content: { type: "text", text: "Are you around tomorrow? I want to walk you through the new layout." }, timestamp: ago(1450) },
+        { id: "m0b", from_me: true, delivered: true, content: { type: "text", text: "Sure — morning works best for me." }, timestamp: ago(1440) },
+        { id: "m1", from_me: false, content: { type: "text", text: "hey! is this thing encrypted end to end?" }, timestamp: ago(42) },
+        { id: "m2", from_me: true, delivered: true, content: { type: "text", text: "yep — X25519 + AES-GCM. We compared the safety code on the call, so nobody is in the middle." }, timestamp: ago(41) },
+        { id: "m2b", from_me: true, delivered: true, content: { type: "text", text: "and it goes straight from my machine to yours, no server in between" }, timestamp: ago(41) },
+        { id: "m3", from_me: false, content: { type: "text", text: "slick. sending you the file now — notes are on https://example.org/roadmap" }, timestamp: ago(12) },
+        { id: "m3a", from_me: false, content: { type: "file", filename: "roadmap.pdf", size: 248000, path: "/mock/roadmap.pdf" }, timestamp: ago(11) },
         // A received file the OS would *run*. It is here so the "this file will
         // run as a program" confirmation is reachable in a plain browser — the
         // double extension is the shape that actually turns up in the wild.
-        { id: "m3b", from_me: false, content: { type: "file", filename: "holiday.jpg.exe", size: 8400000, path: "/mock/holiday.jpg.exe" }, timestamp: now },
+        { id: "m3b", from_me: false, content: { type: "file", filename: "holiday.jpg.exe", size: 8400000, path: "/mock/holiday.jpg.exe" }, timestamp: ago(10) },
+        { id: "m3c", from_me: true, content: { type: "text", text: "got it, thanks! I'll read it tonight." }, timestamp: ago(2) },
       ],
     },
     "22222222-2222-2222-2222-222222222222": {
       id: "22222222-2222-2222-2222-222222222222", title: "Bob", peer_fingerprint: "ffeeddccbbaa00998877665544332211f0e1d2c3b4a5968778695a4b3c2d1e0f",
-      participants: [], created_at: now, is_host_placeholder: false, messages: [
-        { id: "m4", from_me: false, content: { type: "text", text: "let's verify fingerprints" }, timestamp: now },
+      participants: [], created_at: ago(3000), is_host_placeholder: false, transport: "relay", messages: [
+        { id: "m4", from_me: false, content: { type: "text", text: "let's verify fingerprints" }, timestamp: ago(95) },
+      ],
+    },
+    "44444444-4444-4444-4444-444444444444": {
+      id: "44444444-4444-4444-4444-444444444444", title: "Carol", peer_fingerprint: null,
+      participants: [], created_at: ago(6000), is_host_placeholder: false, transport: "direct", messages: [
+        { id: "m5", from_me: true, delivered: true, content: { type: "text", text: "Here's my invite link, connect whenever you're ready." }, timestamp: ago(4400) },
       ],
     },
     "33333333-3333-3333-3333-333333333333": {
@@ -240,15 +253,21 @@ function makeMock() {
   };
   const connected = { "11111111-1111-1111-1111-111111111111": true };
   const contacts = [
-    { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f6", address: "192.168.1.21:12345", trust: "verified" },
-    { id: "c2", name: "Carol", fingerprint: "deadbeef0102", address: "10.0.0.5:12345", trust: "unverified" },
+    { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00", address: "192.168.1.21:12345", trust: "verified", reachable: true, relay_only: false, chat_id: "11111111-1111-1111-1111-111111111111" },
+    { id: "c2", name: "Carol", fingerprint: "deadbeef01020304a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90aabb", address: "10.0.0.5:12345", trust: "unverified", reachable: true, relay_only: false, chat_id: "44444444-4444-4444-4444-444444444444" },
+    { id: "c3", name: "Dana", fingerprint: "0f1e2d3c4b5a69788796a5b4c3d2e1f00112233445566778899aabbccddeeff", address: "", trust: "unverified", reachable: true, relay_only: true, chat_id: null },
   ];
   // Mirrors the real bridge: unread is derived from a persisted read mark, not
   // from what the UI happened to see this session.
   const readMarks = {};
   const summaries = () => Object.values(chats).map((c) => ({
     id: c.id, title: c.title,
-    last: c.messages.length ? (c.messages.at(-1).content.text || "") : null,
+    // Mirrors `list_conversations`: a file's preview is its name behind a clip.
+    last: c.messages.length
+      ? (c.messages.at(-1).content.type === "file" ? `📎 ${c.messages.at(-1).content.filename}` : c.messages.at(-1).content.text || "")
+      : null,
+    last_from_me: c.messages.length ? !!c.messages.at(-1).from_me : false,
+    kind: c.kind || "dm", transport: c.transport || "direct",
     connected: !!connected[c.id], placeholder: c.is_host_placeholder,
     verified: !!c.peer_fingerprint,
     messages: c.messages.length,
@@ -373,7 +392,15 @@ function makeMock() {
     myAddresses: async () => ({ hosting: true, local: "192.168.1.9:12345", external: null }),
     hostViaRelay: async () => "rly_" + Math.random().toString(36).slice(2, 10),
     connectViaRelay: ok,
-    pendingFingerprint: async () => null,
+    // `?mockVerify=1` previews the TOFU verification dialog for Bob.
+    pendingFingerprint: async () => (new URLSearchParams(location.search).get("mockVerify")
+      ? { chat_id: "22222222-2222-2222-2222-222222222222", peer_name: "Bob",
+        // `?mockVerify=changed` previews a known contact presenting a new key.
+        fingerprint: new URLSearchParams(location.search).get("mockVerify") === "changed"
+          ? "0123456789abcdef".repeat(4)
+          : chats["22222222-2222-2222-2222-222222222222"]?.peer_fingerprint || "ff".repeat(32),
+        sas: "482 913 🦊🎈🌵" }
+      : null),
     renameChat: async (id, title) => { if (chats[id]) chats[id].title = title; },
     deleteChat: async (id) => { delete chats[id]; },
     listContacts: async () => contacts,
@@ -508,7 +535,7 @@ export function fmtTime(ts) {
 let cachedTimeFormat = null;
 function timeFormat() {
   if (!cachedTimeFormat) {
-    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
   }
   return cachedTimeFormat;
 }
@@ -557,13 +584,14 @@ function human(n) {
 // casing across summary vs detail payloads) so a conversation keeps the same
 // shape whichever payload arrived last.
 function normalizeKind(value) { return String(value || "dm").toLowerCase(); }
-function normalizeTransport(value) { return String(value || "direct").toLowerCase(); }
+export function normalizeTransport(value) { return String(value || "direct").toLowerCase(); }
 
 export function summaryToConv(s) {
   const transport = normalizeTransport(s.transport);
   return {
     id: s.id, name: s.title,
     last: s.last || (s.connected ? "Connected" : s.placeholder ? "Waiting for a peer…" : ""),
+    lastFromMe: !!s.last_from_me,
     lastT: fmtWhen(s.last_at), typing: false,
     kind: normalizeKind(s.kind),
     transport,

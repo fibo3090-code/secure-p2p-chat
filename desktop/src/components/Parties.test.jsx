@@ -62,7 +62,7 @@ describe("Parties — joining", () => {
     expect(await screen.findByText("Enter the server address.")).toBeTruthy();
     expect(api.partyJoin).not.toHaveBeenCalled();
 
-    await userEvent.type(screen.getByPlaceholderText(/server address/), "10.0.0.5:12345");
+    await userEvent.type(screen.getByLabelText("Server address"), "10.0.0.5:12345");
     await userEvent.click(screen.getByRole("button", { name: /Connect & join/ }));
     expect(await screen.findByText("Choose a username.")).toBeTruthy();
     expect(api.partyJoin).not.toHaveBeenCalled();
@@ -72,10 +72,10 @@ describe("Parties — joining", () => {
     const api = installApi({ partyList: [], partySaved: [] });
     render(<Parties />);
     await screen.findByText("Join a community");
-    await userEvent.type(screen.getByPlaceholderText(/server address/), "10.0.0.5:12345");
+    await userEvent.type(screen.getByLabelText("Server address"), "10.0.0.5:12345");
     // maxLength stops typing past the cap, so set it directly to prove the
     // check exists rather than relying on the attribute alone.
-    const user = screen.getByPlaceholderText("username");
+    const user = screen.getByLabelText("Username");
     expect(user.getAttribute("maxlength")).toBe("32");
     await userEvent.type(user, "a".repeat(32));
     await userEvent.click(screen.getByRole("button", { name: /Connect & join/ }));
@@ -92,8 +92,8 @@ describe("Parties — joining", () => {
 
     render(<Parties />);
     await screen.findByText("Join a community");
-    await userEvent.type(screen.getByPlaceholderText(/server address/), "10.0.0.5:12345");
-    await userEvent.type(screen.getByPlaceholderText("username"), "me");
+    await userEvent.type(screen.getByLabelText("Server address"), "10.0.0.5:12345");
+    await userEvent.type(screen.getByLabelText("Username"), "me");
     await userEvent.click(screen.getByRole("button", { name: /Connect & join/ }));
 
     expect(await screen.findByText("Verify this community server")).toBeTruthy();
@@ -120,8 +120,8 @@ describe("Parties — joining", () => {
     installApi({ partyList: [], partySaved: [], partyJoin });
     render(<Parties />);
     await screen.findByText("Join a community");
-    await userEvent.type(screen.getByPlaceholderText(/server address/), "10.0.0.5:12345");
-    await userEvent.type(screen.getByPlaceholderText("username"), "me");
+    await userEvent.type(screen.getByLabelText("Server address"), "10.0.0.5:12345");
+    await userEvent.type(screen.getByLabelText("Username"), "me");
     await userEvent.click(screen.getByRole("button", { name: /Connect & join/ }));
     await screen.findByText("Verify this community server");
 
@@ -150,8 +150,11 @@ describe("Parties — joining", () => {
     render(<Parties />);
     await userEvent.click(await screen.findByTitle("Fill in you@10.0.0.5:12345"));
 
-    expect(screen.getByPlaceholderText(/server address/).value).toBe("10.0.0.5:12345");
-    expect(screen.getByPlaceholderText("username").value).toBe("you");
+    // A known community asks only for its password; the details are one click away.
+    expect(screen.getByRole("heading", { name: "Rejoin Test" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Edit details" }));
+    expect(screen.getByLabelText("Server address").value).toBe("10.0.0.5:12345");
+    expect(screen.getByLabelText("Username").value).toBe("you");
     // Joining straight from a card sent whatever happened to be in the shared
     // password box — to whichever community was clicked next.
     expect(api.partyJoin).not.toHaveBeenCalled();
