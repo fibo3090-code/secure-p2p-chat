@@ -4,7 +4,8 @@ import { memo, useCallback, useMemo, useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { api, fmtDay, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
-import { cx, Avatar, IconButton, Button, Modal, TrustBadge, TransportBadge } from "./ui.jsx";
+import { cx, Avatar, IconButton, Button, Modal } from "./ui.jsx";
+import { fileKind, splitName } from "../lib/fileKind.js";
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const isImageName = (name) => IMAGE_RE.test(name || "");
@@ -42,20 +43,33 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
   useEffect(() => {
     if (!open) return;
     const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
     window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("mousedown", onDown); window.removeEventListener("keydown", onKey); };
   }, [open]);
   const item = (fn) => () => { setOpen(false); fn && fn(contact); };
+  // A listener has no peer yet, so there is nothing to verify and nothing to
+  // rename it after: offering either was a control that could only fail.
+  const isPlaceholder = contact.placeholder;
   return (
     <div className="chat-head-actions">
-      <IconButton name="fingerprint" label="Verify fingerprint" onClick={() => onVerify && onVerify(contact)} />
+      <IconButton name="info" label="Conversation info" onClick={() => onInfo && onInfo(contact)} />
       <div className="pop-wrap" ref={ref}>
-        <IconButton name="more" label="More" active={open} onClick={() => setOpen((o) => !o)} />
+        <IconButton name="more" label="More actions" active={open} aria-haspopup="menu" aria-expanded={open}
+          onClick={() => setOpen((o) => !o)} />
         {open && (
-          <div className="pop-menu">
-            <button onClick={item(onInfo)}><Icon name="info" size={15} /> Conversation info</button>
-            <button onClick={item(onRename)}><Icon name="edit" size={15} /> Rename</button>
-            <button className="is-danger" onClick={item(onDelete)}><Icon name="trash" size={15} /> Delete</button>
+          <div className="pop-menu" role="menu">
+            {!isPlaceholder && (
+              <button role="menuitem" onClick={item(onVerify)}><Icon name="fingerprint" size={15} /> Safety code</button>
+            )}
+            {!isPlaceholder && (
+              <button role="menuitem" onClick={item(onRename)}><Icon name="edit" size={15} /> Rename</button>
+            )}
+            <div className="pop-sep" role="separator" />
+            <button role="menuitem" className="is-danger" onClick={item(onDelete)}>
+              <Icon name="trash" size={15} /> {isPlaceholder ? "Stop listening" : "Delete conversation"}
+            </button>
           </div>
         )}
       </div>
@@ -63,7 +77,52 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
   );
 }
 
-const STATE_LABEL = { connected: "Connected", hosting: "Hosting", offline: "Offline", connecting: "Connecting" };
+const STATE_LABEL = { connected: "Connected", hosting: "Listening for a peer", offline: "Offline", connecting: "Connecting…" };
+const TRANSPORT_WORD = { direct: "Direct", relay: "Via relay", server: "Via server" };
+
+// What a listener shows instead of an empty, black thread: the address a peer
+// needs, ready to copy. "Share your address" with no address on screen was a
+// dead end.
+function HostingCard() {
+  const [addr, setAddr] = useState(null);
+  useEffect(() => {
+    let live = true;
+    api.myAddresses().then((a) => live && setAddr(a)).catch(() => {});
+    return () => { live = false; };
+  }, []);
+  const copy = (text) => navigator.clipboard?.writeText(text)
+    .then(() => toast("Copied", "success"))
+    .catch(() => toast("Could not copy", "error"));
+  const lines = [
+    addr?.local && { label: "On this network", value: addr.local },
+    addr?.external && { label: "Over the internet", value: addr.external },
+  ].filter(Boolean);
+  return (
+    <div className="hosting-card">
+      <span className="hosting-pulse" aria-hidden="true"><Icon name="radio" size={24} /></span>
+      <div className="hosting-h">Waiting for someone to connect</div>
+      <p className="hosting-p">
+        Give the other person one of these addresses. When they dial it you'll
+        both see a safety code to compare before anything is sent.
+      </p>
+      {lines.length > 0 ? (
+        <div className="hosting-addrs">
+          {lines.map((l) => (
+            <div key={l.label} className="hosting-addr">
+              <span className="hosting-addr-l">{l.label}</span>
+              <code className="hosting-addr-v">{l.value}</code>
+              <button className="hosting-copy" onClick={() => copy(l.value)} aria-label={`Copy ${l.label.toLowerCase()} address`}>
+                <Icon name="copy" size={14} /> Copy
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="hosting-p">Looking up your address…</div>
+      )}
+    </div>
+  );
+}
 
 // Shown above a disabled composer. Messages only exist once a session carries
 // them, so say which situation this is and what would fix it — the alternative
@@ -90,7 +149,8 @@ export function rowStatusLabel(c) {
   else if (c.state === "connected") bits.push("connected");
   else if (c.state === "connecting") bits.push("connecting");
   else bits.push("offline");
-  if (c.trust === "unverified") bits.push("not verified");
+  if (c.trust === "verified" && c.state !== "hosting") bits.push("verified");
+  if (c.trust === "unverified" && c.state !== "hosting") bits.push("not verified");
   return bits.join(", ");
 }
 
@@ -105,41 +165,53 @@ function convRowsEqual(a, b) {
   return (
     x.id === y.id && x.name === y.name && x.last === y.last && x.lastT === y.lastT &&
     x.typing === y.typing && x.kind === y.kind && x.transport === y.transport &&
-    x.state === y.state && x.trust === y.trust && x.unread === y.unread
+    x.state === y.state && x.trust === y.trust && x.unread === y.unread &&
+    x.lastFromMe === y.lastFromMe
   );
 }
 
 const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
   const status = rowStatusLabel(c);
+  const hosting = c.state === "hosting";
   return (
     <button
-      className={cx("conv-row", active && "is-active")}
+      className={cx("conv-row", active && "is-active", c.unread > 0 && "has-unread")}
       role="option"
       aria-selected={active}
       aria-label={`${c.name}. ${status}`}
       onClick={() => onSelect(c.id)}
     >
-      <Avatar name={c.name} size={42} state={c.state} party={c.trust === "party"} />
+      <Avatar name={c.name} size={44} state={hosting ? undefined : c.state}
+        party={c.trust === "party"} icon={hosting ? "radio" : undefined} />
       <div className="conv-main">
         <div className="conv-line1">
           <span className="conv-name">{c.name}</span>
+          {/* aria-hidden: every marker here is repeated in the row's aria-label
+              above, in words. Leaving them exposed makes a reader announce a
+              bare glyph after the name. */}
+          {c.trust === "verified" && !hosting && (
+            <span className="conv-verified" aria-hidden="true" title="Verified"><Icon name="shieldCheck" size={13} /></span>
+          )}
           <span className="conv-time">{c.lastT}</span>
         </div>
         <div className="conv-line2">
           <span className="conv-preview">
-            {c.typing ? <em className="conv-typing">typing…</em> : c.last}
+            {c.typing ? <em className="conv-typing">typing…</em>
+              : <>{c.lastFromMe && c.last && <span className="conv-you">You: </span>}{c.last}</>}
           </span>
-          {/* aria-hidden: every marker here is repeated in the row's aria-label
-              above, in words. Leaving them exposed makes a reader announce a
-              bare number after the preview text. */}
           <span className="conv-markers" aria-hidden="true">
             {c.kind === "group" && <Icon name="users" size={12} />}
             {c.kind === "channel" && <Icon name="hash" size={12} />}
-            {c.transport === "relay" && <Icon name="satellite" size={12} />}
-            {c.transport === "server" && <Icon name="server" size={12} />}
-            {c.state === "hosting" && <span className="marker-h">H</span>}
-            {c.trust === "unverified" && <span className="marker-warn"><Icon name="alert" size={12} /></span>}
-            {c.unread > 0 && <span className="conv-unread">{c.unread}</span>}
+            {hosting && <span className="conv-chip is-hosting">Listening</span>}
+            {c.transport === "relay" && <span className="conv-chip" title="Via relay">Relay</span>}
+            {c.transport === "server" && <span className="conv-chip" title="Via server">Server</span>}
+            {/* Only a real peer can be unverified. A listener with nobody on
+                the other end used to wear the same warning, and a warning that
+                shows up where nothing is wrong is one people learn to skip. */}
+            {c.trust === "unverified" && !hosting && (
+              <span className="marker-warn" title="Not verified"><Icon name="shieldAlert" size={13} /></span>
+            )}
+            {c.unread > 0 && <span className="conv-unread">{c.unread > 99 ? "99+" : c.unread}</span>}
           </span>
         </div>
       </div>
@@ -147,7 +219,7 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
   );
 }, convRowsEqual);
 
-export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery }) {
+export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery, connectedCount = 0 }) {
   const filtered = useMemo(
     () => contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase())),
     [contacts, query],
@@ -160,12 +232,24 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
   );
   return (
     <div className="conv-list">
-      <div className="conv-search">
-        <Icon name="search" size={15} />
-        <input placeholder="Search conversations" aria-label="Search conversations"
-          value={query} onChange={(e) => setQuery(e.target.value)} />
-        <button className="conv-add" onClick={onAdd} title="New connection" aria-label="New connection"><Icon name="plus" size={17} /></button>
+      <div className="conv-head">
+        <div className="conv-head-txt">
+          <h1 className="conv-title">Chats</h1>
+          <span className="conv-sub">
+            {connectedCount > 0
+              ? <><span className="conv-sub-dot" aria-hidden="true" />{connectedCount} connected</>
+              : "Nobody connected"}
+          </span>
+        </div>
+        <button className="conv-add" onClick={onAdd} title="New connection" aria-label="New connection">
+          <Icon name="compose" size={17} />
+        </button>
       </div>
+      <label className="conv-search">
+        <Icon name="search" size={15} />
+        <input placeholder="Search" aria-label="Search conversations"
+          value={query} onChange={(e) => setQuery(e.target.value)} />
+      </label>
       <div className="sr-only" role="status" aria-live="polite">
         {totalUnread > 0 ? `${totalUnread} unread message${totalUnread === 1 ? "" : "s"}` : "No unread messages"}
       </div>
@@ -195,7 +279,15 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
   );
 }
 
-function MessageItemInner({ m, preview, onOpen, onReveal }) {
+// A sent message's delivery state, as an icon with its word attached. One
+// tick: sent from this device. Two: the peer's app confirmed receipt.
+function Receipt({ delivered }) {
+  return delivered
+    ? <span className="msg-receipt is-delivered" title="Delivered"><Icon name="checkCheck" size={14} /><span className="sr-only">Delivered</span></span>
+    : <span className="msg-receipt" title="Sent"><Icon name="check" size={14} /><span className="sr-only">Sent</span></span>;
+}
+
+function MessageItemInner({ m, preview, onOpen, onReveal, pos = "single" }) {
   if (m.kind === "system") {
     return (
       <div className={cx("sys-msg", m.warn && "is-warn", m.ok && "is-ok")}>
@@ -205,20 +297,26 @@ function MessageItemInner({ m, preview, onOpen, onReveal }) {
       </div>
     );
   }
+  const mine = m.from === "me";
   if (m.kind === "file") {
-    const mine = m.from === "me";
     const done = m.progress >= 100;
+    const kind = fileKind(m.name);
+    // A received file the OS would execute says so on the card, before anyone
+    // clicks it. The refusal itself stays in the bridge — this is the warning
+    // label on the box, not the lock on it.
+    const risky = kind.risky && !mine;
+    const { stem, ext } = splitName(m.name);
     // Name the folder the file actually went to. Hardcoding "Downloads" was
     // wrong for anyone who picked a different download folder — and this card
     // is the only place the app ever says where a received file landed.
-    const sub = done
-      ? (mine ? "sent" : m.dir ? `saved to ${m.dir}` : "saved")
-      : m.progress + "%";
+    const where = done
+      ? (mine ? "Sent" : m.dir ? `Saved to ${m.dir}` : "Saved")
+      : `${m.progress}%`;
     const canOpen = done && m.hasPath;
     const open = canOpen && onOpen ? () => onOpen(m) : undefined;
     return (
-      <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
-        <div className={cx("file-card", mine && "is-mine", canOpen && "is-openable")}>
+      <div className={cx("msg-row", mine ? "is-mine" : "is-them", "pos-" + pos)}>
+        <div className={cx("file-card", mine && "is-mine", canOpen && "is-openable", risky && "is-risky")}>
           {preview && (
             <button className="file-thumb" onClick={open} title={"Open " + m.name}>
               <img src={preview} alt={m.name} loading="lazy" />
@@ -226,31 +324,53 @@ function MessageItemInner({ m, preview, onOpen, onReveal }) {
           )}
           <div className="file-card-row">
             <button className="file-ic" onClick={open} disabled={!canOpen}
-              title={canOpen ? "Open file" : undefined}><Icon name="file" size={20} /></button>
+              aria-label={canOpen ? `Open ${m.name}` : m.name}
+              title={canOpen ? "Open file" : undefined}><Icon name={kind.icon} size={20} /></button>
             <button className="file-meta" onClick={open} disabled={!canOpen}
               title={m.path || (canOpen ? "Open file" : undefined)}>
-              <div className="file-name">{m.name}</div>
-              <div className="file-sub">{m.size} · {sub} · {m.t}</div>
+              <div className="file-name">
+                {/* The final extension is the one the OS acts on, so it is the
+                    one that must not be lost to an ellipsis: a long stem
+                    truncates, ".exe" never does. */}
+                <span className="file-stem">{ext ? stem : m.name}</span>
+                {ext && <span className={cx("file-ext", risky && "is-risky")}>.{ext}</span>}
+              </div>
+              <div className="file-sub">
+                {risky
+                  ? <span className="file-risk"><Icon name="alert" size={12} /> Program — runs code if opened</span>
+                  : <span>{kind.label} · {m.size}</span>}
+              </div>
             </button>
             {canOpen && (
-              <button className="file-reveal" title="Show in folder"
-                onClick={() => onReveal && onReveal(m)}><Icon name="folder" size={15} /></button>
+              <button className="file-reveal" title="Show in folder" aria-label={`Show ${m.name} in folder`}
+                onClick={() => onReveal && onReveal(m)}><Icon name="folder" size={16} /></button>
             )}
-            <span className={cx("file-status", done && "is-done")} title={sub}>
-              <Icon name={done ? "check" : "clock"} size={16} />
+          </div>
+          <div className="file-foot">
+            <span className="file-where" title={m.path || undefined}>
+              {risky ? <>{m.size} · {where}</> : where}
+            </span>
+            <span className="msg-meta">
+              {m.t}
+              {mine && done && <Receipt delivered={m.delivered} />}
             </span>
           </div>
         </div>
       </div>
     );
   }
-  const mine = m.from === "me";
   return (
-    <div className={cx("msg-row", mine ? "is-mine" : "is-them")}>
+    <div className={cx("msg-row", mine ? "is-mine" : "is-them", "pos-" + pos)}>
       <div className="msg-bubble">
         {m.author && !mine && <span className="msg-author">{m.author}</span>}
         <span className="msg-text"><LinkifiedText text={m.text} /></span>
-        <span className="msg-time">{m.t}{mine && m.delivered && <Icon name="check" size={12} />}</span>
+        {/* The spacer reserves room for the timestamp on the last line, so
+            short messages keep it inline and long ones never run under it. */}
+        <span className="msg-meta-spacer" aria-hidden="true" />
+        <span className="msg-meta">
+          <time dateTime={m.ts || undefined}>{m.t}</time>
+          {mine && <Receipt delivered={m.delivered} />}
+        </span>
       </div>
     </div>
   );
@@ -262,7 +382,7 @@ function MessageItemInner({ m, preview, onOpen, onReveal }) {
 // row, several times a second, for the entire time the app was open. Comparing
 // the fields a row actually renders makes an idle tick cost nothing.
 function messagesEqual(a, b) {
-  if (a.preview !== b.preview || a.onOpen !== b.onOpen || a.onReveal !== b.onReveal) return false;
+  if (a.preview !== b.preview || a.onOpen !== b.onOpen || a.onReveal !== b.onReveal || a.pos !== b.pos) return false;
   const x = a.m;
   const y = b.m;
   return (
@@ -270,7 +390,7 @@ function messagesEqual(a, b) {
     x.from === y.from && x.author === y.author && x.delivered === y.delivered &&
     x.name === y.name && x.size === y.size && x.progress === y.progress &&
     x.hasPath === y.hasPath && x.path === y.path && x.dir === y.dir &&
-    x.warn === y.warn && x.ok === y.ok
+    x.warn === y.warn && x.ok === y.ok && x.ts === y.ts
   );
 }
 
@@ -401,6 +521,9 @@ function GetStarted({ onStart }) {
 // "Show earlier messages" widens the window on demand.
 const MSG_WINDOW = 150;
 
+// Messages closer together than this, from the same side, are one "turn".
+const GROUP_GAP_MS = 5 * 60 * 1000;
+
 // How many image previews are held as `data:` URLs at once. Each is a
 // base64-encoded copy of the file in webview memory (up to the bridge's 4 MiB
 // cap), so an image-heavy thread could otherwise pin hundreds of megabytes just
@@ -506,6 +629,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   // Sending needs a live session. Without this the composer accepted a whole
   // paragraph, the bridge reported success, and the text vanished.
   const online = contact ? contact.state === "connected" : false;
+  const hosting = contact ? contact.state === "hosting" : false;
   // One outgoing file at a time per conversation: `FileChunk` carries no
   // transfer id, so two concurrent sends interleave on the wire and corrupt
   // both files. The backend refuses the second send; the button must not
@@ -529,11 +653,23 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   const visible = useMemo(() => {
     if (!messages) return [];
     let lastDay = null;
-    return messages.slice(-shown).map((m, i) => {
+    const rows = messages.slice(-shown).map((m, i) => {
       const day = m.ts ? new Date(m.ts).toDateString() : null;
       const sep = day && day !== lastDay ? fmtDay(m.ts) : null;
       if (day) lastDay = day;
       return { m, sep, key: m.id || `i${i}` };
+    });
+    // Group runs: consecutive messages from the same side, on the same day,
+    // within a few minutes, read as one turn — tight spacing, and only the last
+    // bubble of the run gets the "tail" corner. Every message keeps its own
+    // timestamp; grouping changes the rhythm, never the information.
+    const joins = (a, b) => a && b && !b.sep && a.m.kind !== "system" && b.m.kind !== "system" &&
+      a.m.from === b.m.from && a.m.ts && b.m.ts &&
+      Math.abs(new Date(b.m.ts) - new Date(a.m.ts)) < GROUP_GAP_MS;
+    return rows.map((r, i) => {
+      const prev = joins(rows[i - 1], r);
+      const next = joins(r, rows[i + 1]);
+      return { ...r, pos: prev && next ? "mid" : prev ? "last" : next ? "first" : "single" };
     });
   }, [messages, shown]);
 
@@ -558,16 +694,28 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
     <div className="chat-pane">
       <header className="chat-head">
         <div className="chat-head-l">
-          <Avatar name={contact.name} size={40} state={contact.state} party={contact.trust === "party"} />
+          <Avatar name={contact.name} size={38} state={hosting ? undefined : contact.state}
+            party={contact.trust === "party"} icon={hosting ? "radio" : undefined} />
           <div className="chat-head-info">
-            <div className="chat-head-name">
-              {contact.name}
-              <TrustBadge trust={contact.trust} mini />
-              <TransportBadge transport={contact.transport} kind={contact.kind} mini />
-            </div>
-            <div className="chat-head-sub mono">
+            <h2 className="chat-head-name">{contact.name}</h2>
+            {/* Plain words, not a row of glyphs and a hex string: whether the
+                peer is here, how the bytes travel, and whether you checked it
+                is really them. The trust word is also the way to act on it. */}
+            <div className="chat-head-sub">
               <span className={"chat-state state-txt-" + contact.state}>{STATE_LABEL[contact.state]}</span>
-              {contact.address && <><span className="chat-dot">·</span>{contact.address}</>}
+              {!hosting && (
+                <>
+                  <span className="chat-dot" aria-hidden="true">·</span>
+                  <span>{TRANSPORT_WORD[contact.transport] || TRANSPORT_WORD.direct}</span>
+                  <span className="chat-dot" aria-hidden="true">·</span>
+                  <button className={cx("chat-trust", contact.trust === "verified" ? "is-ok" : "is-warn")}
+                    onClick={() => onVerify && onVerify(contact)}
+                    title={contact.trust === "verified" ? "Show the safety code" : "Compare safety codes to verify this contact"}>
+                    <Icon name={contact.trust === "verified" ? "shieldCheck" : "shieldAlert"} size={13} />
+                    {contact.trust === "verified" ? "Verified" : "Not verified"}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -575,13 +723,30 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       </header>
 
       <div className="chat-scroll" ref={scrollRef}>
-        <div className="chat-thread">
+        {hosting && <HostingCard />}
+        <div className="chat-thread" hidden={hosting && contact.messages.length === 0}>
+          {!hosting && (
+            // Said once, quietly, where the conversation starts: what protects
+            // it and whether it has been checked. Nothing else in the thread
+            // ever told the user their messages were encrypted.
+            <button className={cx("e2e-note", contact.trust === "verified" ? "is-ok" : "is-warn")}
+              onClick={() => onVerify && onVerify(contact)}>
+              <Icon name="lock" size={12} />
+              <span>
+                Messages with {contact.name} are end-to-end encrypted
+                {contact.transport === "relay" ? " — the relay only sees encrypted bytes" : ""}.{" "}
+                {contact.trust === "verified"
+                  ? "Safety code verified."
+                  : <strong>Not verified yet — compare safety codes.</strong>}
+              </span>
+            </button>
+          )}
           {contact.messages.length > shown && (
             <button className="thread-more" onClick={() => setShown((s) => s + MSG_WINDOW)}>
               Show earlier messages ({contact.messages.length - shown} more)
             </button>
           )}
-          {visible.map(({ m, sep, key }) => (
+          {visible.map(({ m, sep, key, pos }) => (
             <div key={key}>
               {/* A date break is a structural divider, not decoration: without
                   the role a screen reader reads the date as a stray line of
@@ -592,7 +757,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
                   <span>{sep}</span>
                 </div>
               )}
-              <MessageItem m={m} preview={m.id ? previews[m.id] : null}
+              <MessageItem m={m} preview={m.id ? previews[m.id] : null} pos={pos}
                 onOpen={openFile} onReveal={revealFile} />
             </div>
           ))}
@@ -601,7 +766,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
 
       <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
-      {!online && (
+      {!online && !hosting && (
         <div className="composer-notice" role="status">
           <Icon name="alert" size={14} />
           <span>{OFFLINE_NOTICE[contact.state] || OFFLINE_NOTICE.offline}</span>
@@ -609,24 +774,27 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       )}
 
       <div className="composer">
-        <button className="composer-clip"
-          title={clipTitle}
-          disabled={!online || sending}
-          onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
-        <textarea className="composer-input" id="composer-input" rows={1}
-          aria-label={online ? `Message ${contact.name}` : "Message box — not connected"}
-          placeholder={online ? `Message ${contact.name.split(" ")[0]}…` : "Not connected — reconnect to send"}
-          // Typing into a conversation with no session used to look like it
-          // worked: the send reported success, the box cleared, and the message
-          // simply never existed. Better to refuse the keystroke than to eat a
-          // paragraph.
-          disabled={!online}
-          value={draft} onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); onSend(); } }} />
-        <button className={cx("composer-send", online && draft.trim() && "is-ready")}
-          onClick={onSend} disabled={!online} title={online ? "Send" : "Not connected"}>
-          <Icon name="send" size={18} />
-        </button>
+        <div className={cx("composer-box", !online && "is-off")}>
+          <button className="composer-clip"
+            title={clipTitle} aria-label={clipTitle}
+            disabled={!online || sending}
+            onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
+          <textarea className="composer-input" id="composer-input" rows={1}
+            aria-label={online ? `Message ${contact.name}` : "Message box — not connected"}
+            placeholder={online ? `Message ${contact.name.split(" ")[0]}` : hosting ? "You can write once someone connects" : "Not connected — reconnect to send"}
+            // Typing into a conversation with no session used to look like it
+            // worked: the send reported success, the box cleared, and the message
+            // simply never existed. Better to refuse the keystroke than to eat a
+            // paragraph.
+            disabled={!online}
+            value={draft} onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); onSend(); } }} />
+          <button className={cx("composer-send", online && draft.trim() && "is-ready")}
+            onClick={onSend} disabled={!online} title={online ? "Send (Enter)" : "Not connected"}
+            aria-label="Send">
+            <Icon name="send" size={17} />
+          </button>
+        </div>
       </div>
 
       {riskyOpen && (
@@ -645,8 +813,8 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               sure, close this and ask them on a call.
             </p>
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-              <Button icon="x" onClick={() => setRiskyOpen(null)}>Don't open</Button>
-              <Button variant="danger" icon="alert" onClick={confirmRiskyOpen}>
+              <Button icon="x" variant="primary" autoFocus onClick={() => setRiskyOpen(null)}>Don't open</Button>
+              <Button variant="danger-ghost" icon="alert" onClick={confirmRiskyOpen}>
                 Run it anyway
               </Button>
             </div>

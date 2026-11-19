@@ -265,6 +265,7 @@ function makeMock() {
     last: c.messages.length
       ? (c.messages.at(-1).content.type === "file" ? `📎 ${c.messages.at(-1).content.filename}` : c.messages.at(-1).content.text || "")
       : null,
+    last_from_me: c.messages.length ? !!c.messages.at(-1).from_me : false,
     kind: c.kind || "dm", transport: c.transport || "direct",
     connected: !!connected[c.id], placeholder: c.is_host_placeholder,
     verified: !!c.peer_fingerprint,
@@ -586,6 +587,7 @@ export function summaryToConv(s) {
   return {
     id: s.id, name: s.title,
     last: s.last || (s.connected ? "Connected" : s.placeholder ? "Waiting for a peer…" : ""),
+    lastFromMe: !!s.last_from_me,
     lastT: fmtWhen(s.last_at), typing: false,
     kind: normalizeKind(s.kind),
     transport,

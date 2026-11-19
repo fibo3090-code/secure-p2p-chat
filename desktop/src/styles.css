@@ -1,7 +1,7 @@
-/* Fonts intentionally not fetched from any third party: a desktop secure-chat
-   app must stay offline and leak no client metadata on startup. The design
-   system's font-family stacks fall back to system-ui / monospace locally. */
+/* Bundled typefaces (fonts.css) — never fetched from a third party: a secure
+   messenger must stay offline and leak no client metadata on startup. */
 /* Ported P2PEM design system (tokens, theming, components). */
+@import "./fonts.css";
 @import "./app-system.css";
 /* Extra themes (midnight / forest / rose) + local polish. */
 @import "./themes.css";

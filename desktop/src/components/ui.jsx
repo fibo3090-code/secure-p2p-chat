@@ -23,25 +23,37 @@ export function IconButton({ name, label, active, size = 18, ...rest }) {
   );
 }
 
-function AvatarInner({ name, size = 38, state, party }) {
+// Initials from the letters of a name only: "Listening :12345" used to render
+// as "L:", because the first character of each word was taken verbatim.
+function initialsOf(name) {
+  const words = String(name || "").split(/\s+/)
+    .map((w) => w.replace(/[^\p{L}\p{N}]/gu, ""))
+    .filter(Boolean);
+  return (words.map((w) => [...w][0]).join("").slice(0, 2) || "?").toUpperCase();
+}
+
+const STATE_WORD = { connected: "connected", hosting: "waiting for a peer", offline: "offline", connecting: "connecting" };
+
+function AvatarInner({ name, size = 38, state, party, icon }) {
   // Both derive only from `name`, and an avatar is rendered once per
   // conversation row on every poll tick — so the string walk was running for
   // every row, several times a second, to produce the same number each time.
   const { initials, bg } = useMemo(() => {
-    const letters = (name || "?").split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+    const letters = initialsOf(name);
     const hue = [...(name || "")].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
     return { initials: letters, bg: `oklch(0.62 0.13 ${hue})` };
   }, [name]);
   return (
     <span className="avatar-wrap" style={{ width: size, height: size }}>
-      <span className="avatar" style={{
-        background: party ? "transparent" : bg, width: size, height: size,
-        fontSize: size * 0.36, border: party ? "1.5px solid var(--accent)" : "none",
-        color: party ? "var(--accent)" : "#fff",
+      <span className={cx("avatar", (party || icon) && "is-glyph")} style={{
+        background: party || icon ? undefined : bg, width: size, height: size,
+        fontSize: size * 0.38,
       }}>
-        {party ? <Icon name="users" size={size * 0.5} /> : initials}
+        {party ? <Icon name="users" size={size * 0.5} />
+          : icon ? <Icon name={icon} size={size * 0.46} />
+            : initials}
       </span>
-      {state && <span className={cx("state-dot", "state-" + state)} title={state} />}
+      {state && <span className={cx("state-dot", "state-" + state)} title={STATE_WORD[state] || state} />}
     </span>
   );
 }
@@ -61,9 +73,13 @@ const TRUST = {
 export function TrustBadge({ trust, mini }) {
   const t = TRUST[trust] || TRUST.unverified;
   return (
-    <span className={cx("trust-badge", t.cls, mini && "is-mini")}>
+    // A mini badge is an icon, so it carries its word for everyone else: a
+    // tooltip for the pointer and hidden text for a screen reader. The mini
+    // form used to be silent, which made "Verified" the one fact about a
+    // conversation a reader could not hear.
+    <span className={cx("trust-badge", t.cls, mini && "is-mini")} title={mini ? t.label : undefined}>
       <Icon name={t.icon} size={mini ? 12 : 13} />
-      {!mini && <span>{t.label}</span>}
+      {mini ? <span className="sr-only">{t.label}</span> : <span>{t.label}</span>}
     </span>
   );
 }
