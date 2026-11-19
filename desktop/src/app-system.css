@@ -227,6 +227,7 @@ input,textarea{font-family:inherit;color:inherit}
   display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;color:var(--dim);
   transition:background .13s,color .13s}
 .rail-btn:hover{background:var(--s2);color:var(--text)}
+.rail-btn:focus-visible{outline-offset:-2px}
 .rail-btn.is-active{background:color-mix(in oklab,var(--accent) 14%,var(--s1));color:var(--text)}
 .rail-btn.is-active>svg{color:var(--accent-text)}
 .rail-btn.is-active::before{content:"";position:absolute;left:-5px;top:22%;bottom:22%;width:3px;
@@ -239,7 +240,7 @@ input,textarea{font-family:inherit;color:inherit}
 .rail-foot{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%}
 .rail-gate{position:relative}
 .rail-gate::after{content:"";position:absolute;top:8px;right:20px;width:8px;height:8px;border-radius:50%;
-  background:var(--success);box-shadow:0 0 0 2px var(--s1)}
+  background:var(--accent);box-shadow:0 0 0 2px var(--s1)}
 .rail-gate.is-closed::after{background:var(--warning)}
 .rail-gate.is-closed{color:var(--warning);background:color-mix(in oklab,var(--warning) 10%,transparent)}
 .rail-id{border-radius:50%;transition:transform .13s;padding:2px}
@@ -417,7 +418,7 @@ input,textarea{font-family:inherit;color:inherit}
 .is-mine .msg-meta-spacer{--meta-w:74px}
 .msg-meta{position:absolute;right:11px;bottom:5px;display:inline-flex;align-items:center;gap:3px;
   font-size:11px;line-height:1;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
-.is-mine .msg-meta{color:color-mix(in oklab,var(--mine-ink) 72%,transparent)}
+.is-mine .msg-meta{color:var(--mine-ink)}
 .msg-receipt{display:inline-flex}
 .msg-receipt.is-delivered{color:inherit}
 /* Community chat file chips (Parties). */
@@ -455,7 +456,7 @@ input,textarea{font-family:inherit;color:inherit}
 .file-ext.is-risky{color:var(--warning)}
 .file-card.is-openable .file-meta:hover .file-name{text-decoration:underline;text-underline-offset:2px}
 .file-sub{font-size:12px;color:var(--dim);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.file-card.is-mine .file-sub{color:color-mix(in oklab,var(--mine-ink) 75%,transparent)}
+.file-card.is-mine .file-sub{color:var(--mine-ink)}
 .file-risk{display:inline-flex;align-items:center;gap:4px;color:var(--warning);font-weight:600}
 .file-reveal{flex:none;display:grid;place-items:center;width:34px;height:34px;border-radius:10px;
   color:var(--dim);transition:background .13s,color .13s}
@@ -464,9 +465,9 @@ input,textarea{font-family:inherit;color:inherit}
 .file-card.is-mine .file-reveal:hover{background:rgba(255,255,255,.16)}
 .file-foot{display:flex;align-items:center;gap:10px;padding:0 2px 0 3px}
 .file-where{flex:1;min-width:0;font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.file-card.is-mine .file-where{color:color-mix(in oklab,var(--mine-ink) 72%,transparent)}
+.file-card.is-mine .file-where{color:var(--mine-ink)}
 .file-foot .msg-meta{position:static}
-.file-card.is-mine .msg-meta{color:color-mix(in oklab,var(--mine-ink) 72%,transparent)}
+.file-card.is-mine .msg-meta{color:var(--mine-ink)}
 
 /* first-run call to action inside the empty conversation list */
 .conv-empty-cta{display:flex;align-items:center;gap:6px;margin:12px auto 0;padding:8px 14px;
@@ -704,7 +705,6 @@ input,textarea{font-family:inherit;color:inherit}
 .set-row-desc{font-size:12px;color:var(--dim);margin-top:2px}
 .set-path{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12px;color:var(--dim);
   background:var(--s2);padding:7px 11px;border-radius:var(--r-sm)}
-.set-id-card{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 0}
 .set-id-l{display:flex;align-items:center;gap:12px}
 .set-id-ic{display:grid;place-items:center;width:40px;height:40px;border-radius:var(--r-sm);background:var(--s3);color:var(--accent-text)}
 .set-id-name{font-weight:700;font-size:14px}
@@ -1129,6 +1129,8 @@ button.contact-row-main:disabled{cursor:default}
 .card-actions.is-start{justify-content:flex-start;flex-wrap:wrap}
 .list-row-use{flex:none;display:inline-flex;align-items:center;gap:4px;font-size:12.5px;font-weight:600;
   color:var(--accent-text);padding:4px 10px;border-radius:8px;background:color-mix(in oklab,var(--accent) 12%,transparent)}
-.list-row-use.is-on{color:var(--success);background:color-mix(in oklab,var(--success) 12%,transparent)}
+.list-row-use.is-on{color:var(--accent-text);background:none}
+.list-row.is-picked{box-shadow:inset 3px 0 0 var(--accent)}
 .chat-empty-link{color:var(--accent-text);font-weight:600;text-decoration:underline;text-underline-offset:2px;
   text-decoration-color:color-mix(in oklab,currentColor 45%,transparent)}
+.e2e-later{color:var(--dim)}

@@ -150,6 +150,9 @@ describe("Parties — joining", () => {
     render(<Parties />);
     await userEvent.click(await screen.findByTitle("Fill in you@10.0.0.5:12345"));
 
+    // A known community asks only for its password; the details are one click away.
+    expect(screen.getByRole("heading", { name: "Rejoin Test" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Edit details" }));
     expect(screen.getByLabelText("Server address").value).toBe("10.0.0.5:12345");
     expect(screen.getByLabelText("Username").value).toBe("you");
     // Joining straight from a card sent whatever happened to be in the shared

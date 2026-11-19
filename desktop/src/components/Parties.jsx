@@ -89,6 +89,9 @@ function JoinForm({ onJoined, onCancel, initial }) {
   // With saved communities, the blank form waits behind "Join another
   // community" — picking one of yours is the common path.
   const [another, setAnother] = useState(false);
+  // A known community only needs its password; the address and username are
+  // already right, so they stay folded unless the user asks to edit them.
+  const [editDetails, setEditDetails] = useState(false);
   const showForm = saved.length === 0 || !!pickedSaved || another;
   const passRef = useRef(null);
   // Field-level errors sit on the field they are about, not at the bottom of
@@ -160,7 +163,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
                 <button key={p.address} className={cx("list-row", picked && "is-picked")} disabled={busy}
                   title={`Fill in ${p.username}@${p.address}`} aria-pressed={picked}
                   onClick={() => {
-                    setAddress(p.address); setUsername(p.username); setPassword(""); setErr("");
+                    setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); setEditDetails(false);
                     // Next step is the password (if it has one), then Join.
                     setTimeout(() => passRef.current?.focus(), 0);
                   }}>
@@ -169,7 +172,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
                     <span className="list-row-name">{p.name || p.address}</span>
                     <span className="list-row-sub">Username: {p.username} · <span className="mono">{p.address}</span></span>
                   </span>
-                  <span className={cx("list-row-use", picked && "is-on")}>{picked ? <><Icon name="check" size={14} /> Selected</> : "Use"}</span>
+                  <span className={cx("list-row-use", picked && "is-on")}>{picked ? <><Icon name="check" size={14} /> Selected</> : "Rejoin"}</span>
                 </button>
               );
             })}
@@ -188,7 +191,13 @@ function JoinForm({ onJoined, onCancel, initial }) {
             ? "Add its password if it has one, then join."
             : "Ask the operator for the server address and, if it has one, its password. The first time, you'll check its fingerprint before anything is sent."}
         </p>
-        <div className="field-grid">
+        {pickedSaved && !editDetails ? (
+          <p className="field-hint">
+            As <strong>{pickedSaved.username}</strong> on <span className="mono">{pickedSaved.address}</span>
+            {" · "}<button type="button" className="chat-empty-link" onClick={() => setEditDetails(true)}>Edit details</button>
+          </p>
+        ) : (
+                <div className="field-grid">
           <div className="field">
             <label className="field-label" htmlFor="party-addr">Server address</label>
             <Input id="party-addr" mono value={address} autoFocus placeholder="192.168.1.20:12345"
@@ -206,6 +215,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
             {fieldErr("user")}
           </div>
         </div>
+        )}
         <div className="field">
           <label className="field-label" htmlFor="party-pass">Server password <span className="field-opt">optional</span></label>
           <PasswordInput id="party-pass" ref={passRef} value={password} placeholder="Leave empty if the server has none"

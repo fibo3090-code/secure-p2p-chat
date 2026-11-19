@@ -495,7 +495,8 @@ export default function App() {
       <Verify req={fpReq} onClose={() => setFpReq(null)} />
       <RenameDialog target={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={doRename} />
       <ConfirmDelete target={deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete} />
-      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)} />
+      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)}
+        onRename={(c) => setRenameTarget(c)} onDelete={(c) => setDeleteTarget(c)} />
       <Toasts />
     </div>
   );

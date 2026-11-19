@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { Modal, Button } from "./ui.jsx";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
-import { api, friendlyError } from "../lib/bridge.js";
+import { api, friendlyError, normalizeTransport } from "../lib/bridge.js";
 function group(fp) {
   return (fp || "").replace(/(.{4})/g, "$1 ").trim();
 }
@@ -28,6 +28,8 @@ function splitSas(sas) {
   return m ? [m[1].trim(), m[2].trim()] : [String(sas || ""), ""];
 }
 
+const LOOKUP_TIMEOUT_MS = 400;
+
 export function Verify({ req, onClose }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -40,18 +42,31 @@ export function Verify({ req, onClose }) {
   // how the bytes are travelling. A key change must not read as "first
   // connection" — it is the prompt where the user most needs to slow down.
   const [known, setKnown] = useState(null);
+  // Until the lookup settles, "trust" stays disabled: a changed-key warning
+  // must never appear under a cursor already on the button. Bounded, so a hung
+  // call cannot trap the user in an unanswerable prompt.
+  const [settled, setSettled] = useState(false);
   useEffect(() => {
     setKnown(null);
-    if (!req?.chat_id) return undefined;
+    setSettled(false);
+    if (!req?.chat_id) { setSettled(true); return undefined; }
     let live = true;
+    const done = () => live && setSettled(true);
+    const timer = setTimeout(done, LOOKUP_TIMEOUT_MS);
     api.getConversation(req.chat_id)
-      .then((chat) => live && chat && setKnown({ fingerprint: chat.peer_fingerprint || null, transport: chat.transport || null }))
-      .catch(() => {});
-    return () => { live = false; };
+      .then((chat) => live && chat && setKnown({
+        fingerprint: chat.peer_fingerprint || null,
+        // The Rust enum serialises as "Direct"/"Relay"; compare normalised.
+        transport: chat.transport ? normalizeTransport(chat.transport) : null,
+      }))
+      .catch(() => {})
+      .finally(done);
+    return () => { live = false; clearTimeout(timer); };
   }, [req?.chat_id]);
   if (!req) return null;
   const first = req.peer_name.split(" ")[0];
-  const changed = !!(known?.fingerprint && req.fingerprint && known.fingerprint !== req.fingerprint);
+  const norm = (fp) => String(fp || "").replace(/\s+/g, "").toLowerCase();
+  const changed = !!(known?.fingerprint && req.fingerprint && norm(known.fingerprint) !== norm(req.fingerprint));
   const route = known?.transport === "relay" ? "Via relay — the relay can't read this conversation"
     : known?.transport === "server" ? "Via a community server"
       : known?.transport === "direct" ? "Direct connection" : null;
@@ -124,7 +139,7 @@ export function Verify({ req, onClose }) {
             alarm, and nothing here is wrong yet. */}
         <div className="verify-actions">
           <Button variant="danger-ghost" icon="x" disabled={busy} onClick={() => decide(false)}>Reject</Button>
-          <Button icon="shieldCheck" disabled={busy} onClick={() => decide(true)}>
+          <Button icon="shieldCheck" disabled={busy || !settled} onClick={() => decide(true)}>
             {busy ? "Working…" : "Codes match — trust"}
           </Button>
         </div>

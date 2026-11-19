@@ -276,7 +276,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
           {/* One identity card: who you are to others, the key that proves it,
               and what that means — instead of a card, a loose caption and a
               wrapped hex block. */}
-          <div className="set-id-card">
+          <div className="id-card">
             <div className="set-id">
               <Avatar name={identity?.name} size={48} />
               <div className="set-id-main">

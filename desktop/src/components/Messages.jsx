@@ -772,7 +772,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
                   ? <span className="e2e-ok">Safety code verified</span>
                   : online
                     ? <span className="e2e-action">Compare safety codes</span>
-                    : <span className="e2e-action">Verify on next connection</span>}
+                    : <span className="e2e-later">You'll verify on the next connection</span>}
               </span>
             </button>
           )}

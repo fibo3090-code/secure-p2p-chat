@@ -395,7 +395,10 @@ function makeMock() {
     // `?mockVerify=1` previews the TOFU verification dialog for Bob.
     pendingFingerprint: async () => (new URLSearchParams(location.search).get("mockVerify")
       ? { chat_id: "22222222-2222-2222-2222-222222222222", peer_name: "Bob",
-        fingerprint: chats["22222222-2222-2222-2222-222222222222"]?.peer_fingerprint || "ff".repeat(32),
+        // `?mockVerify=changed` previews a known contact presenting a new key.
+        fingerprint: new URLSearchParams(location.search).get("mockVerify") === "changed"
+          ? "0123456789abcdef".repeat(4)
+          : chats["22222222-2222-2222-2222-222222222222"]?.peer_fingerprint || "ff".repeat(32),
         sas: "482 913 🦊🎈🌵" }
       : null),
     renameChat: async (id, title) => { if (chats[id]) chats[id].title = title; },
@@ -581,7 +584,7 @@ function human(n) {
 // casing across summary vs detail payloads) so a conversation keeps the same
 // shape whichever payload arrived last.
 function normalizeKind(value) { return String(value || "dm").toLowerCase(); }
-function normalizeTransport(value) { return String(value || "direct").toLowerCase(); }
+export function normalizeTransport(value) { return String(value || "direct").toLowerCase(); }
 
 export function summaryToConv(s) {
   const transport = normalizeTransport(s.transport);

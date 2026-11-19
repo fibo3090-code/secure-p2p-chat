@@ -78,7 +78,7 @@ describe("ConfirmDelete", () => {
 describe("InfoDialog", () => {
   it("shows the grouped fingerprint and the transport in words", () => {
     render(<InfoDialog target={chat} onClose={() => {}} />);
-    expect(screen.getByText(/direct \(peer-to-peer\)/)).toBeTruthy();
+    expect(screen.getByText(/Direct \(peer-to-peer\)/)).toBeTruthy();
     // Grouped in fours so it can be read aloud without losing your place.
     expect(screen.getByText(/^abab abab/)).toBeTruthy();
   });

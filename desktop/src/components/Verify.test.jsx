@@ -114,7 +114,8 @@ describe("Verify", () => {
   });
 
   it("says the safety code changed when a verified conversation sees a new key", async () => {
-    installApi({ getConversation: { id: "chat-1", peer_fingerprint: "cd".repeat(32), transport: "relay" } });
+    // The real bridge serialises the Rust enum as "Relay", not "relay".
+    installApi({ getConversation: { id: "chat-1", peer_fingerprint: "cd".repeat(32), transport: "Relay" } });
     render(<Verify req={req} onClose={() => {}} />);
     // A changed key must not read as a first connection.
     expect(await screen.findByText("Alice's safety code changed")).toBeTruthy();
@@ -123,9 +124,20 @@ describe("Verify", () => {
   });
 
   it("stays a plain check when the stored key matches or there is none", async () => {
-    installApi({ getConversation: { id: "chat-1", peer_fingerprint: null, transport: "direct" } });
+    installApi({ getConversation: { id: "chat-1", peer_fingerprint: "AB".repeat(32), transport: "Direct" } });
     render(<Verify req={req} onClose={() => {}} />);
     expect(await screen.findByText("Direct connection")).toBeTruthy();
+    // Same key in a different case is the same key — no false alarm.
     expect(screen.queryByText(/safety code changed/)).toBeNull();
+  });
+
+  it("holds the trust button until the lookup has settled", async () => {
+    let resolve;
+    installApi({ getConversation: () => new Promise((r) => { resolve = r; }) });
+    render(<Verify req={req} onClose={() => {}} />);
+    expect(screen.getByRole("button", { name: /Codes match/ }).disabled).toBe(true);
+    resolve({ id: "chat-1", peer_fingerprint: null, transport: "Direct" });
+    await screen.findByText("Direct connection");
+    expect(screen.getByRole("button", { name: /Codes match/ }).disabled).toBe(false);
   });
 });

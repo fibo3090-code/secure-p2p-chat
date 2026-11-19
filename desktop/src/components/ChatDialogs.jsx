@@ -1,6 +1,7 @@
 // Rename / delete / info dialogs for a conversation.
 import { useEffect, useState } from "react";
-import { cx, Modal, Button, Input } from "./ui.jsx";
+import { cx, Modal, Button, Input, Avatar } from "./ui.jsx";
+import { toast } from "../lib/toast.js";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
 
@@ -46,13 +47,15 @@ export function ConfirmDelete({ target, onClose, onConfirm }) {
   );
 }
 
+const STATE_WORDS = { connected: "Connected", hosting: "Listening for a peer", offline: "Offline", connecting: "Connecting…" };
+
 const TRANSPORT_LABEL = {
-  direct: "direct (peer-to-peer)",
-  relay: "relayed (blind broker, still end-to-end encrypted)",
-  server: "server (community)",
+  direct: "Direct (peer-to-peer)",
+  relay: "Relayed (blind broker, still end-to-end encrypted)",
+  server: "Server (community)",
 };
 
-export function InfoDialog({ target, onClose }) {
+export function InfoDialog({ target, onClose, onRename, onDelete }) {
   if (!target) return null;
   const fp = target.fingerprint || "";
   const transport = TRANSPORT_LABEL[target.transport] || TRANSPORT_LABEL.direct;
@@ -70,8 +73,13 @@ export function InfoDialog({ target, onClose }) {
       : { cls: "is-pending", icon: "shieldAlert", h: "Not verified yet",
         p: `You'll compare a safety code with ${target.name} the next time you connect. Until then, the encryption protects the messages, but nothing proves who is on the other end.` };
   return (
-    <Modal open onClose={onClose} width={440} title={target.name} icon="info" sub="Conversation details">
-      <div className="verify-body">
+    <Modal open onClose={onClose} width={460} title="Conversation info" icon="info">
+      <div className="info-body">
+        <div className="info-head">
+          <Avatar name={target.name} size={64} state={target.state} />
+          <div className="info-name">{target.name}</div>
+          <div className="info-state">{STATE_WORDS[target.state] || "Offline"}</div>
+        </div>
         <div className={cx("trust-panel", trust.cls)}>
           <Icon name={trust.icon} size={18} />
           <div>
@@ -79,6 +87,10 @@ export function InfoDialog({ target, onClose }) {
             <p className="trust-panel-p">{trust.p}</p>
           </div>
         </div>
+        <dl className="info-facts">
+          <dt>Transport</dt><dd>{transport}</dd>
+          <dt>Encryption</dt><dd>End-to-end · X25519 + AES-256-GCM · forward secrecy</dd>
+        </dl>
         {!fp && <div className="verify-hint">No fingerprint yet.</div>}
         {fp && (
           <details className="verify-advanced">
@@ -87,10 +99,25 @@ export function InfoDialog({ target, onClose }) {
             <div className="verify-code">{fp.replace(/(.{4})/g, "$1 ").trim()}</div>
           </details>
         )}
-        <div className="verify-hint">
-          Transport: {transport}. End-to-end encrypted (X25519 + AES-256-GCM, forward secrecy).
+        <div className="info-actions" role="group" aria-label="Conversation actions">
+          {fp && (
+            <button className="info-action" onClick={() => navigator.clipboard?.writeText(fp)
+              .then(() => toast("Fingerprint copied", "success"))
+              .catch(() => toast("Could not copy", "error"))}>
+              <Icon name="copy" size={16} /> Copy fingerprint
+            </button>
+          )}
+          {onRename && !target.placeholder && (
+            <button className="info-action" onClick={() => { onClose(); onRename(target); }}>
+              <Icon name="edit" size={16} /> Rename
+            </button>
+          )}
+          {onDelete && (
+            <button className="info-action is-danger" onClick={() => { onClose(); onDelete(target); }}>
+              <Icon name="trash" size={16} /> {target.placeholder ? "Stop listening" : "Delete conversation"}
+            </button>
+          )}
         </div>
-        <Button full variant="ghost" icon="x" onClick={onClose}>Close</Button>
       </div>
     </Modal>
   );
