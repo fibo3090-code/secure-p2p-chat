@@ -40,6 +40,11 @@ function CopyLine({ value }) {
 
 const DEFAULT_PORT = 12345;
 
+const TRANSPORTS = [
+  { id: "direct", icon: "plug", label: "Direct" },
+  { id: "relay", icon: "satellite", label: "Via relay" },
+];
+
 export function Creator({ open, onClose, initialMode, initialRelay = false }) {
   const [mode, setMode] = useState(initialMode || "connect");
   const [transport, setTransport] = useState("direct");
@@ -205,20 +210,19 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
     });
   }
 
-  // One level of choice: what you are doing (dial / host / invite). The relay
-  // is a property of dialling or hosting, so it is a switch under the field
-  // rather than a second segmented control stacked on the first.
+  // How the bytes travel, chosen up front for dialling and hosting: a direct
+  // connection, or through a relay when neither side can accept one.
   const viaRelay = transport === "relay";
-  const relaySwitch = (mode === "connect" || mode === "host") && (
-    <label className="creator-switch">
-      <input type="checkbox" checked={viaRelay}
-        onChange={(e) => { setTransport(e.target.checked ? "relay" : "direct"); reset(); }} />
-      <span className="creator-switch-ui" aria-hidden="true" />
-      <span>
-        <span className="creator-switch-l">Use a relay</span>
-        <span className="creator-switch-h">When neither of you can accept a direct connection. The relay only sees encrypted bytes.</span>
-      </span>
-    </label>
+  const transportPicker = (mode === "connect" || mode === "host") && (
+    <div className="seg seg-sub" role="radiogroup" aria-label="How to connect">
+      {TRANSPORTS.map((t) => (
+        <button key={t.id} role="radio" aria-checked={transport === t.id}
+          className={cx("seg-btn", transport === t.id && "is-active")}
+          onClick={() => { setTransport(t.id); reset(); }}>
+          <Icon name={t.icon} size={14} />{t.label}
+        </button>
+      ))}
+    </div>
   );
   let primary = null;
   if (mode === "connect" && !viaRelay) primary = <Button icon="send" onClick={connect} disabled={busy}>Connect</Button>;
@@ -238,6 +242,7 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
           </button>
         ))}
       </div>
+      {transportPicker}
 
       {mode === "connect" && !viaRelay && (
         <div className="creator-pane">
@@ -353,7 +358,7 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
       {note && <div className="creator-lead" style={{ marginTop: 12, color: "var(--success)" }}>{note}</div>}
 
       <div className="modal-foot">
-        {relaySwitch || <span />}
+        <span />
         <div className="modal-foot-actions">{primary}</div>
       </div>
     </Modal>

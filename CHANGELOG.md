@@ -35,8 +35,8 @@ predate tagged releases.
     there is no saved address. A listening conversation shows the addresses to
     share, an invite link and Stop listening.
   - Contacts, Relays, Communities and Settings share one page template (Settings
-    has a section index). New connection is one level, with a "Use a relay"
-    switch.
+    has a section index). New connection keeps its Direct / Via relay choice
+    under Dial and Host, with the action in a footer.
   - Daylight was redesigned, and every text colour holds at least 4.5:1 in all
     five themes.
 

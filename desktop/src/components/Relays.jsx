@@ -39,7 +39,7 @@ function Copyable({ value }) {
   );
 }
 
-// Pairing through a relay lives in New connection ("Use a relay"), next to
+// Pairing through a relay lives in New connection ("Via relay"), next to
 // every other way of starting a conversation; this page explains what a relay
 // is and how to run one, and sends you there. Two forms doing the same job in
 // two places was a choice the user should never have had to make.
@@ -60,7 +60,7 @@ export function Relays({ onPair }) {
         <h2 className="card-title">Talk through a relay</h2>
         <p className="card-lead">
           One of you opens a session on a relay and shares the token it gives; the other
-          connects with that token. Both happen in New connection, with “Use a relay” on.
+          connects with that token. Both happen in New connection, with “Via relay” selected.
         </p>
         <div className="card-actions is-start">
           <Button icon="satellite" onClick={() => onPair && onPair("connect")}>Connect with a token</Button>

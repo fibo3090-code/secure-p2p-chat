@@ -256,11 +256,11 @@ describe("Creator — relay", () => {
     expect(await screen.findByText(/relay refused the token/)).toBeTruthy();
   });
 
-  it("switches between direct and relay with one labelled switch", async () => {
+  it("switches between direct and relay with the Direct / Via relay picker", async () => {
     installApi({ listDiscoveredPeers: { enabled: false, peers: [] } });
     open();
     expect(screen.getByLabelText("Their address")).toBeTruthy();
-    await userEvent.click(screen.getByRole("checkbox", { name: /Use a relay/ }));
+    await userEvent.click(screen.getByRole("radio", { name: /Via relay/ }));
     expect(screen.getByLabelText("Relay address")).toBeTruthy();
   });
 });
