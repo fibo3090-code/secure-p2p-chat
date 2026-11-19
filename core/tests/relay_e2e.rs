@@ -7,8 +7,8 @@
 
 use messenger_core::core::{generate_rsa_keypair, ProtocolMessage};
 use messenger_core::network::{
-    generate_relay_token, run_client_session_via_relay, run_host_session_via_relay,
-    run_relay_server, NO_HOLEPUNCH_ENV,
+    generate_relay_token, run_client_session_via_relay, run_host_session_via_relay, serve_relay,
+    NO_HOLEPUNCH_ENV, RELAY_WAIT_TIMEOUT,
 };
 use messenger_core::types::SessionEvent;
 use messenger_core::RSA_KEY_BITS;
@@ -56,12 +56,6 @@ where
     }
 }
 
-/// Reserve an ephemeral loopback port, then free it so the relay can bind it.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
-}
-
 /// Drive a full host+joiner pairing through a fresh relay server: handshake,
 /// TOFU confirmation on both ends, and one host→client message. Returns the
 /// peer labels observed on each side (`p2p:*` for a punched direct socket,
@@ -71,14 +65,15 @@ async fn pair_and_exchange() -> (String, String) {
     pair_and_exchange_on(&relay_addr, &generate_relay_token(), "rendezvous hello").await
 }
 
-/// Start a relay on a free port and wait for it to be listening.
+/// Start a relay on a listener that is already bound, so it is accepting the
+/// moment this returns.
 async fn start_relay() -> String {
-    let port = free_port();
-    tokio::spawn(async move {
-        let _ = run_relay_server(port).await;
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    format!("127.0.0.1:{port}")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    tokio::spawn(serve_relay(listener, RELAY_WAIT_TIMEOUT));
+    addr
 }
 
 /// One full pairing on an existing relay: handshake, TOFU on both ends, and one

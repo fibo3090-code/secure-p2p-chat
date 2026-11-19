@@ -11,11 +11,11 @@
 # becomes a timeout.
 slow-timeout = { period = "60s", terminate-after = 6 }
 
-# One retry, for the genuinely environmental case: these tests bind ephemeral
-# loopback ports, and two of them can collide. It is deliberately not a way to
-# paper over a racy test — a retried test is reported as FLAKY, and that is a
-# defect to fix (usually by giving a wait step more headroom, never by raising
-# this number).
+# One retry, so that a test which fails once and then passes is *identified*
+# as flaky in the log rather than reported as a plain failure. Locally it then
+# passes; in CI it does not (see `flaky-result` below). Servers and hosts in the
+# suite bind port 0 and are handed their listener, so there is no port race
+# left for a retry to excuse.
 retries = { backoff = "exponential", count = 1, delay = "2s", jitter = true }
 
 [profile.ci]
@@ -24,3 +24,6 @@ retries = { backoff = "exponential", count = 1, delay = "2s", jitter = true }
 status-level = "all"
 final-status-level = "slow"
 fail-fast = false
+# A test that needed its retry is a race, and a race that turns CI green on the
+# second try is one nobody fixes. Fail the run, with the FLAKY label attached.
+flaky-result = "fail"

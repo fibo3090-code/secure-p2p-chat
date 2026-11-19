@@ -10,6 +10,13 @@ use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// An app over a throwaway data directory, never the developer's own.
+fn test_app() -> (TuiApp, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("data dir");
+    let app = TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app");
+    (app, dir)
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -20,14 +27,12 @@ fn type_str(app: &mut TuiApp, text: &str) {
     }
 }
 
-/// An app with `n` conversations, each with a session lane the test holds.
-fn app_with_chats(
-    n: usize,
-) -> (
-    TuiApp,
-    Vec<(Uuid, mpsc::UnboundedReceiver<ProtocolMessage>)>,
-) {
-    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
+type Lanes = Vec<(Uuid, mpsc::UnboundedReceiver<ProtocolMessage>)>;
+
+/// An app with `n` conversations, each with a session lane the test holds,
+/// and the data directory that has to outlive it.
+fn app_with_chats(n: usize) -> (TuiApp, Lanes, tempfile::TempDir) {
+    let (mut app, data) = test_app();
     // Isolate send behaviour from the typing-indicator frames keys produce.
     app.chat_manager.config.enable_typing_indicators = false;
     let mut chats = Vec::new();
@@ -44,7 +49,7 @@ fn app_with_chats(
     // Order the receivers the way the list shows them.
     let order = app.chat_ids.clone();
     chats.sort_by_key(|(id, _)| order.iter().position(|o| o == id));
-    (app, chats)
+    (app, chats, data)
 }
 
 fn sent_texts(rx: &mut mpsc::UnboundedReceiver<ProtocolMessage>) -> Vec<String> {
@@ -60,7 +65,7 @@ fn sent_texts(rx: &mut mpsc::UnboundedReceiver<ProtocolMessage>) -> Vec<String> 
 /// selected conversation's wire, its history, and the input is cleared.
 #[test]
 fn typing_a_multiline_message_and_pressing_enter_sends_it() {
-    let (mut app, mut chats) = app_with_chats(1);
+    let (mut app, mut chats, _data) = app_with_chats(1);
     app.chat_list_state.select(Some(0));
     app.focus = TuiFocus::Input;
 
@@ -79,7 +84,7 @@ fn typing_a_multiline_message_and_pressing_enter_sends_it() {
 /// A message goes to the conversation that is selected, and only to it.
 #[test]
 fn a_message_goes_only_to_the_selected_conversation() {
-    let (mut app, mut chats) = app_with_chats(2);
+    let (mut app, mut chats, _data) = app_with_chats(2);
     app.chat_list_state.select(Some(0));
     app.input_field.set_text("To the first");
     app.send_message();
@@ -95,7 +100,7 @@ fn a_message_goes_only_to_the_selected_conversation() {
 /// parsed command and returns to normal mode.
 #[test]
 fn a_typed_command_is_parsed_and_submitted() {
-    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
+    let (mut app, _data) = test_app();
     app.focus = TuiFocus::ChatList;
     app.handle_key_event(key(KeyCode::Char(':')));
     assert_eq!(app.mode, TuiMode::Command);
@@ -108,7 +113,7 @@ fn a_typed_command_is_parsed_and_submitted() {
 /// Tab cycles focus list → messages → input → list.
 #[test]
 fn tab_cycles_focus() {
-    let mut app = TuiApp::new(LogBuffer::new()).unwrap();
+    let (mut app, _data) = test_app();
     app.focus = TuiFocus::ChatList;
     for expected in [TuiFocus::MessageView, TuiFocus::Input, TuiFocus::ChatList] {
         app.handle_key_event(key(KeyCode::Tab));
@@ -120,7 +125,7 @@ fn tab_cycles_focus() {
 /// conversation, and `:rename` renames the selected one.
 #[tokio::test]
 async fn the_selection_survives_a_resync_and_rename_acts_on_it() {
-    let (mut app, chats) = app_with_chats(2);
+    let (mut app, chats, _data) = app_with_chats(2);
     app.chat_list_state.select(Some(1));
     let selected = chats[1].0;
     app.sync_chat_ids();

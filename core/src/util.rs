@@ -649,29 +649,68 @@ mod tests {
         assert!(short.starts_with("abcdefgh"));
     }
 
+    /// What users actually paste into "address" fields, against the one
+    /// parser every connect path goes through (TUI, contacts, invites, the
+    /// relay and the community client).
     #[test]
-    fn test_parse_host_port_ipv4_and_hostname() {
-        assert_eq!(
-            parse_host_port("127.0.0.1:12345", None).unwrap(),
-            ("127.0.0.1".to_string(), 12345)
-        );
-        assert_eq!(
-            parse_host_port("example.local", Some(9000)).unwrap(),
-            ("example.local".to_string(), 9000)
-        );
+    fn parse_host_port_accepts_what_can_be_dialled() {
+        for (input, default, host, port) in [
+            ("127.0.0.1:12345", None, "127.0.0.1", 12345),
+            ("example.com:80", None, "example.com", 80),
+            ("  example.com:80 \n", None, "example.com", 80),
+            ("127.0.0.1:1", None, "127.0.0.1", 1),
+            ("[::1]:65535", None, "::1", 65535),
+            ("[fe80::1%eth0]:80", None, "fe80::1%eth0", 80),
+            ("::1", Some(12345), "::1", 12345),
+            ("2001:db8::7", Some(9), "2001:db8::7", 9),
+            ("example.local", Some(9000), "example.local", 9000),
+            ("[::1]", Some(7), "::1", 7),
+        ] {
+            assert_eq!(
+                parse_host_port(input, default).unwrap_or_else(|e| panic!("{input:?}: {e}")),
+                (host.to_string(), port),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_parse_host_port_ipv6() {
-        assert_eq!(
-            parse_host_port("[::1]:12345", None).unwrap(),
-            ("::1".to_string(), 12345)
-        );
-        assert_eq!(
-            parse_host_port("::1", Some(12345)).unwrap(),
-            ("::1".to_string(), 12345)
-        );
-        assert!(parse_host_port("::1", None).is_err());
+    fn parse_host_port_refuses_what_cannot_be_dialled() {
+        let refused = |input: &str, default: Option<u16>| {
+            if let Ok(parsed) = parse_host_port(input, default) {
+                panic!("{input:?} (default {default:?}) was accepted as {parsed:?}");
+            }
+        };
+        for default in [None, Some(12345)] {
+            // Nothing to dial.
+            for input in ["", "   ", ":80", "[]:80", "[]"] {
+                refused(input, default);
+            }
+            // Pasted URLs and garbage are not hosts.
+            for input in [
+                "http://example.com:8080",
+                "chat-p2p://invite/abc",
+                "example.com:80:90",
+                "ex ample.com:80",
+                "[::1]x",
+                "[::1:80",
+            ] {
+                refused(input, default);
+            }
+        }
+        // Ports that cannot be dialled.
+        for input in [
+            "example.com:0",
+            "example.com:65536",
+            "example.com:-1",
+            "example.com:+80",
+            "example.com:",
+            "[::1]:0",
+        ] {
+            refused(input, None);
+        }
+        // A bare IPv6 address with no default port is ambiguous, not "::" + port 1.
+        refused("::1", None);
     }
 
     #[test]

@@ -442,15 +442,18 @@ pub fn derive_session_key(
         ));
     }
 
-    // Use HKDF-SHA256 to derive session key
-    // Salt is now supported (and recommended to be transcript hash)
-    let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
+    Ok(derive_from_shared(shared_secret.as_bytes(), salt, info))
+}
 
+/// The HKDF-SHA256 half of [`derive_session_key`], split out so the binding
+/// of the key to its salt (the transcript hash) and info can be tested
+/// against a fixed shared secret — an `EphemeralSecret` cannot be reused.
+fn derive_from_shared(shared: &[u8], salt: Option<&[u8]>, info: &[u8]) -> [u8; AES_KEY_SIZE] {
+    let hkdf = Hkdf::<Sha256>::new(salt, shared);
     let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
-
-    Ok(session_key)
+    session_key
 }
 
 /// Generate a new session key by rekeying the current key with a nonce
@@ -922,46 +925,28 @@ mod tests {
         assert_eq!(public2.as_bytes().len(), 32);
     }
 
+    /// The session key is bound to the handshake transcript (the salt) and to
+    /// the protocol context (the info): change either and the key changes, so
+    /// a MITM's two handshakes, or a downgrade to another context, cannot meet
+    /// on one key. The known answer pins the derivation itself, which both
+    /// peers compute independently — computed with an independent HKDF-SHA256.
     #[test]
-    fn test_ecdh_key_agreement() {
-        // Alice generates keypair
-        let (alice_secret, _alice_public) = generate_ephemeral_keypair();
-
-        // Bob generates keypair
-        let (bob_secret, _bob_public) = generate_ephemeral_keypair();
-
-        // Both derive the same session key
-        let info = b"test-context";
-        let alice_session_key = derive_session_key(alice_secret, &_bob_public, None, info).unwrap();
-        let bob_session_key = derive_session_key(bob_secret, &_alice_public, None, info).unwrap();
-
-        // Keys should match
-        assert_eq!(alice_session_key, bob_session_key);
-        assert_eq!(alice_session_key.len(), AES_KEY_SIZE);
-    }
-
-    #[test]
-    fn test_ecdh_different_context() {
-        let (alice_secret, _alice_public) = generate_ephemeral_keypair();
-        let (_bob_secret, bob_public) = generate_ephemeral_keypair();
-
-        // Different context strings produce different keys
-        let key1 = derive_session_key(alice_secret, &bob_public, None, b"context1").unwrap();
-
-        let (alice_secret2, _) = generate_ephemeral_keypair();
-        let key2 = derive_session_key(alice_secret2, &bob_public, None, b"context2").unwrap();
-
-        // Keys should be different (different secrets)
-        assert_ne!(key1, key2);
-    }
-
-    #[test]
-    fn test_x25519_public_key_parsing() {
-        let (_, public) = generate_ephemeral_keypair();
-        let bytes = public.as_bytes();
-
-        let parsed = parse_x25519_public(bytes).unwrap();
-        assert_eq!(parsed.as_bytes(), bytes);
+    fn the_session_key_is_bound_to_its_transcript_and_context() {
+        let shared = [0x33u8; 32];
+        let key = derive_from_shared(&shared, Some(b"transcript"), b"p2p-messenger-v2");
+        assert_eq!(
+            hex::encode(key),
+            "06a9df96d6be81c3e817eeba6458cb680c50ed66b19c6e3bc9e66a6f847d452b"
+        );
+        assert_ne!(
+            key,
+            derive_from_shared(&shared, Some(b"transcripu"), b"p2p-messenger-v2")
+        );
+        assert_ne!(key, derive_from_shared(&shared, None, b"p2p-messenger-v2"));
+        assert_ne!(
+            key,
+            derive_from_shared(&shared, Some(b"transcript"), b"p2p-messenger-v3")
+        );
     }
 
     #[test]
@@ -1050,98 +1035,35 @@ mod tests {
 
     // ========== Key Rotation (Rekeying) Tests ==========
 
+    /// The rekey derivation is a wire contract, like the SAS: both peers
+    /// derive the next key independently, so two builds that disagree on the
+    /// salt, the info string or the KDF desynchronise on the hundredth message.
+    /// Random-input tests ("same input, same output") pass for any such change;
+    /// a known answer — computed with an independent HKDF-SHA256 — does not.
     #[test]
-    fn test_rekey_derives_correct_key() {
-        // Current key (32 bytes) - randomly generated
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-
-        // Nonce for rekeying (16 bytes, random)
-        let nonce: [u8; 16] = rand::thread_rng().gen();
-
-        // Derive next key
-        let next_key = rekey_session_key(&current_key, &nonce);
-
-        // Next key should be 32 bytes (same size)
-        assert_eq!(next_key.len(), AES_KEY_SIZE);
-
-        // Next key should be different from current key
-        assert_ne!(next_key, current_key);
+    fn rekey_derivation_matches_its_known_answer() {
+        let next = rekey_session_key(&[0x11; AES_KEY_SIZE], &[0x22; 16]);
+        assert_eq!(
+            hex::encode(next),
+            "5f1e2782c6a5e7d582b30428aa7cb0e8a6eeae8c6f4c7627024e1dc9943883b7"
+        );
     }
 
+    /// Every input contributes: a different nonce or a different current key
+    /// gives a different next key, and the next key is never the current one.
     #[test]
-    fn test_rekey_deterministic() {
-        // Rekeying with the same inputs should produce the same output
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-        let nonce: [u8; 16] = rand::thread_rng().gen();
-
-        let key1 = rekey_session_key(&current_key, &nonce);
-        let key2 = rekey_session_key(&current_key, &nonce);
-
-        // Same inputs should produce identical output (deterministic)
-        assert_eq!(key1, key2);
-    }
-
-    #[test]
-    fn test_rekey_different_nonces() {
-        // Different nonces should produce different keys
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-        let nonce1: [u8; 16] = rand::thread_rng().gen();
-        let mut nonce2: [u8; 16] = rand::thread_rng().gen();
-        // Ensure nonces are different
-        if nonce1 == nonce2 {
-            nonce2[0] = nonce2[0].wrapping_add(1);
-        }
-
-        let key1 = rekey_session_key(&current_key, &nonce1);
-        let key2 = rekey_session_key(&current_key, &nonce2);
-
-        // Different nonces should produce different keys
-        assert_ne!(key1, key2);
-    }
-
-    #[test]
-    fn test_generate_rekey_nonce() {
-        let nonce1 = generate_rekey_nonce();
-        let nonce2 = generate_rekey_nonce();
-
-        // Nonces should be 16 bytes
-        assert_eq!(nonce1.len(), 16);
-        assert_eq!(nonce2.len(), 16);
-
-        // Nonces should be different (with overwhelming probability)
-        assert_ne!(nonce1, nonce2);
-    }
-
-    #[test]
-    fn test_rekey_encryption_flow() {
-        // Test that rekeying doesn't break encryption/decryption
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-        let cipher1 = AesCipher::new(&current_key).unwrap();
-
-        // Encrypt message with first key
-        let plaintext = b"Message before rekeying";
-        let encrypted = cipher1.encrypt(plaintext, None);
-
-        // Decrypt with same cipher should work
-        let decrypted = cipher1.decrypt(&encrypted, None).unwrap();
-        assert_eq!(plaintext, &decrypted[..]);
-
-        // Now rekey
+    fn rekey_depends_on_both_the_key_and_the_nonce() {
+        let key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
         let nonce = generate_rekey_nonce();
-        let next_key = rekey_session_key(&current_key, &nonce);
-        let cipher2 = AesCipher::new(&next_key).unwrap();
-
-        // Encrypt with new key
-        let plaintext2 = b"Message after rekeying";
-        let encrypted2 = cipher2.encrypt(plaintext2, None);
-
-        // Decrypt should work with new key
-        let decrypted2 = cipher2.decrypt(&encrypted2, None).unwrap();
-        assert_eq!(plaintext2, &decrypted2[..]);
-
-        // Old cipher can still decrypt its own ciphertexts
-        let old_decrypt = cipher1.decrypt(&encrypted, None).unwrap();
-        assert_eq!(plaintext, &old_decrypt[..]);
+        assert_ne!(nonce, generate_rekey_nonce(), "rekey nonces must be fresh");
+        let mut other_nonce = nonce;
+        other_nonce[0] ^= 1;
+        let mut other_key = key;
+        other_key[0] ^= 1;
+        let next = rekey_session_key(&key, &nonce);
+        assert_ne!(next, key);
+        assert_ne!(next, rekey_session_key(&key, &other_nonce));
+        assert_ne!(next, rekey_session_key(&other_key, &nonce));
     }
 
     // ========== Ed25519 Signature Tests ==========

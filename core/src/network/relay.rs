@@ -32,7 +32,7 @@ use crate::core::{recv_packet, send_packet};
 use crate::network::punch::{attempt_punch, parse_candidates, PunchRole, MAX_PUNCH_CANDIDATES};
 use crate::network::ratelimit::RateLimiter;
 
-const RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 const RELAY_TOKEN_BYTES: usize = 16;
 /// How long a freshly accepted connection has to send its `Host`/`Join` frame.
 ///
@@ -152,6 +152,17 @@ pub async fn run_relay_server(port: u16) -> Result<()> {
 /// constant.
 pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duration) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!("Relay server listening on port {}", port);
+    serve_relay(listener, wait_timeout).await
+}
+
+/// Serve the rendezvous on a listener the caller already bound.
+///
+/// Taking the listener rather than a port is what lets a test bind
+/// `127.0.0.1:0` and know the relay is listening the moment this is spawned:
+/// the "pick a free port, release it, let the server bind it, sleep and hope"
+/// pattern raced other tests for the port and slept on every run.
+pub async fn serve_relay(listener: TcpListener, wait_timeout: Duration) -> Result<()> {
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     // Same hardening the community server's accept loop has: an unlimited
     // connection rate against a public rendezvous is an unlimited task and
@@ -160,7 +171,6 @@ pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duratio
         RELAY_MAX_CONNECTIONS_PER_IP,
         RELAY_RATE_WINDOW,
     )));
-    tracing::info!("Relay server listening on port {}", port);
 
     loop {
         // A failed `accept` is almost always transient (the peer went away
@@ -778,19 +788,8 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Reserve an ephemeral loopback port, then free it for the server to bind.
-    fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-        listener.local_addr().expect("local addr").port()
-    }
-
     async fn start_relay() -> String {
-        let port = free_port();
-        tokio::spawn(async move {
-            let _ = run_relay_server(port).await;
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        format!("127.0.0.1:{port}")
+        start_relay_with_wait(RELAY_WAIT_TIMEOUT).await
     }
 
     async fn exchange_ping_pong(host: RelayStream, join: RelayStream) {
@@ -882,12 +881,10 @@ mod tests {
     /// Start a relay whose rendezvous slots expire almost immediately, so the
     /// expiry paths can be exercised without a five-minute test.
     async fn start_relay_with_wait(wait: Duration) -> String {
-        let port = free_port();
-        tokio::spawn(async move {
-            let _ = run_relay_server_with_wait_timeout(port, wait).await;
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        format!("127.0.0.1:{port}")
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        tokio::spawn(serve_relay(listener, wait));
+        addr
     }
 
     /// A joiner presenting a token nobody is hosting must be told so, promptly.
@@ -1060,8 +1057,7 @@ mod tests {
             Error(String),
         }
 
-        pub async fn run(port: u16) -> Result<()> {
-            let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        pub async fn run(listener: TcpListener) -> Result<()> {
             let pending: Arc<Mutex<HashMap<String, oneshot::Sender<TcpStream>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             loop {
@@ -1097,12 +1093,9 @@ mod tests {
 
     #[tokio::test]
     async fn new_clients_fall_back_against_a_legacy_server() {
-        let port = free_port();
-        tokio::spawn(async move {
-            let _ = legacy_server::run(port).await;
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let relay_addr = format!("127.0.0.1:{port}");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let relay_addr = listener.local_addr().expect("addr").to_string();
+        tokio::spawn(legacy_server::run(listener));
         let token = generate_relay_token();
 
         // Punch-capable registration gets dropped by the old server; the

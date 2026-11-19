@@ -451,8 +451,18 @@ async fn reach_ready(host: &mut Peer, client: &mut Peer) {
 /// every 1 s against a 3 s idle timeout, then 6 s of pure silence.
 #[tokio::test]
 async fn idle_session_survives_past_the_idle_timeout() {
-    // Read at message-loop startup, so set before the pair connects. nextest
-    // runs each test in its own process, so this cannot leak across tests.
+    // Read at message-loop startup, so set before the pair connects, and
+    // removed when the test ends — under nextest each test is its own process,
+    // but under plain `cargo test` the rest of this binary would inherit a 3 s
+    // idle timeout.
+    struct ShortTimers;
+    impl Drop for ShortTimers {
+        fn drop(&mut self) {
+            std::env::remove_var("P2PEM_TEST_KEEPALIVE_SECS");
+            std::env::remove_var("P2PEM_TEST_IDLE_TIMEOUT_SECS");
+        }
+    }
+    let _restore = ShortTimers;
     std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "1");
     std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "3");
 

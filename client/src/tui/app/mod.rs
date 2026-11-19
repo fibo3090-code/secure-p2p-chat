@@ -159,12 +159,20 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(logs: LogBuffer) -> Result<Self> {
+        let data_dir = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger")
+            .map(|dirs| dirs.data_dir().to_path_buf());
+        Self::new_in(data_dir, logs)
+    }
+
+    /// [`TuiApp::new`] with the data directory (identity + history) chosen by
+    /// the caller. Tests pass a temp dir: through `new` they read the
+    /// developer's real `identity.json` and, on a machine with none, wrote a
+    /// `history.json.enc` under a throwaway key that the real client could
+    /// then never decrypt.
+    pub fn new_in(data_dir: Option<PathBuf>, logs: LogBuffer) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
 
-        let proj_dirs = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
-
-        let (history_path, identity, _is_new_identity) = if let Some(ref dirs) = proj_dirs {
-            let data_dir = dirs.data_dir();
+        let (history_path, identity, _is_new_identity) = if let Some(ref data_dir) = data_dir {
             std::fs::create_dir_all(data_dir).ok();
 
             let (identity, is_new) = Identity::get_or_create(data_dir, "TUI_User")?;
@@ -1658,8 +1666,13 @@ mod tests {
     use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
-    fn app() -> TuiApp {
-        TuiApp::new(LogBuffer::new()).unwrap()
+    /// An app over a throwaway data directory, never the developer's own.
+    /// Hold the returned directory for as long as the app: dropping it deletes
+    /// the identity and history the app is using.
+    fn app() -> (TuiApp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("data dir");
+        let app = TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app");
+        (app, dir)
     }
 
     fn key(c: char) -> KeyEvent {
@@ -1681,7 +1694,7 @@ mod tests {
 
     #[test]
     fn fingerprint_accept_confirms_and_stores() {
-        let mut app = app();
+        let (mut app, _data) = app();
         let chat_id = Uuid::new_v4();
         app.chat_manager
             .create_local_chat_for_test(chat_id, "Peer".into());
@@ -1711,7 +1724,7 @@ mod tests {
 
     #[test]
     fn fingerprint_reject_declines_and_removes_chat() {
-        let mut app = app();
+        let (mut app, _data) = app();
         let chat_id = Uuid::new_v4();
         app.chat_manager
             .create_local_chat_for_test(chat_id, "Peer".into());
@@ -1736,7 +1749,7 @@ mod tests {
     /// keys must answer nothing — "hey" + Enter used to trust the peer.
     #[test]
     fn typing_into_the_fingerprint_prompt_does_not_answer_it() {
-        let mut app = app();
+        let (mut app, _data) = app();
         let chat_id = Uuid::new_v4();
         app.chat_manager
             .create_local_chat_for_test(chat_id, "Peer".into());
@@ -1774,7 +1787,7 @@ mod tests {
     /// to contain ":clear-history\n" used to run it.
     #[test]
     fn a_paste_is_text_never_keystrokes() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.handle_paste(":clear-history\ny\n");
         assert_eq!(app.overlay, TuiOverlay::None);
         assert_eq!(app.mode, TuiMode::Normal);
@@ -1782,7 +1795,7 @@ mod tests {
 
         // In command mode a multi-line paste collapses to one line and is
         // still not executed.
-        let mut app = self::app();
+        let (mut app, _data) = self::app();
         app.enter_command_mode();
         app.handle_paste("quit\nnow");
         assert_eq!(app.mode, TuiMode::Command);
@@ -1795,7 +1808,7 @@ mod tests {
     /// saved without it.
     #[test]
     fn the_first_run_password_prompt_cannot_be_dismissed() {
-        let mut app = app();
+        let (mut app, _data) = app();
         assert!(!app.identity.is_encrypted());
         app.overlay = TuiOverlay::Password {
             mode: PasswordMode::Set,
@@ -1820,7 +1833,7 @@ mod tests {
         // Generated, not written out: the test needs a right and a wrong one.
         let password = format!("pw-{}", Uuid::new_v4());
         let wrong = format!("pw-{}", Uuid::new_v4());
-        let mut app = app();
+        let (mut app, _data) = app();
         app.history_path = dir.path().join("history.json.enc");
         app.identity_path = dir.path().join("identity.json");
         let mut identity = Identity::new_with_plaintext("T".into()).unwrap();
@@ -1865,7 +1878,7 @@ mod tests {
     #[test]
     fn autosave_skips_an_unchanged_history() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = app();
+        let (mut app, _data) = app();
         app.history_path = dir.path().join("history.json.enc");
         // `TuiApp::new` reads the machine's real data dir; whatever it found
         // there is not this test's business.
@@ -1898,7 +1911,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_command_toggles_config() {
-        let mut app = app();
+        let (mut app, _data) = app();
         assert!(app.chat_manager.config.enable_notifications);
         app.execute_command(TuiCommand::Set {
             key: "notifications".into(),
@@ -1917,7 +1930,7 @@ mod tests {
 
     #[tokio::test]
     async fn contacts_overlay_opens_and_closes() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.execute_command(TuiCommand::Contacts).await;
         assert_eq!(app.overlay, TuiOverlay::Contacts);
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1926,7 +1939,7 @@ mod tests {
 
     #[tokio::test]
     async fn contact_add_then_resolve_by_index_and_name() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.execute_command(TuiCommand::ContactAdd {
             name: "Alice".into(),
             address: "127.0.0.1:9000".into(),
@@ -1941,7 +1954,7 @@ mod tests {
 
     #[test]
     fn unread_marks_unselected_chats() {
-        let mut app = app();
+        let (mut app, _data) = app();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         app.chat_manager.create_local_chat_for_test(a, "A".into());
@@ -1968,7 +1981,7 @@ mod tests {
 
     #[test]
     fn command_autocomplete_matches_and_completes() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.enter_command_mode();
         // Empty buffer => no suggestions (so Up recalls history instead).
         assert!(app.command_suggestions.is_empty());
@@ -1989,7 +2002,7 @@ mod tests {
 
     #[test]
     fn command_autocomplete_arrows_cycle_selection() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.enter_command_mode();
         app.handle_key_event(key('c'));
         let n = app.command_suggestions.len();
@@ -2006,7 +2019,7 @@ mod tests {
 
     #[tokio::test]
     async fn quit_command_requires_confirmation() {
-        let mut app = app();
+        let (mut app, _data) = app();
         app.execute_command(TuiCommand::Quit).await;
         assert_eq!(app.overlay, TuiOverlay::ConfirmQuit);
         assert!(!app.should_quit);

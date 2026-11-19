@@ -1679,7 +1679,14 @@ where
 /// Read a duration override (whole seconds) from an environment variable, for
 /// integration tests that need realistic-wall-clock verification of the
 /// keep-alive/idle behavior. Falls back to `default` when unset or invalid.
+///
+/// Debug builds only. These are test hooks, and in a release binary they
+/// would let anything that controls the environment shorten a real session's
+/// idle timeout; tests run in the debug profile, the shipped app does not.
 fn duration_from_env(var: &str, default: std::time::Duration) -> std::time::Duration {
+    if !cfg!(debug_assertions) {
+        return default;
+    }
     std::env::var(var)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -2587,25 +2594,6 @@ mod tests {
         let typing = ProtocolMessage::TypingStart { seq: 4 };
         assert!(validate_message_sequence(&typing, &mut last_valid_seq).is_ok());
         assert_eq!(last_valid_seq, 4);
-    }
-
-    /// Previous regression test - now replaced with comprehensive tests above
-    /// This documents that Phase 2 (Issue #6) is now COMPLETE
-    #[test]
-    fn test_issue_6_replay_protection_complete() {
-        // Issue #6: Replay Protection & Key Rotation
-        //
-        // Phase 2 (Transport-Layer Validation) - COMPLETED ✅
-        // - Sequence numbers are now validated in transport layer (run_message_loop)
-        // - Replayed/out-of-order messages are rejected before app receives them
-        // - See test_transport_layer_replay_protection() for comprehensive validation
-        //
-        // Phase 3 (Key Rotation) - FUTURE WORK
-        // - Implement periodic session key re-negotiation
-        // - Add RekeyRequest protocol message
-        // - Both sides independently track rekey schedule
-        //
-        // NOTE: Transport-layer replay protection is now implemented in Issue #6 Phase 2
     }
 
     /// A proof whose PEM carries the victim's key in a preamble and the

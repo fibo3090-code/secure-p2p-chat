@@ -434,18 +434,30 @@ mod tests {
         assert_eq!(peers.len(), 1);
     }
 
-    /// Exercises the register → poll → unregister lifecycle when an mDNS daemon is
-    /// available. Sandboxed CI without multicast may be unable to start the
-    /// daemon; in that case the constructor path is still exercised and the test
-    /// does not fail on an environment limitation. `poll` is non-blocking.
+    /// The register → poll → unregister lifecycle, when the environment can
+    /// start an mDNS daemon at all (a sandbox without multicast cannot, and
+    /// that is not this code's failure). `poll` runs on the UI thread every
+    /// frame, so it must not block; a registration that succeeded must be
+    /// undoable.
     #[test]
-    fn discovery_lifecycle_is_non_panicking_when_available() {
-        if let Ok(mut discovery) = Discovery::new() {
-            let _ = discovery.register("test-peer", 12345);
-            let peers = Arc::new(Mutex::new(Vec::new()));
-            discovery.poll(&peers); // must return immediately
-            let _ = discovery.unregister();
-            // Dropping also unregisters; must not panic.
+    fn discovery_lifecycle_does_not_block_the_caller() {
+        let Ok(mut discovery) = Discovery::new() else {
+            return;
+        };
+        let registered = discovery.register("test-peer", 12345).is_ok();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let started = std::time::Instant::now();
+        discovery.poll(&peers);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "poll blocked for {:?}",
+            started.elapsed()
+        );
+        if registered {
+            assert!(
+                discovery.unregister().is_ok(),
+                "a registration could not be undone"
+            );
         }
     }
 }

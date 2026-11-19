@@ -461,6 +461,13 @@ mod tests {
     use ratatui::Terminal;
     use uuid::Uuid;
 
+    /// An app over a throwaway data directory, never the developer's own.
+    fn test_app() -> (TuiApp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("data dir");
+        let app = TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app");
+        (app, dir)
+    }
+
     fn draw_once(app: &mut TuiApp) {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -501,8 +508,8 @@ mod tests {
             TuiOverlay::ConfirmClearHistory,
             TuiOverlay::ConfirmWipe,
         ];
+        let (mut app, _data) = test_app();
         for ov in overlays {
-            let mut app = TuiApp::new(LogBuffer::new()).expect("app");
             app.overlay = ov;
             draw_once(&mut app);
         }
@@ -510,7 +517,7 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_with_stale_chat_ids() {
-        let mut app = TuiApp::new(LogBuffer::new()).expect("app");
+        let (mut app, _data) = test_app();
         let stale_id = Uuid::new_v4();
         app.chat_ids = vec![stale_id];
         app.chat_list_state.select(Some(0));
@@ -528,7 +535,7 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_on_small_terminal_size() {
-        let mut app = TuiApp::new(LogBuffer::new()).expect("app");
+        let (mut app, _data) = test_app();
         app.focus = TuiFocus::Input;
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
