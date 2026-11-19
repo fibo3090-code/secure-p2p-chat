@@ -17,6 +17,9 @@
   /* Ink on a filled sent bubble. Every theme's --mine is chosen to keep this at
      ≥4.5:1, so a sent message is as readable as a received one. */
   --mine-ink:#ffffff;
+  /* Filled destructive surfaces carry white ink, so they take a deep red of
+     their own rather than --error, which is tuned to be read as text. */
+  --error-fill:#c62828;
 }
 :root[data-theme="dark"]{
   --bg:#0a0e16; --s1:#0f1521; --s2:#141c2a; --s3:#1d2738; --s4:#243144;
@@ -40,7 +43,7 @@
   --border:rgba(15,23,42,.09); --border-2:rgba(15,23,42,.14);
   --text:#0f1b2d; --dim:#51637a; --faint:#56657a;
   --accent:#3f5fd9;
-  --accent-text:#3f5fd9;
+  --accent-text:#3a57c9;
   --accent-ink:#ffffff;
   /* Status ink is redefined for a white page: the dark-theme hues sit at
      1.6–2.1:1 on white, which made "Unverified" and "Never backed up" the two
@@ -110,7 +113,7 @@ input,textarea{font-family:inherit;color:inherit}
 .btn-success:hover{filter:brightness(1.07)}
 .btn-warning{background:var(--warning);color:#1e1700}
 .btn-warning:hover{filter:brightness(1.06)}
-.btn-danger{background:#c62828;color:#fff}
+.btn-danger{background:var(--error-fill);color:#fff}
 .btn-danger:hover{filter:brightness(1.07)}
 .btn-danger-ghost{background:color-mix(in oklab,var(--error) 14%,transparent);color:var(--error)}
 .btn-danger-ghost:hover{background:color-mix(in oklab,var(--error) 22%,transparent)}
@@ -136,7 +139,7 @@ input,textarea{font-family:inherit;color:inherit}
 .onb-h{font-family:var(--display);font-weight:600;font-size:16px}
 .onb-p{color:var(--dim);font-size:12.5px;margin-top:3px}
 .onb-field{display:flex;flex-direction:column;gap:7px}
-.onb-flabel{font-size:11.5px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+.onb-flabel{font-size:12.5px;font-weight:600;color:var(--dim)}
 .onb-fhint{font-size:11.5px;color:var(--faint)}
 .onb-err{display:flex;align-items:center;gap:5px;color:var(--error);font-size:12px}
 .onb-foot{display:flex;flex-direction:column;gap:10px;align-items:center;text-align:center}
@@ -234,8 +237,11 @@ input,textarea{font-family:inherit;color:inherit}
   background:var(--accent);color:var(--accent-ink);font-size:11px;font-weight:700;display:grid;place-items:center;
   box-shadow:0 0 0 2px var(--s1);font-variant-numeric:tabular-nums}
 .rail-foot{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%}
+.rail-gate{position:relative}
+.rail-gate::after{content:"";position:absolute;top:8px;right:20px;width:8px;height:8px;border-radius:50%;
+  background:var(--success);box-shadow:0 0 0 2px var(--s1)}
+.rail-gate.is-closed::after{background:var(--warning)}
 .rail-gate.is-closed{color:var(--warning);background:color-mix(in oklab,var(--warning) 10%,transparent)}
-.rail-gate .rail-label{display:block}
 .rail-id{border-radius:50%;transition:transform .13s;padding:2px}
 .rail-id:hover{transform:scale(1.05)}
 .rail-id.is-active{box-shadow:0 0 0 2px var(--accent)}
@@ -353,7 +359,7 @@ input,textarea{font-family:inherit;color:inherit}
 .chat-trust{display:inline-flex;align-items:center;gap:4px;font-size:12.5px;font-weight:500;
   padding:1px 7px 1px 5px;margin:-1px 0 -1px -3px;border-radius:20px;transition:background .13s}
 .chat-trust.is-ok{color:var(--success)}
-.chat-trust.is-pending{color:var(--dim);box-shadow:inset 0 0 0 1px var(--border-2)}
+.chat-trust.is-pending{color:var(--dim)}
 .chat-trust.is-pending:hover{color:var(--text)}
 .chat-trust:hover{background:var(--s3)}
 .chat-head-actions{display:flex;gap:2px;flex:none}
@@ -386,7 +392,8 @@ input,textarea{font-family:inherit;color:inherit}
 
 /* Bubbles. Spacing comes from the run position: a new turn gets air, a
    continuation sits close; only the last bubble of a run has the tail corner. */
-.msg-row{display:flex;margin-top:10px}
+.msg-row{display:flex;margin-top:10px;animation:msg-in .2s cubic-bezier(.2,.7,.3,1)}
+@keyframes msg-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .msg-row.pos-mid,.msg-row.pos-last{margin-top:2px}
 .msg-row.is-mine{justify-content:flex-end}
 .msg-bubble{--r:18px;--rt:6px;position:relative;max-width:min(560px,72%);padding:7px 12px 7px 13px;
@@ -769,7 +776,7 @@ input,textarea{font-family:inherit;color:inherit}
 .role-host{color:var(--warning);background:color-mix(in oklab,var(--warning) 14%,transparent)}
 .role-member{color:var(--dim);background:var(--s3)}
 .cc-act.danger{color:var(--error)}
-.cc-act.danger:hover{background:var(--error);color:#fff}
+.cc-act.danger:hover{background:var(--error-fill);color:#fff}
 .pd-fp{display:flex;gap:16px;align-items:center;background:var(--s1);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px}
 .pd-fp-text{display:flex;flex-direction:column;gap:7px;min-width:0}
 .pd-fp-text code{font-family:var(--mono);font-size:12px;color:var(--dim);word-break:break-all}
@@ -892,7 +899,7 @@ input,textarea{font-family:inherit;color:inherit}
 .party-head-r{display:flex;align-items:center;gap:10px;flex:none}
 .party-leave{display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:var(--r-sm);font-size:12.5px;color:var(--dim)}
 .party-leave:hover{background:var(--s3);color:var(--text)}
-.party-leave.is-confirm{background:var(--error);color:#fff}
+.party-leave.is-confirm{background:var(--error-fill);color:#fff}
 /* disconnected / rejected recovery bar (unlike .party-error, its buttons are real .btn) */
 .party-banner{flex:none;display:flex;align-items:center;gap:10px;padding:9px 18px;background:var(--s2);
   font-size:13px;color:var(--dim);border-bottom:1px solid var(--border)}
@@ -930,7 +937,7 @@ input,textarea{font-family:inherit;color:inherit}
 .party-row:hover .party-rowacts,.party-row:focus-within .party-rowacts{opacity:1}
 .party-rowacts button{display:grid;place-items:center;width:24px;height:24px;border-radius:var(--r-sm);color:var(--faint)}
 .party-rowacts button:hover{background:var(--s3);color:var(--text)}
-.party-rowacts button.is-confirm{background:var(--error);color:#fff;opacity:1}
+.party-rowacts button.is-confirm{background:var(--error-fill);color:#fff;opacity:1}
 .party-rolesel{flex:none;opacity:0;transition:opacity .12s ease;background:var(--s2);color:var(--dim);
   border:1px solid var(--border);border-radius:var(--r-sm);font-size:11px;padding:2px 3px;max-width:74px}
 .party-row:hover .party-rolesel,.party-row:focus-within .party-rolesel{opacity:1}
@@ -970,7 +977,7 @@ input,textarea{font-family:inherit;color:inherit}
 .drive-act:hover:not(:disabled){background:var(--s4);color:var(--text)}
 .drive-act:disabled{opacity:.5;cursor:default}
 .drive-del:hover{background:rgba(229,72,77,.16);color:var(--error)}
-.drive-del.is-confirm{background:var(--error);color:#fff}
+.drive-del.is-confirm{background:var(--error-fill);color:#fff}
 
 .audit-row{display:flex;align-items:baseline;gap:10px;padding:8px 11px;border-radius:var(--r-sm);
   background:var(--s2);font-size:12.5px;flex-wrap:wrap}
@@ -1103,7 +1110,8 @@ button.contact-row-main:disabled{cursor:default}
 .set-layout :not(.set-row)+.set-row{border-top-left-radius:14px;border-top-right-radius:14px}
 .set-layout .set-row:not(:has(+ .set-row)){border-bottom-width:1px;border-bottom-left-radius:14px;
   border-bottom-right-radius:14px;margin-bottom:10px}
-.set-layout .set-row.is-warn{border-color:color-mix(in srgb,var(--warning) 45%,var(--border))}
+.set-layout .set-row.is-warn{border-color:var(--border);box-shadow:inset 3px 0 0 var(--warning);
+  background:color-mix(in oklab,var(--warning) 5%,var(--s1))}
 .set-path{font-family:var(--mono);font-size:12px}
 
 @media (max-width: 980px){
@@ -1118,3 +1126,9 @@ button.contact-row-main:disabled{cursor:default}
 
 .chat-empty-logo{display:grid;place-items:center;margin:0 auto 18px;opacity:.9;
   --logo-ink:var(--canvas);filter:drop-shadow(0 12px 26px color-mix(in oklab,#4f46e5 30%,transparent))}
+.card-actions.is-start{justify-content:flex-start;flex-wrap:wrap}
+.list-row-use{flex:none;display:inline-flex;align-items:center;gap:4px;font-size:12.5px;font-weight:600;
+  color:var(--accent-text);padding:4px 10px;border-radius:8px;background:color-mix(in oklab,var(--accent) 12%,transparent)}
+.list-row-use.is-on{color:var(--success);background:color-mix(in oklab,var(--success) 12%,transparent)}
+.chat-empty-link{color:var(--accent-text);font-weight:600;text-decoration:underline;text-underline-offset:2px;
+  text-decoration-color:color-mix(in oklab,currentColor 45%,transparent)}

@@ -66,7 +66,7 @@ export function InfoDialog({ target, onClose }) {
       p: `You compared safety codes with ${target.name}. If their key ever changes, you'll be asked to check again before anything is sent.` }
     : online
       ? { cls: "is-pending", icon: "shieldAlert", h: "Not verified yet",
-        p: "This connection hasn't been checked. Reconnect when you can talk to them by voice or in person — you'll both see a six-digit safety code to compare before trusting it." }
+        p: "This connection hasn't been checked. The next time you connect, you'll both see a six-digit safety code — compare it by voice or in person before trusting it." }
       : { cls: "is-pending", icon: "shieldAlert", h: "Not verified yet",
         p: `You'll compare a safety code with ${target.name} the next time you connect. Until then, the encryption protects the messages, but nothing proves who is on the other end.` };
   return (

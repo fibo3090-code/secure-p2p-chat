@@ -5,7 +5,7 @@ import { cx, Avatar, Button, Modal, Page, OverflowMenu } from "./ui.jsx";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
-export function Contacts({ onConnected, onOpenChat }) {
+export function Contacts({ onConnected, onOpenChat, connectedChats }) {
   const [contacts, setContacts] = useState([]);
   const [link, setLink] = useState("");
   const [err, setErr] = useState("");
@@ -105,7 +105,9 @@ export function Contacts({ onConnected, onOpenChat }) {
           const verified = c.trust === "verified" || c.trust === "trusted";
           // How you would reach them, in words. "No way to reach them", in
           // Title Case next to an amber dot, read like a fault in the app.
-          const reach = blocked ? "Blocked"
+          // Already talking: offer the conversation, not a second session.
+          const live = !!(c.chat_id && connectedChats && connectedChats.has(c.chat_id));
+          const reach = blocked ? "Blocked" : live ? "Connected"
             : !c.reachable ? "No saved address"
               : c.relay_only ? "Reachable via relay" : "Reachable directly";
           return (
@@ -132,11 +134,17 @@ export function Contacts({ onConnected, onOpenChat }) {
                 {/* A contact imported from a relay invite has no direct
                     address but is still dialable through its relay token —
                     `reachable` covers both, `address` only covered one. */}
-                <Button size="sm" variant="ghost" icon="plug"
-                  title={c.reachable ? `Connect to ${c.name}` : "No saved address for this contact"}
-                  onClick={() => connect(c.id)} disabled={!c.reachable || blocked}>
-                  Connect
-                </Button>
+                {live ? (
+                  <Button size="sm" variant="ghost" icon="message" onClick={() => onOpenChat && onOpenChat(c.chat_id)}>
+                    Message
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="ghost" icon="plug"
+                    title={c.reachable ? `Connect to ${c.name}` : "No saved address for this contact"}
+                    onClick={() => connect(c.id)} disabled={!c.reachable || blocked}>
+                    Connect
+                  </Button>
+                )}
                 <OverflowMenu label={`More actions for ${c.name}`} items={[
                   { icon: "copy", label: "Copy fingerprint", disabled: !c.fingerprint, onClick: () => copyFingerprint(c) },
                   { icon: blocked ? "check" : "ban", label: blocked ? "Unblock" : "Block", onClick: () => toggleBlock(c) },

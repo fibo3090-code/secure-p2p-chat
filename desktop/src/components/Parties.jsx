@@ -85,6 +85,12 @@ function JoinForm({ onJoined, onCancel, initial }) {
   }
 
   const join = () => joinWith(address, username, password);
+  const pickedSaved = saved.find((p) => p.address === address.trim() && p.username === username.trim());
+  // With saved communities, the blank form waits behind "Join another
+  // community" — picking one of yours is the common path.
+  const [another, setAnother] = useState(false);
+  const showForm = saved.length === 0 || !!pickedSaved || another;
+  const passRef = useRef(null);
   // Field-level errors sit on the field they are about, not at the bottom of
   // the form under the password box.
   const errField = err === "Enter the server address." ? "addr"
@@ -153,24 +159,33 @@ function JoinForm({ onJoined, onCancel, initial }) {
                 // community went to whichever card was clicked next.
                 <button key={p.address} className={cx("list-row", picked && "is-picked")} disabled={busy}
                   title={`Fill in ${p.username}@${p.address}`} aria-pressed={picked}
-                  onClick={() => { setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); }}>
+                  onClick={() => {
+                    setAddress(p.address); setUsername(p.username); setPassword(""); setErr("");
+                    // Next step is the password (if it has one), then Join.
+                    setTimeout(() => passRef.current?.focus(), 0);
+                  }}>
                   <Avatar name={p.name || p.address} size={36} party />
                   <span className="list-row-main">
                     <span className="list-row-name">{p.name || p.address}</span>
-                    <span className="list-row-sub">Signed in as {p.username} · <span className="mono">{p.address}</span></span>
+                    <span className="list-row-sub">Username: {p.username} · <span className="mono">{p.address}</span></span>
                   </span>
-                  <span className="list-row-go">{picked ? <Icon name="check" size={16} /> : <Icon name="chevronRight" size={16} />}</span>
+                  <span className={cx("list-row-use", picked && "is-on")}>{picked ? <><Icon name="check" size={14} /> Selected</> : "Use"}</span>
                 </button>
               );
             })}
           </div>
         </section>
       )}
-      <form className="card" onSubmit={(e) => { e.preventDefault(); join(); }}>
-        <h2 className="card-title">{saved.length ? "Join or rejoin" : "Join a community"}</h2>
+      {!showForm && (
+        <div>
+          <Button variant="ghost" icon="plus" onClick={() => setAnother(true)}>Join another community</Button>
+        </div>
+      )}
+      {showForm && <form className="card" onSubmit={(e) => { e.preventDefault(); join(); }}>
+        <h2 className="card-title">{pickedSaved ? `Rejoin ${pickedSaved.name || pickedSaved.address}` : "Join a community"}</h2>
         <p className="card-lead">
-          {saved.length
-            ? "Pick one above to fill this in, or enter a new server. Add its password if it has one."
+          {pickedSaved
+            ? "Add its password if it has one, then join."
             : "Ask the operator for the server address and, if it has one, its password. The first time, you'll check its fingerprint before anything is sent."}
         </p>
         <div className="field-grid">
@@ -193,7 +208,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
         </div>
         <div className="field">
           <label className="field-label" htmlFor="party-pass">Server password <span className="field-opt">optional</span></label>
-          <PasswordInput id="party-pass" value={password} placeholder="Leave empty if the server has none"
+          <PasswordInput id="party-pass" ref={passRef} value={password} placeholder="Leave empty if the server has none"
             autoComplete="off"
             onChange={(e) => setPassword(e.target.value)} />
         </div>
@@ -201,7 +216,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
         <div className="card-actions">
           <Button icon="users" type="submit" disabled={busy}>Connect &amp; join</Button>
         </div>
-      </form>
+      </form>}
     </Page>
   );
 }

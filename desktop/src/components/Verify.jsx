@@ -35,7 +35,26 @@ export function Verify({ req, onClose }) {
   // stale error when a new request arrives — a security-sensitive dialog must
   // not show a previous request's failure before the user acts.
   useEffect(() => { setErr(""); }, [req?.chat_id]);
+  // What we already know about this conversation: a fingerprint stored from an
+  // earlier verification (so a *different* one now means the key changed), and
+  // how the bytes are travelling. A key change must not read as "first
+  // connection" — it is the prompt where the user most needs to slow down.
+  const [known, setKnown] = useState(null);
+  useEffect(() => {
+    setKnown(null);
+    if (!req?.chat_id) return undefined;
+    let live = true;
+    api.getConversation(req.chat_id)
+      .then((chat) => live && chat && setKnown({ fingerprint: chat.peer_fingerprint || null, transport: chat.transport || null }))
+      .catch(() => {});
+    return () => { live = false; };
+  }, [req?.chat_id]);
   if (!req) return null;
+  const first = req.peer_name.split(" ")[0];
+  const changed = !!(known?.fingerprint && req.fingerprint && known.fingerprint !== req.fingerprint);
+  const route = known?.transport === "relay" ? "Via relay — the relay can't read this conversation"
+    : known?.transport === "server" ? "Via a community server"
+      : known?.transport === "direct" ? "Direct connection" : null;
   async function decide(accept) {
     if (busy) return;
     setBusy(true);
@@ -56,10 +75,19 @@ export function Verify({ req, onClose }) {
     // click outside used to clear the prompt without answering, leaving the peer
     // hanging with no explanation and the prompt reappearing on the next poll,
     // which reads as a bug. The only ways out are Verify and Reject.
-    <Modal open={!!req} onClose={onClose} width={440} title={`Verify ${req.peer_name}`} icon="fingerprint"
+    <Modal open={!!req} onClose={onClose} width={440}
+      title={changed ? `${first}'s safety code changed` : `Verify ${req.peer_name}`}
+      icon={changed ? "alert" : "fingerprint"}
       dismissable={false}
-      sub={`First connection — check it's really ${req.peer_name.split(" ")[0]}`}>
+      sub={changed ? "This could be a new device — or someone intercepting" : `Check it's really ${first}`}>
       <div className="verify-body">
+        {changed && (
+          <div className="verify-changed" role="alert">
+            You verified {first} before, and this is a different key. Only trust it if
+            {" "}{first} tells you — by voice or in person — that they reinstalled or changed devices.
+          </div>
+        )}
+        {route && <div className="verify-route">{route}</div>}
         {req.sas ? (
           <>
             {/* Primary check: the short authentication string. Both peers see

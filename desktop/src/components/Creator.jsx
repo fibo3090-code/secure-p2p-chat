@@ -40,7 +40,7 @@ function CopyLine({ value }) {
 
 const DEFAULT_PORT = 12345;
 
-export function Creator({ open, onClose, initialMode }) {
+export function Creator({ open, onClose, initialMode, initialRelay = false }) {
   const [mode, setMode] = useState(initialMode || "connect");
   const [transport, setTransport] = useState("direct");
   const [addr, setAddr] = useState("");
@@ -62,7 +62,8 @@ export function Creator({ open, onClose, initialMode }) {
   // dropped on a generic dialog and left to find the right tab themselves.
   useEffect(() => {
     if (open && initialMode) setMode(initialMode);
-  }, [open, initialMode]);
+    if (open) setTransport(initialRelay ? "relay" : "direct");
+  }, [open, initialMode, initialRelay]);
 
   // Clear per-attempt state when the dialog closes. This component stays
   // mounted, so everything typed for one peer survived into the next open: a

@@ -112,16 +112,16 @@ describe("ChatPane composer", () => {
     onStart: () => {},
   };
 
-  it("disables the composer and explains why when there is no session", () => {
+  it("replaces the composer with an explanation when there is no session", () => {
     render(<ChatPane {...base} contact={contactFixture({ state: "offline", messages: [] })} />);
-    const box = screen.getByRole("textbox");
     // A send that cannot be delivered must never look like it worked: the
-    // backend errors, and the composer refuses the keystroke in the first place.
-    expect(box.disabled).toBe(true);
+    // backend errors, and offline there is no message box to type into at all.
+    expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.getByRole("status").textContent).toMatch(/is offline/);
     // With no saved contact behind it, there is nothing to redial — so no
-    // Reconnect button that could only fail.
+    // Reconnect button that could only fail; the way out is the invite link.
     expect(screen.queryByRole("button", { name: /Reconnect/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Copy invite link/ })).toBeTruthy();
   });
 
   it("offers Reconnect when the conversation has a reachable contact", async () => {

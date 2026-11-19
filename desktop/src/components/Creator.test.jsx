@@ -209,3 +209,59 @@ describe("Creator — nearby peers", () => {
     expect(screen.getByPlaceholderText("192.168.1.20:12345").value).toBe("192.168.1.21:12345");
   });
 });
+
+// Pairing through a relay moved here from the Relays page; its coverage moved
+// with it.
+describe("Creator — relay", () => {
+  const openRelay = (mode = "connect", props = {}) =>
+    render(<Creator open onClose={() => {}} initialMode={mode} initialRelay {...props} />);
+
+  it("refuses to pair without an address, and says which field is missing", async () => {
+    const api = installApi({ listDiscoveredPeers: { enabled: false, peers: [] } });
+    openRelay();
+    await userEvent.click(inPane().getByRole("button", { name: "Connect" }));
+    expect(api.connectViaRelay).not.toHaveBeenCalled();
+    expect(screen.getByText(/Enter the relay address/)).toBeTruthy();
+
+    await userEvent.type(screen.getByLabelText("Relay address"), "relay.test:9000");
+    await userEvent.click(inPane().getByRole("button", { name: "Connect" }));
+    expect(api.connectViaRelay).not.toHaveBeenCalled();
+    expect(screen.getByText(/connection token/)).toBeTruthy();
+  });
+
+  it("pairs with the trimmed address and token", async () => {
+    const api = installApi({ listDiscoveredPeers: { enabled: false, peers: [] } });
+    openRelay();
+    await userEvent.type(screen.getByLabelText("Relay address"), "  relay.test:9000  ");
+    await userEvent.type(screen.getByLabelText("Token from your peer"), " rly_abc ");
+    await userEvent.click(inPane().getByRole("button", { name: "Connect" }));
+    expect(api.connectViaRelay).toHaveBeenCalledWith("relay.test:9000", "rly_abc");
+  });
+
+  it("opens a relay session and shows the token to share", async () => {
+    installApi({ listDiscoveredPeers: { enabled: false, peers: [] }, hostViaRelay: async () => "rly_deadbeef" });
+    openRelay("host");
+    await userEvent.type(screen.getByLabelText("Relay address"), "relay.test:9000");
+    await userEvent.click(inPane().getByRole("button", { name: /Open relay session/ }));
+    expect(await screen.findByText("rly_deadbeef")).toBeTruthy();
+  });
+
+  it("reports a failed pairing instead of silently doing nothing", async () => {
+    installApi({ listDiscoveredPeers: { enabled: false, peers: [] },
+      connectViaRelay: async () => { throw new Error("relay refused the token"); } });
+    openRelay();
+    await userEvent.type(screen.getByLabelText("Relay address"), "relay.test:9000");
+    await userEvent.type(screen.getByLabelText("Token from your peer"), "rly_abc");
+    await userEvent.click(inPane().getByRole("button", { name: "Connect" }));
+    expect(await screen.findByText(/relay refused the token/)).toBeTruthy();
+  });
+
+  it("switches between direct and relay with one labelled switch", async () => {
+    installApi({ listDiscoveredPeers: { enabled: false, peers: [] } });
+    open();
+    expect(screen.getByLabelText("Their address")).toBeTruthy();
+    await userEvent.click(screen.getByRole("checkbox", { name: /Use a relay/ }));
+    expect(screen.getByLabelText("Relay address")).toBeTruthy();
+  });
+});
+

@@ -57,6 +57,7 @@ export default function App() {
   // Which tab the connection dialog opens on, so the get-started suggestions
   // land the user on the path they picked instead of a generic dialog.
   const [creatorMode, setCreatorMode] = useState("connect");
+  const [creatorRelay, setCreatorRelay] = useState(false);
   const [fpReq, setFpReq] = useState(null);
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
@@ -83,8 +84,9 @@ export default function App() {
   const [visible, setVisible] = useState(true);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
-  const openCreator = useCallback((mode = "connect") => {
+  const openCreator = useCallback((mode = "connect", relay = false) => {
     setCreatorMode(mode);
+    setCreatorRelay(relay);
     setCreatorOpen(true);
   }, []);
 
@@ -437,6 +439,14 @@ export default function App() {
                 // panel rather than "select a conversation" with nothing to select.
                 isFirstRun={convs.length === 0}
                 gateClosed={locked}
+                waiting={(() => {
+                  const unread = convs.filter((c) => (c.unread || 0) > 0);
+                  return unread.length ? {
+                    total: unread.reduce((n, c) => n + c.unread, 0), chats: unread.length,
+                    firstId: unread[0].id, firstName: unread[0].title,
+                  } : null;
+                })()}
+                onJump={(id) => id && openConv(id)}
                 onStart={openCreator}
                 // A swallowed failure here is a cancel button that does
                 // nothing, on a transfer the user is actively trying to stop.
@@ -471,16 +481,17 @@ export default function App() {
         )}
         {nav === "contacts" && (
           <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }}
-            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) openConv(id); }} /></main>
+            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) openConv(id); }}
+            connectedChats={new Set(convs.filter((c) => c.connected).map((c) => c.id))} /></main>
         )}
         {nav === "settings" && (
           <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
         )}
         {nav === "parties" && <main className="col-full" id="main-content" tabIndex={-1}><Parties /></main>}
-        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}
+        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onPair={(mode) => openCreator(mode, true)} /></main>}
       </div>
 
-      <Creator open={creatorOpen} initialMode={creatorMode} onClose={() => setCreatorOpen(false)} />
+      <Creator open={creatorOpen} initialMode={creatorMode} initialRelay={creatorRelay} onClose={() => setCreatorOpen(false)} />
       <Verify req={fpReq} onClose={() => setFpReq(null)} />
       <RenameDialog target={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={doRename} />
       <ConfirmDelete target={deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete} />

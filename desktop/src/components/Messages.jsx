@@ -553,7 +553,7 @@ function trimPreviews(map) {
   return Object.fromEntries(keep.map((k) => [k, map[k]]));
 }
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart, reconnectContact, onReconnect, gateClosed }) {
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart, reconnectContact, onReconnect, gateClosed, waiting, onJump }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
   // Inline previews for image files, fetched once per message id (null =
@@ -642,6 +642,11 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   // paragraph, the bridge reported success, and the text vanished.
   const online = contact ? contact.state === "connected" : false;
   const hosting = contact ? contact.state === "hosting" : false;
+  const canRedial = !!(reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked");
+  const copyInvite = () => api.myInviteLink()
+    .then((l) => navigator.clipboard?.writeText(l))
+    .then(() => toast("Invite link copied", "success"))
+    .catch(() => toast("Could not copy the invite link", "error"));
   // One outgoing file at a time per conversation: `FileChunk` carries no
   // transfer id, so two concurrent sends interleave on the wire and corrupt
   // both files. The backend refuses the second send; the button must not
@@ -695,8 +700,25 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       <div className="chat-pane chat-empty">
         <div className="chat-empty-inner">
           <span className="chat-empty-logo"><Logo size={64} /></span>
-          <div className="chat-empty-h">Select a conversation</div>
-          <div className="chat-empty-p">Pick a conversation on the left, or start a new connection.</div>
+          {waiting && waiting.total > 0 ? (
+            <>
+              <div className="chat-empty-h">
+                {waiting.total} unread {waiting.total === 1 ? "message" : "messages"}
+                {waiting.chats > 1 ? ` in ${waiting.chats} conversations` : ""}
+              </div>
+              <div className="chat-empty-p">
+                <button className="chat-empty-link" onClick={() => onJump && onJump(waiting.firstId)}>
+                  Open {waiting.firstName}
+                </button>
+                {" "}or pick a conversation on the left.
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="chat-empty-h">Select a conversation</div>
+              <div className="chat-empty-p">Pick a conversation on the left, or start a new connection.</div>
+            </>
+          )}
         </div>
       </div>
     );
@@ -748,7 +770,9 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
                 End-to-end encrypted{contact.transport === "relay" ? " — the relay only sees encrypted bytes" : ""}.{" "}
                 {contact.trust === "verified"
                   ? <span className="e2e-ok">Safety code verified</span>
-                  : <span className="e2e-action">Compare safety codes</span>}
+                  : online
+                    ? <span className="e2e-action">Compare safety codes</span>
+                    : <span className="e2e-action">Verify on next connection</span>}
               </span>
             </button>
           )}
@@ -778,24 +802,26 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
       {!online && !hosting && (
-        // One calm line, at composer width, with the way out attached. It used
-        // to be a full-bleed amber band telling the user to "reconnect" with
-        // nothing on screen that did.
-        <div className="composer-notice" role="status">
-          <span className="composer-notice-txt">
-            {contact.state === "connecting"
-              ? OFFLINE_NOTICE.connecting
-              : reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked"
-                ? `${contact.name} is offline. Messages can be sent once you're connected again.`
-                : `${contact.name} is offline, and there's no saved address to reach them — they can connect to you.`}
-          </span>
-          {contact.state !== "connecting" && reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked" && (
-            <Button size="sm" icon="refresh" onClick={() => onReconnect && onReconnect(contact)}>Reconnect</Button>
-          )}
+        // Offline, the notice takes the composer's place — one strip, said once,
+        // ending in the one thing that helps: dial them back, or (with no saved
+        // address) hand them a way to dial you.
+        <div className="composer">
+          <div className="composer-notice" role="status">
+            <span className="composer-notice-txt">
+              {contact.state === "connecting"
+                ? OFFLINE_NOTICE.connecting
+                : canRedial
+                  ? `${contact.name} is offline. You can write again once you're connected.`
+                  : `${contact.name} is offline and there's no saved address to reach them. Send them your invite link so they can connect to you.`}
+            </span>
+            {contact.state !== "connecting" && (canRedial
+              ? <Button size="sm" icon="refresh" onClick={() => onReconnect && onReconnect(contact)}>Reconnect</Button>
+              : <Button size="sm" variant="ghost" icon="link" onClick={copyInvite}>Copy invite link</Button>)}
+          </div>
         </div>
       )}
 
-      {!hosting && <div className="composer">
+      {online && <div className="composer">
         <div className={cx("composer-box", !online && "is-off")}>
           <button className="composer-clip"
             title={clipTitle} aria-label={clipTitle}

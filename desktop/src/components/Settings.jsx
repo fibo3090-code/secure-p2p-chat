@@ -273,18 +273,37 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
       <div className="set-scroll">
         <section className="set-block" id="set-identity" aria-labelledby="set-identity-h">
           <h2 className="set-h" id="set-identity-h">Your identity</h2>
-          <div className="set-id">
-            <Avatar name={identity?.name} size={46} />
-            <div>
-              <input className="set-id-name-input" value={nameDraft} maxLength={48}
-                aria-label="Display name"
-                onChange={(e) => setNameDraft(e.target.value)}
-                onBlur={commitName}
-                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} />
-              <code className="set-id-fp">{(identity?.fingerprint || "").replace(/(.{4})/g, "$1 ").trim()}</code>
+          {/* One identity card: who you are to others, the key that proves it,
+              and what that means — instead of a card, a loose caption and a
+              wrapped hex block. */}
+          <div className="set-id-card">
+            <div className="set-id">
+              <Avatar name={identity?.name} size={48} />
+              <div className="set-id-main">
+                <input className="set-id-name-input" value={nameDraft} maxLength={48}
+                  aria-label="Display name" title="Click to rename"
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onBlur={commitName}
+                  onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} />
+                <div className="set-id-fprow">
+                  <span className="set-id-fplabel">Fingerprint</span>
+                  <code className="set-id-fp" title={identity?.fingerprint || ""}>
+                    {(identity?.fingerprint || "").replace(/(.{4})/g, "$1 ").trim()}
+                  </code>
+                  <button className="set-id-copy" aria-label="Copy your fingerprint" title="Copy"
+                    onClick={() => navigator.clipboard?.writeText(identity?.fingerprint || "")
+                      .then(() => toast("Fingerprint copied", "success"))
+                      .catch(() => toast("Could not copy", "error"))}>
+                    <Icon name="copy" size={14} />
+                  </button>
+                </div>
+              </div>
             </div>
+            <p className="set-id-foot">
+              Your name goes into the invite links you share. Your keys are stored encrypted
+              on this device and never leave it.
+            </p>
           </div>
-          <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
           {/* Losing the identity file is the one failure this app cannot undo,
               so the row states plainly whether a backup exists rather than
               offering an Export button with no indication either way. */}

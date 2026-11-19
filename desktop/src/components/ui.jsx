@@ -33,12 +33,21 @@ function initialsOf(name) {
 }
 
 // A curated avatar palette instead of a computed hue: `oklch(.62 .13 h)` landed
-// on olive and sage as often as on anything clean. Ten deep hues, each holding
-// white initials at ≥4.5:1; Daylight tints them (see .avatar in the CSS).
+// on olive and sage as often as on anything clean. Daylight tints these (see
+// .avatar in the CSS).
+// Eight hues spaced evenly round the wheel (no two reds), each holding white
+// initials at ≥5:1, so neighbours in a list differ at a glance.
 const AVATAR_COLORS = [
-  "#4f46e5", "#1d4ed8", "#0e7490", "#047857", "#4d7c0f",
-  "#b45309", "#c2410c", "#be123c", "#be185d", "#7e22ce",
+  "#4f46e5", "#0369a1", "#0f766e", "#15803d", "#a16207", "#c2410c", "#be123c", "#7e22ce",
 ];
+
+// FNV-1a over code points: a plain character sum sent "Alice" and "Carol" to
+// neighbouring reds; this spreads short names across the palette.
+function nameHash(name) {
+  let h = 2166136261;
+  for (const ch of String(name || "")) { h ^= ch.codePointAt(0); h = Math.imul(h, 16777619) >>> 0; }
+  return h;
+}
 
 const STATE_WORD = { connected: "connected", hosting: "waiting for a peer", offline: "offline", connecting: "connecting" };
 
@@ -48,8 +57,7 @@ function AvatarInner({ name, size = 38, state, party, icon }) {
   // every row, several times a second, to produce the same number each time.
   const { initials, bg } = useMemo(() => {
     const letters = initialsOf(name);
-    const sum = [...(name || "")].reduce((a, c) => a + (c.codePointAt(0) || 0), 0);
-    return { initials: letters, bg: AVATAR_COLORS[sum % AVATAR_COLORS.length] };
+    return { initials: letters, bg: AVATAR_COLORS[nameHash(name) % AVATAR_COLORS.length] };
   }, [name]);
   return (
     <span className="avatar-wrap" style={{ width: size, height: size }}>

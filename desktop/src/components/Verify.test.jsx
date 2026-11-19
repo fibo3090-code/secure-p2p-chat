@@ -112,4 +112,20 @@ describe("Verify", () => {
     // fresh decision.
     expect(screen.queryByText(/session is gone/i)).toBeNull();
   });
+
+  it("says the safety code changed when a verified conversation sees a new key", async () => {
+    installApi({ getConversation: { id: "chat-1", peer_fingerprint: "cd".repeat(32), transport: "relay" } });
+    render(<Verify req={req} onClose={() => {}} />);
+    // A changed key must not read as a first connection.
+    expect(await screen.findByText("Alice's safety code changed")).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toMatch(/different key/);
+    expect(screen.getByText(/Via relay/)).toBeTruthy();
+  });
+
+  it("stays a plain check when the stored key matches or there is none", async () => {
+    installApi({ getConversation: { id: "chat-1", peer_fingerprint: null, transport: "direct" } });
+    render(<Verify req={req} onClose={() => {}} />);
+    expect(await screen.findByText("Direct connection")).toBeTruthy();
+    expect(screen.queryByText(/safety code changed/)).toBeNull();
+  });
 });
