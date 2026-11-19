@@ -240,7 +240,7 @@ input,textarea{font-family:inherit;color:inherit}
 .rail-foot{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%}
 .rail-gate{position:relative}
 .rail-gate::after{content:"";position:absolute;top:8px;right:20px;width:8px;height:8px;border-radius:50%;
-  background:var(--accent);box-shadow:0 0 0 2px var(--s1)}
+  background:var(--success);box-shadow:0 0 0 2px var(--s1)}
 .rail-gate.is-closed::after{background:var(--warning)}
 .rail-gate.is-closed{color:var(--warning);background:color-mix(in oklab,var(--warning) 10%,transparent)}
 .rail-id{border-radius:50%;transition:transform .13s;padding:2px}
@@ -1134,3 +1134,4 @@ button.contact-row-main:disabled{cursor:default}
 .chat-empty-link{color:var(--accent-text);font-weight:600;text-decoration:underline;text-underline-offset:2px;
   text-decoration-color:color-mix(in oklab,currentColor 45%,transparent)}
 .e2e-later{color:var(--dim)}
+.modal-icon.is-warn{color:var(--warning);background:color-mix(in oklab,var(--warning) 14%,var(--s2))}

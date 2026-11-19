@@ -156,7 +156,7 @@ const FOCUSABLE =
 /// Reserve it for dialogs that represent a decision the app cannot make on the
 /// user's behalf — the TOFU prompt, where dismissing leaves a live session
 /// waiting and the peer hanging with no explanation.
-export function Modal({ open, onClose, children, width = 460, title, icon, sub, dismissable = true }) {
+export function Modal({ open, onClose, children, width = 460, title, icon, sub, dismissable = true, tone }) {
   // Per-instance ids: several Modals can be mounted at once (rename + verify,
   // etc.), so static ids would collide and break aria-labelledby/describedby.
   const titleId = useId();
@@ -226,7 +226,7 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub, 
         {title && (
           <div className="modal-head">
             <div className="modal-head-l">
-              {icon && <span className="modal-icon"><Icon name={icon} size={18} /></span>}
+              {icon && <span className={cx("modal-icon", tone && `is-${tone}`)}><Icon name={icon} size={18} /></span>}
               <div>
                 <div id={titleId} className="modal-title">{title}</div>
                 {sub && <div id={subId} className="modal-sub">{sub}</div>}

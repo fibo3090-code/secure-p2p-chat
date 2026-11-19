@@ -1,6 +1,6 @@
 // Fingerprint (TOFU) verification — colored safety grid + the hex code, with
 // accept/reject. Driven by the bridge's `fingerprint-request` event.
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Modal, Button } from "./ui.jsx";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
@@ -46,6 +46,7 @@ export function Verify({ req, onClose }) {
   // must never appear under a cursor already on the button. Bounded, so a hung
   // call cannot trap the user in an unanswerable prompt.
   const [settled, setSettled] = useState(false);
+  const rejectRef = useRef(null);
   useEffect(() => {
     setKnown(null);
     setSettled(false);
@@ -63,6 +64,11 @@ export function Verify({ req, onClose }) {
       .finally(done);
     return () => { live = false; clearTimeout(timer); };
   }, [req?.chat_id]);
+  const changedNow = !!(known?.fingerprint && req?.fingerprint &&
+    String(known.fingerprint).replace(/\s+/g, "").toLowerCase() !== String(req.fingerprint).replace(/\s+/g, "").toLowerCase());
+  // The lookup resolves after the dialog opened, so focus moves when the
+  // changed-key state is known, not only on mount.
+  useEffect(() => { if (changedNow) rejectRef.current?.focus(); }, [changedNow]);
   if (!req) return null;
   const first = req.peer_name.split(" ")[0];
   const norm = (fp) => String(fp || "").replace(/\s+/g, "").toLowerCase();
@@ -92,7 +98,7 @@ export function Verify({ req, onClose }) {
     // which reads as a bug. The only ways out are Verify and Reject.
     <Modal open={!!req} onClose={onClose} width={440}
       title={changed ? `${first}'s safety code changed` : `Verify ${req.peer_name}`}
-      icon={changed ? "alert" : "fingerprint"}
+      icon={changed ? "alert" : "fingerprint"} tone={changed ? "warn" : undefined}
       dismissable={false}
       sub={changed ? "This could be a new device — or someone intercepting" : `Check it's really ${first}`}>
       <div className="verify-body">
@@ -102,7 +108,8 @@ export function Verify({ req, onClose }) {
             {" "}{first} tells you — by voice or in person — that they reinstalled or changed devices.
           </div>
         )}
-        {route && <div className="verify-route">{route}</div>}
+        {/* The route reassures; on a changed key it is the wrong moment to. */}
+        {route && !changed && <div className="verify-route">{route}</div>}
         {req.sas ? (
           <>
             {/* Primary check: the short authentication string. Both peers see
@@ -138,8 +145,12 @@ export function Verify({ req, onClose }) {
             solid red one: two full-strength buttons side by side read as an
             alarm, and nothing here is wrong yet. */}
         <div className="verify-actions">
-          <Button variant="danger-ghost" icon="x" disabled={busy} onClick={() => decide(false)}>Reject</Button>
-          <Button icon="shieldCheck" disabled={busy || !settled} onClick={() => decide(true)}>
+          {/* On a changed key, trusting must be deliberate: equal weight, and
+              the default focus on Reject so Enter never accepts out of habit. */}
+          <Button ref={rejectRef} variant="danger-ghost" icon="x" disabled={busy}
+            onClick={() => decide(false)}>Reject</Button>
+          <Button variant={changed ? "ghost" : "primary"} icon="shieldCheck" disabled={busy || !settled}
+            onClick={() => decide(true)}>
             {busy ? "Working…" : "Codes match — trust"}
           </Button>
         </div>

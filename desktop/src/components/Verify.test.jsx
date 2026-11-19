@@ -120,7 +120,9 @@ describe("Verify", () => {
     // A changed key must not read as a first connection.
     expect(await screen.findByText("Alice's safety code changed")).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toMatch(/different key/);
-    expect(screen.getByText(/Via relay/)).toBeTruthy();
+    // Trusting a changed key is deliberate: Reject has focus, trust is not the hero.
+    expect(document.activeElement.textContent).toMatch(/Reject/);
+    expect(screen.getByRole("button", { name: /Codes match/ }).className).not.toMatch(/btn-primary/);
   });
 
   it("stays a plain check when the stored key matches or there is none", async () => {

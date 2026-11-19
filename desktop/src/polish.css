@@ -360,6 +360,8 @@ button.set-row:hover { border-color: var(--border-2); }
 .info-name { font-weight: 600; font-size: 17px; }
 .info-state { font-size: 13px; color: var(--dim); }
 .info-body .verify-advanced { text-align: left; }
+.info-body .verify-advanced summary { text-align: left; }
+.info-body .verify-advanced[open] { align-items: flex-start; }
 .info-actions { display: flex; flex-direction: column; border-radius: 14px; border: 1px solid var(--border); overflow: hidden; }
 .info-action { display: flex; align-items: center; gap: 11px; padding: 11px 14px; text-align: left; font-size: 13.5px;
   font-weight: 500; color: var(--text); background: var(--s1); transition: background .12s; }

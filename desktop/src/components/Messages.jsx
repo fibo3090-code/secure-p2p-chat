@@ -769,10 +769,10 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               <span>
                 End-to-end encrypted{contact.transport === "relay" ? " — the relay only sees encrypted bytes" : ""}.{" "}
                 {contact.trust === "verified"
-                  ? <span className="e2e-ok">Safety code verified</span>
+                  ? <span className="e2e-ok">Safety code verified.</span>
                   : online
-                    ? <span className="e2e-action">Compare safety codes</span>
-                    : <span className="e2e-later">You'll verify on the next connection</span>}
+                    ? <span className="e2e-action">Compare safety codes.</span>
+                    : <span className="e2e-later">You'll verify on the next connection.</span>}
               </span>
             </button>
           )}
