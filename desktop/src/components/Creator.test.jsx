@@ -44,9 +44,9 @@ afterEach(clearToasts);
 const open = (props = {}) =>
   render(<Creator open onClose={() => {}} initialMode="connect" {...props} />);
 
-// "Connect" names both the mode tab and the action button, so the action is
-// always looked up inside the pane rather than across the whole dialog.
-const inPane = () => within(document.querySelector(".creator-pane"));
+// The mode tab is "Dial" and the action is "Connect", so the action can be
+// looked up across the whole dialog (it lives in the footer, not the pane).
+const inPane = () => within(screen.getByRole("dialog"));
 
 describe("Creator — dialling a peer", () => {
   it("refuses an empty address", async () => {
@@ -98,7 +98,7 @@ describe("Creator — dialling a peer", () => {
   it("clears the connection password when the dialog closes", async () => {
     const api = installApi({ listDiscoveredPeers: { enabled: false, peers: [] } });
     const { rerender } = render(<Creator open onClose={() => {}} initialMode="connect" />);
-    await userEvent.type(screen.getByPlaceholderText(/Connection password/), "hunter2hunter2");
+    await userEvent.type(screen.getByLabelText(/Connection password/), "hunter2hunter2");
 
     // Reopening must not carry host A's password over to host B.
     rerender(<Creator open={false} onClose={() => {}} initialMode="connect" />);

@@ -5,7 +5,7 @@ import { cx, Avatar, Button, Modal, Page, OverflowMenu } from "./ui.jsx";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
-export function Contacts({ onConnected }) {
+export function Contacts({ onConnected, onOpenChat }) {
   const [contacts, setContacts] = useState([]);
   const [link, setLink] = useState("");
   const [err, setErr] = useState("");
@@ -81,7 +81,7 @@ export function Contacts({ onConnected }) {
       <form className="contact-import" onSubmit={(e) => { e.preventDefault(); importLink(); }}>
         <label className="field-label" htmlFor="invite-link">Add someone from their invite link</label>
         <div className="creator-row">
-          <input id="invite-link" className="input is-mono" value={link}
+          <input id="invite-link" className="input" value={link}
             placeholder="Paste an invite link (chat-p2p://invite/…)"
             onChange={(e) => setLink(e.target.value)} />
           <Button icon="userPlus" type="submit">Add</Button>
@@ -111,7 +111,11 @@ export function Contacts({ onConnected }) {
           return (
             <div key={c.id} className={cx("contact-row", blocked && "is-blocked")} role="listitem">
               <Avatar name={c.name} size={42} />
-              <div className="contact-row-main">
+              {/* The row opens the conversation you already have with them;
+                  Connect is the separate, explicit action that dials. */}
+              <button className="contact-row-main" disabled={!c.chat_id || !onOpenChat}
+                title={c.chat_id ? `Open your conversation with ${c.name}` : undefined}
+                onClick={() => c.chat_id && onOpenChat && onOpenChat(c.chat_id)}>
                 <div className="contact-row-l1">
                   <span className="contact-row-name">{c.name}</span>
                   <span className={cx("trust-word", blocked ? "is-blocked" : verified ? "is-ok" : "is-warn")}>
@@ -123,8 +127,7 @@ export function Contacts({ onConnected }) {
                   <span>{c.address || reach}</span>
                   {c.address && <><span className="chat-dot" aria-hidden="true">·</span><span>{reach}</span></>}
                 </div>
-                <code className="contact-row-fp" title="Fingerprint">{c.fingerprint || "not verified yet"}</code>
-              </div>
+              </button>
               <div className="contact-row-actions">
                 {/* A contact imported from a relay invite has no direct
                     address but is still dialable through its relay token —

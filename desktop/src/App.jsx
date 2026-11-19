@@ -68,6 +68,9 @@ export default function App() {
   const activeIdRef = useRef(null);
   const visibleRef = useRef(true);
   const [transfers, setTransfers] = useState([]);
+  // Saved contacts, so an offline conversation can offer "Reconnect" — the
+  // notice used to say "reconnect to this peer" with nothing on screen that did.
+  const [savedContacts, setSavedContacts] = useState([]);
   const [partyUnread, setPartyUnread] = useState(0);
   // Conversation lock: when on, no new peer can connect (listener stopped,
   // auto-rehost paused). Existing sessions keep running.
@@ -188,6 +191,7 @@ export default function App() {
         .then((p) => setFpReq((cur) => (p && cur && cur.chat_id === p.chat_id ? cur : p)))
         .catch(() => {});
       api.lockState().then(setLockedState).catch(() => {});
+      api.listContacts().then((l) => setSavedContacts(l || [])).catch(() => {});
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
@@ -310,6 +314,25 @@ export default function App() {
     refresh();
   }
 
+  // The saved contact behind a conversation: the bridge's own association
+  // first, then a matching verified fingerprint.
+  function contactFor(c) {
+    if (!c) return null;
+    return savedContacts.find((k) => k.chat_id === c.id)
+      || (c.fingerprint ? savedContacts.find((k) => k.fingerprint === c.fingerprint) : null)
+      || null;
+  }
+
+  async function reconnect(c) {
+    const k = contactFor(c);
+    if (!k) return;
+    try {
+      await api.connectContact(k.id);
+      toast(`Connecting to ${c.name}…`, "info");
+      refresh();
+    } catch (e) { toast(friendlyError(e), "error"); }
+  }
+
   async function sendFile(c) {
     try { await api.sendFile(c.id); refresh(); }
     catch (e) { toast(friendlyError(e), "error"); }
@@ -387,9 +410,9 @@ export default function App() {
                 catch (e) { toast(friendlyError(e), "error"); }
               }}>
               <Icon name={locked ? "ban" : "radio"} size={19} />
-              <span className="rail-label">{locked ? "Closed" : "Open"}</span>
+              <span className="rail-label">{locked ? "Closed" : "Accepting"}</span>
             </button>
-            <button className={cx("rail-id", nav === "settings" && "is-active")}
+            <button className="rail-id"
               title={`${auth.name} — open your identity settings`}
               aria-label={`${auth.name} — open your identity settings`}
               onClick={() => setNav("settings")}>
@@ -403,14 +426,17 @@ export default function App() {
             <aside className="col-list">
               <ConvList contacts={contacts} activeId={activeId} onSelect={openConv}
                 onAdd={() => openCreator()} query={query} setQuery={setQuery}
-                connectedCount={connCount} />
+                connectedCount={connCount} gateClosed={locked} />
             </aside>
             <main className="col-main" id="main-content" tabIndex={-1}>
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
+                reconnectContact={contactFor(active)}
+                onReconnect={reconnect}
                 // A user with no conversations at all gets the get-started
                 // panel rather than "select a conversation" with nothing to select.
                 isFirstRun={convs.length === 0}
+                gateClosed={locked}
                 onStart={openCreator}
                 // A swallowed failure here is a cancel button that does
                 // nothing, on a transfer the user is actively trying to stop.
@@ -444,7 +470,8 @@ export default function App() {
           </>
         )}
         {nav === "contacts" && (
-          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }}
+            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) openConv(id); }} /></main>
         )}
         {nav === "settings" && (
           <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>

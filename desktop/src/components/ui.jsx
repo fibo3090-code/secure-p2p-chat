@@ -32,6 +32,14 @@ function initialsOf(name) {
   return (words.map((w) => [...w][0]).join("").slice(0, 2) || "?").toUpperCase();
 }
 
+// A curated avatar palette instead of a computed hue: `oklch(.62 .13 h)` landed
+// on olive and sage as often as on anything clean. Ten deep hues, each holding
+// white initials at ≥4.5:1; Daylight tints them (see .avatar in the CSS).
+const AVATAR_COLORS = [
+  "#4f46e5", "#1d4ed8", "#0e7490", "#047857", "#4d7c0f",
+  "#b45309", "#c2410c", "#be123c", "#be185d", "#7e22ce",
+];
+
 const STATE_WORD = { connected: "connected", hosting: "waiting for a peer", offline: "offline", connecting: "connecting" };
 
 function AvatarInner({ name, size = 38, state, party, icon }) {
@@ -40,13 +48,13 @@ function AvatarInner({ name, size = 38, state, party, icon }) {
   // every row, several times a second, to produce the same number each time.
   const { initials, bg } = useMemo(() => {
     const letters = initialsOf(name);
-    const hue = [...(name || "")].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
-    return { initials: letters, bg: `oklch(0.62 0.13 ${hue})` };
+    const sum = [...(name || "")].reduce((a, c) => a + (c.codePointAt(0) || 0), 0);
+    return { initials: letters, bg: AVATAR_COLORS[sum % AVATAR_COLORS.length] };
   }, [name]);
   return (
     <span className="avatar-wrap" style={{ width: size, height: size }}>
       <span className={cx("avatar", (party || icon) && "is-glyph")} style={{
-        background: party || icon ? undefined : bg, width: size, height: size,
+        "--av": party || icon ? undefined : bg, width: size, height: size,
         fontSize: size * 0.38,
       }}>
         {party ? <Icon name="users" size={size * 0.5} />
@@ -232,17 +240,34 @@ export function Modal({ open, onClose, children, width = 460, title, icon, sub, 
 /// form, an offset column, cards packed top-left — so the app read as several
 /// tools sharing a sidebar. Title + one plain-language subtitle, actions on the
 /// right, and one content column.
-export function Page({ title, sub, actions, wide, children, bodyClass }) {
+export function Page({ title, sub, actions, wide, nav, children, bodyClass }) {
+  const head = (
+    <header className="page-head">
+      <div className="page-head-txt">
+        <h1 className="page-title">{title}</h1>
+        {sub && <p className="page-sub">{sub}</p>}
+      </div>
+      {actions && <div className="page-actions">{actions}</div>}
+    </header>
+  );
+  // With a section index (Settings), the index is a column against the rail
+  // and the content sits left-aligned beside it, as in a system settings
+  // window — not a floating nav centred in empty space.
+  if (nav) {
+    return (
+      <div className="page is-settings">
+        {nav}
+        <div className="page-main page-scroll">
+          {head}
+          <div className={cx("page-body", bodyClass)}>{children}</div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="page">
-      <header className="page-head">
-        <div className="page-head-txt">
-          <h1 className="page-title">{title}</h1>
-          {sub && <p className="page-sub">{sub}</p>}
-        </div>
-        {actions && <div className="page-actions">{actions}</div>}
-      </header>
       <div className="page-scroll">
+        {head}
         <div className={cx("page-body", wide && "is-wide", bodyClass)}>{children}</div>
       </div>
     </div>

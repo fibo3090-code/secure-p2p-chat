@@ -107,7 +107,7 @@ export function Relays({ onConnected }) {
         <div className="field">
           <label className="field-label" htmlFor="relay-token">Token from your peer</label>
           <div className="creator-row">
-            <Input id="relay-token" mono value={token} onChange={(e) => setToken(e.target.value)} placeholder="connection token"
+            <Input id="relay-token" value={token} onChange={(e) => setToken(e.target.value)} placeholder="connection token"
               onKeyDown={(e) => e.key === "Enter" && pair()} />
             <Button icon="swap" onClick={pair} disabled={busy}>Connect</Button>
           </div>

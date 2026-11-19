@@ -21,6 +21,10 @@ pub(crate) struct ContactDto {
     /// Deleting this contact would lift a block, letting them connect again.
     /// The confirmation dialog has to be able to say so.
     blocked: bool,
+    /// The conversation this contact is already associated with, if any, so a
+    /// conversation that went offline can offer "Reconnect" and a contact row
+    /// can open its existing thread instead of starting another.
+    chat_id: Option<String>,
 }
 
 /// An imported invite plus whether the link that produced it was signed.
@@ -52,6 +56,7 @@ fn contact_dto(c: &messenger_core::types::Contact) -> ContactDto {
         reachable: has_direct || has_relay,
         relay_only: has_relay && !has_direct,
         blocked: c.trust_state == messenger_core::types::TrustState::Blocked,
+        chat_id: None,
     }
 }
 
@@ -61,7 +66,14 @@ pub(crate) async fn list_contacts(
 ) -> Result<Vec<ContactDto>, String> {
     ensure_ready(&state)?;
     let mgr = state.manager.lock().await;
-    Ok(mgr.contacts.values().map(contact_dto).collect())
+    Ok(mgr
+        .contacts
+        .values()
+        .map(|c| ContactDto {
+            chat_id: mgr.contact_to_chat.get(&c.id).map(|id| id.to_string()),
+            ..contact_dto(c)
+        })
+        .collect())
 }
 
 /// The current user's signed invite link. Embeds every reachable candidate

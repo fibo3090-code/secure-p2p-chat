@@ -118,7 +118,19 @@ describe("ChatPane composer", () => {
     // A send that cannot be delivered must never look like it worked: the
     // backend errors, and the composer refuses the keystroke in the first place.
     expect(box.disabled).toBe(true);
-    expect(screen.getByRole("status").textContent).toMatch(/Not connected/);
+    expect(screen.getByRole("status").textContent).toMatch(/is offline/);
+    // With no saved contact behind it, there is nothing to redial — so no
+    // Reconnect button that could only fail.
+    expect(screen.queryByRole("button", { name: /Reconnect/ })).toBeNull();
+  });
+
+  it("offers Reconnect when the conversation has a reachable contact", async () => {
+    const onReconnect = vi.fn();
+    const contact = contactFixture({ state: "offline", messages: [] });
+    render(<ChatPane {...base} contact={contact}
+      reconnectContact={{ id: "k1", reachable: true, trust: "verified" }} onReconnect={onReconnect} />);
+    await userEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+    expect(onReconnect).toHaveBeenCalledWith(contact);
   });
 
   it("sends on Enter when connected, and not on Shift+Enter", async () => {

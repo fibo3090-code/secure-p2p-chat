@@ -6,6 +6,7 @@ import { api, fmtDay, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { cx, Avatar, IconButton, Button, Modal } from "./ui.jsx";
 import { fileKind, splitName } from "../lib/fileKind.js";
+import { Logo } from "./Logo.jsx";
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const isImageName = (name) => IMAGE_RE.test(name || "");
@@ -61,7 +62,7 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
         {open && (
           <div className="pop-menu" role="menu">
             {!isPlaceholder && (
-              <button role="menuitem" onClick={item(onVerify)}><Icon name="fingerprint" size={15} /> Safety code</button>
+              <button role="menuitem" onClick={item(onVerify)}><Icon name="fingerprint" size={15} /> Verify safety code</button>
             )}
             {!isPlaceholder && (
               <button role="menuitem" onClick={item(onRename)}><Icon name="edit" size={15} /> Rename</button>
@@ -83,27 +84,30 @@ const TRANSPORT_WORD = { direct: "Direct", relay: "Via relay", server: "Via serv
 // What a listener shows instead of an empty, black thread: the address a peer
 // needs, ready to copy. "Share your address" with no address on screen was a
 // dead end.
-function HostingCard() {
+function HostingCard({ onStop, paused }) {
   const [addr, setAddr] = useState(null);
+  const [invite, setInvite] = useState("");
   useEffect(() => {
     let live = true;
     api.myAddresses().then((a) => live && setAddr(a)).catch(() => {});
+    api.myInviteLink().then((l) => live && setInvite(l || "")).catch(() => {});
     return () => { live = false; };
   }, []);
-  const copy = (text) => navigator.clipboard?.writeText(text)
-    .then(() => toast("Copied", "success"))
+  const copy = (text, what) => navigator.clipboard?.writeText(text)
+    .then(() => toast(`${what} copied`, "success"))
     .catch(() => toast("Could not copy", "error"));
   const lines = [
     addr?.local && { label: "On this network", value: addr.local },
     addr?.external && { label: "Over the internet", value: addr.external },
   ].filter(Boolean);
   return (
-    <div className="hosting-card">
-      <span className="hosting-pulse" aria-hidden="true"><Icon name="radio" size={24} /></span>
-      <div className="hosting-h">Waiting for someone to connect</div>
+    <div className={cx("hosting-card", paused && "is-paused")}>
+      <span className="hosting-pulse" aria-hidden="true"><Icon name={paused ? "ban" : "radio"} size={24} /></span>
+      <div className="hosting-h">{paused ? "Paused — not accepting new peers" : "Waiting for someone to connect"}</div>
       <p className="hosting-p">
-        Give the other person one of these addresses. When they dial it you'll
-        both see a safety code to compare before anything is sent.
+        {paused
+          ? "New peers are refused while “Accepting” is switched off in the sidebar. Switch it back on to let someone connect."
+          : "Give the other person one of these. When they connect you'll both see a safety code to compare before anything is sent."}
       </p>
       {lines.length > 0 ? (
         <div className="hosting-addrs">
@@ -111,7 +115,7 @@ function HostingCard() {
             <div key={l.label} className="hosting-addr">
               <span className="hosting-addr-l">{l.label}</span>
               <code className="hosting-addr-v">{l.value}</code>
-              <button className="hosting-copy" onClick={() => copy(l.value)} aria-label={`Copy ${l.label.toLowerCase()} address`}>
+              <button className="hosting-copy" onClick={() => copy(l.value, "Address")} aria-label={`Copy ${l.label.toLowerCase()} address`}>
                 <Icon name="copy" size={14} /> Copy
               </button>
             </div>
@@ -120,6 +124,12 @@ function HostingCard() {
       ) : (
         <div className="hosting-p">Looking up your address…</div>
       )}
+      <div className="hosting-actions">
+        {invite && (
+          <Button size="sm" variant="ghost" icon="link" onClick={() => copy(invite, "Invite link")}>Copy invite link</Button>
+        )}
+        {onStop && <Button size="sm" variant="danger-ghost" icon="x" onClick={onStop}>Stop listening</Button>}
+      </div>
     </div>
   );
 }
@@ -159,7 +169,7 @@ export function rowStatusLabel(c) {
 // and the default shallow compare would never hit. Comparing the fields the row
 // actually renders is what stops an idle poll from re-rendering the whole list.
 function convRowsEqual(a, b) {
-  if (a.onSelect !== b.onSelect || a.active !== b.active) return false;
+  if (a.onSelect !== b.onSelect || a.active !== b.active || a.paused !== b.paused) return false;
   const x = a.c;
   const y = b.c;
   return (
@@ -170,7 +180,7 @@ function convRowsEqual(a, b) {
   );
 }
 
-const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
+const ConvRow = memo(function ConvRow({ c, active, onSelect, paused }) {
   const status = rowStatusLabel(c);
   const hosting = c.state === "hosting";
   return (
@@ -202,7 +212,9 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
           <span className="conv-markers" aria-hidden="true">
             {c.kind === "group" && <Icon name="users" size={12} />}
             {c.kind === "channel" && <Icon name="hash" size={12} />}
-            {hosting && <span className="conv-chip is-hosting">Listening</span>}
+            {hosting && (paused
+              ? <span className="conv-chip is-paused">Paused</span>
+              : <span className="conv-chip is-hosting">Listening</span>)}
             {c.transport === "relay" && <span className="conv-chip" title="Via relay">Relay</span>}
             {c.transport === "server" && <span className="conv-chip" title="Via server">Server</span>}
             {/* Only a real peer can be unverified. A listener with nobody on
@@ -219,7 +231,7 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
   );
 }, convRowsEqual);
 
-export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery, connectedCount = 0 }) {
+export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery, connectedCount = 0, gateClosed = false }) {
   const filtered = useMemo(
     () => contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase())),
     [contacts, query],
@@ -258,7 +270,7 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery,
           instead of leaving the user to count. */}
       <div className="conv-scroll" role="listbox" aria-label="Conversations">
         {filtered.map((c) => (
-          <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} />
+          <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} paused={gateClosed} />
         ))}
         {filtered.length === 0 && (
           <div className="conv-empty">
@@ -541,7 +553,7 @@ function trimPreviews(map) {
   return Object.fromEntries(keep.map((k) => [k, map[k]]));
 }
 
-export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart }) {
+export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart, reconnectContact, onReconnect, gateClosed }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
   // Inline previews for image files, fetched once per message id (null =
@@ -682,7 +694,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
     return (
       <div className="chat-pane chat-empty">
         <div className="chat-empty-inner">
-          <span className="chat-empty-ic"><Icon name="message" size={28} /></span>
+          <span className="chat-empty-logo"><Logo size={64} /></span>
           <div className="chat-empty-h">Select a conversation</div>
           <div className="chat-empty-p">Pick a conversation on the left, or start a new connection.</div>
         </div>
@@ -708,7 +720,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
                   <span className="chat-dot" aria-hidden="true">·</span>
                   <span>{TRANSPORT_WORD[contact.transport] || TRANSPORT_WORD.direct}</span>
                   <span className="chat-dot" aria-hidden="true">·</span>
-                  <button className={cx("chat-trust", contact.trust === "verified" ? "is-ok" : "is-warn")}
+                  <button className={cx("chat-trust", contact.trust === "verified" ? "is-ok" : "is-pending")}
                     onClick={() => onVerify && onVerify(contact)}
                     title={contact.trust === "verified" ? "Show the safety code" : "Compare safety codes to verify this contact"}>
                     <Icon name={contact.trust === "verified" ? "shieldCheck" : "shieldAlert"} size={13} />
@@ -723,7 +735,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       </header>
 
       <div className="chat-scroll" ref={scrollRef}>
-        {hosting && <HostingCard />}
+        {hosting && <HostingCard paused={gateClosed} onStop={onDelete ? () => onDelete(contact) : null} />}
         <div className="chat-thread" hidden={hosting && contact.messages.length === 0}>
           {!hosting && (
             // Said once, quietly, where the conversation starts: what protects
@@ -731,13 +743,12 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
             // ever told the user their messages were encrypted.
             <button className={cx("e2e-note", contact.trust === "verified" ? "is-ok" : "is-warn")}
               onClick={() => onVerify && onVerify(contact)}>
-              <Icon name="lock" size={12} />
+              <Icon name="lock" size={13} />
               <span>
-                Messages with {contact.name} are end-to-end encrypted
-                {contact.transport === "relay" ? " — the relay only sees encrypted bytes" : ""}.{" "}
+                End-to-end encrypted{contact.transport === "relay" ? " — the relay only sees encrypted bytes" : ""}.{" "}
                 {contact.trust === "verified"
-                  ? "Safety code verified."
-                  : <strong>Not verified yet — compare safety codes.</strong>}
+                  ? <span className="e2e-ok">Safety code verified</span>
+                  : <span className="e2e-action">Compare safety codes</span>}
               </span>
             </button>
           )}
@@ -767,13 +778,24 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
       {!online && !hosting && (
+        // One calm line, at composer width, with the way out attached. It used
+        // to be a full-bleed amber band telling the user to "reconnect" with
+        // nothing on screen that did.
         <div className="composer-notice" role="status">
-          <Icon name="alert" size={14} />
-          <span>{OFFLINE_NOTICE[contact.state] || OFFLINE_NOTICE.offline}</span>
+          <span className="composer-notice-txt">
+            {contact.state === "connecting"
+              ? OFFLINE_NOTICE.connecting
+              : reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked"
+                ? `${contact.name} is offline. Messages can be sent once you're connected again.`
+                : `${contact.name} is offline, and there's no saved address to reach them — they can connect to you.`}
+          </span>
+          {contact.state !== "connecting" && reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked" && (
+            <Button size="sm" icon="refresh" onClick={() => onReconnect && onReconnect(contact)}>Reconnect</Button>
+          )}
         </div>
       )}
 
-      <div className="composer">
+      {!hosting && <div className="composer">
         <div className={cx("composer-box", !online && "is-off")}>
           <button className="composer-clip"
             title={clipTitle} aria-label={clipTitle}
@@ -781,7 +803,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
             onClick={() => onSendFile && onSendFile(contact)}><Icon name="paperclip" size={19} /></button>
           <textarea className="composer-input" id="composer-input" rows={1}
             aria-label={online ? `Message ${contact.name}` : "Message box — not connected"}
-            placeholder={online ? `Message ${contact.name.split(" ")[0]}` : hosting ? "You can write once someone connects" : "Not connected — reconnect to send"}
+            placeholder={online ? `Message ${contact.name.split(" ")[0]}` : "Offline — you can write once you're connected"}
             // Typing into a conversation with no session used to look like it
             // worked: the send reported success, the box cleared, and the message
             // simply never existed. Better to refuse the keystroke than to eat a
@@ -795,7 +817,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
             <Icon name="send" size={17} />
           </button>
         </div>
-      </div>
+      </div>}
 
       {riskyOpen && (
         <Modal open onClose={() => setRiskyOpen(null)} width={440}

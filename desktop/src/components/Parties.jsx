@@ -85,6 +85,13 @@ function JoinForm({ onJoined, onCancel, initial }) {
   }
 
   const join = () => joinWith(address, username, password);
+  // Field-level errors sit on the field they are about, not at the bottom of
+  // the form under the password box.
+  const errField = err === "Enter the server address." ? "addr"
+    : /^(Choose a username|Username must)/.test(err) ? "user" : null;
+  const fieldErr = (id) => errField === id && (
+    <div className="onb-err" id={`party-${id}-err`}><Icon name="alert" size={13} /> {err}</div>
+  );
 
   // Said once, as a calm callout rather than a bold clause buried in the middle
   // of a paragraph: what a community is, and the one thing it is not.
@@ -170,12 +177,18 @@ function JoinForm({ onJoined, onCancel, initial }) {
           <div className="field">
             <label className="field-label" htmlFor="party-addr">Server address</label>
             <Input id="party-addr" mono value={address} autoFocus placeholder="192.168.1.20:12345"
+              aria-invalid={errField === "addr" || undefined}
+              aria-describedby={errField === "addr" ? "party-addr-err" : undefined}
               onChange={(e) => setAddress(e.target.value)} />
+            {fieldErr("addr")}
           </div>
           <div className="field">
             <label className="field-label" htmlFor="party-user">Username</label>
             <Input id="party-user" value={username} placeholder="How others will see you" maxLength={MAX_USERNAME_CHARS}
+              aria-invalid={errField === "user" || undefined}
+              aria-describedby={errField === "user" ? "party-user-err" : undefined}
               onChange={(e) => setUsername(e.target.value)} />
+            {fieldErr("user")}
           </div>
         </div>
         <div className="field">
@@ -184,7 +197,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
             autoComplete="off"
             onChange={(e) => setPassword(e.target.value)} />
         </div>
-        {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+        {err && !errField && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
         <div className="card-actions">
           <Button icon="users" type="submit" disabled={busy}>Connect &amp; join</Button>
         </div>

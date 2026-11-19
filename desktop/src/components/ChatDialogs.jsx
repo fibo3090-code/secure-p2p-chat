@@ -1,6 +1,7 @@
 // Rename / delete / info dialogs for a conversation.
 import { useEffect, useState } from "react";
-import { Modal, Button, Input } from "./ui.jsx";
+import { cx, Modal, Button, Input } from "./ui.jsx";
+import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
 
 export function RenameDialog({ target, onClose, onSubmit }) {
@@ -55,13 +56,39 @@ export function InfoDialog({ target, onClose }) {
   if (!target) return null;
   const fp = target.fingerprint || "";
   const transport = TRANSPORT_LABEL[target.transport] || TRANSPORT_LABEL.direct;
+  const verified = target.trust === "verified" || target.trust === "trusted";
+  const online = target.state === "connected";
+  // One place that answers "is this really them?" — the state, what it means,
+  // and when the check happens. The chip and the thread note both lead here,
+  // so it must never be a bare grid of hex with no verdict.
+  const trust = verified
+    ? { cls: "is-ok", icon: "shieldCheck", h: "Verified",
+      p: `You compared safety codes with ${target.name}. If their key ever changes, you'll be asked to check again before anything is sent.` }
+    : online
+      ? { cls: "is-pending", icon: "shieldAlert", h: "Not verified yet",
+        p: "This connection hasn't been checked. Reconnect when you can talk to them by voice or in person — you'll both see a six-digit safety code to compare before trusting it." }
+      : { cls: "is-pending", icon: "shieldAlert", h: "Not verified yet",
+        p: `You'll compare a safety code with ${target.name} the next time you connect. Until then, the encryption protects the messages, but nothing proves who is on the other end.` };
   return (
-    <Modal open onClose={onClose} width={420} title={target.name} icon="info" sub="Conversation details">
+    <Modal open onClose={onClose} width={440} title={target.name} icon="info" sub="Conversation details">
       <div className="verify-body">
-        {fp ? <SafetyGrid fingerprint={fp} n={8} cell={26} /> : <div className="verify-hint">No fingerprint yet.</div>}
-        {fp && <div className="verify-code">{fp.replace(/(.{4})/g, "$1 ").trim()}</div>}
+        <div className={cx("trust-panel", trust.cls)}>
+          <Icon name={trust.icon} size={18} />
+          <div>
+            <div className="trust-panel-h">{trust.h}</div>
+            <p className="trust-panel-p">{trust.p}</p>
+          </div>
+        </div>
+        {!fp && <div className="verify-hint">No fingerprint yet.</div>}
+        {fp && (
+          <details className="verify-advanced">
+            <summary>Full fingerprint (advanced)</summary>
+            <SafetyGrid fingerprint={fp} n={8} cell={26} />
+            <div className="verify-code">{fp.replace(/(.{4})/g, "$1 ").trim()}</div>
+          </details>
+        )}
         <div className="verify-hint">
-          Transport: {transport}. End-to-end encrypted with X25519 + AES-256-GCM.
+          Transport: {transport}. End-to-end encrypted (X25519 + AES-256-GCM, forward secrecy).
         </div>
         <Button full variant="ghost" icon="x" onClick={onClose}>Close</Button>
       </div>

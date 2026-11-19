@@ -158,7 +158,12 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
           This password encrypts your identity and message history on this device.
           There is no account and no recovery — nobody, including us, can reset it.
         </div>
-        {fingerprint && <code className="onb-fp-code">{fingerprint.slice(0, 32)}…</code>}
+        {fingerprint && (
+          <div className="onb-field">
+            <span className="onb-flabel">Your new fingerprint</span>
+            <code className="onb-fp-code" title={fingerprint}>{fingerprint.slice(0, 32).replace(/(.{4})/g, "$1 ").trim()} …</code>
+          </div>
+        )}
         <div className="onb-field">
           <PasswordInput value={pw} autoFocus placeholder={`New password (${min}+ characters)`} disabled={busy}
             autoComplete="new-password"

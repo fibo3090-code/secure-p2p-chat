@@ -253,9 +253,9 @@ function makeMock() {
   };
   const connected = { "11111111-1111-1111-1111-111111111111": true };
   const contacts = [
-    { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00", address: "192.168.1.21:12345", trust: "verified", reachable: true, relay_only: false },
-    { id: "c2", name: "Carol", fingerprint: "deadbeef01020304a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90aabb", address: "10.0.0.5:12345", trust: "unverified", reachable: true, relay_only: false },
-    { id: "c3", name: "Dana", fingerprint: "0f1e2d3c4b5a69788796a5b4c3d2e1f00112233445566778899aabbccddeeff", address: "", trust: "unverified", reachable: true, relay_only: true },
+    { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00", address: "192.168.1.21:12345", trust: "verified", reachable: true, relay_only: false, chat_id: "11111111-1111-1111-1111-111111111111" },
+    { id: "c2", name: "Carol", fingerprint: "deadbeef01020304a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90aabb", address: "10.0.0.5:12345", trust: "unverified", reachable: true, relay_only: false, chat_id: "44444444-4444-4444-4444-444444444444" },
+    { id: "c3", name: "Dana", fingerprint: "0f1e2d3c4b5a69788796a5b4c3d2e1f00112233445566778899aabbccddeeff", address: "", trust: "unverified", reachable: true, relay_only: true, chat_id: null },
   ];
   // Mirrors the real bridge: unread is derived from a persisted read mark, not
   // from what the UI happened to see this session.
@@ -532,7 +532,7 @@ export function fmtTime(ts) {
 let cachedTimeFormat = null;
 function timeFormat() {
   if (!cachedTimeFormat) {
-    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+    cachedTimeFormat = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
   }
   return cachedTimeFormat;
 }

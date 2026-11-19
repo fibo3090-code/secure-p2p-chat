@@ -49,7 +49,9 @@ describe("Contacts", () => {
     expect(screen.getByText("192.168.1.21:12345")).toBeTruthy();
     // Trust is a word on the row, not an unexplained glyph.
     expect(screen.getByText("Verified")).toBeTruthy();
-    expect(screen.getByText("a".repeat(64))).toBeTruthy();
+    // The full fingerprint is one action away, not a third line of hex.
+    await openMenu();
+    expect(screen.getByRole("menuitem", { name: "Copy fingerprint" }).disabled).toBe(false);
   });
 
   it("imports an invite link and reloads the list", async () => {

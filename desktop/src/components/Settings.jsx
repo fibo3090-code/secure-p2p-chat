@@ -27,7 +27,7 @@ function SettingsNav() {
     // Highlight the section in view. jsdom has no IntersectionObserver, and a
     // static first item is a fine fallback anywhere it is missing.
     if (typeof IntersectionObserver === "undefined") return undefined;
-    const root = navRef.current?.closest(".page-scroll") || null;
+    const root = navRef.current?.parentElement?.querySelector(".page-scroll") || null;
     const seen = new Map();
     const io = new IntersectionObserver((entries) => {
       entries.forEach((e) => seen.set(e.target.id, e.isIntersecting));
@@ -268,9 +268,8 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
   }
 
   return (
-    <Page title="Settings" wide bodyClass="set-layout"
-      sub="Your identity, privacy, hosting and how the app looks. Changes save as you make them.">
-      <SettingsNav />
+    <Page title="Settings" bodyClass="set-layout" nav={<SettingsNav />}
+      sub="Changes save as you make them.">
       <div className="set-scroll">
         <section className="set-block" id="set-identity" aria-labelledby="set-identity-h">
           <h2 className="set-h" id="set-identity-h">Your identity</h2>
