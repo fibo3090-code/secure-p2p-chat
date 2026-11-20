@@ -808,19 +808,18 @@ impl PartyManager {
     pub fn poll_events(&mut self) {
         for conn in self.servers.values_mut() {
             loop {
-                let closed = match conn.incoming_rx.try_recv() {
-                    Ok(Incoming::Response(resp)) => {
-                        apply(conn, resp);
-                        continue;
+                match conn.incoming_rx.try_recv() {
+                    Ok(Incoming::Response(resp)) => apply(conn, resp),
+                    Ok(Incoming::Disconnected) => {
+                        conn.status = PartyStatus::Disconnected;
+                        fail_pending_downloads(conn, "connection closed");
                     }
-                    Ok(Incoming::Disconnected) => false,
                     Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => true,
-                };
-                conn.status = PartyStatus::Disconnected;
-                fail_pending_downloads(conn, "connection closed");
-                if closed {
-                    break;
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        conn.status = PartyStatus::Disconnected;
+                        fail_pending_downloads(conn, "connection closed");
+                        break;
+                    }
                 }
             }
         }

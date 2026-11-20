@@ -156,7 +156,7 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
       <div className="sr-only" role="status" aria-live="polite">
         {totalUnread > 0 ? `${totalUnread} unread message${totalUnread === 1 ? "" : "s"}` : "No unread messages"}
       </div>
-          {/* listbox/option, so a reader announces "3 of 12". */}
+      {/* listbox/option, so a reader announces "3 of 12". */}
       <div className="conv-scroll" role="listbox" aria-label="Conversations">
         {filtered.map((c) => (
           <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} />

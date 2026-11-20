@@ -348,10 +348,20 @@ impl PartyState {
         if !self.effective_perms(actor, &source).share {
             return Err("you do not have permission to share this file".to_string());
         }
-        self.check_may_post_file(actor, target)?;
         let (location, is_dm) = match target {
-            UploadTarget::Channel(channel) => (channel, false),
-            UploadTarget::Dm(to) => (messenger_core::party::dm_thread_id(actor, to), true),
+            UploadTarget::Channel(channel) => {
+                self.member_can_post_to_channel(actor, channel)?;
+                (channel, false)
+            }
+            UploadTarget::Dm(to) => {
+                if !self.is_member(to) {
+                    return Err("recipient is not a member of this server".to_string());
+                }
+                if !self.role_of(actor).can_write() {
+                    return Err("your role on this server is read-only".to_string());
+                }
+                (messenger_core::party::dm_thread_id(actor, to), true)
+            }
         };
         if self
             .file_refs

@@ -542,10 +542,12 @@ async fn join_flow(
     wait_timeout: Duration,
 ) -> Result<()> {
     validate_token(&token)?;
-    // Separate statement so the lock is released before any reply is sent.
-    let entry = pending.lock().await.remove(&token);
-    let Some(pending_entry) = entry else {
-        return refuse(&mut stream, "Unknown relay token").await;
+    let pending_entry = {
+        let mut guard = pending.lock().await;
+        match guard.remove(&token) {
+            Some(entry) => entry,
+            None => return refuse(&mut stream, "Unknown relay token").await,
+        }
     };
     if pending_entry.created_at.elapsed() > wait_timeout {
         return refuse(&mut stream, "Relay token expired").await;

@@ -90,7 +90,11 @@ where
 /// reconnect could never stay connected. Every page is budgeted to fit, so
 /// this is defence in depth.
 fn encode_reply(resp: &PartyResponse) -> Vec<u8> {
-    encode_bounded(resp, "a reply").unwrap_or_else(|| {
+    encode_bounded(
+        resp,
+        "a reply was too large to send; answering with an error instead",
+    )
+    .unwrap_or_else(|| {
         PartyResponse::Error("the server's reply was too large to send".to_string()).to_bytes()
     })
 }
@@ -99,10 +103,11 @@ fn encode_reply(resp: &PartyResponse) -> Vec<u8> {
 /// dropping one live update (recovered from history) beats disconnecting every
 /// recipient.
 fn encode_push(resp: &PartyResponse) -> Option<Vec<u8>> {
-    encode_bounded(resp, "a broadcast")
+    encode_bounded(resp, "a broadcast was too large to send; dropping it")
 }
 
-fn encode_bounded(resp: &PartyResponse, what: &str) -> Option<Vec<u8>> {
+/// `resp` encoded, or `None` (logging `oversized`) when it exceeds one frame.
+fn encode_bounded(resp: &PartyResponse, oversized: &str) -> Option<Vec<u8>> {
     let bytes = resp.to_bytes();
     if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
         return Some(bytes);
@@ -110,7 +115,7 @@ fn encode_bounded(resp: &PartyResponse, what: &str) -> Option<Vec<u8>> {
     tracing::error!(
         size = bytes.len(),
         limit = MAX_PARTY_PAYLOAD_BYTES,
-        "{what} was too large to send"
+        "{oversized}"
     );
     None
 }

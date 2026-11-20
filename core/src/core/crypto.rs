@@ -835,11 +835,12 @@ mod tests {
             SignatureScheme::Ed25519.to_u8(),
             SignatureScheme::RsaPss.to_u8(),
         );
-        let cases: [(&[u8], &[u8], Option<SignatureScheme>); 6] = [
+        let cases: [(&[u8], &[u8], Option<SignatureScheme>); 7] = [
             (&[ed, rsa], &[ed, rsa], Some(SignatureScheme::Ed25519)),
             (&[rsa, ed], &[ed, rsa], Some(SignatureScheme::Ed25519)),
             (&[ed], &[rsa, ed], Some(SignatureScheme::Ed25519)),
             (&[ed, rsa], &[rsa], Some(SignatureScheme::RsaPss)),
+            (&[rsa], &[rsa], Some(SignatureScheme::RsaPss)),
             (&[ed], &[rsa], None),
             (&[ed, rsa], &[], None),
         ];
