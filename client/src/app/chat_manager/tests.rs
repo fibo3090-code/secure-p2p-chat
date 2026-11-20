@@ -445,6 +445,136 @@ async fn connect_to_blocked_contact_is_refused() {
     assert!(err.to_string().contains("blocked"));
 }
 
+fn throwaway_key() -> rsa::RsaPrivateKey {
+    // Never used in a handshake here: nothing these tests dial answers.
+    rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap()
+}
+
+/// `connect_to_contact` must not dial when something already reaches the
+/// peer: dialling again replaces a session that is working.
+#[tokio::test]
+async fn connecting_to_a_contact_reuses_a_live_session_instead_of_dialling() {
+    let mut mgr = ChatManager::new(Config::default());
+    let fp = "ab".repeat(32);
+    let contact = mgr.add_contact(
+        "Ann".into(),
+        Some("127.0.0.1:1".into()),
+        Some(fp.clone()),
+        None,
+    );
+
+    // Its own conversation is live: that is the answer.
+    let own = Uuid::new_v4();
+    mgr.create_local_chat_for_test(own, "Ann".into());
+    let _lane = wire_session_for_test(&mut mgr, own);
+    mgr.associate_contact_with_chat(contact, own);
+    assert_eq!(
+        mgr.connect_to_contact(contact, None, &throwaway_key())
+            .await
+            .unwrap(),
+        own
+    );
+    assert_eq!(mgr.sessions_len(), 1, "a live session was dialled over");
+
+    // Another conversation with the same verified peer is live: re-associate.
+    let mut mgr = ChatManager::new(Config::default());
+    let contact = mgr.add_contact(
+        "Ann".into(),
+        Some("127.0.0.1:1".into()),
+        Some(fp.clone()),
+        None,
+    );
+    let other = Uuid::new_v4();
+    mgr.create_local_chat_for_test(other, "Peer ab12".into());
+    mgr.chats.get_mut(&other).unwrap().peer_fingerprint = Some(fp);
+    let _lane = wire_session_for_test(&mut mgr, other);
+    assert_eq!(
+        mgr.connect_to_contact(contact, None, &throwaway_key())
+            .await
+            .unwrap(),
+        other
+    );
+    assert_eq!(mgr.contact_to_chat.get(&contact), Some(&other));
+    assert_eq!(mgr.sessions_len(), 1, "a live session was dialled over");
+}
+
+/// With nothing live, the dial lands in the conversation this contact
+/// already has — found by fingerprint when no association was ever recorded —
+/// so reconnecting never fragments the history; direct addresses are tried
+/// first, and the relay only when there is no usable one.
+#[tokio::test]
+async fn connecting_to_a_contact_dials_into_its_existing_conversation() {
+    let fp = "cd".repeat(32);
+    let existing = |mgr: &mut ChatManager| {
+        let id = Uuid::new_v4();
+        mgr.create_local_chat_for_test(id, "Bob".into());
+        mgr.chats.get_mut(&id).unwrap().peer_fingerprint = Some(fp.clone());
+        id
+    };
+
+    // Direct.
+    let mut mgr = ChatManager::new(Config::default());
+    let history = existing(&mut mgr);
+    let contact = mgr.add_contact(
+        "Bob".into(),
+        Some("127.0.0.1:1".into()),
+        Some(fp.clone()),
+        None,
+    );
+    let chat = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap();
+    assert_eq!(chat, history, "a reconnect opened a second conversation");
+    assert_eq!(mgr.chats[&chat].transport, Transport::Direct);
+    assert_eq!(mgr.contact_to_chat.get(&contact), Some(&history));
+
+    // Relay, because the only address does not parse.
+    let mut mgr = ChatManager::new(Config::default());
+    let history = existing(&mut mgr);
+    let contact = mgr.add_contact(
+        "Bob".into(),
+        Some("not an address".into()),
+        Some(fp.clone()),
+        None,
+    );
+    {
+        let c = mgr.contacts.get_mut(&contact).unwrap();
+        c.relay_server = Some("127.0.0.1:1".into());
+        c.relay_token = Some("token".into());
+    }
+    let chat = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap();
+    assert_eq!(chat, history);
+    assert_eq!(
+        mgr.chats[&chat].transport,
+        Transport::Relay,
+        "an unparsable address must not block the relay fallback"
+    );
+}
+
+/// A contact with no address, no relay and no live session cannot be reached;
+/// the error says what to do rather than pointing at an editor that does not
+/// exist. An unknown contact is an error too.
+#[tokio::test]
+async fn a_contact_with_no_route_is_an_error_that_says_what_to_do() {
+    let mut mgr = ChatManager::new(Config::default());
+    let contact = mgr.add_contact("Cy".into(), None, Some("ef".repeat(32)), None);
+    let err = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("fresh invite link"), "{err}");
+    assert_eq!(mgr.sessions_len(), 0);
+    assert!(mgr
+        .connect_to_contact(Uuid::new_v4(), None, &throwaway_key())
+        .await
+        .is_err());
+}
+
 #[test]
 fn parse_invite_with_valid_address_keeps_it() {
     let mgr = ChatManager::default();

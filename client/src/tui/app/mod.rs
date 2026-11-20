@@ -1827,6 +1827,187 @@ mod tests {
 
     /// JOURNEY-03: `:wipe` checks the password, asks once more (Ctrl+Y only),
     /// then deletes everything and quits.
+    fn last_toast(app: &TuiApp) -> String {
+        app.chat_manager
+            .toasts
+            .last()
+            .map(|t| t.message.clone())
+            .unwrap_or_default()
+    }
+
+    /// The contact commands act on the contact the user named — by list
+    /// position or by name, case-insensitively — and refuse an address no
+    /// socket could dial rather than saving a contact that can never connect.
+    #[tokio::test]
+    async fn contact_commands_add_rename_and_remove_what_was_named() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::ContactAdd {
+            name: "Bad".into(),
+            address: "not-an-address".into(),
+            fingerprint: None,
+        })
+        .await;
+        assert!(
+            app.chat_manager.contacts.is_empty(),
+            "an undialable contact was saved"
+        );
+        assert!(last_toast(&app).contains("Bad address"));
+
+        app.execute_command(TuiCommand::ContactAdd {
+            name: "Alice".into(),
+            address: "10.0.0.2:12345".into(),
+            fingerprint: None,
+        })
+        .await;
+        app.execute_command(TuiCommand::ContactRename {
+            target: "ALICE".into(),
+            new_name: "A".repeat(80),
+        })
+        .await;
+        let name = &app.chat_manager.contacts.values().next().unwrap().name;
+        assert_eq!(
+            name.chars().count(),
+            50,
+            "a rename is capped at 50 characters"
+        );
+
+        app.execute_command(TuiCommand::ContactRemove("2".into()))
+            .await;
+        assert_eq!(
+            app.chat_manager.contacts.len(),
+            1,
+            "removed by an index that does not exist"
+        );
+        assert!(last_toast(&app).contains("No contact"));
+        app.execute_command(TuiCommand::ContactRemove("1".into()))
+            .await;
+        assert!(app.chat_manager.contacts.is_empty());
+    }
+
+    /// `:import` adds a contact from someone else's invite and refuses the
+    /// user's own — that would add the user to their own contacts.
+    #[tokio::test]
+    async fn import_takes_a_peers_invite_and_refuses_your_own() {
+        let (mut app, _data) = app();
+        let mine = app
+            .identity
+            .generate_signed_invite_link_with_addresses(vec!["10.0.0.1:12345".into()], None, None)
+            .unwrap();
+        app.execute_command(TuiCommand::Import(mine)).await;
+        assert!(
+            app.chat_manager.contacts.is_empty(),
+            "the user's own invite was imported"
+        );
+
+        let peer = Identity::new_with_plaintext("Peer".into()).unwrap();
+        let theirs = peer
+            .generate_signed_invite_link_with_addresses(vec!["10.0.0.9:12345".into()], None, None)
+            .unwrap();
+        app.execute_command(TuiCommand::Import(theirs)).await;
+        let contact = app.chat_manager.contacts.values().next().expect("imported");
+        assert_eq!(
+            contact.fingerprint.as_deref(),
+            Some(peer.fingerprint.as_str())
+        );
+        assert_eq!(contact.trust_state, crate::types::TrustState::Unverified);
+
+        app.execute_command(TuiCommand::Import("garbage".into()))
+            .await;
+        assert_eq!(app.chat_manager.contacts.len(), 1);
+        assert!(last_toast(&app).contains("Import failed"));
+    }
+
+    /// `:backup` never copies a plaintext identity — the copy would be the raw
+    /// private key — and copies an encrypted one byte for byte.
+    #[tokio::test]
+    async fn backup_refuses_a_plaintext_identity_and_copies_an_encrypted_one() {
+        let (mut app, data) = app();
+        let dest = data.path().join("backup.json");
+        assert!(!app.identity.is_encrypted());
+        app.execute_command(TuiCommand::Backup(dest.display().to_string()))
+            .await;
+        assert!(!dest.exists(), "a plaintext private key was exported");
+
+        let password = format!("pw-{}", Uuid::new_v4());
+        app.identity.encrypt(&password).unwrap();
+        app.identity.save(&app.identity_path).unwrap();
+        app.execute_command(TuiCommand::Backup(dest.display().to_string()))
+            .await;
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&app.identity_path).unwrap()
+        );
+    }
+
+    /// `:name` validates, and a valid name is written to the identity file —
+    /// not only to the copy the overlay renders.
+    #[tokio::test]
+    async fn name_is_validated_and_persisted() {
+        let (mut app, _data) = app();
+        // A saved identity always has a password: `save` refuses a plaintext key.
+        app.identity
+            .encrypt(&format!("pw-{}", Uuid::new_v4()))
+            .unwrap();
+        app.identity.save(&app.identity_path).unwrap();
+        let before = app.identity.name.clone();
+        app.execute_command(TuiCommand::Name("   ".into())).await;
+        assert_eq!(app.identity.name, before);
+        assert!(last_toast(&app).contains("Invalid name"));
+
+        app.execute_command(TuiCommand::Name("Zoë".into())).await;
+        assert_eq!(app.identity_name, "Zoë");
+        assert_eq!(Identity::load(&app.identity_path).unwrap().name, "Zoë");
+    }
+
+    /// `:accept`/`:decline` act on the offer in the selected conversation
+    /// first, and say so when there is none.
+    #[tokio::test]
+    async fn file_offer_commands_prefer_the_selected_conversation() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::AcceptFile).await;
+        assert!(last_toast(&app).contains("No incoming file"));
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b] {
+            app.chat_manager
+                .create_local_chat_for_test(id, "Peer".into());
+        }
+        let offer_a = app
+            .chat_manager
+            .start_receiving_file(a, "a.bin", 10)
+            .unwrap();
+        let offer_b = app
+            .chat_manager
+            .start_receiving_file(b, "b.bin", 10)
+            .unwrap();
+        app.sync_chat_ids();
+        app.select_chat(b);
+        app.execute_command(TuiCommand::DeclineFile).await;
+        let held = |id: Uuid| {
+            app.chat_manager
+                .active_transfers_snapshot()
+                .iter()
+                .any(|t| t.id == id && t.status == crate::types::TransferStatus::AwaitingAcceptance)
+        };
+        assert!(held(offer_a), "the offer in another chat was declined");
+        assert!(!held(offer_b), "the selected chat's offer is still held");
+    }
+
+    /// Commands that need a selected conversation say so instead of acting
+    /// on some other one; `:history-reset` with a healthy history does nothing.
+    #[tokio::test]
+    async fn chat_commands_without_a_selection_or_a_problem_do_nothing() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::Rename("New".into())).await;
+        assert!(last_toast(&app).contains("No chat selected"));
+        app.execute_command(TuiCommand::Send("/etc/hostname".into()))
+            .await;
+        assert!(last_toast(&app).contains("No chat selected"));
+        app.execute_command(TuiCommand::HistoryReset).await;
+        assert!(last_toast(&app).contains("nothing to reset"));
+        assert!(!app.history_path.with_extension("unreadable").exists());
+    }
+
     #[tokio::test]
     async fn wipe_checks_the_password_confirms_then_deletes_everything() {
         let dir = tempfile::tempdir().unwrap();
