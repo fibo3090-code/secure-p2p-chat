@@ -68,6 +68,13 @@ pub(crate) async fn unlock(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_identity_loaded(&state)?;
+    // Already unlocked: nothing to do. Running the body again re-ran Argon2
+    // and reloaded the history file over the live state — `apply_history`
+    // replaces, so everything not yet saved (saves are coalesced) was dropped
+    // while its sessions stayed open. A double-submitted form was enough.
+    if !crate::lock_identity(&state.identity).is_locked() && !state.needs_password_setup() {
+        return Ok(());
+    }
     let key = {
         let mut id = crate::lock_identity(&state.identity);
         id.decrypt(&password)
@@ -117,6 +124,13 @@ pub(crate) async fn set_password(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_identity_loaded(&state)?;
+    // First setup only. Once a password exists the plaintext key is in memory
+    // while unlocked, so `encrypt` would happily re-wrap `identity.json` under
+    // whatever the caller sent — no current password asked. Anything able to
+    // invoke a command could lock the owner out of their identity and history.
+    if !state.needs_password_setup() {
+        return Err("A password is already set — use Change password instead".to_string());
+    }
     let key = {
         let mut id = crate::lock_identity(&state.identity);
         // `encrypt` enforces the length floor; the message it returns is

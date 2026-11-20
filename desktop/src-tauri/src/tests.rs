@@ -916,3 +916,216 @@ fn set_presence_accepts_partial_information() {
     )
     .expect("a malformed chat id must not fail the call");
 }
+
+// ── Auth re-entry (TAURI-02) ────────────────────────────────────────────────
+
+/// `set_password` is for first setup only. On a ready app the plaintext key
+/// is in memory, so without a guard it re-wrapped `identity.json` under any
+/// password the caller chose — no current password needed. Anything that can
+/// invoke a command (a script injected into the webview) could lock the owner
+/// out of their identity, and with it their whole history. Changing the
+/// password is `change_password`, which asks for the current one.
+#[test]
+fn set_password_cannot_rekey_an_identity_that_already_has_one() {
+    let h = ready_harness();
+    let path = h._dir.path().join("identity.json");
+    let before = std::fs::read(&path).expect("identity saved");
+
+    let err = h
+        .ipc(
+            "set_password",
+            json!({ "password": "attacker-chosen-pass" }),
+        )
+        .expect_err("a second set_password re-keyed the identity");
+    assert!(
+        err_text(&err).to_lowercase().contains("already"),
+        "the refusal should say a password is already set: {}",
+        err_text(&err)
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "identity.json was rewritten"
+    );
+
+    let mut on_disk = Identity::load(&path).expect("load");
+    assert!(on_disk.decrypt("attacker-chosen-pass").is_err());
+    on_disk
+        .decrypt("bridge-test-passphrase")
+        .expect("the owner's password still opens it");
+}
+
+/// A second `unlock` on an unlocked app is a no-op. It used to re-run Argon2
+/// and reload the history file over the running state — `apply_history`
+/// *replaces*, so whatever had not been saved yet (saves are coalesced) was
+/// dropped while its sessions stayed live. A double-submitted form does it.
+#[test]
+fn a_second_unlock_does_not_reload_history_over_unsaved_state() {
+    let h = ready_harness();
+    // A history already on disk (a rename saves immediately)…
+    let saved = h.seed_chat_with_incoming("Saved", 0);
+    h.ipc(
+        "rename_chat",
+        json!({ "id": saved.to_string(), "title": "Saved" }),
+    )
+    .expect("rename");
+    assert!(
+        h.bridge_history_path().exists(),
+        "the rename wrote the history"
+    );
+    // …and a conversation newer than it, not yet written.
+    let chat = h.seed_chat_with_incoming("Unsaved", 1);
+    h.ipc("unlock", json!({ "password": "bridge-test-passphrase" }))
+        .expect("unlocking an unlocked app is not an error");
+    let conversations = h.ipc("list_conversations", json!({})).unwrap();
+    assert!(
+        conversations
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == chat.to_string()),
+        "the unsaved conversation was dropped by a re-entrant unlock"
+    );
+}
+
+// ── Files (TAURI-27) ────────────────────────────────────────────────────────
+
+impl Harness {
+    /// Seed a file message whose bytes are at `path`, as received from the
+    /// peer (`from_me == false`) or as sent by the user.
+    fn seed_file_message(&self, path: &std::path::Path, from_me: bool) -> (uuid::Uuid, uuid::Uuid) {
+        use tauri::Manager;
+        let chat = self.seed_chat_with_incoming("Files", 0);
+        let msg = uuid::Uuid::new_v4();
+        let bridge = self._app.state::<Bridge>();
+        let manager = bridge.manager.clone();
+        let path = path.to_path_buf();
+        tauri::async_runtime::block_on(async move {
+            let mut mgr = manager.lock().await;
+            let chat = mgr.get_chat_mut(chat).unwrap();
+            chat.messages.push(messenger_core::types::Message {
+                id: msg,
+                from_me,
+                content: messenger_core::types::MessageContent::File {
+                    filename: path.file_name().unwrap().to_string_lossy().into(),
+                    size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                    path: Some(path),
+                },
+                timestamp: chrono::Utc::now(),
+                delivered: true,
+            });
+        });
+        (chat, msg)
+    }
+}
+
+/// "Open" on a file received from a peer that would *execute* is held back
+/// until the user confirms: on a chat file card, a click runs attacker-chosen
+/// code. Only the refusal is exercised — the paths that really open a file
+/// would launch a program on the test machine.
+#[test]
+fn opening_a_received_executable_needs_confirmation() {
+    let h = ready_harness();
+    let files = tempfile::tempdir().unwrap();
+    for (name, kind) in [
+        ("setup.exe", "exe"),
+        ("holiday.JPG.Lnk", "lnk"),
+        ("launcher.desktop", "desktop"),
+    ] {
+        let path = files.path().join(name);
+        std::fs::write(&path, b"payload").unwrap();
+        let (chat, msg) = h.seed_file_message(&path, false);
+        let outcome = h
+            .ipc_binds(
+                "open_file",
+                json!({ "id": chat.to_string(), "msg": msg.to_string(), "reveal": false }),
+            )
+            .expect("a held-back open is an outcome, not an error");
+        assert_eq!(outcome["opened"], false, "{name} was opened without asking");
+        assert_eq!(outcome["blocked"], kind, "{name}");
+        assert_eq!(outcome["filename"], name);
+    }
+
+    // On Unix the exec bit decides, whatever the name.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = files.path().join("notes");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (chat, msg) = h.seed_file_message(&path, false);
+        let outcome = h
+            .ipc(
+                "open_file",
+                json!({ "id": chat.to_string(), "msg": msg.to_string(), "reveal": false }),
+            )
+            .unwrap();
+        assert_eq!(outcome["blocked"], "executable");
+    }
+
+    // A file that is gone is an error that says so, not a silent no-op.
+    let gone = files.path().join("gone.pdf");
+    std::fs::write(&gone, b"x").unwrap();
+    let (chat, msg) = h.seed_file_message(&gone, false);
+    std::fs::remove_file(&gone).unwrap();
+    let err = h
+        .ipc(
+            "open_file",
+            json!({ "id": chat.to_string(), "msg": msg.to_string(), "reveal": false }),
+        )
+        .unwrap_err();
+    assert!(
+        err_text(&err).contains("no longer exists"),
+        "{}",
+        err_text(&err)
+    );
+
+    // A text message is not a file.
+    let (chat, _) = h.seed_file_message(&files.path().join("setup.exe"), false);
+    let text = h.seed_chat_with_incoming("Text", 1);
+    let _ = chat;
+    let err = h
+        .ipc("open_file", json!({ "id": text.to_string(), "msg": uuid::Uuid::new_v4().to_string(), "reveal": false }))
+        .unwrap_err();
+    assert_eq!(err_text(&err), "No such message");
+}
+
+/// Inline previews: a small raster image comes back as a data URL; SVG (it
+/// can carry script, and the file came from a peer), non-images, and images
+/// over the 4 MiB cap come back as `None`.
+#[test]
+fn file_previews_are_raster_images_under_the_cap_only() {
+    let h = ready_harness();
+    let files = tempfile::tempdir().unwrap();
+    let preview = |name: &str, bytes: &[u8]| {
+        let path = files.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let (chat, msg) = h.seed_file_message(&path, false);
+        h.ipc_binds(
+            "file_preview",
+            json!({ "id": chat.to_string(), "msg": msg.to_string() }),
+        )
+        .expect("preview")
+    };
+
+    let png = b"\x89PNG\r\n\x1a\nnot really an image but small";
+    let url = preview("photo.png", png);
+    use base64::Engine;
+    assert_eq!(
+        url.as_str().unwrap(),
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    );
+    assert_eq!(
+        preview("drawing.svg", b"<svg onload=alert(1)/>"),
+        Value::Null
+    );
+    assert_eq!(preview("notes.txt", b"hello"), Value::Null);
+    assert_eq!(
+        preview("huge.png", &vec![0u8; 4 * 1024 * 1024 + 1]),
+        Value::Null,
+        "an image over the cap would balloon the webview"
+    );
+}
