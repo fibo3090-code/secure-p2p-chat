@@ -6,7 +6,7 @@ name: P2PEM CodeQL configuration
 # alerts, of which essentially all were test fixtures. `rust/hard-coded-
 # cryptographic-value` fired on `let key = [7u8; AES_KEY_SIZE]` inside a
 # `#[cfg(test)]` module; `rust/cleartext-logging` fired on assertion messages in
-# `client/tests/party_e2e.rs`. Both queries are correct about what they see and
+# the Communities end-to-end tests (now `client/tests/it/party.rs`). Both queries are correct about what they see and
 # wrong about whether it matters: a hard-coded key in a test *is* the test.
 #
 # An alert queue that is 100% noise is not a mild annoyance, it is the failure

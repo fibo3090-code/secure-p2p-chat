@@ -8,7 +8,7 @@
 //! Communities are the most involved subsystem in the workspace — a real join
 //! crosses the v3 handshake, the join gate, the hub, the dispatch layer, SQLite
 //! and the blob store — and none of that was reachable end to end while the only
-//! entry point was `fn main`. `client/tests/party_e2e.rs` drives this against the
+//! entry point was `fn main`. `client/tests/it/party.rs` drives this against the
 //! real `PartyManager` over a loopback socket.
 
 pub mod connection;

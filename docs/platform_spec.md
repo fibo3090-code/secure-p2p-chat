@@ -969,7 +969,7 @@ trusting these numbers:
   round-trips, backward-compatible deserialization.
 - **Identity / persistence**: encrypted identity storage, encrypted-history
   round-trip, wrong-key rejection, corrupt-file handling, format auto-detection.
-- **ChatManager** (`client/tests/feature_coverage_tests.rs` + in-file): group
+- **ChatManager** (`client/tests/it/manager.rs` + `chat_manager` unit tests): group
   chats, rename/delete, history clearing, toast lifecycle, file-transfer state,
   typing indicators, contact import/association, invites (v1–v4 + expiry and
   tamper rejection), invite-QR generation.

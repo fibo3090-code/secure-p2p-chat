@@ -102,7 +102,7 @@ client/src/
     input.rs        EditableField (cursor-aware UTF-8 text editing)
     overlays.rs     modal overlays (verify, contacts, settings, etc.)
     ui.rs           frame composition (chat list, messages, toasts)
-client/tests/      integration tests (link against the client lib)
+client/tests/it/   the client integration suite: one binary, shared harness in common.rs
 
 server/src/
   main.rs         binary entry point: argument parsing and bind

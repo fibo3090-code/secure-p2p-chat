@@ -11,6 +11,39 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- A session dropped with "Decryption failed" when both people sent at once
+  — chatting or transferring files in both directions — at a key rotation.
+  The host could start a second rotation before the peer had switched to the
+  first, discarding the key the peer's in-flight messages used. It now waits.
+- A damaged `identity.json` (a nonce of the wrong length) crashed the unlock
+  instead of reporting an unreadable identity.
+- Desktop: `set_password` on an unlocked app re-protected the identity under
+  any new password without asking for the current one; it is now first-setup
+  only. A second unlock (a double-submitted form) reloaded the history over
+  messages not yet saved, dropping them.
+- Desktop, Communities: text typed in a direct message stayed in the box after
+  switching to a channel, and Enter posted it there — drafts are now per
+  conversation. A slow history response could show one channel's messages
+  under another's name. Read marks were lost on every restart, so the whole
+  history came back badged.
+- Desktop: a link whose text hid a right-to-left override displayed as a
+  different address from the one it opened; links now end at any invisible
+  formatting character, and names and message text are bidi-isolated. Text
+  dialogs open with the field focused again, and return focus to what opened
+  them.
+
+### Changed
+
+- The test suite was audited and restructured: the client's 21 integration
+  test binaries are one, with one shared harness; tests that could not fail
+  (Mutex and `HashMap` round-trips, assertion-free checks, negative checks
+  that only waited) were removed or rewritten against a barrier; the key
+  schedule is pinned by known answers; TUI tests no longer touch the real
+  data directory; a flaky test now fails CI. The Rust suite runs in about 30 s
+  instead of 44 s with the desktop bridge included.
+
 ### Dependencies
 
 - UPnP port mapping (`igd-next`) 0.17 → 0.18. `mdns-sd`, `uuid`, `serde_json`,
