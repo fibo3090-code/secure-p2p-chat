@@ -535,6 +535,55 @@ async fn messages_keep_flowing_across_a_rekey() {
     client.handle.abort();
 }
 
+/// CRYPTO-06: several rekeys under traffic crossing in both directions.
+///
+/// Only the host initiates a rekey, and only one previous key is retained to
+/// decrypt frames the client sent before it switched. Both directions count
+/// toward the threshold, so with the client streaming too the host can start
+/// a *second* rekey before any frame under the first has come back — which
+/// discards the key the client's in-flight frames still use, and the session
+/// dies on "Decryption failed". One-way tests cannot see this: with one
+/// direction quiet, every rekey completes before the next is due.
+#[tokio::test]
+async fn several_rekeys_under_crossing_traffic_lose_nothing() {
+    let (mut host, mut client) = connect_pair().await;
+    reach_ready(&mut host, &mut client).await;
+
+    // ~1000 frames against a 100-message threshold: about ten rekeys.
+    const COUNT: usize = 500;
+    for i in 0..COUNT {
+        for (peer, side) in [(&host, "host"), (&client, "client")] {
+            peer.outbound
+                .send(ProtocolMessage::Text {
+                    text: format!("{side}-{i}"),
+                    timestamp: i as u64,
+                    seq: 0,
+                })
+                .unwrap();
+        }
+    }
+    for (peer, from, label) in [
+        (&mut client, "host", "client"),
+        (&mut host, "client", "host"),
+    ] {
+        for i in 0..COUNT {
+            match next_message(&mut peer.events, label).await {
+                ProtocolMessage::Text { text, .. } => {
+                    assert_eq!(
+                        text,
+                        format!("{from}-{i}"),
+                        "{label} lost or reordered a frame"
+                    )
+                }
+                other => panic!("{label} expected text {i}, got {other:?}"),
+            }
+        }
+    }
+
+    host.handle.abort();
+    client.handle.abort();
+}
+
 /// Regression test for the non-cancel-safe receive in the message loop.
 ///
 /// The loop selects between "read a frame" and "send a frame". It used to build

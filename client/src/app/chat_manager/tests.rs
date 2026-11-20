@@ -1260,38 +1260,53 @@ async fn outgoing_stream_is_backpressured_by_the_bounded_lane() {
         .expect("outgoing transfer tracked")
         .id;
 
-    // With nothing draining the lane, give the task time to run as far ahead as
-    // it can, then confirm it is capped near the lane capacity — not the file.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    mgr.sync_outgoing_transfer_progress();
-    let sent = |mgr: &ChatManager| {
+    let sent = |mgr: &mut ChatManager| {
+        mgr.sync_outgoing_transfer_progress();
         mgr.active_transfers_snapshot()
             .into_iter()
             .find(|t| t.id == transfer_id)
             .map(|t| t.received)
             .unwrap_or(0)
     };
-    let stalled = sent(&mgr);
+    // Wait for the one state in which the reader is provably blocked: the
+    // lane full and nothing draining it. A fixed sleep instead passed on a
+    // slow runner where the reader had not run at all — "stalled at 0 bytes"
+    // satisfies every bound below without anything having been backpressured.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while file_rx.len() < super::FILE_LANE_CAPACITY {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lane never filled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Let a blocked reader prove it stays blocked.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let stalled = sent(&mut mgr);
     let cap_bytes = super::FILE_LANE_CAPACITY as u64 * crate::FILE_CHUNK_SIZE as u64;
+    assert!(stalled > 0, "the reader made no progress at all");
     assert!(
         stalled <= cap_bytes,
-        "backpressure must cap in-flight bytes at ~lane capacity; got {stalled} > {cap_bytes}"
+        "in-flight bytes must be capped at the lane capacity; got {stalled} > {cap_bytes}"
     );
-    assert!(
-        stalled < file_size,
-        "the whole file must not be buffered when the consumer is stalled"
+    assert_eq!(
+        file_rx.len(),
+        super::FILE_LANE_CAPACITY,
+        "nothing may queue past a full lane"
     );
+    assert!(stalled < file_size);
 
-    // Draining the lane must let the producer make further progress.
+    // Draining the lane lets the reader advance.
     for _ in 0..20 {
         let _ = file_rx.recv().await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    mgr.sync_outgoing_transfer_progress();
-    assert!(
-        sent(&mgr) > stalled,
-        "draining the lane must let the backpressured reader advance"
-    );
+    while sent(&mut mgr) <= stalled {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "draining the lane did not let the reader advance"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 /// Queueing frames on the session is not delivery: the "File sent" toast

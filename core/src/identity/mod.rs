@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 
 // Constants for encryption
 const KEY_SIZE: usize = 32; // 256-bit key
+const NONCE_SIZE: usize = 12; // ChaCha20-Poly1305, 96-bit
 
 /// Upper bounds on the Argon2 cost parameters this app will honour from an
 /// identity file. `Params::new` enforces only the RFC's own limits, which run
@@ -342,6 +343,11 @@ impl Identity {
             .hash_password_into(password.as_bytes(), salt, &mut key_bytes[..])
             .ok()?;
         let cipher = ChaCha20Poly1305::new((&key_bytes[..]).into());
+        // The nonce is read from the file. `.into()` on an unchecked slice
+        // asserts its length and panics; a damaged file must be an error.
+        if nonce.len() != NONCE_SIZE {
+            return None;
+        }
         let plaintext = cipher.decrypt(nonce.into(), ciphertext).ok()?;
         String::from_utf8(plaintext).ok().map(Zeroizing::new)
     }
@@ -1055,6 +1061,45 @@ mod tests {
         let wrong_password = test_password();
         let result = identity.decrypt(&wrong_password);
         assert!(result.is_err());
+    }
+
+    /// CRYPTO-08: the nonce and salt come from `identity.json`, which can be
+    /// truncated or edited. A wrong-sized nonce used to reach
+    /// `GenericArray::from_slice`, which *asserts* the length — so a damaged
+    /// file panicked the unlock instead of reaching the "error" auth state,
+    /// and inside a Tauri command could poison the bridge mutex.
+    #[test]
+    fn a_malformed_nonce_or_salt_is_an_error_not_a_panic() {
+        let password = test_password();
+        let mut good = Identity::new_with_plaintext("Test User".to_string()).unwrap();
+        good.encrypt(&password).unwrap();
+        let nonce = good.nonce.clone().unwrap();
+        let salt = good.salt.clone().unwrap();
+
+        let damaged = [
+            ("empty nonce", Vec::new(), salt.clone()),
+            ("short nonce", nonce[..11].to_vec(), salt.clone()),
+            (
+                "long nonce",
+                [nonce.clone(), vec![0]].concat(),
+                salt.clone(),
+            ),
+            ("empty salt", nonce.clone(), Vec::new()),
+            ("short salt", nonce.clone(), salt[..4].to_vec()),
+        ];
+        for (what, nonce, salt) in damaged {
+            let mut identity = good.clone();
+            identity.private_key_pem_plaintext = None;
+            identity.nonce = Some(nonce);
+            identity.salt = Some(salt);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                identity.decrypt(&password)
+            }));
+            match outcome {
+                Ok(result) => assert!(result.is_err(), "{what}: unlocked anyway"),
+                Err(_) => panic!("{what}: decrypt panicked instead of returning an error"),
+            }
+        }
     }
 
     #[test]

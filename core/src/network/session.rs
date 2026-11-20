@@ -1312,8 +1312,17 @@ where
         }
     }
 
+    /// A rotation is due once enough frames or time have passed — and only
+    /// once the previous one has *completed*: a frame from the peer has
+    /// decrypted under the current key, which is what clears `prev_cipher`.
+    /// Rotating again before that discards the one retained key the peer's
+    /// in-flight frames still use, and the session dies on "Decryption
+    /// failed" (CRYPTO-06; both directions count toward the threshold, so
+    /// crossing traffic reached it within one round trip). The peer's
+    /// keep-alive bounds how long a rotation can be held back.
     fn rekey_due(&self) -> bool {
         self.is_rekey_initiator
+            && self.prev_cipher.is_none()
             && (self.messages_since_rekey >= REKEY_MESSAGE_COUNT
                 || self.last_rekey_time.elapsed() >= REKEY_TIME_INTERVAL)
     }
@@ -1808,6 +1817,43 @@ mod tests {
             rx.try_recv().unwrap(),
             SessionEvent::MessageReceived(ProtocolMessage::Text { .. })
         ));
+    }
+
+    /// CRYPTO-06: the host does not start a rotation while the previous one
+    /// is open — it still holds the old key because no frame from the peer
+    /// has decrypted under the new one. The first such frame releases it, so
+    /// rotations are held back, never skipped.
+    #[tokio::test]
+    async fn a_rekey_waits_until_the_peer_has_switched_to_the_last_one() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx);
+
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        assert!(transport.rekey_due(), "the threshold makes a rotation due");
+        transport.rekey().await.unwrap();
+        assert!(transport.prev_cipher.is_some(), "the old key is retained");
+
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        assert!(
+            !transport.rekey_due(),
+            "a second rotation started before the peer switched would drop the key its in-flight frames use"
+        );
+
+        // A frame from the client under the new key: the client has switched.
+        let client =
+            AesCipher::new_with_role(&transport.cipher.get_current_key(), NonceRole::Client)
+                .unwrap();
+        let ping = ProtocolMessage::Ping { seq: 1 };
+        let frame = client.encrypt(&ping.to_plain_bytes(), Some(&aad));
+        assert!(matches!(
+            transport.receive(&frame).unwrap(),
+            Received::Continue
+        ));
+        assert!(transport.prev_cipher.is_none());
+        assert!(transport.rekey_due(), "the held rotation is released");
     }
 
     /// EXT-01: only the host rotates. A client's `Rekey` must not move the
