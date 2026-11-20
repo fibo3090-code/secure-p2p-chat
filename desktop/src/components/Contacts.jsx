@@ -9,16 +9,13 @@ export function Contacts({ onConnected }) {
   const [contacts, setContacts] = useState([]);
   const [link, setLink] = useState("");
   const [err, setErr] = useState("");
-  // Deleting a contact throws away a verified fingerprint, which is the whole
-  // basis of trusting that peer — re-establishing it means another out-of-band
-  // check. Deleting a *conversation* already confirms, so doing it silently
-  // here was both inconsistent and the more destructive of the two.
+  // Deleting a contact discards a verified fingerprint (another out-of-band
+  // check to restore), so it confirms, like deleting a conversation.
   const [deleteTarget, setDeleteTarget] = useState(null);
 
   const load = useCallback(() => {
-    // `|| []` because the whole pane renders off `contacts.length`: one command
-    // answering with nothing takes the surface down entirely, and a contacts
-    // list is not worth a blank screen.
+    // `|| []`: the pane renders off `contacts.length`, so an empty answer
+    // must not blank it.
     api.listContacts().then((list) => setContacts(list || [])).catch(() => {});
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -30,10 +27,8 @@ export function Contacts({ onConnected }) {
       const res = await api.importInvite(link.trim());
       setLink("");
       load();
-      // An unsigned (v1) link carries no proof of who made it, so say so. The
-      // contact is still Unverified either way and has to pass the safety code
-      // on first connection — but importing both kinds with the same silent
-      // success told the user nothing.
+      // An unsigned (v1) link proves nothing about its maker, so say so (either
+      // kind still starts Unverified and must pass the safety code).
       if (res && res.signed === false) {
         toast("Added from an unsigned invite link — anyone can create one. Compare the safety code when you first connect.", "error");
       } else {
@@ -54,9 +49,8 @@ export function Contacts({ onConnected }) {
       load();
     } catch (e) { setErr(friendlyError(e)); }
   }
-  // Say whether the copy happened. A clipboard write can be refused by the
-  // webview, and silently doing nothing invites the user to paste a stale
-  // fingerprint into a verification conversation.
+  // Say whether the copy happened: the webview can refuse it, and a stale
+  // fingerprint pasted into a verification chat is worse than an error.
   async function copyFingerprint(c) {
     if (!c.fingerprint) return;
     try {
@@ -116,9 +110,7 @@ export function Contacts({ onConnected }) {
                   {c.reachable ? (c.relay_only ? "ready · via relay" : "ready") : "no way to reach them"}
                 </span>
                 <div className="contact-card-actions">
-                  {/* A contact imported from a relay invite has no direct
-                      address but is still dialable through its relay token —
-                      `reachable` covers both, `address` only covered one. */}
+                  {/* `reachable` also covers relay-only contacts (no address). */}
                   <IconButton name="send" label="Connect" onClick={() => connect(c.id)}
                     disabled={!c.reachable || c.trust === "blocked"} />
                   <IconButton name="copy" label="Copy fingerprint" disabled={!c.fingerprint}
