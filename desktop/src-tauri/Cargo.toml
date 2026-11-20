@@ -57,3 +57,7 @@ base64 = { workspace = true }
 [target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2.11.3", features = ["test"] }
 tempfile = { workspace = true }
+# A real Community server in process, so the `party_*` commands are driven
+# end to end — the two-step join, the pin written only after a real join, and
+# file transfer — rather than only for their argument binding.
+messenger-server = { workspace = true }

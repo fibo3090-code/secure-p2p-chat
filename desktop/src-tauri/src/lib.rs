@@ -735,9 +735,9 @@ impl PollContext {
     /// dialog would spring back open four times a second. When the user
     /// answers one, the next peer's prompt becomes the head and is emitted in
     /// its turn instead of being lost.
-    fn publish_fingerprint_prompt(
+    fn publish_fingerprint_prompt<R: tauri::Runtime>(
         &self,
-        app: &tauri::AppHandle,
+        app: &tauri::AppHandle<R>,
         prompt: Option<PendingFingerprint>,
         last_session: &mut Option<Uuid>,
     ) -> bool {

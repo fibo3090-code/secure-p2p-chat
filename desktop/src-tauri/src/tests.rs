@@ -1129,3 +1129,430 @@ fn file_previews_are_raster_images_under_the_cap_only() {
         "an image over the cap would balloon the webview"
     );
 }
+
+// ── Communities, end to end (TAURI-01 / TAURI-27) ───────────────────────────
+
+/// A real community server on a loopback port, on the app's own runtime.
+struct PartyServer {
+    address: String,
+    state: Arc<Mutex<messenger_server::state::PartyState>>,
+    _dir: tempfile::TempDir,
+}
+
+fn start_party_server(password: Option<&str>) -> PartyServer {
+    let dir = tempfile::tempdir().unwrap();
+    let state = messenger_server::state::PartyState::load(
+        "Bridge Test Community",
+        password.map(str::to_owned),
+        dir.path(),
+    )
+    .unwrap();
+    let state = Arc::new(Mutex::new(state));
+    let served = state.clone();
+    let address = tauri::async_runtime::block_on(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let key = messenger_core::core::generate_rsa_keypair(messenger_core::RSA_KEY_BITS).unwrap();
+        tauri::async_runtime::spawn(messenger_server::run_accept_loop(
+            listener,
+            served,
+            Arc::new(key),
+            Arc::new(messenger_server::hub::Hub::new()),
+        ));
+        address
+    });
+    PartyServer {
+        address,
+        state,
+        _dir: dir,
+    }
+}
+
+impl Harness {
+    fn bridge(&self) -> tauri::State<'_, Bridge> {
+        use tauri::Manager;
+        self._app.state::<Bridge>()
+    }
+
+    /// Drain community events (what the poll loop does) until `done`, or fail.
+    fn pump_party(&self, label: &str, mut done: impl FnMut(&Harness) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let party = self.bridge().party.clone();
+            tauri::async_runtime::block_on(async move { party.lock().await.poll_events() });
+            if done(self) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "[{label}] timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn party_server(&self, sid: &str) -> Option<Value> {
+        self.ipc("party_list", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == sid)
+            .cloned()
+    }
+
+    /// What the poll loop does on a tick: record a community once it is joined.
+    fn poll_parties_once(&self) {
+        let ctx = crate::PollContext::from_bridge(&self.bridge());
+        let mut recorded = std::collections::HashSet::new();
+        tauri::async_runtime::block_on(ctx.poll_parties(&mut recorded));
+    }
+}
+
+/// The join is two steps and nothing moves before the second. Step one
+/// returns the server's fingerprint and SAS and has joined nobody; a second
+/// call with a fingerprint the user did NOT verify is refused before the
+/// `Join` frame (username + password) goes out; only the verified one joins.
+/// The pin is written by the poll loop once the server has accepted us —
+/// never at connect time.
+#[test]
+fn party_join_is_two_steps_and_pins_only_after_a_real_join() {
+    let h = ready_harness();
+    let srv = start_party_server(Some("community-pass"));
+    let join = |fingerprint: Value| {
+        h.ipc_binds(
+            "party_join",
+            json!({ "address": srv.address, "username": "alice",
+                    "password": "community-pass", "fingerprint": fingerprint }),
+        )
+    };
+    let members =
+        || tauri::async_runtime::block_on(async { srv.state.lock().await.members().len() });
+
+    let step1 = join(Value::Null).expect("first contact");
+    assert_eq!(step1["status"], "verify");
+    let fingerprint = step1["fingerprint"].as_str().unwrap().to_string();
+    assert_eq!(fingerprint.len(), 64);
+    assert!(!step1["sas"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(members(), 0, "step one joined somebody");
+
+    let err = join(json!("ff".repeat(32))).expect_err("an unverified key was joined");
+    assert!(
+        err_text(&err).contains("not the one you verified"),
+        "{}",
+        err_text(&err)
+    );
+    assert_eq!(
+        members(),
+        0,
+        "credentials reached a server the user did not verify"
+    );
+
+    let step2 = join(json!(fingerprint)).expect("join with the verified key");
+    assert_eq!(step2["status"], "joined");
+    let sid = step2["server"].as_str().unwrap().to_string();
+    assert_eq!(
+        h.ipc("party_saved", json!({})).unwrap(),
+        json!([]),
+        "pinned before joining"
+    );
+
+    h.pump_party("joined", |h| {
+        h.party_server(&sid)
+            .is_some_and(|s| s["status"] == "joined")
+    });
+    h.poll_parties_once();
+    let saved = h.ipc("party_saved", json!({})).unwrap();
+    assert_eq!(
+        saved[0]["fingerprint"],
+        fingerprint.as_str(),
+        "the joined server was not pinned"
+    );
+    assert_eq!(saved[0]["address"], srv.address.as_str());
+
+    // Post and read back through the commands the Communities pane uses.
+    let server = h.party_server(&sid).unwrap();
+    let channel = server["channels"][0]["id"].as_str().unwrap().to_string();
+    h.ipc_binds(
+        "party_post",
+        json!({ "server": sid, "channel": channel, "text": "hello" }),
+    )
+    .expect("post");
+    h.pump_party("post stored", |h| {
+        h.ipc(
+            "party_history",
+            json!({ "server": sid, "channel": channel }),
+        )
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["text"] == "hello")
+    });
+
+    // Leaving removes the server and its saved entry.
+    h.ipc_binds("party_leave", json!({ "server": sid }))
+        .expect("leave");
+    assert!(h.party_server(&sid).is_none());
+    assert_eq!(
+        h.ipc("party_saved", json!({})).unwrap(),
+        json!([]),
+        "leaving kept the pin"
+    );
+    let err = h.ipc("party_leave", json!({ "server": sid })).unwrap_err();
+    assert_eq!(err_text(&err), "unknown server");
+}
+
+/// A wrong password is a rejection the pane can show — and a community the
+/// user never got into is not pinned.
+#[test]
+fn a_rejected_party_join_is_reported_and_never_pinned() {
+    let h = ready_harness();
+    let srv = start_party_server(Some("community-pass"));
+    let args = |fingerprint: Value| {
+        json!({ "address": srv.address, "username": "alice",
+                "password": "not-the-password", "fingerprint": fingerprint })
+    };
+    let fp = h.ipc("party_join", args(Value::Null)).unwrap()["fingerprint"].clone();
+    let sid = h.ipc("party_join", args(fp)).unwrap()["server"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.pump_party("rejected", |h| {
+        h.party_server(&sid)
+            .is_some_and(|s| s["status"] == "rejected")
+    });
+    let detail = h.party_server(&sid).unwrap()["status_detail"].clone();
+    assert!(
+        detail
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("password"),
+        "{detail}"
+    );
+    h.poll_parties_once();
+    assert_eq!(h.ipc("party_saved", json!({})).unwrap(), json!([]));
+}
+
+/// The halves of `party_send_file` / `party_download_file` that the native
+/// dialogs wrap: an upload is refused on size before it is read, and a
+/// download returns exactly the stored bytes — or the server's refusal.
+#[test]
+fn community_file_upload_and_download_cores() {
+    use crate::commands::party::{fetch_party_file, read_upload};
+    let h = ready_harness();
+    let srv = start_party_server(None);
+    let fp = h
+        .ipc("party_join", json!({ "address": srv.address, "username": "bob", "password": "", "fingerprint": null }))
+        .unwrap()["fingerprint"]
+        .clone();
+    let sid = h
+        .ipc(
+            "party_join",
+            json!({ "address": srv.address, "username": "bob", "password": "", "fingerprint": fp }),
+        )
+        .unwrap()["server"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.pump_party("joined", |h| {
+        h.party_server(&sid)
+            .is_some_and(|s| s["status"] == "joined")
+    });
+    let channel = h.party_server(&sid).unwrap()["channels"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let files = tempfile::tempdir().unwrap();
+    // Over the cap: refused from the metadata, without reading a byte.
+    let huge = files.path().join("huge.bin");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(messenger_core::party::MAX_PARTY_FILE_BYTES + 1)
+        .unwrap();
+    let err = tauri::async_runtime::block_on(read_upload(&huge)).unwrap_err();
+    assert!(err.contains("limited to"), "{err}");
+
+    let notes = files.path().join("notes.txt");
+    let bytes: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&notes, &bytes).unwrap();
+    let (name, mime, data) = tauri::async_runtime::block_on(read_upload(&notes)).unwrap();
+    assert_eq!((name.as_str(), mime.as_str()), ("notes.txt", "text/plain"));
+
+    let party = h.bridge().party.clone();
+    let (sid_u, cid_u) = (
+        uuid::Uuid::parse_str(&sid).unwrap(),
+        uuid::Uuid::parse_str(&channel).unwrap(),
+    );
+    tauri::async_runtime::block_on(async {
+        party
+            .lock()
+            .await
+            .send_file(sid_u, cid_u, name, mime, data)
+            .unwrap()
+    });
+    let hash = messenger_core::party::blob_hash(&bytes);
+    h.pump_party("file stored", |h| {
+        h.ipc(
+            "party_history",
+            json!({ "server": sid, "channel": channel }),
+        )
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["hash"] == hash.as_str())
+    });
+
+    // The poll loop is what completes a download; run it beside the wait.
+    let pumping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pump = {
+        let (party, pumping) = (party.clone(), pumping.clone());
+        std::thread::spawn(move || {
+            while pumping.load(std::sync::atomic::Ordering::SeqCst) {
+                let party = party.clone();
+                tauri::async_runtime::block_on(async move { party.lock().await.poll_events() });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })
+    };
+    let timeout = std::time::Duration::from_secs(30);
+    let got = tauri::async_runtime::block_on(fetch_party_file(&party, sid_u, hash, timeout));
+    let missing =
+        tauri::async_runtime::block_on(fetch_party_file(&party, sid_u, "0".repeat(64), timeout));
+    pumping.store(false, std::sync::atomic::Ordering::SeqCst);
+    pump.join().unwrap();
+    assert_eq!(got.expect("download"), bytes);
+    assert_eq!(
+        missing.unwrap_err(),
+        messenger_core::party::UNKNOWN_FILE_ERROR
+    );
+}
+
+// ── The poll loop's steps ───────────────────────────────────────────────────
+
+/// History writes are coalesced: the loop writes when the state changed and
+/// the floor has passed, and never rewrites a state already on disk.
+#[test]
+fn the_poll_loop_saves_changed_history_once_and_skips_an_unchanged_one() {
+    let h = ready_harness();
+    let ctx = crate::PollContext::from_bridge(&h.bridge());
+    let sig = |h: &Harness| {
+        let manager = h.bridge().manager.clone();
+        tauri::async_runtime::block_on(
+            async move { crate::state_signature(&*manager.lock().await) },
+        )
+    };
+    let long_ago = std::time::Instant::now() - crate::HISTORY_SAVE_MIN_INTERVAL;
+
+    h.seed_chat_with_incoming("New", 1);
+    let changed = sig(&h);
+    assert!(tauri::async_runtime::block_on(
+        ctx.save_history_if_changed(changed, long_ago)
+    ));
+    assert!(h.bridge_history_path().exists());
+    assert!(
+        !tauri::async_runtime::block_on(ctx.save_history_if_changed(changed, long_ago)),
+        "an unchanged state was written again"
+    );
+    h.seed_chat_with_incoming("Newer", 1);
+    assert!(
+        !tauri::async_runtime::block_on(
+            ctx.save_history_if_changed(sig(&h), std::time::Instant::now())
+        ),
+        "the save floor was ignored"
+    );
+}
+
+/// The signature the loop saves on sees every persisted change — contacts and
+/// their trust included, which it once ignored, so an imported invite or a
+/// block survived only as far as the next clean shutdown.
+#[test]
+fn the_persisted_signature_sees_contacts_trust_and_titles() {
+    let h = ready_harness();
+    let manager = h.bridge().manager.clone();
+    tauri::async_runtime::block_on(async move {
+        let mut m = manager.lock().await;
+        let mut last = crate::state_signature(&m);
+        let mut moved = |m: &ChatManager, what: &str| {
+            let now = crate::state_signature(m);
+            assert_ne!(now, last, "{what} did not change the signature");
+            last = now;
+        };
+        let contact = m.add_contact(
+            "Ann".into(),
+            Some("10.0.0.2:1".into()),
+            Some("ab".repeat(32)),
+            None,
+        );
+        moved(&m, "adding a contact");
+        m.block_contact(contact).unwrap();
+        moved(&m, "blocking a contact");
+        let chat = uuid::Uuid::new_v4();
+        m.create_local_chat_for_test(chat, "Chat".into());
+        moved(&m, "a new conversation");
+        m.rename_chat(chat, "Renamed".into()).unwrap();
+        moved(&m, "a rename");
+    });
+}
+
+/// The fingerprint prompt is published once per prompt — a closed dialog must
+/// not spring back open every tick — and the queryable copy is cleared when
+/// the queue drains, so nothing keeps resurfacing an answered prompt.
+#[test]
+fn the_poll_loop_publishes_each_fingerprint_prompt_once() {
+    let h = ready_harness();
+    let ctx = crate::PollContext::from_bridge(&h.bridge());
+    let handle = h._app.handle().clone();
+    let prompt = p2pem_classic::app::PendingFingerprint {
+        fingerprint: "cd".repeat(32),
+        peer_name: "Peer".into(),
+        sas: "12-34-56 🐔 🍎 🌻".into(),
+        session_id: uuid::Uuid::new_v4(),
+    };
+    let mut last = None;
+    assert!(ctx.publish_fingerprint_prompt(&handle, Some(prompt.clone()), &mut last));
+    assert_eq!(
+        h.ipc("pending_fingerprint", json!({})).unwrap()["fingerprint"],
+        prompt.fingerprint.as_str()
+    );
+    assert!(
+        !ctx.publish_fingerprint_prompt(&handle, Some(prompt), &mut last),
+        "republished"
+    );
+    assert!(!ctx.publish_fingerprint_prompt(&handle, None, &mut last));
+    assert_eq!(
+        h.ipc("pending_fingerprint", json!({})).unwrap(),
+        Value::Null
+    );
+}
+
+/// Auto-rehost re-opens a direct listener a peer consumed, on the port that
+/// was in use, and leaves a relay rendezvous alone.
+#[test]
+fn the_poll_loop_rehosts_a_consumed_direct_listener_only() {
+    let h = ready_harness();
+    let ctx = crate::PollContext::from_bridge(&h.bridge());
+    let manager = h.bridge().manager.clone();
+    // A relay rendezvous: hosting, but with no direct port.
+    tauri::async_runtime::block_on(async {
+        let mut m = manager.lock().await;
+        m.is_hosting = true;
+        m.hosting_port = None;
+    });
+    tauri::async_runtime::block_on(ctx.auto_rehost());
+    assert!(
+        tauri::async_runtime::block_on(async { manager.lock().await.sessions_len() }) == 0,
+        "a relay rendezvous was replaced by a TCP listener"
+    );
+    // A direct listener that a peer consumed.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    tauri::async_runtime::block_on(async { manager.lock().await.hosting_port = Some(port) });
+    tauri::async_runtime::block_on(ctx.auto_rehost());
+    let m = tauri::async_runtime::block_on(manager.lock());
+    assert_eq!(m.hosting_port, Some(port), "rehosted somewhere else");
+    assert!(!m.check_rehost_needed(), "the listener was not re-opened");
+}

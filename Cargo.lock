@@ -4080,6 +4080,7 @@ dependencies = [
  "directories",
  "log",
  "messenger-core",
+ "messenger-server",
  "open",
  "p2pem-classic",
  "rfd",

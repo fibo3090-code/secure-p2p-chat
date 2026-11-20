@@ -900,12 +900,18 @@ async fn pick_upload<R: tauri::Runtime>(
     let Some(path) = picked else {
         return Ok(None);
     };
+    read_upload(&path).await.map(Some)
+}
+
+/// Read a file chosen for a community upload, refusing it on size *before*
+/// reading. Split from [`pick_upload`] so the cap is testable without a dialog.
+pub(crate) async fn read_upload(path: &Path) -> Result<(String, String, Vec<u8>), String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let mime = messenger_core::util::guess_mime(&path).to_string();
-    let size = tokio::fs::metadata(&path)
+    let mime = messenger_core::util::guess_mime(path).to_string();
+    let size = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("Could not read {}: {e}", path.display()))?
         .len();
@@ -918,10 +924,10 @@ async fn pick_upload<R: tauri::Runtime>(
             messenger_core::util::format_size(cap)
         ));
     }
-    let data = tokio::fs::read(&path)
+    let data = tokio::fs::read(path)
         .await
         .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-    Ok(Some((name, mime, data)))
+    Ok((name, mime, data))
 }
 
 /// Pick a file and post it to a community channel. The picker runs on a blocking
@@ -969,6 +975,37 @@ pub(crate) async fn party_send_file_dm<R: tauri::Runtime>(
         .map_err(|e| e.to_string())
 }
 
+/// Ask the server for a file and wait, bounded, for its bytes. Split from
+/// [`party_download_file`] so it is testable without the save dialog.
+///
+/// The party lock is released BEFORE awaiting, so the poll loop can lock the
+/// manager, drain the FileData response, and complete us. A bare `rx.await`
+/// would hang forever if the server accepted the request and never answered:
+/// the click does nothing, with no error and no way to tell it from a slow
+/// link. Outer error: the sender was dropped (connection torn down). Inner
+/// error: the server refused (file gone / not permitted).
+pub(crate) async fn fetch_party_file(
+    party: &Arc<Mutex<PartyManager>>,
+    sid: Uuid,
+    hash: String,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let rx = party
+        .lock()
+        .await
+        .request_download(sid, hash)
+        .map_err(|e| e.to_string())?;
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(data))) => Ok(data),
+        Ok(Ok(Err(reason))) => Err(reason),
+        Ok(Err(_)) => Err("download failed: the connection closed".to_string()),
+        Err(_) => Err(format!(
+            "download timed out after {}s — the community server did not send the file",
+            timeout.as_secs()
+        )),
+    }
+}
+
 /// How long to wait for a community server to deliver a requested file before
 /// giving up. Generous enough for a large blob on a slow link, short enough that
 /// a server which simply never answers produces an error instead of a click that
@@ -988,30 +1025,7 @@ pub(crate) async fn party_download_file<R: tauri::Runtime>(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
-    // Register the download and drop the party lock BEFORE awaiting, so the poll
-    // loop can lock the manager, drain the FileData response, and complete us.
-    let rx = state
-        .party
-        .lock()
-        .await
-        .request_download(sid, hash)
-        .map_err(|e| e.to_string())?;
-    // Bounded wait. A bare `rx.await` hangs forever if the server accepts the
-    // request and then never answers (or the response is lost): the click does
-    // nothing, with no error and no way to tell it apart from a slow link.
-    // Outer error: the sender was dropped (connection torn down). Inner error:
-    // the server refused (file gone / not permitted).
-    let data = match tokio::time::timeout(PARTY_DOWNLOAD_TIMEOUT, rx).await {
-        Ok(Ok(Ok(data))) => data,
-        Ok(Ok(Err(reason))) => return Err(reason),
-        Ok(Err(_)) => return Err("download failed: the connection closed".to_string()),
-        Err(_) => {
-            return Err(format!(
-                "download timed out after {}s — the community server did not send the file",
-                PARTY_DOWNLOAD_TIMEOUT.as_secs()
-            ))
-        }
-    };
+    let data = fetch_party_file(&state.party, sid, hash, PARTY_DOWNLOAD_TIMEOUT).await?;
     // Another member chose this name. Sanitize it before it reaches the save
     // dialog, as the TUI does: a dialog pre-filled with `../` segments, a
     // Windows device name or a U+202E override (`photo_gnp.exe` rendering as
