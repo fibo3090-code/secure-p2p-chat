@@ -18,9 +18,7 @@ import { toast } from "./lib/toast.js";
 import { THEMES, loadTheme, saveTheme } from "./lib/themes.js";
 
 function RailBtn({ icon, label, active, onClick, badge }) {
-  // The badge is a bare number next to an icon, so a reader announced "Chats"
-  // whether or not anything was waiting. Fold the count into the accessible
-  // name and hide the visual duplicate.
+  // Fold the badge count into the accessible name; hide the visual duplicate.
   const unreadLabel = badge > 0 ? `, ${badge} unread` : "";
   return (
     <button className={cx("rail-btn", active && "is-active")} onClick={onClick} title={label}
@@ -62,15 +60,13 @@ function ThemeMenu({ theme, setTheme }) {
   );
 }
 
-// Backoff for the startup `auth_status` handshake: quick first retries so a
-// slow bridge is invisible, then back off so a hard failure doesn't spin.
+// Backoff for the startup `auth_status` handshake: quick first, then slower.
 const BOOT_RETRY_MS = [400, 800, 1600, 3200, 6400, 10000];
 
 export default function App() {
   const [auth, setAuth] = useState(null);
-  // Boot state. `auth === null` used to render nothing at all, so a single
-  // failed or slow `auth_status` left a permanently blank window with no
-  // message, no spinner and no recovery. Now the failure is visible and retried.
+  // Boot state: a failed or slow `auth_status` is shown and retried, never a
+  // blank window.
   const [bootError, setBootError] = useState("");
   const [bootAttempt, setBootAttempt] = useState(0);
   // Shown once, right after a new identity is created.
@@ -83,28 +79,22 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
   const [creatorOpen, setCreatorOpen] = useState(false);
-  // Which tab the connection dialog opens on, so the get-started suggestions
-  // land the user on the path they picked instead of a generic dialog.
+  // Which tab the connection dialog opens on (set by the get-started paths).
   const [creatorMode, setCreatorMode] = useState("connect");
   const [fpReq, setFpReq] = useState(null);
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [infoTarget, setInfoTarget] = useState(null);
-  // Unread is computed by the bridge from a read mark persisted inside the
-  // encrypted history, so a message that arrived while the app was closed is
-  // still unread on the next launch. The refs mirror the open conversation and
-  // visibility so the event-driven refresh never reads a stale closure.
+  // Unread comes from the bridge's persisted read mark. The refs mirror the
+  // open conversation and visibility for the event-driven refresh.
   const activeIdRef = useRef(null);
   const visibleRef = useRef(true);
   const [transfers, setTransfers] = useState([]);
   const [partyUnread, setPartyUnread] = useState(0);
-  // Conversation lock: when on, no new peer can connect (listener stopped,
-  // auto-rehost paused). Existing sessions keep running.
+  // Conversation lock: no new peer can connect; existing sessions keep running.
   const [locked, setLockedState] = useState(false);
-  // Does the user actually have the window in front of them? Pushed down to the
-  // bridge so "notify when a message arrives in the background" means it.
-  // `visible` is tracked separately because it is the far more reliable of the
-  // two signals — see the effect below.
+  // Whether the user has the window in front of them, pushed to the bridge for
+  // notifications (`visible` is tracked separately; see below).
   const [focused, setFocused] = useState(true);
   const [visible, setVisible] = useState(true);
 
@@ -126,8 +116,7 @@ export default function App() {
     return status;
   }, []);
 
-  // Keep trying until the bridge answers. Every failure is shown, so the user
-  // knows the app is working on it rather than staring at an empty window.
+  // Keep trying until the bridge answers, showing every failure.
   useEffect(() => {
     if (auth) return undefined;
     let cancelled = false;
@@ -145,15 +134,10 @@ export default function App() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [auth, bootAttempt, refreshAuth]);
 
-  // Window focus + visibility, tracked separately because they are trusted
-  // differently:
-  //
-  // - `visible` (visibilityState) is reliable across webviews and is what gates
-  //   clearing unread. If it were gated on focus instead, a webview that
-  //   under-reports `hasFocus()` would leave conversations badged forever —
-  //   a worse failure than an occasional extra notification.
-  // - `focused` (visible AND hasFocus) is what the notification gate uses:
-  //   suppressing a popup needs *more* confidence that the user is looking.
+  // `visible` (visibilityState, reliable) gates clearing unread, so a webview
+  // under-reporting `hasFocus()` cannot leave conversations badged forever.
+  // `focused` (visible AND hasFocus) gates notifications, which need more
+  // confidence that the user is looking.
   useEffect(() => {
     const update = () => {
       const vis = document.visibilityState === "visible";
@@ -175,8 +159,8 @@ export default function App() {
 
   const ready = auth?.state === "ready";
 
-  // An unreadable history file blocks saving until the user decides; ask once
-  // per unlock and keep the banner up until it is resolved.
+  // An unreadable history file blocks saving: ask once per unlock, keep the
+  // banner up until resolved.
   const [historyIssue, setHistoryIssue] = useState(null);
   useEffect(() => {
     if (!ready) return;
@@ -185,9 +169,7 @@ export default function App() {
       .catch(() => {});
   }, [ready]);
 
-  // Tell the bridge what is on screen. ChatManager owns no window handle, so
-  // without this it cannot tell a background message from one the user is
-  // reading right now.
+  // Tell the bridge what is on screen (ChatManager owns no window handle).
   useEffect(() => {
     if (!ready) return;
     api.setPresence(focused, activeId).catch(() => {});
@@ -197,22 +179,16 @@ export default function App() {
     if (!ready) return;
     try {
       const list = await api.listConversations();
-      // `unread` comes from the bridge (a persisted read mark), so it is already
-      // correct across restarts. The only local adjustment is optimistic: the
-      // conversation the user is looking at right now reads as zero immediately,
-      // instead of flashing a badge until `mark_read` round-trips.
+      // Optimistic: the open conversation reads as zero before `mark_read`
+      // round-trips.
       const cur = activeIdRef.current;
       setConvs(list.map((c) => (
         c.id === cur && visibleRef.current ? { ...c, unread: 0 } : c
       )));
       // Live file-transfer progress, shown in the chat pane.
       api.listTransfers().then(setTransfers).catch(() => {});
-      // The pending TOFU prompt is authoritative state on the bridge, which
-      // holds a queue: adopt whichever is at the head (so a second peer's
-      // prompt is surfaced once the first is answered, instead of being lost),
-      // and drop ours when there is none left — a prompt whose session already
-      // died can never be answered, and an undismissable dialog for it would
-      // wedge the app.
+      // The bridge queues TOFU prompts: adopt the head, and drop ours when the
+      // queue is empty (a dead session's dialog could never be answered).
       api.pendingFingerprint()
         .then((p) => setFpReq((cur) => (p && cur && cur.chat_id === p.chat_id ? cur : p)))
         .catch(() => {});
@@ -220,8 +196,7 @@ export default function App() {
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
-            // The user may have switched while this was in flight; showing it
-            // now would put A on screen with B as the recipient.
+            // The user may have switched meanwhile.
             if (activeIdRef.current !== cur) return;
             setActive(chatToContact(chat, list.find((c) => c.id === cur)?.connected));
           }).catch(() => {});
@@ -235,24 +210,22 @@ export default function App() {
     if (!ready) return;
     refresh();
     const u1 = onBridge("state-updated", () => refresh());
-    // Only transfer progress moved: refetch the transfer list, not every
-    // conversation (PERF-01).
+    // Only transfer progress moved: refetch transfers only (PERF-01).
     const u5 = onBridge("transfers-updated", () => {
       api.listTransfers().then(setTransfers).catch(() => {});
     });
     const u2 = onBridge("fingerprint-request", (e) => setFpReq(e.payload));
     const u3 = onBridge("toast", (e) => toast(e.payload.message, e.payload.level));
-    // Communities unread total for the rail badge — computed here (not in the
-    // Parties pane) so messages arriving while another tab is open still badge.
+    // Communities unread for the rail badge, computed here so it badges on
+    // any tab.
     const u4 = onBridge("party-updated", async () => {
       try { setPartyUnread(computeUnread(await api.partyList()).total); } catch { /* ignore */ }
     });
     return () => { [u1, u2, u3, u4, u5].forEach((u) => u.then((f) => f())); };
   }, [ready, refresh]);
 
-  // Clear the read mark for the conversation the user is actually looking at.
-  // Keyed on that conversation's message count so an arrival in the open chat
-  // is marked read too, without firing on every idle poll.
+  // Mark the visible conversation read, keyed on its message count so an
+  // arrival there is marked too without firing every idle poll.
   const activeMessages = convs.find((c) => c.id === activeId)?.messages ?? 0;
   useEffect(() => {
     if (!ready || !activeId || !visible) return;
@@ -266,9 +239,8 @@ export default function App() {
     );
   }
 
-  // Startup found an identity file it could not read. The backend refuses to
-  // replace it (that would abandon the user's history and their contacts'
-  // trust), so there is nothing to retry — explain and stop.
+  // The identity file could not be read and the backend refuses to replace
+  // it: nothing to retry, so explain and stop.
   if (auth.state === "error") {
     return <BootScreen fatal error={auth.error || "The identity could not be loaded."} />;
   }
@@ -284,9 +256,7 @@ export default function App() {
         try {
           await api.setPassword(pw);
           await refreshAuth();
-          // A brand-new identity is exactly when a backup matters and exactly
-          // when nobody thinks to make one — so ask here, once, with the action
-          // attached rather than only a warning that it can't be reset.
+          // A new identity is when a backup matters most: ask once, with the action.
           setBackupPrompt(true);
           return "";
         } catch (e) { return friendlyError(e); }
@@ -303,13 +273,11 @@ export default function App() {
   async function openConv(id) {
     setActiveId(id);
     activeIdRef.current = id;
-    // Opening a conversation reads it. Clear the badge locally for an instant
-    // response; `mark_read` persists it so the badge stays cleared next launch.
+    // Clear the badge locally now; `mark_read` persists it.
     setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, unread: 0 } : c)));
     api.markRead(id).catch(() => {});
     setNav("chats");
-    // Drafts are per-conversation: clear on switch so unsent text can't follow
-    // the user into another thread and be sent to the wrong recipient.
+    // Drafts are per-conversation, so unsent text cannot go to the wrong peer.
     setDraft("");
     try {
       const chat = await api.getConversation(id);
@@ -321,15 +289,12 @@ export default function App() {
 
   async function send() {
     const text = draft.trim();
-    // Send to the conversation that is on screen, and only when it is the
-    // selected one. They can differ for a moment while a switch is loading;
-    // sending to `activeId` then delivered the text to a conversation other
-    // than the one the user was looking at (audit UI-02).
+    // Send only to the selected conversation on screen; mid-switch they can
+    // differ (audit UI-02).
     const target = active && active.id === activeId ? active.id : null;
     if (!text || !target) return;
     setDraft("");
-    // Restore the draft if the send fails, so a transient error doesn't lose
-    // what the user typed — but only into the conversation it was meant for.
+    // Restore the draft on failure, only into the conversation it was meant for.
     try { await api.sendMessage(target, text); }
     catch (e) {
       if (activeIdRef.current === target) setDraft(text);
@@ -362,11 +327,7 @@ export default function App() {
 
   return (
     <div className="app-root">
-      {/* Skip links, first in the tab order. The window opens focused on the
-          titlebar, so a keyboard user reaching the message box crossed the lock
-          button, "New connection", the theme menu, five rail buttons and every
-          conversation in the list — twenty-plus stops before typing, every
-          launch. Hidden until focused (see .skip-link). */}
+      {/* Skip links, first in tab order, hidden until focused (.skip-link). */}
       <a className="skip-link" href="#main-content">Skip to main content</a>
       {nav === "chats" && activeId && (
         <a className="skip-link" href="#composer-input">Skip to message box</a>
@@ -406,10 +367,7 @@ export default function App() {
         }} />
       )}
       <div className="app-body">
-        {/* role + label are explicit: <nav> carries the landmark implicitly, but
-            an unlabelled one is announced only as "navigation", and this app has
-            more than one region a reader will call that. Naming it is what makes
-            the landmark list usable. */}
+        {/* Labelled, so this landmark is distinguishable from the others. */}
         <nav className="rail" role="navigation" aria-label="Primary">
           <div className="rail-nav">
             <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}
@@ -439,18 +397,15 @@ export default function App() {
             <main className="col-main" id="main-content" tabIndex={-1}>
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
-                // A user with no conversations at all gets the get-started
-                // panel rather than "select a conversation" with nothing to select.
+                // No conversations at all: show the get-started panel.
                 isFirstRun={convs.length === 0}
                 onStart={openCreator}
-                // A swallowed failure here is a cancel button that does
-                // nothing, on a transfer the user is actively trying to stop.
+                // Never swallow a failed cancel.
                 onCancelTransfer={(id) =>
                   api.cancelTransfer(id).catch((e) => toast(`Could not cancel: ${friendlyError(e)}`, "error"))}
                 transfers={transfers.filter((t) =>
-                  // done/cancelled rows can linger in the snapshot until the next
-                  // transfer; the completed file already shows as a message, so
-                  // only surface in-flight work and failures (with their reason).
+                  // Finished files already show as messages: surface only
+                  // in-flight work and failures.
                   t.chat_id === activeId && t.status !== "done" && t.status !== "cancelled")}
                 onAcceptTransfer={async (t) => {
                   try { await api.acceptTransfer(t.id); refresh(); } catch (e) { toast(friendlyError(e), "error"); }
@@ -459,9 +414,8 @@ export default function App() {
                   try { await api.declineTransfer(t.id); refresh(); } catch (e) { toast(friendlyError(e), "error"); }
                 }}
                 onVerify={async (c) => {
-                  // Open the accept/reject dialog only when a real TOFU request
-                  // is pending for this chat; an established chat has nothing to
-                  // confirm, so show the read-only fingerprint instead.
+                  // A pending TOFU request opens accept/reject; otherwise show
+                  // the read-only fingerprint.
                   try {
                     const p = await api.pendingFingerprint();
                     if (p && p.chat_id === c.id) { setFpReq(p); return; }

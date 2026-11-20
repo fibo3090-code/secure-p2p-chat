@@ -46,17 +46,10 @@ pub fn pem_encode_public(pubkey: &RsaPublicKey) -> Result<String> {
 const PUBLIC_KEY_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
 const PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
 
-/// Import an RSA public key from PEM — **strictly**: exactly one
-/// `PUBLIC KEY` block, with nothing around it but whitespace.
-///
-/// RFC 7468 lets a parser skip a free-text *preamble* before the block, and
-/// the `pem-rfc7468` decoder does: anything up to the first line break that is
-/// followed by `-----BEGIN `. A preamble can therefore carry a complete PEM
-/// block of its own, and a string holding two blocks meant one key to this
-/// parser and another to anything that scanned for the first `BEGIN` marker —
-/// which is how the fingerprint used to be computed. Every peer-supplied key
-/// (identity proofs, invites, community servers) passes through here, so a
-/// second block, a preamble or trailing text is refused outright.
+/// Import an RSA public key from PEM, strictly: exactly one `PUBLIC KEY` block and
+/// nothing around it but whitespace. RFC 7468 lets a parser skip a free-text preamble,
+/// which can carry a second block that a marker scan would read instead; every
+/// peer-supplied key passes through here, so a preamble or trailing text is refused.
 pub fn pem_decode_public(pem: &str) -> Result<RsaPublicKey> {
     let trimmed = pem.trim();
     let single_block = trimmed.starts_with(PUBLIC_KEY_BEGIN)
@@ -84,21 +77,13 @@ pub fn pem_decode_private(pem: &str) -> Result<RsaPrivateKey> {
     RsaPrivateKey::from_pkcs1_pem(pem).map_err(|e| anyhow!("Private PEM decode failed: {}", e))
 }
 
-// NOTE: RSA-OAEP encryption/decryption was intentionally removed. This product
-// never performs RSA *decryption* on the wire — the live handshake uses X25519
-// for key agreement and RSA only for PSS *signatures* on identity proofs. The
-// RSA private-key decryption path is precisely what the Marvin timing attack
-// (RUSTSEC-2023-0071) targets, so removing these functions keeps that
-// side-channel out of the product entirely rather than relying on it being
-// "unused". Do not reintroduce RSA encryption/decryption; use the AEAD tunnel.
+// RSA-OAEP was removed on purpose: the handshake uses X25519 for key agreement and RSA
+// only for PSS signatures, so RSA decryption (the Marvin attack surface,
+// RUSTSEC-2023-0071) stays out of the product. Do not reintroduce it.
 
-/// The fingerprint of a public key: lowercase hex SHA-256 of its
-/// SubjectPublicKeyInfo DER encoding.
-///
-/// Computed from the *parsed* key, so it always names the key that signatures
-/// are verified with. For any honestly encoded PEM this equals the hash of the
-/// PEM's base64 body (SPKI DER is canonical), so existing fingerprints, pins
-/// and verified contacts are unchanged.
+/// The fingerprint of a public key: lowercase hex SHA-256 of its SPKI DER encoding.
+/// Computed from the parsed key, so it names the key signatures are verified with;
+/// for an honest PEM it equals the hash of the base64 body (SPKI DER is canonical).
 pub fn fingerprint_public_key(key: &RsaPublicKey) -> Result<String> {
     let der = key
         .to_public_key_der()
@@ -106,96 +91,49 @@ pub fn fingerprint_public_key(key: &RsaPublicKey) -> Result<String> {
     Ok(hex::encode(Sha256::digest(der.as_bytes())))
 }
 
-/// The fingerprint of a PEM-encoded public key; see [`fingerprint_public_key`].
-///
-/// This used to hash the base64 text between the first `BEGIN` and the first
-/// `END` marker found anywhere in the string, falling back to hashing the raw
-/// bytes, while signatures were verified against whatever the PEM *parser*
-/// returned. The two disagreed on a crafted string (a preamble holding one key,
-/// the block proper holding another), so a peer could present someone else's
-/// fingerprint while signing with its own key — and a string whose `END`
-/// marker came first panicked the slice. Now there is one parse, and a
-/// malformed PEM is an error rather than a fingerprint of its bytes.
+/// The fingerprint of a PEM-encoded public key; see [`fingerprint_public_key`]. One
+/// strict parse, so the fingerprint and signature checks can never see different keys,
+/// and a malformed PEM is an error rather than a fingerprint of its bytes.
 pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> Result<String> {
     let pem = std::str::from_utf8(pem_bytes).map_err(|e| anyhow!("PEM is not UTF-8: {}", e))?;
     fingerprint_public_key(&pem_decode_public(pem)?)
 }
 
-// ============================================================================
-// RSA-PSS Signing for Invite Links and Other Integrity-Protected Data
-// ============================================================================
-
-/// Sign data using RSA-PSS with SHA-256
-///
-/// Uses randomized signing for each call (security best practice)
-///
-/// # Arguments
-/// * `privkey` - RSA private key
-/// * `data` - Data to sign
-///
-/// # Returns
-/// Raw RSA-PSS signature bytes
+/// Sign data with RSA-PSS (SHA-256, randomized), returning the raw signature bytes.
 pub fn rsa_sign_pss(privkey: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
-
-    // Sign with randomized signing for enhanced security
-    // SigningKey::<Sha256>::sign_with_rng automatically applies SHA-256 hashing
-    let signature = signing_key
-        .sign_with_rng(&mut rng, data)
+    Ok(signing_key
+        .sign_with_rng(&mut OsRng, data)
         .to_bytes()
-        .to_vec();
-
-    Ok(signature)
+        .to_vec())
 }
 
-/// Verify RSA-PSS signature with SHA-256
-///
-/// # Arguments
-/// * `pubkey` - RSA public key
-/// * `data` - Original data that was signed
-/// * `signature` - Raw RSA-PSS signature bytes
-///
-/// # Returns
-/// Ok(()) if signature is valid, Err if invalid
+/// Verify an RSA-PSS (SHA-256) signature over `data`.
 pub fn rsa_verify_pss(pubkey: &RsaPublicKey, data: &[u8], signature: &[u8]) -> Result<()> {
-    use rsa::signature::Verifier as RsaVerifier;
-
     let verifying_key = VerifyingKey::<Sha256>::new(pubkey.clone());
-
-    // Convert byte slice to RSA Signature type
-    let rsa_signature = rsa::pss::Signature::try_from(signature)
+    let rsa_signature = RsaSignature::try_from(signature)
         .map_err(|e| anyhow!("Failed to parse RSA signature: {}", e))?;
-
-    // Verify signature
-    // VerifyingKey::<Sha256>::verify automatically applies SHA-256 hashing
     verifying_key
         .verify(data, &rsa_signature)
         .map_err(|e| anyhow!("RSA-PSS signature verification failed: {}", e))
 }
 
-// ============================================================================
-// Ed25519 EDDSA Signatures for Modern Key Exchanges
-// ============================================================================
-
-/// Signature scheme for identity proofs
-/// Determines which algorithm is used to sign the ephemeral key during handshake
+/// Signature scheme for identity proofs (the algorithm that signs the ephemeral key).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SignatureScheme {
-    /// RSA-PSS with SHA-256 (current default, will be deprecated)
+    /// RSA-PSS with SHA-256 (kept for older peers)
     RsaPss = 1,
-    /// Ed25519 EdDSA (recommended, future default)
+    /// Ed25519 EdDSA (preferred)
     Ed25519 = 2,
 }
 
 impl SignatureScheme {
-    /// Get the numeric value for wire protocol
+    /// The numeric value on the wire.
     pub fn to_u8(self) -> u8 {
         self as u8
     }
 
-    /// Parse from numeric value
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(SignatureScheme::RsaPss),
@@ -204,7 +142,6 @@ impl SignatureScheme {
         }
     }
 
-    /// Human-readable name
     pub fn name(&self) -> &'static str {
         match self {
             SignatureScheme::RsaPss => "RSA-PSS",
@@ -219,37 +156,24 @@ impl std::fmt::Display for SignatureScheme {
     }
 }
 
-/// Domain separator for the Ed25519 signing key derived from an RSA identity.
-/// Frozen: changing it changes every derived key, and with it every binding
-/// signature peers have already seen.
+/// Domain separator for the Ed25519 subkey derived from an RSA identity. Frozen:
+/// changing it changes every derived key and every binding peers have seen.
 const ED25519_SUBKEY_INFO: &[u8] = b"p2pem-ed25519-identity-subkey-v1";
 
 /// Domain separator for the signature that binds a derived Ed25519 key to the
 /// RSA identity it belongs to. Also frozen.
 const ED25519_BINDING_LABEL: &[u8] = b"P2PEM_ED25519_BINDING_V1";
 
-/// Derive this identity's Ed25519 *signing subkey* from its RSA private key.
+/// Derive this identity's Ed25519 signing subkey from its RSA private key.
 ///
-/// Deterministic, so the same identity always yields the same subkey and an
-/// existing identity gains one without touching `identity.json` — which matters
-/// because that file is the only key to the message history, and a migration
-/// that damages it is unrecoverable. It also means nothing has to be threaded
-/// through the handshake: anything holding the RSA private key can derive this.
-///
-/// The subordinate relationship is the point at this stage. The peer
-/// **fingerprint is still derived from the RSA public key**, so the RSA key is
-/// the identity and this is a signing key under it — deriving it expresses
-/// exactly that. A verifier cannot derive it (they have no private key), which
-/// is what [`cross_sign_ed25519`] is for.
-///
-/// Retiring RSA entirely (the last step of the migration) needs an independent
-/// key, since this one cannot outlive the key it comes from. That step
-/// re-derives fingerprints and re-verifies with the user anyway, so it is the
-/// right place to mint one — not here.
+/// Deterministic, so an existing identity gains one without touching `identity.json`
+/// (the only key to the message history). The fingerprint is still derived from the
+/// RSA key, so this is a signing key under that identity; verifiers cannot derive it,
+/// which is what [`cross_sign_ed25519`] is for. Retiring RSA will need an independent
+/// key, minted when fingerprints are re-verified anyway.
 pub fn derive_ed25519_subkey(privkey: &RsaPrivateKey) -> Result<Ed25519SigningKey> {
     use rsa::pkcs8::EncodePrivateKey;
-    // The private key's DER is the secret input; it carries far more entropy
-    // than the 256 bits being extracted.
+    // The private key's DER is the secret input (far more than 256 bits of entropy).
     let der = privkey
         .to_pkcs8_der()
         .map_err(|e| anyhow!("Failed to encode RSA private key for derivation: {}", e))?;
@@ -268,21 +192,16 @@ fn ed25519_binding_digest(ed_public: &Ed25519VerifyingKey) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// Sign an Ed25519 public key with the RSA identity it belongs to.
-///
-/// This is what lets a peer accept an Ed25519 proof from a fingerprint they
-/// trust: they already know the RSA public key (it is what the fingerprint is
-/// derived from), so a valid binding says "the holder of that identity vouches
-/// for this signing key". Without it, an attacker could present any Ed25519 key
-/// alongside a stolen `public_key_pem` and sign with a key of their choosing.
+/// Sign an Ed25519 public key with the RSA identity it belongs to, so a peer who trusts
+/// the fingerprint can accept proofs from this subkey. Without it an attacker could pair
+/// a stolen `public_key_pem` with a signing key of their choosing.
 pub fn cross_sign_ed25519(
     privkey: &RsaPrivateKey,
     ed_public: &Ed25519VerifyingKey,
 ) -> Result<Vec<u8>> {
     let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
     Ok(signing_key
-        .sign_with_rng(&mut rng, &ed25519_binding_digest(ed_public))
+        .sign_with_rng(&mut OsRng, &ed25519_binding_digest(ed_public))
         .to_vec())
 }
 
@@ -349,16 +268,7 @@ pub fn ed25519_public_to_hex(vkey: &Ed25519VerifyingKey) -> String {
 /// Import Ed25519 public key from hex format
 pub fn ed25519_public_from_hex(hex_str: &str) -> Result<Ed25519VerifyingKey> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
-    if bytes.len() != 32 {
-        return Err(anyhow!(
-            "Ed25519 public key must be 32 bytes, got {}",
-            bytes.len()
-        ));
-    }
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&bytes);
-    Ed25519VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|e| anyhow!("Invalid Ed25519 public key: {}", e))
+    ed25519_public_from_bytes(&bytes)
 }
 
 /// Export Ed25519 private key to hex format (32 bytes) - CAREFUL: SENSITIVE DATA
@@ -369,30 +279,19 @@ pub fn ed25519_private_to_hex(skey: &Ed25519SigningKey) -> String {
 /// Import Ed25519 private key from hex format
 pub fn ed25519_private_from_hex(hex_str: &str) -> Result<Ed25519SigningKey> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
-    if bytes.len() != 32 {
-        return Err(anyhow!(
-            "Ed25519 private key must be 32 bytes, got {}",
-            bytes.len()
-        ));
-    }
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&bytes);
+    let key_bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 private key must be 32 bytes, got {}", bytes.len()))?;
     Ok(Ed25519SigningKey::from_bytes(&key_bytes))
 }
 
-/// Negotiate signature scheme from lists of supported schemes
-///
-/// Selects the highest priority common scheme:
-/// - Returns Ed25519 (2) if both support it (preferred)
-/// - Returns RsaPss (1) if both support it (fallback)
-/// - Returns None if no common scheme found
-///
-/// Both lists should contain u8 values from SignatureScheme enum (1 or 2)
+/// Pick the best scheme both sides support: Ed25519, then RSA-PSS, else `None`.
+/// Both lists hold [`SignatureScheme`] wire values.
 pub fn negotiate_signature_scheme(
     our_schemes: &[u8],
     their_schemes: &[u8],
 ) -> Option<SignatureScheme> {
-    // Prefer Ed25519 first, fall back to RsaPss
     for &preferred in &[2u8, 1u8] {
         if our_schemes.contains(&preferred) && their_schemes.contains(&preferred) {
             return SignatureScheme::from_u8(preferred);
@@ -401,9 +300,6 @@ pub fn negotiate_signature_scheme(
     None
 }
 
-// X25519 ECDH for Forward Secrecy
-// ============================================================================
-
 /// Generate ephemeral X25519 keypair for forward secrecy
 pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
     let secret = EphemeralSecret::random();
@@ -411,30 +307,16 @@ pub fn generate_ephemeral_keypair() -> (EphemeralSecret, X25519PublicKey) {
     (secret, public)
 }
 
-/// Perform ECDH key agreement and derive AES key using HKDF-SHA256
+/// ECDH key agreement, then HKDF-SHA256 (`salt`: the transcript hash) to an AES-256 key.
 ///
-/// # Arguments
-/// * `our_secret` - Our ephemeral private key
-/// * `their_public` - Their ephemeral public key
-/// * `salt` - Optional salt (e.g., hash of handshake transcript)
-/// * `info` - Context string for HKDF (e.g., "p2p-messenger-v2")
-///
-/// # Returns
-/// 32-byte AES-256 key derived from shared secret
-///
-/// # Errors
-/// Rejects non-contributory exchanges: a low-order (or all-zero) peer public
-/// key collapses the shared secret to the identity, letting an attacker force
-/// a predictable key. Not exploitable here on its own (the identity proof
-/// signs the ephemeral key and the transcript salts HKDF), but refusing such
-/// keys outright is standard hygiene (RFC 7748 §6.1).
+/// Rejects non-contributory exchanges: a low-order (or all-zero) peer key collapses
+/// the shared secret to a predictable value (RFC 7748 §6.1).
 pub fn derive_session_key(
     our_secret: EphemeralSecret,
     their_public: &X25519PublicKey,
     salt: Option<&[u8]>,
     info: &[u8],
 ) -> Result<[u8; AES_KEY_SIZE]> {
-    // Perform ECDH to get shared secret
     let shared_secret = our_secret.diffie_hellman(their_public);
     if !shared_secret.was_contributory() {
         return Err(anyhow!(
@@ -442,10 +324,7 @@ pub fn derive_session_key(
         ));
     }
 
-    // Use HKDF-SHA256 to derive session key
-    // Salt is now supported (and recommended to be transcript hash)
     let hkdf = Hkdf::<Sha256>::new(salt, shared_secret.as_bytes());
-
     let mut session_key = [0u8; AES_KEY_SIZE];
     hkdf.expand(info, &mut session_key)
         .expect("HKDF expand should not fail with valid length");
@@ -453,21 +332,9 @@ pub fn derive_session_key(
     Ok(session_key)
 }
 
-/// Generate a new session key by rekeying the current key with a nonce
-///
-/// Used for periodic key rotation to provide perfect forward secrecy.
-/// Derives next key from current key + random nonce using HKDF-SHA256.
-///
-/// # Arguments
-/// * `current_key` - Current 32-byte session key
-/// * `nonce` - Random 16-byte nonce (should be cryptographically random)
-///
-/// # Returns
-/// New 32-byte session key
+/// Derive the next session key from the current one and a random nonce (HKDF-SHA256,
+/// nonce as salt) for periodic key rotation.
 pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> [u8; AES_KEY_SIZE] {
-    // Use HKDF to derive next key from current key and nonce
-    // Current key acts as IKM (Input Keying Material)
-    // Nonce acts as salt for additional entropy
     let hkdf = Hkdf::<Sha256>::new(Some(nonce), current_key);
 
     let mut next_key = [0u8; AES_KEY_SIZE];
@@ -477,61 +344,39 @@ pub fn rekey_session_key(current_key: &[u8; AES_KEY_SIZE], nonce: &[u8; 16]) -> 
     next_key
 }
 
-/// Generate a cryptographically random nonce for rekeying
-///
-/// # Returns
-/// 16-byte random nonce suitable for key rotation
+/// A random 16-byte nonce for rekeying.
 pub fn generate_rekey_nonce() -> [u8; 16] {
     rand::random()
 }
 
 /// Parse X25519 public key from 32 bytes.
 ///
-/// Rejects the all-zero key outright; the remaining low-order points are
-/// caught at agreement time by [`derive_session_key`]'s contributory check.
+/// Rejects the all-zero key outright; other low-order points are caught at agreement
+/// time by [`derive_session_key`]'s contributory check.
 pub fn parse_x25519_public(bytes: &[u8]) -> Result<X25519PublicKey> {
-    if bytes.len() != 32 {
-        return Err(anyhow!(
-            "X25519 public key must be 32 bytes, got {}",
-            bytes.len()
-        ));
-    }
-    if bytes.iter().all(|&b| b == 0) {
+    let key_bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("X25519 public key must be 32 bytes, got {}", bytes.len()))?;
+    if key_bytes == [0u8; 32] {
         return Err(anyhow!("X25519 public key must not be all zeros"));
     }
-
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(bytes);
     Ok(X25519PublicKey::from(key_bytes))
 }
 
-// ============================================================================
-// Short Authentication String (SAS)
-// ============================================================================
-
-/// 32 visually distinct, easy-to-name emoji for the SAS display. Indexed by
-/// 5-bit groups of the SAS material — the table is part of the SAS format, so
-/// entries must never be reordered or replaced (append-only via a new label).
+/// 32 easy-to-name emoji for the SAS, indexed by 5-bit groups of the SAS material.
+/// Part of the SAS format: never reorder or replace entries.
 const SAS_EMOJI: [&str; 32] = [
     "🐶", "🐱", "🦊", "🐻", "🐼", "🦁", "🐮", "🐷", "🐸", "🐵", "🐔", "🐧", "🦉", "🦄", "🐝", "🦋",
     "🐢", "🐙", "🐬", "🐳", "🌹", "🌻", "🌵", "🍀", "🍎", "🍋", "🍇", "🍓", "🥕", "🍕", "🎈", "⚽",
 ];
 
-/// Derive the Short Authentication String both peers display during
-/// fingerprint verification: six digits plus three emoji, derived from the
-/// handshake transcript material via HKDF.
+/// The Short Authentication String both peers display during verification: six digits
+/// plus three emoji (~35 bits), derived from the transcript material via HKDF. A MITM
+/// runs two handshakes with different transcripts, so the victims see different codes.
 ///
-/// Both sides of one session compute the identical SAS; an active MITM runs
-/// two distinct handshakes whose transcripts (ephemeral keys, identity keys)
-/// differ, so the two victims see different codes. Reading the code aloud on
-/// any out-of-band channel therefore detects an interposed session — far less
-/// friction than comparing a 64-character fingerprint. ~35 bits shown.
-///
-/// The "one guess per connection attempt" property depends on the v4
-/// ephemeral-key commitment (`network::session::ephemeral_commitment`):
-/// without it, a man in the middle that has seen one victim's key can try its
-/// own until both codes match. A v3 handshake has no commitment, and the
-/// session warns the user that the code is weak (audit CRYPTO-02).
+/// One guess per connection attempt holds only with the v4 ephemeral-key commitment
+/// (`network::session::ephemeral_commitment`); a v3 handshake has none and the session
+/// warns that the code is weak (audit CRYPTO-02).
 pub fn derive_sas(transcript_material: &[u8]) -> String {
     let hkdf = Hkdf::<Sha256>::new(None, transcript_material);
     let mut out = [0u8; 5];
@@ -553,10 +398,9 @@ pub fn derive_sas(transcript_material: &[u8]) -> String {
     )
 }
 
-/// Which side of a session a cipher belongs to. Both peers derive the *same*
-/// AES-GCM key, so to guarantee their nonce spaces can never collide the high bit
-/// of the nonce encodes the role: the two sides therefore live in disjoint halves
-/// of the nonce space even if their random session ids coincide.
+/// Which side of a session a cipher belongs to. Both peers derive the same AES-GCM key,
+/// so the nonce's high bit encodes the role and the two sides use disjoint nonce spaces
+/// even if their random session ids coincide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NonceRole {
     /// The connection initiator's listener side (`new` defaults to this).
@@ -575,13 +419,11 @@ impl NonceRole {
     }
 }
 
-/// AES-GCM cipher wrapper for encrypting/decrypting messages
-/// Uses counter-based nonces for guaranteed uniqueness
+/// AES-GCM cipher with counter-based nonces: session_id(4) || counter(8).
 #[derive(Clone)]
 pub struct AesCipher {
     cipher: Aes256Gcm,
-    /// Retained for rekeying. Wrapped in `Zeroizing` so the key material is wiped
-    /// from memory when the cipher is dropped (defense in depth).
+    /// Retained for rekeying; zeroized on drop.
     key: zeroize::Zeroizing<[u8; AES_KEY_SIZE]>,
     nonce_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     session_id: [u8; 4],
@@ -589,16 +431,13 @@ pub struct AesCipher {
 }
 
 impl AesCipher {
-    /// Create a new cipher from a 32-byte key with a random session id, in the
-    /// default [`NonceRole::Host`] role. Use [`AesCipher::new_with_role`] to pin
-    /// the role so the two peers of a session get disjoint nonce spaces.
+    /// A cipher in the default [`NonceRole::Host`] role with a random session id. Use
+    /// [`AesCipher::new_with_role`] so the two peers get disjoint nonce spaces.
     pub fn new(key: &[u8]) -> Result<Self> {
         Self::new_with_role(key, NonceRole::Host)
     }
 
-    /// Create a new cipher from a 32-byte key for a specific session role. The
-    /// role is encoded into the high bit of the nonce so the host and client
-    /// sides — which share one derived key — can never produce the same nonce.
+    /// A cipher for a specific session role (encoded in the nonce's high bit).
     pub fn new_with_role(key: &[u8], role: NonceRole) -> Result<Self> {
         if key.len() != AES_KEY_SIZE {
             return Err(anyhow!(
@@ -609,12 +448,9 @@ impl AesCipher {
         }
 
         let mut session_id = [0u8; 4];
-        // Use OS RNG explicitly for cryptographic session IDs
         OsRng.fill_bytes(&mut session_id);
-        // Reserve the high bit of the first nonce byte for the session role so the
-        // host and client (which share one derived key) occupy disjoint nonce
-        // spaces. Without this, the two directions could pick the same random
-        // session id (~2^-32) and reuse a key+nonce pair — catastrophic for GCM.
+        // Reserve the nonce's high bit for the role: host and client share one key, and
+        // equal random session ids (~2^-32) would otherwise reuse a key+nonce pair.
         session_id[0] = (session_id[0] & 0x7f) | role.nonce_bit();
 
         let mut key_array = [0u8; AES_KEY_SIZE];
@@ -635,21 +471,15 @@ impl AesCipher {
         self.role
     }
 
-    /// Get the current session key (for rekeying purposes)
+    /// The current session key (for rekeying).
     pub fn get_current_key(&self) -> [u8; AES_KEY_SIZE] {
         *self.key
     }
 
-    /// Encrypt plaintext with optional AAD, returns nonce(12) || ciphertext || tag(16)
-    /// Uses counter-based nonce: session_id(4) || counter(8) for guaranteed uniqueness
-    ///
-    /// # Arguments
-    /// * `plaintext` - Data to encrypt
-    /// * `aad` - Optional Additional Authenticated Data (binds authenticity context)
+    /// Encrypt with optional AAD; returns nonce(12) || ciphertext || tag(16).
     pub fn encrypt(&self, plaintext: &[u8], aad: Option<&[u8]>) -> Vec<u8> {
-        // Reserve the next counter value atomically without allowing wraparound.
-        // A hand-written CAS loop rather than `fetch_update` (deprecated on
-        // current stable) or `try_update` (newer than our MSRV).
+        // Reserve the next counter value without wraparound. A manual CAS loop:
+        // `fetch_update` is deprecated and `try_update` is newer than our MSRV.
         use std::sync::atomic::Ordering::SeqCst;
         let mut counter = self.nonce_counter.load(SeqCst);
         loop {
@@ -665,24 +495,14 @@ impl AesCipher {
             }
         }
 
-        // Build nonce: session_id (4 bytes) || counter (8 bytes)
         let mut nonce_bytes = [0u8; crate::AES_NONCE_SIZE];
         nonce_bytes[0..4].copy_from_slice(&self.session_id);
         nonce_bytes[4..crate::AES_NONCE_SIZE].copy_from_slice(&counter.to_be_bytes());
 
         let nonce = Nonce::from(nonce_bytes);
-
-        // Use aead::Payload to handle AAD
-        let payload = if let Some(aad_bytes) = aad {
-            Payload {
-                msg: plaintext,
-                aad: aad_bytes,
-            }
-        } else {
-            Payload {
-                msg: plaintext,
-                aad: b"",
-            }
+        let payload = Payload {
+            msg: plaintext,
+            aad: aad.unwrap_or(b""),
         };
 
         let ciphertext = self
@@ -690,22 +510,16 @@ impl AesCipher {
             .encrypt(&nonce, payload)
             .expect("AES-GCM encryption should not fail");
 
-        // Format: nonce || ciphertext (includes tag)
         let mut output = Vec::with_capacity(crate::AES_NONCE_SIZE + ciphertext.len());
         output.extend_from_slice(&nonce_bytes);
         output.extend_from_slice(&ciphertext);
         output
     }
 
-    /// Decrypt a frame that must have been sent by the **other** side of the
-    /// session.
-    ///
-    /// Both directions share one key and one AAD; only the nonce's role bit
-    /// tells them apart, and plain [`decrypt`](Self::decrypt) ignores it. So a
-    /// frame we sent, echoed back by anyone on the path, authenticated as the
-    /// peer's — a user's own "yes" shown as the peer's reply, their own `Ack`
-    /// marking a message delivered, their own `Rekey` killing the session
-    /// (audit NET-01). Every tunnel receive goes through this.
+    /// Decrypt a frame that must have been sent by the **other** side. Both directions
+    /// share one key and AAD and only the nonce's role bit tells them apart, so without
+    /// this a frame of ours echoed back on the path authenticated as the peer's (audit
+    /// NET-01). Every tunnel receive goes through this.
     pub fn decrypt_from_peer(&self, payload: &[u8], aad: Option<&[u8]>) -> Option<Vec<u8>> {
         let first = *payload.first()?;
         if first & 0x80 == self.role.nonce_bit() {
@@ -714,54 +528,40 @@ impl AesCipher {
         self.decrypt(payload, aad)
     }
 
-    /// Decrypt payload with optional AAD: nonce(AES_NONCE_SIZE) || ciphertext || tag(AES_GCM_TAG_SIZE)
-    ///
-    /// # Arguments
-    /// * `payload` - Encrypted data in format nonce || ciphertext
-    /// * `aad` - Optional Additional Authenticated Data (must match encryption AAD)
+    /// Decrypt nonce || ciphertext || tag with optional AAD (must match encryption).
     pub fn decrypt(&self, payload: &[u8], aad: Option<&[u8]>) -> Option<Vec<u8>> {
         if payload.len() < crate::AES_NONCE_SIZE + crate::AES_GCM_TAG_SIZE {
-            return None; // Too small
+            return None;
         }
 
         let (nonce_bytes, ciphertext) = payload.split_at(crate::AES_NONCE_SIZE);
-        // Convert nonce slice to array then to Nonce
-        let nonce_arr: [u8; crate::AES_NONCE_SIZE] =
-            match <[u8; crate::AES_NONCE_SIZE]>::try_from(nonce_bytes) {
-                Ok(a) => a,
-                Err(_) => return None,
-            };
-
-        let nonce = Nonce::from(nonce_arr);
-
-        // Use aead::Payload to handle AAD
-        let aead_payload = if let Some(aad_bytes) = aad {
-            Payload {
-                msg: ciphertext,
-                aad: aad_bytes,
-            }
-        } else {
-            Payload {
-                msg: ciphertext,
-                aad: b"",
-            }
+        let nonce_arr: [u8; crate::AES_NONCE_SIZE] = nonce_bytes.try_into().ok()?;
+        let aead_payload = Payload {
+            msg: ciphertext,
+            aad: aad.unwrap_or(b""),
         };
-
-        self.cipher.decrypt(&nonce, aead_payload).ok()
+        self.cipher
+            .decrypt(&Nonce::from(nonce_arr), aead_payload)
+            .ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
 
+    fn random_cipher() -> AesCipher {
+        AesCipher::new(&rand::random::<[u8; 32]>()).unwrap()
+    }
+
+    fn rsa_public() -> RsaPublicKey {
+        RsaPublicKey::from(&generate_rsa_keypair(RSA_KEY_BITS).unwrap())
+    }
+
+    /// Both peers derive the SAME key, so nonce uniqueness across directions must not
+    /// rely on the random session ids differing: the role sits in the high bit.
     #[test]
     fn host_and_client_nonces_live_in_disjoint_spaces() {
-        // Both peers derive the SAME key; nonce uniqueness across the two
-        // directions must not rely on the 4-byte random session id differing.
-        // The role is encoded in the nonce's high bit, so host and client nonces
-        // can never collide even if their random session ids coincide.
         let key = [9u8; AES_KEY_SIZE];
         for _ in 0..64 {
             let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
@@ -779,204 +579,104 @@ mod tests {
 
     #[test]
     fn test_aes_roundtrip() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
-        let plaintext = b"Hello, secure world!";
-        let encrypted = cipher.encrypt(plaintext, None);
-        let decrypted = cipher.decrypt(&encrypted, None).unwrap();
-
-        assert_eq!(plaintext, &decrypted[..]);
+        let cipher = random_cipher();
+        for aad in [None, Some(&b"additional_context"[..])] {
+            let encrypted = cipher.encrypt(b"Hello, secure world!", aad);
+            assert_eq!(
+                cipher.decrypt(&encrypted, aad).unwrap(),
+                b"Hello, secure world!"
+            );
+        }
     }
 
     #[test]
-    fn test_aes_roundtrip_with_aad() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
-        let plaintext = b"Hello with AAD";
-        let aad = b"additional_context";
-        let encrypted = cipher.encrypt(plaintext, Some(aad));
-        let decrypted = cipher.decrypt(&encrypted, Some(aad)).unwrap();
-
-        assert_eq!(plaintext, &decrypted[..]);
-    }
-
-    #[test]
-    fn test_aes_aad_mismatch_fails() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
-        let plaintext = b"Secret message";
-        let aad = b"original_context";
-        let encrypted = cipher.encrypt(plaintext, Some(aad));
-
-        // Try to decrypt with different AAD
-        let wrong_aad = b"wrong_context";
-        let result = cipher.decrypt(&encrypted, Some(wrong_aad));
-
-        // Should fail due to AAD mismatch
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_aes_aad_stripped_fails() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
-        let plaintext = b"Secret message";
-        let aad = b"required_context";
-        let encrypted = cipher.encrypt(plaintext, Some(aad));
-
-        // Try to decrypt without AAD when it was used
-        let result = cipher.decrypt(&encrypted, None);
-
-        // Should fail because AAD is not provided
-        assert!(result.is_none());
+    fn test_aes_aad_mismatch_or_stripped_fails() {
+        let cipher = random_cipher();
+        let encrypted = cipher.encrypt(b"Secret message", Some(b"original_context"));
+        assert!(cipher.decrypt(&encrypted, Some(b"wrong_context")).is_none());
+        assert!(cipher.decrypt(&encrypted, None).is_none());
     }
 
     #[test]
     fn test_aes_nonce_randomness() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
-        let plaintext = b"Same message";
-        let enc1 = cipher.encrypt(plaintext, None);
-        let enc2 = cipher.encrypt(plaintext, None);
-
-        // Ciphertexts should be different due to random nonces
+        let cipher = random_cipher();
+        let enc1 = cipher.encrypt(b"Same message", None);
+        let enc2 = cipher.encrypt(b"Same message", None);
         assert_ne!(enc1, enc2);
-
-        // But both should decrypt correctly
-        assert_eq!(cipher.decrypt(&enc1, None).unwrap(), plaintext);
-        assert_eq!(cipher.decrypt(&enc2, None).unwrap(), plaintext);
+        assert_eq!(cipher.decrypt(&enc1, None).unwrap(), b"Same message");
+        assert_eq!(cipher.decrypt(&enc2, None).unwrap(), b"Same message");
     }
 
     #[test]
     fn test_aes_tamper_detection() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
+        let cipher = random_cipher();
         let mut encrypted = cipher.encrypt(b"Test", None);
-        if encrypted.len() > 20 {
-            encrypted[20] ^= 1; // Tamper with ciphertext
-        }
-
+        encrypted[20] ^= 1;
         assert!(cipher.decrypt(&encrypted, None).is_none());
     }
 
     #[test]
     #[should_panic(expected = "AES-GCM nonce counter exhausted; rekey required")]
     fn test_aes_nonce_counter_exhaustion_panics() {
-        let key: [u8; 32] = rand::thread_rng().gen();
-        let cipher = AesCipher::new(&key).unwrap();
-
+        let cipher = random_cipher();
         cipher
             .nonce_counter
             .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
-
         let _ = cipher.encrypt(b"nonce exhaustion", None);
     }
 
+    /// The decoded key verifies a PSS signature made with the private key (PSS is the
+    /// only RSA operation the product uses).
     #[test]
     fn test_rsa_pem_roundtrip() {
         let privkey = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let pubkey = RsaPublicKey::from(&privkey);
-
-        let pem = pem_encode_public(&pubkey).unwrap();
-        let decoded = pem_decode_public(&pem).unwrap();
-
-        // The PEM-decoded public key must be functionally equivalent to the
-        // original: a signature made with the private key verifies under both.
-        // (Verified via PSS signatures — the only RSA operation the product
-        // actually uses; RSA encryption was removed, see the note above.)
-        let data = b"pem roundtrip";
-        let sig = rsa_sign_pss(&privkey, data).unwrap();
-        assert!(rsa_verify_pss(&pubkey, data, &sig).is_ok());
-        assert!(rsa_verify_pss(&decoded, data, &sig).is_ok());
+        let decoded = pem_decode_public(&pem_encode_public(&pubkey).unwrap()).unwrap();
+        let sig = rsa_sign_pss(&privkey, b"pem roundtrip").unwrap();
+        assert!(rsa_verify_pss(&pubkey, b"pem roundtrip", &sig).is_ok());
+        assert!(rsa_verify_pss(&decoded, b"pem roundtrip", &sig).is_ok());
     }
 
     #[test]
     fn test_fingerprint_consistency() {
-        let privkey = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let pubkey = RsaPublicKey::from(&privkey);
-        let pem = pem_encode_public(&pubkey).unwrap();
-
+        let pem = pem_encode_public(&rsa_public()).unwrap();
         let fp1 = fingerprint_pubkey(pem.as_bytes()).unwrap();
-        let fp2 = fingerprint_pubkey(pem.as_bytes()).unwrap();
-
-        assert_eq!(fp1, fp2);
-        assert_eq!(fp1.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+        assert_eq!(fp1, fingerprint_pubkey(pem.as_bytes()).unwrap());
+        assert_eq!(fp1.len(), 64);
     }
 
     #[test]
     fn test_ephemeral_keypair_generation() {
-        let (_secret1, public1) = generate_ephemeral_keypair();
-        let (_secret2, public2) = generate_ephemeral_keypair();
-
-        // Keys should be different
+        let (_, public1) = generate_ephemeral_keypair();
+        let (_, public2) = generate_ephemeral_keypair();
         assert_ne!(public1.as_bytes(), public2.as_bytes());
-
-        // Public keys should be 32 bytes
         assert_eq!(public1.as_bytes().len(), 32);
-        assert_eq!(public2.as_bytes().len(), 32);
     }
 
     #[test]
-    fn test_ecdh_key_agreement() {
-        // Alice generates keypair
-        let (alice_secret, _alice_public) = generate_ephemeral_keypair();
-
-        // Bob generates keypair
-        let (bob_secret, _bob_public) = generate_ephemeral_keypair();
-
-        // Both derive the same session key
-        let info = b"test-context";
-        let alice_session_key = derive_session_key(alice_secret, &_bob_public, None, info).unwrap();
-        let bob_session_key = derive_session_key(bob_secret, &_alice_public, None, info).unwrap();
-
-        // Keys should match
-        assert_eq!(alice_session_key, bob_session_key);
-        assert_eq!(alice_session_key.len(), AES_KEY_SIZE);
-    }
-
-    #[test]
-    fn test_ecdh_different_context() {
-        let (alice_secret, _alice_public) = generate_ephemeral_keypair();
-        let (_bob_secret, bob_public) = generate_ephemeral_keypair();
-
-        // Different context strings produce different keys
-        let key1 = derive_session_key(alice_secret, &bob_public, None, b"context1").unwrap();
-
-        let (alice_secret2, _) = generate_ephemeral_keypair();
-        let key2 = derive_session_key(alice_secret2, &bob_public, None, b"context2").unwrap();
-
-        // Keys should be different (different secrets)
+    fn test_ecdh_different_secrets_give_different_keys() {
+        let (alice, _) = generate_ephemeral_keypair();
+        let (alice2, _) = generate_ephemeral_keypair();
+        let (_, bob_public) = generate_ephemeral_keypair();
+        let key1 = derive_session_key(alice, &bob_public, None, b"context1").unwrap();
+        let key2 = derive_session_key(alice2, &bob_public, None, b"context2").unwrap();
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn test_x25519_public_key_parsing() {
         let (_, public) = generate_ephemeral_keypair();
-        let bytes = public.as_bytes();
-
-        let parsed = parse_x25519_public(bytes).unwrap();
-        assert_eq!(parsed.as_bytes(), bytes);
-    }
-
-    #[test]
-    fn test_x25519_invalid_length() {
-        let invalid = vec![0u8; 16]; // Wrong length
-        assert!(parse_x25519_public(&invalid).is_err());
+        let parsed = parse_x25519_public(public.as_bytes()).unwrap();
+        assert_eq!(parsed.as_bytes(), public.as_bytes());
+        assert!(parse_x25519_public(&[0u8; 16]).is_err());
+        assert!(parse_x25519_public(&[0u8; 32]).is_err());
     }
 
     #[test]
     fn test_sas_is_deterministic_and_transcript_bound() {
         let a = derive_sas(b"transcript-one");
-        let b = derive_sas(b"transcript-one");
-        let c = derive_sas(b"transcript-two");
-        assert_eq!(a, b, "same transcript must give the same SAS");
-        assert_ne!(a, c, "different transcripts must give different SAS");
+        assert_eq!(a, derive_sas(b"transcript-one"));
+        assert_ne!(a, derive_sas(b"transcript-two"));
         // Format: "NN-NN-NN" then three emoji.
         let digits = a.split(' ').next().unwrap();
         assert_eq!(digits.len(), 8);
@@ -984,23 +684,17 @@ mod tests {
         assert_eq!(a.split(' ').count(), 4);
     }
 
+    /// Both peers render the SAS independently, so the derivation and emoji table
+    /// must never change.
     #[test]
     fn test_sas_known_answer_is_stable() {
-        // The SAS format is user-facing and must not silently change: both
-        // peers of one session render it independently, so any change to the
-        // derivation or the emoji table breaks cross-version comparison.
         assert_eq!(derive_sas(b"p2pem-test-vector"), "20-19-64 🌻 🍎 🐔");
     }
 
-    #[test]
-    fn test_x25519_rejects_all_zero_public_key() {
-        assert!(parse_x25519_public(&[0u8; 32]).is_err());
-    }
-
+    /// Canonical order-8 point (libsodium's blacklist): it parses, but DH against it
+    /// collapses to the identity, so agreement must fail.
     #[test]
     fn test_x25519_rejects_low_order_public_key() {
-        // Canonical order-8 point on Curve25519 (libsodium's blacklist entry):
-        // DH against it collapses to the identity, so the exchange must fail.
         let low_order: [u8; 32] = [
             0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
             0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
@@ -1011,444 +705,224 @@ mod tests {
         assert!(derive_session_key(our_secret, &malicious, None, b"test").is_err());
     }
 
+    /// Both sides derive the same key from parsed wire bytes and can talk with it.
     #[test]
     fn test_forward_secrecy_full_flow() {
-        // Simulate full handshake with forward secrecy
+        let (alice_secret, alice_public) = generate_ephemeral_keypair();
+        let (bob_secret, bob_public) = generate_ephemeral_keypair();
+        let bob_parsed = parse_x25519_public(bob_public.as_bytes()).unwrap();
+        let alice_parsed = parse_x25519_public(alice_public.as_bytes()).unwrap();
 
-        // 1. Both parties generate ephemeral keys
-        let (alice_ephemeral_secret, alice_ephemeral_public) = generate_ephemeral_keypair();
-        let (bob_ephemeral_secret, bob_ephemeral_public) = generate_ephemeral_keypair();
-
-        // 2. Exchange public keys (simulated)
-        let alice_public_bytes = alice_ephemeral_public.as_bytes();
-        let bob_public_bytes = bob_ephemeral_public.as_bytes();
-
-        // 3. Parse received public keys
-        let bob_public_parsed = parse_x25519_public(bob_public_bytes).unwrap();
-        let alice_public_parsed = parse_x25519_public(alice_public_bytes).unwrap();
-
-        // 4. Derive session keys
         let info = b"p2p-messenger-v2";
-        let alice_key =
-            derive_session_key(alice_ephemeral_secret, &bob_public_parsed, None, info).unwrap();
-        let bob_key =
-            derive_session_key(bob_ephemeral_secret, &alice_public_parsed, None, info).unwrap();
-
-        // 5. Keys should match
+        let alice_key = derive_session_key(alice_secret, &bob_parsed, None, info).unwrap();
+        let bob_key = derive_session_key(bob_secret, &alice_parsed, None, info).unwrap();
         assert_eq!(alice_key, bob_key);
+        assert_eq!(alice_key.len(), AES_KEY_SIZE);
 
-        // 6. Use keys for encryption
-        let alice_cipher = AesCipher::new(&alice_key).unwrap();
-        let bob_cipher = AesCipher::new(&bob_key).unwrap();
-
-        let plaintext = b"Forward secrecy test message";
-        let encrypted = alice_cipher.encrypt(plaintext, None);
-        let decrypted = bob_cipher.decrypt(&encrypted, None).unwrap();
-
-        assert_eq!(plaintext, &decrypted[..]);
-    }
-
-    // ========== Key Rotation (Rekeying) Tests ==========
-
-    #[test]
-    fn test_rekey_derives_correct_key() {
-        // Current key (32 bytes) - randomly generated
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-
-        // Nonce for rekeying (16 bytes, random)
-        let nonce: [u8; 16] = rand::thread_rng().gen();
-
-        // Derive next key
-        let next_key = rekey_session_key(&current_key, &nonce);
-
-        // Next key should be 32 bytes (same size)
-        assert_eq!(next_key.len(), AES_KEY_SIZE);
-
-        // Next key should be different from current key
-        assert_ne!(next_key, current_key);
+        let encrypted = AesCipher::new(&alice_key)
+            .unwrap()
+            .encrypt(b"Forward secrecy test message", None);
+        let decrypted = AesCipher::new(&bob_key)
+            .unwrap()
+            .decrypt(&encrypted, None)
+            .unwrap();
+        assert_eq!(decrypted, b"Forward secrecy test message");
     }
 
     #[test]
-    fn test_rekey_deterministic() {
-        // Rekeying with the same inputs should produce the same output
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-        let nonce: [u8; 16] = rand::thread_rng().gen();
-
-        let key1 = rekey_session_key(&current_key, &nonce);
-        let key2 = rekey_session_key(&current_key, &nonce);
-
-        // Same inputs should produce identical output (deterministic)
-        assert_eq!(key1, key2);
-    }
-
-    #[test]
-    fn test_rekey_different_nonces() {
-        // Different nonces should produce different keys
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
-        let nonce1: [u8; 16] = rand::thread_rng().gen();
-        let mut nonce2: [u8; 16] = rand::thread_rng().gen();
-        // Ensure nonces are different
-        if nonce1 == nonce2 {
-            nonce2[0] = nonce2[0].wrapping_add(1);
-        }
-
-        let key1 = rekey_session_key(&current_key, &nonce1);
-        let key2 = rekey_session_key(&current_key, &nonce2);
-
-        // Different nonces should produce different keys
-        assert_ne!(key1, key2);
-    }
-
-    #[test]
-    fn test_generate_rekey_nonce() {
+    fn test_rekey_derivation() {
+        let current_key: [u8; AES_KEY_SIZE] = rand::random();
         let nonce1 = generate_rekey_nonce();
         let nonce2 = generate_rekey_nonce();
-
-        // Nonces should be 16 bytes
-        assert_eq!(nonce1.len(), 16);
-        assert_eq!(nonce2.len(), 16);
-
-        // Nonces should be different (with overwhelming probability)
         assert_ne!(nonce1, nonce2);
+
+        let next = rekey_session_key(&current_key, &nonce1);
+        assert_ne!(next, current_key);
+        assert_eq!(next, rekey_session_key(&current_key, &nonce1));
+        assert_ne!(next, rekey_session_key(&current_key, &nonce2));
     }
 
+    /// Rekeying yields a working cipher, and the old one still opens its own frames.
     #[test]
     fn test_rekey_encryption_flow() {
-        // Test that rekeying doesn't break encryption/decryption
-        let current_key: [u8; AES_KEY_SIZE] = rand::thread_rng().gen();
+        let current_key: [u8; AES_KEY_SIZE] = rand::random();
         let cipher1 = AesCipher::new(&current_key).unwrap();
+        let encrypted = cipher1.encrypt(b"Message before rekeying", None);
+        assert_eq!(
+            cipher1.decrypt(&encrypted, None).unwrap(),
+            b"Message before rekeying"
+        );
 
-        // Encrypt message with first key
-        let plaintext = b"Message before rekeying";
-        let encrypted = cipher1.encrypt(plaintext, None);
-
-        // Decrypt with same cipher should work
-        let decrypted = cipher1.decrypt(&encrypted, None).unwrap();
-        assert_eq!(plaintext, &decrypted[..]);
-
-        // Now rekey
-        let nonce = generate_rekey_nonce();
-        let next_key = rekey_session_key(&current_key, &nonce);
+        let next_key = rekey_session_key(&current_key, &generate_rekey_nonce());
         let cipher2 = AesCipher::new(&next_key).unwrap();
-
-        // Encrypt with new key
-        let plaintext2 = b"Message after rekeying";
-        let encrypted2 = cipher2.encrypt(plaintext2, None);
-
-        // Decrypt should work with new key
-        let decrypted2 = cipher2.decrypt(&encrypted2, None).unwrap();
-        assert_eq!(plaintext2, &decrypted2[..]);
-
-        // Old cipher can still decrypt its own ciphertexts
-        let old_decrypt = cipher1.decrypt(&encrypted, None).unwrap();
-        assert_eq!(plaintext, &old_decrypt[..]);
+        let encrypted2 = cipher2.encrypt(b"Message after rekeying", None);
+        assert_eq!(
+            cipher2.decrypt(&encrypted2, None).unwrap(),
+            b"Message after rekeying"
+        );
+        assert_eq!(
+            cipher1.decrypt(&encrypted, None).unwrap(),
+            b"Message before rekeying"
+        );
     }
-
-    // ========== Ed25519 Signature Tests ==========
 
     #[test]
     fn test_ed25519_keypair_generation() {
         let (skey1, vkey1) = generate_ed25519_keypair();
         let (skey2, vkey2) = generate_ed25519_keypair();
-
-        // Keys should be different
         assert_ne!(skey1.to_bytes(), skey2.to_bytes());
         assert_ne!(vkey1.to_bytes(), vkey2.to_bytes());
-
-        // Keys should be correct size
-        assert_eq!(skey1.to_bytes().len(), 32);
-        assert_eq!(vkey1.to_bytes().len(), 32);
     }
 
-    /// The subkey is a deterministic function of the identity, so an existing
-    /// identity gains one without any change to `identity.json` — the file that
-    /// is the only key to the message history, and the last thing that should
-    /// be migrated for a signing-algorithm change.
+    /// Deterministic per identity, so an existing identity gains a subkey without any
+    /// change to `identity.json`.
     #[test]
     fn ed25519_subkey_is_deterministic_per_identity() {
         let a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-
-        let a1 = derive_ed25519_subkey(&a).unwrap();
-        let a2 = derive_ed25519_subkey(&a).unwrap();
-        let b1 = derive_ed25519_subkey(&b).unwrap();
-
+        let public = |k: &RsaPrivateKey| derive_ed25519_subkey(k).unwrap().verifying_key();
         assert_eq!(
-            a1.verifying_key().to_bytes(),
-            a2.verifying_key().to_bytes(),
+            public(&a),
+            public(&a),
             "the same identity must always derive the same subkey"
         );
         assert_ne!(
-            a1.verifying_key().to_bytes(),
-            b1.verifying_key().to_bytes(),
+            public(&a),
+            public(&b),
             "different identities must derive different subkeys"
         );
     }
 
-    /// The binding is what lets a peer accept an Ed25519 proof from a
-    /// fingerprint they already trust — so it has to actually bind.
     #[test]
     fn the_binding_ties_a_subkey_to_exactly_one_identity() {
         let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let other = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let subkey = derive_ed25519_subkey(&identity).unwrap();
-        let public = subkey.verifying_key();
+        let rsa = RsaPublicKey::from(&identity);
+        let public = derive_ed25519_subkey(&identity).unwrap().verifying_key();
         let binding = cross_sign_ed25519(&identity, &public).unwrap();
 
-        assert!(verify_ed25519_binding(&RsaPublicKey::from(&identity), &public, &binding).is_ok());
-
-        // Somebody else's identity does not vouch for this key.
+        assert!(verify_ed25519_binding(&rsa, &public, &binding).is_ok());
         assert!(
             verify_ed25519_binding(&RsaPublicKey::from(&other), &public, &binding).is_err(),
             "a binding must not verify under an identity that did not make it"
         );
-
-        // Nor does this binding cover a different key — which is the attack it
-        // exists to stop: presenting a stolen public_key_pem alongside an
-        // attacker-controlled signing key.
+        // The attack it exists to stop: a stolen PEM with an attacker's signing key.
         let attacker = derive_ed25519_subkey(&other).unwrap().verifying_key();
         assert!(
-            verify_ed25519_binding(&RsaPublicKey::from(&identity), &attacker, &binding).is_err(),
+            verify_ed25519_binding(&rsa, &attacker, &binding).is_err(),
             "a binding must not transfer to another subkey"
         );
-
-        // And a corrupted signature fails rather than being ignored.
         let mut damaged = binding.clone();
         damaged[0] ^= 0xff;
-        assert!(verify_ed25519_binding(&RsaPublicKey::from(&identity), &public, &damaged).is_err());
+        assert!(verify_ed25519_binding(&rsa, &public, &damaged).is_err());
     }
 
-    /// Adding a signing subkey must not disturb the fingerprint, because every
-    /// contact's TOFU trust is pinned to it.
+    /// Every contact's TOFU trust is pinned to the fingerprint.
     #[test]
     fn deriving_a_subkey_does_not_change_the_identity_fingerprint() {
         let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let pem = pem_encode_public(&RsaPublicKey::from(&identity)).unwrap();
         let before = fingerprint_pubkey(pem.as_bytes()).unwrap();
         let _ = derive_ed25519_subkey(&identity).unwrap();
-        let after = fingerprint_pubkey(pem.as_bytes()).unwrap();
-        assert_eq!(before, after);
+        assert_eq!(before, fingerprint_pubkey(pem.as_bytes()).unwrap());
     }
 
-    /// An older peer offering only RSA-PSS still negotiates, which is what
-    /// keeps this change back-compatible.
+    /// Ed25519 is preferred whatever the order; an RSA-only (older) peer still
+    /// negotiates; no overlap is `None`.
     #[test]
-    fn negotiation_falls_back_for_a_peer_that_only_knows_rsa() {
-        let ours = [
+    fn test_signature_scheme_negotiation() {
+        let (ed, rsa) = (
             SignatureScheme::Ed25519.to_u8(),
             SignatureScheme::RsaPss.to_u8(),
+        );
+        let cases: [(&[u8], &[u8], Option<SignatureScheme>); 6] = [
+            (&[ed, rsa], &[ed, rsa], Some(SignatureScheme::Ed25519)),
+            (&[rsa, ed], &[ed, rsa], Some(SignatureScheme::Ed25519)),
+            (&[ed], &[rsa, ed], Some(SignatureScheme::Ed25519)),
+            (&[ed, rsa], &[rsa], Some(SignatureScheme::RsaPss)),
+            (&[ed], &[rsa], None),
+            (&[ed, rsa], &[], None),
         ];
-        let legacy = [SignatureScheme::RsaPss.to_u8()];
-
-        assert_eq!(
-            negotiate_signature_scheme(&ours, &ours),
-            Some(SignatureScheme::Ed25519),
-            "two current peers use Ed25519"
-        );
-        assert_eq!(
-            negotiate_signature_scheme(&ours, &legacy),
-            Some(SignatureScheme::RsaPss),
-            "an older peer still connects, over RSA-PSS"
-        );
-        assert_eq!(negotiate_signature_scheme(&ours, &[]), None);
+        for (ours, theirs, expected) in cases {
+            assert_eq!(
+                negotiate_signature_scheme(ours, theirs),
+                expected,
+                "{ours:?} vs {theirs:?}"
+            );
+        }
     }
 
     #[test]
     fn test_ed25519_sign_verify() {
         let (signing_key, verifying_key) = generate_ed25519_keypair();
-        let message = b"Test message for Ed25519";
+        let (_, other_key) = generate_ed25519_keypair();
+        let data = [&b"IDENTITY_PROOF"[..], &[42u8; 32]].concat();
+        let signature = sign_ed25519(&signing_key, &data);
+        assert!(verify_ed25519(&verifying_key, &data, &signature).is_ok());
 
-        // Sign
-        let signature = sign_ed25519(&signing_key, message);
-
-        // Verify should succeed
-        let result = verify_ed25519(&verifying_key, message, &signature);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_ed25519_verify_wrong_message() {
-        let (signing_key, verifying_key) = generate_ed25519_keypair();
-        let message1 = b"Test message 1";
-        let message2 = b"Test message 2";
-
-        // Sign message1
-        let signature = sign_ed25519(&signing_key, message1);
-
-        // Verify against message2 should fail
-        let result = verify_ed25519(&verifying_key, message2, &signature);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_ed25519_verify_wrong_key() {
-        let (signing_key1, _) = generate_ed25519_keypair();
-        let (_, verifying_key2) = generate_ed25519_keypair();
-        let message = b"Test message";
-
-        // Sign with key1
-        let signature = sign_ed25519(&signing_key1, message);
-
-        // Verify with key2 should fail
-        let result = verify_ed25519(&verifying_key2, message, &signature);
-        assert!(result.is_err());
+        let wrong_data = [&b"IDENTITY_PROOF"[..], &[99u8; 32]].concat();
+        assert!(verify_ed25519(&verifying_key, &wrong_data, &signature).is_err());
+        assert!(verify_ed25519(&other_key, &data, &signature).is_err());
     }
 
     #[test]
     fn test_ed25519_hex_roundtrip() {
         let (_, vkey_orig) = generate_ed25519_keypair();
-
-        // Export to hex
         let hex_str = ed25519_public_to_hex(&vkey_orig);
-        assert_eq!(hex_str.len(), 64); // 32 bytes = 64 hex chars
-
-        // Import from hex
-        let vkey_imported = ed25519_public_from_hex(&hex_str).unwrap();
-
-        // Should match
-        assert_eq!(vkey_orig.to_bytes(), vkey_imported.to_bytes());
+        assert_eq!(hex_str.len(), 64);
+        assert_eq!(ed25519_public_from_hex(&hex_str).unwrap(), vkey_orig);
     }
 
     #[test]
     fn test_signature_scheme_enum() {
-        // Test RsaPss
-        assert_eq!(SignatureScheme::RsaPss.to_u8(), 1);
-        assert_eq!(SignatureScheme::RsaPss.name(), "RSA-PSS");
-        assert_eq!(SignatureScheme::from_u8(1), Some(SignatureScheme::RsaPss));
-
-        // Test Ed25519
-        assert_eq!(SignatureScheme::Ed25519.to_u8(), 2);
-        assert_eq!(SignatureScheme::Ed25519.name(), "Ed25519");
-        assert_eq!(SignatureScheme::from_u8(2), Some(SignatureScheme::Ed25519));
-
-        // Test unknown
+        for (scheme, value, name) in [
+            (SignatureScheme::RsaPss, 1, "RSA-PSS"),
+            (SignatureScheme::Ed25519, 2, "Ed25519"),
+        ] {
+            assert_eq!(scheme.to_u8(), value);
+            assert_eq!(scheme.name(), name);
+            assert_eq!(scheme.to_string(), name);
+            assert_eq!(SignatureScheme::from_u8(value), Some(scheme));
+        }
         assert_eq!(SignatureScheme::from_u8(99), None);
-
-        // Test Display
-        assert_eq!(format!("{}", SignatureScheme::RsaPss), "RSA-PSS");
-        assert_eq!(format!("{}", SignatureScheme::Ed25519), "Ed25519");
-    }
-
-    #[test]
-    fn test_ed25519_identity_proof_binding() {
-        // Simulate the identity proof signing scenario
-        let (signing_key, verifying_key) = generate_ed25519_keypair();
-
-        // Ephemeral key bytes (simulated X25519 key)
-        let ephemeral_bytes = [42u8; 32];
-
-        // Create the message to sign (like in the handshake)
-        let mut data = Vec::new();
-        data.extend_from_slice(b"IDENTITY_PROOF");
-        data.extend_from_slice(&ephemeral_bytes);
-
-        // Sign
-        let signature = sign_ed25519(&signing_key, &data);
-
-        // Verify with correct data
-        assert!(verify_ed25519(&verifying_key, &data, &signature).is_ok());
-
-        // Verify with different ephemeral key should fail
-        let mut wrong_data = Vec::new();
-        wrong_data.extend_from_slice(b"IDENTITY_PROOF");
-        wrong_data.extend_from_slice(&[99u8; 32]);
-        assert!(verify_ed25519(&verifying_key, &wrong_data, &signature).is_err());
-    }
-
-    #[test]
-    fn test_signature_scheme_negotiation() {
-        // Test that negotiation prefers Ed25519 over RSA-PSS
-        let our_schemes = vec![
-            SignatureScheme::RsaPss.to_u8(),
-            SignatureScheme::Ed25519.to_u8(),
-        ];
-        let their_schemes = vec![
-            SignatureScheme::Ed25519.to_u8(),
-            SignatureScheme::RsaPss.to_u8(),
-        ];
-
-        let negotiated = negotiate_signature_scheme(&our_schemes, &their_schemes);
-        assert_eq!(negotiated, Some(SignatureScheme::Ed25519));
-
-        // Test fallback to RSA-PSS when Ed25519 not available
-        let our_schemes_rsa_only = vec![SignatureScheme::RsaPss.to_u8()];
-        let their_schemes_rsa_only = vec![SignatureScheme::RsaPss.to_u8()];
-
-        let negotiated = negotiate_signature_scheme(&our_schemes_rsa_only, &their_schemes_rsa_only);
-        assert_eq!(negotiated, Some(SignatureScheme::RsaPss));
-
-        // Test no common scheme
-        let our_schemes_ed = vec![SignatureScheme::Ed25519.to_u8()];
-        let their_schemes_rsa = vec![SignatureScheme::RsaPss.to_u8()];
-
-        let negotiated = negotiate_signature_scheme(&our_schemes_ed, &their_schemes_rsa);
-        assert_eq!(negotiated, None);
-
-        // Test reverse order doesn't matter (Ed25519 still preferred)
-        let our_schemes_rev = vec![SignatureScheme::Ed25519.to_u8()];
-        let their_schemes_rev = vec![
-            SignatureScheme::RsaPss.to_u8(),
-            SignatureScheme::Ed25519.to_u8(),
-        ];
-
-        let negotiated = negotiate_signature_scheme(&our_schemes_rev, &their_schemes_rev);
-        assert_eq!(negotiated, Some(SignatureScheme::Ed25519));
     }
 
     #[test]
     fn test_supported_signature_schemes_message() {
-        // Test SupportedSignatureSchemes message encoding/decoding
+        use crate::core::ProtocolMessage;
         let schemes = vec![
             SignatureScheme::RsaPss.to_u8(),
             SignatureScheme::Ed25519.to_u8(),
         ];
-        let msg = crate::core::ProtocolMessage::SupportedSignatureSchemes {
+        let msg = ProtocolMessage::SupportedSignatureSchemes {
             schemes: schemes.clone(),
         };
-
-        let bytes = msg.to_plain_bytes();
-        assert!(!bytes.is_empty());
-
-        let decoded = crate::core::ProtocolMessage::from_plain_bytes(&bytes);
-        assert!(decoded.is_some());
-
-        match decoded {
-            Some(crate::core::ProtocolMessage::SupportedSignatureSchemes {
-                schemes: decoded_schemes,
-            }) => {
-                assert_eq!(decoded_schemes, schemes);
+        match ProtocolMessage::from_plain_bytes(&msg.to_plain_bytes()) {
+            Some(ProtocolMessage::SupportedSignatureSchemes { schemes: decoded }) => {
+                assert_eq!(decoded, schemes)
             }
-            _ => panic!("Expected SupportedSignatureSchemes message"),
+            other => panic!("Expected SupportedSignatureSchemes message, got {other:?}"),
         }
     }
 
-    /// Two public keys in one string: one hidden in an RFC 7468 preamble,
-    /// one in the block proper. The fingerprint used to be read from the first
-    /// and signatures checked against the second, so a peer could present a
-    /// victim's fingerprint while signing with its own key.
-    fn two_key_pem() -> (String, RsaPublicKey, RsaPublicKey) {
-        let victim = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
-        let attacker = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
-        let crafted = format!(
-            "x{}\n{}",
-            pem_encode_public(&victim).unwrap().trim_end(),
-            pem_encode_public(&attacker).unwrap()
-        );
-        (crafted, victim, attacker)
-    }
-
+    /// One key hidden in an RFC 7468 preamble and another in the block proper: a
+    /// fingerprint read from the first with signatures checked against the second
+    /// would let a peer present a victim's fingerprint.
     #[test]
     fn a_pem_with_a_second_key_in_its_preamble_is_refused() {
-        let (crafted, _, _) = two_key_pem();
+        let crafted = format!(
+            "x{}\n{}",
+            pem_encode_public(&rsa_public()).unwrap().trim_end(),
+            pem_encode_public(&rsa_public()).unwrap()
+        );
         assert!(pem_decode_public(&crafted).is_err());
         assert!(fingerprint_pubkey(crafted.as_bytes()).is_err());
     }
 
     #[test]
     fn text_around_a_single_pem_block_is_refused() {
-        let key = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
-        // `pem_encode_public` uses the platform line ending (CRLF on
-        // Windows); normalise so the CRLF case below is not `\r\r\n`.
+        let key = rsa_public();
+        // Normalise the platform line ending so the CRLF case is not `\r\r\n`.
         let pem = pem_encode_public(&key).unwrap().replace("\r\n", "\n");
         assert!(pem_decode_public(&format!("comment\n{pem}")).is_err());
         assert!(pem_decode_public(&format!("{pem}trailing")).is_err());
@@ -1457,8 +931,7 @@ mod tests {
         assert_eq!(pem_decode_public(&pem.replace('\n', "\r\n")).unwrap(), key);
     }
 
-    /// An END marker before the BEGIN marker used to make the fingerprint's
-    /// slice start past its end and panic — a crash from a pasted v1 invite.
+    /// An END marker before BEGIN (e.g. a pasted v1 invite) is an error, not a panic.
     #[test]
     fn markers_in_the_wrong_order_are_an_error_not_a_panic() {
         let s = "-----END PUBLIC KEY----------BEGIN PUBLIC KEY-----";
@@ -1467,14 +940,13 @@ mod tests {
         assert!(fingerprint_pubkey(&[0xff, 0xfe]).is_err());
     }
 
-    /// Existing fingerprints, pins and verified contacts must not move: for an
-    /// honestly encoded key the parsed-key fingerprint equals the hash of the
-    /// PEM's base64 body, which is what was stored before.
+    /// Stored fingerprints must not move: for an honest key the parsed-key fingerprint
+    /// equals the hash of the PEM's base64 body.
     #[test]
     fn honest_fingerprints_are_unchanged() {
         use base64::Engine;
         for _ in 0..3 {
-            let key = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
+            let key = rsa_public();
             let pem = pem_encode_public(&key).unwrap();
             let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
             let der = base64::engine::general_purpose::STANDARD

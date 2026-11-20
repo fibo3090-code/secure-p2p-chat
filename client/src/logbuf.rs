@@ -1,18 +1,9 @@
-//! In-process ring buffer of recent `tracing` events.
-//!
-//! The TUI's log overlay and the diagnostics bundle both need to show what the
-//! app has been doing. That used to come from `egui_tracing::EventCollector` —
-//! an egui crate pulled in purely for its collector, which kept the terminal UI
-//! (and, transitively, the Tauri desktop bridge) depending on a GUI toolkit
-//! that no longer ships. This is the same capability with no such dependency:
-//! a `tracing_subscriber::Layer` that keeps the last [`LOG_CAPACITY`] events.
-//!
-//! Bounded on purpose: a long-running session must not grow a log buffer until
-//! it becomes the app's largest allocation, and the overlay only ever shows the
-//! recent tail anyway.
+//! In-process ring buffer of recent `tracing` events, for the log overlay and
+//! diagnostics bundles: a `tracing_subscriber::Layer` keeping the last
+//! [`LOG_CAPACITY`] events, bounded so a long session cannot grow it forever.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
 use tracing::field::{Field, Visit};
@@ -46,43 +37,31 @@ impl LogBuffer {
         }
     }
 
-    /// A snapshot of the retained events, oldest first.
-    ///
-    /// A poisoned lock is recovered from rather than propagated: losing the log
-    /// overlay because some other thread panicked while logging would turn a
-    /// diagnostic aid into a second failure.
-    pub fn events(&self) -> Vec<LogEvent> {
-        match self.inner.lock() {
-            Ok(buf) => buf.iter().cloned().collect(),
-            Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
-        }
+    /// Recovers a poisoned lock: a thread that panicked while logging must not
+    /// also take the log overlay down.
+    fn buf(&self) -> MutexGuard<'_, VecDeque<LogEvent>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Number of retained events.
+    /// A snapshot of the retained events, oldest first.
+    pub fn events(&self) -> Vec<LogEvent> {
+        self.buf().iter().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
-        match self.inner.lock() {
-            Ok(buf) => buf.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
-        }
+        self.buf().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Drop everything currently retained.
     pub fn clear(&self) {
-        match self.inner.lock() {
-            Ok(mut buf) => buf.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
+        self.buf().clear();
     }
 
     fn push(&self, event: LogEvent) {
-        let mut buf = match self.inner.lock() {
-            Ok(b) => b,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut buf = self.buf();
         if buf.len() == LOG_CAPACITY {
             buf.pop_front();
         }
@@ -174,8 +153,7 @@ mod tests {
         assert!(handle.is_empty());
     }
 
-    /// Events recorded through the real tracing pipeline must land in the
-    /// buffer with their message intact — this is what the log overlay shows.
+    /// Events from the real tracing pipeline land with their message intact.
     #[test]
     fn captures_events_through_a_subscriber() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -193,8 +171,7 @@ mod tests {
         assert_eq!(events[1].message, "structured too");
     }
 
-    /// An event carrying only structured fields still has to render as
-    /// something a human can read, not an empty line.
+    /// An event with only structured fields still renders as something.
     #[test]
     fn field_only_events_still_render() {
         use tracing_subscriber::layer::SubscriberExt;

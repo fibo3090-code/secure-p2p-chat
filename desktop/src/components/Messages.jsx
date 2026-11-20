@@ -1,5 +1,4 @@
-// Unified Messages surface — conversation list + chat pane. Clean port of the
-// mockup's chat.jsx, driven by live data adapted in lib/bridge.js.
+// Messages surface: conversation list + chat pane, fed by lib/bridge.js adapters.
 import { memo, useCallback, useMemo, useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { api, fmtDay, friendlyError } from "../lib/bridge.js";
@@ -9,9 +8,8 @@ import { cx, Avatar, IconButton, Button, Modal, TrustBadge, TransportBadge } fro
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const isImageName = (name) => IMAGE_RE.test(name || "");
 
-// Render message text with http(s) URLs clickable. Opening goes through the
-// bridge's open_url (scheme re-checked there) so links launch the system
-// browser, never navigate the webview. Trailing punctuation stays text.
+// Message text with http(s) URLs clickable, opened via the bridge's open_url
+// (scheme re-checked there), never in the webview. Trailing punctuation stays text.
 const URL_RE = /(https?:\/\/[^\s<>"']+)/gi;
 function LinkifiedText({ text }) {
   const parts = String(text ?? "").split(URL_RE);
@@ -65,20 +63,15 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
 
 const STATE_LABEL = { connected: "Connected", hosting: "Hosting", offline: "Offline", connecting: "Connecting" };
 
-// Shown above a disabled composer. Messages only exist once a session carries
-// them, so say which situation this is and what would fix it — the alternative
-// (accept the text and drop it) is how a typed paragraph disappears.
+// Shown above a disabled composer: why sending is impossible and what fixes it.
 const OFFLINE_NOTICE = {
   offline: "Not connected — messages can't be sent yet. Reconnect to this peer, or ask them to connect to you.",
   hosting: "Waiting for a peer to connect. Share your address, then you can start the conversation.",
   connecting: "Connecting… you'll be able to send as soon as the peer answers.",
 };
 
-// The markers beside a conversation are icons and a bare count, so a screen
-// reader reached the row and announced only the name and preview — the
-// unverified warning and the unread badge, the two things that decide whether
-// you open it, were invisible. Spelled out here and stitched into the row's
-// accessible name.
+// The row markers are icons and a bare count, so spell them out for the row's
+// accessible name (unread and unverified decide whether you open it).
 export function rowStatusLabel(c) {
   const bits = [];
   if (c.unread > 0) bits.push(`${c.unread} unread message${c.unread === 1 ? "" : "s"}`);
@@ -94,10 +87,7 @@ export function rowStatusLabel(c) {
   return bits.join(", ");
 }
 
-// Memoised by value, not by identity: the conversation list is rebuilt from a
-// fresh bridge payload on every poll tick, so every row object is new each time
-// and the default shallow compare would never hit. Comparing the fields the row
-// actually renders is what stops an idle poll from re-rendering the whole list.
+// Memoised by value: every poll rebuilds each row object, so identity never matches.
 function convRowsEqual(a, b) {
   if (a.onSelect !== b.onSelect || a.active !== b.active) return false;
   const x = a.c;
@@ -129,9 +119,7 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect }) {
           <span className="conv-preview">
             {c.typing ? <em className="conv-typing">typing…</em> : c.last}
           </span>
-          {/* aria-hidden: every marker here is repeated in the row's aria-label
-              above, in words. Leaving them exposed makes a reader announce a
-              bare number after the preview text. */}
+          {/* aria-hidden: repeated in words in the row's aria-label. */}
           <span className="conv-markers" aria-hidden="true">
             {c.kind === "group" && <Icon name="users" size={12} />}
             {c.kind === "channel" && <Icon name="hash" size={12} />}
@@ -152,8 +140,7 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
     () => contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase())),
     [contacts, query],
   );
-  // Total unread, announced politely. A badge appearing on a row the user is
-  // not looking at is otherwise a purely visual event.
+  // Total unread, announced politely.
   const totalUnread = useMemo(
     () => filtered.reduce((n, c) => n + (c.unread || 0), 0),
     [filtered],
@@ -169,9 +156,7 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery 
       <div className="sr-only" role="status" aria-live="polite">
         {totalUnread > 0 ? `${totalUnread} unread message${totalUnread === 1 ? "" : "s"}` : "No unread messages"}
       </div>
-      {/* listbox/option: the rows are a single-select list of conversations,
-          not a run of unrelated buttons, so a reader announces "3 of 12"
-          instead of leaving the user to count. */}
+          {/* listbox/option, so a reader announces "3 of 12". */}
       <div className="conv-scroll" role="listbox" aria-label="Conversations">
         {filtered.map((c) => (
           <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} />
@@ -208,9 +193,7 @@ function MessageItemInner({ m, preview, onOpen, onReveal }) {
   if (m.kind === "file") {
     const mine = m.from === "me";
     const done = m.progress >= 100;
-    // Name the folder the file actually went to. Hardcoding "Downloads" was
-    // wrong for anyone who picked a different download folder — and this card
-    // is the only place the app ever says where a received file landed.
+    // Name the folder the file actually went to.
     const sub = done
       ? (mine ? "sent" : m.dir ? `saved to ${m.dir}` : "saved")
       : m.progress + "%";
@@ -256,11 +239,7 @@ function MessageItemInner({ m, preview, onOpen, onReveal }) {
   );
 }
 
-// Memoised by value. `chatToContact` rebuilds the whole message array from a
-// fresh bridge payload on every poll tick, so each `m` is a new object and the
-// default shallow compare never hits — a 150-message thread re-rendered every
-// row, several times a second, for the entire time the app was open. Comparing
-// the fields a row actually renders makes an idle tick cost nothing.
+// Memoised by value: `chatToContact` rebuilds every message on each poll tick.
 function messagesEqual(a, b) {
   if (a.preview !== b.preview || a.onOpen !== b.onOpen || a.onReveal !== b.onReveal) return false;
   const x = a.m;
@@ -288,11 +267,9 @@ function transferLabel(t) {
   return `${transferPct(t)}%`;
 }
 
-// Live progress cards for the conversation's in-flight file transfers, so a
-// large send/receive shows movement instead of nothing until completion.
-// An "awaiting" transfer is an incoming offer: it shows Accept / Decline
-// instead of a progress bar (nothing is saved until the user accepts).
-// In-flight transfers get a cancel button (either direction).
+// Live progress for in-flight transfers. An "awaiting" incoming offer shows
+// Accept / Decline instead (nothing is saved until accepted); in-flight ones
+// can be cancelled in either direction.
 function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
   if (!transfers || transfers.length === 0) return null;
   return (
@@ -325,10 +302,8 @@ function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
   );
 }
 
-// The three real ways to reach someone for the first time. There is no account
-// system and no directory, so a user arriving from a mainstream messenger has
-// no working mental model — spelling the options out here is the difference
-// between "this app is broken" and a first successful connection.
+// The three real ways to reach someone for the first time: there is no account
+// system or directory to fall back on.
 const START_PATHS = [
   {
     mode: "invite",
@@ -396,21 +371,15 @@ function GetStarted({ onStart }) {
   );
 }
 
-// How many messages render at once. Long histories only mount their tail, so a
-// 10k-message thread doesn't re-render thousands of nodes on every poll tick;
-// "Show earlier messages" widens the window on demand.
+// Messages rendered at once; long histories mount only their tail, and "Show
+// earlier messages" widens the window.
 const MSG_WINDOW = 150;
 
-// How many image previews are held as `data:` URLs at once. Each is a
-// base64-encoded copy of the file in webview memory (up to the bridge's 4 MiB
-// cap), so an image-heavy thread could otherwise pin hundreds of megabytes just
-// by being scrolled through. Keeping the most recent handful covers what is on
-// screen; anything older is re-fetched if the user scrolls back.
+// Image previews held as `data:` URLs at once (each up to 4 MiB), so scrolling
+// an image-heavy thread cannot pin hundreds of MB; older ones re-render plain.
 const MAX_CACHED_PREVIEWS = 24;
 
-/// Keep only the newest `MAX_CACHED_PREVIEWS` entries, preserving insertion
-/// order (JS objects keep string-key insertion order for non-numeric keys, and
-/// message ids are UUIDs).
+/// Keep the newest `MAX_CACHED_PREVIEWS` entries (insertion order; UUID keys).
 function trimPreviews(map) {
   const keys = Object.keys(map);
   if (keys.length <= MAX_CACHED_PREVIEWS) return map;
@@ -421,16 +390,14 @@ function trimPreviews(map) {
 export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSendFile, draft, setDraft, onSend, transfers, onAcceptTransfer, onDeclineTransfer, onCancelTransfer, isFirstRun, onStart }) {
   const scrollRef = useRef(null);
   const [shown, setShown] = useState(MSG_WINDOW);
-  // Inline previews for image files, fetched once per message id (null =
-  // asked, not previewable) so the poll-driven re-renders never refetch.
+  // Image previews, fetched once per message id (null = not previewable).
   const [previews, setPreviews] = useState({});
   // A peer-sent file the OS would execute, held for the user's confirmation.
   const [riskyOpen, setRiskyOpen] = useState(null);
   const requested = useRef(new Set());
   const contactId = contact ? contact.id : null;
   const messageCount = contact ? contact.messages.length : 0;
-  // The conversation on screen *now*, for async work started on an earlier
-  // render to check before it writes (see the preview effect below).
+  // The conversation on screen now, checked by async work before it writes.
   const visibleContact = useRef(contactId);
   useEffect(() => {
     visibleContact.current = contactId;
@@ -441,10 +408,8 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [contactId, messageCount]);
-  // Which file cards are currently previewable. Keying the effect on this —
-  // rather than on the message count — means a card that becomes eligible
-  // without the thread growing (it gains a path, or finishes) still gets its
-  // thumbnail. `requested` keeps repeat evaluations idempotent.
+  // Keyed on which cards are previewable (not the message count), so a card
+  // that gains a path or finishes still gets its thumbnail.
   const previewKey = (contact ? contact.messages.slice(-shown) : [])
     .filter((m) => m.kind === "file")
     .map((m) => `${m.id}:${m.hasPath ? 1 : 0}:${m.progress}`)
@@ -464,26 +429,18 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         try { updates[m.id] = await api.filePreview(forContact, m.id); }
         catch { updates[m.id] = null; }
       }
-      // Dropped only if the user has since switched conversations. This used
-      // to be an effect-cleanup flag, so *any* re-run cancelled the write —
-      // and the effect re-runs whenever another file card's progress ticks.
-      // The ids were already in `requested`, so a thumbnail fetched during
-      // someone else's transfer was thrown away and never asked for again.
-      //
-      // Bounded: `requested` still remembers what was asked for, so an evicted
-      // preview is not re-fetched in a loop — it simply renders as a plain card
-      // until the conversation is reopened.
+      // Dropped only if the user switched conversations: an effect-cleanup flag
+      // discarded thumbnails whenever another card's progress ticked. Bounded;
+      // `requested` stops an evicted preview being re-fetched in a loop.
       if (visibleContact.current === forContact) {
         setPreviews((p) => trimPreviews({ ...p, ...updates }));
       }
     })();
   }, [contactId, previewKey, shown]); // eslint-disable-line react-hooks/exhaustive-deps -- `contact` changes identity every poll; previewKey captures what matters
 
-  // Opening a peer's file can mean running their code. The bridge refuses
-  // those unless confirmed and tells us what it is, so the click turns into a
-  // question instead of an execution.
-  // useCallback, because these are the props `MessageItem`'s memo compares by
-  // identity — recreating them each render would defeat it entirely.
+  // Opening a peer's file can run their code: the bridge refuses unless
+  // confirmed, so the click becomes a question. useCallback keeps
+  // `MessageItem`'s memo effective.
   const openFile = useCallback(async (m) => {
     try {
       const r = await api.openFile(contactId, m.id, false);
@@ -503,13 +460,10 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       .catch((e) => toast(`Could not show the file: ${friendlyError(e)}`, "error")),
   [contactId]);
 
-  // Sending needs a live session. Without this the composer accepted a whole
-  // paragraph, the bridge reported success, and the text vanished.
+  // Sending needs a live session, or the typed text would vanish.
   const online = contact ? contact.state === "connected" : false;
-  // One outgoing file at a time per conversation: `FileChunk` carries no
-  // transfer id, so two concurrent sends interleave on the wire and corrupt
-  // both files. The backend refuses the second send; the button must not
-  // pretend otherwise.
+  // One outgoing file at a time: `FileChunk` carries no transfer id, so
+  // concurrent sends corrupt both. The backend refuses; the button agrees.
   const sending = (transfers || []).some(
     (t) => t.direction === "outgoing" && (t.status === "pending" || t.status === "active"),
   );
@@ -519,12 +473,8 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
       ? "Already sending a file in this conversation"
       : "Send file";
 
-  // The rendered window and its day separators, recomputed only when the thread
-  // or the window actually changes. `Date` parsing per message on every poll
-  // tick was the other half of the re-render cost.
-  //
-  // Declared before the early returns below: hooks must run in the same order on
-  // every render, so this cannot move inside the JSX.
+  // The rendered window and day separators, memoised (per-message `Date`
+  // parsing every tick was costly). Before the early returns: hook order.
   const messages = contact ? contact.messages : null;
   const visible = useMemo(() => {
     if (!messages) return [];
@@ -538,10 +488,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   }, [messages, shown]);
 
   if (!contact) {
-    // With nothing to select, "Select a conversation" is a dead end — and this
-    // is exactly the moment a new user decides whether the app works. There are
-    // no accounts and no directory here, so the first connection genuinely needs
-    // explaining; show the three real paths instead of a shrug.
+    // No conversation yet: show the three real paths, not a dead end.
     if (isFirstRun) return <GetStarted onStart={onStart} />;
     return (
       <div className="chat-pane chat-empty">
@@ -583,10 +530,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
           )}
           {visible.map(({ m, sep, key }) => (
             <div key={key}>
-              {/* A date break is a structural divider, not decoration: without
-                  the role a screen reader reads the date as a stray line of
-                  text between two messages, with nothing saying the thread has
-                  moved to another day. */}
+              {/* role="separator" so a reader hears the day change. */}
               {sep && (
                 <div className="day-sep" role="separator" aria-label={`Messages from ${sep}`}>
                   <span>{sep}</span>
@@ -616,10 +560,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         <textarea className="composer-input" id="composer-input" rows={1}
           aria-label={online ? `Message ${contact.name}` : "Message box — not connected"}
           placeholder={online ? `Message ${contact.name.split(" ")[0]}…` : "Not connected — reconnect to send"}
-          // Typing into a conversation with no session used to look like it
-          // worked: the send reported success, the box cleared, and the message
-          // simply never existed. Better to refuse the keystroke than to eat a
-          // paragraph.
+          // Refuse the keystroke rather than eat a paragraph.
           disabled={!online}
           value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); onSend(); } }} />

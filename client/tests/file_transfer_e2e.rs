@@ -1,88 +1,29 @@
-//! End-to-end file transfer between two real `ChatManager`s over a loopback
-//! socket: `send_file` → v3 session → chunked wire frames → spool → the
-//! acceptance gate → the receiver's download directory.
+//! End-to-end file transfer between two real `ChatManager`s over loopback:
+//! `send_file` → session → `FileMeta`/`FileChunk`/`FileEnd` → spool → the
+//! acceptance gate → the download directory. What it guards fails silently:
 //!
-//! Everything below the manager is the production path — the real handshake, the
-//! real `FileMeta`/`FileChunk`/`FileEnd` frames, the real receiver. The pieces
-//! this covers are the ones whose failure modes are silent:
-//!
-//! - **The acceptance gate.** `auto_accept_files` is off by default. Nothing may
-//!   reach the download directory or the chat history until `accept_incoming_file`
-//!   is called, and declining must both delete the spool *and* tell the sender to
-//!   stop — a decline the sender never hears about still pulls the whole file
-//!   across the wire.
-//! - **Bytes arriving intact**, since a chunking bug corrupts a file rather than
-//!   failing it.
-//! - **Cancellation from either end**, which has to leave no stuck progress row
-//!   and no orphaned temp file.
+//! - **The acceptance gate** (`auto_accept_files` defaults off): nothing reaches
+//!   the download dir or history before `accept_incoming_file`, and a decline
+//!   deletes the spool *and* tells the sender to stop.
+//! - **Bytes arriving intact** (a chunking bug corrupts rather than fails).
+//! - **Cancellation from either end** leaves no stuck row or orphaned spool.
 
+mod common;
+
+use common::*;
 use messenger_core::core::generate_rsa_keypair;
-use messenger_core::types::{Config, MessageContent, TransferStatus};
+use messenger_core::types::{FileTransferState, MessageContent, TransferStatus};
 use messenger_core::RSA_KEY_BITS;
 use p2pem_classic::app::ChatManager;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
-
-/// How long any single "pump until" step may take before the test fails rather
-/// than hangs.
-///
-/// Deliberately generous — it is a hang detector, not a performance assertion.
-/// A debug-build RSA handshake is slow, and under a parallel runner several run
-/// at once; a tight bound here turns load into a flake.
-const STEP_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// Reserve an ephemeral loopback port, then release it for the host to bind.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
-}
-
-/// A manager with its own download/temp directories, so two peers in one test
-/// never write over each other.
-fn manager_in(dir: &Path, auto_accept: bool) -> ChatManager {
-    let download = dir.join("downloads");
-    let temp = dir.join("tmp");
-    std::fs::create_dir_all(&download).expect("download dir");
-    std::fs::create_dir_all(&temp).expect("temp dir");
-    let config = Config {
-        download_dir: download,
-        temp_dir: temp,
-        auto_accept_files: auto_accept,
-        ..Config::default()
-    };
-    ChatManager::new(config)
-}
-
-/// Drive both managers' event loops until `done` reports true, or fail.
-///
-/// Both sides have to be pumped: a transfer only advances when the *receiver*
-/// drains its session events, and the sender's own progress is mirrored out of
-/// the streaming task by the same poll.
-async fn pump_until<F>(a: &mut ChatManager, b: &mut ChatManager, label: &str, mut done: F)
-where
-    F: FnMut(&mut ChatManager, &mut ChatManager) -> bool,
-{
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        a.poll_session_events();
-        b.poll_session_events();
-        if done(a, b) {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("[{label}] timed out");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
 
 struct Pair {
     host: ChatManager,
     client: ChatManager,
-    /// The host-side conversation for this peer. The host creates a *new* chat
-    /// keyed by the client's own chat id, so this is not the placeholder id
-    /// `start_host` returned.
+    /// The host-side conversation: the host creates a *new* chat keyed by the
+    /// client's chat id, not the placeholder `start_host` returned.
     host_chat: Uuid,
     client_chat: Uuid,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
@@ -107,15 +48,13 @@ async fn connected_pair(host_auto_accept: bool, client_auto_accept: bool) -> Pai
         .await
         .expect("connect to host");
 
-    // TOFU on both ends. The prompt is a queue read by peeking, and
-    // `confirm_fingerprint` is what removes the entry and persists the trust.
-    pump_until(&mut host, &mut client, "tofu prompts", |h, c| {
+    // TOFU on both ends: the prompt queue is peeked, and `confirm_fingerprint`
+    // removes the entry and persists the trust.
+    pump_pair(&mut host, &mut client, "tofu prompts", |h, c| {
         h.pending_fingerprint().is_some() && c.pending_fingerprint().is_some()
     })
     .await;
-
-    // The prompt carries the SESSION id, which on the host side is the
-    // listener placeholder's — not the conversation the peer will live in.
+    // The prompt carries the SESSION id (on the host, the listener's).
     let host_prompt = host.pending_fingerprint().expect("host prompt").clone();
     let client_prompt = client.pending_fingerprint().expect("client prompt").clone();
     host.confirm_fingerprint(host_prompt.session_id, true)
@@ -124,11 +63,9 @@ async fn connected_pair(host_auto_accept: bool, client_auto_accept: bool) -> Pai
         .confirm_fingerprint(client_prompt.session_id, true)
         .expect("client accepts");
 
-    // The host creates a new chat per incoming connection, keyed by the
-    // *client's* chat id, so find it by the fingerprint that was just stored on
-    // it rather than assuming an id.
+    // Find the host's new chat by the fingerprint just stored on it.
     let mut host_chat = None;
-    pump_until(&mut host, &mut client, "sessions ready", |h, c| {
+    pump_pair(&mut host, &mut client, "sessions ready", |h, c| {
         host_chat = h
             .chats
             .iter()
@@ -137,144 +74,114 @@ async fn connected_pair(host_auto_accept: bool, client_auto_accept: bool) -> Pai
         host_chat.is_some() && c.chats.contains_key(&client_chat)
     })
     .await;
-    let host_chat = host_chat.expect("a host-side conversation for the peer");
 
     Pair {
         host,
         client,
-        host_chat,
+        host_chat: host_chat.expect("a host-side conversation for the peer"),
         client_chat,
         _dirs: (host_dir, client_dir),
     }
 }
 
-/// Write a file of `len` bytes with a non-repeating pattern, so a chunking bug
-/// that duplicates or drops a chunk changes the contents rather than the length.
-fn write_test_file(dir: &Path, name: &str, len: usize) -> (PathBuf, Vec<u8>) {
+/// A file of `len` bytes in its own temp dir, with a non-repeating pattern so a
+/// duplicated or dropped chunk changes the contents, not just the length.
+fn test_file(name: &str, len: usize) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+    let dir = tempfile::tempdir().expect("src dir");
     let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-    let path = dir.join(name);
+    let path = dir.path().join(name);
     std::fs::write(&path, &bytes).expect("write test file");
-    (path, bytes)
+    (dir, path, bytes)
 }
 
-fn transfers_for(mgr: &ChatManager, chat: Uuid) -> Vec<messenger_core::types::FileTransferState> {
+fn awaiting(mgr: &ChatManager) -> Option<FileTransferState> {
     mgr.active_transfers_snapshot()
         .into_iter()
-        .filter(|t| t.chat_id == chat)
-        .collect()
+        .find(|t| t.status == TransferStatus::AwaitingAcceptance)
 }
 
-/// Entries in `dir`, split into the receiver's in-progress spools (`tmp_<uuid>_`)
-/// and finished files.
-///
-/// The spool deliberately lives *in the download directory*: finalizing is a
-/// `rename`, and a rename is only atomic within one filesystem. So "nothing has
-/// been saved" means no finished file — not an empty directory.
-fn dir_entries(dir: &Path) -> (Vec<String>, Vec<String>) {
-    let mut spools = Vec::new();
-    let mut finished = Vec::new();
-    for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("tmp_") {
-            spools.push(name);
-        } else {
-            finished.push(name);
-        }
-    }
-    (spools, finished)
+/// Every transfer has finished one way or another.
+fn settled(mgr: &ChatManager) -> bool {
+    mgr.active_transfers_snapshot().iter().all(|t| {
+        matches!(
+            t.status,
+            TransferStatus::Cancelled | TransferStatus::Failed(_) | TransferStatus::Completed
+        )
+    })
 }
 
-fn received_file_message(mgr: &ChatManager, chat: Uuid) -> Option<(String, PathBuf)> {
-    mgr.chats
-        .get(&chat)?
-        .messages
+fn in_progress(mgr: &ChatManager) -> bool {
+    mgr.active_transfers_snapshot()
         .iter()
-        .rev()
-        .find_map(|m| match &m.content {
+        .any(|t| t.status == TransferStatus::InProgress)
+}
+
+/// Entries in `dir`, split into in-progress spools (`tmp_<uuid>_`) and finished
+/// files. The spool lives *in* the download dir (finalizing is a rename, atomic
+/// only within one filesystem), so "nothing saved" means no finished file.
+fn dir_entries(dir: &Path) -> (Vec<String>, Vec<String>) {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .partition(|name| name.starts_with("tmp_"))
+}
+
+/// The latest received file message with a saved path, in any conversation.
+fn received_file(mgr: &ChatManager) -> Option<(String, PathBuf)> {
+    mgr.chats.values().find_map(|chat| {
+        chat.messages.iter().rev().find_map(|m| match &m.content {
             MessageContent::File { filename, path, .. } if !m.from_me => {
                 Some((filename.clone(), path.clone()?))
             }
             _ => None,
         })
+    })
 }
 
-/// The whole path, with the gate on: offer held, nothing on disk, then accepted
+/// The whole path with the gate on: offer held, nothing on disk, then accepted
 /// and the exact bytes land in the download directory.
 #[tokio::test]
 async fn a_file_crosses_the_wire_and_lands_after_the_user_accepts() {
     let mut p = connected_pair(false, false).await;
-    let src_dir = tempfile::tempdir().expect("src dir");
     // Several chunks' worth: FILE_CHUNK_SIZE is 64 KiB.
-    let (path, expected) = write_test_file(src_dir.path(), "report.pdf", 200 * 1024);
-
+    let (_src, path, expected) = test_file("report.pdf", 200 * 1024);
     p.host
         .send_file(p.host_chat, path)
         .await
         .expect("send_file");
 
-    // The receiver holds the offer: `auto_accept_files` is off.
-    pump_until(&mut p.host, &mut p.client, "offer held", |_, c| {
-        transfers_for(c, c.chats.keys().copied().next().unwrap_or_default())
-            .iter()
-            .any(|t| t.status == TransferStatus::AwaitingAcceptance)
-            || c.active_transfers_snapshot()
-                .iter()
-                .any(|t| t.status == TransferStatus::AwaitingAcceptance)
+    pump_pair(&mut p.host, &mut p.client, "offer held", |_, c| {
+        awaiting(c).is_some()
     })
     .await;
-
-    let offer = p
-        .client
-        .active_transfers_snapshot()
-        .into_iter()
-        .find(|t| t.status == TransferStatus::AwaitingAcceptance)
-        .expect("an offer awaiting acceptance");
+    let offer = awaiting(&p.client).expect("an offer awaiting acceptance");
     assert_eq!(offer.filename, "report.pdf");
 
-    // Chunks may be spooling, but nothing may be *saved*: no finished file in
-    // the download directory, and nothing in the conversation.
+    // Chunks may spool, but nothing may be *saved* or appear in the history.
     let downloads = p.client.config.download_dir.clone();
     let (_spools, finished) = dir_entries(&downloads);
     assert!(
         finished.is_empty(),
         "nothing may be saved before the user accepts, found {finished:?}"
     );
-    assert!(received_file_message(&p.client, p.client_chat).is_none());
+    assert!(received_file(&p.client).is_none());
 
     p.client
         .accept_incoming_file(offer.id)
         .expect("accept the offer");
-
-    pump_until(&mut p.host, &mut p.client, "file finalized", |_, c| {
-        c.chats.values().any(|chat| {
-            chat.messages
-                .iter()
-                .any(|m| !m.from_me && matches!(&m.content, MessageContent::File { .. }))
-        })
+    pump_pair(&mut p.host, &mut p.client, "file finalized", |_, c| {
+        received_file(c).is_some()
     })
     .await;
 
-    let (name, saved) = p
-        .client
-        .chats
-        .values()
-        .find_map(|chat| {
-            chat.messages.iter().rev().find_map(|m| match &m.content {
-                MessageContent::File { filename, path, .. } if !m.from_me => {
-                    Some((filename.clone(), path.clone()?))
-                }
-                _ => None,
-            })
-        })
-        .expect("a received file message with a path");
-
+    let (name, saved) = received_file(&p.client).expect("a received file message with a path");
     assert_eq!(name, "report.pdf");
     assert!(
         saved.starts_with(&downloads),
         "the file must land in the configured download dir, got {}",
         saved.display()
     );
-    // Byte-exact: a chunking bug corrupts rather than fails.
     assert_eq!(
         std::fs::read(&saved).expect("read saved file"),
         expected,
@@ -286,84 +193,46 @@ async fn a_file_crosses_the_wire_and_lands_after_the_user_accepts() {
 #[tokio::test]
 async fn auto_accept_saves_without_prompting() {
     let mut p = connected_pair(false, true).await;
-    let src_dir = tempfile::tempdir().expect("src dir");
-    let (path, expected) = write_test_file(src_dir.path(), "notes.txt", 8 * 1024);
-
+    let (_src, path, expected) = test_file("notes.txt", 8 * 1024);
     p.host
         .send_file(p.host_chat, path)
         .await
         .expect("send_file");
 
-    pump_until(&mut p.host, &mut p.client, "auto-accepted", |_, c| {
-        c.chats.values().any(|chat| {
-            chat.messages
-                .iter()
-                .any(|m| !m.from_me && matches!(&m.content, MessageContent::File { .. }))
-        })
+    pump_pair(&mut p.host, &mut p.client, "auto-accepted", |_, c| {
+        received_file(c).is_some()
     })
     .await;
-
-    let saved = p
-        .client
-        .chats
-        .values()
-        .find_map(|chat| {
-            chat.messages.iter().rev().find_map(|m| match &m.content {
-                MessageContent::File { path, .. } if !m.from_me => path.clone(),
-                _ => None,
-            })
-        })
-        .expect("a saved file");
+    let (_, saved) = received_file(&p.client).expect("a saved file");
     assert_eq!(std::fs::read(&saved).expect("read saved"), expected);
 }
 
-/// Declining deletes the spool and leaves the download directory untouched.
-///
-/// It must also emit `FileCancel`: a decline the sender never hears about still
-/// pulls the entire file across the wire, so the user's "no" only ever reached
-/// their own disk.
+/// Declining deletes the spool, saves nothing, and emits `FileCancel` — a
+/// decline the sender never hears about still pulls the whole file across.
 #[tokio::test]
 async fn declining_an_offer_saves_nothing_and_stops_the_sender() {
     let mut p = connected_pair(false, false).await;
-    let src_dir = tempfile::tempdir().expect("src dir");
-    let (path, _) = write_test_file(src_dir.path(), "unwanted.bin", 512 * 1024);
-
+    let (_src, path, _) = test_file("unwanted.bin", 512 * 1024);
     p.host
         .send_file(p.host_chat, path)
         .await
         .expect("send_file");
 
-    pump_until(&mut p.host, &mut p.client, "offer arrives", |_, c| {
-        c.active_transfers_snapshot()
-            .iter()
-            .any(|t| t.status == TransferStatus::AwaitingAcceptance)
+    pump_pair(&mut p.host, &mut p.client, "offer arrives", |_, c| {
+        awaiting(c).is_some()
     })
     .await;
-
-    let offer = p
-        .client
-        .active_transfers_snapshot()
-        .into_iter()
-        .find(|t| t.status == TransferStatus::AwaitingAcceptance)
-        .expect("an offer");
+    let offer = awaiting(&p.client).expect("an offer");
     p.client
         .reject_incoming_file(offer.id)
         .expect("decline the offer");
 
-    // The sender is told to stop.
-    pump_until(&mut p.host, &mut p.client, "sender stops", |h, _| {
-        h.active_transfers_snapshot().iter().all(|t| {
-            matches!(
-                t.status,
-                TransferStatus::Cancelled | TransferStatus::Failed(_) | TransferStatus::Completed
-            )
-        })
+    pump_pair(&mut p.host, &mut p.client, "sender stops", |h, _| {
+        settled(h)
     })
     .await;
 
-    // Nothing saved, and no orphaned spool left behind.
-    let downloads = p.client.config.download_dir.clone();
-    let (spools, finished) = dir_entries(&downloads);
+    let (spools, finished) = dir_entries(&p.client.config.download_dir);
     assert!(
         finished.is_empty(),
         "a declined file must not be saved, found {finished:?}"
@@ -381,25 +250,22 @@ async fn declining_an_offer_saves_nothing_and_stops_the_sender() {
     );
 }
 
-/// The sender cancels mid-flight. Neither side may be left with a transfer that
-/// still reads as in progress, and nothing may be saved.
+/// The sender cancels mid-flight; neither side may be left with a transfer
+/// that still reads as in progress.
 #[tokio::test]
 async fn the_sender_can_cancel_and_neither_side_is_left_hanging() {
     let mut p = connected_pair(false, true).await;
-    let src_dir = tempfile::tempdir().expect("src dir");
     // Large enough that the cancel lands before the stream finishes.
-    let (path, _) = write_test_file(src_dir.path(), "big.iso", 4 * 1024 * 1024);
-
+    let (_src, path, _) = test_file("big.iso", 4 * 1024 * 1024);
     p.host
         .send_file(p.host_chat, path)
         .await
         .expect("send_file");
 
-    pump_until(&mut p.host, &mut p.client, "transfer started", |h, _| {
+    pump_pair(&mut p.host, &mut p.client, "transfer started", |h, _| {
         !h.active_transfers_snapshot().is_empty()
     })
     .await;
-
     let outgoing = p
         .host
         .active_transfers_snapshot()
@@ -408,46 +274,27 @@ async fn the_sender_can_cancel_and_neither_side_is_left_hanging() {
         .expect("an outgoing transfer");
     p.host.cancel_transfer(outgoing.id);
 
-    pump_until(&mut p.host, &mut p.client, "both settle", |h, c| {
-        let settled = |m: &ChatManager| {
-            m.active_transfers_snapshot().iter().all(|t| {
-                matches!(
-                    t.status,
-                    TransferStatus::Cancelled
-                        | TransferStatus::Failed(_)
-                        | TransferStatus::Completed
-                )
-            })
-        };
+    pump_pair(&mut p.host, &mut p.client, "both settle", |h, c| {
         settled(h) && settled(c)
     })
     .await;
-
     assert!(
-        !p.host
-            .active_transfers_snapshot()
-            .iter()
-            .any(|t| t.status == TransferStatus::InProgress),
+        !in_progress(&p.host),
         "the sender must not be left with a running transfer"
     );
     assert!(
-        !p.client
-            .active_transfers_snapshot()
-            .iter()
-            .any(|t| t.status == TransferStatus::InProgress),
+        !in_progress(&p.client),
         "the receiver must not be left with a stuck progress row"
     );
 }
 
-/// One outgoing transfer per conversation. `FileChunk` carries no transfer id,
-/// so two concurrent sends interleave into whichever spool the receiver has open
-/// and corrupt both files — the guard is what makes the wire format safe.
+/// One outgoing transfer per conversation: `FileChunk` carries no transfer id,
+/// so two concurrent sends would interleave and corrupt both files.
 #[tokio::test]
 async fn a_second_concurrent_send_on_one_conversation_is_refused() {
     let mut p = connected_pair(false, true).await;
-    let src_dir = tempfile::tempdir().expect("src dir");
-    let (first, _) = write_test_file(src_dir.path(), "one.bin", 2 * 1024 * 1024);
-    let (second, _) = write_test_file(src_dir.path(), "two.bin", 2 * 1024 * 1024);
+    let (_src1, first, _) = test_file("one.bin", 2 * 1024 * 1024);
+    let (_src2, second, _) = test_file("two.bin", 2 * 1024 * 1024);
 
     p.host
         .send_file(p.host_chat, first)
@@ -471,9 +318,7 @@ async fn a_second_concurrent_send_on_one_conversation_is_refused() {
 async fn sending_a_file_with_no_session_is_an_error() {
     let dir = tempfile::tempdir().expect("dir");
     let mut mgr = manager_in(dir.path(), false);
-    let src_dir = tempfile::tempdir().expect("src dir");
-    let (path, _) = write_test_file(src_dir.path(), "orphan.txt", 16);
-
+    let (_src, path, _) = test_file("orphan.txt", 16);
     let err = mgr
         .send_file(Uuid::new_v4(), path)
         .await
@@ -481,33 +326,33 @@ async fn sending_a_file_with_no_session_is_an_error() {
     assert!(!err.to_string().is_empty());
 }
 
-/// A second file sent while the first is still waiting for the user's decision
-/// must not touch the first.
-///
-/// `FileChunk` carries no transfer id, so the receiver routes chunks to the
-/// transfer currently streaming. An offer held for acceptance used to count as
-/// streaming even after its `FileEnd`, so the second offer was refused and its
-/// chunks were written into the *first* file's spool — overflowing its declared
-/// size, failing it, and deleting it.
+/// A second offer while the first awaits a decision must not touch the first.
+/// Chunks route to the transfer *streaming*; a held offer used to count as
+/// streaming after its `FileEnd`, so the second file's chunks overflowed the
+/// first one's spool and deleted it.
 #[tokio::test]
 async fn a_second_offer_while_the_first_awaits_acceptance_leaves_both_intact() {
     let mut p = connected_pair(false, false).await;
-    let src_dir = tempfile::tempdir().expect("src dir");
-    let (first, first_bytes) = write_test_file(src_dir.path(), "first.bin", 200 * 1024);
-    let (second, second_bytes) = write_test_file(src_dir.path(), "second.bin", 150 * 1024);
+    let (_src1, first, first_bytes) = test_file("first.bin", 200 * 1024);
+    let (_src2, second, second_bytes) = test_file("second.bin", 150 * 1024);
+    let held = |c: &ChatManager| {
+        c.active_transfers_snapshot()
+            .into_iter()
+            .filter(|t| t.status == TransferStatus::AwaitingAcceptance && t.received == t.size)
+            .count()
+    };
 
     p.host
         .send_file(p.host_chat, first)
         .await
         .expect("send first");
     // The sender finishes; the receiver holds the complete file, undecided.
-    pump_until(&mut p.host, &mut p.client, "first held", |h, c| {
-        transfers_for(h, p.host_chat)
+    let host_chat = p.host_chat;
+    pump_pair(&mut p.host, &mut p.client, "first held", |h, c| {
+        h.active_transfers_snapshot()
             .iter()
-            .any(|t| t.status == TransferStatus::Completed)
-            && c.active_transfers_snapshot()
-                .iter()
-                .any(|t| t.status == TransferStatus::AwaitingAcceptance && t.received == t.size)
+            .any(|t| t.chat_id == host_chat && t.status == TransferStatus::Completed)
+            && held(c) >= 1
     })
     .await;
 
@@ -515,21 +360,17 @@ async fn a_second_offer_while_the_first_awaits_acceptance_leaves_both_intact() {
         .send_file(p.host_chat, second)
         .await
         .expect("send second");
-    pump_until(&mut p.host, &mut p.client, "second held too", |_, c| {
-        let held: Vec<_> = c
-            .active_transfers_snapshot()
-            .into_iter()
-            .filter(|t| t.status == TransferStatus::AwaitingAcceptance && t.received == t.size)
-            .collect();
-        held.len() == 2
+    pump_pair(&mut p.host, &mut p.client, "second held too", |_, c| {
+        held(c) == 2
     })
     .await;
 
     for offer in p.client.active_transfers_snapshot() {
         p.client.accept_incoming_file(offer.id).expect("accept");
     }
-    pump_until(&mut p.host, &mut p.client, "both saved", |_, c| {
-        c.chats[&p.client_chat]
+    let client_chat = p.client_chat;
+    pump_pair(&mut p.host, &mut p.client, "both saved", |_, c| {
+        c.chats[&client_chat]
             .messages
             .iter()
             .filter(|m| !m.from_me && matches!(m.content, MessageContent::File { .. }))
