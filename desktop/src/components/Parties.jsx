@@ -213,7 +213,14 @@ export function Parties() {
   const [cid, setCid] = useState(null);      // active channel
   const [dm, setDm] = useState(null);        // active DM peer (member id) — takes precedence
   const [msgs, setMsgs] = useState([]);
-  const [draft, setDraft] = useState("");
+  // One draft per thread (UI-03). A single shared draft followed the user from
+  // a private DM into a public channel, where Enter posted it to the whole
+  // community — the P2P composer clears on switch for exactly this reason.
+  const [drafts, setDrafts] = useState({});
+  const thread = `${sid}|${dm ? `dm:${dm}` : cid}`;
+  const draft = drafts[thread] || "";
+  const setDraftIn = (key, text) => setDrafts((d) => ({ ...d, [key]: text }));
+  const setDraft = (text) => setDraftIn(thread, text);
   const [newChannel, setNewChannel] = useState("");
   const [adding, setAdding] = useState(false);       // show the join form to add another community
   const [prefill, setPrefill] = useState(null);      // prefill for the join form (rejoin flows)
@@ -239,12 +246,14 @@ export function Parties() {
       // Unread bookkeeping: the thread on screen is always read; badge the rest.
       const srv = list.find((s) => s.id === sid);
       if (srv) {
-        if (dm) markRead(sid, `dm-${dm}`, srv.members.find((m) => m.id === dm)?.dm_messages);
-        else if (cid) markRead(sid, cid, srv.channels.find((c) => c.id === cid)?.messages);
+        if (dm) markRead(srv, `dm-${dm}`, srv.members.find((m) => m.id === dm)?.dm_messages);
+        else if (cid) markRead(srv, cid, srv.channels.find((c) => c.id === cid)?.messages);
       }
-      // Forget marks for communities the user has left, so the persisted store
-      // does not grow without bound as servers come and go.
-      pruneTo(list);
+      // Forget marks for communities the user has left — judged against the
+      // saved list, which still names a community that has not rejoined yet.
+      // If it cannot be read, keep everything: losing marks is the worse error.
+      const saved = await api.partySaved().catch(() => null);
+      if (Array.isArray(saved)) pruneTo([...list, ...saved]);
       setUnread(computeUnread(list).byKey);
       setServers(list);
     } catch { /* ignore */ }
@@ -255,15 +264,15 @@ export function Parties() {
   // thread just left can resolve last; writing it would show that thread's
   // messages — a private channel's, say — under this one's name (UI-04).
   const threadRef = useRef(null);
-  threadRef.current = `${sid}|${dm ? `dm:${dm}` : cid}`;
+  threadRef.current = thread;
   const loadMsgs = useCallback(async () => {
     if (!sid) { setMsgs([]); return; }
-    const thread = `${sid}|${dm ? `dm:${dm}` : cid}`;
+    const wanted = `${sid}|${dm ? `dm:${dm}` : cid}`;
     try {
       let next = [];
       if (dm) next = await api.partyDmHistory(sid, dm);
       else if (cid) next = await api.partyHistory(sid, cid);
-      if (threadRef.current === thread) setMsgs(next);
+      if (threadRef.current === wanted) setMsgs(next);
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
 
@@ -340,12 +349,15 @@ export function Parties() {
   async function send() {
     const text = draft.trim();
     if (!text || !server) return;
-    setDraft("");
+    // A refusal can arrive after the user has moved on: the text goes back to
+    // the thread it was written for, not whichever one is open by then.
+    const from = thread;
+    setDraftIn(from, "");
     try {
       if (dm) await api.partySendDm(server.id, dm, text);
       else if (cid) await api.partyPost(server.id, cid, text);
       loadMsgs();
-    } catch (e) { setDraft(text); toast(friendlyError(e), "error"); }
+    } catch (e) { setDraftIn(from, text); toast(friendlyError(e), "error"); }
   }
 
   // Share a file into the active channel or DM. The native picker opens in the
@@ -526,7 +538,7 @@ export function Parties() {
                 title={c.kind === "public" ? `#${c.name}` : `#${c.name} — ${c.kind}`}
                 onClick={() => {
                   setView("chat"); setDm(null); setCid(c.id);
-                  markRead(server.id, c.id, c.messages);
+                  markRead(server, c.id, c.messages);
                 }}>
                 <span className="party-hash"><Icon name={kindIcon(c.kind)} size={12} /></span> {c.name}
                 {unread[`${server.id}|${c.id}`] > 0 && (
@@ -573,7 +585,7 @@ export function Parties() {
                 onClick={() => {
                   if (m.is_me) return;
                   setView("chat"); setDm(m.id);
-                  markRead(server.id, `dm-${m.id}`, m.dm_messages);
+                  markRead(server, `dm-${m.id}`, m.dm_messages);
                 }}
                 title={m.is_me ? "You" : `Direct message ${m.username}`}>
                 <span className={cx("party-dot", m.online ? "is-online" : "is-offline")} />

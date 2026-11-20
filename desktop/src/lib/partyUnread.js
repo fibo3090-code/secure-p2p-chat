@@ -2,8 +2,14 @@
 // total) and the Parties pane (per-channel / per-DM badges, mark-read). One
 // module-level store so the two components never disagree.
 //
-// Keys: `${serverId}|${channelId}` for channels, `${serverId}|dm-${memberId}`
-// for DM threads.
+// Stored keys: `${anchor}|${channelId}` for channels, `${anchor}|dm-${memberId}`
+// for DM threads, where the anchor is the server's pinned **fingerprint**. The
+// `id` a server has in the list is minted fresh on every join, so marks keyed by
+// it never survived a restart or rejoin: the whole history came back badged, and
+// the old marks were pruned as belonging to a server that no longer existed
+// (UI-05). Channel and member ids are the server's own and are durable. The
+// `byKey` map `computeUnread` returns is keyed by the live `id`, which is what
+// the panes look threads up by.
 //
 // The read marks are **persisted**. A community server holds durable history and
 // replays it on rejoin, so an in-memory store meant every restart re-seeded the
@@ -61,20 +67,32 @@ function persist() {
   write(STORAGE_KEY, Object.fromEntries(seen));
 }
 
+/** What a server's marks are stored under: its fingerprint, or its id if it has none. */
+function anchorOf(server) {
+  return String(server?.fingerprint || server?.id);
+}
+
 function threadKeys(server) {
   const keys = [];
+  const anchor = anchorOf(server);
   for (const c of server.channels || []) {
-    keys.push({ key: `${server.id}|${c.id}`, count: c.messages ?? 0 });
+    keys.push({ shown: `${server.id}|${c.id}`, stored: `${anchor}|${c.id}`, count: c.messages ?? 0 });
   }
   for (const m of server.members || []) {
-    if (!m.is_me) keys.push({ key: `${server.id}|dm-${m.id}`, count: m.dm_messages ?? 0 });
+    if (!m.is_me) {
+      keys.push({
+        shown: `${server.id}|dm-${m.id}`,
+        stored: `${anchor}|dm-${m.id}`,
+        count: m.dm_messages ?? 0,
+      });
+    }
   }
   return keys;
 }
 
-// Mark one thread fully read at `count` messages.
-export function markRead(serverId, threadId, count) {
-  const key = `${serverId}|${threadId}`;
+// Mark one thread of `server` fully read at `count` messages.
+export function markRead(server, threadId, count) {
+  const key = `${anchorOf(server)}|${threadId}`;
   const n = Number.isInteger(count) && count >= 0 ? count : 0;
   if (seen.get(key) === n) return;
   seen.set(key, n);
@@ -91,19 +109,22 @@ export function computeUnread(servers) {
   let total = 0;
   const byKey = {};
   for (const s of servers || []) {
-    for (const { key, count } of threadKeys(s)) {
-      const n = Math.max(0, count - (seen.get(key) ?? 0));
-      if (n > 0) byKey[key] = n;
+    for (const { shown, stored, count } of threadKeys(s)) {
+      const n = Math.max(0, count - (seen.get(stored) ?? 0));
+      if (n > 0) byKey[shown] = n;
       total += n;
     }
   }
   return { total, byKey };
 }
 
-// Drop marks for servers the user has left, so storage does not grow without
-// bound as communities come and go.
-export function pruneTo(servers) {
-  const live = new Set((servers || []).map((s) => String(s.id)));
+// Drop marks for communities the user has left, so storage does not grow
+// without bound as they come and go. `keep` must name every community the user
+// still has — the *saved* list, not only the ones connected right now: pruning
+// against the live list wiped the marks of every community not yet rejoined
+// after a restart.
+export function pruneTo(keep) {
+  const live = new Set((keep || []).map(anchorOf));
   let changed = false;
   for (const key of [...seen.keys()]) {
     if (!live.has(key.split("|")[0])) {

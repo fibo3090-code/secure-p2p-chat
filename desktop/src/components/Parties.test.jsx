@@ -169,6 +169,28 @@ describe("Parties — a joined community", () => {
     expect(await screen.findByText("welcome")).toBeTruthy();
   });
 
+  // UI-03: one draft per thread. A shared draft followed the user from a
+  // private DM into a public channel, and Enter posted it to everyone.
+  it("keeps a DM's unsent text in the DM, never in a channel", async () => {
+    const api = installApi({
+      partyList: [joinedServer], partySaved: [], partyHistory: [], partyDmHistory: [],
+    });
+    render(<Parties />);
+    await screen.findByLabelText(/^Message # general/);
+    await userEvent.click(screen.getByTitle("Direct message nova"));
+    const dmBox = await screen.findByLabelText(/^Message ✉ nova/);
+    await userEvent.type(dmBox, "only for nova");
+
+    await userEvent.click(screen.getByTitle("#general"));
+    const channelBox = await screen.findByLabelText(/^Message # general/);
+    expect(channelBox.value).toBe("");
+    await userEvent.type(channelBox, "{Enter}");
+    expect(api.partyPost).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByTitle("Direct message nova"));
+    expect((await screen.findByLabelText(/^Message ✉ nova/)).value).toBe("only for nova");
+  });
+
   // UI-04: every selection change and every `party-updated` tick starts a
   // history fetch, and a slower one for the channel just left could resolve
   // last — rendering one thread's messages (a private channel's, say) under
