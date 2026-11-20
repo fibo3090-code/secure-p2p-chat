@@ -2,7 +2,8 @@
 
 Every finding from the thirteen area reports, sorted by severity. "Status" is the auditor's
 (VERIFIED = traced through the code; SUSPECTED = plausible, needs confirmation); `Fixed` marks
-findings already resolved since the audit. Effort: S < 1 h, M ≈ half a day, L = days.
+findings already resolved since the audit, `Partly fixed` ones where part of the problem remains
+(the README's §9 says which part). Effort: S < 1 h, M ≈ half a day, L = days.
 Duplicates across reports are kept here (each report stands alone); the deduplicated,
 prioritised view is in [README.md](README.md).
 
@@ -27,7 +28,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-03 | High | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No way to delete local data; documented "Delete Everything" and uninstaller cleanup do not exist; uninstall leaves identity and history behind |
 | JOURNEY-04 | High | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Users are told everything is end-to-end encrypted with no server copy, but community operators read all community traffic in plaintext |
 | JOURNEY-05 | High | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: `tauri-action` is given `tagName` with a read-only token (pipeline break or attestation bypass) |
-| NET-01 | High | VERIFIED | S | [02-network](reports/02-network.md) | Transport frames can be reflected back to their sender and are accepted as the peer's |
+| NET-01 | High | Fixed | S | [02-network](reports/02-network.md) | Transport frames can be reflected back to their sender and are accepted as the peer's |
 | NET-02 | High | VERIFIED | M | [02-network](reports/02-network.md) | The one-shot host listener lets one TCP connection make the host unreachable, repeatedly |
 | PERF-01 | High | VERIFIED | M | [11-performance](reports/11-performance.md) | Desktop refresh: full conversation over IPC, then O(n) Intl formatting in JS, at 4 Hz during transfers |
 | PERF-02 | High | VERIFIED | M | [11-performance](reports/11-performance.md) | One maximum-size peer text (about 24 MiB) is re-processed on every frame, refresh and save |
@@ -52,8 +53,8 @@ prioritised view is in [README.md](README.md).
 | TUI-06 | High | VERIFIED | S | [05-tui](reports/05-tui.md) | The terminal is left in raw mode on the alternate screen on startup errors and panics, and the error message is invisible |
 | TUI-07 | High | VERIFIED | L | [05-tui](reports/05-tui.md) | Community (Party) messages, DMs, the audit log and notices are never displayed; the TUI can post but never read |
 | TUI-08 | High | VERIFIED | M | [05-tui](reports/05-tui.md) | Community connect and trust block the whole UI on a TCP connect with no timeout |
-| UI-01 | High | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | Community first-join SAS check does not cover the connection that receives the credentials |
-| UI-02 | High | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | A late conversation fetch can show A while the composer sends to B |
+| UI-01 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Community first-join SAS check does not cover the connection that receives the credentials |
+| UI-02 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | A late conversation fetch can show A while the composer sends to B |
 | APP-02 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | `send_file` awaits the bounded file lane while the caller holds the `ChatManager` lock |
 | APP-03 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | A received file whose finalize fails leaves its spool, and possibly an empty placeholder, in Downloads |
 | APP-04 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | A local disk-write error on receive does not tell the sender to stop |
@@ -66,7 +67,7 @@ prioritised view is in [README.md](README.md).
 | CRYPTO-03 | Medium | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Both directions share one key and one AAD, and decrypt never checks the role bit, so frames can be reflected |
 | CRYPTO-04 | Medium | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
 | CRYPTO-05 | Medium | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The connection password is sent to an unverified host |
-| CRYPTO-06 | Medium | SUSPECTED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A second rekey can overwrite the retained old key while old-key frames are still in flight |
+| CRYPTO-06 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A second rekey can overwrite the retained old key while old-key frames are still in flight |
 | DOC-08 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
 | DOC-09 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The USER_GUIDE TUI command reference omits about 16 commands |
 | DOC-10 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | USER_GUIDE describes community pinning wrongly, and the TUI never pins |
@@ -101,7 +102,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-11 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | `chat-p2p://` invite links are not registered with the OS, and the IPs they embed are not disclosed |
 | JOURNEY-12 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unaccepted file offers are spooled into the user's Downloads folder and orphaned after a crash |
 | JOURNEY-14 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unsigned installers ship with no install walkthrough |
-| NET-03 | Medium | SUSPECTED | S | [02-network](reports/02-network.md) | Two host rekeys can happen before the client switches, after which old-key frames are undecryptable |
+| NET-03 | Medium | Fixed | S | [02-network](reports/02-network.md) | Two host rekeys can happen before the client switches, after which old-key frames are undecryptable |
 | NET-04 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | No `TCP_NODELAY` and a two-write frame cause delayed-ACK stalls on every small message |
 | NET-05 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | Unauthenticated peers can create unlimited TOFU prompts, 30-minute sessions and junk conversations |
 | NET-06 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | A relay host that disconnects while waiting keeps its token slot for the full 5 minutes |
@@ -145,7 +146,7 @@ prioritised view is in [README.md](README.md).
 | SRV-16 | Medium | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Per-IP connection limit silently refuses groups behind one NAT; password guessing scales with source addresses |
 | SUPPLY-01 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The process gap: new RustSec advisories break unrelated Rust PRs, frontend PRs merge green past them, and the daily audit only files an issue |
 | SUPPLY-02 | Medium | SUSPECTED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | tauri-action is given `tagName`/`releaseName`, which makes it try to create or upload to the GitHub release, contradicting the attest-then-publish design |
-| TAURI-02 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `set_password` re-keys an unlocked, already-protected identity without the current password; `unlock` is re-entrant |
+| TAURI-02 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `set_password` re-keys an unlocked, already-protected identity without the current password; `unlock` is re-entrant |
 | TAURI-03 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | One `connection_password` serves both hosting and dialling: the host password leaks to dialled peers and is lost on auto-rehost |
 | TAURI-04 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | `party_join` holds the party mutex across an untimed TCP connect and handshake, freezing the whole poll loop |
 | TAURI-05 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | No single-instance guard: two app instances race on one identity, history file and port |
@@ -167,21 +168,21 @@ prioritised view is in [README.md](README.md).
 | TUI-19 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Settings that do nothing in the TUI, and features missing compared with the desktop app |
 | TUI-20 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The composer and command box do not scroll, and cursor placement ignores soft wrap |
 | TUI-21 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Colours are hard-coded: security text is white (invisible on light themes), no `NO_COLOR`, RGB safety grid |
-| TUI-22 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | Unit tests touch the developer's real data directory; the TUI has no data-dir override |
+| TUI-22 | Medium | Partly fixed | S | [05-tui](reports/05-tui.md) | Unit tests touch the developer's real data directory; the TUI has no data-dir override |
 | TUI-23 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | `:invite` advertises the configured listen port, not the port actually being hosted |
 | TUI-24 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | No log output anywhere (relay server is silent; `RUST_LOG` has no visible effect); docs reference a log view that does not exist |
-| UI-03 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | Communities composer draft is shared across channels, DMs and servers |
-| UI-04 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | Stale Communities history responses can render under the wrong channel header |
-| UI-05 | Medium | VERIFIED | S/M | [07-react-frontend](reports/07-react-frontend.md) | Community read marks never survive a restart or rejoin |
+| UI-03 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Communities composer draft is shared across channels, DMs and servers |
+| UI-04 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Stale Communities history responses can render under the wrong channel header |
+| UI-05 | Medium | Fixed | S/M | [07-react-frontend](reports/07-react-frontend.md) | Community read marks never survive a restart or rejoin |
 | UI-06 | Medium | VERIFIED | M | [07-react-frontend](reports/07-react-frontend.md) | Whole-conversation refetch on every UI tick, up to 4 Hz during transfers |
 | UI-07 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | The invite link is fetched once and cached for the whole session |
-| UI-08 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | Modal focus management overrides every `autoFocus` inside a dialog |
+| UI-08 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Modal focus management overrides every `autoFocus` inside a dialog |
 | UI-09 | Medium | SUSPECTED | S | [07-react-frontend](reports/07-react-frontend.md) | Toast live regions are `display:none` when empty, so the first announcement may be lost |
 | UI-10 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | `--faint` text fails WCAG AA contrast in every theme |
-| UI-11 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | Peer-supplied text is not bidi-isolated; linked URLs can display spoofed |
+| UI-11 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Peer-supplied text is not bidi-isolated; linked URLs can display spoofed |
 | UI-12 | Medium | SUSPECTED | M | [07-react-frontend](reports/07-react-frontend.md) | The file-permission dialog does not reflect the current grant, so Save can revoke rights |
 | QUAL-14 | Low/Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Logic duplicated between the TUI and the desktop shell, already drifting |
-| QUAL-19 | Low/Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Test fixtures copy-pasted across test binaries; port allocation is racy |
+| QUAL-19 | Low/Medium | Partly fixed | M | [12-code-quality](reports/12-code-quality.md) | Test fixtures copy-pasted across test binaries; port allocation is racy |
 | APP-11 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | After a Party disconnect, unconfirmed sends stay on screen and upload offers stay in memory |
 | APP-12 | Low | VERIFIED | M | [04-client-core](reports/04-client-core.md) | Messages typed during the handshake return `Ok` and can vanish without an error |
 | APP-15 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | An unsigned (v1) invite can silently overwrite an existing, even Verified, contact's address and name |
@@ -194,7 +195,7 @@ prioritised view is in [README.md](README.md).
 | APP-22 | Low | VERIFIED | M | [04-client-core](reports/04-client-core.md) | O(n) scans per event and whole-history clones per save |
 | APP-23 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Concurrent downloads of the same Party file collide |
 | CRYPTO-07 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Signature-scheme negotiation is not covered by the transcript or signatures |
-| CRYPTO-08 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A malformed `nonce` in `identity.json` panics during unlock |
+| CRYPTO-08 | Low | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A malformed `nonce` in `identity.json` panics during unlock |
 | CRYPTO-09 | Low | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The history file has no AAD, no anti-rollback, and random nonces under one fixed key |
 | CRYPTO-10 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Gaps in key-material hygiene |
 | CRYPTO-11 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Packets before authentication may be up to 8 MiB |
@@ -214,9 +215,9 @@ prioritised view is in [README.md](README.md).
 | DOC-35 | Low | VERIFIED | S | [09-documentation](reports/09-documentation.md) | Bug-report template is out of date |
 | DOC-36 | Low | VERIFIED | S | [09-documentation](reports/09-documentation.md) | CHANGELOG: security fixes have sat unreleased for 2.5 months |
 | DOC-37 | Low | VERIFIED | S | [09-documentation](reports/09-documentation.md) | Contributor docs miss per-OS setup, fuzzing and CodeQL |
-| DX-12 | Low | VERIFIED | M | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Eighteen client integration-test crates: about 4.1 GB and 17 extra links per test build |
+| DX-12 | Low | Fixed | M | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Eighteen client integration-test crates: about 4.1 GB and 17 extra links per test build |
 | DX-13 | Low | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Duplicated 20-line apt block ×5 in `ci.yml` and ×1 in `release.yml`, already drifting |
-| DX-14 | Low | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Test hooks leak process-global environment variables and are compiled into release builds; the documented `cargo test` fallback relies on luck |
+| DX-14 | Low | Fixed | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Test hooks leak process-global environment variables and are compiled into release builds; the documented `cargo test` fallback relies on luck |
 | DX-15 | Low | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `run-codeql-local.ps1` does not reproduce CI's CodeQL |
 | DX-16 | Low | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Stale or misleading comments that steer build decisions |
 | JOURNEY-13 | Low | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The UPnP / NAT-PMP mapping is not removed when the app exits |
@@ -255,7 +256,7 @@ prioritised view is in [README.md](README.md).
 | QUAL-16 | Low | SUSPECTED | S | [12-code-quality](reports/12-code-quality.md) | `#![allow(dead_code)]` on the whole server state module is stale |
 | QUAL-17 | Low | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Typestate expressed as `Option` plus `expect` |
 | QUAL-18 | Low | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | Logging of identifying metadata at info and debug, with debug on by default |
-| QUAL-20 | Low | VERIFIED | S/M | [12-code-quality](reports/12-code-quality.md) | Synchronization by sleeping, absence checks bounded by time, and an empty test |
+| QUAL-20 | Low | Fixed | S/M | [12-code-quality](reports/12-code-quality.md) | Synchronization by sleeping, absence checks bounded by time, and an empty test |
 | QUAL-21 | Low | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | Persisted config fields with no consumer; a security-relevant knob nobody can set |
 | QUAL-22 | Low | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | Diagnostics and crash dir hard-coded to the TUI's ProjectDirs |
 | QUAL-24 | Low | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | Cargo manifests: unused dependencies, broad features, stale metadata |
@@ -325,7 +326,7 @@ prioritised view is in [README.md](README.md).
 | UI-33 | Low | SUSPECTED | S | [07-react-frontend](reports/07-react-frontend.md) | The safety grid is case-sensitive over the hex string |
 | APP-24 | Info | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Dead code and dead fields |
 | CRYPTO-15 | Info | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | The Ed25519 proof path adds work and no security while the identity is still RSA |
-| CRYPTO-17 | Info | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | Security-critical paths with no tests |
+| CRYPTO-17 | Info | Partly fixed | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | Security-critical paths with no tests |
 | CRYPTO-18 | Info | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Minor protocol and encoding nits |
 | DOC-38 | Info | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The project is called five different things |
 | DOC-39 | Info | VERIFIED | S | [09-documentation](reports/09-documentation.md) | Public constants in `core` have no rustdoc |
@@ -335,7 +336,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-23 | Info | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Stale or unused packaging bits |
 | NET-20 | Info | VERIFIED | S | [02-network](reports/02-network.md) | Relay control frames accept trailing bytes, unlike every other bincode frame |
 | NET-21 | Info | VERIFIED | S/M | [02-network](reports/02-network.md) | Per-frame copies and the bridge's small buffers |
-| NET-22 | Info | VERIFIED | ? | [02-network](reports/02-network.md) | Test gaps for these paths |
+| NET-22 | Info | Partly fixed | ? | [02-network](reports/02-network.md) | Test gaps for these paths |
 | PRIV-12 | Info | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Stale privacy comment in `Config` about mDNS |
 | QUAL-23 | Info | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | `expect` on the AEAD nonce counter |
 | QUAL-26 | Info | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | No doctests while CI runs `cargo test --doc` |
@@ -348,11 +349,11 @@ prioritised view is in [README.md](README.md).
 | TAURI-24 | Info | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Stale comments and an unused command |
 | TAURI-25 | Info | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The invoke-contract test cannot see Tauri's camelCase mapping or nested struct fields |
 | TAURI-26 | Info | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | No updater and no OS code signing |
-| TAURI-27 | Info | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Command test coverage gaps |
+| TAURI-27 | Info | Partly fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Command test coverage gaps |
 | TAURI-28 | Info | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The community pin is keyed by the raw address string |
 | TAURI-29 | Info | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Optional hardening not enabled |
 | TUI-37 | Info | VERIFIED | S | [05-tui](reports/05-tui.md) | Diagnostics bundle details |
 | UI-34 | Info | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | Set-password explanation path is unreachable |
 | UI-35 | Info | VERIFIED | L | [07-react-frontend](reports/07-react-frontend.md) | i18n readiness |
 | UI-36 | Info | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | No system-theme default |
-| UI-37 | Info | VERIFIED | M | [07-react-frontend](reports/07-react-frontend.md) | Test coverage gaps for the bugs above |
+| UI-37 | Info | Partly fixed | M | [07-react-frontend](reports/07-react-frontend.md) | Test coverage gaps for the bugs above |

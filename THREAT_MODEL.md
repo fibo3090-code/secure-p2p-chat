@@ -192,6 +192,13 @@ Limitation:
 - no invite revocation before the 30-day expiry (signed invites are rejected at import once older than `INVITE_MAX_AGE_SECS`; legacy unsigned v1 links carry no timestamp and never expire)
 - no hardware-backed identity support
 - no post-quantum protection
+- an invite's fingerprint is not compared with the key that answers when the
+  contact is first dialled: a different key gets an ordinary first-use
+  safety-code prompt, not a mismatch warning, so the safety code is the only
+  defence there (audit CRYPTO-04, open)
+- no rollback protection for the history file: anyone able to write the data
+  directory can put back an older `history.json.enc`, which loads normally and
+  restores revoked trust and lifted blocks (audit CRYPTO-09, open)
 
 ## Planning References
 

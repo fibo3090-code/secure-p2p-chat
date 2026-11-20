@@ -20,7 +20,7 @@ the area report for whatever you pick up → [findings-index.md](findings-index.
 | Area reports | 13 (+1 external) |
 | Findings | 348 (3 Critical, 43 High, 126 Medium, 143 Low, 33 Info) |
 | Status | ~95 % VERIFIED by tracing the code; the rest SUSPECTED and labelled |
-| Already fixed | CRYPTO-01 and QUAL-01 (see §1) |
+| Already fixed | CRYPTO-01 and QUAL-01 (see §1); 15 more and 6 in part after the test-suite audit (see §9) |
 | Not covered | No dynamic testing of installers, native dialogs, real NATs, or Windows/macOS behaviour; nothing here proves the absence of other defects |
 
 The numbers overcount: the same root cause is often reported by several
@@ -208,6 +208,63 @@ drifted (QUAL-10); no `[workspace.lints]` (QUAL-27).
 | 6 — performance | PERF-01…PERF-07. | ~1 week |
 | 7 — docs | Correct the seven High doc findings, then restructure by audience; shrink CLAUDE.md. | ~2 days |
 | 8 — quality | The code-quality roadmap (QUAL-03/04/05/08/09/10/27), TUI split leftovers. | ongoing |
+
+## 9. Test-suite audit (2026-11-20) — bugs found and their status
+
+The whole test suite was audited against this report (branch
+`claude/sharp-cerf-5wz80l`). Every finding below was **reproduced by a test that
+failed before the fix** and passes after it, unless it says otherwise. The test
+named is the regression guard: if it is deleted or weakened, the bug can return
+unnoticed.
+
+### Fixed
+
+| ID | Bug | How it showed | Regression test |
+|---|---|---|---|
+| CRYPTO-06 / NET-03 | With traffic crossing in both directions, the host started a second key rotation before the peer had switched to the first. Only one previous key is kept, so frames the peer sent under it became undecryptable and the session ended on "Decryption failed!" — two people messaging or sending files at once lost the connection. `rekey_due` now waits until a frame under the current key has arrived (`prev_cipher` empty). | Failed 5 runs out of 5 (500 messages each way, ~10 rotations). | `session_e2e::several_rekeys_under_crossing_traffic_lose_nothing`; the gate itself: `session::tests::a_rekey_waits_until_the_peer_has_switched_to_the_last_one` (checked to fail with the gate reverted) |
+| CRYPTO-08 | A nonce of the wrong length in `identity.json` reached `GenericArray::from_slice`, which asserts, so a damaged file **panicked** the unlock instead of reporting an unreadable identity. The length is checked first now. | Panicked on the first case (empty nonce). | `identity::tests::a_malformed_nonce_or_salt_is_an_error_not_a_panic` |
+| TAURI-02 | `set_password` on an unlocked app re-wrapped `identity.json` under any new password without asking for the current one — anything able to invoke a command could lock the owner out of their identity and history. A second `unlock` reloaded the history over the live state and dropped conversations not yet saved. `set_password` is now first setup only; `unlock` on an unlocked app is a no-op. | Both failed (re-key accepted; unsaved conversation dropped). | `tests::set_password_cannot_rekey_an_identity_that_already_has_one`, `tests::a_second_unlock_does_not_reload_history_over_unsaved_state` (desktop bridge) |
+| UI-03 | Communities shared one composer draft across every channel, DM and server: text typed to one member stayed in the box after switching to a public channel, and Enter posted it to everyone. Drafts are per thread; a refused send returns to the thread it was written for. | Failed. | `Parties.test.jsx` › keeps a DM's unsent text in the DM, never in a channel |
+| UI-04 | A slow history response for the channel just left replaced the current one's messages, showing one thread's history under another's name. Responses for a thread no longer open are dropped. | Failed. | `Parties.test.jsx` › never shows a thread's history under another thread's header |
+| UI-05 | Community read marks were keyed by the session id minted on every join, so after a restart every channel came back fully badged and the old marks were pruned; pruning ran against the live list and wiped communities not yet rejoined. Marks are anchored on the pinned fingerprint and pruned against the saved list. The old persistence test "restarted" with the same id, which is why it never caught this. | Failed. | `partyUnread.test.js` › survives a restart, which gives the community a new id; › keeps the marks of a saved community that has not rejoined yet |
+| UI-08 | The Modal took focus back from any `autoFocus` field, so every text dialog needed an extra Tab; and it captured the element to return focus to *after* the field had focus, so closing returned focus to nothing. | Failed. | `ui.test.jsx` › leaves focus on an autoFocus field and returns it to the opener on close; › returns focus to the opener when the dialog is mounted already open |
+| UI-11 | A right-to-left override (or other invisible formatting character) inside a URL in a peer's message made the link display as a different address from the one it opened. Links end at the first `\p{Cf}` character; names and message text are bidi-isolated in CSS. | Failed for RLO, RLI and zero-width space. | `Messages.test.jsx` › cuts a link at a RLO / RLI / zero-width space |
+| TUI-22 | Every TUI test read the developer's real `~/.local/share/EncryptedMessenger` and could write a `history.json.enc` there under a throwaway key that the real client then cannot decrypt (this test machine had one from earlier runs). Tests now use `TuiApp::new_in(tempdir)`. | Observed on disk. Verified by comparing the real directory before and after a full run. | all TUI tests (`tui::app::tests`, `tui::ui::tests`, `client/tests/it/tui.rs`) |
+| DX-14 | The `P2PEM_TEST_*` timer overrides were read by release binaries too, so the environment could shorten a real session's idle timeout; the test that sets them never restored them. Debug builds only now, restored on drop. A flaky test now fails CI (`flaky-result = "fail"`). | Read in code. | `session_e2e::idle_session_survives_past_the_idle_timeout` |
+| QUAL-20 | Startup by sleeping (relay), an upper-bound-only backpressure test that passed when the reader never ran, absence checks that passed by waiting, and an empty test. | Read in code. | relay tests via `serve_relay(listener, …)`; `outgoing_stream_is_backpressured_by_the_bounded_lane`; `client/tests/it/party.rs` (`settle` barrier) |
+| DX-12 | 21 client integration-test binaries, each linking the whole tree. Now one (`client/tests/it/`). | Measured. | — |
+| UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
+
+### Partly fixed
+
+| ID | Done | Still open |
+|---|---|---|
+| QUAL-19 | One shared client harness; hosts and relays bind port 0 in tests. | `punch.rs` tests still pick a free port and rebind — a hole punch needs a chosen port, so the race is inherent there. No cached RSA test keys (nextest runs a process per test, so a cache would not survive between tests). |
+| TUI-22 | Tests are hermetic. | The TUI still has no data-dir override, so two TUI peers cannot run on one machine. |
+| CRYPTO-17 | Tests for reflected frames, several rekeys with traffic both ways, and a malformed identity nonce. | No test for an invite-fingerprint mismatch on first connect (that is CRYPTO-04, still open), a peer reusing our own ephemeral key, or history rollback (CRYPTO-09, still open). |
+| NET-22 | Reflection, crossing rekeys, silent connection in the handshake (already present). | Relay re-registration of a token, per-IP pending-slot cap, punch tag replay, split punch verdicts, password over relay, stale direct addresses reaching the relay (NET-12), peers confirming more than the idle timeout apart. |
+| TAURI-27 | `open_file` refusal of received executables, `file_preview` (SVG refused, 4 MiB cap), `set_password`/`unlock` on a ready app. | `party_join` two-step at the bridge level, `state_signature` sensitivity, `party_send_file`/`party_download_file`, `pick_upload`'s size cap. |
+| UI-37 | UI-03, UI-04, UI-05, UI-08 and UI-11 each have a test (and a fix). | Smoke tests still cover first paint only, not a flow. |
+
+### Confirmed still open
+
+These were confirmed while auditing the tests. They are not fixed, because they
+change the trust or dial behaviour rather than the tests:
+
+- **CRYPTO-04 (Medium, security).** Dialling a contact imported from an invite
+  records no expected fingerprint. If a different key answers, the user sees an
+  ordinary first-use safety-code prompt, not "this is not the key in your
+  invite". Confirmed by reading `connect_to_contact` and
+  `handle_tofu_verification`: neither has an expected-fingerprint path.
+- **NET-12 (Low).** `connect_to_contact` uses the relay only when the contact
+  has *no* parseable address. A contact with a stale but parseable address and a
+  relay token is dialled directly, the dial fails, and the relay is never tried.
+  Confirmed by reading the code. The new test
+  `connecting_to_a_contact_dials_into_its_existing_conversation` covers only
+  the unparseable-address case.
+- **CRYPTO-09 (Low, security).** The history file has no rollback protection.
+  An older `history.json.enc` loads normally and restores revoked trust and
+  lifted blocks. Unchanged.
 
 ## Method and limits
 
