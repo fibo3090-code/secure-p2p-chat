@@ -308,3 +308,38 @@ describe("ChatPane image previews", () => {
     expect(screen.queryByAltText("cat.png")).toBeNull();
   });
 });
+
+// UI-11: message text is the peer's. A right-to-left override inside a URL
+// made `https://evil.example/‮moc.knab` *display* as a bank's address while
+// the link opened the attacker's. A URL now ends at the first format character
+// (bidi controls, zero-width characters), so what the link says is all of what
+// it opens, and nothing invisible is inside it.
+describe("ChatPane links", () => {
+  const base = { draft: "", setDraft: () => {}, onSend: () => {}, transfers: [], onStart: () => {} };
+  const textMsg = (text) => ({ id: "m", ts: Date.now(), from: "them", text, t: "12:00" });
+
+  it("opens a plain link through the bridge, punctuation left outside it", async () => {
+    const openUrl = vi.fn(async () => {});
+    installApi({ openUrl });
+    render(<ChatPane {...base} contact={contactFixture({ messages: [textMsg("see https://example.com/a.")] })} />);
+    const link = screen.getByRole("link");
+    expect(link.textContent).toBe("https://example.com/a");
+    await userEvent.click(link);
+    expect(openUrl).toHaveBeenCalledWith("https://example.com/a");
+  });
+
+  for (const [what, ch] of [["RLO", "‮"], ["RLI", "⁧"], ["zero-width space", "​"]]) {
+    it(`cuts a link at a ${what} so the text shown is the address opened`, async () => {
+      const openUrl = vi.fn(async () => {});
+      installApi({ openUrl });
+      render(<ChatPane {...base} contact={contactFixture({
+        messages: [textMsg(`https://evil.example/${ch}moc.knab`)],
+      })} />);
+      const link = screen.getByRole("link");
+      expect(link.textContent).toBe("https://evil.example/");
+      expect(link.getAttribute("href")).toBe("https://evil.example/");
+      await userEvent.click(link);
+      expect(openUrl).toHaveBeenCalledWith("https://evil.example/");
+    });
+  }
+});

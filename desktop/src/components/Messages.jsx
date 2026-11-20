@@ -12,7 +12,12 @@ const isImageName = (name) => IMAGE_RE.test(name || "");
 // Render message text with http(s) URLs clickable. Opening goes through the
 // bridge's open_url (scheme re-checked there) so links launch the system
 // browser, never navigate the webview. Trailing punctuation stays text.
-const URL_RE = /(https?:\/\/[^\s<>"']+)/gi;
+//
+// A URL ends at the first Unicode format character (\p{Cf}: bidi overrides and
+// isolates, zero-width characters). The text is the peer's, and an override
+// inside a link made `https://evil.example/\u202Emoc.knab` display as a
+// different address from the one it opened (UI-11).
+const URL_RE = /(https?:\/\/[^\s<>"'\p{Cf}]+)/giu;
 function LinkifiedText({ text }) {
   const parts = String(text ?? "").split(URL_RE);
   if (parts.length === 1) return <>{text}</>;

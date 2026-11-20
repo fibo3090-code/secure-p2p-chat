@@ -250,12 +250,20 @@ export function Parties() {
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
 
+  // The thread on screen, read when a history response lands. Every selection
+  // change and every `party-updated` tick starts a fetch, and one for the
+  // thread just left can resolve last; writing it would show that thread's
+  // messages — a private channel's, say — under this one's name (UI-04).
+  const threadRef = useRef(null);
+  threadRef.current = `${sid}|${dm ? `dm:${dm}` : cid}`;
   const loadMsgs = useCallback(async () => {
     if (!sid) { setMsgs([]); return; }
+    const thread = `${sid}|${dm ? `dm:${dm}` : cid}`;
     try {
-      if (dm) setMsgs(await api.partyDmHistory(sid, dm));
-      else if (cid) setMsgs(await api.partyHistory(sid, cid));
-      else setMsgs([]);
+      let next = [];
+      if (dm) next = await api.partyDmHistory(sid, dm);
+      else if (cid) next = await api.partyHistory(sid, cid);
+      if (threadRef.current === thread) setMsgs(next);
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
 

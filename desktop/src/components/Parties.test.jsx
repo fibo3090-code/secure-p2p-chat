@@ -169,6 +169,41 @@ describe("Parties — a joined community", () => {
     expect(await screen.findByText("welcome")).toBeTruthy();
   });
 
+  // UI-04: every selection change and every `party-updated` tick starts a
+  // history fetch, and a slower one for the channel just left could resolve
+  // last — rendering one thread's messages (a private channel's, say) under
+  // another thread's name until the next event.
+  it("never shows a thread's history under another thread's header", async () => {
+    const twoChannels = {
+      ...joinedServer,
+      channels: [
+        ...joinedServer.channels,
+        { id: "ch2", name: "secret", messages: 1, kind: "private", members: [], can_post: true },
+      ],
+    };
+    const pending = {};
+    installApi({
+      partyList: [twoChannels],
+      partySaved: [],
+      partyHistory: (_sid, cid) => new Promise((resolve) => { (pending[cid] ||= []).push(resolve); }),
+    });
+    const msg = (text) => [{ sender_name: "nova", from_me: false, kind: "text", text, size: null, timestamp: Date.now() }];
+
+    render(<Parties />);
+    await waitFor(() => expect(pending.ch1?.length).toBeGreaterThan(0));
+    await userEvent.click(screen.getByTitle("#secret — private"));
+    await waitFor(() => expect(pending.ch2?.length).toBeGreaterThan(0));
+
+    // The new channel answers first, the one that was left answers last.
+    pending.ch2.forEach((r) => r(msg("in secret")));
+    expect(await screen.findByText("in secret")).toBeTruthy();
+    pending.ch1.forEach((r) => r(msg("in general")));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(screen.queryByText("in general")).toBeNull();
+    expect(screen.getByText("in secret")).toBeTruthy();
+  });
+
   // JOURNEY-04 / PRIV-01: the operator reads community traffic, so the
   // conversation itself has to say so — not only the join screen.
   it("says on screen that the operator can read the community", async () => {
