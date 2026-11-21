@@ -1796,9 +1796,8 @@ fn two_desktop_apps_connect_verify_and_exchange_a_message() {
     });
     for h in [&host, &client] {
         let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
-        assert_eq!(
-            prompt["sas"].as_str().unwrap().len() > 0,
-            true,
+        assert!(
+            !prompt["sas"].as_str().unwrap().is_empty(),
             "no safety code shown"
         );
         h.ipc_binds(
