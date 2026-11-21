@@ -2008,6 +2008,351 @@ mod tests {
         assert!(!app.history_path.with_extension("unreadable").exists());
     }
 
+    /// The connection commands between two terminal clients, as users type
+    /// them: `:host` on an OS-chosen port (the toast must name the port that
+    /// was bound, not the 0 that was asked for), `:connect`, both safety-code
+    /// prompts answered with Ctrl+Y, a message typed and sent; then the same
+    /// through a relay with `:host-relay` / `:connect-relay`; and the
+    /// `:connection-password` / `:lock` switches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_connection_commands_work_end_to_end() {
+        async fn tick_both(
+            a: &mut TuiApp,
+            b: &mut TuiApp,
+            label: &str,
+            mut done: impl FnMut(&TuiApp, &TuiApp) -> bool,
+        ) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                a.tick();
+                b.tick();
+                if done(a, b) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "[{label}] timed out");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        let prompted = |a: &TuiApp| matches!(a.overlay, TuiOverlay::FingerprintVerify { .. });
+        let texts = |a: &TuiApp| -> Vec<String> {
+            a.chat_manager
+                .chats
+                .values()
+                .flat_map(|c| c.messages.iter())
+                .filter_map(|m| match &m.content {
+                    crate::types::MessageContent::Text { text } if !m.from_me => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let (mut host, _host_data) = app();
+        let (mut client, _client_data) = app();
+        host.chat_manager.config.enable_typing_indicators = false;
+        client.chat_manager.config.enable_typing_indicators = false;
+
+        // Direct.
+        host.execute_command(TuiCommand::Host(Some(0))).await;
+        let port = host.chat_manager.hosting_port.expect("hosting");
+        assert!(
+            last_toast(&host).contains(&format!(":{port}")),
+            "the toast must name the bound port: {}",
+            last_toast(&host)
+        );
+        client
+            .execute_command(TuiCommand::Connect {
+                host: "127.0.0.1".into(),
+                port,
+            })
+            .await;
+        tick_both(&mut host, &mut client, "both prompted", |h, c| {
+            prompted(h) && prompted(c)
+        })
+        .await;
+        host.handle_key_event(ctrl('y'));
+        client.handle_key_event(ctrl('y'));
+        let chat = client
+            .selected_chat_id()
+            .expect("the dialled chat is selected");
+        tick_both(&mut host, &mut client, "connected", |_, c| {
+            c.chat_manager.is_connected(&chat)
+        })
+        .await;
+        client.focus = TuiFocus::Input;
+        for ch in "hi host".chars() {
+            client.handle_key_event(key(ch));
+        }
+        client.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tick_both(&mut host, &mut client, "message", |h, _| {
+            texts(h) == ["hi host"]
+        })
+        .await;
+
+        // Through a relay.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = listener.local_addr().unwrap().to_string();
+        tokio::spawn(crate::network::serve_relay(
+            listener,
+            std::time::Duration::from_secs(60),
+        ));
+        let (mut rhost, _d1) = app();
+        let (mut rclient, _d2) = app();
+        rhost
+            .execute_command(TuiCommand::HostRelay {
+                relay: relay.clone(),
+                token: None,
+            })
+            .await;
+        let token = match &rhost.overlay {
+            TuiOverlay::Invite { link } => {
+                assert!(link.starts_with("chat-p2p://invite/"), "{link}");
+                last_toast(&rhost)
+                    .split("token ")
+                    .nth(1)
+                    .map(|t| t.trim_end_matches(')').to_string())
+                    .expect("the toast names the token")
+            }
+            other => panic!("no invite shown: {other:?}"),
+        };
+        rhost.overlay = TuiOverlay::None;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        rclient
+            .execute_command(TuiCommand::ConnectRelay {
+                relay: relay.clone(),
+                token,
+            })
+            .await;
+        tick_both(&mut rhost, &mut rclient, "relay prompts", |h, c| {
+            prompted(h) && prompted(c)
+        })
+        .await;
+
+        // The switches.
+        let (mut app, _d) = app();
+        app.execute_command(TuiCommand::ConnectionPassword(Some(
+            "pw-long-enough".into(),
+        )))
+        .await;
+        assert!(app.chat_manager.has_connection_password());
+        app.execute_command(TuiCommand::ConnectionPassword(None))
+            .await;
+        assert!(!app.chat_manager.has_connection_password());
+        app.execute_command(TuiCommand::Host(Some(0))).await;
+        app.execute_command(TuiCommand::Lock(true)).await;
+        assert!(app.chat_manager.is_conversation_locked());
+        assert!(!app.chat_manager.is_hosting, "locking must stop hosting");
+        app.execute_command(TuiCommand::Lock(false)).await;
+        assert!(!app.chat_manager.is_conversation_locked());
+    }
+
+    /// The Communities commands end to end, as a terminal user drives them:
+    /// a real community server in process, the real command executors, and
+    /// `tick` as the UI loop. The user joins as the owner (claim token in the
+    /// password field) so governance runs rather than only being refused; a
+    /// second member joins through the library to be the target of a DM and a
+    /// role change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_party_commands_work_end_to_end() {
+        use messenger_core::party::{MessagePayload, Role};
+        use messenger_server::state::PartyState;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let state = PartyState::load("TUI Community", None, server_dir.path()).unwrap();
+        let claim = state.owner_claim_token().unwrap().to_owned();
+        let state = Arc::new(Mutex::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let key = crate::core::generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        tokio::spawn(messenger_server::run_accept_loop(
+            listener,
+            state.clone(),
+            Arc::new(key),
+            Arc::new(messenger_server::hub::Hub::new()),
+        ));
+
+        let (mut app, data) = app();
+        app.chat_manager.config.download_dir = data.path().join("downloads");
+        std::fs::create_dir_all(&app.chat_manager.config.download_dir).unwrap();
+        async fn tick_until(app: &mut TuiApp, label: &str, mut done: impl FnMut(&TuiApp) -> bool) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                app.tick();
+                if done(app) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "[{label}] timed out");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        let members = |state: &Arc<Mutex<PartyState>>| {
+            let state = state.clone();
+            async move { state.lock().await.members() }
+        };
+
+        // Commands that need a community say so before one is joined.
+        app.execute_command(TuiCommand::PartyPost("early".into()))
+            .await;
+        assert!(last_toast(&app).contains("No Party server joined"));
+        app.execute_command(TuiCommand::PartyTrust).await;
+        assert!(last_toast(&app).contains("No community server is waiting"));
+
+        // Step one: the fingerprint, and nothing sent.
+        app.execute_command(TuiCommand::PartyConnect {
+            address: address.clone(),
+            username: "tui".into(),
+            password: Some(claim),
+        })
+        .await;
+        tick_until(&mut app, "verify prompt", |a| {
+            a.pending_party_join.is_some()
+        })
+        .await;
+        assert!(last_toast(&app).contains("Nothing has been sent yet"));
+        assert!(
+            members(&state).await.is_empty(),
+            "credentials moved before :party-trust"
+        );
+
+        // Step two: join with exactly the verified fingerprint.
+        app.execute_command(TuiCommand::PartyTrust).await;
+        tick_until(&mut app, "joined", |a| {
+            a.current_party
+                .and_then(|id| a.party_manager.server(id))
+                .is_some_and(|s| s.member_id.is_some() && !s.channels.is_empty())
+        })
+        .await;
+        let sid = app.current_party.unwrap();
+        assert_eq!(app.party_manager.my_role(sid), Some(Role::Owner));
+
+        // A second member, for the DM and the role change.
+        let mut other = crate::app::party_manager::PartyManager::new();
+        let other_key = crate::core::generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        let fp = app
+            .party_manager
+            .server(sid)
+            .unwrap()
+            .server_fingerprint
+            .clone();
+        other
+            .connect_and_join(&address, "nova", None, &other_key, Some(&fp))
+            .await
+            .unwrap();
+        tick_until(&mut app, "nova listed", |a| {
+            a.party_manager
+                .server(sid)
+                .is_some_and(|s| s.members.len() == 2)
+        })
+        .await;
+
+        app.execute_command(TuiCommand::PartyCreateChannel("ops".into()))
+            .await;
+        tick_until(&mut app, "channel", |a| {
+            a.party_manager
+                .server(sid)
+                .is_some_and(|s| s.channels.iter().any(|c| c.name == "ops"))
+        })
+        .await;
+
+        app.execute_command(TuiCommand::PartyPost("hello from the terminal".into()))
+            .await;
+        app.execute_command(TuiCommand::PartyDm {
+            target: "nova".into(),
+            text: "psst".into(),
+        })
+        .await;
+        app.execute_command(TuiCommand::PartyDm {
+            target: "nobody".into(),
+            text: "x".into(),
+        })
+        .await;
+        assert!(last_toast(&app).contains("No member 'nobody'"));
+
+        let shared = data.path().join("notes.txt");
+        std::fs::write(&shared, b"shared through the TUI").unwrap();
+        app.execute_command(TuiCommand::PartySendFile(shared.display().to_string()))
+            .await;
+        tick_until(&mut app, "post, DM and file stored", |a| {
+            let s = a.party_manager.server(sid).unwrap();
+            let confirmed = |f: &dyn Fn(&MessagePayload) -> bool| {
+                s.messages
+                    .values()
+                    .flatten()
+                    .any(|e| e.seq != 0 && f(&e.payload))
+            };
+            confirmed(&|p| matches!(p, MessagePayload::Text(t) if t == "hello from the terminal"))
+                && confirmed(&|p| matches!(p, MessagePayload::File(f) if f.name == "notes.txt"))
+        })
+        .await;
+        let nova = app
+            .party_manager
+            .server(sid)
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.username == "nova")
+            .map(|m| m.id)
+            .unwrap();
+        tick_until(&mut app, "dm stored", |a| {
+            a.party_manager
+                .dm_messages(sid, nova)
+                .iter()
+                .any(|e| e.seq != 0)
+        })
+        .await;
+
+        // Download it back into the download directory.
+        app.execute_command(TuiCommand::PartyDownload("notes".into()))
+            .await;
+        let saved = app.chat_manager.config.download_dir.join("notes.txt");
+        tick_until(&mut app, "download saved", |_| saved.exists()).await;
+        assert_eq!(std::fs::read(&saved).unwrap(), b"shared through the TUI");
+        app.execute_command(TuiCommand::PartyDownload("no-such-file".into()))
+            .await;
+        assert!(last_toast(&app).contains("No shared file matches"));
+
+        // Governance, as the owner.
+        app.execute_command(TuiCommand::PartyRole {
+            username: "nova".into(),
+            role: "admin".into(),
+        })
+        .await;
+        let nova_role = || {
+            let state = state.clone();
+            async move { state.lock().await.role_of(nova) }
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while nova_role().await != Role::Admin {
+            assert!(Instant::now() < deadline, "the role change never landed");
+            app.tick();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        app.execute_command(TuiCommand::PartyRole {
+            username: "nova".into(),
+            role: "king".into(),
+        })
+        .await;
+        assert!(last_toast(&app).contains("Unknown role"));
+        app.execute_command(TuiCommand::PartyDeleteChannel("ops".into()))
+            .await;
+        tick_until(&mut app, "channel deleted", |a| {
+            a.party_manager
+                .server(sid)
+                .is_some_and(|s| !s.channels.iter().any(|c| c.name == "ops"))
+        })
+        .await;
+        app.execute_command(TuiCommand::PartyDeleteChannel("ops".into()))
+            .await;
+        assert!(last_toast(&app).contains("No channel called"));
+
+        app.execute_command(TuiCommand::PartyStatus).await;
+        assert!(last_toast(&app).contains(&address), "{}", last_toast(&app));
+        app.execute_command(TuiCommand::PartyPane).await;
+        assert_eq!(app.overlay, TuiOverlay::Party);
+        drop(other);
+    }
+
     #[tokio::test]
     async fn wipe_checks_the_password_confirms_then_deletes_everything() {
         let dir = tempfile::tempdir().unwrap();
