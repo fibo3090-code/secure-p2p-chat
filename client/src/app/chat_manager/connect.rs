@@ -282,6 +282,7 @@ impl ChatManager {
         let relay_token = token.unwrap_or_else(generate_relay_token);
         let chat_id = Uuid::new_v4();
         let (server, session_token) = (relay_server.to_string(), relay_token.clone());
+        let password = self.connection_password.clone();
         self.spawn_session(chat_id, "Relay hosting stopped", move |ch| async move {
             run_host_session_via_relay(
                 &server,
@@ -292,6 +293,7 @@ impl ChatManager {
                 ch.file_rx,
                 ch.confirm_rx,
                 chat_id,
+                password,
             )
             .await
         });
@@ -383,6 +385,7 @@ impl ChatManager {
     ) -> Result<Uuid> {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         let (server, token) = (relay_server.to_string(), token.to_string());
+        let password = self.connection_password.clone();
         self.spawn_session(chat_id, "Relay connection failed", move |ch| async move {
             run_client_session_via_relay(
                 &server,
@@ -393,6 +396,7 @@ impl ChatManager {
                 ch.file_rx,
                 ch.confirm_rx,
                 chat_id,
+                password,
             )
             .await
         });

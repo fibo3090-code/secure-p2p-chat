@@ -503,6 +503,52 @@ async fn idle_session_survives_past_the_idle_timeout() {
     client.handle.abort();
 }
 
+/// NET-10: the two people compare the safety code at their own pace. The
+/// first to accept enters its message loop and its idle timer starts, while
+/// the other is still reading the prompt and sends nothing — so confirming
+/// more than the idle window apart (five minutes in production, comparing a
+/// code over the phone) used to end the session on "Receive idle timeout"
+/// before the second side had even answered. Shrunk here to a 3 s window
+/// and a 6 s gap with the debug-only timer hooks.
+#[tokio::test]
+async fn confirming_the_safety_code_minutes_apart_keeps_the_session() {
+    struct ShortTimers;
+    impl Drop for ShortTimers {
+        fn drop(&mut self) {
+            std::env::remove_var("P2PEM_TEST_KEEPALIVE_SECS");
+            std::env::remove_var("P2PEM_TEST_IDLE_TIMEOUT_SECS");
+        }
+    }
+    let _restore = ShortTimers;
+    std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "1");
+    std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "3");
+
+    let (mut host, mut client) = connect_pair().await;
+    wait_until(&mut host.events, "host prompt", awaiting_confirmation).await;
+    wait_until(&mut client.events, "client prompt", awaiting_confirmation).await;
+
+    host.confirm.send(true).unwrap();
+    // Twice the idle window before the other side answers.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    client.confirm.send(true).unwrap();
+
+    let text = |t: &str| ProtocolMessage::Text {
+        text: t.into(),
+        timestamp: 0,
+        seq: 0,
+    };
+    host.outbound.send(text("to client")).unwrap();
+    client.outbound.send(text("to host")).unwrap();
+    for (peer, label) in [(&mut client, "client"), (&mut host, "host")] {
+        match next_message(&mut peer.events, label).await {
+            ProtocolMessage::Text { text, .. } => assert_eq!(text, format!("to {label}")),
+            other => panic!("{label} expected text, got {other:?}"),
+        }
+    }
+    host.handle.abort();
+    client.handle.abort();
+}
+
 /// Regression test for the rekey/replay desync: the transport rekeys after
 /// `REKEY_MESSAGE_COUNT` (100) messages, and the rekey must not break the session.
 /// Sending more than that many messages one way must still deliver every one.

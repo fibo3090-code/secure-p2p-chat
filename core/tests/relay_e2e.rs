@@ -109,6 +109,7 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
             host_file_rx,
             host_confirm_rx,
             uuid::Uuid::new_v4(),
+            None,
         )
         .await
     });
@@ -127,6 +128,7 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
             client_file_rx,
             client_confirm_rx,
             uuid::Uuid::new_v4(),
+            None,
         )
         .await
     });
@@ -300,6 +302,7 @@ async fn an_unknown_token_fails_fast_and_leaves_the_relay_serving() {
             file_rx,
             confirm_rx,
             uuid::Uuid::new_v4(),
+            None,
         ),
     )
     .await

@@ -23,6 +23,12 @@ predate tagged releases.
   silently as some other peer you know.
 - A contact whose saved address had gone stale was never reached even when it
   had a relay route; the relay is now tried when no direct address answers.
+- A session ended if the two people compared the safety code more than five
+  minutes apart: the side that accepted first timed out waiting for the other.
+- The connection password was not asked for when hosting through a relay.
+- Relay server: a host that disconnected while waiting kept its token for five
+  minutes, so its own reconnect was refused; and a few addresses could fill
+  the rendezvous table and lock every other host out.
 - A damaged `identity.json` (a nonce of the wrong length) crashed the unlock
   instead of reporting an unreadable identity.
 - Desktop: `set_password` on an unlocked app re-protected the identity under

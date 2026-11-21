@@ -407,6 +407,7 @@ pub async fn run_client_session_direct_or_relay(
                 file_rx,
                 confirm_rx,
                 chat_id,
+                connection_password,
             )
             .await;
         }
@@ -1653,7 +1654,15 @@ where
     // be a timeout around each individual read, restarted on every iteration —
     // so our own sends and keep-alive ticks kept re-arming it, and a peer that
     // had gone away without closing the socket was never detected.
-    let idle = tokio::time::sleep(recv_idle_timeout);
+    //
+    // Until the peer's FIRST frame, the limit is its whole confirmation window
+    // plus one idle window. Both sides enter this loop only after their own
+    // user accepts the safety code, and the other may still be reading the
+    // prompt — it sends nothing until it has answered. Arming the plain idle
+    // timer here ended the session whenever two people compared the code more
+    // than five minutes apart (audit NET-10). A peer that rejects closes the
+    // socket, which is seen at once; one that vanished is still bounded.
+    let idle = tokio::time::sleep(FINGERPRINT_CONFIRM_TIMEOUT + recv_idle_timeout);
     tokio::pin!(idle);
 
     loop {
@@ -2093,6 +2102,70 @@ mod tests {
         );
 
         // Keep the peer end alive until the assertions run.
+        drop(peer_stream);
+    }
+
+    /// Dead-peer detection, which nothing tested: once the peer has spoken,
+    /// silence longer than the idle window ends the session with an error the
+    /// app can show — a peer that vanished without closing its socket (a
+    /// laptop lid, a dropped Wi-Fi) must not leave a conversation reading as
+    /// connected. The longer first-frame window (NET-10) must not leak past
+    /// the first frame. Timers shrunk with the debug-only hooks.
+    #[tokio::test]
+    async fn a_peer_that_goes_silent_after_speaking_is_detected() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("P2PEM_TEST_IDLE_TIMEOUT_SECS");
+                std::env::remove_var("P2PEM_TEST_KEEPALIVE_SECS");
+            }
+        }
+        let _restore = Restore;
+        std::env::set_var("P2PEM_TEST_IDLE_TIMEOUT_SECS", "2");
+        std::env::set_var("P2PEM_TEST_KEEPALIVE_SECS", "60");
+
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport".to_vec();
+        let ours = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let theirs = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (loop_stream, mut peer_stream) = tokio::io::duplex(4096);
+        let (to_app_tx, mut to_app_rx) = mpsc::unbounded_channel();
+        let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+        let (_file_tx, file_rx) = mpsc::channel(1);
+        let loop_aad = aad.clone();
+        let handle = tokio::spawn(async move {
+            run_message_loop(loop_stream, ours, loop_aad, to_app_tx, from_app_rx, file_rx).await
+        });
+
+        // The peer speaks once, then says nothing more — socket still open.
+        let ping = ProtocolMessage::Ping { seq: 1 };
+        send_packet(
+            &mut peer_stream,
+            &theirs.encrypt(&ping.to_plain_bytes(), Some(&aad)),
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("a silent peer was never detected")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1500),
+            "the session ended before the idle window ran out"
+        );
+        let mut idle_reported = false;
+        while let Ok(ev) = to_app_rx.try_recv() {
+            if let SessionEvent::Error(e) = ev {
+                idle_reported |= e.contains("idle timeout");
+            }
+        }
+        assert!(
+            idle_reported,
+            "the idle timeout was not reported to the app"
+        );
         drop(peer_stream);
     }
 

@@ -105,11 +105,11 @@ prioritised view is in [README.md](README.md).
 | NET-03 | Medium | Fixed | S | [02-network](reports/02-network.md) | Two host rekeys can happen before the client switches, after which old-key frames are undecryptable |
 | NET-04 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | No `TCP_NODELAY` and a two-write frame cause delayed-ACK stalls on every small message |
 | NET-05 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | Unauthenticated peers can create unlimited TOFU prompts, 30-minute sessions and junk conversations |
-| NET-06 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | A relay host that disconnects while waiting keeps its token slot for the full 5 minutes |
-| NET-07 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | No per-address cap on pending rendezvous slots; a few IPs can fill the global table |
+| NET-06 | Medium | Fixed | S | [02-network](reports/02-network.md) | A relay host that disconnects while waiting keeps its token slot for the full 5 minutes |
+| NET-07 | Medium | Fixed | S | [02-network](reports/02-network.md) | No per-address cap on pending rendezvous slots; a few IPs can fill the global table |
 | NET-08 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | The punch hello tag is sent before the peer proves anything, so any stranger can reflect it and claim the punched socket |
 | NET-09 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | The relay control channel is cleartext: token, LAN IPs and pairing are visible and spoofable on path |
-| NET-10 | Medium | VERIFIED | S/M | [02-network](reports/02-network.md) | Confirming the SAS more than 5 minutes apart kills the session |
+| NET-10 | Medium | Fixed | S/M | [02-network](reports/02-network.md) | Confirming the SAS more than 5 minutes apart kills the session |
 | PERF-06 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | Server history is fully resident; paging scans from message 1; startup re-parses everything |
 | PERF-07 | Medium | VERIFIED | M | [11-performance](reports/11-performance.md) | P2P receive path has no backpressure; chunk writes are blocking I/O under the manager lock |
 | PERF-08 | Medium | VERIFIED | M | [11-performance](reports/11-performance.md) | Server upload spools held in RAM: about 0.5 GiB per member, not bounded server-wide |
@@ -228,7 +228,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-19 | Low | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The first host triggers an OS firewall prompt the app never explains; the listener is IPv4-only on every interface |
 | JOURNEY-20 | Low | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Server and tools defaults: relative data dir, password visible in process list, no Intel macOS tools |
 | JOURNEY-21 | Low | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Relative-path fallback when no data directory resolves |
-| NET-11 | Low | VERIFIED | S | [02-network](reports/02-network.md) | The connection password is silently ignored for relay-hosted sessions |
+| NET-11 | Low | Fixed | S | [02-network](reports/02-network.md) | The connection password is silently ignored for relay-hosted sessions |
 | NET-12 | Low | Fixed | S | [02-network](reports/02-network.md) | `connect_to_contact` never falls back to the relay when direct addresses fail |
 | NET-13 | Low | VERIFIED | S | [02-network](reports/02-network.md) | A UPnP / NAT-PMP mapping that fails the routable check is created and then leaked |
 | NET-14 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Client-side relay I/O has no timeouts |

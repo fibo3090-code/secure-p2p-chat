@@ -184,3 +184,55 @@ async fn a_contact_whose_address_went_stale_is_reached_through_its_relay() {
     );
     assert_eq!(client.contact_to_chat.get(&contact), Some(&chat));
 }
+
+/// NET-11: a connection password set on the host applies when it hosts
+/// through a relay too. It used to be dropped on that path, so anyone holding
+/// the relay token reached the safety-code prompt, and nothing told the user
+/// their password was not being asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_password_is_enforced_over_the_relay() {
+    use messenger_core::network::{generate_relay_token, serve_relay, RELAY_WAIT_TIMEOUT};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let relay = listener.local_addr().expect("addr").to_string();
+    tokio::spawn(serve_relay(listener, RELAY_WAIT_TIMEOUT));
+    let password = format!("pw-{}", uuid::Uuid::new_v4());
+
+    for (supplied, admitted) in [(None, false), (Some(password.clone()), true)] {
+        let host_dir = tempfile::tempdir().unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let mut host = manager_in(host_dir.path());
+        let mut client = manager_in(client_dir.path());
+        host.set_connection_password(Some(password.clone()));
+        client.set_connection_password(supplied.clone());
+        let token = generate_relay_token();
+        host.start_host_via_relay(&relay, Some(token.clone()), rsa_key())
+            .await
+            .expect("host on the relay");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        client
+            .connect_via_relay(&relay, &token, None, rsa_key())
+            .await
+            .expect("dial through the relay");
+
+        if admitted {
+            pump_pair(&mut host, &mut client, "both prompts", |h, c| {
+                h.pending_fingerprint().is_some() && c.pending_fingerprint().is_some()
+            })
+            .await;
+        } else {
+            pump_pair(&mut host, &mut client, "refused", |h, _| {
+                h.toasts
+                    .iter()
+                    .any(|t| t.message.to_lowercase().contains("password"))
+            })
+            .await;
+            assert!(
+                host.pending_fingerprint().is_none(),
+                "a peer without the password reached the safety-code prompt"
+            );
+        }
+    }
+}
