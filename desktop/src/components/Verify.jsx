@@ -9,6 +9,24 @@ function group(fp) {
   return (fp || "").replace(/(.{4})/g, "$1 ").trim();
 }
 
+// Why this prompt is not an ordinary first use (the bridge's `warning`), or
+// null. Unknown kinds still warn: a newer backend that adds a reason must not
+// have it rendered as a first contact by an older dialog.
+export function warningText(warning) {
+  if (!warning) return null;
+  const short = (fp) => (fp || "").slice(0, 16);
+  switch (warning.kind) {
+    case "invite_mismatch":
+      return `This is not the key in ${warning.contact}'s invite (expected ${short(warning.expected)}…). ` +
+        "Someone may be intercepting the connection.";
+    case "key_changed":
+      return `This conversation's key has changed (was ${short(warning.previous)}…). ` +
+        "It may be a new device — or someone intercepting the connection.";
+    default:
+      return "This is not the key this peer was expected to present.";
+  }
+}
+
 export function Verify({ req, onClose }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -17,6 +35,7 @@ export function Verify({ req, onClose }) {
   // not show a previous request's failure before the user acts.
   useEffect(() => { setErr(""); }, [req?.chat_id]);
   if (!req) return null;
+  const warning = warningText(req.warning);
   async function decide(accept) {
     if (busy) return;
     setBusy(true);
@@ -39,8 +58,17 @@ export function Verify({ req, onClose }) {
     // which reads as a bug. The only ways out are Verify and Reject.
     <Modal open={!!req} onClose={onClose} width={440} title={`Verify ${req.peer_name}`} icon="fingerprint"
       dismissable={false}
-      sub="Trust on first use — confirm out of band">
+      sub={warning ? "Unexpected key — do not trust it unless the codes match" : "Trust on first use — confirm out of band"}>
       <div className="verify-body">
+        {/* A warning leads, above the code. The SAS still decides, but a user
+            told "this is not the key you expected" compares it very
+            differently from one told nothing (CRYPTO-04). */}
+        {warning && (
+          <div className="verify-warning" role="alert">
+            <Icon name="alert" size={15} />
+            <span>{warning} Reject unless the codes match exactly.</span>
+          </div>
+        )}
         {req.sas ? (
           <>
             {/* Primary check: the short authentication string. Both peers see
@@ -75,7 +103,7 @@ export function Verify({ req, onClose }) {
             correct action, not an edge case. */}
         <div className="verify-actions">
           <Button icon="shieldCheck" disabled={busy} onClick={() => decide(true)}>
-            {busy ? "Working…" : "Codes match — trust"}
+            {busy ? "Working…" : warning ? "Codes match — trust this new key" : "Codes match — trust"}
           </Button>
           <Button variant="danger" icon="x" disabled={busy} onClick={() => decide(false)}>Reject</Button>
         </div>

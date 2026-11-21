@@ -770,6 +770,42 @@ fn no_pending_fingerprint_on_fresh_session() {
     .expect_err("confirmed a fingerprint with no pending session");
 }
 
+/// CRYPTO-04: the prompt the webview polls must say when the key is not the
+/// one in the dialled contact's invite, or `Verify` renders a first contact.
+#[test]
+fn pending_fingerprint_carries_the_invite_mismatch_warning() {
+    use p2pem_classic::app::{FingerprintWarning, PendingFingerprint};
+    use tauri::Manager;
+
+    let h = ready_harness();
+    let session = uuid::Uuid::new_v4();
+    let pending = h._app.state::<Bridge>().pending_fp.clone();
+    *pending.lock().unwrap() = Some(PendingFingerprint {
+        fingerprint: "bb".repeat(32),
+        peer_name: "10.0.0.2:12345".into(),
+        sas: "123456 🎃🎈🎁".into(),
+        session_id: session,
+        warning: Some(FingerprintWarning::InviteMismatch {
+            contact_id: uuid::Uuid::new_v4(),
+            contact_name: "Alice".into(),
+            expected: "aa".repeat(32),
+        }),
+    });
+
+    let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+    assert_eq!(prompt["chat_id"], session.to_string());
+    assert_eq!(
+        prompt["warning"],
+        json!({ "kind": "invite_mismatch", "contact": "Alice", "expected": "aa".repeat(32) })
+    );
+
+    // An ordinary first use carries an explicit null, not a missing key.
+    pending.lock().unwrap().as_mut().unwrap().warning = None;
+    let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+    assert_eq!(prompt["warning"], Value::Null);
+    assert!(prompt.as_object().unwrap().contains_key("warning"));
+}
+
 // ── Invites & contacts ──────────────────────────────────────────────────────
 
 #[test]

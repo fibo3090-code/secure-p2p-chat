@@ -18,7 +18,7 @@ vi.mock("../lib/bridge.js", async (importOriginal) => {
   return { ...actual, api: bridge.api };
 });
 
-import { Verify } from "./Verify.jsx";
+import { Verify, warningText } from "./Verify.jsx";
 import { stubApi } from "../test/render.jsx";
 
 function installApi(overrides) {
@@ -55,6 +55,38 @@ describe("Verify", () => {
     render(<Verify req={{ ...req, sas: null }} onClose={() => {}} />);
     expect(screen.getByText(/Compare this grid/)).toBeTruthy();
     expect(screen.queryByText(/Read this aloud/)).toBeNull();
+  });
+
+  // CRYPTO-04: a key that is not the one in the dialled contact's invite must
+  // not look like a first contact.
+  it("leads with a warning when the key is not the one in the contact's invite", () => {
+    render(<Verify req={{ ...req, warning: { kind: "invite_mismatch", contact: "Alice", expected: "cd".repeat(32) } }}
+      onClose={() => {}} />);
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toMatch(/not the key in Alice's invite/);
+    expect(alert.textContent).toContain("cd".repeat(8));
+    expect(screen.getByText(/Unexpected key/)).toBeTruthy();
+    // The SAS is still the check, and accepting is still possible — but it is
+    // worded as trusting a *new* key, not as a routine confirmation.
+    expect(screen.getByText("418 902 🎃🎈🎁")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /trust this new key/ })).toBeTruthy();
+  });
+
+  it("warns when a known conversation's key changed", () => {
+    render(<Verify req={{ ...req, warning: { kind: "key_changed", previous: "ef".repeat(32) } }} onClose={() => {}} />);
+    expect(screen.getByRole("alert").textContent).toMatch(/key has changed/);
+  });
+
+  it("shows no warning for an ordinary first use", () => {
+    render(<Verify req={{ ...req, warning: null }} onClose={() => {}} />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText(/Trust on first use/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Codes match — trust" })).toBeTruthy();
+  });
+
+  it("still warns for a warning kind it does not know", () => {
+    expect(warningText({ kind: "something_new" })).toBeTruthy();
+    expect(warningText(null)).toBeNull();
   });
 
   it("cannot be dismissed — a live session is waiting on the answer", async () => {

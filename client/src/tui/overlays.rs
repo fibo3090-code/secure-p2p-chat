@@ -4,6 +4,7 @@
 //! route to it first (see `TuiApp::handle_key_event`). Every overlay has an
 //! equivalent `:`-command so the app stays fully keyboard/command driven.
 
+use crate::app::FingerprintWarning;
 use crate::tui::app::TuiApp;
 use crate::tui::command::{command_help, settings_keys, COMMANDS};
 use crate::types::{ToastLevel, TransferStatus};
@@ -30,6 +31,9 @@ pub enum TuiOverlay {
         peer_name: String,
         sas: String,
         chat_id: Uuid,
+        /// Set when this is not an ordinary first use: the key changed, or it
+        /// is not the one in the dialled contact's invite (CRYPTO-04).
+        warning: Option<FingerprintWarning>,
     },
     Contacts,
     Settings,
@@ -96,8 +100,9 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             fingerprint,
             peer_name,
             sas,
+            warning,
             ..
-        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, area),
+        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, warning.as_ref(), area),
         TuiOverlay::Contacts => render_contacts(f, app, area),
         TuiOverlay::Settings => render_settings(f, app, area),
         TuiOverlay::Invite { link } => render_invite(f, &link, area),
@@ -236,7 +241,37 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
     f.render_widget(para, inner);
 }
 
-fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &str, full: Rect) {
+/// The text the fingerprint prompt leads with when it is not a first use.
+pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
+    match warning {
+        FingerprintWarning::KeyChanged { previous } => format!(
+            "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
+            short_fingerprint(previous)
+        ),
+        FingerprintWarning::InviteMismatch {
+            contact_name,
+            expected,
+            ..
+        } => format!(
+            "⚠ WARNING: this is NOT the key in {}'s invite (expected {}…). Someone may be intercepting the connection. Reject unless the codes match.",
+            contact_name,
+            short_fingerprint(expected)
+        ),
+    }
+}
+
+fn short_fingerprint(fp: &str) -> String {
+    fp.chars().take(16).collect()
+}
+
+fn render_fingerprint(
+    f: &mut Frame,
+    fingerprint: &str,
+    peer_name: &str,
+    sas: &str,
+    warning: Option<&FingerprintWarning>,
+    full: Rect,
+) {
     let area = centered_rect(70, 70, full);
     let inner = clear_and_block(f, area, "🛡 Verify peer identity");
 
@@ -244,19 +279,36 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),                           // heading
-            Constraint::Length(2),                           // instruction
-            Constraint::Length(if has_sas { 3 } else { 0 }), // SAS
-            Constraint::Min(6),                              // color grid
-            Constraint::Length(2),                           // fingerprint hex
-            Constraint::Length(1),                           // actions
+            Constraint::Length(if warning.is_some() { 3 } else { 0 }), // warning
+            Constraint::Length(2),                                     // heading
+            Constraint::Length(2),                                     // instruction
+            Constraint::Length(if has_sas { 3 } else { 0 }),           // SAS
+            Constraint::Min(6),                                        // color grid
+            Constraint::Length(2),                                     // fingerprint hex
+            Constraint::Length(1),                                     // actions
         ])
         .split(inner);
+
+    // A warning leads: the SAS still decides, but the user must know this
+    // is not an ordinary first contact before reading the code.
+    if let Some(warning) = warning {
+        f.render_widget(
+            Paragraph::new(fingerprint_warning_text(warning))
+                .wrap(Wrap { trim: true })
+                .style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            rows[0],
+        );
+    }
 
     f.render_widget(
         Paragraph::new(format!("Connecting to {}", peer_name))
             .style(Style::default().add_modifier(Modifier::BOLD)),
-        rows[0],
+        rows[1],
     );
 
     // The short authentication string leads: both peers see the same code,
@@ -267,7 +319,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
             Paragraph::new("Read this code aloud with your peer — it must match on both ends:")
                 .wrap(Wrap { trim: false })
                 .style(Style::default().fg(Color::Gray)),
-            rows[1],
+            rows[2],
         );
         f.render_widget(
             Paragraph::new(sas.to_string())
@@ -277,7 +329,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
                         .fg(BRAND_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ),
-            rows[2],
+            rows[3],
         );
     } else {
         f.render_widget(
@@ -286,7 +338,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
             )
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::Gray)),
-            rows[1],
+            rows[2],
         );
     }
 
@@ -303,13 +355,13 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
             )
         })
         .collect();
-    f.render_widget(Paragraph::new(grid_lines), rows[3]);
+    f.render_widget(Paragraph::new(grid_lines), rows[4]);
 
     f.render_widget(
         Paragraph::new(fingerprint.to_string())
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::White)),
-        rows[4],
+        rows[5],
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -326,7 +378,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
             ),
             Span::raw(" later (:verify accept|reject)"),
         ])),
-        rows[5],
+        rows[6],
     );
 }
 

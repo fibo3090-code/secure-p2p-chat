@@ -305,6 +305,29 @@ impl ChatManager {
         }
     }
 
+    /// Replace a contact's fingerprint with one the user accepted over an
+    /// invite-mismatch warning (CRYPTO-04), and reset it to `Unverified` so
+    /// `promote_contact_verified` records the acceptance. Blocked contacts are
+    /// left alone: a block is never lifted or moved by a connection attempt.
+    pub(super) fn rebind_contact_fingerprint(&mut self, contact_id: Uuid, fingerprint: &str) {
+        let Some(contact) = self.contacts.get_mut(&contact_id) else {
+            return;
+        };
+        if contact.trust_state == TrustState::Blocked {
+            return;
+        }
+        tracing::warn!(
+            contact = %contact.name,
+            old = ?contact.fingerprint,
+            new = %fingerprint,
+            "Contact rebound to a key the user accepted over its invite"
+        );
+        contact.fingerprint = Some(fingerprint.to_string());
+        // The public key the invite carried belongs to the old fingerprint.
+        contact.public_key = None;
+        contact.trust_state = TrustState::Unverified;
+    }
+
     /// Associate a contact with a one-to-one chat (useful when a session is created for that contact)
     pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
         tracing::debug!(

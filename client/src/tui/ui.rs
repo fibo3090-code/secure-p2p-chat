@@ -486,6 +486,18 @@ mod tests {
                 peer_name: "Peer".into(),
                 sas: "12-34-56 🐶 🐱 🦊".into(),
                 chat_id: Uuid::new_v4(),
+                warning: None,
+            },
+            TuiOverlay::FingerprintVerify {
+                fingerprint: "ab".repeat(32),
+                peer_name: "Peer".into(),
+                sas: "12-34-56 🐶 🐱 🦊".into(),
+                chat_id: Uuid::new_v4(),
+                warning: Some(crate::app::FingerprintWarning::InviteMismatch {
+                    contact_id: Uuid::new_v4(),
+                    contact_name: "Alice".into(),
+                    expected: "cd".repeat(32),
+                }),
             },
             TuiOverlay::Contacts,
             TuiOverlay::Settings,
