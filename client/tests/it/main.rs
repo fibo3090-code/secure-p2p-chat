@@ -12,6 +12,7 @@
 
 mod common;
 
+mod cli;
 mod contacts;
 mod file_transfer;
 mod manager;

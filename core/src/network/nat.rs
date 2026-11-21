@@ -236,6 +236,23 @@ mod tests {
         assert_eq!(v6.to_host_port(), "[2001:db8::7]:12345");
     }
 
+    /// A mapping whose "external" address is itself private is behind a
+    /// second NAT and useless to outside peers: it is refused with an error
+    /// that says to use a relay, and a public one is accepted.
+    #[test]
+    fn a_mapping_behind_a_second_nat_is_refused() {
+        let err = check_routable("100.64.3.4".parse().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("use a relay"), "{err}");
+        assert!(check_routable("192.168.0.1".parse().unwrap()).is_err());
+        assert!(
+            check_routable("203.0.113.9".parse().unwrap()).is_err(),
+            "documentation range"
+        );
+        assert!(check_routable("8.8.4.4".parse().unwrap()).is_ok());
+    }
+
     #[test]
     fn detects_unroutable_external_addresses() {
         // Public: routable.

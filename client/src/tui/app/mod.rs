@@ -2145,6 +2145,78 @@ mod tests {
         assert!(!app.chat_manager.is_conversation_locked());
     }
 
+    /// A diagnostics bundle goes to whoever the user sends it to. It carries
+    /// what support needs — versions, paths, counts, settings — and none of
+    /// what the app holds in trust: no message text, no peer fingerprint, no
+    /// connection password, no private key, and only a prefix of the user's
+    /// own fingerprint. It lands in the app's own data directory.
+    #[tokio::test]
+    async fn the_diagnostics_bundle_carries_no_secrets() {
+        let (mut app, data) = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        let peer_fp = "cd".repeat(32);
+        let chat_ref = app.chat_manager.get_chat_mut(chat).unwrap();
+        chat_ref.peer_fingerprint = Some(peer_fp.clone());
+        chat_ref.messages.push(crate::types::Message {
+            id: Uuid::new_v4(),
+            from_me: false,
+            content: crate::types::MessageContent::Text {
+                text: "the secret text".into(),
+            },
+            timestamp: chrono::Utc::now(),
+            delivered: true,
+        });
+        app.chat_manager
+            .set_connection_password(Some("hunter2-connection-secret".into()));
+        let private_key = {
+            use rsa::pkcs8::EncodePrivateKey;
+            app.identity
+                .private_key()
+                .unwrap()
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string()
+        };
+
+        app.execute_command(TuiCommand::Diagnostics).await;
+        let bundles: Vec<_> = std::fs::read_dir(data.path().join("diagnostics"))
+            .expect("the bundle is in the app's own data directory")
+            .flatten()
+            .collect();
+        assert_eq!(bundles.len(), 1);
+        let mut everything = String::new();
+        for file in std::fs::read_dir(bundles[0].path()).unwrap().flatten() {
+            everything.push_str(&std::fs::read_to_string(file.path()).unwrap());
+        }
+        let report: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundles[0].path().join("diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["chats"], 1);
+        assert_eq!(
+            report["identity_fingerprint_prefix"]
+                .as_str()
+                .unwrap()
+                .len(),
+            16
+        );
+        for secret in [
+            "the secret text",
+            peer_fp.as_str(),
+            app.identity.fingerprint.as_str(),
+            "hunter2-connection-secret",
+            "PRIVATE KEY",
+            private_key.lines().nth(1).unwrap(),
+        ] {
+            assert!(
+                !everything.contains(secret),
+                "the bundle leaked {secret:.24}…"
+            );
+        }
+    }
+
     /// The Communities commands end to end, as a terminal user drives them:
     /// a real community server in process, the real command executors, and
     /// `tick` as the UI loop. The user joins as the owner (claim token in the

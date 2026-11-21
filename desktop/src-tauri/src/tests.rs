@@ -1556,3 +1556,78 @@ fn the_poll_loop_rehosts_a_consumed_direct_listener_only() {
     assert_eq!(m.hosting_port, Some(port), "rehosted somewhere else");
     assert!(!m.check_rehost_needed(), "the listener was not re-opened");
 }
+
+// ── Start-up (init_bridge) ──────────────────────────────────────────────────
+
+/// Run the real start-up path over `dir` (`P2PEM_DATA_DIR`), restoring the
+/// environment afterwards.
+fn boot_in(dir: &std::path::Path) -> Bridge {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::env::remove_var("P2PEM_DATA_DIR");
+        }
+    }
+    let _restore = Restore;
+    std::env::set_var("P2PEM_DATA_DIR", dir);
+    crate::init_bridge()
+}
+
+/// The rule the whole data model rests on: `identity.json` is the only key to
+/// the history, so an existing file that does not load puts the app in an
+/// error state and is left exactly as it was. Generating a replacement would
+/// look like a fresh install while making every stored message unreadable
+/// and breaking trust with every contact. (The other bridge tests build this
+/// state by hand; this runs the real start-up.)
+#[test]
+fn start_up_never_replaces_an_identity_it_could_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let damaged = b"{ this is not an identity".to_vec();
+    std::fs::write(dir.path().join("identity.json"), &damaged).unwrap();
+
+    let bridge = boot_in(dir.path());
+    assert!(
+        bridge.init_error.is_some(),
+        "a damaged identity booted as if fine"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("identity.json")).unwrap(),
+        damaged,
+        "the unreadable identity was replaced"
+    );
+    let h = harness_with(bridge, dir);
+    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "error");
+    assert!(h
+        .ipc("set_password", json!({ "password": "a-new-password-x" }))
+        .is_err());
+    assert!(h.ipc("list_conversations", json!({})).is_err());
+}
+
+/// A fresh directory boots into password setup, with paths inside it; an
+/// existing password-protected identity boots locked, asking to unlock.
+#[test]
+fn start_up_resolves_the_data_dir_and_the_auth_state() {
+    let fresh = tempfile::tempdir().unwrap();
+    let bridge = boot_in(fresh.path());
+    assert!(bridge.init_error.is_none());
+    assert!(bridge.needs_password_setup());
+    assert_eq!(bridge.identity_path, fresh.path().join("identity.json"));
+    assert_eq!(bridge.history_path, fresh.path().join("history.json.enc"));
+    assert_eq!(bridge.parties_path, fresh.path().join("parties.json"));
+
+    let existing = tempfile::tempdir().unwrap();
+    let mut identity = Identity::new_with_plaintext("Owner".into()).unwrap();
+    identity.encrypt("the-owners-password").unwrap();
+    identity
+        .save(&existing.path().join("identity.json"))
+        .unwrap();
+    let bridge = boot_in(existing.path());
+    assert!(bridge.init_error.is_none());
+    assert!(
+        !bridge.needs_password_setup(),
+        "a protected identity was offered setup"
+    );
+    assert!(crate::lock_identity(&bridge.identity).is_locked());
+    let h = harness_with(bridge, existing);
+    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+}
