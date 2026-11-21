@@ -331,7 +331,9 @@ impl ChatManager {
         };
 
         // Create the conversation, or reset an existing one for its new session.
-        // A new chat starts with no `peer_fingerprint`, so TOFU actually runs.
+        // A new chat starts with no `peer_fingerprint`, so TOFU actually runs:
+        // pre-filling the peer's own made the check trivially "match" and
+        // auto-trusted every caller.
         let title = format!(
             "Peer {}",
             crate::util::format_fingerprint_short(fingerprint)

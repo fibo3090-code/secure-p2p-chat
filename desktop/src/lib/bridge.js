@@ -71,6 +71,8 @@ export function friendlyError(e, fallback = "Something went wrong.") {
   return out ? `${out}.` : fallback;
 }
 
+// Tauri binds invoke keys by exact name and a mismatch is a silent no-op, so
+// command params are single words (checked by invokeContract.test.js).
 const realApi = {
   authStatus: () => invoke("auth_status"),
   unlock: (password) => invoke("unlock", { password }),

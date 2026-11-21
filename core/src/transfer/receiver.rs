@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::util::sanitize_filename;
@@ -42,6 +44,116 @@ fn reserve_unique_path(dest_dir: &Path, filename: &str) -> Result<PathBuf> {
     Err(anyhow::anyhow!(
         "could not find a free filename for {filename} after {MAX_NAME_ATTEMPTS} attempts"
     ))
+}
+
+/// Async receiver that spools to a separate `tmp_dir`. The app uses
+/// [`IncomingFileSync`] instead, whose spool shares the download directory's
+/// filesystem so that finalizing is an atomic rename.
+pub struct IncomingFile {
+    tmp_path: PathBuf,
+    file: File,
+    received: u64,
+    expected: u64,
+    filename: String,
+}
+
+impl IncomingFile {
+    /// Start receiving a file (create temporary file)
+    pub async fn start_meta(filename: &str, size: u64, tmp_dir: &Path) -> Result<Self> {
+        if size > crate::MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File size {} exceeds maximum allowed ({} bytes)",
+                size,
+                crate::MAX_FILE_SIZE
+            );
+        }
+        let safe_filename = sanitize_filename(filename);
+        tracing::info!(
+            "Starting file reception: {} ({} bytes)",
+            safe_filename,
+            size
+        );
+
+        tokio::fs::create_dir_all(tmp_dir).await?;
+        let tmp_path = tmp_dir.join(format!("tmp_{}_{}", Uuid::new_v4(), safe_filename));
+        let file = File::create(&tmp_path).await?;
+
+        Ok(Self {
+            tmp_path,
+            file,
+            received: 0,
+            expected: size,
+            filename: safe_filename,
+        })
+    }
+
+    /// Append a chunk. The overflow check precedes the write, so excess bytes
+    /// never reach the disk.
+    pub async fn append_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        let would_be = self.received.saturating_add(chunk.len() as u64);
+        if would_be > self.expected {
+            anyhow::bail!(
+                "received more data than expected: {} > {}",
+                would_be,
+                self.expected
+            );
+        }
+        self.file.write_all(chunk).await?;
+        self.received = would_be;
+        tracing::trace!("Received chunk ({}/{} bytes)", self.received, self.expected);
+        Ok(())
+    }
+
+    /// Finalize the file transfer (rename onto a name reserved with
+    /// `reserve_unique_path`).
+    pub async fn finalize(mut self, dest_dir: &Path) -> Result<PathBuf> {
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+        drop(self.file);
+
+        if self.received != self.expected {
+            anyhow::bail!(
+                "size mismatch: expected {}, got {}",
+                self.expected,
+                self.received
+            );
+        }
+
+        tokio::fs::create_dir_all(dest_dir).await?;
+        let (dir, name) = (dest_dir.to_path_buf(), self.filename.clone());
+        let final_path =
+            tokio::task::spawn_blocking(move || reserve_unique_path(&dir, &name)).await??;
+        tokio::fs::rename(&self.tmp_path, &final_path).await?;
+        tracing::info!("File saved to: {:?}", final_path);
+        Ok(final_path)
+    }
+
+    /// Abort and cleanup temporary file
+    pub async fn abort_cleanup(self) -> Result<()> {
+        drop(self.file);
+        tokio::fs::remove_file(&self.tmp_path).await.ok();
+        tracing::warn!("File transfer aborted, cleaned up temp file");
+        Ok(())
+    }
+
+    /// Get progress as percentage (0-100)
+    pub fn progress_percent(&self) -> f64 {
+        if self.expected == 0 {
+            0.0
+        } else {
+            (self.received as f64 / self.expected as f64) * 100.0
+        }
+    }
+
+    /// Get received bytes
+    pub fn received(&self) -> u64 {
+        self.received
+    }
+
+    /// Get expected size
+    pub fn expected(&self) -> u64 {
+        self.expected
+    }
 }
 
 /// An incoming file being spooled to disk.
@@ -145,6 +257,42 @@ impl IncomingFileSync {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn the_async_receiver_writes_checks_and_cleans_up() {
+        let temp_dir = TempDir::new().unwrap();
+        let taken = temp_dir.path().join("test.txt");
+        std::fs::write(&taken, b"first").unwrap();
+
+        let mut incoming = IncomingFile::start_meta("test.txt", 4, temp_dir.path())
+            .await
+            .unwrap();
+        incoming.append_chunk(b"abcd").await.unwrap();
+        let err = incoming.append_chunk(b"more").await.unwrap_err();
+        assert!(err.to_string().contains("more data than expected"));
+        assert_eq!(
+            incoming.received(),
+            4,
+            "a rejected chunk must not be counted"
+        );
+        let final_path = incoming.finalize(temp_dir.path()).await.unwrap();
+        assert_ne!(final_path, taken, "an existing file must not be replaced");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"first");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"abcd");
+
+        let mut short = IncomingFile::start_meta("short.txt", 10, temp_dir.path())
+            .await
+            .unwrap();
+        short.append_chunk(b"Hello").await.unwrap();
+        assert!(short.finalize(temp_dir.path()).await.is_err());
+
+        let spool_dir = temp_dir.path().join("spool");
+        let aborted = IncomingFile::start_meta("x.txt", 5, &spool_dir)
+            .await
+            .unwrap();
+        aborted.abort_cleanup().await.unwrap();
+        assert_eq!(std::fs::read_dir(&spool_dir).unwrap().count(), 0);
+    }
 
     #[test]
     fn test_incoming_file_roundtrip() {

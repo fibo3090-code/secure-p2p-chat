@@ -837,6 +837,24 @@ mod tests {
         assert_eq!(loaded.private_key().unwrap(), original_pem);
     }
 
+    /// The derived serde keeps the legacy file shapes: a plaintext key is read
+    /// but never written, and absent optional fields load as `None`.
+    #[test]
+    fn legacy_identity_json_loads_and_never_writes_the_plaintext_key() {
+        let identity = fresh("Legacy");
+        let pem = identity.private_key_pem_plaintext.clone().unwrap();
+        let mut json = serde_json::to_value(&identity).unwrap();
+        assert!(json.get("private_key_pem_plaintext").is_none());
+        assert!(json.get("encrypted_private_key").is_none());
+        json["private_key_pem_plaintext"] = serde_json::Value::String(pem.to_string());
+
+        let loaded: Identity = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.private_key_pem_plaintext.as_deref(), Some(&*pem));
+        assert!(loaded.encrypted_private_key.is_none() && loaded.argon_params.is_none());
+        let rewritten = serde_json::to_value(&loaded).unwrap();
+        assert!(rewritten.get("private_key_pem_plaintext").is_none());
+    }
+
     #[test]
     fn test_save_unencrypted_fails() {
         let dir = tempdir().unwrap();
