@@ -355,7 +355,62 @@ pub async fn run_client_session_multi(
     chat_id: uuid::Uuid,
     connection_password: Option<String>,
 ) -> Result<()> {
-    let (mut stream, host, port) = connect_first_reachable(targets, &to_app_tx).await?;
+    run_client_session_direct_or_relay(
+        targets,
+        None,
+        privkey,
+        to_app_tx,
+        from_app_rx,
+        file_rx,
+        confirm_rx,
+        chat_id,
+        connection_password,
+    )
+    .await
+}
+
+/// As [`run_client_session_multi`], with a relay route to fall back to when
+/// **no** direct candidate accepts a connection — a contact's saved address
+/// goes stale when the peer changes networks, and failing direct-only never
+/// tried the route that would have worked (audit NET-12). Only a failure to
+/// *open* a direct connection falls through: a session that connected and
+/// then ended is not redialled through the relay. `relay` is
+/// `(server, token)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_client_session_direct_or_relay(
+    targets: &[(String, u16)],
+    relay: Option<(String, String)>,
+    privkey: RsaPrivateKey,
+    to_app_tx: mpsc::UnboundedSender<SessionEvent>,
+    from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
+    file_rx: mpsc::Receiver<ProtocolMessage>,
+    confirm_rx: mpsc::UnboundedReceiver<bool>,
+    chat_id: uuid::Uuid,
+    connection_password: Option<String>,
+) -> Result<()> {
+    let (mut stream, host, port) = match connect_first_reachable(targets, &to_app_tx).await {
+        Ok(connected) => connected,
+        Err(direct) => {
+            let Some((server, token)) = relay else {
+                return Err(direct);
+            };
+            tracing::info!(error = %direct, relay = %server, "no direct route; falling back to the relay");
+            let _ = to_app_tx.send(SessionEvent::Warning(format!(
+                "Could not reach them directly ({direct}); trying the relay {server}…"
+            )));
+            return crate::network::relay::run_client_session_via_relay(
+                &server,
+                &token,
+                privkey,
+                to_app_tx,
+                from_app_rx,
+                file_rx,
+                confirm_rx,
+                chat_id,
+            )
+            .await;
+        }
+    };
     tracing::info!("Connected to {}:{}", host, port);
 
     run_client_session_over_stream(

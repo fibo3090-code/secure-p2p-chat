@@ -575,6 +575,104 @@ async fn a_contact_with_no_route_is_an_error_that_says_what_to_do() {
         .is_err());
 }
 
+/// Dial a contact whose invite named `invite_fp` and return the conversation
+/// with a confirm channel standing in for the session's.
+async fn dialled_contact(
+    mgr: &mut ChatManager,
+    invite_fp: &str,
+) -> (Uuid, mpsc::UnboundedReceiver<bool>) {
+    let contact = mgr.add_contact(
+        "Ann".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.into()),
+        None,
+    );
+    let chat = mgr
+        .connect_to_contact(contact, None, &throwaway_key())
+        .await
+        .unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(chat, tx);
+    (chat, rx)
+}
+
+fn last_toast(mgr: &ChatManager) -> String {
+    mgr.toasts
+        .last()
+        .map(|t| t.message.clone())
+        .unwrap_or_default()
+}
+
+/// CRYPTO-04: an invite names its maker's key. When the contact is dialled
+/// and a *different* key answers, that is not an ordinary first contact — it
+/// is a man in the middle, or not the person the invite came from — and the
+/// user must be told so, not shown the usual first-use prompt.
+#[tokio::test]
+async fn a_key_that_is_not_the_invites_is_flagged_on_first_connect() {
+    let mut mgr = ChatManager::new(Config::default());
+    let (chat, mut confirm) = dialled_contact(&mut mgr, &"aa".repeat(32)).await;
+
+    mgr.handle_tofu_verification(chat, &"bb".repeat(32), "Ann", "12-34-56");
+
+    assert!(
+        last_toast(&mgr).contains("not the one in their invite"),
+        "{}",
+        last_toast(&mgr)
+    );
+    assert!(
+        mgr.pending_fingerprint().is_some(),
+        "the user must still decide"
+    );
+    assert!(
+        confirm.try_recv().is_err(),
+        "it was answered without the user"
+    );
+    assert_eq!(
+        mgr.chats[&chat].peer_fingerprint, None,
+        "the wrong key was trusted"
+    );
+}
+
+/// The invite's own key is not *verification*: it still gets the ordinary
+/// safety-code prompt, not an automatic accept and not a warning.
+#[tokio::test]
+async fn the_invites_own_key_still_gets_the_normal_prompt() {
+    let mut mgr = ChatManager::new(Config::default());
+    let fp = "aa".repeat(32);
+    let (chat, mut confirm) = dialled_contact(&mut mgr, &fp).await;
+
+    mgr.handle_tofu_verification(chat, &fp, "Ann", "12-34-56");
+
+    assert!(mgr.pending_fingerprint().is_some());
+    assert!(
+        confirm.try_recv().is_err(),
+        "an invite was treated as verification"
+    );
+    assert!(
+        !last_toast(&mgr).contains("SECURITY WARNING"),
+        "{}",
+        last_toast(&mgr)
+    );
+}
+
+/// A mismatch takes precedence over "this key is verified elsewhere": the key
+/// that answered may belong to someone the user trusts, but it is not the
+/// contact they dialled, so it must not be silently accepted as them.
+#[tokio::test]
+async fn a_mismatch_is_not_auto_accepted_as_some_other_known_peer() {
+    let mut mgr = ChatManager::new(Config::default());
+    let other = Uuid::new_v4();
+    mgr.create_local_chat_for_test(other, "Bob".into());
+    mgr.get_chat_mut(other).unwrap().peer_fingerprint = Some("bb".repeat(32));
+    let (chat, mut confirm) = dialled_contact(&mut mgr, &"aa".repeat(32)).await;
+
+    mgr.handle_tofu_verification(chat, &"bb".repeat(32), "Ann", "12-34-56");
+
+    assert!(confirm.try_recv().is_err(), "Bob's key was accepted as Ann");
+    assert!(mgr.pending_fingerprint().is_some());
+    assert!(last_toast(&mgr).contains("not the one in their invite"));
+}
+
 #[test]
 fn parse_invite_with_valid_address_keeps_it() {
     let mgr = ChatManager::default();

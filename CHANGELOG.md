@@ -17,6 +17,12 @@ predate tagged releases.
   — chatting or transferring files in both directions — at a key rotation.
   The host could start a second rotation before the peer had switched to the
   first, discarding the key the peer's in-flight messages used. It now waits.
+- Connecting to a contact imported from an invite now checks the key that
+  answers against the one the invite named, and warns when they differ instead
+  of showing an ordinary first-contact prompt; such a key is never accepted
+  silently as some other peer you know.
+- A contact whose saved address had gone stale was never reached even when it
+  had a relay route; the relay is now tried when no direct address answers.
 - A damaged `identity.json` (a nonce of the wrong length) crashed the unlock
   instead of reporting an unreadable identity.
 - Desktop: `set_password` on an unlocked app re-protected the identity under

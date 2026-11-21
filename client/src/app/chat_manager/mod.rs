@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::core::ProtocolMessage;
 use crate::network::{
-    generate_relay_token, run_client_session_multi, run_client_session_via_relay, run_host_session,
-    run_host_session_via_relay,
+    generate_relay_token, run_client_session_direct_or_relay, run_client_session_via_relay,
+    run_host_session, run_host_session_via_relay,
 };
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
@@ -113,6 +113,12 @@ pub struct ChatManager {
     pub contacts: HashMap<Uuid, Contact>,
     /// Map contact_id -> one-to-one chat id (if any). Used to find session/chat for a contact.
     pub contact_to_chat: HashMap<Uuid, Uuid>,
+    /// The fingerprint an outgoing dial to a contact expects, keyed by the
+    /// conversation it dials into — the one the contact's invite named. Not
+    /// trust (an invite is not verification): it only turns "a different key
+    /// answered" into a warning instead of an ordinary first-use prompt
+    /// (CRYPTO-04). Consumed by the session's fingerprint check.
+    expected_fingerprints: HashMap<Uuid, String>,
     sessions: HashMap<Uuid, SessionHandle>,
     /// The spawned task driving each session, so tearing a session down actually
     /// stops it. Dropping the [`SessionHandle`] only closes the outbound
@@ -262,6 +268,7 @@ impl ChatManager {
             chats: HashMap::new(),
             contacts: HashMap::new(),
             contact_to_chat: HashMap::new(),
+            expected_fingerprints: HashMap::new(),
             sessions: HashMap::new(),
             session_tasks: HashMap::new(),
             session_events: HashMap::new(),

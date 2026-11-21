@@ -20,7 +20,7 @@ the area report for whatever you pick up → [findings-index.md](findings-index.
 | Area reports | 13 (+1 external) |
 | Findings | 348 (3 Critical, 43 High, 126 Medium, 143 Low, 33 Info) |
 | Status | ~95 % VERIFIED by tracing the code; the rest SUSPECTED and labelled |
-| Already fixed | CRYPTO-01 and QUAL-01 (see §1); 15 more and 6 in part after the test-suite audit (see §9) |
+| Already fixed | CRYPTO-01 and QUAL-01 (see §1); 17 more and 6 in part after the test-suite audit (see §9) |
 | Not covered | No dynamic testing of installers, native dialogs, real NATs, or Windows/macOS behaviour; nothing here proves the absence of other defects |
 
 The numbers overcount: the same root cause is often reported by several
@@ -233,6 +233,8 @@ unnoticed.
 | DX-14 | The `P2PEM_TEST_*` timer overrides were read by release binaries too, so the environment could shorten a real session's idle timeout; the test that sets them never restored them. Debug builds only now, restored on drop. A flaky test now fails CI (`flaky-result = "fail"`). | Read in code. | `session_e2e::idle_session_survives_past_the_idle_timeout` |
 | QUAL-20 | Startup by sleeping (relay), an upper-bound-only backpressure test that passed when the reader never ran, absence checks that passed by waiting, and an empty test. | Read in code. | relay tests via `serve_relay(listener, …)`; `outgoing_stream_is_backpressured_by_the_bounded_lane`; `client/tests/it/party.rs` (`settle` barrier) |
 | DX-12 | 21 client integration-test binaries, each linking the whole tree. Now one (`client/tests/it/`). | Measured. | — |
+| CRYPTO-04 | Dialling a contact imported from an invite recorded no expected fingerprint, so a different key answering got an ordinary first-use prompt. The dial now records the invite's key for the conversation; a different key raises a security warning naming the contact, still needs the user's decision, and is never auto-accepted as some *other* known peer. The invite's own key still gets the normal prompt — an invite is not verification. | Failed (no warning; and a key verified for another peer was accepted as the contact). | `a_key_that_is_not_the_invites_is_flagged_on_first_connect`, `a_mismatch_is_not_auto_accepted_as_some_other_known_peer`, `the_invites_own_key_still_gets_the_normal_prompt` (`chat_manager` tests) |
+| NET-12 | A contact with a stale (parseable) address and a relay route was dialled direct-only and never reached. The direct candidates are tried first and the relay is used when none accepts a connection — into the same conversation, which now reads `Relay`. A session that connected and later ended is not redialled. | Timed out (90 s) before; connects in about 1 s after. | `client/tests/it/reconnect.rs::a_contact_whose_address_went_stale_is_reached_through_its_relay` |
 | UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
 
 ### Partly fixed
@@ -241,30 +243,17 @@ unnoticed.
 |---|---|---|
 | QUAL-19 | One shared client harness; hosts and relays bind port 0 in tests. | `punch.rs` tests still pick a free port and rebind — a hole punch needs a chosen port, so the race is inherent there. No cached RSA test keys (nextest runs a process per test, so a cache would not survive between tests). |
 | TUI-22 | Tests are hermetic. | The TUI still has no data-dir override, so two TUI peers cannot run on one machine. |
-| CRYPTO-17 | Tests for reflected frames, several rekeys with traffic both ways, and a malformed identity nonce. | No test for an invite-fingerprint mismatch on first connect (that is CRYPTO-04, still open), a peer reusing our own ephemeral key, or history rollback (CRYPTO-09, still open). |
-| NET-22 | Reflection, crossing rekeys, silent connection in the handshake (already present). | Relay re-registration of a token, per-IP pending-slot cap, punch tag replay, split punch verdicts, password over relay, stale direct addresses reaching the relay (NET-12), peers confirming more than the idle timeout apart. |
-| TAURI-27 | `open_file` refusal of received executables, `file_preview` (SVG refused, 4 MiB cap), `set_password`/`unlock` on a ready app. | `party_join` two-step at the bridge level, `state_signature` sensitivity, `party_send_file`/`party_download_file`, `pick_upload`'s size cap. |
+| CRYPTO-17 | Tests for reflected frames, several rekeys with traffic both ways, a malformed identity nonce, and an invite-fingerprint mismatch on first connect (CRYPTO-04). | No test for a peer reusing our own ephemeral key, or for history rollback (CRYPTO-09, still open). |
+| NET-22 | Reflection, crossing rekeys, silent connection in the handshake (already present), stale direct addresses reaching the relay (NET-12). | Relay re-registration of a token, per-IP pending-slot cap, punch tag replay, split punch verdicts, password over relay, peers confirming more than the idle timeout apart. |
+| TAURI-27 | `open_file` refusal of received executables, `file_preview` (SVG refused, 4 MiB cap), `set_password`/`unlock` on a ready app, `party_join`'s two steps against a real server (pin written only after a real join), the upload size cap and download core behind the native dialogs, `state_signature` sensitivity, save coalescing, prompt publishing, auto-rehost. | The native dialogs themselves (cannot open headless). |
 | UI-37 | UI-03, UI-04, UI-05, UI-08 and UI-11 each have a test (and a fix). | Smoke tests still cover first paint only, not a flow. |
 
 ### Confirmed still open
 
-These were confirmed while auditing the tests. They are not fixed, because they
-change the trust or dial behaviour rather than the tests:
-
-- **CRYPTO-04 (Medium, security).** Dialling a contact imported from an invite
-  records no expected fingerprint. If a different key answers, the user sees an
-  ordinary first-use safety-code prompt, not "this is not the key in your
-  invite". Confirmed by reading `connect_to_contact` and
-  `handle_tofu_verification`: neither has an expected-fingerprint path.
-- **NET-12 (Low).** `connect_to_contact` uses the relay only when the contact
-  has *no* parseable address. A contact with a stale but parseable address and a
-  relay token is dialled directly, the dial fails, and the relay is never tried.
-  Confirmed by reading the code. The new test
-  `connecting_to_a_contact_dials_into_its_existing_conversation` covers only
-  the unparseable-address case.
-- **CRYPTO-09 (Low, security).** The history file has no rollback protection.
-  An older `history.json.enc` loads normally and restores revoked trust and
-  lifted blocks. Unchanged.
+- **CRYPTO-09 (Low, security).** The history file has no rollback protection:
+  an older `history.json.enc` loads normally and restores revoked trust and
+  lifted blocks. Fixing it needs a generation counter kept in `identity.json`,
+  a format change rather than a test.
 
 ## Method and limits
 

@@ -109,3 +109,78 @@ async fn redialing_a_verified_peer_continues_the_same_conversation() {
     )
     .await;
 }
+
+/// NET-12: a contact can carry both a direct address and a relay route. When
+/// the address has gone stale (the peer changed networks), the dial must fall
+/// through to the relay — into the same conversation — instead of failing
+/// direct-only and never trying the route that would have worked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contact_whose_address_went_stale_is_reached_through_its_relay() {
+    use messenger_core::network::{
+        generate_relay_token, serve_relay, NO_HOLEPUNCH_ENV, RELAY_WAIT_TIMEOUT,
+    };
+    use messenger_core::types::Transport;
+
+    // Bridged, so the route that won is unambiguous. Restored on the way out.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::env::remove_var(NO_HOLEPUNCH_ENV);
+        }
+    }
+    let _restore = Restore;
+    std::env::set_var(NO_HOLEPUNCH_ENV, "1");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let relay = listener.local_addr().expect("addr").to_string();
+    tokio::spawn(serve_relay(listener, RELAY_WAIT_TIMEOUT));
+
+    let host_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+    let mut host = manager_in(host_dir.path());
+    let mut client = manager_in(client_dir.path());
+    let token = generate_relay_token();
+    host.start_host_via_relay(&relay, Some(token.clone()), rsa_key())
+        .await
+        .expect("host on the relay");
+
+    // A port nothing listens on any more: the contact's stale address.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let contact = client.add_contact("Moved".into(), Some(dead.to_string()), None, None);
+    {
+        let c = client.contacts.get_mut(&contact).unwrap();
+        c.relay_server = Some(relay.clone());
+        c.relay_token = Some(token);
+    }
+    let chat = client
+        .connect_to_contact(contact, None, &rsa_key())
+        .await
+        .expect("dial the contact");
+
+    pump_pair(&mut host, &mut client, "both prompts", |h, c| {
+        h.pending_fingerprint().is_some() && c.pending_fingerprint().is_some()
+    })
+    .await;
+    let prompt = host.pending_fingerprint().unwrap().session_id;
+    host.confirm_fingerprint(prompt, true).unwrap();
+    let prompt = client.pending_fingerprint().unwrap().session_id;
+    client.confirm_fingerprint(prompt, true).unwrap();
+    pump_pair(
+        &mut host,
+        &mut client,
+        "connected through the relay",
+        |_, c| c.is_connected(&chat),
+    )
+    .await;
+    assert_eq!(
+        client.chats[&chat].transport,
+        Transport::Relay,
+        "the conversation must say which route it is on"
+    );
+    assert_eq!(client.contact_to_chat.get(&contact), Some(&chat));
+}

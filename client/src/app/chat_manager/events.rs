@@ -88,6 +88,31 @@ impl ChatManager {
             session_id,
         };
 
+        // The key the contact's invite named, if this conversation was dialled
+        // from a contact and has no verified key yet. Used once.
+        let expected = self.expected_fingerprints.remove(&chat_id);
+        if stored.is_none() {
+            if let Some(expected) = expected.filter(|e| !e.eq_ignore_ascii_case(fingerprint)) {
+                tracing::warn!(
+                    %chat_id,
+                    expected = %expected,
+                    presented = %fingerprint,
+                    "FINGERPRINT DOES NOT MATCH THE INVITE"
+                );
+                // Takes precedence over auto-accepting a peer known from
+                // elsewhere: whoever answered is not the contact dialled.
+                self.queue_fingerprint_request(prompt);
+                self.add_toast(
+                    ToastLevel::Warning,
+                    format!(
+                        "SECURITY WARNING: {} answered with a key that is not the one in their invite",
+                        peer_name
+                    ),
+                );
+                return;
+            }
+        }
+
         match stored.as_deref() {
             Some(known) if known == fingerprint => {
                 tracing::debug!(%chat_id, "Fingerprint matches stored value; proceeding");
@@ -181,6 +206,7 @@ impl ChatManager {
             SessionEvent::Connected { peer } => {
                 tracing::info!("Session {} connected to {}", chat_id, peer);
                 let hole_punched = is_hole_punched(&peer);
+                let relayed = peer.starts_with("relay:");
                 if hole_punched {
                     self.add_toast(
                         ToastLevel::Success,
@@ -198,8 +224,13 @@ impl ChatManager {
                         chat.title = peer;
                     }
                     chat.is_host_placeholder = false;
+                    // The label says which route won; a dial that fell back
+                    // from a dead direct address to the relay must not still
+                    // read as Direct.
                     if hole_punched {
                         chat.transport = Transport::Direct;
+                    } else if relayed {
+                        chat.transport = Transport::Relay;
                     }
                     // A fresh session restarts the wire sequence at 1, but this
                     // chat's high-water mark is left over from the previous

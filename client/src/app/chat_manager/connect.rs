@@ -334,6 +334,19 @@ impl ChatManager {
         existing_chat_id: Option<Uuid>,
         privkey: RsaPrivateKey,
     ) -> Result<Uuid> {
+        self.dial_candidates(targets, None, existing_chat_id, privkey)
+            .await
+    }
+
+    /// Dial the direct candidates in order, falling back to `relay`
+    /// (`(server, token)`) only when none of them accepts a connection.
+    async fn dial_candidates(
+        &mut self,
+        targets: Vec<(String, u16)>,
+        relay: Option<(String, String)>,
+        existing_chat_id: Option<Uuid>,
+        privkey: RsaPrivateKey,
+    ) -> Result<Uuid> {
         let (host, port) = targets
             .first()
             .cloned()
@@ -343,8 +356,9 @@ impl ChatManager {
 
         let password = self.connection_password.clone();
         self.spawn_session(chat_id, "Connection failed", move |ch| async move {
-            run_client_session_multi(
+            run_client_session_direct_or_relay(
                 &targets,
+                relay,
                 privkey,
                 ch.to_app_tx,
                 ch.from_app_rx,
@@ -494,9 +508,15 @@ impl ChatManager {
             .filter_map(|a| Self::parse_address(a).ok())
             .collect();
 
+        let relay = contact
+            .relay_server
+            .clone()
+            .zip(contact.relay_token.clone());
         let chat_id = if !candidates.is_empty() {
-            tracing::info!(%contact_id, candidates = candidates.len(), "Connecting to contact by address");
-            self.connect_to_host_candidates(candidates, target, privkey.clone())
+            tracing::info!(%contact_id, candidates = candidates.len(), relay = relay.is_some(), "Connecting to contact by address");
+            // The relay rides along as the fallback: a saved address goes
+            // stale when the peer changes networks (NET-12).
+            self.dial_candidates(candidates, relay, target, privkey.clone())
                 .await?
         } else if let (Some(server), Some(token)) = (&contact.relay_server, &contact.relay_token) {
             tracing::info!(%contact_id, relay = %server, "Connecting to contact via relay");
@@ -512,6 +532,21 @@ impl ChatManager {
             );
         };
         self.associate_contact_with_chat(contact_id, chat_id);
+        // The invite named a key. If the conversation has not verified one yet,
+        // the key that answers is checked against it (see
+        // `handle_tofu_verification`); a verified one is checked already.
+        let unverified = self
+            .chats
+            .get(&chat_id)
+            .is_some_and(|c| c.peer_fingerprint.is_none());
+        match contact.fingerprint {
+            Some(fp) if unverified => {
+                self.expected_fingerprints.insert(chat_id, fp);
+            }
+            _ => {
+                self.expected_fingerprints.remove(&chat_id);
+            }
+        }
         Ok(chat_id)
     }
 }

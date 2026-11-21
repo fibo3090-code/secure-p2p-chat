@@ -65,7 +65,7 @@ prioritised view is in [README.md](README.md).
 | APP-09 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Chunked-text reassembly is bounded by message count, not bytes (hundreds of MiB per chat) |
 | APP-10 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party `connect_and_join` has no TCP connect timeout, and the desktop holds the `PartyManager` lock across it |
 | CRYPTO-03 | Medium | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Both directions share one key and one AAD, and decrypt never checks the role bit, so frames can be reflected |
-| CRYPTO-04 | Medium | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
+| CRYPTO-04 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
 | CRYPTO-05 | Medium | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The connection password is sent to an unverified host |
 | CRYPTO-06 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A second rekey can overwrite the retained old key while old-key frames are still in flight |
 | DOC-08 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
@@ -229,7 +229,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-20 | Low | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Server and tools defaults: relative data dir, password visible in process list, no Intel macOS tools |
 | JOURNEY-21 | Low | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Relative-path fallback when no data directory resolves |
 | NET-11 | Low | VERIFIED | S | [02-network](reports/02-network.md) | The connection password is silently ignored for relay-hosted sessions |
-| NET-12 | Low | VERIFIED | S | [02-network](reports/02-network.md) | `connect_to_contact` never falls back to the relay when direct addresses fail |
+| NET-12 | Low | Fixed | S | [02-network](reports/02-network.md) | `connect_to_contact` never falls back to the relay when direct addresses fail |
 | NET-13 | Low | VERIFIED | S | [02-network](reports/02-network.md) | A UPnP / NAT-PMP mapping that fails the routable check is created and then leaked |
 | NET-14 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Client-side relay I/O has no timeouts |
 | NET-15 | Low | SUSPECTED | M | [02-network](reports/02-network.md) | Punch outcome is decided per client, not by the server, so split verdicts break both peers |
