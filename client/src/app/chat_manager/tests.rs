@@ -445,6 +445,181 @@ async fn connect_to_blocked_contact_is_refused() {
     assert!(err.to_string().contains("blocked"));
 }
 
+/// CRYPTO-04. Dial a contact imported from an invite for key K1 and have K2
+/// answer. Without an expected fingerprint the new chat started with
+/// `peer_fingerprint: None`, so whatever key answered was shown as an ordinary
+/// first-use prompt — the out-of-band invite did nothing to stop a MITM.
+#[tokio::test]
+async fn dialing_an_invited_contact_warns_when_a_different_key_answers() {
+    let invite_fp = "aa".repeat(32);
+    let presented_fp = "bb".repeat(32);
+    let mut mgr = ChatManager::new(Config::default());
+    // Nothing listens on port 1: the session task fails in the background, but
+    // the handshake's outcome is what is driven here.
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.clone()),
+        None,
+    );
+    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+
+    mgr.handle_tofu_verification(chat_id, &presented_fp, "127.0.0.1:1", "123456 🎃🎈🎁");
+
+    let prompt = mgr
+        .pending_fingerprint()
+        .expect("a key that is not the invite's must be put to the user");
+    assert_eq!(prompt.fingerprint, presented_fp);
+    assert_eq!(
+        prompt.warning,
+        Some(FingerprintWarning::InviteMismatch {
+            contact_id,
+            contact_name: "Alice".into(),
+            expected: invite_fp.clone(),
+        }),
+        "the prompt must say the key differs from the invite, not ask a first-use question"
+    );
+    assert!(
+        mgr.get_chat(chat_id).unwrap().peer_fingerprint.is_none(),
+        "nothing is trusted before the user decides"
+    );
+    assert_eq!(
+        mgr.get_contact(contact_id).unwrap().fingerprint.as_deref(),
+        Some(invite_fp.as_str()),
+        "the contact keeps the invite's key until the user accepts another"
+    );
+}
+
+/// The other half of CRYPTO-04: the invite's key answering is *not*
+/// verification. It gets the ordinary SAS prompt, with no warning, and is not
+/// auto-accepted.
+#[tokio::test]
+async fn dialing_an_invited_contact_still_prompts_when_the_invite_key_answers() {
+    let invite_fp = "aa".repeat(32);
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.clone()),
+        None,
+    );
+    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+
+    mgr.handle_tofu_verification(chat_id, &invite_fp, "127.0.0.1:1", "123456 🎃🎈🎁");
+
+    let prompt = mgr
+        .pending_fingerprint()
+        .expect("an invite is not verification: the SAS must still be compared");
+    assert_eq!(prompt.session_id, chat_id);
+    assert_eq!(
+        prompt.warning, None,
+        "a matching key is an ordinary first use"
+    );
+    assert!(mgr.get_chat(chat_id).unwrap().peer_fingerprint.is_none());
+    assert_eq!(
+        mgr.get_contact(contact_id).unwrap().trust_state,
+        TrustState::Unverified
+    );
+}
+
+/// Auto-trust on first use is a convenience for peers nobody vouched for. It
+/// must not wave through a key that contradicts the invite the user imported.
+#[tokio::test]
+async fn auto_trust_does_not_accept_a_key_that_contradicts_the_invite() {
+    let invite_fp = "aa".repeat(32);
+    let presented_fp = "bb".repeat(32);
+    let mut mgr = ChatManager::new(Config {
+        auto_trust_on_first_use: true,
+        ..Config::default()
+    });
+    // A chat elsewhere already trusts K2, which would also make it "known".
+    let elsewhere = Uuid::new_v4();
+    mgr.create_local_chat_for_test(elsewhere, "Someone".into());
+    mgr.get_chat_mut(elsewhere).unwrap().peer_fingerprint = Some(presented_fp.clone());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.clone()),
+        None,
+    );
+    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+
+    mgr.handle_tofu_verification(chat_id, &presented_fp, "127.0.0.1:1", "123456 🎃🎈🎁");
+
+    assert!(matches!(
+        mgr.pending_fingerprint().map(|p| &p.warning),
+        Some(Some(FingerprintWarning::InviteMismatch { .. }))
+    ));
+    assert!(mgr.get_chat(chat_id).unwrap().peer_fingerprint.is_none());
+}
+
+/// Accepting a key after being told it is not the invite's is the user's
+/// decision, made by comparing the SAS. The contact must follow it: left on
+/// the invite's key, a later block would block a key that never connects,
+/// and every reconnect would warn about the key the user already accepted.
+#[tokio::test]
+async fn accepting_a_key_over_the_invite_warning_rebinds_the_contact() {
+    let invite_fp = "aa".repeat(32);
+    let presented_fp = "bb".repeat(32);
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.clone()),
+        None,
+    );
+    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+    mgr.handle_tofu_verification(chat_id, &presented_fp, "127.0.0.1:1", "123456 🎃🎈🎁");
+
+    mgr.confirm_fingerprint(chat_id, true).unwrap();
+
+    assert_eq!(
+        mgr.get_chat(chat_id).unwrap().peer_fingerprint.as_deref(),
+        Some(presented_fp.as_str())
+    );
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.fingerprint.as_deref(), Some(presented_fp.as_str()));
+    assert_eq!(contact.trust_state, TrustState::Verified);
+}
+
+/// A prompt for a conversation whose key changed says so in the prompt itself,
+/// not only in a toast that disappears after four seconds.
+#[test]
+fn a_changed_key_prompt_carries_the_previous_fingerprint() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Bob".into());
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("OLD-FP".into());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(chat_id, tx);
+
+    mgr.handle_tofu_verification(chat_id, "NEW-FP", "Bob", "");
+
+    assert_eq!(
+        mgr.pending_fingerprint().unwrap().warning,
+        Some(FingerprintWarning::KeyChanged {
+            previous: "OLD-FP".into()
+        })
+    );
+    assert!(rx.try_recv().is_err());
+}
+
 #[test]
 fn parse_invite_with_valid_address_keeps_it() {
     let mgr = ChatManager::default();
@@ -1941,6 +2116,7 @@ fn delete_all_data_removes_files_and_clears_state() {
         peer_name: "peer".to_string(),
         sas: String::new(),
         session_id: chat_id,
+        warning: None,
     });
 
     mgr.delete_all_data(&data_dir, &history_path, &identity_path)

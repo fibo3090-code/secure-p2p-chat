@@ -105,6 +105,42 @@ pub struct PendingFingerprint {
     pub sas: String,
     /// Session id the accept/reject decision must be routed to.
     pub session_id: Uuid,
+    /// Why this prompt is not an ordinary first use, if it is not. A UI must
+    /// lead with it: the SAS still decides, but a user who was told "this is
+    /// not the key you expected" compares it very differently from one who
+    /// was told nothing.
+    pub warning: Option<FingerprintWarning>,
+}
+
+/// What makes a TOFU prompt a warning rather than a first-use question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FingerprintWarning {
+    /// This conversation already trusted a different key.
+    KeyChanged {
+        /// The fingerprint the conversation stored.
+        previous: String,
+    },
+    /// The peer was dialled as a contact whose invite named a different key.
+    ///
+    /// The invite's fingerprint is only ever the *expected* value — an invite
+    /// is not verification — but a different key answering where it should
+    /// have been is exactly what an interposed attacker looks like.
+    InviteMismatch {
+        contact_id: Uuid,
+        contact_name: String,
+        /// The fingerprint the contact's invite named.
+        expected: String,
+    },
+}
+
+/// The fingerprint a session is expected to present, because the user dialled
+/// it as a contact that carries one. Session-only: never persisted, never
+/// trusted on its own.
+#[derive(Clone, Debug)]
+pub(super) struct ExpectedPeer {
+    pub(super) contact_id: Uuid,
+    pub(super) contact_name: String,
+    pub(super) fingerprint: String,
 }
 
 /// Main chat manager - orchestrates sessions, messages, and file transfers
@@ -172,6 +208,12 @@ pub struct ChatManager {
     /// (the session died) — never by merely reading them, so a UI that polls
     /// cannot consume a prompt it has not yet answered.
     fingerprint_verification_requests: VecDeque<PendingFingerprint>,
+    /// The fingerprint each outgoing session to a contact should present,
+    /// keyed by session id (see [`ExpectedPeer`]). Set by
+    /// `connect_to_contact`, dropped by `teardown_session`. A different key
+    /// answering takes the warning path in `handle_tofu_verification`; a
+    /// matching one still gets the ordinary SAS prompt.
+    pub(super) expected_fingerprints: HashMap<Uuid, ExpectedPeer>,
     pub history_key: Option<[u8; 32]>,
     /// Why the history file on disk could not be loaded, if it could not.
     ///
@@ -278,6 +320,7 @@ impl ChatManager {
             toasts: Vec::new(),
             config,
             fingerprint_verification_requests: VecDeque::new(),
+            expected_fingerprints: HashMap::new(),
             fingerprint_confirm_senders: HashMap::new(),
             history_key: None,
             history_load_error: None,
@@ -691,6 +734,7 @@ impl ChatManager {
         self.session_events.remove(&session_id);
         self.fingerprint_confirm_senders.remove(&session_id);
         self.drop_fingerprint_requests_for_session(session_id);
+        self.expected_fingerprints.remove(&session_id);
         self.pending_text_sends.remove(&session_id);
         self.pending_file_sends.remove(&session_id);
         self.awaiting_ack.retain(|(sid, _), _| *sid != session_id);
@@ -807,6 +851,7 @@ impl ChatManager {
         self.incoming_text_messages.clear();
         self.toasts.clear();
         self.fingerprint_verification_requests.clear();
+        self.expected_fingerprints.clear();
 
         if !history_path.as_os_str().is_empty() && self.history_key.is_some() {
             // An unreadable file is moved aside, not cleared over: "clear my
