@@ -7,7 +7,7 @@
 // reach the composer without crossing twenty controls.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const bridge = vi.hoisted(() => ({ api: {}, real: null }));
@@ -68,10 +68,21 @@ describe("App — boot", () => {
     await screen.findByRole("navigation", { name: "Primary" });
   });
 
-  it("reports a failed handshake and keeps retrying", async () => {
-    installApi({ authStatus: async () => { throw new Error("the backend did not respond"); } });
+  it("reports a failed handshake and keeps retrying until the backend answers", async () => {
+    // It used to assert only the error text, which passes for a shell that
+    // gives up after one try. The retry is the point: the backend can be slow
+    // to come up, and a window stuck on an error until restarted is broken.
+    let calls = 0;
+    const authStatus = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("the backend did not respond");
+      return ready;
+    });
+    readyApi({ authStatus });
     render(<App />);
     expect(await screen.findByText(/did not respond/)).toBeTruthy();
+    await screen.findByRole("navigation", { name: "Primary" }, { timeout: 3000 });
+    expect(authStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("refuses to continue past an unreadable identity, and offers no retry", async () => {
@@ -208,4 +219,37 @@ describe("App — conversation switching", () => {
     await waitFor(() => expect(api.sendMessage).toHaveBeenCalled());
     expect(api.sendMessage.mock.calls.every(([id]) => id === "chat-2")).toBe(true);
   });
+
+  // A send the backend refuses must keep the text: the composer is the only
+  // copy of it, and the error is the only sign anything went wrong.
+  it("keeps the draft when a send is refused, and says why", async () => {
+    readyApi({
+      getConversation: detail("chat-1", "Alice"),
+      sendMessage: vi.fn(async () => { throw "Not connected — this conversation has no session"; }),
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByText("hi from Alice");
+    const box = document.getElementById("composer-input");
+    await userEvent.type(box, "do not lose me{Enter}");
+    await waitFor(() => expect(box.value).toBe("do not lose me"));
+    const { subscribe } = await import("./lib/toast.js");
+    let shown = [];
+    subscribe((l) => { shown = l; })();
+    expect(shown.some((t) => t.level === "error" && /Not connected/.test(t.message))).toBe(true);
+  });
+
+  it("deleting the open conversation closes it", async () => {
+    const api = readyApi({ getConversation: detail("chat-1", "Alice"), deleteChat: vi.fn(async () => {}) });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByText("hi from Alice");
+    await userEvent.click(screen.getByRole("button", { name: "More" }));
+    await userEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete conversation" });
+    await userEvent.click(within(dialog).getByRole("button", { name: /Delete/ }));
+    await waitFor(() => expect(api.deleteChat).toHaveBeenCalledWith("chat-1"));
+    await waitFor(() => expect(screen.queryByText("hi from Alice")).toBeNull());
+  });
 });
+

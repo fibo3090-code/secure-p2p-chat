@@ -7,7 +7,7 @@
 // undo, and an Export button with no indication either way says nothing.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const bridge = vi.hoisted(() => ({ api: {}, real: null }));
@@ -171,4 +171,80 @@ describe("Settings", () => {
     expect(api.deleteAllData).toHaveBeenCalledWith("correct horse battery", "DELETE");
     expect(await screen.findByText(/Everything has been deleted/)).toBeTruthy();
   });
+
+  // Changing the one password the app has. The floor is the bridge's real
+  // rule, a mismatch must not reach the bridge, a refusal (wrong current
+  // password) stays on screen, and typed passwords do not outlive the dialog
+  // — it stays mounted, so leaving them in state left them in the DOM.
+  it("changes the password only when the new one is valid and confirmed", async () => {
+    const changePassword = vi.fn(async (current) => {
+      if (current !== "the-current-password") throw "Current password is incorrect";
+    });
+    installApi({ getSettings: settings, changePassword });
+    render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
+    const open = async () => {
+      await screen.findAllByRole("button", { name: /^Change$/ });
+      const passwordRow = screen.getByText(/Unlocks this device's identity file/).closest(".set-row");
+      await userEvent.click(within(passwordRow).getByRole("button", { name: /^Change$/ }));
+      return {
+        current: screen.getByPlaceholderText("Current password"),
+        next: screen.getByPlaceholderText(/New password \(at least 12 characters\)/),
+        confirm: screen.getByPlaceholderText("Repeat the new password"),
+        submit: screen.getByRole("button", { name: "Change password" }),
+      };
+    };
+
+    let f = await open();
+    await userEvent.type(f.current, "the-current-password");
+    await userEvent.type(f.next, "short");
+    expect(await screen.findByText(/At least 12 characters/)).toBeTruthy();
+    expect(f.submit.disabled).toBe(true);
+    await userEvent.clear(f.next);
+    await userEvent.type(f.next, "a-long-new-password");
+    await userEvent.type(f.confirm, "a-different-one!!");
+    expect(await screen.findByText(/don't match/)).toBeTruthy();
+    expect(f.submit.disabled).toBe(true);
+    expect(changePassword).not.toHaveBeenCalled();
+
+    // Closing clears what was typed.
+    await userEvent.keyboard("{Escape}");
+    f = await open();
+    expect([f.current.value, f.next.value, f.confirm.value]).toEqual(["", "", ""]);
+
+    // A refusal is shown and the dialog stays open.
+    await userEvent.type(f.current, "a-wrong-password");
+    await userEvent.type(f.next, "a-long-new-password");
+    await userEvent.type(f.confirm, "a-long-new-password");
+    await userEvent.click(f.submit);
+    expect(await screen.findByText(/Current password is incorrect/)).toBeTruthy();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+
+    await userEvent.clear(f.current);
+    await userEvent.type(f.current, "the-current-password");
+    await userEvent.click(f.submit);
+    await waitFor(() =>
+      expect(changePassword).toHaveBeenLastCalledWith("the-current-password", "a-long-new-password"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(toasts().some((t) => t.message.includes("Password changed"))).toBe(true);
+  });
+
+  it("exports the identity backup and diagnostics through the bridge", async () => {
+    const api = installApi({
+      getSettings: settings,
+      exportIdentity: "/backups/p2pem-identity-backup.json",
+      exportDiagnostics: "/data/diagnostics/bundle-1",
+    });
+    render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: /Export now/ }));
+    await waitFor(() => expect(api.exportIdentity).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(toasts().some((t) => t.message.includes("/backups/p2pem-identity-backup.json"))).toBe(true));
+    // The settings are re-read so the row can say a backup now exists.
+    expect(api.getSettings.mock.calls.length).toBeGreaterThan(1);
+
+    await userEvent.click(screen.getByRole("button", { name: /^Export$/ }));
+    await waitFor(() =>
+      expect(toasts().some((t) => t.message.includes("/data/diagnostics/bundle-1"))).toBe(true));
+  });
 });
+

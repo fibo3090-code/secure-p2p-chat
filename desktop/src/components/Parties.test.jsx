@@ -281,3 +281,70 @@ describe("Parties — a joined community", () => {
     expect(composer().disabled).toBe(true);
   });
 });
+
+describe("Parties — managing a community", () => {
+  // Leaving forgets the server's pinned fingerprint, so rejoining is an
+  // unverified first contact again: one click must not do it.
+  it("leaves only on a second click, and says what the second click costs", async () => {
+    const api = installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
+    render(<Parties />);
+    const leave = await screen.findByTitle("Leave this community");
+    await userEvent.click(leave);
+    expect(api.partyLeave).not.toHaveBeenCalled();
+    expect(leave.getAttribute("title")).toMatch(/forgets the server's verified fingerprint/);
+    await userEvent.click(leave);
+    await waitFor(() => expect(api.partyLeave).toHaveBeenCalledWith("s1"));
+  });
+
+  it("deletes a channel and its history only on a second click", async () => {
+    const api = installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
+    render(<Parties />);
+    const del = await screen.findByTitle("Delete #general");
+    await userEvent.click(del);
+    expect(api.partyDeleteChannel).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByTitle(/Click again to delete #general/));
+    await waitFor(() => expect(api.partyDeleteChannel).toHaveBeenCalledWith("s1", "ch1"));
+  });
+
+  it("creates a channel from the box", async () => {
+    const api = installApi({ partyList: [joinedServer], partySaved: [], partyHistory: [] });
+    render(<Parties />);
+    await userEvent.type(await screen.findByPlaceholderText("new channel"), "ops{Enter}");
+    await waitFor(() => expect(api.partyCreateChannel).toHaveBeenCalledWith("s1", "ops"));
+  });
+
+  // A message card names its file in `text`; reading only `name` saved
+  // every download as "undefined". The click must also visibly work, and a
+  // second click while it runs must not queue another request.
+  it("downloads a file under its own name, once, showing that it is working", async () => {
+    let finish;
+    const partyDownloadFile = vi.fn(() => new Promise((r) => { finish = r; }));
+    installApi({
+      partyList: [joinedServer], partySaved: [],
+      partyHistory: [{ sender_name: "nova", from_me: false, kind: "file", text: "report.pdf",
+        size: 2048, hash: "ab".repeat(32), timestamp: Date.now() }],
+      partyDownloadFile,
+    });
+    render(<Parties />);
+    await userEvent.click(await screen.findByTitle("Download report.pdf"));
+    expect(partyDownloadFile).toHaveBeenCalledWith("s1", "ab".repeat(32), "report.pdf");
+    const busy = await screen.findByTitle("Downloading…");
+    expect(busy.disabled).toBe(true);
+    await userEvent.click(busy);
+    expect(partyDownloadFile).toHaveBeenCalledTimes(1);
+    finish();
+    expect(await screen.findByTitle("Download report.pdf")).toBeTruthy();
+  });
+
+  it("explains a rejected join and offers to rejoin with the address filled in", async () => {
+    installApi({
+      partyList: [{ ...joinedServer, status: "rejected", status_detail: "wrong password" }],
+      partySaved: [], partyHistory: [],
+    });
+    render(<Parties />);
+    expect((await screen.findAllByText(/Join rejected: wrong password/)).length).toBeGreaterThan(0);
+    await userEvent.click(screen.getByRole("button", { name: /Rejoin/ }));
+    expect(await screen.findByDisplayValue("10.0.0.5:12345")).toBeTruthy();
+    expect(screen.getByDisplayValue("you")).toBeTruthy();
+  });
+});
