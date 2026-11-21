@@ -197,10 +197,6 @@ impl ChatManager {
         };
     }
 
-    pub fn ui_presence(&self) -> UiPresence {
-        self.presence
-    }
-
     /// Whether an arriving message in `chat_id` warrants a desktop notification:
     /// enabled, and not for the conversation on screen.
     pub fn should_notify_for(&self, chat_id: Uuid) -> bool {

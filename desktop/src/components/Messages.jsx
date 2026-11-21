@@ -3,7 +3,7 @@ import { memo, useCallback, useMemo, useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { api, fmtDay, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
-import { cx, Avatar, IconButton, Button, Modal, TrustBadge, TransportBadge } from "./ui.jsx";
+import { cx, Avatar, IconButton, Button, Modal, TrustBadge, TransportBadge, usePopover } from "./ui.jsx";
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const isImageName = (name) => IMAGE_RE.test(name || "");
@@ -35,14 +35,7 @@ function LinkifiedText({ text }) {
 }
 
 function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
+  const [open, setOpen, ref] = usePopover();
   const item = (fn) => () => { setOpen(false); fn && fn(contact); };
   return (
     <div className="chat-head-actions">

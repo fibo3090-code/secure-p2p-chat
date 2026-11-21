@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onBridge, summaryToConv, chatToContact, friendlyError } from "./lib/bridge.js";
 import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
-import { cx, Avatar } from "./components/ui.jsx";
+import { cx, Avatar, usePopover } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
 import { BootScreen, LockScreen, SetPasswordScreen, BackupPrompt } from "./components/Onboarding.jsx";
 import { Creator } from "./components/Creator.jsx";
@@ -31,14 +31,7 @@ function RailBtn({ icon, label, active, onClick, badge }) {
 }
 
 function ThemeMenu({ theme, setTheme }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
+  const [open, setOpen, ref] = usePopover();
   return (
     <div className="theme-wrap" ref={ref}>
       <button className="tb-icon" title="Theme" onClick={() => setOpen((o) => !o)}>

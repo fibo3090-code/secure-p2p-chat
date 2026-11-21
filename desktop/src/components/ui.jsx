@@ -5,6 +5,19 @@ import { Icon } from "../lib/Icon.jsx";
 
 export const cx = (...a) => a.filter(Boolean).join(" ");
 
+/// Open/closed state for a popover that closes on a click outside `ref`.
+export function usePopover() {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [open]);
+  return [open, setOpen, ref];
+}
+
 export function Button({ children, variant = "primary", size = "md", icon, iconRight, full, ...rest }) {
   return (
     <button className={cx("btn", "btn-" + variant, "btn-" + size, full && "btn-full")} {...rest}>

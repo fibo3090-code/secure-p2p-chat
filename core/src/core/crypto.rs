@@ -29,13 +29,6 @@ pub fn generate_rsa_keypair(bits: usize) -> Result<RsaPrivateKey> {
     RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| anyhow!("RSA keygen failed: {}", e))
 }
 
-/// Generate RSA keypair asynchronously (non-blocking for GUI)
-pub async fn generate_rsa_keypair_async(bits: usize) -> Result<RsaPrivateKey> {
-    tokio::task::spawn_blocking(move || generate_rsa_keypair(bits))
-        .await
-        .map_err(|e| anyhow!("Task join error: {}", e))?
-}
-
 /// Export RSA public key to PEM format
 pub fn pem_encode_public(pubkey: &RsaPublicKey) -> Result<String> {
     pubkey
@@ -269,21 +262,6 @@ pub fn ed25519_public_to_hex(vkey: &Ed25519VerifyingKey) -> String {
 pub fn ed25519_public_from_hex(hex_str: &str) -> Result<Ed25519VerifyingKey> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
     ed25519_public_from_bytes(&bytes)
-}
-
-/// Export Ed25519 private key to hex format (32 bytes) - CAREFUL: SENSITIVE DATA
-pub fn ed25519_private_to_hex(skey: &Ed25519SigningKey) -> String {
-    hex::encode(skey.to_bytes())
-}
-
-/// Import Ed25519 private key from hex format
-pub fn ed25519_private_from_hex(hex_str: &str) -> Result<Ed25519SigningKey> {
-    let bytes = hex::decode(hex_str).map_err(|e| anyhow!("Hex decode failed: {}", e))?;
-    let key_bytes: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("Ed25519 private key must be 32 bytes, got {}", bytes.len()))?;
-    Ok(Ed25519SigningKey::from_bytes(&key_bytes))
 }
 
 /// Pick the best scheme both sides support: Ed25519, then RSA-PSS, else `None`.

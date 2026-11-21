@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use rand::RngCore;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,16 +155,6 @@ pub fn current_timestamp_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-pub fn random_bytes(n: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; n];
-    rand::thread_rng().fill_bytes(&mut buf);
-    buf
-}
-
-pub fn to_hex(bytes: &[u8]) -> String {
-    hex::encode(bytes)
 }
 
 /// Longest filename [`sanitize_filename`] emits, in **bytes** (the OS limit is

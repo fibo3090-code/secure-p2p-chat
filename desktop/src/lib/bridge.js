@@ -211,8 +211,9 @@ function makeMock() {
   // Party mock: a single joinable server with two channels.
   const partyState = { servers: [], msgs: {} }; // msgs keyed by `${server}|${thread}`
   const findServer = (id) => partyState.servers.find((x) => x.id === id);
-  const pushParty = (key, msg) =>
+  const pushParty = (key, msg) => {
     (partyState.msgs[key] ||= []).push({ sender_name: "you", from_me: true, size: null, timestamp: Date.now(), ...msg });
+  };
   const mockFile = { kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash" };
   const addChannel = (sid, name, kind = "public", members = []) => {
     const s = findServer(sid);
