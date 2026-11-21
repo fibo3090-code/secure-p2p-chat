@@ -182,20 +182,51 @@ fn ensure_ready(state: &Bridge) -> Result<(), String> {
 /// explain why. That reads as a freeze, and the usual reaction is to kill the
 /// app — mid-transfer, mid-handshake.
 ///
-/// `build` receives a dialog that already has its parent set; it should apply
-/// any per-call configuration and then call `pick_file` / `save_file` /
-/// `pick_folder`.
-async fn native_file_dialog<R: tauri::Runtime, T, F>(
+/// The dialog is described as data ([`Dialog`]) rather than built by the
+/// caller, so tests can answer it: under `cfg(test)` no window opens, the
+/// request is recorded and a scripted answer returned (`tests::dialogs`).
+/// That is what lets the commands behind a dialog — what a cancel does, what
+/// a pick reaches, which name a save is pre-filled with — run in tests.
+async fn native_file_dialog<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
-    build: F,
-) -> Result<T, String>
-where
-    F: FnOnce(rfd::FileDialog) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || build(rfd::FileDialog::new().set_parent(&window)))
+    dialog: Dialog,
+) -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(all(test, not(windows)))]
+    {
+        let _ = window;
+        Ok(tests::dialogs::answer(dialog))
+    }
+    #[cfg(not(all(test, not(windows))))]
+    {
+        tokio::task::spawn_blocking(move || {
+            let d = rfd::FileDialog::new().set_parent(&window);
+            match dialog {
+                Dialog::Open { title } => d.set_title(title).pick_file(),
+                Dialog::Save { title, file_name } => {
+                    d.set_title(title).set_file_name(file_name).save_file()
+                }
+                Dialog::Folder { title } => d.set_title(title).pick_folder(),
+            }
+        })
         .await
         .map_err(|e| e.to_string())
+    }
+}
+
+/// A native file dialog to show: pick a file, save one under a suggested
+/// name, or pick a folder. `None` from [`native_file_dialog`] means cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dialog {
+    Open {
+        title: &'static str,
+    },
+    Save {
+        title: &'static str,
+        file_name: String,
+    },
+    Folder {
+        title: &'static str,
+    },
 }
 
 mod commands;

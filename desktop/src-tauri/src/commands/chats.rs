@@ -286,8 +286,13 @@ pub(crate) async fn send_file<R: tauri::Runtime>(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
-    let picked =
-        crate::native_file_dialog(window, |d| d.set_title("Send a file").pick_file()).await?;
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Open {
+            title: "Send a file",
+        },
+    )
+    .await?;
     let Some(path) = picked else {
         return Ok(()); // user cancelled
     };

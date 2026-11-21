@@ -327,11 +327,13 @@ pub(crate) async fn export_identity<R: tauri::Runtime>(
     if !source.exists() {
         return Err("No identity file to back up yet".to_string());
     }
-    let picked = crate::native_file_dialog(window, |d| {
-        d.set_title("Save identity backup")
-            .set_file_name("p2pem-identity-backup.json")
-            .save_file()
-    })
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Save {
+            title: "Save identity backup",
+            file_name: "p2pem-identity-backup.json".to_string(),
+        },
+    )
     .await?;
     let Some(dest) = picked else {
         return Ok(None); // cancelled
@@ -513,9 +515,12 @@ pub(crate) async fn pick_download_dir<R: tauri::Runtime>(
     state: tauri::State<'_, Bridge>,
 ) -> Result<Option<String>, String> {
     ensure_ready(&state)?;
-    let picked = crate::native_file_dialog(window, |d| {
-        d.set_title("Choose download folder").pick_folder()
-    })
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Folder {
+            title: "Choose download folder",
+        },
+    )
     .await?;
     let Some(dir) = picked else {
         return Ok(None);

@@ -895,8 +895,13 @@ fn parse_ids(ids: &[String]) -> Result<Vec<Uuid>, String> {
 async fn pick_upload<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
 ) -> Result<Option<(String, String, Vec<u8>)>, String> {
-    let picked =
-        crate::native_file_dialog(window, |d| d.set_title("Share a file").pick_file()).await?;
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Open {
+            title: "Share a file",
+        },
+    )
+    .await?;
     let Some(path) = picked else {
         return Ok(None);
     };
@@ -1032,11 +1037,13 @@ pub(crate) async fn party_download_file<R: tauri::Runtime>(
     // `photo_exe.png`) is inviting the user to confirm something they cannot
     // see.
     let suggested = messenger_core::util::sanitize_filename(&name);
-    let picked = crate::native_file_dialog(window, move |d| {
-        d.set_title("Save file")
-            .set_file_name(suggested)
-            .save_file()
-    })
+    let picked = crate::native_file_dialog(
+        window,
+        crate::Dialog::Save {
+            title: "Save file",
+            file_name: suggested,
+        },
+    )
     .await?;
     let Some(path) = picked else {
         return Ok(()); // user cancelled the save dialog

@@ -1769,12 +1769,10 @@ fn texts_from_peer(h: &Harness, id: &str) -> Vec<String> {
         .collect()
 }
 
-/// The desktop app's central path, through the commands the webview calls:
-/// host, dial, both safety-code prompts answered, a message sent and
-/// received, and the sender's copy marked delivered by the peer's receipt.
-/// Everything else in this file checks commands one at a time.
-#[test]
-fn two_desktop_apps_connect_verify_and_exchange_a_message() {
+/// Two ready apps, connected and verified through the commands the webview
+/// calls: host, dial, both safety-code prompts answered. Returns the host's
+/// and the client's conversation ids.
+fn connected_pair() -> (Harness, Harness, String, String) {
     let host = ready_harness();
     let client = ready_harness();
 
@@ -1819,7 +1817,16 @@ fn two_desktop_apps_connect_verify_and_exchange_a_message() {
         connected(h).is_some() && connected(c).is_some()
     });
     let (host_chat, client_chat) = (connected(&host).unwrap(), connected(&client).unwrap());
+    (host, client, host_chat, client_chat)
+}
 
+/// The desktop app's central path, through the commands the webview calls:
+/// a verified connection, a message sent and received, and the sender's copy
+/// marked delivered by the peer's receipt. Everything else in this file
+/// checks commands one at a time.
+#[test]
+fn two_desktop_apps_connect_verify_and_exchange_a_message() {
+    let (host, client, host_chat, client_chat) = connected_pair();
     client
         .ipc_binds(
             "send_message",
@@ -1866,4 +1873,311 @@ fn nearby_peers_are_not_browsed_unless_the_user_opted_in() {
         .unwrap()
         .iter()
         .any(|p| p["name"] == "Nearby" && p["port"] == 12345));
+}
+
+// ── Commands behind a native dialog ─────────────────────────────────────────
+//
+// `native_file_dialog` is answered from here under `cfg(test)`: each request
+// is recorded, and the next scripted answer returned (`None` = cancelled, and
+// also what an unscripted dialog gets). So the commands around a dialog run
+// for real — what a cancel does, where a pick goes, which name a save
+// suggests. The rfd call itself is the one line left that only a desktop
+// session can exercise.
+
+pub(crate) mod dialogs {
+    use crate::Dialog;
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static ANSWERS: Mutex<VecDeque<Option<PathBuf>>> = Mutex::new(VecDeque::new());
+    static ASKED: Mutex<Vec<Dialog>> = Mutex::new(Vec::new());
+    /// nextest runs each test in its own process; this keeps plain
+    /// `cargo test`, which does not, from sharing one script between tests.
+    pub(super) static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn answer(dialog: Dialog) -> Option<PathBuf> {
+        ASKED.lock().unwrap().push(dialog);
+        ANSWERS.lock().unwrap().pop_front().flatten()
+    }
+
+    pub(super) fn will_answer(answer: Option<PathBuf>) {
+        ANSWERS.lock().unwrap().push_back(answer);
+    }
+
+    /// Every dialog opened so far, and forget them.
+    pub(super) fn asked() -> Vec<Dialog> {
+        std::mem::take(&mut *ASKED.lock().unwrap())
+    }
+
+    pub(super) fn reset() {
+        ANSWERS.lock().unwrap().clear();
+        ASKED.lock().unwrap().clear();
+    }
+}
+
+fn dialog_test() -> std::sync::MutexGuard<'static, ()> {
+    let guard = dialogs::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dialogs::reset();
+    guard
+}
+
+/// Cancelling is the most common answer to any dialog, and must be a quiet
+/// no-op: not an error toast, not a half-done action.
+#[test]
+fn a_cancelled_dialog_changes_nothing() {
+    use crate::Dialog;
+    let _serial = dialog_test();
+    let h = ready_harness();
+    let before = h.ipc("get_settings", json!({})).unwrap();
+    let chat = h.seed_chat_with_incoming("Peer", 0).to_string();
+    let some_id = uuid::Uuid::new_v4().to_string();
+
+    assert_eq!(
+        h.ipc_binds("pick_download_dir", json!({})).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        h.ipc_binds("export_identity", json!({})).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        h.ipc_binds("send_file", json!({ "id": chat })).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        h.ipc_binds(
+            "party_send_file",
+            json!({ "server": some_id, "channel": some_id })
+        )
+        .unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        h.ipc_binds(
+            "party_send_file_dm",
+            json!({ "server": some_id, "to": some_id })
+        )
+        .unwrap(),
+        Value::Null
+    );
+
+    assert_eq!(
+        dialogs::asked(),
+        vec![
+            Dialog::Folder {
+                title: "Choose download folder"
+            },
+            Dialog::Save {
+                title: "Save identity backup",
+                file_name: "p2pem-identity-backup.json".into()
+            },
+            Dialog::Open {
+                title: "Send a file"
+            },
+            Dialog::Open {
+                title: "Share a file"
+            },
+            Dialog::Open {
+                title: "Share a file"
+            },
+        ],
+        "each command asks for the right kind of dialog"
+    );
+    assert_eq!(
+        h.ipc("get_settings", json!({})).unwrap(),
+        before,
+        "a cancel changed settings"
+    );
+    assert!(h
+        .ipc("list_transfers", json!({}))
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn the_chosen_folder_and_backup_location_are_used() {
+    let _serial = dialog_test();
+    let h = ready_harness();
+    let out = tempfile::tempdir().unwrap();
+
+    let folder = out.path().join("incoming");
+    std::fs::create_dir(&folder).unwrap();
+    dialogs::will_answer(Some(folder.clone()));
+    assert_eq!(
+        h.ipc_binds("pick_download_dir", json!({})).unwrap(),
+        json!(folder.display().to_string())
+    );
+    assert_eq!(
+        h.ipc("get_settings", json!({})).unwrap()["download_dir"],
+        json!(folder.display().to_string())
+    );
+
+    let dest = out.path().join("backup.json");
+    dialogs::will_answer(Some(dest.clone()));
+    assert_eq!(
+        h.ipc_binds("export_identity", json!({})).unwrap(),
+        json!(dest.display().to_string())
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        std::fs::read(h._dir.path().join("identity.json")).unwrap(),
+        "the backup is the (encrypted) identity file, byte for byte"
+    );
+    assert!(h.ipc("get_settings", json!({})).unwrap()["identity_backed_up_at"].is_string());
+}
+
+/// A file picked in the dialog reaches the peer — held for acceptance, then
+/// written to the folder the peer chose, intact. The desktop file flow end to
+/// end, through the commands the webview calls.
+#[test]
+fn a_file_picked_in_the_dialog_reaches_the_peer() {
+    let _serial = dialog_test();
+    let (host, client, _host_chat, client_chat) = connected_pair();
+    let out = tempfile::tempdir().unwrap();
+    let downloads = out.path().join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    dialogs::will_answer(Some(downloads.clone()));
+    host.ipc_binds("pick_download_dir", json!({})).unwrap();
+
+    let file = out.path().join("report.bin");
+    let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&file, &bytes).unwrap();
+    dialogs::will_answer(Some(file));
+    client
+        .ipc_binds("send_file", json!({ "id": client_chat }))
+        .expect("send");
+
+    let offer = |h: &Harness| {
+        h.ipc("list_transfers", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["direction"] == "incoming" && t["status"] == "awaiting")
+            .cloned()
+    };
+    tick_both(&host, &client, "offer held", |h, _| offer(h).is_some());
+    let offer = offer(&host).unwrap();
+    assert_eq!(offer["filename"], "report.bin");
+    assert!(
+        std::fs::read_dir(&downloads).unwrap().all(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("tmp_")),
+        "a held offer reached the download folder before it was accepted"
+    );
+
+    host.ipc_binds("accept_transfer", json!({ "id": offer["id"] }))
+        .expect("accept");
+    let landed = downloads.join("report.bin");
+    tick_both(&host, &client, "file written", |_, _| {
+        std::fs::read(&landed).is_ok_and(|b| b == bytes)
+    });
+}
+
+/// A community file is shared from the dialog and saved through it — under
+/// the name the uploader chose, *sanitised before it fills the save dialog*:
+/// a U+202E override makes `photo\u{202E}gnp.exe` read as `photoexe.png`.
+#[test]
+fn a_community_file_is_shared_and_saved_under_a_name_that_shows_what_it_is() {
+    use crate::Dialog;
+    let _serial = dialog_test();
+    let h = ready_harness();
+    let srv = start_party_server(None);
+    let fp = h
+        .ipc("party_join", json!({ "address": srv.address, "username": "bob", "password": "", "fingerprint": null }))
+        .unwrap()["fingerprint"]
+        .clone();
+    let sid = h
+        .ipc(
+            "party_join",
+            json!({ "address": srv.address, "username": "bob", "password": "", "fingerprint": fp }),
+        )
+        .unwrap()["server"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.pump_party("joined", |h| {
+        h.party_server(&sid)
+            .is_some_and(|s| s["status"] == "joined")
+    });
+    let channel = h.party_server(&sid).unwrap()["channels"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = tempfile::tempdir().unwrap();
+    let tricky = out.path().join("photo\u{202E}gnp.exe");
+    let bytes = b"MZ not really a program".to_vec();
+    std::fs::write(&tricky, &bytes).unwrap();
+    dialogs::will_answer(Some(tricky));
+    h.ipc_binds(
+        "party_send_file",
+        json!({ "server": sid, "channel": channel }),
+    )
+    .expect("share");
+
+    let hash = messenger_core::party::blob_hash(&bytes);
+    let mut stored_name = String::new();
+    h.pump_party("file stored", |h| {
+        let history = h
+            .ipc(
+                "party_history",
+                json!({ "server": sid, "channel": channel }),
+            )
+            .unwrap();
+        match history
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["hash"] == hash.as_str())
+        {
+            Some(m) => {
+                stored_name = m["text"].as_str().unwrap_or_default().to_string();
+                true
+            }
+            None => false,
+        }
+    });
+
+    // Download it. The poll loop completes downloads, so run it alongside.
+    let party = h.bridge().party.clone();
+    let pumping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pump = {
+        let (party, pumping) = (party.clone(), pumping.clone());
+        std::thread::spawn(move || {
+            while pumping.load(std::sync::atomic::Ordering::SeqCst) {
+                let party = party.clone();
+                tauri::async_runtime::block_on(async move { party.lock().await.poll_events() });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })
+    };
+    let dest = out.path().join("saved.bin");
+    dialogs::will_answer(Some(dest.clone()));
+    let res = h.ipc_binds(
+        "party_download_file",
+        json!({ "server": sid, "hash": hash, "name": stored_name }),
+    );
+    pumping.store(false, std::sync::atomic::Ordering::SeqCst);
+    pump.join().unwrap();
+    res.expect("download");
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+
+    let asked = dialogs::asked();
+    let Some(Dialog::Save { file_name, .. }) = asked.last() else {
+        panic!("no save dialog: {asked:?}");
+    };
+    assert!(
+        !file_name.contains('\u{202E}'),
+        "the save dialog was pre-filled with a direction override: {file_name:?}"
+    );
+    assert!(
+        file_name.ends_with(".exe"),
+        "sanitising must not hide what it is: {file_name:?}"
+    );
 }
