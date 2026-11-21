@@ -247,11 +247,11 @@ unnoticed.
 | ID | Done | Still open |
 |---|---|---|
 | QUAL-19 | One shared client harness; hosts and relays bind port 0 in tests. | `punch.rs` tests still pick a free port and rebind — a hole punch needs a chosen port, so the race is inherent there. No cached RSA test keys (nextest runs a process per test, so a cache would not survive between tests). |
-| TUI-22 | Tests are hermetic. | The TUI still has no data-dir override, so two TUI peers cannot run on one machine. |
+| TUI-22 | Tests are hermetic; the diagnostics bundle lands in the app's own data dir. | The TUI still has no data-dir override, so two TUI peers cannot run on one machine. |
 | CRYPTO-17 | Tests for reflected frames, several rekeys with traffic both ways, a malformed identity nonce, and an invite-fingerprint mismatch on first connect (CRYPTO-04). | No test for a peer reusing our own ephemeral key, or for history rollback (CRYPTO-09, still open). |
 | NET-22 | Reflection, crossing rekeys, silent connection in the handshake (already present), stale direct addresses reaching the relay (NET-12), re-registration after a host left (NET-06), the per-address slot cap (NET-07), the password over relay (NET-11), peers confirming far apart (NET-10). | Split punch verdicts (NET-15, SUSPECTED) — see below. |
-| TAURI-27 | `open_file` refusal of received executables, `file_preview` (SVG refused, 4 MiB cap), `set_password`/`unlock` on a ready app, `party_join`'s two steps against a real server (pin written only after a real join), the upload size cap and download core behind the native dialogs, `state_signature` sensitivity, save coalescing, prompt publishing, auto-rehost. | The native dialogs themselves (cannot open headless). |
-| UI-37 | UI-03, UI-04, UI-05, UI-08 and UI-11 each have a test (and a fix). | Smoke tests still cover first paint only, not a flow. |
+| TAURI-27 | `open_file` refusal of received executables, `file_preview` (SVG refused, 4 MiB cap), `set_password`/`unlock` on a ready app, `party_join`'s two steps against a real server (pin written only after a real join), the upload size cap and download core behind the native dialogs, `state_signature` sensitivity, save coalescing, prompt publishing, auto-rehost, the real start-up (`init_bridge`), the identity backup, diagnostics, mDNS opt-in, and the whole host → dial → verify → message → receipt flow over IPC. | The native dialogs themselves (cannot open headless). |
+| UI-37 | UI-03, UI-04, UI-05, UI-08 and UI-11 each have a test (and a fix). | Smoke tests still cover first paint only, not a flow (the flow is covered over IPC by the bridge tests, and per component by vitest). |
 
 ### Confirmed still open
 
