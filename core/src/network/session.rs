@@ -818,7 +818,8 @@ where
 /// Constant-time password comparison, so a wrong connection password cannot be
 /// recovered via response timing. Both inputs are first reduced to 32 bytes by Argon2id
 /// (minimum cost, fresh random salt per comparison), so the length never reaches a
-/// branch; nothing relies on Argon2's cost, only on a salted fixed-length function.
+/// branch; nothing relies on Argon2's cost, only on a salted fixed-length function
+/// (not SHA-256: the wrong primitive for a password, and code scanning flags it).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use argon2::{Algorithm, Argon2, Params, Version};
     let salt: [u8; 16] = rand::random();
