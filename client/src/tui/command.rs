@@ -347,6 +347,9 @@ struct Args<'a> {
     words: std::str::SplitWhitespace<'a>,
     /// Everything after the command word, spaces preserved (trimmed).
     rest: &'a str,
+    /// Set once a free-text argument has taken the rest of the line, after
+    /// which leftover words are that text, not extra arguments.
+    took_rest: std::cell::Cell<bool>,
 }
 
 impl<'a> Args<'a> {
@@ -373,12 +376,14 @@ impl<'a> Args<'a> {
 
     /// The whole remainder of the line (it may contain spaces), required.
     fn text(&self) -> Result<String, String> {
+        self.took_rest.set(true);
         non_empty(self.rest, || self.usage())
     }
 
     /// The remainder after `first` (a word already taken with [`Self::word`]),
     /// required — for `<target> <free text>` commands.
     fn text_after(&self, first: &str) -> Result<String, String> {
+        self.took_rest.set(true);
         non_empty(self.rest[first.len()..].trim(), || self.usage())
     }
 }
@@ -405,9 +410,10 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         cmd,
         words,
         rest: input[cmd.len()..].trim(),
+        took_rest: std::cell::Cell::new(false),
     };
 
-    Ok(match cmd {
+    let parsed = match cmd {
         "host" => C::Host(
             a.next()
                 .map(|p| {
@@ -495,7 +501,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "party-channel-access" => C::PartyChannelAccess {
             channel: a.word()?.trim_start_matches('#').to_string(),
             kind: a.word()?.to_ascii_lowercase(),
-            members: a.words.map(str::to_string).collect(),
+            members: a.words.by_ref().map(str::to_string).collect(),
         },
 
         "rename" => C::Rename(a.text()?),
@@ -534,7 +540,15 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "quit" | "q" => C::Quit,
         "quit!" | "q!" => C::ForceQuit,
         _ => return Err(format!("Unknown command: {}. Try :help", cmd)),
-    })
+    };
+    // A word nothing consumed is a mistake to report, never to drop: with the
+    // port written after a space, `:connect 10.0.0.5 9000` dialled 12345.
+    if !a.took_rest.get() {
+        if let Some(extra) = a.next() {
+            return Err(format!("Unexpected '{extra}'. {}", a.usage()));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Valid keys for `:set`, exposed for validation and help.
@@ -556,6 +570,32 @@ pub use parse_bool as parse_setting_bool;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A word the parser does not use must be an error, not dropped. With the
+    /// port written after a space, `:connect 10.0.0.5 9000` dialled the
+    /// default port 12345 and said nothing.
+    #[test]
+    fn a_word_left_over_is_an_error_not_ignored() {
+        for line in [
+            ":connect 10.0.0.5 9000",
+            ":host 9000 extra",
+            ":connect-relay relay.example:1 token extra",
+            ":stop-host now",
+            ":quit please",
+        ] {
+            let err = parse_command(line).expect_err(line);
+            assert!(err.contains("Usage"), "{line}: {err}");
+        }
+        // Free-text arguments still take the rest of the line.
+        assert!(parse_command(":set name Ada Lovelace").is_ok());
+        assert_eq!(
+            parse_command(":connect 10.0.0.5:9000").unwrap(),
+            TuiCommand::Connect {
+                host: "10.0.0.5".into(),
+                port: 9000
+            }
+        );
+    }
 
     #[test]
     fn parses_connection_commands() {

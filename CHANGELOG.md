@@ -13,6 +13,9 @@ predate tagged releases.
 
 ### Fixed
 
+- Terminal client: a command given more words than it takes ignored the rest
+  silently, so `:connect 10.0.0.5 9000` dialled port 12345. It now says which
+  word was unexpected and shows the usage.
 - Hosting behind a double or carrier-grade NAT left the router forwarding the
   port to this machine for an hour, although the mapping was rejected as
   unreachable: the router was asked for the forward before its external

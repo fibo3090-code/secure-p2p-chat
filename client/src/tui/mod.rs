@@ -93,7 +93,7 @@ pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
     app.prompt_auth_if_needed();
     apply_launch_config(&mut app, &launch).await;
 
-    let res = run_app(&mut terminal, app).await;
+    let res = run_app(&mut terminal, app, &mut CrosstermEvents).await;
 
     drop(guard);
 
@@ -162,10 +162,10 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
 
 /// Place the hardware cursor in the input/command box using the editable field's
 /// own cursor position, reusing the shared layout so it never drifts from the UI.
-fn set_cursor_position(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &TuiApp,
-) -> Result<()> {
+fn set_cursor_position<B: Backend>(terminal: &mut Terminal<B>, app: &TuiApp) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     let size: Rect = terminal.size()?.into();
     let input_area = ui::regions(size).input;
 
@@ -193,11 +193,36 @@ fn set_cursor_position(
     Ok(())
 }
 
+/// Where terminal input comes from. The only part of the loop that needs a
+/// real TTY is crossterm's global event queue, so it sits behind this and the
+/// loop itself — key filtering, paste, quit-and-save, cursor placement — runs
+/// in tests against a `TestBackend` and a script.
+trait EventSource {
+    /// The next event, or `None` if nothing arrived within `timeout`.
+    fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>>;
+}
+
+struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        Ok(if event::poll(timeout)? {
+            Some(event::read()?)
+        } else {
+            None
+        })
+    }
+}
+
 /// Main application loop.
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
     mut app: TuiApp,
-) -> Result<()> {
+    events: &mut impl EventSource,
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     loop {
         app.tick();
 
@@ -213,10 +238,10 @@ async fn run_app(
             return Ok(());
         }
 
-        if event::poll(Duration::from_millis(100))? {
+        if let Some(event) = events.next_event(Duration::from_millis(100))? {
             // On Windows, crossterm reports both key-press and key-release events;
             // only act on presses so each keystroke registers once.
-            match event::read()? {
+            match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key_event(key),
                 // A paste is text, never keystrokes (see TerminalGuard).
                 Event::Paste(text) => app.handle_paste(&text),
@@ -226,6 +251,341 @@ async fn run_app(
                 app.shutdown_save();
                 return Ok(());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers};
+    use std::collections::VecDeque;
+
+    /// A scripted terminal. When the script runs out the loop is ended with an
+    /// error, so a test that forgets to quit fails instead of hanging.
+    struct Script(VecDeque<Event>, VecDeque<Box<dyn FnOnce()>>);
+
+    impl Script {
+        fn new(events: impl IntoIterator<Item = Event>) -> Self {
+            Script(events.into_iter().collect(), VecDeque::new())
+        }
+
+        /// Run `f` (between frames, as an idle poll) before the first event.
+        fn first(mut self, f: impl FnOnce() + 'static) -> Self {
+            self.1.push_back(Box::new(f));
+            self
+        }
+    }
+
+    impl EventSource for Script {
+        fn next_event(&mut self, _timeout: Duration) -> Result<Option<Event>> {
+            if let Some(f) = self.1.pop_front() {
+                f();
+                return Ok(None);
+            }
+            self.0
+                .pop_front()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("script ran out"))
+        }
+    }
+
+    fn press(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn release(c: char) -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn enter() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn app_in(dir: &tempfile::TempDir) -> TuiApp {
+        TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app")
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `:q` then `y`, through the real loop: the history is written on the way
+    /// out. Quitting is the one save a user counts on, and the loop is where
+    /// it happens.
+    #[tokio::test]
+    async fn quitting_through_the_loop_saves_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        let chat = uuid::Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Kept".into());
+        let history = dir.path().join("history.json.enc");
+        assert!(!history.exists());
+        let key = app
+            .chat_manager
+            .history_key
+            .expect("an unlocked app has a key");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut script = Script::new([press(':'), press('q'), enter(), press('y')]);
+        run_app(&mut terminal, app, &mut script)
+            .await
+            .expect("the loop ended by quitting, not by running out of input");
+        assert!(script.0.is_empty());
+
+        // Read it back with the key the app was using. (A fresh identity has
+        // no password and is never written, so a relaunch here would be a new
+        // identity — that rule is tested where it lives.)
+        let mut reader = crate::app::ChatManager::default();
+        assert!(reader.load_history_auto(&history, &key).expect("readable"));
+        assert!(
+            reader.chats.contains_key(&chat),
+            "the conversation did not survive the quit"
+        );
+    }
+
+    /// `:q!` skips the confirmation, and with it the confirmation's own save:
+    /// the loop's save on the way out is the only one it gets.
+    #[tokio::test]
+    async fn force_quitting_still_saves_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        let chat = uuid::Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Kept".into());
+        let key = app.chat_manager.history_key.expect("key");
+        let history = dir.path().join("history.json.enc");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // The first frame autosaves in the background. Let that land and take
+        // it away, so the file can only come back from the save on the way out.
+        let autosaved = history.clone();
+        let mut script =
+            Script::new([press(':'), press('q'), press('!'), enter()]).first(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !autosaved.exists() {
+                    assert!(std::time::Instant::now() < deadline, "no autosave");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Written via temp + rename, so present means complete.
+                std::fs::remove_file(&autosaved).unwrap();
+            });
+        run_app(&mut terminal, app, &mut script)
+            .await
+            .expect("quit");
+
+        let mut reader = crate::app::ChatManager::default();
+        assert!(
+            reader.load_history_auto(&history, &key).expect("readable"),
+            "nothing was saved on the way out"
+        );
+        assert!(reader.chats.contains_key(&chat));
+    }
+
+    #[tokio::test]
+    async fn declining_the_quit_prompt_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut script = Script::new([press(':'), press('q'), enter(), press('n')]);
+        let err = run_app(&mut terminal, app_in(&dir), &mut script)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("script ran out"), "{err}");
+    }
+
+    /// Windows reports a key's release as well as its press. Acting on both
+    /// typed every character twice.
+    #[tokio::test]
+    async fn a_key_release_is_not_a_second_keystroke() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut script = Script::new([
+            press(':'),
+            release(':'),
+            press('a'),
+            release('a'),
+            press('b'),
+            release('b'),
+        ]);
+        let _ = run_app(&mut terminal, app_in(&dir), &mut script).await;
+        let shown = screen(&terminal);
+        assert!(shown.contains(":ab"), "{shown}");
+        assert!(!shown.contains("aa") && !shown.contains("::"), "{shown}");
+
+        // The hardware cursor follows the edit: just after ":ab", inside the box.
+        let input = ui::regions(Rect::new(0, 0, 100, 30)).input;
+        assert!(terminal.backend().cursor_visible());
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(input.x + 1 + 3, input.y + 1)
+        );
+    }
+
+    /// A paste arrives as one event and is inserted as text. Delivered as
+    /// keystrokes, each newline was an Enter: every line was sent, and a line
+    /// starting with ':' ran as a command.
+    #[tokio::test]
+    async fn a_pasted_command_is_text_not_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut script = Script::new([Event::Paste(":quit!\n".into())]);
+        let err = run_app(&mut terminal, app_in(&dir), &mut script)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("script ran out"),
+            "a pasted ':quit!' quit the app: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cursor_is_hidden_while_an_overlay_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // `:q` opens the quit confirmation; the script ends there.
+        let mut script = Script::new([press(':'), press('q'), enter()]);
+        let _ = run_app(&mut terminal, app_in(&dir), &mut script).await;
+        assert!(!terminal.backend().cursor_visible());
+    }
+
+    fn launch() -> TuiLaunchConfig {
+        TuiLaunchConfig {
+            host: false,
+            connect: None,
+            host_relay: None,
+            relay_connect: None,
+            relay_token: None,
+            port: 0,
+        }
+    }
+
+    fn toasts(app: &TuiApp) -> Vec<String> {
+        app.chat_manager
+            .toasts
+            .iter()
+            .map(|t| t.message.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn launch_flags_host_and_report_what_they_could_not_do() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // --host --port 0: listening, on the port the OS gave it.
+        let mut app = app_in(&dir);
+        apply_launch_config(
+            &mut app,
+            &TuiLaunchConfig {
+                host: true,
+                ..launch()
+            },
+        )
+        .await;
+        assert!(
+            app.chat_manager.hosting_port.is_some_and(|p| p != 0),
+            "{:?}",
+            toasts(&app)
+        );
+
+        // A malformed target is said, not silently ignored.
+        let mut app = app_in(&dir);
+        apply_launch_config(
+            &mut app,
+            &TuiLaunchConfig {
+                connect: Some("not a host:port:at all".into()),
+                ..launch()
+            },
+        )
+        .await;
+        assert!(
+            toasts(&app).iter().any(|t| t.contains("Invalid --connect")),
+            "{:?}",
+            toasts(&app)
+        );
+
+        // --connect-relay needs a token; without one nothing is dialled.
+        let mut app = app_in(&dir);
+        apply_launch_config(
+            &mut app,
+            &TuiLaunchConfig {
+                relay_connect: Some("127.0.0.1:1".into()),
+                ..launch()
+            },
+        )
+        .await;
+        assert!(
+            toasts(&app)
+                .iter()
+                .any(|t| t.contains("requires --relay-token")),
+            "{:?}",
+            toasts(&app)
+        );
+        assert!(app.chat_manager.chats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_flags_reach_a_relay() {
+        use messenger_core::network::{generate_relay_token, serve_relay, RELAY_WAIT_TIMEOUT};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve_relay(listener, RELAY_WAIT_TIMEOUT));
+        let token = generate_relay_token();
+
+        let host_dir = tempfile::tempdir().unwrap();
+        let mut host = app_in(&host_dir);
+        apply_launch_config(
+            &mut host,
+            &TuiLaunchConfig {
+                host_relay: Some(relay.clone()),
+                relay_token: Some(token.clone()),
+                ..launch()
+            },
+        )
+        .await;
+        let client_dir = tempfile::tempdir().unwrap();
+        let mut client = app_in(&client_dir);
+        apply_launch_config(
+            &mut client,
+            &TuiLaunchConfig {
+                relay_connect: Some(relay),
+                relay_token: Some(token),
+                ..launch()
+            },
+        )
+        .await;
+
+        // Both reach the safety-code prompt: the flags dialled, through the
+        // relay, with the token given.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            host.tick();
+            client.tick();
+            if host.chat_manager.pending_fingerprint().is_some()
+                && client.chat_manager.pending_fingerprint().is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host {:?} / client {:?}",
+                toasts(&host),
+                toasts(&client)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
