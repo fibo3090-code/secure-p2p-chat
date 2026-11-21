@@ -33,20 +33,11 @@ pub(super) struct LegacySnapshot {
 }
 
 impl PartyState {
-    /// Run one logical mutation as one database transaction.
-    ///
-    /// Every `persist_*` helper writes through the same connection, so the
-    /// rows a mutation touches — a refcount, a file reference, a message, an
-    /// audit entry — commit together or not at all. Before this each was its
-    /// own autocommit statement: a crash part-way through deleting a channel
-    /// left refcounts decremented for references that survived the restart,
-    /// and each statement paid its own commit.
-    ///
-    /// A failed statement is still only logged, exactly as before: the
-    /// in-memory model has already moved on, and refusing the request would
-    /// not undo that. What this changes is that a crash can no longer leave
-    /// half of a mutation on disk. Nests safely: an inner call inside an open
-    /// transaction just runs.
+    /// Run one logical mutation as one database transaction, so the rows it
+    /// touches (refcount, file reference, message, audit entry) commit together
+    /// or not at all. A failed statement is still only logged — memory has
+    /// already moved on — but a crash can no longer leave half a mutation on
+    /// disk. Nests safely: an inner call inside an open transaction just runs.
     pub(super) fn with_tx<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let began = match &self.db {
             Some(conn) if conn.is_autocommit() => match conn.execute_batch("BEGIN") {
@@ -129,9 +120,6 @@ impl PartyState {
 
     /// Remove a channel's rows — its messages, its file references and the
     /// channel itself — as one transaction.
-    ///
-    /// Three autocommit statements used to do this, so a crash between them
-    /// left a channel with no messages, or messages with no channel.
     pub(super) fn delete_channel_rows(&self, channel: Uuid) {
         let Some(conn) = &self.db else { return };
         let id = channel.to_string();
@@ -229,9 +217,8 @@ impl PartyState {
                         username,
                         fingerprint,
                         online: false,
-                        // A role that will not parse falls back to the least
-                        // privileged value rather than failing the load: a
-                        // damaged row must not hand out authority.
+                        // An unparseable role falls back to the least
+                        // privileged value: a damaged row must not grant authority.
                         role: serde_json::from_str(&role).unwrap_or(Role::Guest),
                     },
                 );
@@ -300,9 +287,7 @@ impl PartyState {
                 .as_ref()
                 .expect("reload_from_db requires a blob directory");
             for (hash, size, mime, refcount) in raw {
-                // Presence check only: the bytes are read on demand by
-                // `blob_bytes`, so a restart no longer pulls the entire blob
-                // store into memory.
+                // Presence check only: bytes are read on demand.
                 if !blob_dir.join(&hash).is_file() {
                     tracing::error!(hash = %hash, "blob bytes missing on disk; skipping");
                     continue;
@@ -343,16 +328,13 @@ impl PartyState {
             for row in rows {
                 let (id, hash, name, uploader, location, is_dm, shared_at, default_perms, grants) =
                     row?;
-                // A reference to a blob that is gone grants access to nothing and
-                // would only inflate the owner's quota, so drop it.
+                // A reference to a vanished blob grants nothing; drop it.
                 if !blobs.contains_key(&hash) {
                     continue;
                 }
                 file_refs.push(FileRef {
                     id: Uuid::parse_str(&id)?,
-                    // A row that will not parse falls back to the default
-                    // grant rather than failing the load: a damaged value
-                    // must not hand out rights nobody granted.
+                    // An unparseable grant falls back to the default.
                     default_perms: serde_json::from_str(&default_perms).unwrap_or_default(),
                     grants: serde_json::from_str::<HashMap<String, FilePermissions>>(&grants)
                         .unwrap_or_default()
@@ -462,20 +444,15 @@ pub(super) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              detail TEXT NOT NULL
          );",
     )?;
-    // Added after the first release: `ALTER TABLE` is how an existing party.db
-    // gains them, and "duplicate column" is the expected answer on a database
-    // that already has them.
+    // Columns added after the first release; "duplicate column" is the expected
+    // answer on a database that already has them.
     for sql in [
         "ALTER TABLE members ADD COLUMN role TEXT NOT NULL DEFAULT '\"Member\"'",
         "ALTER TABLE channels ADD COLUMN members TEXT NOT NULL DEFAULT '[]'",
-        // `file_refs` was first keyed by (hash, location), which collapsed
-        // repeated shares of the same content. Give existing rows a per-share
-        // id; `randomblob` is evaluated per row, so each gets a distinct one,
-        // and 32 undashed hex characters parse as a UUID.
+        // Give legacy (hash, location)-keyed rows a per-share id (`randomblob`
+        // is per row; 32 undashed hex characters parse as a UUID).
         "ALTER TABLE file_refs ADD COLUMN id TEXT",
-        // Per-file permissions. Existing shares keep the previous behaviour,
-        // which is exactly `FilePermissions::default()` — visible and
-        // downloadable to whoever can reach the location, nothing more.
+        // Per-file permissions; existing shares keep `FilePermissions::default()`.
         "ALTER TABLE file_refs ADD COLUMN default_perms TEXT NOT NULL          DEFAULT '{\"view\":true,\"download\":true,\"delete\":false,\"share\":false}'",
         "ALTER TABLE file_refs ADD COLUMN grants TEXT NOT NULL DEFAULT '{}'",
     ] {
@@ -494,8 +471,7 @@ pub(super) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS file_refs_id ON file_refs (id)",
         [],
     )?;
-    // Deleting a channel removes its references by location; without an index
-    // that is a scan of every share on the server.
+    // Channel deletion removes references by location.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS file_refs_location ON file_refs (location)",
         [],
@@ -503,28 +479,19 @@ pub(super) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Tune a freshly opened database for a server that writes on every request.
+/// Tune a freshly opened database for a server that writes on every request
+/// under the global state lock (SQLite's defaults cost several fsyncs per
+/// statement):
 ///
-/// SQLite's defaults are a rollback journal with `synchronous=FULL`: three or
-/// four fsyncs per autocommit statement, every one of them taken while the
-/// global state lock is held. That capped a whole community at roughly a
-/// hundred writes a second on good disks and a few dozen on an SD card, and
-/// every member's request queued behind each fsync.
-///
-/// - **WAL** appends to a log instead of rewriting pages through a journal, and
-///   lets readers proceed alongside the writer.
-/// - **`synchronous=NORMAL`** under WAL syncs at checkpoints rather than on
-///   every commit. It is still safe against an application crash; a power cut
-///   can lose the last few commits, never corrupt the database.
-/// - **`busy_timeout`** waits out a lock held by an external reader (a backup,
-///   an operator's `sqlite3` shell) instead of failing the write at once.
-/// - The statement cache is sized to hold every statement this module issues,
-///   so `prepare_cached` never has to evict and re-parse one.
+/// - **WAL** appends to a log and lets readers proceed alongside the writer.
+/// - **`synchronous=NORMAL`** syncs at checkpoints: safe against an app crash; a
+///   power cut can lose the last few commits, never corrupt the database.
+/// - **`busy_timeout`** waits out an external reader's lock (a backup, a shell).
+/// - The statement cache holds every statement this module issues.
 pub(super) fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
-        // Some filesystems (certain network mounts) cannot hold a WAL. The
-        // server still works in the mode SQLite fell back to, just slower.
+        // Some filesystems cannot hold a WAL; SQLite's fallback still works.
         tracing::warn!(journal_mode = %mode, "party.db could not switch to WAL mode");
     }
     conn.execute_batch(
@@ -540,9 +507,6 @@ pub(super) fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
 const STATEMENT_CACHE_CAPACITY: usize = 64;
 
 /// Run one statement through the connection's prepared-statement cache.
-///
-/// `Connection::execute` re-parses and re-plans its SQL every call; these are a
-/// handful of fixed statements issued on every post, so they are compiled once.
 pub(super) fn execute_cached<P: rusqlite::Params>(
     conn: &Connection,
     sql: &str,
@@ -551,12 +515,8 @@ pub(super) fn execute_cached<P: rusqlite::Params>(
     conn.prepare_cached(sql)?.execute(params)
 }
 
-/// Run `f` inside a transaction, unless one is already open.
-///
-/// Nesting is the point of the check: a helper that is atomic on its own (a DM
-/// writes its thread row and its message) is also called from inside a larger
-/// mutation that has already begun one, and SQLite refuses a nested `BEGIN`.
-/// In that case the outer transaction is what makes it atomic.
+/// Run `f` inside a transaction, unless one is already open (SQLite refuses a
+/// nested `BEGIN`; the outer transaction then provides the atomicity).
 pub(super) fn atomically<T>(
     conn: &Connection,
     f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
@@ -592,14 +552,8 @@ pub(super) fn db_is_empty(conn: &Connection) -> rusqlite::Result<bool> {
         && table_count(conn, CountedTable::DmThreads)? == 0)
 }
 
-/// The tables `table_count` will count. SQLite cannot bind an identifier as a
-/// parameter, so the name has to be interpolated — which means the only real
-/// defence is that the set of possible names is closed.
-///
-/// It was a `&str` with a comment promising callers would only pass literals. A
-/// comment is not a defence: the day someone counts rows for a caller-supplied
-/// name, the promise is silently broken and the compiler says nothing. As an
-/// enum the query cannot be given a name this module did not write.
+/// The tables `table_count` will count. A table name cannot be bound as a
+/// parameter, so it is interpolated — from this closed set only.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum CountedTable {
     Members,
@@ -709,8 +663,7 @@ pub(super) fn insert_dm_message_row(
     e: &Envelope,
 ) -> rusqlite::Result<()> {
     let json = serde_json::to_string(e).expect("Envelope serializes");
-    // Two statements, one transaction: a DM used to cost two commits, and a
-    // crash between them left a thread row with no message.
+    // One transaction for the thread row and its message.
     atomically(conn, |conn| {
         execute_cached(
             conn,
@@ -726,11 +679,8 @@ pub(super) fn insert_dm_message_row(
     })
 }
 
-/// Load and deserialize an ordered envelope history from `table` where the keying
-/// column `key_col` equals `key`. Both `table` and `key_col` are module constants.
-/// Remove staging files a previous run left behind. Best effort: a file that
-/// cannot be removed is logged and skipped, because failing a server start over
-/// one orphaned temporary is a worse outcome than leaving it there.
+/// Remove staging files a previous run left behind. Best effort: one orphaned
+/// temporary is not worth failing a server start over.
 pub(super) fn sweep_staging_files(blob_dir: &Path) {
     let entries = match std::fs::read_dir(blob_dir) {
         Ok(entries) => entries,
@@ -765,11 +715,8 @@ pub(super) fn sweep_staging_files(blob_dir: &Path) {
     }
 }
 
-/// The two tables history lives in, with the thread each row is keyed by.
-///
-/// The table and column names are interpolated into SQL (an identifier cannot
-/// be bound as a parameter), so they come from this closed set and nowhere else
-/// — the same reasoning as [`CountedTable`].
+/// The two tables history lives in, with the thread each row is keyed by (a
+/// closed set, interpolated like [`CountedTable`]).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ThreadTable {
     Channel(Uuid),
@@ -785,11 +732,9 @@ impl ThreadTable {
     }
 }
 
-/// Decode stored envelope rows, skipping (and logging) any that will not parse.
-///
-/// One damaged row used to fail the whole load with `?`, which meant the server
-/// would not start at all. Its seq is simply absent from history; numbering is
-/// unaffected because it comes from the highest seq stored, not from a count.
+/// Decode stored envelope rows, skipping (and logging) any that will not parse,
+/// so one damaged row cannot stop the server starting. Numbering comes from the
+/// highest stored seq, so it is unaffected.
 fn decode_rows(rows: Vec<(i64, String)>) -> Vec<Envelope> {
     rows.into_iter()
         .filter_map(|(seq, json)| match serde_json::from_str(&json) {
@@ -803,10 +748,8 @@ fn decode_rows(rows: Vec<(i64, String)>) -> Vec<Envelope> {
 }
 
 /// Load a thread for memory: its newest `resident` envelopes, and the highest
-/// seq it has ever stored.
-///
-/// Only the tail is read. Loading every envelope of every thread made startup
-/// time and resident memory grow with the community's entire history.
+/// seq it has ever stored (only the tail is read, so startup does not scale
+/// with history).
 pub(super) fn load_history(
     conn: &Connection,
     table: ThreadTable,
@@ -837,11 +780,8 @@ pub(super) fn load_history(
     ))
 }
 
-/// One page's worth of a thread's envelopes after `since_seq`, read from the
-/// database for a request that reaches past what memory holds.
-///
-/// At most [`MAX_HISTORY_BATCH`] rows; the caller still applies the byte
-/// budget (`take_history_page`).
+/// One page of a thread's envelopes after `since_seq` (at most
+/// [`MAX_HISTORY_BATCH`] rows; the caller applies the byte budget).
 pub(super) fn load_page(
     conn: &Connection,
     table: ThreadTable,
@@ -865,12 +805,9 @@ pub(super) fn load_page(
     Ok(decode_rows(rows))
 }
 
-/// Bound the member-supplied strings of a stored file message.
-///
-/// An older server stored a file's name and MIME type exactly as sent, so a
-/// database may hold an envelope whose metadata alone is megabytes — large
-/// enough to make every page or broadcast carrying it unsendable. Reducing it
-/// on load lets such a community be joined again without editing the database.
+/// Bound the member-supplied strings of a stored file message: an older server
+/// stored them as sent, and oversized metadata made every page carrying it
+/// unsendable.
 pub(super) fn repair_envelope(mut env: Envelope) -> Envelope {
     if let MessagePayload::File(meta) = &mut env.payload {
         meta.name = sanitize_filename(&meta.name);

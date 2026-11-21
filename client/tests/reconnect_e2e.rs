@@ -4,60 +4,27 @@
 //!
 //! What must hold afterwards, on **both** sides:
 //!
-//! - **One conversation per peer.** The re-dial starts a fresh chat (nothing at
-//!   dial time says who will answer); once the peer's verified identity arrives
-//!   it has to be folded back into the conversation that holds the history.
-//!   The host always did this; the dialing side used to leave a second, empty
-//!   "host:port" thread beside the real one.
+//! - **One conversation per peer.** The re-dial starts a fresh chat; once the
+//!   verified identity arrives it is folded into the one holding the history
+//!   (the dialing side used to leave a second, empty "host:port" thread).
 //! - **No second safety-code prompt** for a peer both sides already verified.
 //! - **Messages flow both ways in the old conversation**, which also proves
 //!   the replay counters were reset for the new session.
 
+mod common;
+
+use common::{free_port, pump_pair as pump_until};
 use messenger_core::core::generate_rsa_keypair;
-use messenger_core::types::{Config, MessageContent};
+use messenger_core::types::MessageContent;
 use messenger_core::RSA_KEY_BITS;
 use p2pem_classic::app::ChatManager;
 use std::path::Path;
-use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-/// A hang detector, not a performance bound: debug-build RSA handshakes are
-/// slow, and several run at once under a parallel runner.
-const STEP_TIMEOUT: Duration = Duration::from_secs(90);
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
-}
-
 fn manager_in(dir: &Path, history_key: [u8; 32]) -> ChatManager {
-    let download = dir.join("downloads");
-    let temp = dir.join("tmp");
-    std::fs::create_dir_all(&download).expect("download dir");
-    std::fs::create_dir_all(&temp).expect("temp dir");
-    let mut manager = ChatManager::new(Config {
-        download_dir: download,
-        temp_dir: temp,
-        ..Config::default()
-    });
+    let mut manager = common::manager_in(dir, false);
     manager.set_history_key(history_key);
     manager
-}
-
-async fn pump_until<F>(a: &mut ChatManager, b: &mut ChatManager, label: &str, mut done: F)
-where
-    F: FnMut(&mut ChatManager, &mut ChatManager) -> bool,
-{
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        a.poll_session_events();
-        b.poll_session_events();
-        if done(a, b) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "[{label}] timed out");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// Conversations, not listeners.
@@ -128,8 +95,7 @@ async fn redialing_a_verified_peer_continues_the_same_conversation() {
     // --- The dialing side restarts. ---
     client.save_history(&client_history).expect("save");
     drop(client);
-    // Dropping the manager must close its sessions, or the host would not
-    // notice until its idle timeout.
+    // Dropping the manager must close its sessions (not wait for a timeout).
     pump_until(
         &mut host,
         &mut ChatManager::default(),
@@ -143,8 +109,7 @@ async fn redialing_a_verified_peer_continues_the_same_conversation() {
         .expect("load");
     assert_eq!(conversations(&client), vec![client_chat]);
 
-    // The host's listener was consumed by the first peer; re-open it the way
-    // both shells' auto-rehost does.
+    // The first peer consumed the listener; re-open it as auto-rehost does.
     assert!(host.check_rehost_needed());
     host.start_host(port, host_key).await.expect("rehost");
 

@@ -32,14 +32,8 @@ const HKDF_INFO: &[u8] = b"p2p-messenger-v2-forward-secrecy";
 const RATE_LIMIT_MAX_CONNECTIONS: usize = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Global rate limiter state.
-///
-/// This is the shared [`RateLimiter`], not a bare map: the hand-rolled version
-/// here only ever *pruned* an address's timestamps and never dropped the address
-/// itself, so every source that had ever connected kept a `HashMap` entry for
-/// the life of the process. A scan across a /64 is enough to turn that into an
-/// out-of-memory condition a remote party controls. `RateLimiter` ages entries
-/// out and caps how many it will hold (`ratelimit::MAX_TRACKED_ADDRESSES`).
+/// Global rate limiter. The shared [`RateLimiter`] ages entries out and caps how many
+/// addresses it tracks, so a scan across a /64 cannot grow it without bound.
 static RATE_LIMITER: std::sync::LazyLock<Mutex<RateLimiter>> = std::sync::LazyLock::new(|| {
     Mutex::new(RateLimiter::with_limits(
         RATE_LIMIT_MAX_CONNECTIONS,
@@ -83,28 +77,20 @@ fn labeled_aad(label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
     aad
 }
 
-/// Bind the host listener on `port` (all interfaces).
-///
-/// Separate from [`run_host_session`] on purpose: the caller must learn that a
-/// bind failed (port already in use) **before** it creates any chat or session
-/// state. When the bind lived inside the spawned session task its failure was
-/// only logged, and the app was left showing a "Host on :port" conversation
-/// that reported itself connected while nothing was listening at all.
+/// Bind the host listener on `port` (all interfaces). Separate from [`run_host_session`]
+/// so a bind failure (port in use) surfaces before any chat or session state exists.
 pub async fn bind_host_listener(port: u16) -> Result<TcpListener> {
     TcpListener::bind(("0.0.0.0", port))
         .await
         .map_err(|e| anyhow!("Could not listen on port {}: {}", port, e))
 }
 
-/// Handshakes the host listener runs at once. Beyond this, new connections
-/// are closed on arrival until one finishes. Small on purpose: a host serves
-/// one peer per session, and this only has to outlast connections that open
-/// and then say nothing.
+/// Handshakes the host runs at once; further connections are closed on arrival. It only
+/// has to outlast connections that open and then say nothing.
 pub const MAX_PENDING_HOST_HANDSHAKES: usize = 4;
 
-/// One deadline for a whole incoming handshake plus the password gate. The
-/// per-packet timeout alone let a connection that sent each packet just in
-/// time hold a slot for over a minute.
+/// One deadline for the whole incoming handshake plus password gate, so a peer that
+/// sends each packet just in time cannot hold a slot.
 pub const HOST_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// A wrong connection password. Typed so the accept loop can tell the user
@@ -159,19 +145,13 @@ fn new_connection_prompt(peer_label: String, tunnel: &EstablishedTunnel) -> Sess
     }
 }
 
-/// Run a host session on an already-bound listener: keep accepting until one
-/// peer completes the handshake (and password gate), then verification and the
-/// message loop as on every other transport. Use [`bind_host_listener`] to
-/// obtain the listener.
+/// Run a host session on a listener from [`bind_host_listener`]: accept until one peer
+/// completes the handshake (and password gate), then verify and run the message loop.
 ///
-/// The listener used to be one-shot — accept, drop it, then handshake — so a
-/// single connection that sent nothing left the port closed for the whole
-/// handshake timeout, and reconnecting the moment it reopened kept the host
-/// unreachable indefinitely (audit NET-02). Now handshakes run concurrently
-/// (at most [`MAX_PENDING_HOST_HANDSHAKES`], each under
-/// [`HOST_HANDSHAKE_DEADLINE`]) while the listener stays open, and the per-IP
-/// rate limit is applied *before* a slot is spent. The listener is still
-/// released the moment a peer wins, so auto-rehost can bind again.
+/// Handshakes run concurrently (at most [`MAX_PENDING_HOST_HANDSHAKES`], each under
+/// [`HOST_HANDSHAKE_DEADLINE`]) with the per-IP rate limit applied before a slot is
+/// spent, so one silent connection cannot close the port (audit NET-02). The listener
+/// is dropped as soon as a peer wins so auto-rehost can bind again.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session(
     listener: TcpListener,
@@ -249,10 +229,8 @@ pub async fn run_host_session(
         }
     };
 
-    // Release the port the instant we have our peer. A session serves exactly
-    // one connection, so holding the listener for the whole conversation only
-    // ever did one thing: make the auto-rehost's bind fail with EADDRINUSE.
-    // The other half-finished handshakes are abandoned with it.
+    // Release the port as soon as we have our peer so auto-rehost can bind; the other
+    // half-finished handshakes are abandoned with it.
     drop(listener);
     pending.abort_all();
     tracing::info!("Client connected from {}", peer_addr);
@@ -272,11 +250,9 @@ pub async fn run_host_session(
     .await
 }
 
-/// Attempt a TCP connection to each candidate in order, bounding every attempt
-/// with [`crate::CONNECT_ATTEMPT_TIMEOUT_SECS`] so one dead address (which
-/// would otherwise hang for the OS connect timeout) cannot stall the fallback
-/// to the next. Emits a `Warning` event between failed attempts so the UI can
-/// show progress. Returns the connected stream plus the winning target.
+/// Try a TCP connection to each candidate in order, each bounded by
+/// [`crate::CONNECT_ATTEMPT_TIMEOUT_SECS`] so one dead address cannot stall the fallback.
+/// Emits a `Warning` between failed attempts. Returns the stream plus the winning target.
 pub async fn connect_first_reachable(
     targets: &[(String, u16)],
     to_app_tx: &mpsc::UnboundedSender<SessionEvent>,
@@ -340,10 +316,8 @@ pub async fn run_client_session(
     .await
 }
 
-/// Try each `(host, port)` candidate in priority order (bounded per-attempt
-/// timeout) and run the client session over the first that accepts the TCP
-/// connection. Later candidates are only tried when earlier ones fail to
-/// *connect* — once a stream is established the session lives or dies there.
+/// Run the client session over the first `(host, port)` candidate that accepts a TCP
+/// connection; once a stream is established the session lives or dies there.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_client_session_multi(
     targets: &[(String, u16)],
@@ -372,24 +346,18 @@ pub async fn run_client_session_multi(
     .await
 }
 
-/// A completed Protocol v3 cryptographic handshake: the peer's verified identity
-/// fingerprint and chat id, plus the established AEAD tunnel (cipher + transport
-/// AAD). Callers apply their own trust policy (interactive TOFU for P2P, server
-/// policy for the Party server) and then run whatever message loop rides on top.
+/// A completed handshake: the peer's verified fingerprint and chat id plus the AEAD
+/// tunnel. Callers apply their own trust policy and message loop on top.
 pub struct EstablishedTunnel {
     pub peer_fingerprint: String,
     pub peer_chat_id: uuid::Uuid,
     pub cipher: AesCipher,
     pub transport_aad: Vec<u8>,
-    /// Which signature scheme the two peers settled on for identity proofs.
-    /// Worth surfacing rather than discarding: it is the one handshake choice
-    /// that varies by peer version, so it is what a diagnostic report needs to
-    /// answer "why did this connection behave differently from that one".
+    /// Signature scheme negotiated for identity proofs; varies by peer version, so
+    /// diagnostics report it.
     pub signature_scheme: SignatureScheme,
-    /// Whether the client committed to its ephemeral key before seeing the
-    /// host's (both peers v4+). Without the commitment a man in the middle can
-    /// try ephemeral keys until both victims' safety codes match, so the code
-    /// is only a weak check and the user is told to compare the fingerprint.
+    /// Whether the client committed to its ephemeral key first (both peers v4+). Without
+    /// it a MITM can grind keys until both SAS codes match, so the SAS is a weak check.
     pub sas_committed: bool,
 }
 
@@ -399,11 +367,8 @@ pub const SAS_COMMITMENT_VERSION: u32 = 4;
 /// Domain separator for the ephemeral-key commitment.
 const COMMITMENT_LABEL: &[u8] = b"p2pem-v4-ephemeral-commitment";
 
-/// The client's commitment to its ephemeral key, sent before it sees the
-/// host's. It is what stops a man in the middle from grinding its own key
-/// until both victims' safety codes match (audit CRYPTO-02): with the client
-/// committed first and the host's key fixed before the reveal, neither half
-/// of an interposed session leaves the attacker anything to search over.
+/// The client's commitment to its ephemeral key, sent before it sees the host's, so a
+/// MITM cannot grind keys until both victims' safety codes match (audit CRYPTO-02).
 pub fn ephemeral_commitment(ephemeral: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(COMMITMENT_LABEL);
@@ -427,12 +392,9 @@ fn check_commitment(commitment: &[u8], ephemeral: &[u8]) -> Result<()> {
 pub const LEGACY_SAS_WARNING: &str = "This peer runs an older version, so its safety code is a \
 weak check. Compare the full fingerprint (advanced) instead, or ask them to update.";
 
-/// Sign our ephemeral key for the identity proof under the negotiated scheme.
-///
-/// Returns the bytes for [`IdentityProof::signature`]. For RSA-PSS that is the
-/// signature; for Ed25519 it is a serialized [`Ed25519Proof`] carrying the
-/// signature, the subkey, and the subkey's binding to this RSA identity.
-/// Shared by every handshake variant so all four sign identically.
+/// Sign our ephemeral key for the identity proof under the negotiated scheme: an RSA-PSS
+/// signature, or a serialized [`Ed25519Proof`] (signature, subkey, and the subkey's
+/// binding to this RSA identity). Shared by every handshake variant.
 fn build_identity_signature(
     scheme: SignatureScheme,
     privkey: &RsaPrivateKey,
@@ -462,28 +424,16 @@ fn build_identity_signature(
     }
 }
 
-/// Decode a peer's `IdentityProof`, refusing anything appended to it.
-///
-/// This frame is decoded **before any trust decision has been made** — it is
-/// what the fingerprint, and therefore TOFU, is computed from. Plain
-/// `bincode::deserialize` stops at the end of the struct and ignores the rest,
-/// so `proof || junk` decoded identically to `proof`: two distinct byte strings
-/// with one meaning, on the earliest attacker-reachable frame in the handshake.
-///
-/// The Party codec refuses trailing bytes for exactly this reason, and both
-/// frames sit inside the AEAD tunnel, so the argument is the same in both
-/// places. See [`messenger_core::util::decode_exact`].
+/// Decode a peer's `IdentityProof`, refusing trailing bytes. It is decoded before any
+/// trust decision, and `proof || junk` must not decode to the same proof
+/// (see [`crate::util::decode_exact`]).
 fn decode_identity_proof(bytes: &[u8]) -> Result<IdentityProof> {
     crate::util::decode_exact(bytes)
 }
 
-/// Verify a peer's identity proof against the ephemeral key they sent.
-///
-/// The identity is always the RSA key in `public_key_pem` — that is what the
-/// fingerprint, and therefore TOFU, is derived from, and this step does not
-/// change it. An Ed25519 proof is accepted only when the subkey it was signed
-/// with is itself signed by that RSA identity, so trusting a fingerprint still
-/// means trusting exactly one key.
+/// Verify a peer's identity proof against the ephemeral key they sent. The identity is
+/// always the RSA key in `public_key_pem` (what the fingerprint is derived from); an
+/// Ed25519 proof is accepted only when its subkey is signed by that RSA identity.
 fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> Result<()> {
     let peer_pubkey = pem_decode_public(&proof.public_key_pem)?;
     let mut hasher = Sha256::new();
@@ -517,10 +467,7 @@ fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> 
     }
 }
 
-/// The signature schemes we offer, best first. Ed25519 first, RSA-PSS retained
-/// for peers that predate it — [`negotiate_signature_scheme`] prefers Ed25519
-/// when both sides offer it, so an older peer that advertises only RSA-PSS
-/// still connects.
+/// The signature schemes we offer, best first; RSA-PSS is kept for older peers.
 const OFFERED_SCHEMES: [SignatureScheme; 2] = [SignatureScheme::Ed25519, SignatureScheme::RsaPss];
 
 /// Our protocol version as it goes on the wire (plaintext, big-endian u32).
@@ -614,12 +561,9 @@ struct TunnelKeys {
     transport_aad: Vec<u8>,
 }
 
-/// Derive the session key and AADs from the ECDH result and the transcript.
-///
-/// The transcript order is fixed regardless of who computes it —
-/// `HostVersion || ClientVersion || HostEphemeral || ClientEphemeral` — so
-/// both peers hash identical bytes. That is why the arguments name roles, not
-/// "ours"/"theirs": the latter is exactly the swap that would desync the keys.
+/// Derive the session key and AADs from the ECDH result and the transcript. The
+/// transcript is `HostVersion || ClientVersion || HostEphemeral || ClientEphemeral`
+/// whoever computes it, which is why the arguments name roles, not "ours"/"theirs".
 fn derive_tunnel_keys(
     our_secret: EphemeralSecret,
     their_public: &X25519PublicKey,
@@ -706,9 +650,7 @@ where
             proof.signature_scheme
         ));
     }
-    // Verifies under whichever scheme the peer used; an Ed25519 proof is only
-    // accepted when its subkey is bound to the RSA identity that the
-    // fingerprint — and therefore TOFU — is derived from.
+    // An Ed25519 proof is only accepted when its subkey is bound to the RSA identity.
     verify_identity_proof(&proof, peer_ephemeral)
         .map_err(|e| anyhow!("{} identity verification failed: {}", peer, e))?;
     Ok(proof)
@@ -736,15 +678,10 @@ impl TunnelKeys {
     }
 }
 
-/// Run the host side of the Protocol v3 handshake over `stream`: version exchange,
-/// X25519 ephemeral key exchange, session-key derivation, and the encrypted,
-/// transcript-bound identity-proof exchange. Returns the established tunnel and the
-/// peer's verified identity. The caller is responsible for trust policy (TOFU /
-/// server policy) and the message loop.
-///
-/// Wire order (the client mirrors it): send version, receive version, send
-/// ephemeral, receive ephemeral, send schemes, receive schemes, send proof,
-/// receive proof.
+/// Host side of the handshake: version exchange, X25519 ephemeral exchange, session-key
+/// derivation, and the encrypted, transcript-bound identity-proof exchange. The caller
+/// applies trust policy and runs the message loop. Wire order (the client mirrors it):
+/// version, (v4: client commitment), ephemeral, schemes, proof.
 pub async fn host_handshake<S>(
     stream: &mut S,
     privkey: &RsaPrivateKey,
@@ -814,10 +751,8 @@ where
     keys.established(&client_proof, scheme, committed)
 }
 
-/// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
-/// [`host_handshake`]; returns the established tunnel and the host's verified
-/// identity (`peer_chat_id` is the host's advertised chat id). The host proves
-/// its identity first, so the client verifies before revealing its own.
+/// Client side of the handshake; mirror of [`host_handshake`]. The host proves its
+/// identity first, so the client verifies before revealing its own.
 pub async fn client_handshake<S>(
     stream: &mut S,
     privkey: &RsaPrivateKey,
@@ -880,25 +815,11 @@ where
     keys.established(&host_proof, scheme, committed)
 }
 
-/// Constant-time comparison so a wrong connection password cannot be recovered
-/// byte-by-byte via response timing.
-///
-/// `subtle::ConstantTimeEq` rather than a hand-rolled loop, for two reasons.
-/// The community server already uses `subtle` for exactly this comparison, and
-/// one implementation of "compare a secret" is one place to get it right. More
-/// concretely, a hand-written version's early `return` on a length mismatch is
-/// itself a timing signal — it answers "wrong length" faster than "wrong bytes",
-/// which hands an attacker the password's length for free before they start
-/// guessing its content. Here both operands are first reduced to a fixed 32
-/// bytes, so the comparison is over equal-length inputs whatever was sent and
-/// the length never reaches a branch.
-///
-/// The reduction is Argon2id under a fresh random salt, at its minimum cost
-/// (8 KiB, one pass: microseconds). A fast hash such as SHA-256 did the same
-/// job, but it is the wrong primitive to put a password through, and code
-/// scanning rightly flags it; nothing here relies on Argon2's cost, only on
-/// it being a salted, fixed-length function of the input. The salt is per
-/// comparison, so nothing about either value can be precomputed or linked.
+/// Constant-time password comparison, so a wrong connection password cannot be
+/// recovered via response timing. Both inputs are first reduced to 32 bytes by Argon2id
+/// (minimum cost, fresh random salt per comparison), so the length never reaches a
+/// branch; nothing relies on Argon2's cost, only on a salted fixed-length function
+/// (not SHA-256: the wrong primitive for a password, and code scanning flags it).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use argon2::{Algorithm, Argon2, Params, Version};
     let salt: [u8; 16] = rand::random();
@@ -915,11 +836,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(ha.ct_eq(&hb[..]))
 }
 
-/// Host side of the optional connection-password gate, run over the established
-/// tunnel right after the handshake (so it is confidential and transcript-bound)
-/// and before the peer is surfaced for TOFU. The host announces whether a password
-/// is required; the client replies with its (encrypted) password. A wrong password
-/// returns an error and the caller drops the connection.
+/// Host side of the optional connection-password gate, run inside the tunnel right after
+/// the handshake and before TOFU. The host announces whether a password is required; the
+/// client replies with it. A wrong password returns [`PasswordRefused`].
 async fn host_password_gate<S>(
     stream: &mut S,
     cipher: &AesCipher,
@@ -1011,9 +930,8 @@ async fn await_user_confirmation(
     Err(anyhow!(error))
 }
 
-/// Everything after the handshake and password gate, common to both roles:
-/// surface the peer for verification, wait for the user, then run the
-/// message loop.
+/// Common to both roles after the handshake and password gate: surface the peer for
+/// verification, wait for the user, then run the message loop.
 #[allow(clippy::too_many_arguments)]
 async fn verify_then_run<S>(
     stream: &mut S,
@@ -1046,9 +964,8 @@ where
     .await
 }
 
-/// Host side of a P2P session over an already-connected stream (direct TCP,
-/// hole-punched socket or relay bridge): handshake, optional password gate,
-/// TOFU verification, message loop.
+/// Host side of a P2P session over an already-connected stream (direct TCP, punched
+/// socket or relay bridge): handshake, password gate, TOFU verification, message loop.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_host_session_over_stream<S>(
     stream: &mut S,
@@ -1065,8 +982,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let tunnel = host_handshake(stream, &privkey, chat_id).await?;
-    // Optional connection-password gate (inside the encrypted, authenticated
-    // tunnel, before the peer is surfaced for verification).
+    // Optional password gate, inside the tunnel and before verification.
     reported(
         &to_app_tx,
         host_password_gate(
@@ -1149,33 +1065,18 @@ where
     .await
 }
 
-/// Validate message sequence number for replay attack protection
-///
-/// Transport-layer validation ensures that:
-/// 1. Messages are strictly monotonically increasing (seq > last_valid_seq)
-/// 2. Replayed messages (old seq) are rejected
-/// 3. Out-of-order messages are rejected
-/// 4. Duplicate messages are rejected
-///
-/// This is enforced BEFORE the message is emitted to the app layer.
-///
-/// # Arguments
-/// * `msg` - The parsed ProtocolMessage
-/// * `last_valid_seq` - Mutable reference to track the last accepted sequence number
-///
-/// # Returns
-/// * `Ok(())` if the sequence is valid and last_valid_seq is updated
-/// * `Err(String)` if the sequence is invalid (with descriptive reason)
+/// Transport-layer replay protection, enforced before a frame reaches the app: a
+/// sequenced frame is accepted only if its seq is strictly greater than the last
+/// accepted one (rejecting replays, duplicates and reordering), which it then becomes.
 fn validate_message_sequence(
     msg: &ProtocolMessage,
     last_valid_seq: &mut u64,
 ) -> Result<(), String> {
-    // Handshake messages don't have sequence numbers - always allow
+    // Handshake messages carry no sequence number.
     let Some(seq) = msg.seq() else {
         return Ok(());
     };
 
-    // Strict monotonic increase: new sequence must be strictly greater than last valid
     if seq <= *last_valid_seq {
         return Err(format!(
             "Replay/Out-of-order detected: received seq={}, expected seq > {}",
@@ -1183,19 +1084,13 @@ fn validate_message_sequence(
         ));
     }
 
-    // Update to new valid sequence
     *last_valid_seq = seq;
     Ok(())
 }
 
-/// Send a `Rekey` frame and rotate to the next session key.
-///
-/// Only ONE side of a session (the host) ever initiates a rekey. If both sides
-/// could initiate, they might rekey in the same round trip — each applying its
-/// own new key before the other's `Rekey` (encrypted under the *old* key)
-/// arrives — and the next frame would be undecryptable, tearing the session
-/// down. A single deterministic initiator makes that race impossible; the
-/// other side rekeys only in response to a received `Rekey`.
+/// Send a `Rekey` frame and rotate to the next session key. Only the host initiates;
+/// if both sides could, each might apply its new key before the other's old-key
+/// `Rekey` arrives and the next frame would be undecryptable.
 async fn initiate_rekey<S>(
     stream: &mut S,
     cipher: &mut AesCipher,
@@ -1221,11 +1116,8 @@ where
     // current key), so the peer can still decrypt the Rekey itself.
     let next_key = rekey_session_key(&cipher.get_current_key(), &nonce);
     let role = cipher.role();
-    // Retain the outgoing side's *old* key for the receive path: the peer keeps
-    // sending under it until it processes this Rekey, so frames encrypted with
-    // the old key can still be in flight. The window closes as soon as a frame
-    // decrypts under the new key (proof the peer has switched). See the receive
-    // branch in run_message_loop.
+    // Keep the old key for receiving: the peer sends under it until it processes this
+    // Rekey. Dropped once a frame decrypts under the new key (see `Transport::receive`).
     *prev_cipher = Some(cipher.clone());
     *cipher = AesCipher::new_with_role(&next_key, role)?;
     *messages_since_rekey = 0;
@@ -1240,19 +1132,14 @@ const REKEY_MESSAGE_COUNT: u64 = 100;
 const REKEY_TIME_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How long the peer may stay silent before the session is considered dead.
-/// The peer's keep-alives arrive well inside it.
 const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Keep-alive pings run well inside the peer's idle window (2 pings per 300 s),
-/// so a quiet-but-healthy session is never torn down. Before this, two
-/// connected peers who simply didn't type for five minutes were disconnected by
-/// each side's receive timeout.
+/// Keep-alive pings run well inside the peer's idle window, so a quiet but healthy
+/// session is never torn down.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 
-/// How many inbound frames may complete and wait while a write is blocked
-/// before the loop stops reading and simply waits for the write. Keeps an
-/// honest peer flowing (see [`write_while_reading`]) without letting one that
-/// never reads make us buffer without limit.
+/// Inbound frames that may complete and wait while a write is blocked before the loop
+/// stops reading (see [`write_while_reading`]); bounds a peer that never reads.
 const MAX_FRAMES_HELD_DURING_WRITE: usize = 16;
 
 /// What a received frame means for the loop.
@@ -1261,30 +1148,24 @@ enum Received {
     Stop,
 }
 
-/// The per-session state every frame passes through, in either direction: the
-/// cipher (and the key retained across a rotation), both sequence counters and
-/// the rekey schedule.
+/// Per-session state every frame passes through: the cipher (and the key retained across
+/// a rotation), both sequence counters and the rekey schedule.
 struct Transport<W> {
     writer: W,
     cipher: AesCipher,
-    /// The key in force *before* the most recent rotation, kept for a bounded
-    /// window so frames the peer sent under the old key (still in flight when
-    /// we rotated) remain decryptable. Cleared the moment a frame decrypts
-    /// under the current key — proof the peer has switched.
+    /// The key in force before the latest rotation, so frames the peer sent under it
+    /// still decrypt. Cleared once a frame decrypts under the current key.
     prev_cipher: Option<AesCipher>,
     transport_aad: Vec<u8>,
     to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     /// The outgoing sequence, stamped on every frame we send (Rekey included).
     sent_seq: u64,
-    /// The last sequence accepted from the peer — transport-layer replay
-    /// protection, enforced before anything reaches the app.
+    /// The last sequence accepted from the peer (replay protection).
     last_valid_seq: u64,
     messages_since_rekey: u64,
     last_rekey_time: Instant,
-    /// Only the host initiates rekeys, so the two peers can never rekey
-    /// simultaneously and desync their keys (the client rekeys only in
-    /// response to a received `Rekey`). The role is fixed for the life of the
-    /// session and preserved across rekeys.
+    /// Only the host initiates rekeys, so the peers never rekey simultaneously; the
+    /// client rekeys only in response to a received `Rekey`.
     is_rekey_initiator: bool,
 }
 
@@ -1332,19 +1213,13 @@ where
         .map_err(|e| anyhow!("Network send error (rekey): {}", e))
     }
 
-    /// Encrypt and write one outbound application frame, first rotating the
-    /// key if a host-initiated rekey is due. Used by the control lane and the
-    /// bounded file-data lane alike, so both stamp the single monotonic
-    /// outbound sequence and both surface their send confirmations.
+    /// Encrypt and write one outbound frame, first rotating the key if a rekey is due.
+    /// Shared by the control and file lanes, so both stamp one monotonic sequence.
     async fn send(&mut self, mut msg: ProtocolMessage) -> Result<()> {
         if self.rekey_due() {
             self.rekey().await?;
         }
 
-        // Interleaving the two lanes is safe: each frame still gets the next
-        // seq in the order it is written, so application frames and Rekey
-        // frames form one strictly-increasing stream the peer's replay check
-        // accepts.
         self.sent_seq += 1;
         msg.set_seq(self.sent_seq);
         tracing::debug!("Sending message: {:?}", msg);
@@ -1357,12 +1232,9 @@ where
             .map_err(|e| anyhow!("Network send error: {}", e))?;
         self.messages_since_rekey += 1;
 
-        // Report the transport seq of load-bearing final frames back to the
-        // app: FileEnd ("queueing is not delivery"), and the frame carrying an
-        // outgoing text message (single frame, or the final chunk of a large
-        // one) so the app can correlate the peer's delivery receipt
-        // (`Ack { acked_seq }`) back to that message. Frames drain FIFO per
-        // lane, so order correlates.
+        // Report the wire seq of FileEnd and of the frame completing an outgoing text
+        // (single frame or final chunk), so the app can correlate delivery receipts
+        // (`Ack { acked_seq }`). Frames drain FIFO per lane, so order correlates.
         let confirmed = match msg {
             ProtocolMessage::FileEnd { seq } => Some(SessionEvent::FileSendComplete { seq }),
             ProtocolMessage::Text { seq, .. } => Some(SessionEvent::TextSendComplete { seq }),
@@ -1380,11 +1252,9 @@ where
         Ok(())
     }
 
-    /// Keep-alive: ping on the shared outbound sequence so the peer's idle timer
-    /// resets even when nobody is typing. If a rekey is due, the host rotates
-    /// instead — otherwise a silent-but-receiving host would never rekey (it
-    /// never sends), quietly weakening forward secrecy. The Rekey frame doubles
-    /// as keep-alive traffic.
+    /// Keep-alive ping on the shared outbound sequence. If a rekey is due the host
+    /// rotates instead (the Rekey frame doubles as keep-alive), or a host that only
+    /// receives would never rekey.
     async fn keep_alive(&mut self) -> Result<()> {
         if self.rekey_due() {
             return self.rekey().await;
@@ -1404,10 +1274,8 @@ where
     /// One frame off the wire: decrypt, check its sequence, and either act on
     /// it here (`Rekey`, `Ping`) or hand it to the app.
     fn receive(&mut self, encrypted: &[u8]) -> Result<Received> {
-        // Try the current key first. If it works, the peer has switched to it,
-        // so any retained previous key can be dropped (its in-flight window is
-        // closed). If it fails, fall back to the previous key for frames the
-        // peer sent under the old key before it processed our Rekey.
+        // Try the current key first; success proves the peer switched, so drop the
+        // previous key. Otherwise fall back to it for frames sent before our Rekey.
         let decrypted = match self
             .cipher
             .decrypt_from_peer(encrypted, Some(&self.transport_aad))
@@ -1422,10 +1290,8 @@ where
                 .and_then(|pc| pc.decrypt_from_peer(encrypted, Some(&self.transport_aad))),
         };
         let Some(plaintext) = decrypted else {
-            // Undecryptable under BOTH keys over a reliable, ordered stream
-            // means the channel is genuinely desynced or tampered with — it
-            // cannot recover, so fail closed instead of spinning on every
-            // subsequent (also-undecryptable) packet until the idle timeout.
+            // Undecryptable under both keys over an ordered stream: desynced or
+            // tampered, and unrecoverable, so fail closed.
             tracing::error!("Decryption failed - possible tampering or key mismatch!");
             let _ = self
                 .to_app_tx
@@ -1438,18 +1304,15 @@ where
         };
         tracing::debug!("Received message: {:?}", msg);
 
-        // Transport-layer replay protection: a replayed, duplicated or
-        // reordered frame is dropped before the app ever sees it.
+        // Replay protection: drop replayed, duplicated or reordered frames.
         if let Err(e) = validate_message_sequence(&msg, &mut self.last_valid_seq) {
             tracing::warn!("Rejecting message due to invalid sequence: {}", e);
             return Ok(Received::Continue);
         }
 
         match msg {
-            // Only the host rotates (see `is_rekey_initiator`). A client that
-            // sends `Rekey` anyway is not following the protocol, and obeying
-            // it would let it force rotations at will and desync the session
-            // (external review EXT-01). Ignore the frame, keep the session.
+            // Only the host rotates; obeying a client's Rekey would let it force
+            // rotations and desync the session (EXT-01). Ignore it, keep the session.
             ProtocolMessage::Rekey { .. } if self.is_rekey_initiator => {
                 tracing::warn!("Ignoring Rekey from a peer that is not the initiator");
             }
@@ -1469,9 +1332,7 @@ where
                 self.last_rekey_time = Instant::now();
                 tracing::info!("Session key rotated (received Rekey message)");
             }
-            // Keep-alive: transport plumbing that only exists to defeat the idle
-            // timeout. (The app layer also tolerates Ping for peers that still
-            // forward it.)
+            // Keep-alive only; not surfaced to the app.
             ProtocolMessage::Ping { .. } => tracing::trace!("Keep-alive ping received"),
             msg => {
                 self.messages_since_rekey += 1;
@@ -1484,9 +1345,8 @@ where
     }
 }
 
-/// Read one frame, owning the read half for the duration and handing it back
-/// with the result — so the caller can hold a single read in flight across
-/// `select!` iterations (see `run_message_loop` for why that matters).
+/// Read one frame, owning the read half and handing it back with the result, so one
+/// read can stay in flight across `select!` iterations.
 async fn read_frame<R>(mut reader: R) -> (R, std::io::Result<Vec<u8>>)
 where
     R: AsyncRead + Unpin,
@@ -1495,17 +1355,11 @@ where
     (reader, result)
 }
 
-/// Drive `write` to completion while keeping the in-flight read moving,
-/// queueing any frame that completes meanwhile in `inbox`.
-///
-/// A write blocks once the peer's receive buffer is full, and the peer only
-/// drains it by reading — which it cannot do while *it* is blocked writing to
-/// us. A loop that stops reading whenever it writes therefore deadlocks as
-/// soon as both peers push more than the pipe holds at the same moment (two
-/// file transfers crossing, or a burst of large messages each way): each waits
-/// for the other forever, with nothing reported. The cap
-/// ([`MAX_FRAMES_HELD_DURING_WRITE`]) bounds what a peer that never reads can
-/// make us hold; reading also stops after a read error, which is final.
+/// Drive `write` to completion while keeping the in-flight read moving, queueing any
+/// frame that completes meanwhile in `inbox`. A write blocks once the peer's buffer is
+/// full, and the peer drains it only by reading; if both stop reading while writing
+/// (crossing transfers), both deadlock. [`MAX_FRAMES_HELD_DURING_WRITE`] bounds what a
+/// peer that never reads can make us hold; reading also stops after a read error.
 async fn write_while_reading<W, F, R>(
     write: W,
     pending_read: &mut std::pin::Pin<Box<F>>,
@@ -1553,8 +1407,7 @@ async fn run_message_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Test hooks: integration tests shrink these windows (seconds) to verify the
-    // keep-alive behavior in wall-clock-realistic time. Never set in production.
+    // Test hooks (seconds) so integration tests can exercise keep-alive quickly.
     let recv_idle_timeout = duration_from_env("P2PEM_TEST_IDLE_TIMEOUT_SECS", RECV_IDLE_TIMEOUT);
     let keepalive_interval = duration_from_env("P2PEM_TEST_KEEPALIVE_SECS", KEEPALIVE_INTERVAL);
 
@@ -1565,30 +1418,18 @@ where
     );
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // The in-flight read is kept alive ACROSS loop iterations.
-    //
-    // `select!` drops the futures of the branches that lose, and `recv_packet`
-    // is not cancel-safe: it reads a 4-byte length prefix and then the body.
-    // Building a fresh read every iteration meant that whenever a send, a file
-    // chunk or a keep-alive won the race while a frame was half-read, the bytes
-    // already taken off the socket were thrown away. The next read then parsed
-    // ciphertext as a length prefix and the session died on "packet size
-    // exceeds limit" — which needs nothing more than both peers sending at
-    // about the same time. The Party server hit and fixed the same thing
-    // (`server/src/connection.rs`).
-    //
-    // Splitting the stream lets one read stay pending while the write half
-    // serves the other branches (and keeps moving during writes, see
-    // `write_while_reading`); a cancelled poll of it resumes where it was.
+    // The in-flight read is kept alive ACROSS loop iterations: `select!` drops losing
+    // futures and `recv_packet` is not cancel-safe (length prefix, then body), so a
+    // fresh read per iteration discarded half-read bytes whenever a send won the race
+    // and the next read parsed ciphertext as a length. Splitting the stream lets one
+    // read stay pending (and keep moving during writes, see `write_while_reading`).
     let (reader, writer) = tokio::io::split(stream);
     let mut transport = Transport::new(writer, cipher, transport_aad, to_app_tx.clone());
     let mut pending_read = Box::pin(read_frame(reader));
     let mut inbox = std::collections::VecDeque::new();
 
-    // Silence from the peer, measured from the last frame *received*. It used to
-    // be a timeout around each individual read, restarted on every iteration —
-    // so our own sends and keep-alive ticks kept re-arming it, and a peer that
-    // had gone away without closing the socket was never detected.
+    // Silence from the peer, measured from the last frame *received*, so our own sends
+    // and keep-alives do not re-arm it.
     let idle = tokio::time::sleep(recv_idle_timeout);
     tokio::pin!(idle);
 
@@ -1604,14 +1445,11 @@ where
                         LoopEvent::Frame(frame)
                     }
                     _ = &mut idle => LoopEvent::IdleTimeout,
-                    // The control lane: text, typing, and file-transfer control
-                    // frames (FileCancel). Unbounded, so an abort is never stuck
-                    // behind queued bulk data.
+                    // Control lane (text, typing, FileCancel): unbounded, so an
+                    // abort is never stuck behind queued bulk data.
                     Some(msg) = from_app_rx.recv() => LoopEvent::Send(msg),
-                    // The bounded file-data lane: FileMeta/FileChunk/FileEnd.
-                    // Its capacity is what applies backpressure to the streaming
-                    // task, so a slow peer paces the disk reader instead of the
-                    // whole file piling up in memory.
+                    // Bounded file-data lane: its capacity applies backpressure so
+                    // a slow peer paces the disk reader.
                     Some(msg) = file_rx.recv() => LoopEvent::Send(msg),
                     _ = keepalive.tick() => LoopEvent::KeepAlive,
                 };
@@ -1676,9 +1514,8 @@ where
     Ok(())
 }
 
-/// Read a duration override (whole seconds) from an environment variable, for
-/// integration tests that need realistic-wall-clock verification of the
-/// keep-alive/idle behavior. Falls back to `default` when unset or invalid.
+/// Read a duration override (whole seconds) from an environment variable, falling back
+/// to `default` when unset or invalid. Test hook only.
 fn duration_from_env(var: &str, default: std::time::Duration) -> std::time::Duration {
     std::env::var(var)
         .ok()
@@ -1692,57 +1529,88 @@ mod tests {
     use super::*;
     use crate::core::{generate_rsa_keypair, IdentityProof};
     use crate::RSA_KEY_BITS;
-    use anyhow::Result;
-    use rand::RngCore;
 
-    #[test]
-    fn constant_time_eq_matches_plain_equality() {
-        assert!(constant_time_eq(b"", b""));
-        assert!(constant_time_eq(b"correct horse", b"correct horse"));
-        assert!(!constant_time_eq(b"correct horse", b"correct horsf"));
-        // Different lengths must simply compare unequal — and must do so on the
-        // same code path as a same-length mismatch, so the answer takes the same
-        // work either way and never reveals how long the secret is.
-        assert!(!constant_time_eq(b"short", b"considerably longer"));
-        assert!(!constant_time_eq(b"considerably longer", b"short"));
-        assert!(!constant_time_eq(b"", b"x"));
-        // A prefix is not a match: the digest covers the whole input.
-        assert!(!constant_time_eq(b"secret", b"secretsauce"));
+    fn pem_of(key: &RsaPrivateKey) -> String {
+        pem_encode_public(&RsaPublicKey::from(key)).unwrap()
     }
 
-    #[tokio::test]
-    async fn initiate_rekey_frame_decryptable_by_peer_and_keys_agree() {
-        // The initiator sends the Rekey encrypted under the CURRENT key and only
-        // then rotates, so a peer still holding the old key can decrypt it and
-        // derive the same next key. This is the invariant the deterministic
-        // single-initiator design relies on.
-        let key = [7u8; crate::AES_KEY_SIZE];
-        let mut host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
-        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
-        let aad = b"transport-aad".to_vec();
+    fn identity_proof(pem: String, signature: Vec<u8>, scheme: SignatureScheme) -> IdentityProof {
+        IdentityProof {
+            public_key_pem: pem,
+            signature,
+            version: PROTOCOL_VERSION as u32,
+            chat_id: uuid::Uuid::new_v4(),
+            signature_scheme: scheme,
+        }
+    }
 
+    fn test_cipher() -> AesCipher {
+        AesCipher::new(&rand::random::<[u8; crate::AES_KEY_SIZE]>()).unwrap()
+    }
+
+    fn text(seq: u64) -> ProtocolMessage {
+        ProtocolMessage::Text {
+            text: "hello".into(),
+            timestamp: 0,
+            seq,
+        }
+    }
+
+    /// Run [`initiate_rekey`] on `cipher`; returns the Rekey frame, the retained key
+    /// and the updated `(sent_seq, messages_since_rekey)`.
+    async fn rekey(
+        cipher: &mut AesCipher,
+        aad: &[u8],
+        mut sent_seq: u64,
+        mut msgs: u64,
+    ) -> (Vec<u8>, Option<AesCipher>, u64, u64) {
         let (mut a, mut b) = tokio::io::duplex(4096);
-        let mut sent_seq = 5u64;
-        let mut msgs = 9u64;
+        let mut prev = None;
         let mut last = Instant::now();
-        let mut prev: Option<AesCipher> = None;
-
         initiate_rekey(
             &mut a,
-            &mut host,
+            cipher,
             &mut prev,
-            &aad,
+            aad,
             &mut sent_seq,
             &mut msgs,
             &mut last,
         )
         .await
         .unwrap();
-        // The initiator retains the pre-rotation key for the in-flight window.
+        (recv_packet(&mut b).await.unwrap(), prev, sent_seq, msgs)
+    }
+
+    /// A port that was free a moment ago, so connecting to it fails fast.
+    async fn dead_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"correct horse", b"correct horse"));
+        assert!(!constant_time_eq(b"correct horse", b"correct horsf"));
+        // Different lengths compare unequal on the same path as a same-length mismatch.
+        assert!(!constant_time_eq(b"short", b"considerably longer"));
+        assert!(!constant_time_eq(b"considerably longer", b"short"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"secret", b"secretsauce"));
+    }
+
+    /// The Rekey goes out under the CURRENT key and only then rotates, so a peer
+    /// still on the old key decrypts it and derives the same next key.
+    #[tokio::test]
+    async fn initiate_rekey_frame_decryptable_by_peer_and_keys_agree() {
+        let key = [7u8; crate::AES_KEY_SIZE];
+        let mut host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let aad = b"transport-aad".to_vec();
+
+        let (frame, prev, sent_seq, msgs) = rekey(&mut host, &aad, 5, 9).await;
         assert!(prev.is_some(), "initiator must retain the previous key");
 
-        // Peer reads the frame and decrypts it with the OLD key.
-        let frame = recv_packet(&mut b).await.unwrap();
         let pt = peer
             .decrypt(&frame, Some(&aad))
             .expect("peer must decrypt the Rekey with the pre-rotation key");
@@ -1756,15 +1624,13 @@ mod tests {
         let n: [u8; crate::REKEY_NONCE_SIZE] = nonce.as_slice().try_into().unwrap();
         let peer_next = crate::core::rekey_session_key(&peer.get_current_key(), &n);
 
-        // Both sides land on the same next key, and the initiator reset its
-        // counters.
         assert_eq!(host.get_current_key(), peer_next);
         assert_eq!(sent_seq, 6);
         assert_eq!(msgs, 0);
     }
 
-    /// NET-01: one key and one AAD serve both directions, so a frame we sent,
-    /// echoed back by anyone on the path, used to be accepted as the peer's.
+    /// NET-01: one key and AAD serve both directions, so a frame of ours echoed back
+    /// on the path must not be accepted as the peer's.
     #[test]
     fn a_reflected_frame_is_not_accepted_as_the_peers() {
         let key: [u8; 32] = rand::random();
@@ -1773,12 +1639,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut transport = Transport::new(tokio::io::sink(), ours.clone(), aad.clone(), tx);
 
-        let mut echoed = ProtocolMessage::Text {
-            seq: 0,
-            text: "yes".into(),
-            timestamp: 0,
-        };
-        echoed.set_seq(7);
+        let echoed = text(7);
         let frame = ours.encrypt(&echoed.to_plain_bytes(), Some(&aad));
         assert!(matches!(transport.receive(&frame).unwrap(), Received::Stop));
         while let Ok(event) = rx.try_recv() {
@@ -1803,8 +1664,7 @@ mod tests {
         ));
     }
 
-    /// EXT-01: only the host rotates. A client's `Rekey` must not move the
-    /// host's key, or a misbehaving client could force rotations at will.
+    /// EXT-01: a client's `Rekey` must not move the host's key.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
         let key: [u8; 32] = rand::random();
@@ -1828,35 +1688,15 @@ mod tests {
         assert!(transport.prev_cipher.is_none());
     }
 
+    /// After a rotation, a frame the peer sent under the OLD key still decrypts via
+    /// the retained key, and the window closes once a NEW-key frame arrives.
     #[tokio::test]
     async fn old_key_in_flight_frames_survive_a_rekey() {
-        // Reproduces the race CodeRabbit flagged: after the initiator rotates,
-        // a frame the peer sent under the OLD key (still in flight) must remain
-        // decryptable via the retained previous key, and the window must close
-        // once a NEW-key frame proves the peer has switched.
         let key = [3u8; crate::AES_KEY_SIZE];
         let mut host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
         let client_old = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
         let aad = b"aad".to_vec();
-
-        let (mut a, mut b) = tokio::io::duplex(4096);
-        let mut sent_seq = 0u64;
-        let mut msgs = 0u64;
-        let mut last = Instant::now();
-        let mut prev: Option<AesCipher> = None;
-
-        initiate_rekey(
-            &mut a,
-            &mut host,
-            &mut prev,
-            &aad,
-            &mut sent_seq,
-            &mut msgs,
-            &mut last,
-        )
-        .await
-        .unwrap();
-        let _ = recv_packet(&mut b).await.unwrap(); // drain the Rekey frame
+        let (_, mut prev, _, _) = rekey(&mut host, &aad, 0, 0).await;
 
         // Mirror of the receive branch's dual-key decrypt.
         let decrypt = |host: &AesCipher, prev: &mut Option<AesCipher>, frame: &[u8]| match host
@@ -1871,7 +1711,6 @@ mod tests {
                 .and_then(|pc: &AesCipher| pc.decrypt(frame, Some(&aad))),
         };
 
-        // Old-key in-flight frame: fails under the new key, decrypts via prev.
         let old_frame = client_old.encrypt(b"hello-old", Some(&aad));
         assert_eq!(
             decrypt(&host, &mut prev, &old_frame).as_deref(),
@@ -1880,8 +1719,6 @@ mod tests {
         );
         assert!(prev.is_some(), "prev retained while old-key frames arrive");
 
-        // Peer has now switched: a new-key frame decrypts under the current key
-        // and closes the window.
         let client_new =
             AesCipher::new_with_role(&host.get_current_key(), NonceRole::Client).unwrap();
         let new_frame = client_new.encrypt(b"hello-new", Some(&aad));
@@ -1894,15 +1731,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_first_reachable_falls_back_to_next_candidate() {
-        // A live listener…
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live_port = listener.local_addr().unwrap().port();
-        // …and a dead candidate: bind-then-drop guarantees the port was free a
-        // moment ago, so connecting to it gets an immediate RST (fast fail).
-        let dead_port = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let dead_port = dead_port().await;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let targets = vec![
@@ -1915,7 +1746,6 @@ mod tests {
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, live_port);
 
-        // A Warning must have been emitted for the failed first candidate.
         match rx.try_recv() {
             Ok(SessionEvent::Warning(msg)) => {
                 assert!(msg.contains(&dead_port.to_string()));
@@ -1927,27 +1757,14 @@ mod tests {
 
     #[tokio::test]
     async fn connect_first_reachable_errors_when_all_dead() {
-        let dead_port = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            l.local_addr().unwrap().port()
-        };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let targets = vec![("127.0.0.1".to_string(), dead_port)];
+        let targets = vec![("127.0.0.1".to_string(), dead_port().await)];
         assert!(connect_first_reachable(&targets, &tx).await.is_err());
-
-        // Empty candidate list is an error, not a panic.
         assert!(connect_first_reachable(&[], &tx).await.is_err());
     }
 
-    fn test_cipher() -> AesCipher {
-        let mut key = [0u8; crate::AES_KEY_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut key);
-        AesCipher::new(&key).expect("random test key should be valid")
-    }
-
-    /// A frame that decrypts cleanly (tampering aside) must end the session rather
-    /// than leaving the loop spinning on every subsequent packet: an AEAD failure
-    /// over a reliable stream means the channel is desynced or tampered with.
+    /// An AEAD failure over a reliable stream means desync or tampering: the session
+    /// must end promptly and report it rather than spin on every later packet.
     #[tokio::test]
     async fn decryption_failure_ends_the_session() {
         let cipher = test_cipher();
@@ -1962,17 +1779,13 @@ mod tests {
         let handle = tokio::spawn(async move {
             run_message_loop(loop_stream, cipher, aad, to_app_tx, from_app_rx, file_rx).await
         });
-
-        // A well-formed packet whose contents cannot be authenticated under the key.
         send_packet(&mut peer_stream, &[0u8; 64]).await.unwrap();
 
-        // The loop must surface the failure and terminate (not idle for minutes).
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("loop must terminate promptly after a decryption failure");
         assert!(result.unwrap().is_ok());
 
-        // It reported the failure before shutting down.
         let mut saw_error = false;
         while let Ok(ev) = to_app_rx.try_recv() {
             if matches!(ev, SessionEvent::Error(_) | SessionEvent::Disconnected) {
@@ -1983,170 +1796,95 @@ mod tests {
             saw_error,
             "a decryption failure must be surfaced to the app"
         );
-
-        // Keep the peer end alive until the assertions run.
         drop(peer_stream);
     }
 
+    /// A hand-rolled v3 exchange: both sides derive the same key from the transcript
+    /// `HostVersion || ClientVersion || HostEphemeral || ClientEphemeral`, and each
+    /// decrypts the other's identity proof under the identity-proof AAD.
     #[tokio::test]
     async fn test_full_handshake_with_forward_secrecy() -> Result<()> {
-        let host_privkey = generate_rsa_keypair(RSA_KEY_BITS)?;
-        let client_privkey = generate_rsa_keypair(RSA_KEY_BITS)?;
+        fn derive(
+            secret: EphemeralSecret,
+            theirs: &X25519PublicKey,
+            host_eph: &[u8],
+            client_eph: &[u8],
+        ) -> Result<([u8; crate::AES_KEY_SIZE], AesCipher, Vec<u8>)> {
+            let v = our_version_bytes();
+            let salt = Sha256::digest([&v[..], &v[..], host_eph, client_eph].concat());
+            let key = derive_session_key(secret, theirs, Some(&salt), HKDF_INFO)?;
+            Ok((
+                key,
+                AesCipher::new(&key)?,
+                labeled_aad(b"identity-proof", &salt),
+            ))
+        }
+        fn proof_bytes(privkey: &RsaPrivateKey, ephemeral: &[u8]) -> Result<Vec<u8>> {
+            let scheme = SignatureScheme::RsaPss;
+            let sig = build_identity_signature(scheme, privkey, ephemeral)?;
+            Ok(bincode::serialize(&identity_proof(
+                pem_of(privkey),
+                sig,
+                scheme,
+            ))?)
+        }
 
-        let (mut host_stream, mut client_stream) = tokio::io::duplex(8192);
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS)?;
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS)?;
+        let (mut hs, mut cs) = tokio::io::duplex(8192);
 
-        // Host side
-        let host_handle = tokio::spawn(async move {
-            // 1. Send/Recv Version
-            send_packet(&mut host_stream, &(PROTOCOL_VERSION as u32).to_be_bytes()).await?;
-            let _client_version = recv_packet(&mut host_stream).await?;
-
-            // 2. Exchange ephemeral keys (Raw Bytes)
-            let (host_ephemeral_secret, host_ephemeral_public) = generate_ephemeral_keypair();
-            send_packet(&mut host_stream, host_ephemeral_public.as_bytes()).await?;
-            let client_ephemeral_bytes = recv_packet(&mut host_stream).await?;
-            let client_ephemeral_public = parse_x25519_public(&client_ephemeral_bytes)?;
-
-            // 3. Derive key
-            // Transcript: HostVersion || _client_version || HostEphemeral || client_ephemeral_bytes
-            let mut transcript = Vec::new();
-            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes());
-            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes()); // Assuming client sends same version
-            transcript.extend_from_slice(host_ephemeral_public.as_bytes());
-            transcript.extend_from_slice(&client_ephemeral_bytes);
-            let salt = Sha256::digest(&transcript);
-
-            let host_aes_key = derive_session_key(
-                host_ephemeral_secret,
-                &client_ephemeral_public,
-                Some(&salt),
-                HKDF_INFO,
-            )
-            .unwrap();
-            let cipher = AesCipher::new(&host_aes_key)?;
-
-            // 4. Send Identity Proof (Encrypted)
-            let signing_key = SigningKey::<Sha256>::new(host_privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(host_ephemeral_public.as_bytes());
-            let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
-
-            let my_proof = IdentityProof {
-                public_key_pem: pem_encode_public(&RsaPublicKey::from(&host_privkey))?,
-                signature: signature.to_vec(),
-                version: PROTOCOL_VERSION as u32,
-                chat_id: uuid::Uuid::new_v4(),
-                signature_scheme: SignatureScheme::RsaPss,
-            };
-            let my_proof_bytes = bincode::serialize(&my_proof)?;
-            let identity_proof_aad = labeled_aad(b"identity-proof", salt.as_slice());
-            let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
-            send_packet(&mut host_stream, &encrypted_proof).await?;
-
-            // 5. Recv Client Identity Proof (Encrypted)
-            let encrypted_client_proof = recv_packet(&mut host_stream).await?;
-            let client_proof_bytes = cipher
-                .decrypt(&encrypted_client_proof, Some(&identity_proof_aad))
+        let host = tokio::spawn(async move {
+            send_packet(&mut hs, &our_version_bytes()).await?;
+            recv_packet(&mut hs).await?;
+            let (secret, public) = generate_ephemeral_keypair();
+            send_packet(&mut hs, public.as_bytes()).await?;
+            let client_eph = recv_packet(&mut hs).await?;
+            let their = parse_x25519_public(&client_eph)?;
+            let (key, cipher, aad) = derive(secret, &their, public.as_bytes(), &client_eph)?;
+            let proof = proof_bytes(&host_priv, public.as_bytes())?;
+            send_packet(&mut hs, &cipher.encrypt(&proof, Some(&aad))).await?;
+            let client_proof = cipher
+                .decrypt(&recv_packet(&mut hs).await?, Some(&aad))
                 .expect("client proof decrypt should succeed");
-            let client_proof: IdentityProof = decode_identity_proof(&client_proof_bytes)?;
-            assert_eq!(client_proof.version, PROTOCOL_VERSION as u32);
-
-            Ok(host_aes_key)
+            assert_eq!(
+                decode_identity_proof(&client_proof)?.version,
+                PROTOCOL_VERSION as u32
+            );
+            Ok::<_, anyhow::Error>(key)
         });
 
-        // Client side
-        let client_handle = tokio::spawn(async move {
-            // 1. Recv/Send Version
-            let _host_version = recv_packet(&mut client_stream).await?;
-            send_packet(&mut client_stream, &(PROTOCOL_VERSION as u32).to_be_bytes()).await?;
-
-            // 2. Exchange ephemeral keys (Raw Bytes)
-            let host_ephemeral_bytes = recv_packet(&mut client_stream).await?;
-            let host_ephemeral_public = parse_x25519_public(&host_ephemeral_bytes)?;
-
-            let (client_ephemeral_secret, client_ephemeral_public) = generate_ephemeral_keypair();
-            send_packet(&mut client_stream, client_ephemeral_public.as_bytes()).await?;
-
-            // 3. Derive key
-            // Transcript: _host_version || Version || host_ephemeral_bytes || ClientEphemeral
-            let mut transcript = Vec::new();
-            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes()); // Host version (simulated)
-            transcript.extend_from_slice(&(PROTOCOL_VERSION as u32).to_be_bytes()); // Client version
-            transcript.extend_from_slice(&host_ephemeral_bytes);
-            transcript.extend_from_slice(client_ephemeral_public.as_bytes());
-            let salt = Sha256::digest(&transcript);
-
-            let client_aes_key = derive_session_key(
-                client_ephemeral_secret,
-                &host_ephemeral_public,
-                Some(&salt),
-                HKDF_INFO,
-            )
-            .unwrap();
-            let cipher = AesCipher::new(&client_aes_key)?;
-
-            // 4. Recv Host Identity Proof (Encrypted)
-            let encrypted_host_proof = recv_packet(&mut client_stream).await?;
-            let identity_proof_aad = labeled_aad(b"identity-proof", salt.as_slice());
-            let host_proof_bytes = cipher
-                .decrypt(&encrypted_host_proof, Some(&identity_proof_aad))
+        let client = tokio::spawn(async move {
+            recv_packet(&mut cs).await?;
+            send_packet(&mut cs, &our_version_bytes()).await?;
+            let host_eph = recv_packet(&mut cs).await?;
+            let their = parse_x25519_public(&host_eph)?;
+            let (secret, public) = generate_ephemeral_keypair();
+            send_packet(&mut cs, public.as_bytes()).await?;
+            let (key, cipher, aad) = derive(secret, &their, &host_eph, public.as_bytes())?;
+            let host_proof = cipher
+                .decrypt(&recv_packet(&mut cs).await?, Some(&aad))
                 .expect("host proof decrypt should succeed");
-            let host_proof: IdentityProof = decode_identity_proof(&host_proof_bytes)?;
-            assert_eq!(host_proof.version, PROTOCOL_VERSION as u32);
-
-            // 5. Send Client Identity Proof (Encrypted)
-            let signing_key = SigningKey::<Sha256>::new(client_privkey.clone());
-            let mut rng = OsRng;
-            let mut hasher = Sha256::new();
-            hasher.update(b"IDENTITY_PROOF");
-            hasher.update(client_ephemeral_public.as_bytes());
-            let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
-
-            let my_proof = IdentityProof {
-                public_key_pem: pem_encode_public(&RsaPublicKey::from(&client_privkey))?,
-                signature: signature.to_vec(),
-                version: PROTOCOL_VERSION as u32,
-                chat_id: uuid::Uuid::new_v4(),
-                signature_scheme: SignatureScheme::RsaPss,
-            };
-            let my_proof_bytes = bincode::serialize(&my_proof)?;
-            let encrypted_proof = cipher.encrypt(&my_proof_bytes, Some(&identity_proof_aad));
-            send_packet(&mut client_stream, &encrypted_proof).await?;
-
-            Ok(client_aes_key)
+            assert_eq!(
+                decode_identity_proof(&host_proof)?.version,
+                PROTOCOL_VERSION as u32
+            );
+            let proof = proof_bytes(&client_priv, public.as_bytes())?;
+            send_packet(&mut cs, &cipher.encrypt(&proof, Some(&aad))).await?;
+            Ok::<_, anyhow::Error>(key)
         });
 
-        let host_aes_res: Result<[u8; crate::AES_KEY_SIZE]> = host_handle.await.unwrap();
-        let client_aes_res: Result<[u8; crate::AES_KEY_SIZE]> = client_handle.await.unwrap();
-
-        let host_aes = host_aes_res.unwrap();
-        let client_aes = client_aes_res.unwrap();
-
-        // Keys should match
-        assert_eq!(host_aes, client_aes);
-
+        assert_eq!(host.await.unwrap()?, client.await.unwrap()?);
         Ok(())
     }
 
-    /// Two current peers must actually settle on Ed25519 — and the fingerprint
-    /// they exchange must be unchanged, because every contact's TOFU trust is
-    /// pinned to it and this migration step deliberately does not touch it.
+    /// Two current peers settle on Ed25519, and the fingerprint (what TOFU pins) is
+    /// still that of the RSA identity.
     #[tokio::test]
     async fn a_live_handshake_negotiates_ed25519_without_changing_the_fingerprint() {
         let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let expected_host_fp = fingerprint_pubkey(
-            pem_encode_public(&rsa::RsaPublicKey::from(&host_priv))
-                .unwrap()
-                .as_bytes(),
-        );
-        let expected_client_fp = fingerprint_pubkey(
-            pem_encode_public(&rsa::RsaPublicKey::from(&client_priv))
-                .unwrap()
-                .as_bytes(),
-        );
+        let expected_host_fp = fingerprint_pubkey(pem_of(&host_priv).as_bytes()).unwrap();
+        let expected_client_fp = fingerprint_pubkey(pem_of(&client_priv).as_bytes()).unwrap();
 
         let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
         let hp = host_priv.clone();
@@ -2160,8 +1898,8 @@ mod tests {
 
         assert_eq!(host.signature_scheme, SignatureScheme::Ed25519);
         assert_eq!(client.signature_scheme, SignatureScheme::Ed25519);
-        assert_eq!(client.peer_fingerprint, expected_host_fp.unwrap());
-        assert_eq!(host.peer_fingerprint, expected_client_fp.unwrap());
+        assert_eq!(client.peer_fingerprint, expected_host_fp);
+        assert_eq!(host.peer_fingerprint, expected_client_fp);
     }
 
     /// Run both handshake halves announcing the given versions.
@@ -2203,8 +1941,8 @@ mod tests {
         );
     }
 
-    /// A v3 peer on either side still connects — without the commitment, which
-    /// both sides then report so the UI can warn that the code is weak.
+    /// A v3 peer on either side still connects, without the commitment, which both
+    /// sides report so the UI can warn that the code is weak.
     #[tokio::test]
     async fn a_v3_peer_still_connects_but_without_the_commitment() {
         for (h, c) in [(3, PROTOCOL_VERSION as u32), (PROTOCOL_VERSION as u32, 3)] {
@@ -2221,9 +1959,8 @@ mod tests {
         }
     }
 
-    /// The point of the commitment: a client that reveals a key other than the
-    /// one it committed to (a man in the middle that went shopping for a
-    /// matching code) is refused before any key is derived.
+    /// A client revealing a key other than the one it committed to (a MITM shopping
+    /// for a matching code) is refused before any key is derived.
     #[tokio::test]
     async fn a_client_that_breaks_its_commitment_is_refused() {
         let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
@@ -2248,8 +1985,7 @@ mod tests {
         assert!(err.to_string().contains("commitment"), "{err}");
     }
 
-    /// The commitment is frozen wire format: changing the label or the hash
-    /// would make every v4 peer refuse every other.
+    /// The commitment is frozen wire format.
     #[test]
     fn the_commitment_format_is_frozen() {
         let c = ephemeral_commitment(&[0u8; 32]);
@@ -2262,41 +1998,31 @@ mod tests {
         assert!(check_commitment(&c[..31], &[0u8; 32]).is_err());
     }
 
-    /// An Ed25519 proof is only worth anything with its binding: without one,
-    /// the subkey proves that somebody holds *some* Ed25519 key, which is not
-    /// an identity. Accepting it would let an attacker pair a stolen
-    /// `public_key_pem` — and therefore a trusted fingerprint — with a signing
-    /// key of their own.
+    /// Without a valid binding an Ed25519 subkey is not an identity: accepting it
+    /// would pair a stolen `public_key_pem` (a trusted fingerprint) with the
+    /// attacker's signing key.
     #[test]
     fn an_ed25519_proof_without_a_valid_binding_is_rejected() {
         let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let ephemeral = [7u8; 32];
         let signature =
             build_identity_signature(SignatureScheme::Ed25519, &identity, &ephemeral).unwrap();
-        let pem = pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap();
-        let proof = |sig: Vec<u8>| IdentityProof {
-            public_key_pem: pem.clone(),
-            signature: sig,
-            version: PROTOCOL_VERSION as u32,
-            chat_id: uuid::Uuid::new_v4(),
-            signature_scheme: SignatureScheme::Ed25519,
+        let pem = pem_of(&identity);
+        let proof = |blob: &Ed25519Proof| {
+            let sig = bincode::serialize(blob).unwrap();
+            identity_proof(pem.clone(), sig, SignatureScheme::Ed25519)
         };
 
-        let good = proof(signature.clone());
+        let good = identity_proof(pem.clone(), signature.clone(), SignatureScheme::Ed25519);
         assert!(verify_identity_proof(&good, &ephemeral).is_ok());
 
         let blob: Ed25519Proof = bincode::deserialize(&signature).unwrap();
 
-        // Binding removed.
         let mut stripped = blob.clone();
         stripped.binding = Vec::new();
-        assert!(
-            verify_identity_proof(&proof(bincode::serialize(&stripped).unwrap()), &ephemeral)
-                .is_err()
-        );
+        assert!(verify_identity_proof(&proof(&stripped), &ephemeral).is_err());
 
-        // A subkey swapped for the attacker's, keeping the victim's identity
-        // and their binding — the attack the binding exists to stop.
+        // The attacker's subkey with the victim's identity and binding.
         let attacker = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let attacker_key = derive_ed25519_subkey(&attacker).unwrap();
         let mut digest = Sha256::new();
@@ -2308,32 +2034,23 @@ mod tests {
             .to_bytes()
             .to_vec();
         assert!(
-            verify_identity_proof(&proof(bincode::serialize(&swapped).unwrap()), &ephemeral)
-                .is_err(),
+            verify_identity_proof(&proof(&swapped), &ephemeral).is_err(),
             "a subkey the identity never vouched for must be refused"
         );
 
         // A binding made by somebody else's identity.
         let mut foreign = blob.clone();
         foreign.binding = cross_sign_ed25519(&attacker, &attacker_key.verifying_key()).unwrap();
-        assert!(
-            verify_identity_proof(&proof(bincode::serialize(&foreign).unwrap()), &ephemeral)
-                .is_err()
-        );
+        assert!(verify_identity_proof(&proof(&foreign), &ephemeral).is_err());
 
         // Signing a different ephemeral key is still caught.
         assert!(verify_identity_proof(&good, &[8u8; 32]).is_err());
     }
 
-    /// The wire shape of `IdentityProof` must not have changed, or peers built
-    /// before Ed25519 cannot decode it.
-    ///
-    /// bincode is not self-describing: it decodes positionally, so a field
-    /// appended to this struct makes an older peer read past the end of the
-    /// buffer and fail the handshake with "unexpected end of file" —
-    /// `#[serde(default)]` does nothing about it. This caught exactly that
-    /// against a released 1.16.0 server, which is why the Ed25519 material
-    /// travels inside `signature` instead.
+    /// bincode decodes positionally, so a field appended to `IdentityProof` breaks
+    /// every older peer (`#[serde(default)]` does not help); this caught exactly that
+    /// against a released 1.16.0 server, hence the Ed25519 material rides in
+    /// `signature`.
     #[test]
     fn the_identity_proof_wire_shape_is_unchanged_for_older_peers() {
         #[derive(serde::Deserialize)]
@@ -2349,14 +2066,8 @@ mod tests {
         for scheme in [SignatureScheme::RsaPss, SignatureScheme::Ed25519] {
             let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
             let signature = build_identity_signature(scheme, &identity, &[3u8; 32]).unwrap();
-            let bytes = bincode::serialize(&IdentityProof {
-                public_key_pem: pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap(),
-                signature,
-                version: PROTOCOL_VERSION as u32,
-                chat_id: uuid::Uuid::new_v4(),
-                signature_scheme: scheme,
-            })
-            .unwrap();
+            let bytes =
+                bincode::serialize(&identity_proof(pem_of(&identity), signature, scheme)).unwrap();
             assert!(
                 bincode::deserialize::<AsOlderPeersSeeIt>(&bytes).is_ok(),
                 "{scheme} proof no longer decodes against the released field layout"
@@ -2364,23 +2075,15 @@ mod tests {
         }
     }
 
-    /// `proof || junk` must not decode to `proof`.
-    ///
-    /// This frame is parsed before any trust decision, so a decoder that gives
-    /// two distinct byte strings one meaning is doing it at the point where the
-    /// peer's identity is still an open question. The positive half of the
-    /// assertion matters as much as the negative one: it pins that the strict
-    /// options still read exactly what `bincode::serialize` writes, so this is a
-    /// compatibility check, not only a rejection check.
+    /// `proof || junk` must not decode to `proof`, while the encoder's own output
+    /// still parses (a compatibility check as much as a rejection check).
     #[test]
     fn an_identity_proof_with_trailing_bytes_is_refused() {
-        let proof = IdentityProof {
-            public_key_pem: "test-public-key".to_string(),
-            signature: vec![1, 2, 3, 4],
-            version: PROTOCOL_VERSION as u32,
-            chat_id: uuid::Uuid::new_v4(),
-            signature_scheme: SignatureScheme::RsaPss,
-        };
+        let proof = identity_proof(
+            "test-public-key".into(),
+            vec![1, 2, 3, 4],
+            SignatureScheme::RsaPss,
+        );
         let bytes = bincode::serialize(&proof).unwrap();
 
         let decoded = decode_identity_proof(&bytes).expect("the encoder's own output must parse");
@@ -2396,240 +2099,117 @@ mod tests {
         );
     }
 
+    /// Identity-proof and transport ciphertexts are bound to their transcript AAD.
     #[test]
-    fn test_identity_proof_aad_binding_rejects_wrong_context() {
-        let proof = IdentityProof {
-            public_key_pem: "test-public-key".to_string(),
-            signature: vec![1, 2, 3, 4],
-            version: PROTOCOL_VERSION as u32,
-            chat_id: uuid::Uuid::new_v4(),
-            signature_scheme: SignatureScheme::RsaPss,
-        };
-        let proof_bytes = bincode::serialize(&proof).unwrap();
+    fn test_aad_binding_rejects_wrong_context() {
+        let proof = identity_proof(
+            "test-public-key".into(),
+            vec![1, 2, 3, 4],
+            SignatureScheme::RsaPss,
+        );
+        let cases = [
+            (&b"identity-proof"[..], bincode::serialize(&proof).unwrap()),
+            (&b"transport"[..], text(1).to_plain_bytes()),
+        ];
         let cipher = test_cipher();
-
-        let correct_aad = labeled_aad(b"identity-proof", b"transcript-a");
-        let wrong_aad = labeled_aad(b"identity-proof", b"transcript-b");
-
-        let encrypted = cipher.encrypt(&proof_bytes, Some(&correct_aad));
-        assert!(
-            cipher.decrypt(&encrypted, Some(&wrong_aad)).is_none(),
-            "identity proof must not decrypt under a different transcript binding"
-        );
-        assert!(
-            cipher.decrypt(&encrypted, None).is_none(),
-            "identity proof must not decrypt when AAD is stripped"
-        );
+        for (label, plaintext) in cases {
+            let encrypted = cipher.encrypt(&plaintext, Some(&labeled_aad(label, b"session-a")));
+            assert!(
+                cipher
+                    .decrypt(&encrypted, Some(&labeled_aad(label, b"session-b")))
+                    .is_none(),
+                "must not decrypt under a different transcript binding"
+            );
+            assert!(
+                cipher.decrypt(&encrypted, None).is_none(),
+                "must not decrypt when AAD is stripped"
+            );
+        }
     }
 
-    #[test]
-    fn test_transport_aad_binding_rejects_wrong_context() {
-        let cipher = test_cipher();
-        let msg = ProtocolMessage::Text {
-            text: "hello".to_string(),
-            timestamp: 42,
-            seq: 1,
-        };
-        let plaintext = msg.to_plain_bytes();
-        let correct_aad = labeled_aad(b"transport", b"session-a");
-        let wrong_aad = labeled_aad(b"transport", b"session-b");
-
-        let encrypted = cipher.encrypt(&plaintext, Some(&correct_aad));
-        assert!(
-            cipher.decrypt(&encrypted, Some(&wrong_aad)).is_none(),
-            "transport ciphertext must not decrypt under a different transcript binding"
-        );
-        assert!(
-            cipher.decrypt(&encrypted, None).is_none(),
-            "transport ciphertext must not decrypt when AAD is stripped"
-        );
-    }
-
-    /// Test: Replay protection now works at transport layer
-    /// Transport-layer sequence validation rejects:
-    /// - Duplicate messages (seq == last_valid_seq)
-    /// - Old messages (seq < last_valid_seq)
-    /// - Only allows strictly increasing sequence numbers
+    /// Only strictly increasing sequences pass: duplicates, replays and reordering
+    /// are refused without moving the mark; gaps are fine.
     #[test]
     fn test_transport_layer_replay_protection() {
-        let mut last_valid_seq = 0u64;
-
-        // Test 1: Accept first message with seq=1
-        let msg1 = ProtocolMessage::Text {
-            text: "Hello".to_string(),
-            timestamp: 0,
-            seq: 1,
-        };
-        assert!(validate_message_sequence(&msg1, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 1);
-
-        // Test 2: Accept second message with seq=2
-        let msg2 = ProtocolMessage::Text {
-            text: "World".to_string(),
-            timestamp: 1,
-            seq: 2,
-        };
-        assert!(validate_message_sequence(&msg2, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 2);
-
-        // Test 3: Reject replay with seq=1 (older than last_valid_seq)
-        let replay1 = ProtocolMessage::Text {
-            text: "Replay".to_string(),
-            timestamp: 2,
-            seq: 1,
-        };
-        let result = validate_message_sequence(&replay1, &mut last_valid_seq);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Replay"));
-        // last_valid_seq should NOT be updated
-        assert_eq!(last_valid_seq, 2);
-
-        // Test 4: Reject duplicate with seq=2 (equal to last_valid_seq)
-        let duplicate2 = ProtocolMessage::Text {
-            text: "Duplicate".to_string(),
-            timestamp: 3,
-            seq: 2,
-        };
-        let result = validate_message_sequence(&duplicate2, &mut last_valid_seq);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Replay"));
-        assert_eq!(last_valid_seq, 2);
-
-        // Test 5: Accept message with seq=3 (strictly greater)
-        let msg3 = ProtocolMessage::Text {
-            text: "Next".to_string(),
-            timestamp: 4,
-            seq: 3,
-        };
-        assert!(validate_message_sequence(&msg3, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 3);
-
-        // Test 6: Reject out-of-order with seq=2 (after accepting seq=3)
-        let out_of_order = ProtocolMessage::Text {
-            text: "Out of order".to_string(),
-            timestamp: 5,
-            seq: 2,
-        };
-        let result = validate_message_sequence(&out_of_order, &mut last_valid_seq);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Out-of-order"));
-        assert_eq!(last_valid_seq, 3);
-
-        // Test 7: Large gap in sequences is acceptable (seq=100)
-        let msg100 = ProtocolMessage::Text {
-            text: "Big gap".to_string(),
-            timestamp: 6,
-            seq: 100,
-        };
-        assert!(validate_message_sequence(&msg100, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 100);
+        let mut last = 0u64;
+        // (seq, expected error text, last accepted afterwards)
+        let cases = [
+            (1, None, 1),
+            (2, None, 2),
+            (1, Some("Replay"), 2),
+            (2, Some("Replay"), 2),
+            (3, None, 3),
+            (2, Some("Out-of-order"), 3),
+            (100, None, 100),
+        ];
+        for (seq, err, after) in cases {
+            let result = validate_message_sequence(&text(seq), &mut last);
+            match err {
+                None => assert!(result.is_ok(), "seq {seq}"),
+                Some(e) => assert!(result.unwrap_err().contains(e), "seq {seq}"),
+            }
+            assert_eq!(last, after);
+        }
     }
 
-    /// Test: Handshake messages bypass sequence validation
-    /// (Version, EphemeralKey, SupportedSignatureSchemes have no seq field)
+    /// Handshake messages carry no seq and pass without moving the mark.
     #[test]
     fn test_handshake_messages_bypass_sequence_check() {
-        let mut last_valid_seq = 5;
-
-        // Handshake messages should always pass, even with no sequence number
-        let version_msg = ProtocolMessage::Version { version: 3 };
-        assert!(validate_message_sequence(&version_msg, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 5); // Unchanged
-
-        let ephemeral_msg = ProtocolMessage::EphemeralKey {
-            public_key: vec![0u8; 32],
-        };
-        assert!(validate_message_sequence(&ephemeral_msg, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 5); // Unchanged
-
-        let schemes_msg = ProtocolMessage::SupportedSignatureSchemes {
-            schemes: vec![SignatureScheme::RsaPss.to_u8()],
-        };
-        assert!(validate_message_sequence(&schemes_msg, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 5); // Unchanged
+        let mut last = 5;
+        for msg in [
+            ProtocolMessage::Version { version: 3 },
+            ProtocolMessage::EphemeralKey {
+                public_key: vec![0u8; 32],
+            },
+            ProtocolMessage::SupportedSignatureSchemes {
+                schemes: vec![SignatureScheme::RsaPss.to_u8()],
+            },
+        ] {
+            assert!(validate_message_sequence(&msg, &mut last).is_ok());
+            assert_eq!(last, 5);
+        }
     }
 
-    /// Test: Different message types all respect sequence numbers
     #[test]
     fn test_replay_protection_all_message_types() {
-        let mut last_valid_seq = 0u64;
-
-        // Test FileChunk sequence validation
-        let chunk1 = ProtocolMessage::FileChunk {
+        let chunk = |seq| ProtocolMessage::FileChunk {
             chunk: vec![1, 2, 3],
-            seq: 1,
+            seq,
         };
-        assert!(validate_message_sequence(&chunk1, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 1);
-
-        // Replayed chunk should be rejected
-        let replay_chunk = ProtocolMessage::FileChunk {
-            chunk: vec![1, 2, 3],
-            seq: 1,
-        };
-        assert!(validate_message_sequence(&replay_chunk, &mut last_valid_seq).is_err());
-
-        // Test FileMeta sequence validation
         let meta = ProtocolMessage::FileMeta {
             filename: "test.txt".to_string(),
             size: 1024,
             seq: 2,
         };
-        assert!(validate_message_sequence(&meta, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 2);
-
-        // Test Ping sequence validation
-        let ping = ProtocolMessage::Ping { seq: 3 };
-        assert!(validate_message_sequence(&ping, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 3);
-
-        // Test TypingStart sequence validation
-        let typing = ProtocolMessage::TypingStart { seq: 4 };
-        assert!(validate_message_sequence(&typing, &mut last_valid_seq).is_ok());
-        assert_eq!(last_valid_seq, 4);
+        let mut last = 0u64;
+        assert!(validate_message_sequence(&chunk(1), &mut last).is_ok());
+        assert_eq!(last, 1);
+        assert!(validate_message_sequence(&chunk(1), &mut last).is_err());
+        for (msg, seq) in [
+            (meta, 2),
+            (ProtocolMessage::Ping { seq: 3 }, 3),
+            (ProtocolMessage::TypingStart { seq: 4 }, 4),
+        ] {
+            assert!(validate_message_sequence(&msg, &mut last).is_ok());
+            assert_eq!(last, seq);
+        }
     }
 
-    /// Previous regression test - now replaced with comprehensive tests above
-    /// This documents that Phase 2 (Issue #6) is now COMPLETE
-    #[test]
-    fn test_issue_6_replay_protection_complete() {
-        // Issue #6: Replay Protection & Key Rotation
-        //
-        // Phase 2 (Transport-Layer Validation) - COMPLETED ✅
-        // - Sequence numbers are now validated in transport layer (run_message_loop)
-        // - Replayed/out-of-order messages are rejected before app receives them
-        // - See test_transport_layer_replay_protection() for comprehensive validation
-        //
-        // Phase 3 (Key Rotation) - FUTURE WORK
-        // - Implement periodic session key re-negotiation
-        // - Add RekeyRequest protocol message
-        // - Both sides independently track rekey schedule
-        //
-        // NOTE: Transport-layer replay protection is now implemented in Issue #6 Phase 2
-    }
-
-    /// A proof whose PEM carries the victim's key in a preamble and the
-    /// attacker's in the block, signed by the attacker, used to verify under
-    /// the attacker's key while fingerprinting as the victim — silent
-    /// impersonation of any peer whose public key is known. It must not verify.
+    /// A PEM with the victim's key in a preamble and the attacker's in the block,
+    /// signed by the attacker, must not verify (it would fingerprint as the victim).
     #[test]
     fn an_identity_proof_with_a_smuggled_second_key_is_rejected() {
-        let victim = RsaPublicKey::from(&crate::core::generate_rsa_keypair(2048).unwrap());
-        let attacker_priv = crate::core::generate_rsa_keypair(2048).unwrap();
+        let victim = RsaPublicKey::from(&generate_rsa_keypair(2048).unwrap());
+        let attacker_priv = generate_rsa_keypair(2048).unwrap();
         let crafted = format!(
             "x{}\n{}",
             pem_encode_public(&victim).unwrap().trim_end(),
-            pem_encode_public(&RsaPublicKey::from(&attacker_priv)).unwrap()
+            pem_of(&attacker_priv)
         );
         let ephemeral = [7u8; 32];
         for scheme in [SignatureScheme::RsaPss, SignatureScheme::Ed25519] {
-            let proof = IdentityProof {
-                public_key_pem: crafted.clone(),
-                signature: build_identity_signature(scheme, &attacker_priv, &ephemeral).unwrap(),
-                version: PROTOCOL_VERSION as u32,
-                chat_id: uuid::Uuid::nil(),
-                signature_scheme: scheme,
-            };
+            let sig = build_identity_signature(scheme, &attacker_priv, &ephemeral).unwrap();
+            let proof = identity_proof(crafted.clone(), sig, scheme);
             assert!(
                 verify_identity_proof(&proof, &ephemeral).is_err(),
                 "{scheme} proof with two keys must not verify"

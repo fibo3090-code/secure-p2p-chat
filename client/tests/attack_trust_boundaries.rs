@@ -1,41 +1,24 @@
-//! Attacks against the trust boundaries, rather than tests of them.
-//!
-//! Each of these plays a hostile party and tries to reach something it should
-//! not: forge an invite, get a fingerprint accepted without the user answering,
-//! read another member's private channel, pull a file by content hash without
-//! permission, replay a captured frame, or make a peer write more to disk than
-//! they agreed to.
-//!
-//! The distinction from the rest of the suite matters. Those tests drive the
-//! happy path and check the result; these start from what an attacker controls
-//! and see how far it reaches. A test that only ever asks for what it is allowed
-//! cannot tell you what happens when someone asks for what they are not.
+//! Attacks against the trust boundaries: each test plays a hostile party,
+//! starts from what an attacker controls (a forged invite, an unanswered
+//! prompt, a content hash, a borrowed username, a guest seat) and checks how
+//! far it reaches — which a happy-path test cannot tell you.
 
+mod common;
+
+use common::*;
 use messenger_core::core::generate_rsa_keypair;
 use messenger_core::party::{ChannelKind, Role};
 use messenger_core::types::{Config, TrustState};
 use messenger_core::RSA_KEY_BITS;
-use messenger_server::hub::Hub;
-use messenger_server::run_accept_loop;
-use messenger_server::state::PartyState;
 use p2pem_classic::app::chat_manager::ChatManager;
-use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use p2pem_classic::app::party_manager::{PartyManager, PartyStatus};
+use std::time::Duration;
 use uuid::Uuid;
-
-const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
 // ── Invite forgery ──────────────────────────────────────────────────────────
 
-/// An invite's `fingerprint` and its `public_key` must agree.
-///
-/// The v2 signature only proves the maker holds the private key for the key
-/// *inside* the invite. `fingerprint` is a separate field, and it is the one
-/// every later trust decision is made against — so an invite naming someone
-/// else's fingerprint alongside the attacker's key would have the victim's
-/// identity attached to the attacker's connection.
+/// An invite's `fingerprint` and `public_key` must agree: the signature only
+/// covers the key, while every trust decision is made against `fingerprint`.
 #[test]
 fn an_invite_whose_fingerprint_contradicts_its_key_is_refused() {
     let mgr = ChatManager::new(Config::default());
@@ -66,8 +49,7 @@ fn an_invite_whose_fingerprint_contradicts_its_key_is_refused() {
     );
 }
 
-/// Garbage in the invite slot must be refused rather than panicking — the link
-/// is pasted by the user from wherever they got it.
+/// Garbage in the invite slot (pasted from anywhere) must not panic.
 #[test]
 fn malformed_invite_links_are_refused_without_panicking() {
     let mgr = ChatManager::new(Config::default());
@@ -90,12 +72,8 @@ fn malformed_invite_links_are_refused_without_panicking() {
 
 // ── TOFU ────────────────────────────────────────────────────────────────────
 
-/// A contact the user never verified must not make a fingerprint auto-accepted.
-///
-/// `known_trusted` only auto-accepts a fingerprint a *chat* already stores or
-/// that a contact holds as `Verified`/`Trusted`. Matching any contact at all
-/// meant pasting a link pre-trusted whatever fingerprint it named, and that peer
-/// then connected with no safety-code prompt.
+/// A contact the user never verified must not make its fingerprint
+/// auto-accepted (pasting a link used to pre-trust whatever it named).
 #[test]
 fn an_unverified_contact_does_not_pre_trust_its_fingerprint() {
     let mut mgr = ChatManager::new(Config::default());
@@ -116,9 +94,8 @@ fn an_unverified_contact_does_not_pre_trust_its_fingerprint() {
     );
 }
 
-/// An incoming chat must not start with the peer's own fingerprint pre-filled:
-/// that would make the TOFU comparison trivially match and auto-trust every
-/// caller. This is a bug that existed once already.
+/// An incoming chat must not start with a fingerprint pre-filled, which would
+/// make TOFU trivially match and auto-trust every caller (a past bug).
 #[test]
 fn a_fresh_incoming_chat_holds_no_fingerprint() {
     let mut mgr = ChatManager::new(Config::default());
@@ -133,113 +110,14 @@ fn a_fresh_incoming_chat_holds_no_fingerprint() {
 
 // ── Community access control ────────────────────────────────────────────────
 
-/// Step one of a first join: connect without credentials and learn the
-/// server's fingerprint, as the user would see it before accepting.
-async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
-    match PartyManager::new()
-        .connect_and_join(address, "probe", None, key, None)
-        .await
-        .expect("first contact")
-    {
-        PartyJoinOutcome::NeedsVerification { fingerprint, .. } => fingerprint,
-        other => panic!("a first contact must stop for verification, got {other:?}"),
-    }
-}
-
-struct TestServer {
-    address: String,
-    /// The one-time owner claim token; the operator joins with it.
-    claim_token: Option<String>,
-    _dir: tempfile::TempDir,
-}
-
-async fn start_server() -> TestServer {
-    let dir = tempfile::tempdir().expect("dir");
-    let state = PartyState::load("Attack Target", None, dir.path()).expect("state");
-    let claim_token = state.owner_claim_token().map(str::to_owned);
-    let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS).expect("key"));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let address = listener.local_addr().expect("addr").to_string();
-    let hub = Arc::new(Hub::new());
-    let state = Arc::new(Mutex::new(state));
-    tokio::spawn(async move {
-        let _ = run_accept_loop(listener, state, privkey, hub).await;
-    });
-    TestServer {
-        address,
-        claim_token,
-        _dir: dir,
-    }
-}
-
-async fn pump_until<F>(mgr: &mut PartyManager, label: &str, mut done: F)
-where
-    F: FnMut(&mut PartyManager) -> bool,
-{
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        mgr.poll_events();
-        if done(mgr) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "[{label}] timed out");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-async fn join(server: &TestServer, username: &str) -> (PartyManager, Uuid) {
-    join_with(server, username, None).await
-}
-
-/// Join as the community's owner: with the claim token as the password.
-async fn join_owner(server: &TestServer, username: &str) -> (PartyManager, Uuid) {
-    join_with(server, username, server.claim_token.clone()).await
-}
-
-async fn join_with(
-    server: &TestServer,
-    username: &str,
-    password: Option<String>,
-) -> (PartyManager, Uuid) {
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
-    let mut mgr = PartyManager::new();
-    let sid = match mgr
-        .connect_and_join(
-            &server.address,
-            username,
-            password,
-            &key,
-            Some(&learn_fingerprint(&server.address, &key).await),
-        )
-        .await
-        .expect("join")
-    {
-        PartyJoinOutcome::Joining { server_id, .. } => server_id,
-        other => panic!("expected Joining, got {other:?}"),
-    };
-    pump_until(&mut mgr, "joined", |m| {
-        m.server(sid)
-            .is_some_and(|s| s.status == PartyStatus::Joined && s.member_id.is_some())
-    })
-    .await;
-    (mgr, sid)
-}
-
-/// Content-addressed storage is shared across the whole server, so knowing a
-/// hash must not be enough to fetch the bytes. A member who cannot reach the
-/// place a file was shared must be refused at the download endpoint.
+/// Blobs are stored server-wide, so knowing a hash must not fetch the bytes: a
+/// member who cannot reach where a file was shared is refused at download.
 #[tokio::test]
 async fn a_content_hash_is_not_a_capability() {
-    let server = start_server().await;
+    let server = start_server(None).await;
     let (mut owner, owner_sid) = join_owner(&server, "owner").await;
-    let (mut intruder, intruder_sid) = join(&server, "intruder").await;
-
-    pump_until(&mut owner, "members", |m| {
-        m.server(owner_sid).is_some_and(|s| s.members.len() >= 2)
-    })
-    .await;
+    let (mut intruder, intruder_sid) = join(&server, "intruder", None).await;
+    wait_members(&mut owner, owner_sid, 2).await;
 
     // A private channel the intruder is not in.
     owner
@@ -250,19 +128,7 @@ async fn a_content_hash_is_not_a_capability() {
             Vec::new(),
         )
         .expect("create private channel");
-    pump_until(&mut owner, "channel", |m| {
-        m.server(owner_sid)
-            .is_some_and(|s| s.channels.iter().any(|c| c.name == "vault"))
-    })
-    .await;
-    let vault = owner
-        .server(owner_sid)
-        .unwrap()
-        .channels
-        .iter()
-        .find(|c| c.name == "vault")
-        .map(|c| c.id)
-        .expect("vault");
+    let vault = wait_channel(&mut owner, owner_sid, "vault").await;
 
     let secret = b"the contents of a private channel".to_vec();
     owner
@@ -276,8 +142,7 @@ async fn a_content_hash_is_not_a_capability() {
         .expect("upload");
     owner.refresh_files(owner_sid).expect("list");
     pump_until(&mut owner, "file stored", |m| {
-        m.server(owner_sid)
-            .is_some_and(|s| s.files.iter().any(|f| f.name == "secret.bin"))
+        has_file(m, owner_sid, "secret.bin")
     })
     .await;
     let hash = owner
@@ -291,89 +156,43 @@ async fn a_content_hash_is_not_a_capability() {
 
     // The intruder never sees it in a listing…
     intruder.refresh_files(intruder_sid).expect("list");
-    for _ in 0..40 {
-        intruder.poll_events();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    idle(&mut [&mut intruder], 40, 25).await;
     assert!(
-        !intruder
-            .server(intruder_sid)
-            .unwrap()
-            .files
-            .iter()
-            .any(|f| f.name == "secret.bin"),
+        !has_file(&intruder, intruder_sid, "secret.bin"),
         "a private channel's file must not appear in a non-member's listing"
     );
 
-    // …and asking for the hash directly must be refused.
+    // …and asking for the hash directly must be refused (or go unanswered).
     let rx = intruder
         .request_download(intruder_sid, hash)
         .expect("request is sent");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut rx = rx;
-    let outcome = loop {
-        intruder.poll_events();
-        match rx.try_recv() {
-            Ok(result) => break result,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                break Err("connection closed".to_string())
-            }
-        }
-        if Instant::now() > deadline {
-            break Err("no answer".to_string());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-
-    match outcome {
-        Err(_) => {} // refused, as required
-        Ok(bytes) => panic!(
+    if let Some(Ok(bytes)) = download_result(&mut intruder, rx, Duration::from_secs(20)).await {
+        panic!(
             "a non-member downloaded {} bytes of a private file by hash",
             bytes.len()
-        ),
+        );
     }
 }
 
-/// Roles are ordered, and the ordering is the whole governance model: nobody may
-/// grant at or above their own level, and the owner may never be demoted.
-/// Otherwise whoever gets an admin seat owns the community.
+/// Nobody may grant at or above their own level, and the owner may never be
+/// demoted — otherwise whoever gets an admin seat owns the community.
 #[tokio::test]
 async fn a_member_cannot_escalate_or_depose_the_owner() {
-    let server = start_server().await;
+    let server = start_server(None).await;
     let (mut owner, owner_sid) = join_owner(&server, "owner").await;
-    let (mut member, member_sid) = join(&server, "member").await;
-
-    pump_until(&mut owner, "members", |m| {
-        m.server(owner_sid).is_some_and(|s| s.members.len() >= 2)
-    })
-    .await;
-    pump_until(&mut member, "self", |m| {
-        m.server(member_sid).is_some_and(|s| s.member_id.is_some())
-    })
-    .await;
+    let (mut member, member_sid) = join(&server, "member", None).await;
+    wait_members(&mut owner, owner_sid, 2).await;
 
     let me = member.server(member_sid).unwrap().member_id.unwrap();
-    let owner_id = member
-        .server(member_sid)
-        .unwrap()
-        .members
-        .iter()
-        .find(|m| m.username == "owner")
-        .map(|m| m.id)
-        .expect("the owner is visible in the directory");
+    let owner_id =
+        member_named(&member, member_sid, "owner").expect("the owner is visible in the directory");
 
     // Promote self to admin, then to owner; demote the actual owner.
     for role in [Role::Admin, Role::Owner] {
         let _ = member.set_role(member_sid, me, role);
     }
     let _ = member.set_role(member_sid, owner_id, Role::Guest);
-
-    for _ in 0..60 {
-        member.poll_events();
-        owner.poll_events();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    idle(&mut [&mut member, &mut owner], 60, 20).await;
 
     assert_eq!(
         member.my_role(member_sid),
@@ -387,26 +206,15 @@ async fn a_member_cannot_escalate_or_depose_the_owner() {
     );
 }
 
-/// A guest is read-only everywhere. The UI hides the controls, but the server is
-/// what has to refuse — a modified client simply would not hide them.
+/// A guest is read-only everywhere; the server must refuse what a modified
+/// client would not hide.
 #[tokio::test]
 async fn a_guest_cannot_write_however_it_asks() {
-    let server = start_server().await;
+    let server = start_server(None).await;
     let (mut owner, owner_sid) = join_owner(&server, "owner").await;
-    let (mut guest, guest_sid) = join(&server, "guest").await;
-
-    pump_until(&mut owner, "members", |m| {
-        m.server(owner_sid).is_some_and(|s| s.members.len() >= 2)
-    })
-    .await;
-    let guest_id = owner
-        .server(owner_sid)
-        .unwrap()
-        .members
-        .iter()
-        .find(|m| m.username == "guest")
-        .map(|m| m.id)
-        .expect("guest visible");
+    let (mut guest, guest_sid) = join(&server, "guest", None).await;
+    wait_members(&mut owner, owner_sid, 2).await;
+    let guest_id = member_named(&owner, owner_sid, "guest").expect("guest visible");
     owner
         .set_role(owner_sid, guest_id, Role::Guest)
         .expect("demote to guest");
@@ -435,17 +243,9 @@ async fn a_guest_cannot_write_however_it_asks() {
         vec![0u8; 64],
     );
 
-    for _ in 0..60 {
-        guest.poll_events();
-        owner.poll_events();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
+    idle(&mut [&mut guest, &mut owner], 60, 20).await;
     owner.refresh_files(owner_sid).ok();
-    for _ in 0..40 {
-        owner.poll_events();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    idle(&mut [&mut owner], 40, 25).await;
 
     let server_view = owner.server(owner_sid).unwrap();
     assert!(
@@ -461,41 +261,18 @@ async fn a_guest_cannot_write_however_it_asks() {
     );
 }
 
-/// Joining with someone else's username must not take over their membership.
-/// Identity is the handshake-verified fingerprint, not the name typed into a box.
+/// Identity is the handshake-verified fingerprint, not the username: reusing
+/// someone's name must not take over their membership.
 #[tokio::test]
 async fn a_username_is_not_an_identity() {
-    let server = start_server().await;
+    let server = start_server(None).await;
     let (mut owner, owner_sid) = join_owner(&server, "owner").await;
-    pump_until(&mut owner, "joined", |m| {
-        m.server(owner_sid).is_some_and(|s| s.member_id.is_some())
-    })
-    .await;
     let real_owner_id = owner.server(owner_sid).unwrap().member_id.unwrap();
 
     // A different key claiming the same username.
-    let impostor_key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
     let mut impostor = PartyManager::new();
-    let outcome = impostor
-        .connect_and_join(
-            &server.address,
-            "owner",
-            None,
-            &impostor_key,
-            Some(&learn_fingerprint(&server.address, &impostor_key).await),
-        )
-        .await
-        .expect("the connection itself succeeds");
-    let imp_sid = match outcome {
-        PartyJoinOutcome::Joining { server_id, .. } => server_id,
-        other => panic!("expected Joining, got {other:?}"),
-    };
-
-    for _ in 0..80 {
-        impostor.poll_events();
-        owner.poll_events();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let imp_sid = connect_pinned(&mut impostor, &server, "owner", None, &client_key()).await;
+    idle(&mut [&mut impostor, &mut owner], 80, 25).await;
 
     let status = impostor.server(imp_sid).map(|s| s.status.clone());
     match status {

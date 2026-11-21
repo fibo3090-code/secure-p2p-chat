@@ -1,16 +1,7 @@
 //! One thread's message history — a channel's or a DM thread's — with only its
-//! newest envelopes held in memory.
-//!
-//! Every message ever posted used to live in a `Vec` for the life of the
-//! process, and every one was deserialized at startup. Server memory therefore
-//! grew with the community's entire history, restarts got slower with it, and
-//! one member posting maximum-size messages could walk the server toward an
-//! OOM kill. The database already holds every envelope, so memory only needs
-//! the tail that live catch-up actually asks for; a request for anything older
-//! is answered from SQLite (see `PartyState::history_page`).
-//!
-//! A server without a database (`PartyState::new`, used by tests and
-//! in-process callers) has nowhere to page from, so it keeps everything.
+//! newest envelopes held in memory. SQLite holds all of them and answers older
+//! requests (`PartyState::history_page`), so server memory and startup time do
+//! not grow with history. A database-less state keeps everything.
 
 use std::collections::VecDeque;
 
@@ -26,13 +17,11 @@ pub(super) const RESIDENT_HISTORY: usize = 256;
 #[derive(Debug, Default)]
 pub(super) struct History {
     resident: VecDeque<Envelope>,
-    /// The highest seq assigned in this thread, resident or not. The next
-    /// envelope gets `last_seq + 1`; this is what keeps numbering stable once
-    /// older envelopes are no longer in memory to be counted.
+    /// The highest seq assigned in this thread, resident or not; the next
+    /// envelope gets `last_seq + 1`.
     last_seq: u64,
-    /// Every envelope with `seq >= complete_from` is resident. 1 until the
-    /// first eviction, so a thread that never outgrew the cap is served
-    /// entirely from memory.
+    /// Every envelope with `seq >= complete_from` is resident (1 until the
+    /// first eviction).
     complete_from: u64,
 }
 
@@ -90,24 +79,16 @@ impl History {
         since_seq.saturating_add(1) >= self.complete_from
     }
 
-    /// Resident envelopes strictly after `since_seq`, ascending.
-    ///
-    /// A binary search, not a scan from the first message: `history_since`
-    /// used to walk the whole channel to find its starting point, so catching
-    /// up on a long channel cost O(n) per page and O(n²) overall.
+    /// Resident envelopes strictly after `since_seq`, ascending (binary search).
     pub(super) fn after(&self, since_seq: u64) -> impl Iterator<Item = &Envelope> {
         let start = self.resident.partition_point(|e| e.seq <= since_seq);
         self.resident.range(start..)
     }
 
     /// Drop resident envelopes older than `cutoff_ms` (retention), always
-    /// keeping the newest one: it carries `last_seq`, and a thread whose every
-    /// envelope vanished would number its next message from 1 again on the
-    /// next restart — under seqs clients already hold. Returns how many went.
-    ///
-    /// `complete_from` needs no change: what was popped no longer exists
-    /// anywhere (retention deletes the same rows from the database), so
-    /// "everything from `complete_from` up is resident" still holds.
+    /// keeping the newest one so numbering survives a restart. Returns how many
+    /// went. `complete_from` still holds: retention deletes the same rows from
+    /// the database.
     pub(super) fn prune_before(&mut self, cutoff_ms: u64) -> usize {
         let mut pruned = 0;
         while self.resident.len() > 1
@@ -122,7 +103,8 @@ impl History {
         pruned
     }
 
-    /// Envelopes currently held in memory (diagnostics and tests).
+    /// Envelopes currently held in memory (tests).
+    #[cfg(test)]
     pub(super) fn resident_len(&self) -> usize {
         self.resident.len()
     }

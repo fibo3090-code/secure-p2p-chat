@@ -1,10 +1,6 @@
-//! Persistent server identity (Phase 1, slice 3).
-//!
-//! The server's RSA identity is stored as a PEM file under the operator's data
-//! dir and reused across restarts, so its fingerprint — which clients pin via TOFU
-//! on first connect — stays constant. This mirrors how an SSH host key works: the
-//! private key lives on the server host (owner-only file permissions) rather than
-//! being password-encrypted like the client's interactive identity.
+//! Persistent server identity: an RSA key stored as a PEM under the data dir
+//! and reused across restarts, so the fingerprint clients pin stays constant
+//! (like an SSH host key: owner-only file, not password-encrypted).
 
 use std::path::Path;
 
@@ -34,13 +30,9 @@ pub fn load_or_create_server_identity(data_dir: &Path) -> Result<RsaPrivateKey> 
     }
 }
 
-/// Write a private-key PEM: owner-only **from creation**, and atomically.
-///
-/// This used to `fs::write` and then `chmod 0600`. Under a typical 022 umask
-/// that left the server's private key world-readable (0644) for the window
-/// between the two calls, and a crash mid-write left a truncated PEM that the
-/// next start refuses to load. `write_file_atomic` creates the temp file 0600,
-/// fsyncs it and renames it into place, so neither state is ever observable.
+/// Write a private-key PEM atomically and owner-only **from creation**
+/// (`write_file_atomic`: 0600 temp file, fsync, rename), so the key is never
+/// world-readable and never truncated.
 fn write_private_pem(path: &Path, pem: &str) -> Result<()> {
     messenger_core::util::write_file_atomic(path, pem.as_bytes())
         .with_context(|| format!("writing {}", path.display()))

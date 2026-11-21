@@ -1,11 +1,9 @@
-//! Per-connection server runtime (Phase 1, slice 3).
+//! Per-connection server runtime.
 //!
-//! Reuses the extracted Protocol v3 [`host_handshake`] to establish an
-//! authenticated, encrypted tunnel to a client, then runs the Party loop:
-//! it concurrently (a) decrypts incoming [`PartyRequest`]s, applies them via
-//! [`handle_request`], and replies, and (b) writes down the tunnel any
-//! [`PartyResponse`] broadcast to it by another connection through the [`Hub`].
-//! Newly posted messages are fanned out to every *other* connected member.
+//! Runs the v3 [`host_handshake`], then the Party loop: decrypt incoming
+//! [`PartyRequest`]s, apply them via [`handle_request`] and reply, while writing
+//! down the tunnel any [`PartyResponse`] another connection pushed through the
+//! [`Hub`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,25 +24,18 @@ use crate::dispatch::{
 use crate::hub::Hub;
 use crate::state::PartyState;
 
-/// Timeouts applied to one connection.
-///
-/// There were none. Once its handshake completed a connection could sit
-/// unjoined forever, and a write to a client that had stopped reading blocked
-/// its task forever — so an unauthenticated peer could hold a task and a file
-/// descriptor per socket indefinitely, and one stuck client also held back the
-/// broadcasts of every message it posted.
+/// Timeouts applied to one connection, so an unauthenticated peer cannot hold
+/// a task and a socket indefinitely, nor a stuck reader hold up broadcasts.
 #[derive(Debug, Clone)]
 pub struct ConnectionLimits {
-    /// Ceiling on the whole v3 handshake. Each handshake read already has its
-    /// own timeout; this bounds the sum, so a peer that trickles bytes cannot
-    /// stretch it out.
+    /// Ceiling on the whole handshake (each read also has its own timeout), so
+    /// a peer that trickles bytes cannot stretch it out.
     pub handshake_timeout: Duration,
-    /// How long a connection may stay unjoined after its handshake. A client
-    /// joins in its first frame; one that has not by now is a probe, a scanner,
-    /// or someone holding sockets open.
+    /// How long a connection may stay unjoined after its handshake (a client
+    /// joins in its first frame).
     pub join_timeout: Duration,
-    /// Ceiling on writing one frame. A client whose TCP window stays shut this
-    /// long has stopped reading, and is disconnected rather than waited on.
+    /// Ceiling on writing one frame; a client that stopped reading is
+    /// disconnected rather than waited on.
     pub write_timeout: Duration,
 }
 
@@ -79,12 +70,8 @@ where
 }
 
 /// Read one frame, taking ownership of the read half and the sequence counter
-/// and handing both back with the result.
-///
-/// Ownership is the point. It lets the caller hold a single read future across
-/// `select!` iterations instead of building a new one each time — see the
-/// comment at the call site for why abandoning a part-read frame breaks the
-/// connection for good.
+/// and handing both back, so the caller can hold one read future across
+/// `select!` iterations (see the call site).
 async fn read_frame<R>(
     mut rd: R,
     cipher: &messenger_core::core::AesCipher,
@@ -98,33 +85,29 @@ where
     (rd, seq, result)
 }
 
-/// Encode a reply to this client, answering with an error instead when it is
-/// too large for one frame.
-///
-/// Defence in depth: every listing and page is budgeted to fit (see
-/// `take_history_page`), so this should never fire. But a reply that cannot be
-/// sent fails `send_packet`, and a failed send ends the connection — and a
-/// client that asks for the same thing again on reconnect then can never stay
-/// connected at all. An error the client can show is strictly better.
+/// Encode a reply, answering with an error when it is too large for a frame:
+/// a failed send would end the connection, and a client re-asking on
+/// reconnect could never stay connected. Every page is budgeted to fit, so
+/// this is defence in depth.
 fn encode_reply(resp: &PartyResponse) -> Vec<u8> {
-    let bytes = resp.to_bytes();
-    if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
-        return bytes;
-    }
-    tracing::error!(
-        size = bytes.len(),
-        limit = MAX_PARTY_PAYLOAD_BYTES,
-        "a reply was too large to send; answering with an error instead"
-    );
-    PartyResponse::Error("the server's reply was too large to send".to_string()).to_bytes()
+    encode_bounded(
+        resp,
+        "a reply was too large to send; answering with an error instead",
+    )
+    .unwrap_or_else(|| {
+        PartyResponse::Error("the server's reply was too large to send".to_string()).to_bytes()
+    })
 }
 
-/// Encode a pushed broadcast, or `None` when it is too large for one frame.
-///
-/// A broadcast too large to send would otherwise disconnect *every* online
-/// recipient at once. Dropping it costs them one live update, which they
-/// recover from history.
+/// Encode a pushed broadcast, or `None` when it is too large for one frame:
+/// dropping one live update (recovered from history) beats disconnecting every
+/// recipient.
 fn encode_push(resp: &PartyResponse) -> Option<Vec<u8>> {
+    encode_bounded(resp, "a broadcast was too large to send; dropping it")
+}
+
+/// `resp` encoded, or `None` (logging `oversized`) when it exceeds one frame.
+fn encode_bounded(resp: &PartyResponse, oversized: &str) -> Option<Vec<u8>> {
     let bytes = resp.to_bytes();
     if bytes.len() <= MAX_PARTY_PAYLOAD_BYTES {
         return Some(bytes);
@@ -132,23 +115,16 @@ fn encode_push(resp: &PartyResponse) -> Option<Vec<u8>> {
     tracing::error!(
         size = bytes.len(),
         limit = MAX_PARTY_PAYLOAD_BYTES,
-        "a broadcast was too large to send; dropping it"
+        "{oversized}"
     );
     None
 }
 
 /// Perform the I/O `handle_request` deferred, once the state lock is released,
-/// and produce the replies it leads to.
+/// so one member's 100 MiB transfer does not stall everyone else's messages.
 ///
-/// Anything that moves real bytes — a blob read, a blob write — is deliberately
-/// *not* done inside `handle_request`, because doing it there does it with the
-/// state mutex held and one member's 100 MiB transfer then stalls every other
-/// member's messages for its whole duration.
-///
-/// `spawn_blocking`, not `block_in_place`: this is ordinary file I/O with
-/// nothing borrowed from the state, so it belongs on the blocking pool, and
-/// unlike `block_in_place` it does not require a multi-threaded runtime (the
-/// tests run on a current-thread one).
+/// `spawn_blocking` rather than `block_in_place`: plain file I/O borrowing
+/// nothing from the state, and it works on a current-thread runtime (tests).
 async fn perform_deferred(
     work: Deferred,
     state: &Mutex<PartyState>,
@@ -174,10 +150,8 @@ async fn perform_deferred(
             .await;
             let out = match written {
                 Ok((staged, Ok(()))) => {
-                    // Phase 3: re-check and commit, under the lock again. The
-                    // upload's own bytes are on disk by now; this only renames
-                    // and records, so the lock is held for a rename rather than
-                    // for a 100 MiB write.
+                    // Phase 3: re-check and commit under the lock — only a
+                    // rename and some rows, not the write.
                     let mut st = state.lock().await;
                     let committed = st.commit_upload(*staged);
                     upload_committed(&st, member, committed)
@@ -187,9 +161,7 @@ async fn perform_deferred(
                     Dispatch::action_failed(Uuid::nil(), reason)
                 }
                 Err(_) => {
-                    // The blocking task panicked or was cancelled; the staged
-                    // upload went with it, so only the reservation is left to
-                    // release.
+                    // The blocking task panicked; only the reservation is left.
                     state
                         .lock()
                         .await
@@ -228,10 +200,8 @@ where
 
 /// Serve one client connection to completion (until the peer disconnects, a
 /// frame fails to authenticate, a timeout in `limits` expires, or the hub
-/// evicts it). The server's identity (`server_privkey`) is TOFU-verified by the
-/// client; the client's handshake-verified fingerprint is bound to its
-/// membership on join. Once joined, the connection is registered with `hub` to
-/// receive broadcasts.
+/// evicts it). The client's verified fingerprint is bound to its membership on
+/// join, after which the connection is registered with `hub` for broadcasts.
 pub async fn serve_connection_with<S>(
     stream: &mut S,
     server_privkey: &RsaPrivateKey,
@@ -257,66 +227,39 @@ where
     let aad = tunnel.transport_aad;
     let conn_id = Uuid::new_v4();
     let write_timeout = limits.write_timeout;
-    // Bounded: an unbounded lane let a client that stopped reading its socket
-    // accumulate every broadcast on our heap. See `hub::BROADCAST_QUEUE_DEPTH`.
+    // Bounded (see `hub::BROADCAST_QUEUE_DEPTH`), and the sender is *moved*
+    // into the hub on registration, never cloned: with the hub holding the only
+    // sender, eviction closes the lane, `recv` returns `None`, and the loop ends
+    // so the client reconnects and catches up — instead of staying connected
+    // but deaf.
     let (out_tx, mut out_rx) = mpsc::channel::<PartyResponse>(crate::hub::BROADCAST_QUEUE_DEPTH);
-    // The sender is *moved* into the hub on registration, never cloned.
-    //
-    // That is what makes eviction close the connection. The hub drops a
-    // connection whose queue is full; if this task still held its own copy of
-    // the sender, the receiver would never report closed and the connection
-    // would carry on — answering requests, receiving no broadcasts, DMs or
-    // directory changes ever again, with nothing to tell the client. With the
-    // hub holding the only sender, eviction closes the lane, `recv` returns
-    // `None` once the queue drains, and the loop ends so the client reconnects
-    // and catches up from history.
     let mut out_tx = Some(out_tx);
     let mut conn = ConnState::with_fingerprint(tunnel.peer_fingerprint);
     let mut registered = false;
-    // Per-direction frame counters: every Party frame carries a sequence inside
-    // the AEAD so a replayed frame cannot be accepted twice.
+    // Per-direction frame counters (inside the AEAD) reject replayed frames.
     let mut send_seq = FrameSeq::new();
     let recv_seq = FrameSeq::new();
 
-    // Split so reads (incoming requests) and writes (replies + pushed broadcasts)
-    // can be driven independently inside the select loop.
     let (rd, mut wr) = tokio::io::split(&mut *stream);
 
-    // The in-flight read, kept alive ACROSS loop iterations.
-    //
-    // This is the whole reason `read_frame` exists rather than calling
-    // `recv_framed` inline: `tokio::select!` drops the future in the branch that
-    // does not win, and `recv_framed` is not cancel-safe. It reads a 4-byte
-    // length prefix and then the body; dropping it in between takes those bytes
-    // off the socket and throws them away. The next read then treats body bytes
-    // as a length prefix, and the connection dies on a decrypt or length error —
-    // silently, from the client's point of view.
-    //
-    // That is not a rare interleaving: it happens whenever a broadcast arrives
-    // while this client is mid-frame, which is exactly what a busy community
-    // does. The symptom was a client whose pane simply stopped updating (a
-    // channel created by someone else never appearing, say) until it reconnected.
-    //
-    // Holding one future across iterations means a cancelled poll resumes where
-    // it left off, so no read is ever abandoned part-way.
+    // The in-flight read, kept alive ACROSS loop iterations. `select!` drops
+    // the losing branch's future and `recv_framed` is not cancel-safe (length
+    // prefix, then body): a broadcast arriving mid-frame used to discard the
+    // bytes read so far and desynchronise the stream. Holding one future means
+    // a cancelled poll resumes instead.
     let mut pending = Box::pin(read_frame(rd, &cipher, &aad, recv_seq));
 
-    // The pre-join deadline. A `Sleep` polled by reference is cancel-safe, so
-    // it can sit in the select alongside the held read without disturbing it.
+    // The pre-join deadline: a `Sleep` polled by reference is cancel-safe.
     let join_deadline = tokio::time::sleep(limits.join_timeout);
     tokio::pin!(join_deadline);
 
-    // How the connection ended. A failed write is recorded here rather than
-    // returned with `?`: returning early skipped the teardown below, so a
-    // client that vanished while the server was writing to it — someone
-    // closing their laptop mid-conversation — stayed registered in the hub
-    // (and so "online" forever, with every broadcast to it silently dropped)
-    // and kept its upload reservations until the server restarted.
+    // How the connection ended. A failed write is recorded rather than
+    // returned with `?`, so the teardown below still runs (unregister, go
+    // offline, release reservations).
     let mut served: anyhow::Result<()> = Ok(());
 
     loop {
-        // The read half and its sequence counter, handed back when a frame
-        // completes, so the next read can be started after the branch body.
+        // Handed back when a frame completes, to start the next read.
         let mut finished = None;
         let awaiting_join = conn.member().is_none();
 
@@ -325,8 +268,7 @@ where
             // cancel-safe: a message is either taken from the queue or left in it.
             push = out_rx.recv() => {
                 let Some(push) = push else {
-                    // Only the hub holds the sender, so this is an eviction
-                    // (see `out_tx` above).
+                    // Only the hub holds the sender: this is an eviction.
                     tracing::warn!(conn = %conn_id, "evicted for not reading broadcasts; closing so the client reconnects");
                     served = Err(anyhow!("evicted: the client stopped reading broadcasts"));
                     break;
@@ -359,8 +301,7 @@ where
                     None => Dispatch::reply(PartyResponse::Error("malformed request".to_string())),
                 };
 
-                // The lock is released above; anything that moves real bytes
-                // happens now (see `perform_deferred`).
+                // The lock is released; move any real bytes now.
                 if let Some(work) = outcome.deferred.take() {
                     let done = perform_deferred(work, &state, &mut conn).await;
                     outcome.replies.extend(done.replies);
@@ -387,13 +328,12 @@ where
                     hub.broadcast_except(conn_id, resp);
                 }
                 for (member, resp) in outcome.directed {
-                    // Excluding this connection lets a DM be delivered to the
-                    // sender's *other* devices without duplicating it on the one
-                    // that sent it (which already appended it optimistically).
+                    // Excluding this connection reaches the sender's *other*
+                    // devices without duplicating the optimistic row here.
                     hub.send_to_member_except(member, conn_id, resp);
                 }
-                // Fanned out first: what was stored should still reach everyone
-                // else even though this client's own reply could not be written.
+                // Fanned out first, so what was stored reaches everyone else
+                // even when this client's own reply could not be written.
                 if served.is_err() {
                     break;
                 }
@@ -407,34 +347,21 @@ where
 
     hub.unregister(conn_id);
     if let Some(member) = conn.member() {
-        // A client that vanished mid-transfer must not pin its spool for the
-        // life of the process. Each pending upload can hold up to
-        // MAX_PARTY_FILE_BYTES, so this is memory, not just tidiness.
-        //
-        // This connection's ids, not every id belonging to the member: one
-        // person can be signed in from two devices with uploads in flight on
-        // both, and sweeping by member would make closing a laptop cancel the
-        // phone's transfer.
-        //
-        // The list stays accurate because every path that ends an upload — a
-        // failed chunk, a refused finish, a commit, a discard — clears the id
-        // through `ConnState::finish_upload`, and an id in flight is left listed
-        // precisely so this can release its reservation.
+        // Release this connection's uploads (not the member's: their other
+        // devices may have transfers in flight). Every path that ends an upload
+        // clears its id, so what is left here is exactly what must be released.
         let open = conn.open_uploads().to_vec();
         if !open.is_empty() {
             state.lock().await.cancel_connection_uploads(member, &open);
         }
-        // Presence is per-member but connections are per-device: only go offline
-        // once this member's *last* connection is gone, or closing one of two
-        // open clients would report them as offline while they are still here.
+        // Go offline only when the member's *last* connection is gone.
         if !hub.member_is_connected(member) {
             let directory = {
                 let mut st = state.lock().await;
                 st.set_online(member, false);
                 st.members()
             };
-            // Tell everyone still connected. Without this the online dots only
-            // ever moved when a client happened to re-request the directory.
+            // Tell everyone still connected.
             hub.broadcast_all(PartyResponse::Members(directory));
         }
     }
@@ -450,18 +377,26 @@ mod tests {
     };
     use messenger_core::RSA_KEY_BITS;
     use rsa::RsaPrivateKey;
+    use std::time::Duration;
     use tokio::io::DuplexStream;
 
     type TestClient = PartyClient<DuplexStream>;
+    type Served = tokio::task::JoinHandle<anyhow::Result<()>>;
 
-    /// Send a request and read the reply, skipping unsolicited pushes.
-    ///
-    /// Joining broadcasts the refreshed directory and a channel change
-    /// broadcasts `DirectoryChanged`, so a client that was already online has
-    /// those waiting ahead of its own next reply. Real clients apply pushes and
-    /// replies from one interleaved stream (`PartyManager::apply` does); these
-    /// single-stepped tests skip the pushes to assert on the reply they asked
-    /// for.
+    fn key() -> RsaPrivateKey {
+        generate_rsa_keypair(RSA_KEY_BITS).unwrap()
+    }
+
+    fn fixture() -> (Arc<Mutex<PartyState>>, Arc<Hub>) {
+        (
+            Arc::new(Mutex::new(PartyState::new("TestSrv", None))),
+            Arc::new(Hub::new()),
+        )
+    }
+
+    /// Send a request and read the reply, skipping the unsolicited `Members` /
+    /// `DirectoryChanged` pushes that joins and channel changes queue ahead of
+    /// it (real clients apply both from one stream).
     async fn request(client: &mut TestClient, req: PartyRequest) -> PartyResponse {
         client.send(&req).await.unwrap();
         loop {
@@ -472,46 +407,98 @@ mod tests {
         }
     }
 
-    /// Spawn a `serve_connection` task and connect a real `PartyClient` to it.
-    async fn connect(
-        server_priv: RsaPrivateKey,
-        client_priv: &RsaPrivateKey,
-        state: Arc<Mutex<PartyState>>,
-        hub: Arc<Hub>,
-    ) -> (TestClient, tokio::task::JoinHandle<()>) {
-        let (mut server_stream, client_stream) = tokio::io::duplex(1 << 16);
-        let handle = tokio::spawn(async move {
-            let _ = serve_connection(&mut server_stream, &server_priv, state, hub).await;
-        });
-        let client = PartyClient::connect(client_stream, client_priv, Uuid::new_v4())
-            .await
-            .expect("client handshake");
-        (client, handle)
+    async fn post(
+        client: &mut TestClient,
+        channel: Uuid,
+        text: impl Into<String>,
+    ) -> PartyResponse {
+        let text = text.into();
+        request(client, PartyRequest::PostMessage { channel, text }).await
     }
 
-    /// Connect over a deliberately tiny duplex buffer, so a large frame cannot
-    /// be delivered in one write and the server is forced to read it in pieces.
-    /// That is the window where a cancelled read used to lose bytes.
-    async fn connect_with_buffer(
-        server_priv: RsaPrivateKey,
-        client_priv: &RsaPrivateKey,
+    /// Spawn `serve_connection_with` over a duplex of `buffer` bytes, handing
+    /// back the client end and the server task.
+    fn spawn_with_limits(
         state: Arc<Mutex<PartyState>>,
         hub: Arc<Hub>,
         buffer: usize,
-    ) -> (TestClient, tokio::task::JoinHandle<()>) {
+        limits: ConnectionLimits,
+    ) -> (DuplexStream, Served) {
         let (mut server_stream, client_stream) = tokio::io::duplex(buffer);
+        let server_priv = key();
         let handle = tokio::spawn(async move {
-            let _ = serve_connection(&mut server_stream, &server_priv, state, hub).await;
+            serve_connection_with(&mut server_stream, &server_priv, state, hub, &limits).await
         });
-        let client = PartyClient::connect(client_stream, client_priv, Uuid::new_v4())
+        (client_stream, handle)
+    }
+
+    async fn handshake(stream: DuplexStream) -> TestClient {
+        PartyClient::connect(stream, &key(), Uuid::new_v4())
             .await
-            .expect("client handshake");
-        (client, handle)
+            .expect("client handshake")
+    }
+
+    /// A client over a duplex of `buffer` bytes; a tiny buffer forces the
+    /// server to read each frame in pieces.
+    async fn connect_with_buffer(
+        state: &Arc<Mutex<PartyState>>,
+        hub: &Arc<Hub>,
+        buffer: usize,
+    ) -> (TestClient, Served) {
+        let (stream, served) = spawn_with_limits(
+            state.clone(),
+            hub.clone(),
+            buffer,
+            ConnectionLimits::default(),
+        );
+        (handshake(stream).await, served)
+    }
+
+    async fn connect(state: &Arc<Mutex<PartyState>>, hub: &Arc<Hub>) -> (TestClient, Served) {
+        connect_with_buffer(state, hub, 1 << 16).await
+    }
+
+    /// Join and return the assigned member id.
+    async fn join_as(client: &mut TestClient, name: &str) -> Uuid {
+        match client.join(name, None).await.unwrap() {
+            PartyResponse::Joined { member_id, .. } => member_id,
+            other => panic!("expected Joined, got {other:?}"),
+        }
+    }
+
+    /// Read whatever is already queued and stop when it goes quiet, so a later
+    /// assertion sees only frames caused by what follows.
+    async fn drain(client: &mut TestClient) -> Vec<PartyResponse> {
+        let mut seen = Vec::new();
+        while let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv()).await
+        {
+            seen.push(resp);
+        }
+        seen
+    }
+
+    async fn is_online(state: &Mutex<PartyState>, id: Uuid) -> bool {
+        state
+            .lock()
+            .await
+            .members()
+            .iter()
+            .any(|m| m.id == id && m.online)
+    }
+
+    fn short_limits() -> ConnectionLimits {
+        let t = Duration::from_millis(500);
+        ConnectionLimits {
+            handshake_timeout: t,
+            join_timeout: t,
+            write_timeout: t,
+        }
     }
 
     /// A server-side stream that, once `cut`, never yields another byte and
-    /// refuses every write: a client that has gone in the way that leaves the
-    /// server's read pending, so it only finds out by failing to write.
+    /// refuses every write: a client gone in the way that leaves the server's
+    /// read pending, so it only finds out by failing to write.
     struct Severable {
         inner: DuplexStream,
         cut: Arc<std::sync::atomic::AtomicBool>,
@@ -565,16 +552,10 @@ mod tests {
 
     /// A client that vanishes while the server is writing to it must still be
     /// torn down: unregistered from the hub, marked offline, its reservations
-    /// released.
-    ///
-    /// A failed write used to return straight out of the connection loop with
-    /// `?`, skipping all of that — the member stayed "online" forever (the hub
-    /// still listed the dead connection) and every broadcast to them was
-    /// silently dropped.
+    /// released (a failed write used to `?` straight past all of that).
     #[tokio::test]
     async fn a_client_lost_during_a_write_is_still_torn_down() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
+        let (state, hub) = fixture();
         let channel = state.lock().await.default_channel();
 
         let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -583,50 +564,25 @@ mod tests {
             inner: server_stream,
             cut: cut.clone(),
         };
-        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let server_priv = key();
         let (st, h) = (state.clone(), hub.clone());
         let served =
             tokio::spawn(
                 async move { serve_connection(&mut server_stream, &server_priv, st, h).await },
             );
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let mut alice = PartyClient::connect(client_stream, &alice_priv, Uuid::new_v4())
-            .await
-            .unwrap();
-        let PartyResponse::Joined {
-            member_id: alice_id,
-            ..
-        } = alice.join("alice", None).await.unwrap()
-        else {
-            panic!("alice did not join");
-        };
+        let mut alice = handshake(client_stream).await;
+        let alice_id = join_as(&mut alice, "alice").await;
 
-        let (mut bob, _b) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
-        assert!(matches!(
-            bob.join("bob", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
+        let (mut bob, _b) = connect(&state, &hub).await;
+        join_as(&mut bob, "bob").await;
         assert!(hub.member_is_connected(alice_id));
 
         // Alice's link dies; the next thing the server writes to her fails.
         cut.store(true, std::sync::atomic::Ordering::SeqCst);
-        let reply = request(
-            &mut bob,
-            PartyRequest::PostMessage {
-                channel,
-                text: "anyone there?".into(),
-            },
-        )
-        .await;
+        let reply = post(&mut bob, channel, "anyone there?").await;
         assert!(matches!(reply, PartyResponse::MessagePosted { .. }));
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
             .await
             .expect("the connection task ends")
             .unwrap();
@@ -636,69 +592,30 @@ mod tests {
             "the dead connection is still registered"
         );
         assert!(
-            !state
-                .lock()
-                .await
-                .members()
-                .iter()
-                .any(|m| m.id == alice_id && m.online),
+            !is_online(&state, alice_id).await,
             "alice is still shown online"
         );
     }
 
     /// A broadcast arriving while this client is mid-frame must not cost it the
-    /// connection.
-    ///
-    /// The connection loop selects over "a broadcast to write" and "a request to
-    /// read", and `select!` drops the future in the branch that loses. Reading a
-    /// frame is *not* cancel-safe — it takes a 4-byte length prefix and then the
-    /// body — so a dropped read used to leave those bytes consumed and gone. The
-    /// next read parsed body bytes as a length, and the connection died on a
-    /// length or decrypt error with nothing said to either end.
-    ///
-    /// It looked to the user like a client that simply stopped updating: a
-    /// channel someone else created never appeared, messages stopped arriving,
-    /// and only a reconnect fixed it. It needed exactly two things to happen at
-    /// once, which is to say it needed the community to be busy.
-    ///
-    /// This forces the window deterministically: a tiny duplex buffer means the
-    /// big post below takes many reads to arrive, and another member broadcasts
-    /// throughout.
+    /// connection (`recv_framed` is not cancel-safe; see `serve_connection_with`).
+    /// A tiny duplex buffer makes the big post take many reads while another
+    /// member broadcasts throughout.
     #[tokio::test]
     async fn a_broadcast_arriving_mid_frame_does_not_break_the_connection() {
-        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
+        let (state, hub) = fixture();
         let channel = state.lock().await.default_channel();
 
-        let (mut alice, _a) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &alice_priv,
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
-        assert!(matches!(
-            alice.join("alice", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
-
+        let (mut alice, _a) = connect(&state, &hub).await;
+        join_as(&mut alice, "alice").await;
         // 64 bytes: far smaller than one frame, so every frame is split.
-        let (mut bob, _b) =
-            connect_with_buffer(server_priv, &bob_priv, state.clone(), hub.clone(), 64).await;
-        assert!(matches!(
-            bob.join("bob", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
+        let (mut bob, _b) = connect_with_buffer(&state, &hub, 64).await;
+        join_as(&mut bob, "bob").await;
 
         let (mut bob_rd, mut bob_wr) = bob.split();
 
-        // Bob's reader runs as its own task, the way a real client's does. It
-        // has to: the server writes broadcasts into the same tiny pipe, and a
-        // client that only reads *after* finishing its write would deadlock the
-        // duplex rather than test anything.
+        // Bob's reader runs as its own task, as a real client's does; reading
+        // only after the write would deadlock the tiny duplex instead.
         let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
         let reader = tokio::spawn(async move {
             loop {
@@ -716,8 +633,6 @@ mod tests {
             }
         });
 
-        // Bob starts a big post; through a 64-byte pipe it cannot land in one
-        // write, so the server is mid-frame for a long time.
         let big = "x".repeat(32 * 1024);
         let writer = tokio::spawn(async move {
             bob_wr
@@ -728,21 +643,13 @@ mod tests {
 
         // …while alice keeps broadcasting into it.
         for i in 0..10 {
-            let _ = request(
-                &mut alice,
-                PartyRequest::PostMessage {
-                    channel,
-                    text: format!("alice {i}"),
-                },
-            )
-            .await;
+            let _ = post(&mut alice, channel, format!("alice {i}")).await;
             tokio::task::yield_now().await;
         }
         writer.await.expect("writer task");
 
-        // Bob's own post must still be acknowledged. Under the old loop his
-        // stream was desynchronised long before this and the read errored out.
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        // Bob's own post must still be acknowledged.
+        tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match seen_rx.recv().await {
                     Some(Ok(PartyResponse::MessagePosted { channel: c, .. })) if c == channel => {
@@ -761,30 +668,12 @@ mod tests {
 
     #[tokio::test]
     async fn client_joins_posts_and_fetches_history_over_the_tunnel() {
-        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
+        let (state, hub) = fixture();
         let channel = state.lock().await.default_channel();
+        let (mut client, server) = connect(&state, &hub).await;
+        join_as(&mut client, "alice").await;
 
-        let (mut client, server) =
-            connect(server_priv, &client_priv, state.clone(), hub.clone()).await;
-
-        let joined = client.join("alice", None).await.unwrap();
-        assert!(
-            matches!(joined, PartyResponse::Joined { .. }),
-            "got {joined:?}"
-        );
-
-        let posted = request(
-            &mut client,
-            PartyRequest::PostMessage {
-                channel,
-                text: "hello server".to_string(),
-            },
-        )
-        .await;
-        match posted {
+        match post(&mut client, channel, "hello server").await {
             PartyResponse::MessagePosted { channel: c, seq } => {
                 assert_eq!(c, channel);
                 assert_eq!(seq, 1);
@@ -815,68 +704,34 @@ mod tests {
         let member = guard.members()[0].id;
         assert_eq!(guard.history_since(member, channel, 0).len(), 1);
         drop(guard);
-        drop(client);
         server.abort();
     }
 
     #[tokio::test]
     async fn requests_before_join_are_rejected_over_the_tunnel() {
-        let server_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
-
-        let (mut client, server) =
-            connect(server_priv, &client_priv, state.clone(), hub.clone()).await;
-
+        let (state, hub) = fixture();
+        let (mut client, server) = connect(&state, &hub).await;
         match request(&mut client, PartyRequest::ListMembers).await {
             PartyResponse::Error(msg) => assert_eq!(msg, "join required"),
             other => panic!("expected join-required error, got {other:?}"),
         }
-        drop(client);
         server.abort();
     }
 
     #[tokio::test]
     async fn posted_message_is_broadcast_to_other_members() {
-        let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let server_priv_b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
+        let (state, hub) = fixture();
         let channel = state.lock().await.default_channel();
-
-        // Two clients connect to the same shared state + hub.
-        let (mut alice, alice_srv) =
-            connect(server_priv_a, &alice_priv, state.clone(), hub.clone()).await;
-        let (mut bob, bob_srv) =
-            connect(server_priv_b, &bob_priv, state.clone(), hub.clone()).await;
-
-        // Both join (so both are registered for broadcasts).
-        assert!(matches!(
-            alice.join("alice", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
-        assert!(matches!(
-            bob.join("bob", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
+        let (mut alice, alice_srv) = connect(&state, &hub).await;
+        let (mut bob, bob_srv) = connect(&state, &hub).await;
+        join_as(&mut alice, "alice").await;
+        join_as(&mut bob, "bob").await;
         // Bob is registered once his join is acknowledged.
         assert_eq!(hub.len(), 2);
 
         // Alice posts; she gets the ack, Bob receives the broadcast live.
-        let ack = request(
-            &mut alice,
-            PartyRequest::PostMessage {
-                channel,
-                text: "hi bob".to_string(),
-            },
-        )
-        .await;
+        let ack = post(&mut alice, channel, "hi bob").await;
         assert!(matches!(ack, PartyResponse::MessagePosted { .. }));
-
         match bob.recv().await.unwrap() {
             PartyResponse::Message(env) => {
                 assert_eq!(env.channel, channel);
@@ -884,35 +739,17 @@ mod tests {
             }
             other => panic!("expected broadcast Message, got {other:?}"),
         }
-
-        drop(alice);
-        drop(bob);
         alice_srv.abort();
         bob_srv.abort();
     }
 
     #[tokio::test]
     async fn direct_message_is_delivered_and_fetchable() {
-        let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let server_priv_b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
-
-        let (mut alice, alice_srv) =
-            connect(server_priv_a, &alice_priv, state.clone(), hub.clone()).await;
-        let (mut bob, bob_srv) =
-            connect(server_priv_b, &bob_priv, state.clone(), hub.clone()).await;
-
-        let alice_id = match alice.join("alice", None).await.unwrap() {
-            PartyResponse::Joined { member_id, .. } => member_id,
-            other => panic!("expected Joined, got {other:?}"),
-        };
-        let bob_id = match bob.join("bob", None).await.unwrap() {
-            PartyResponse::Joined { member_id, .. } => member_id,
-            other => panic!("expected Joined, got {other:?}"),
-        };
+        let (state, hub) = fixture();
+        let (mut alice, alice_srv) = connect(&state, &hub).await;
+        let (mut bob, bob_srv) = connect(&state, &hub).await;
+        let alice_id = join_as(&mut alice, "alice").await;
+        let bob_id = join_as(&mut bob, "bob").await;
 
         // Alice DMs Bob: she gets an ack; Bob receives the message live.
         let ack = request(
@@ -924,7 +761,6 @@ mod tests {
         )
         .await;
         assert!(matches!(ack, PartyResponse::MessagePosted { .. }));
-
         match bob.recv().await.unwrap() {
             PartyResponse::Message(env) => {
                 assert_eq!(env.sender, alice_id);
@@ -938,15 +774,15 @@ mod tests {
         }
 
         // Bob catches up on DM history with Alice.
-        match request(
+        let history = request(
             &mut bob,
             PartyRequest::FetchDmHistory {
                 with: alice_id,
                 since_seq: 0,
             },
         )
-        .await
-        {
+        .await;
+        match history {
             PartyResponse::History(items) => {
                 assert_eq!(items.len(), 1);
                 assert_eq!(
@@ -956,71 +792,19 @@ mod tests {
             }
             other => panic!("expected DM history, got {other:?}"),
         }
-
-        drop(alice);
-        drop(bob);
         alice_srv.abort();
         bob_srv.abort();
     }
 
-    /// Join and return the assigned member id.
-    async fn join_as(client: &mut TestClient, name: &str) -> Uuid {
-        match client.join(name, None).await.unwrap() {
-            PartyResponse::Joined { member_id, .. } => member_id,
-            other => panic!("expected Joined, got {other:?}"),
-        }
-    }
-
-    /// Read whatever is already queued for this client and stop when it goes
-    /// quiet, so a later assertion sees only frames caused by what follows.
-    async fn drain(client: &mut TestClient) -> Vec<PartyResponse> {
-        let mut seen = Vec::new();
-        while let Ok(Ok(resp)) =
-            tokio::time::timeout(std::time::Duration::from_millis(200), client.recv()).await
-        {
-            seen.push(resp);
-        }
-        seen
-    }
-
-    /// A private channel's messages must not reach a member who is not in it —
-    /// over the wire, not merely in the dispatcher's return value.
-    ///
-    /// This is the end-to-end half of the access leak: the dispatcher deciding
-    /// on a `directed` list proves nothing on its own, because the bug lived in
-    /// the gap between what the dispatcher returned and who the hub actually
-    /// sent it to. `broadcast_except` pushed to every registered connection, so
-    /// a member correctly denied the channel in `ListChannels` and denied its
-    /// history still received every message posted to it.
+    /// A private channel's messages must not reach a non-member *over the
+    /// wire*, not merely in the dispatcher's return value: the leak lived in the
+    /// hub, which pushed every message to every registered connection.
     #[tokio::test]
     async fn a_private_channels_messages_never_reach_a_non_member_over_the_tunnel() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
-
-        let client_privs: Vec<RsaPrivateKey> = (0..3)
-            .map(|_| generate_rsa_keypair(RSA_KEY_BITS).unwrap())
-            .collect();
-        let (mut owner, owner_srv) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &client_privs[0],
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
-        let (mut bob, bob_srv) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &client_privs[1],
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
-        let (mut carol, carol_srv) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &client_privs[2],
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
+        let (state, hub) = fixture();
+        let (mut owner, owner_srv) = connect(&state, &hub).await;
+        let (mut bob, bob_srv) = connect(&state, &hub).await;
+        let (mut carol, carol_srv) = connect(&state, &hub).await;
 
         // The owner (who joins with the claim token) can make a private
         // channel; the other two are ordinary members.
@@ -1030,7 +814,7 @@ mod tests {
             other => panic!("expected Joined, got {other:?}"),
         }
         let bob_id = join_as(&mut bob, "bob").await;
-        let _carol_id = join_as(&mut carol, "carol").await;
+        join_as(&mut carol, "carol").await;
 
         let channels = request(
             &mut owner,
@@ -1058,20 +842,11 @@ mod tests {
         // Quieten both spectators, so anything below is caused by the post.
         drain(&mut bob).await;
         drain(&mut carol).await;
-
         assert!(matches!(
-            request(
-                &mut owner,
-                PartyRequest::PostMessage {
-                    channel: private,
-                    text: "members only".to_string(),
-                },
-            )
-            .await,
+            post(&mut owner, private, "members only").await,
             PartyResponse::MessagePosted { .. }
         ));
 
-        // Bob is in the channel, so it reaches him.
         let bobs = drain(&mut bob).await;
         assert!(
             bobs.iter().any(|r| matches!(
@@ -1082,8 +857,6 @@ mod tests {
             )),
             "a channel member must receive the message; got {bobs:?}"
         );
-
-        // Carol is not, so nothing about it reaches her socket at all.
         let carols = drain(&mut carol).await;
         assert!(
             !carols
@@ -1091,39 +864,21 @@ mod tests {
                 .any(|r| matches!(r, PartyResponse::Message(_))),
             "a non-member received a private channel's message: {carols:?}"
         );
-
-        drop(owner);
-        drop(bob);
-        drop(carol);
         owner_srv.abort();
         bob_srv.abort();
         carol_srv.abort();
     }
 
     /// A file too large for one frame goes up and comes back down over the real
-    /// tunnel, byte for byte.
-    ///
-    /// The pieces were unit-tested separately — `PartyState` directly, and the
-    /// client against a mock channel — but the whole path (offer, stream,
-    /// commit, then page back down) had never run through framing, the
-    /// dispatcher and the hub together.
+    /// tunnel (framing, dispatcher and hub together), byte for byte.
     #[tokio::test]
     async fn a_chunked_upload_round_trips_over_the_tunnel() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
+        let (state, hub) = fixture();
         let channel = state.lock().await.default_channel();
-        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let (mut client, server) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &client_priv,
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
+        let (mut client, server) = connect(&state, &hub).await;
         join_as(&mut client, "owner").await;
 
-        // Deliberately not a whole number of chunks, so the final short chunk is
-        // exercised — the case an off-by-one gets wrong.
+        // Not a whole number of chunks, so the short final chunk is exercised.
         let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 1234))
             .map(|i| (i % 251) as u8)
             .collect();
@@ -1146,8 +901,7 @@ mod tests {
             other => panic!("expected UploadReady, got {other:?}"),
         };
 
-        // Chunks are not individually acknowledged, so they stream without a
-        // reply until the upload is committed.
+        // Chunks are not individually acknowledged.
         for part in payload.chunks(PARTY_CHUNK_BYTES) {
             client
                 .send(&PartyRequest::UploadChunk {
@@ -1191,15 +945,11 @@ mod tests {
         // …and pages back down, in order, matching byte for byte.
         let mut got: Vec<u8> = Vec::new();
         loop {
-            match request(
-                &mut client,
-                PartyRequest::DownloadChunk {
-                    hash: hash.clone(),
-                    offset: got.len() as u64,
-                },
-            )
-            .await
-            {
+            let chunk = PartyRequest::DownloadChunk {
+                hash: hash.clone(),
+                offset: got.len() as u64,
+            };
+            match request(&mut client, chunk).await {
                 PartyResponse::FileChunk {
                     offset,
                     total,
@@ -1220,19 +970,9 @@ mod tests {
             }
         }
         assert_eq!(got, payload);
-
-        drop(client);
         server.abort();
     }
 
-    /// When a member's last connection goes away, everyone still connected must
-    /// be told. Nothing announced this before, so a member who left showed as
-    /// online in every other client until something else happened to refresh the
-    /// directory — which, since nothing refreshed it either, meant forever.
-    /// A reply too large for a frame used to fail `send_packet` and end the
-    /// connection; a client that asked again on reconnect could then never stay
-    /// connected. It becomes an error the client can show, and an oversized
-    /// broadcast is dropped rather than disconnecting every recipient.
     #[test]
     fn an_oversized_reply_becomes_an_error_and_an_oversized_push_is_dropped() {
         let huge = PartyResponse::Error("x".repeat(MAX_PARTY_PAYLOAD_BYTES));
@@ -1249,20 +989,13 @@ mod tests {
         assert_eq!(encode_push(&small), Some(small.to_bytes()));
     }
 
+    /// When a member's last connection goes away, everyone still connected is
+    /// told, without having asked.
     #[tokio::test]
     async fn leaving_broadcasts_the_member_as_offline() {
-        let server_priv_a = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let server_priv_b = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let bob_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
-
-        let (mut alice, alice_srv) =
-            connect(server_priv_a, &alice_priv, state.clone(), hub.clone()).await;
-        let (mut bob, bob_srv) =
-            connect(server_priv_b, &bob_priv, state.clone(), hub.clone()).await;
-
+        let (state, hub) = fixture();
+        let (mut alice, alice_srv) = connect(&state, &hub).await;
+        let (mut bob, bob_srv) = connect(&state, &hub).await;
         alice.join("alice", None).await.unwrap();
         bob.join("bob", None).await.unwrap();
 
@@ -1275,11 +1008,9 @@ mod tests {
             other => panic!("expected a Members push after Bob joined, got {other:?}"),
         }
 
-        // Bob's connection ends.
         drop(bob);
         bob_srv.await.ok();
 
-        // Alice is told, without having asked.
         match alice.recv().await.unwrap() {
             PartyResponse::Members(members) => {
                 let bob = members
@@ -1292,64 +1023,18 @@ mod tests {
             }
             other => panic!("expected an offline directory push, got {other:?}"),
         }
-
-        drop(alice);
         alice_srv.abort();
     }
 
-    /// Spawn `serve_connection_with` over a duplex of `buffer` bytes, handing
-    /// back the server task so a test can watch it end.
-    fn spawn_with_limits(
-        server_priv: RsaPrivateKey,
-        state: Arc<Mutex<PartyState>>,
-        hub: Arc<Hub>,
-        buffer: usize,
-        limits: ConnectionLimits,
-    ) -> (DuplexStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
-        let (mut server_stream, client_stream) = tokio::io::duplex(buffer);
-        let handle = tokio::spawn(async move {
-            serve_connection_with(&mut server_stream, &server_priv, state, hub, &limits).await
-        });
-        (client_stream, handle)
-    }
-
-    fn short_limits() -> ConnectionLimits {
-        ConnectionLimits {
-            handshake_timeout: std::time::Duration::from_millis(500),
-            join_timeout: std::time::Duration::from_millis(500),
-            write_timeout: std::time::Duration::from_millis(500),
-        }
-    }
-
-    /// SRV-02: when the hub evicted a connection whose queue was full, the task
-    /// still held its own copy of the sender, so the receiver never closed and
-    /// the connection carried on — answering requests but deaf to every
-    /// broadcast, DM and directory change, with nothing telling the client.
-    /// Eviction must close the connection so the client reconnects.
+    /// SRV-02: eviction must close the connection so the client reconnects,
+    /// rather than leave it answering requests but deaf to every broadcast.
     #[tokio::test]
     async fn an_evicted_connection_is_closed_rather_than_left_deaf() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let hub = Arc::new(Hub::new());
-        let (stream, served) = spawn_with_limits(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state.clone(),
-            hub.clone(),
-            1 << 16,
-            ConnectionLimits::default(),
-        );
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let mut alice = PartyClient::connect(stream, &alice_priv, Uuid::new_v4())
-            .await
-            .unwrap();
-        let PartyResponse::Joined {
-            member_id: alice_id,
-            ..
-        } = alice.join("alice", None).await.unwrap()
-        else {
-            panic!("alice did not join");
-        };
+        let (state, hub) = fixture();
+        let (mut alice, served) = connect(&state, &hub).await;
+        let alice_id = join_as(&mut alice, "alice").await;
         // Registration happens after the reply is written; wait for it.
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while !hub.member_is_connected(alice_id) {
                 tokio::task::yield_now().await;
             }
@@ -1365,46 +1050,28 @@ mod tests {
         assert!(!hub.member_is_connected(alice_id), "evicted from the hub");
 
         // The client drains what was queued and then sees the connection end.
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                if alice.recv().await.is_err() {
-                    return;
-                }
-            }
+        let ended = tokio::time::timeout(Duration::from_secs(30), async {
+            while alice.recv().await.is_ok() {}
         })
         .await;
         assert!(ended.is_ok(), "the evicted connection must be closed");
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), served)
+        let outcome = tokio::time::timeout(Duration::from_secs(10), served)
             .await
             .expect("the connection task ends")
             .unwrap();
         assert!(outcome.unwrap_err().to_string().contains("evicted"));
         // Torn down like any other disconnect: shown offline.
-        assert!(!state
-            .lock()
-            .await
-            .members()
-            .iter()
-            .any(|m| m.id == alice_id && m.online));
+        assert!(!is_online(&state, alice_id).await);
     }
 
     /// SRV-03: a connection that completed its handshake could sit unjoined
     /// forever, holding a task and a file descriptor.
     #[tokio::test]
     async fn a_connection_that_never_joins_is_closed() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let (stream, served) = spawn_with_limits(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state,
-            Arc::new(Hub::new()),
-            1 << 16,
-            short_limits(),
-        );
-        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let mut client = PartyClient::connect(stream, &client_priv, Uuid::new_v4())
-            .await
-            .unwrap();
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+        let (state, hub) = fixture();
+        let (stream, served) = spawn_with_limits(state, hub, 1 << 16, short_limits());
+        let mut client = handshake(stream).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
             .await
             .expect("closed after the join deadline")
             .unwrap();
@@ -1415,23 +1082,11 @@ mod tests {
     /// A joined connection is not subject to the join deadline.
     #[tokio::test]
     async fn a_joined_connection_outlives_the_join_deadline() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let (stream, served) = spawn_with_limits(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state,
-            Arc::new(Hub::new()),
-            1 << 16,
-            short_limits(),
-        );
-        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let mut client = PartyClient::connect(stream, &client_priv, Uuid::new_v4())
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.join("alice", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let (state, hub) = fixture();
+        let (stream, served) = spawn_with_limits(state, hub, 1 << 16, short_limits());
+        let mut client = handshake(stream).await;
+        join_as(&mut client, "alice").await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!served.is_finished(), "joined members may idle");
         assert!(matches!(
             request(&mut client, PartyRequest::ListChannels).await,
@@ -1444,75 +1099,37 @@ mod tests {
     /// deadline rather than held.
     #[tokio::test]
     async fn a_peer_that_never_handshakes_is_closed() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
-        let (_silent, served) = spawn_with_limits(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state,
-            Arc::new(Hub::new()),
-            1 << 16,
-            short_limits(),
-        );
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+        let (state, hub) = fixture();
+        let (_silent, served) = spawn_with_limits(state, hub, 1 << 16, short_limits());
+        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
             .await
             .expect("closed at the handshake deadline")
             .unwrap();
         assert!(outcome.is_err());
     }
 
-    /// SRV-03: a write to a client that stopped reading blocked its task
-    /// forever. It now times out and the connection is torn down.
+    /// SRV-03: a write to a client that stopped reading times out and the
+    /// connection is torn down.
     #[tokio::test]
     async fn a_client_that_stops_reading_is_disconnected_by_the_write_timeout() {
-        let state = Arc::new(Mutex::new(PartyState::new("TestSrv", None)));
+        let (state, hub) = fixture();
         state.lock().await.set_write_rate_limit(None);
-        let hub = Arc::new(Hub::new());
         let channel = state.lock().await.default_channel();
 
         // A small pipe, so a handful of broadcasts fills it.
-        let (stream, served) = spawn_with_limits(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state.clone(),
-            hub.clone(),
-            4 * 1024,
-            short_limits(),
-        );
-        let alice_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
-        let mut alice = PartyClient::connect(stream, &alice_priv, Uuid::new_v4())
-            .await
-            .unwrap();
-        let PartyResponse::Joined {
-            member_id: alice_id,
-            ..
-        } = alice.join("alice", None).await.unwrap()
-        else {
-            panic!("alice did not join");
-        };
-
-        let (mut bob, _b) = connect(
-            generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            &generate_rsa_keypair(RSA_KEY_BITS).unwrap(),
-            state.clone(),
-            hub.clone(),
-        )
-        .await;
-        assert!(matches!(
-            bob.join("bob", None).await.unwrap(),
-            PartyResponse::Joined { .. }
-        ));
+        let (stream, served) =
+            spawn_with_limits(state.clone(), hub.clone(), 4 * 1024, short_limits());
+        let mut alice = handshake(stream).await;
+        let alice_id = join_as(&mut alice, "alice").await;
+        let (mut bob, _b) = connect(&state, &hub).await;
+        join_as(&mut bob, "bob").await;
         // Alice never reads again. Far fewer broadcasts than the queue holds,
         // so it is the write timeout — not eviction — that has to end this.
         for i in 0..8 {
-            let reply = request(
-                &mut bob,
-                PartyRequest::PostMessage {
-                    channel,
-                    text: format!("{i}{}", "z".repeat(2048)),
-                },
-            )
-            .await;
+            let reply = post(&mut bob, channel, format!("{i}{}", "z".repeat(2048))).await;
             assert!(matches!(reply, PartyResponse::MessagePosted { .. }));
         }
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), served)
+        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
             .await
             .expect("the stuck write times out")
             .unwrap();

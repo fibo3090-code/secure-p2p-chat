@@ -1,15 +1,9 @@
 //! Coverage-guided fuzzing of the peer-to-peer frame decoder.
 //!
-//! `from_plain_bytes` sees every frame a peer sends, once decrypted. It is the
-//! single largest attacker-controlled parser in the project: reaching it needs
-//! only a completed handshake, and everything after it trusts what it returns.
-//!
-//! The property suite in `core/tests/fuzz_parsers.rs` covers the same function
-//! and runs on every pull request, which is what makes it useful. This target is
-//! the other half: libFuzzer mutates toward new coverage, so it walks into
-//! branch combinations a random generator reaches only by luck. Neither replaces
-//! the other — the cheap one gates merges, this one is run deliberately and for
-//! longer.
+//! `from_plain_bytes` sees every decrypted frame a peer sends: the largest
+//! attacker-controlled parser, reachable after a handshake. The property suite
+//! (`core/tests/fuzz_parsers.rs`) gates every PR; this coverage-guided half is
+//! run deliberately and longer, reaching branches random inputs rarely hit.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -18,9 +12,7 @@ use messenger_core::core::ProtocolMessage;
 fuzz_target!(|data: &[u8]| {
     // Contract 1: never panic, on any input.
     if let Some(decoded) = ProtocolMessage::from_plain_bytes(data) {
-        // Contract 2: anything accepted must survive a round trip. A decoder
-        // that accepts what its encoder cannot reproduce has a state in it that
-        // no other part of the system knows how to handle.
+        // Contract 2: anything accepted survives a round trip.
         let re_encoded = decoded.to_plain_bytes();
         let again = ProtocolMessage::from_plain_bytes(&re_encoded)
             .expect("a frame this decoder produced must parse back");
@@ -29,12 +21,9 @@ fuzz_target!(|data: &[u8]| {
             std::mem::discriminant(&again),
             "re-encoding changed the frame type"
         );
-        // On the *bytes*, not only on the type. Comparing discriminants let a
-        // decoder that silently altered a frame's contents — a lossy string, a
-        // sanitised filename, a truncation — round-trip clean, which is the
-        // whole class of bug this contract is for. Compared from the second
-        // encode onward because the legacy `TEXT:` arm stamps the current
-        // clock, so only the re-encoded form is a fixpoint.
+        // On the *bytes*, not just the type, or a decoder that silently alters
+        // content passes. From the second encode on: the legacy `TEXT:` arm
+        // stamps the current clock.
         assert_eq!(
             re_encoded,
             again.to_plain_bytes(),

@@ -1,56 +1,28 @@
-// Thin typed wrappers over the Tauri command bridge + adapters that map the
-// Rust `ChatManager` shapes (Chat/ConvSummary/Message) into the presentational
-// `contact` shape the ported components expect.
+// Thin wrappers over the Tauri command bridge, plus adapters from the Rust
+// `ChatManager` shapes to the presentational `contact` shape.
 //
-// When NOT running inside Tauri (e.g. opened in a plain browser for UI work),
-// `api`/`onBridge` fall back to an in-memory mock so the whole UI is navigable
-// without the Rust backend. Append `?mock=unlock`, `?mock=set_password`, or
-// `?mock=error` to the URL to preview the auth and startup-failure screens.
+// Outside Tauri (a plain browser), `api`/`onBridge` fall back to an in-memory
+// mock. `?mock=unlock`, `?mock=set_password` or `?mock=error` preview the auth
+// and startup-failure screens.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { folderOf } from "./parse.js";
 
-// The gate is the Tauri host object, deliberately, and **not**
-// `import.meta.env.DEV`.
-//
-// That means the mock is compiled into the production bundle too. It is dead
-// weight in the shipped app — `__TAURI_INTERNALS__` is always present inside
-// the webview, so `realApi` is always what the app gets — but two things depend
-// on the mock surviving the build, and they are worth writing down rather than
-// leaving as an accident of how the condition happens to be spelled:
-//
-//   - The `built` smoke project serves `dist/` through `vite preview`, in a
-//     plain browser with no Tauri host. Without the mock in the bundle, the very
-//     first `api.authStatus()` rejects, `App.jsx` shows its boot error, and the
-//     smoke test would be asserting that the error screen renders.
-//   - Anyone opening the built output to look at the UI gets a navigable app
-//     rather than a dead page.
-//
-// If this ever needs to become `import.meta.env.DEV` — to keep the mock out of
-// the shipped bundle — the built smoke project needs a real answer for the
-// bridge first, or it silently starts testing the boot-error path.
+// Gated on the Tauri host object, NOT `import.meta.env.DEV`, so the mock is in
+// the production bundle: the `built` smoke project serves `dist/` in a plain
+// browser and needs it, or it would only ever test the boot-error screen.
 const inTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 
-// ── Shared rules the mock mirrors from the Rust bridge ──────────────────────
-//
-// These exist so the dev mock enforces the *same* rules as production. A mock
-// that is more permissive than the real bridge is worse than no mock: it makes
-// the security-relevant paths invisible during browser-based UI work, so the
-// only place they are ever exercised is a user's machine.
-
-/// Schemes `open_url` will hand to the OS. Mirrors the check in
-/// `commands/chats.rs::open_url`, which refuses everything else.
-///
-/// The list is what matters, not the shape of the check: `javascript:` and
-/// `data:` URIs passed to `window.open` execute in the opener's origin, so a
-/// message body is enough to run script against the app if this is skipped.
+// The mock enforces the same security rules as the Rust bridge; a more
+// permissive mock hides those paths during browser UI work.
+/// Schemes `open_url` will hand to the OS (mirrors `commands/chats.rs`).
+/// `javascript:`/`data:` URIs passed to `window.open` run in the app's origin.
 export function isOpenableUrl(url) {
   return /^https?:\/\//i.test(String(url ?? "").trim());
 }
 
-/// Extensions the OS would *run* rather than display. Mirrors
-/// `RISKY_EXTENSIONS` in `commands/chats.rs`; kept in sync deliberately, because
-/// the mock's job is to make the confirmation dialog reachable in a browser.
+/// Extensions the OS would *run*. Mirrors `RISKY_EXTENSIONS` in
+/// `commands/chats.rs`, so the confirmation dialog is reachable in a browser.
 const RISKY_EXTENSIONS = new Set([
   // Windows executables, installers and script hosts
   "exe", "com", "scr", "pif", "bat", "cmd", "msi", "msp", "msc", "cpl", "hta",
@@ -63,24 +35,16 @@ const RISKY_EXTENSIONS = new Set([
   "deb", "rpm",
 ]);
 
-/// The extension that makes `filename` an executable, or null for ordinary
-/// content. Only the *final* extension counts, so `holiday.jpg.exe` is caught.
+/// The extension that makes `filename` executable, or null. Only the *final*
+/// extension counts, so `holiday.jpg.exe` is caught.
 export function executionRisk(filename) {
   const ext = String(filename ?? "").split(".").pop()?.toLowerCase();
   return ext && RISKY_EXTENSIONS.has(ext) ? ext : null;
 }
 
-// ── Error text shown to people ──────────────────────────────────────────────
-
-/// Turn whatever the bridge threw into a sentence worth showing.
-///
-/// Command errors arrive as raw `Err(String)` from Rust — often an `io::Error`
-/// or an `anyhow` chain carrying an absolute path through the user's home
-/// directory, a temp filename, or an internal type name. Pasted into a toast
-/// verbatim (`String(e)`) that is both unreadable and a small disclosure: chat
-/// screenshots and bug reports then carry the local username and directory
-/// layout. This keeps the part that tells the user what happened and drops the
-/// part that only tells them where our code lives.
+/// Turn whatever the bridge threw into a sentence worth showing: keep what
+/// happened, drop absolute paths (they leak the username into screenshots) and
+/// code locations.
 export function friendlyError(e, fallback = "Something went wrong.") {
   let msg = "";
   if (typeof e === "string") msg = e;
@@ -101,8 +65,7 @@ export function friendlyError(e, fallback = "Something went wrong.") {
     .trim();
 
   if (!msg || msg === "…") return fallback;
-  // Long anyhow chains read as a wall; keep the first cause, which is the one
-  // that says what actually failed.
+  // Keep the first cause of a long anyhow chain.
   const [first] = msg.split(/:\s(?=[A-Z])/);
   const out = (first || msg).trim().replace(/[.\s]+$/, "");
   return out ? `${out}.` : fallback;
@@ -119,24 +82,20 @@ const realApi = {
   setAsideHistory: () => invoke("set_aside_history"),
   exportDiagnostics: () => invoke("export_diagnostics"),
   openDataDir: () => invoke("open_data_dir"),
-  // Irreversible: the backend checks the password and the typed word, deletes
-  // the identity, history and saved communities, then quits.
+  // Irreversible: checks the password and the typed word, deletes, then quits.
   deleteAllData: (password, confirm) => invoke("delete_all_data", { password, confirm }),
   lockState: () => invoke("lock_state"),
   setLocked: (locked) => invoke("set_locked", { locked }),
   listConversations: () => invoke("list_conversations"),
   getConversation: (id) => invoke("get_conversation", { id }),
   markRead: (id) => invoke("mark_read", { id }),
-  // Window focus + open conversation, so the backend can tell a background
-  // message from one the user is reading. Single-word params by convention.
+  // Window focus + open conversation, so notifications skip the visible thread.
   setPresence: (focused, chat) => invoke("set_presence", { focused, chat: chat || null }),
   sendMessage: (id, text) => invoke("send_message", { id, text }),
   sendFile: (id) => invoke("send_file", { id }),
-  // File cards: open with the default app (reveal=false) or show in folder.
-  // Only (chat id, message id) cross the bridge — never filesystem paths.
-  // Resolves to { opened, blocked, filename }. `blocked` is set when the file
-  // came from the peer and opening it would execute code — pass confirm:true
-  // to go ahead once the user has been told what it is.
+  // Only (chat id, message id) cross the bridge, never paths. Resolves to
+  // { opened, blocked, filename }; `blocked` is set for a received file that
+  // would execute — pass confirm:true once the user has been told.
   openFile: (id, msg, reveal = false, confirm = false) =>
     invoke("open_file", { id, msg, reveal, confirm }),
   filePreview: (id, msg) => invoke("file_preview", { id, msg }),
@@ -165,12 +124,8 @@ const realApi = {
   myInviteLink: () => invoke("my_invite_link"),
   importInvite: (link) => invoke("import_invite", { link }),
   connectContact: (id) => invoke("connect_contact", { id }),
-  // Communities (Party servers). Single-word command params by convention.
-  // `trust` is the second step of first-join verification: false asks the
-  // bridge to stop and report the server fingerprint + SAS without sending
-  // the credentials; true proceeds after the user has compared them.
-  // `fingerprint`: null for the first step (learn the server's identity);
-  // the fingerprint the user accepted for the second, which the bridge then
+  // Communities. `fingerprint`: null for the first join step (learn the
+  // server's identity), then the one the user accepted, which the bridge
   // requires the credential-bearing connection to present.
   partyJoin: (address, username, password, fingerprint = null) =>
     invoke("party_join", { address, username, password, fingerprint }),
@@ -203,7 +158,7 @@ const realApi = {
     invoke("party_set_file_permissions", { server, hash, location, member, perms }),
 };
 
-// ── Dev mock ────────────────────────────────────────────────────────────────
+// ── Dev mock ──
 function makeMock() {
   const now = new Date().toISOString();
   let authState = new URLSearchParams(location.search).get("mock") || "ready";
@@ -221,9 +176,7 @@ function makeMock() {
         { id: "m2", from_me: true, content: { type: "text", text: "yep — X25519 + AES-GCM. fingerprint verified ✔" }, timestamp: now },
         { id: "m3", from_me: false, content: { type: "text", text: "slick. sending you the file now" }, timestamp: now },
         { id: "m3a", from_me: false, content: { type: "file", filename: "roadmap.pdf", size: 248000, path: "/mock/roadmap.pdf" }, timestamp: now },
-        // A received file the OS would *run*. It is here so the "this file will
-        // run as a program" confirmation is reachable in a plain browser — the
-        // double extension is the shape that actually turns up in the wild.
+        // A received file the OS would run, so the confirmation is reachable.
         { id: "m3b", from_me: false, content: { type: "file", filename: "holiday.jpg.exe", size: 8400000, path: "/mock/holiday.jpg.exe" }, timestamp: now },
       ],
     },
@@ -243,8 +196,7 @@ function makeMock() {
     { id: "c1", name: "Alice", fingerprint: "a1b2c3d4e5f6", address: "192.168.1.21:12345", trust: "verified" },
     { id: "c2", name: "Carol", fingerprint: "deadbeef0102", address: "10.0.0.5:12345", trust: "unverified" },
   ];
-  // Mirrors the real bridge: unread is derived from a persisted read mark, not
-  // from what the UI happened to see this session.
+  // Unread derives from a persisted read mark, as in the real bridge.
   const readMarks = {};
   const summaries = () => Object.values(chats).map((c) => ({
     id: c.id, title: c.title,
@@ -256,8 +208,20 @@ function makeMock() {
     last_at: c.messages.length ? c.messages.at(-1).timestamp : null,
   }));
   const ok = async () => {};
-  // ── Party (Communities) mock — a single joinable server with two channels ──
+  // Party mock: a single joinable server with two channels.
   const partyState = { servers: [], msgs: {} }; // msgs keyed by `${server}|${thread}`
+  const findServer = (id) => partyState.servers.find((x) => x.id === id);
+  const pushParty = (key, msg) => {
+    (partyState.msgs[key] ||= []).push({ sender_name: "you", from_me: true, size: null, timestamp: Date.now(), ...msg });
+  };
+  const mockFile = { kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash" };
+  const addChannel = (sid, name, kind = "public", members = []) => {
+    const s = findServer(sid);
+    if (!s) return;
+    const id = "ch-" + Math.random().toString(36).slice(2, 7);
+    s.channels.push({ id, name, messages: 0, kind, members, can_post: true });
+    partyState.msgs[`${sid}|${id}`] = [];
+  };
   function seedParty(address, username) {
     const sid = "srv-" + Math.random().toString(36).slice(2, 8);
     const me = "mem-me";
@@ -267,8 +231,7 @@ function makeMock() {
       username: username || "you",
       fingerprint: "5f3a9c2e7b1d4068aa22cc55ee88ff00112233445566778899aabbccddeeff11",
       status: "joined", status_detail: null, member_id: me, last_error: null,
-      // The mock signs you in as the owner so the admin surfaces are reachable
-      // in a plain browser; the real server decides this, not the client.
+      // Owner, so the admin surfaces are reachable; the real server decides.
       my_role: "owner", last_notice: null,
       channels: [
         { id: gen, name: "general", messages: 0, kind: "public", members: [], can_post: true },
@@ -307,8 +270,7 @@ function makeMock() {
     unlock: async () => { authState = "ready"; },
     setPassword: async () => { authState = "ready"; },
     changePassword: async (current) => {
-      // The mock has no key material; reject an obviously-empty current password
-      // so the dialog's error path is exercisable in a plain browser.
+      // No key material: reject an empty current password to exercise errors.
       if (!current) throw new Error("Current password is incorrect");
     },
     setDisplayName: async (name) => ({ state: authState, name, fingerprint: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2" }),
@@ -334,27 +296,19 @@ function makeMock() {
     setPresence: async () => {},
     sendMessage: async (id, text) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "text", text }, timestamp: new Date().toISOString() }); },
     sendFile: async (id) => { chats[id].messages.push({ id: "x" + Math.random(), from_me: true, content: { type: "file", filename: "example.pdf", size: 248000, path: "/mock/example.pdf" }, timestamp: new Date().toISOString() }); },
-    // Mirrors the real gate: a file *received from a peer* whose extension means
-    // the OS would run it is refused until `confirm` is passed. Always answering
-    // "opened" meant the confirmation dialog — the one security-critical thing
-    // this screen does — could not be reached at all in a plain browser, so it
-    // was only ever exercised by hand in the packaged app.
+    // Mirrors the real gate: a received file that would run is refused until
+    // `confirm` is passed. Revealing launches nothing, so it is never gated.
     openFile: async (id, msg, reveal = false, confirm = false) => {
       const m = (chats[id]?.messages || []).find((x) => x.id === msg);
       const filename = m?.content?.filename || null;
       const risk = m && !m.from_me ? executionRisk(filename) : null;
-      // Revealing in the file manager launches nothing, so it is never gated.
       if (risk && !reveal && !confirm) {
         return { opened: false, blocked: risk, filename };
       }
       return { opened: true, blocked: null, filename };
     },
     filePreview: async () => null,
-    // The real bridge refuses anything that is not http(s) — `javascript:` and
-    // `data:` URIs handed to `window.open` execute against the app's origin. The
-    // mock refused nothing, so a regression in the calling code (linkifying an
-    // attacker-supplied string, say) looked fine in a browser and only failed
-    // closed once it reached the Rust side.
+    // Refuses non-http(s) like the real bridge.
     openUrl: async (url) => {
       if (!isOpenableUrl(url)) throw new Error("Only http(s) links can be opened");
       window.open(url, "_blank", "noopener");
@@ -393,69 +347,46 @@ function makeMock() {
     },
     partyList: async () => partyState.servers,
     partyHistory: async (server, channel) => partyState.msgs[`${server}|${channel}`] || [],
-    partyPost: async (server, channel, text) => {
-      (partyState.msgs[`${server}|${channel}`] ||= []).push({ sender_name: "you", from_me: true, kind: "text", text, size: null, timestamp: Date.now() });
-    },
-    partyCreateChannel: async (server, name) => {
-      const s = partyState.servers.find((x) => x.id === server);
-      if (s) { const id = "ch-" + Math.random().toString(36).slice(2, 7); s.channels.push({ id, name, messages: 0, kind: "public", members: [], can_post: true }); partyState.msgs[`${server}|${id}`] = []; }
-    },
-    partySendDm: async (server, to, text) => {
-      const key = `${server}|dm-${to}`;
-      (partyState.msgs[key] ||= []).push({ sender_name: "you", from_me: true, kind: "text", text, size: null, timestamp: Date.now() });
-    },
+    partyPost: async (server, channel, text) => pushParty(`${server}|${channel}`, { kind: "text", text }),
+    partyCreateChannel: async (sid, name) => addChannel(sid, name),
+    partySendDm: async (server, to, text) => pushParty(`${server}|dm-${to}`, { kind: "text", text }),
     partyDmHistory: async (server, peer) => partyState.msgs[`${server}|dm-${peer}`] || [],
-    partyClearError: async (server) => { const s = partyState.servers.find((x) => x.id === server); if (s) s.last_error = null; },
-    partySendFile: async (server, channel) => {
-      (partyState.msgs[`${server}|${channel}`] ||= []).push({ sender_name: "you", from_me: true, kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash", timestamp: Date.now() });
-    },
-    partySendFileDm: async (server, to) => {
-      (partyState.msgs[`${server}|dm-${to}`] ||= []).push({ sender_name: "you", from_me: true, kind: "file", text: "mock-file.png", size: 12345, hash: "mockhash", timestamp: Date.now() });
-    },
+    partyClearError: async (sid) => { const s = findServer(sid); if (s) s.last_error = null; },
+    partySendFile: async (server, channel) => pushParty(`${server}|${channel}`, mockFile),
+    partySendFileDm: async (server, to) => pushParty(`${server}|dm-${to}`, mockFile),
     partyDownloadFile: async () => { console.log("[mock] party download only works in the desktop app"); },
     partySaved: async () => [{ address: "192.168.1.20:12345", username: "you", name: "Mock Community", fingerprint: "abc123" }],
-    partyLeave: async (server) => { partyState.servers = partyState.servers.filter((s) => s.id !== server); },
-    partyCreateChannelKind: async (server, name, kind, members = []) => {
-      const s = partyState.servers.find((x) => x.id === server);
-      if (!s) return;
-      const id = "ch-" + Math.random().toString(36).slice(2, 7);
-      s.channels.push({ id, name, messages: 0, kind, members, can_post: true });
-      partyState.msgs[`${server}|${id}`] = [];
-    },
-    partyDeleteChannel: async (server, channel) => {
-      const s = partyState.servers.find((x) => x.id === server);
+    partyLeave: async (sid) => { partyState.servers = partyState.servers.filter((s) => s.id !== sid); },
+    partyCreateChannelKind: async (sid, name, kind, members = []) => addChannel(sid, name, kind, members),
+    partyDeleteChannel: async (sid, channel) => {
+      const s = findServer(sid);
       if (s) s.channels = s.channels.filter((c) => c.id !== channel);
-      delete partyState.msgs[`${server}|${channel}`];
+      delete partyState.msgs[`${sid}|${channel}`];
     },
-    partySetChannelAccess: async (server, channel, kind, members = []) => {
-      const c = partyState.servers.find((x) => x.id === server)?.channels.find((c) => c.id === channel);
+    partySetChannelAccess: async (sid, channel, kind, members = []) => {
+      const c = findServer(sid)?.channels.find((c) => c.id === channel);
       if (c) { c.kind = kind; c.members = members; }
     },
-    partySetRole: async (server, member, role) => {
-      const m = partyState.servers.find((x) => x.id === server)?.members.find((m) => m.id === member);
+    partySetRole: async (sid, member, role) => {
+      const m = findServer(sid)?.members.find((m) => m.id === member);
       if (m) m.role = role;
     },
     partyRefreshFiles: ok,
-    partyDeleteFile: async (server, hash, location) => {
-      const s = partyState.servers.find((x) => x.id === server);
+    partyDeleteFile: async (sid, hash, location) => {
+      const s = findServer(sid);
       if (s) s.files = s.files.filter((f) => !(f.hash === hash && f.location === location));
     },
     partyRefreshAudit: ok,
-    partyClearNotice: async (server) => {
-      const s = partyState.servers.find((x) => x.id === server);
-      if (s) s.last_notice = null;
-    },
-    partyShareFile: async (server, hash, _from, { channel = null } = {}) => {
-      const s = partyState.servers.find((x) => x.id === server);
+    partyClearNotice: async (sid) => { const s = findServer(sid); if (s) s.last_notice = null; },
+    partyShareFile: async (sid, hash, _from, { channel = null } = {}) => {
+      const s = findServer(sid);
       const src = s?.files.find((f) => f.hash === hash);
       if (!s || !src) return;
       const target = s.channels.find((c) => c.id === channel);
       s.files.push({ ...src, location: channel, location_name: `#${target?.name || "?"}` });
     },
-    partySetFilePermissions: async (server, hash, location, member, perms) => {
-      const f = partyState.servers
-        .find((x) => x.id === server)?.files
-        .find((f) => f.hash === hash && f.location === location);
+    partySetFilePermissions: async (sid, hash, location, member, perms) => {
+      const f = findServer(sid)?.files.find((f) => f.hash === hash && f.location === location);
       if (!f || member) return; // the mock only models the default grant
       f.can_view = perms.view;
       f.can_download = perms.download;
@@ -468,19 +399,10 @@ function makeMock() {
 export const api = inTauri ? realApi : makeMock();
 export const onBridge = inTauri ? (event, cb) => listen(event, cb) : async () => () => {};
 
-// ── Adapters + formatting ────────────────────────────────────────────────────
-/// Parse a timestamp into a `Date`, or `null` when there isn't one.
-///
-/// Two traps, both of which shipped:
-///
-/// - `new Date("nonsense").toLocaleTimeString()` does not throw; it returns the
-///   *string* "Invalid Date". A try/catch is therefore no guard at all, and the
-///   words "Invalid Date" appeared next to the message text.
-/// - `new Date(null)` is not invalid — it is the Unix epoch. A message with no
-///   timestamp rendered as 1 January 1970 rather than as nothing.
-///
-/// Both read to the user as corrupted data. An absent stamp should render as an
-/// absent stamp.
+// ── Adapters + formatting ──
+/// A timestamp as a `Date`, or null. Guards both traps: an unparseable string
+/// formats as the words "Invalid Date" (no throw), and `new Date(null)` is the
+/// 1970 epoch. An absent stamp should render as nothing.
 function parseStamp(ts) {
   if (ts === null || ts === undefined || ts === "") return null;
   const d = new Date(ts);
@@ -488,12 +410,6 @@ function parseStamp(ts) {
 }
 
 export function fmtTime(ts) {
-  // The `isNaN` check is the point, and the try/catch is not a substitute for
-  // it: `new Date("nonsense").toLocaleTimeString()` does not throw, it returns
-  // the string "Invalid Date". So the catch never fired and every message row
-  // with an unparseable stamp rendered the words "Invalid Date" next to the
-  // text — which reads as data loss, where a blank stamp reads as "no time
-  // recorded". `fmtWhen` and `fmtDay` already guarded this; this one did not.
   const d = parseStamp(ts);
   if (!d) return "";
   try {
@@ -501,10 +417,8 @@ export function fmtTime(ts) {
   } catch { return ""; }
 }
 
-// One formatter, built on first use. `toLocaleTimeString` with an options
-// object constructs a new `Intl.DateTimeFormat` on every call, which is the
-// slow path in WebKitGTK and WKWebView — and it ran once per message per
-// refresh (PERF-01).
+// One cached formatter: building an `Intl.DateTimeFormat` per message per
+// refresh is slow in WebKitGTK and WKWebView (PERF-01).
 let cachedTimeFormat = null;
 function timeFormat() {
   if (!cachedTimeFormat) {
@@ -513,8 +427,7 @@ function timeFormat() {
   return cachedTimeFormat;
 }
 
-// Compact "last activity" stamp for the conversation list: time-of-day for
-// today, weekday within the last week, short date otherwise.
+// "Last activity" stamp: time today, weekday this week, else a short date.
 export function fmtWhen(ts) {
   const d = parseStamp(ts);
   if (!d) return "";
@@ -553,9 +466,7 @@ function human(n) {
   return n.toFixed(i ? 1 : 0) + " " + u[i];
 }
 
-// Both adapters normalize kind/transport identically (backends emit either
-// casing across summary vs detail payloads) so a conversation keeps the same
-// shape whichever payload arrived last.
+// Backends emit either casing across summary vs detail payloads.
 function normalizeKind(value) { return String(value || "dm").toLowerCase(); }
 function normalizeTransport(value) { return String(value || "direct").toLowerCase(); }
 
@@ -592,8 +503,7 @@ export function chatToContact(chat, connected) {
     messages: (chat.messages || []).map((m) => {
       const c = m.content || {};
       if (c.type === "file") {
-        // hasPath gates the open/reveal actions — a file whose location was
-        // never recorded (old history) renders as a plain card.
+        // hasPath gates open/reveal; old history may not record a location.
         return { kind: "file", id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", name: c.filename, size: human(c.size), progress: 100, t: fmtTime(m.timestamp), hasPath: !!c.path, path: c.path ? String(c.path) : "", dir: folderOf(c.path), delivered: !!m.delivered };
       }
       return { id: m.id, ts: m.timestamp, from: m.from_me ? "me" : "them", text: msgText(c), t: fmtTime(m.timestamp), delivered: !!m.delivered };

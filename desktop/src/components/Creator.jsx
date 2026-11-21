@@ -15,9 +15,7 @@ const MODES = [
 
 function CopyLine({ value }) {
   const [done, setDone] = useState(false);
-  // writeText returns a promise, so a sync try/catch never sees a rejection and
-  // "Copied ✓" appeared even when nothing reached the clipboard — the user then
-  // pastes stale content into a chat and wonders why their peer can't connect.
+  // writeText is async: await it, or "Copied ✓" shows when nothing was copied.
   async function copy() {
     if (!value) return;
     try {
@@ -61,18 +59,13 @@ export function Creator({ open, onClose, initialMode }) {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // Open on the tab the caller asked for. The get-started panel routes each of
-  // its three suggestions straight to the matching path, so the user is never
-  // dropped on a generic dialog and left to find the right tab themselves.
+  // Open on the tab the caller asked for (the get-started panel's suggestions).
   useEffect(() => {
     if (open && initialMode) setMode(initialMode);
   }, [open, initialMode]);
 
-  // Clear per-attempt state when the dialog closes. This component stays
-  // mounted, so everything typed for one peer survived into the next open: a
-  // connection password meant for host A was then silently sent to host B, and
-  // a stale error sat above a fresh, unrelated form. Addresses and tokens are
-  // cleared for the same reason — they belong to the attempt, not to the app.
+  // Clear per-attempt state on close: this stays mounted, and a connection
+  // password meant for host A was once silently sent to host B.
   useEffect(() => {
     if (open) return;
     setPassword("");
@@ -121,9 +114,8 @@ export function Creator({ open, onClose, initialMode }) {
   function reset() { setErr(""); setNote(""); setHostToken(""); setHostAddr(null); }
   function done(msg) { if (msg) { setNote(msg); } else onClose(); }
 
-  // Single in-flight guard: each connect/host call creates a session in
-  // ChatManager, so a double-submit (repeat click or Enter) would spawn
-  // duplicate conversations / overlapping host attempts.
+  // In-flight guard: each call creates a session, so a double submit would
+  // spawn duplicate conversations or overlapping hosts.
   async function run(fn) {
     if (busy) return;
     setBusy(true);
@@ -136,9 +128,7 @@ export function Creator({ open, onClose, initialMode }) {
     if (!raw) return setErr("Enter a peer address.");
     const i = raw.lastIndexOf(":");
     const h = i > -1 ? raw.slice(0, i) : raw;
-    // A typo'd port used to fall back to 12345 silently, so the app dialled a
-    // different machine's port than the one on screen and reported a plain
-    // "connection refused". Say what is wrong instead of guessing.
+    // A bad port is an error, never a silent fall back to the default.
     let p = DEFAULT_PORT;
     if (i > -1) {
       p = parsePort(raw.slice(i + 1));
@@ -186,16 +176,11 @@ export function Creator({ open, onClose, initialMode }) {
     if (!importLink.trim()) return setErr("Paste an invite link.");
     await run(async () => {
       try {
-        // `import_invite` answers with { contact, signed }, not with the contact
-        // itself. Reading `.id` off the wrapper meant `connect_contact` was
-        // called with `undefined`, failed to parse as a UUID, and the dialog
-        // reported "Saved undefined to contacts." — so importing a link from
-        // here never actually connected.
+        // `import_invite` answers { contact, signed }, not the contact itself.
         const res = await api.importInvite(importLink.trim());
         const c = res?.contact ?? res;
         setImportLink("");
-        // An unsigned (v1) link carries no proof of who made it. Same warning
-        // the Contacts pane gives, because it is the same decision.
+        // An unsigned (v1) link proves nothing about its maker (as in Contacts).
         if (res && res.signed === false) {
           toast(
             "Added from an unsigned invite link — anyone can create one. Compare the safety code when you first connect.",

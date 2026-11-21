@@ -1,7 +1,4 @@
-//! Contact and invite commands.
-//!
-//! Bodies of `TuiApp::execute_command`, one method per command, so the
-//! dispatcher reads as a table.
+//! Contact and invite commands: bodies of `TuiApp::execute_command`.
 
 use super::*;
 
@@ -40,7 +37,7 @@ impl TuiApp {
             .await
         {
             Ok(chat_id) => {
-                self.toast(ToastLevel::Info, "Connecting to contact…".to_string());
+                self.toast(ToastLevel::Info, "Connecting to contact…");
                 self.overlay = TuiOverlay::None;
                 self.select_chat(chat_id);
             }
@@ -54,7 +51,7 @@ impl TuiApp {
             Some(id) => {
                 self.chat_manager.remove_contact(id);
                 self.sync_contact_ids();
-                self.toast(ToastLevel::Info, "Contact removed".to_string());
+                self.toast(ToastLevel::Info, "Contact removed");
                 self.save_history_now();
             }
             None => self.toast(ToastLevel::Error, format!("No contact '{}'", target)),
@@ -68,7 +65,7 @@ impl TuiApp {
                 if let Some(c) = self.chat_manager.contacts.get_mut(&id) {
                     c.name = new_name.chars().take(50).collect();
                 }
-                self.toast(ToastLevel::Success, "Contact renamed".to_string());
+                self.toast(ToastLevel::Success, "Contact renamed");
                 self.save_history_now();
             }
             None => self.toast(ToastLevel::Error, format!("No contact '{}'", target)),
@@ -76,9 +73,8 @@ impl TuiApp {
     }
 
     pub(super) fn cmd_invite(&mut self, addr: Option<String>) {
-        // Explicit address wins; otherwise embed every reachable
-        // candidate in priority order (UPnP external first, LAN next)
-        // so peers can try them in turn.
+        // Explicit address wins; otherwise every candidate in priority order
+        // (UPnP external, then LAN) so peers can try them in turn.
         let addrs: Vec<String> = match addr {
             Some(a) => vec![a],
             None => {
@@ -102,7 +98,7 @@ impl TuiApp {
             Ok(link) => {
                 Self::copy_to_clipboard(&link);
                 self.overlay = TuiOverlay::Invite { link };
-                self.toast(ToastLevel::Success, "Invite link copied".to_string());
+                self.toast(ToastLevel::Success, "Invite link copied");
             }
             Err(e) => self.toast(ToastLevel::Error, format!("Invite failed: {}", e)),
         }

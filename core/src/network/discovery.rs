@@ -1,8 +1,5 @@
-//! mDNS/Bonjour local peer discovery.
-//!
-//! This module provides functionality to:
-//! - Register this instance on the local network when hosting.
-//! - Discover other peers on the same network.
+//! mDNS/Bonjour LAN discovery: advertise this instance while hosting and list
+//! peers on the same network. It supplies addresses, never trust (TOFU still runs).
 
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
@@ -20,21 +17,12 @@ pub struct DiscoveredPeer {
     pub address: String,
     /// The port the peer is listening on.
     pub port: u16,
-    /// The fingerprint of the peer's identity key, when the peer advertises one.
-    ///
-    /// Nothing consumes this and this build does not advertise it — see
-    /// [`Discovery::register`]. Kept so a peer on an older version is still
-    /// parsed cleanly.
+    /// Identity fingerprint, if an older peer advertises one. Unused, and this
+    /// build does not advertise it (see [`Discovery::register`]).
     pub fingerprint: Option<String>,
-    /// The full mDNS service name (`<instance>._p2p-messenger._tcp.local.`).
-    ///
-    /// This is the identity mDNS itself uses, and the only thing a
-    /// `ServiceRemoved` event carries. Removal used to match
-    /// `fullname.contains(peer.name)`, which was wrong twice over: `name` holds
-    /// the *hostname* while the fullname is built from the *instance* name, so
-    /// it frequently matched nothing and the peer was never removed; and being a
-    /// substring test, when it did match it could take "laptop" out along with
-    /// "laptop-alice".
+    /// Full mDNS service name (`<instance>._p2p-messenger._tcp.local.`): the only
+    /// thing a `ServiceRemoved` carries, so removal matches it exactly. (`name` is
+    /// the hostname, and a substring test would evict "laptop" with "laptop-alice".)
     pub fullname: String,
 }
 
@@ -45,55 +33,26 @@ pub struct Discovery {
     registered_service_fullname: Option<String>,
 }
 
-/// The TXT record advertised alongside the service.
-///
-/// Deliberately empty. The service type, instance name, address and port are all
-/// discovery needs, and anything added here is broadcast in the clear to every
-/// device on the network — so a field belongs here only if something actually
-/// reads it and it is safe for strangers to see. The identity fingerprint met
-/// neither test.
+/// The TXT record advertised with the service. Deliberately empty: it is
+/// broadcast in the clear to the whole LAN, so a field belongs here only if
+/// something reads it and strangers may see it. The fingerprint met neither test.
 fn service_txt_properties() -> HashMap<String, String> {
     HashMap::new()
 }
 
-/// Most peers the list will hold.
-///
-/// mDNS is unauthenticated LAN input: anything on the network can announce as
-/// many services as it likes, and each announcement is resolved under a mutex
-/// that the UI reads. Without a cap, a hostile responder advertising a few
-/// hundred names — now multiplied by the addresses each one claims — turns the
-/// peer list into an unbounded allocation and every poll into a quadratic scan.
-///
-/// 256 is far more than any real network offers and small enough that the
-/// linear scan below stays free.
+/// Most peers the list will hold. mDNS is unauthenticated LAN input resolved
+/// under a mutex the UI reads, so a flood of announcements must not grow it (or
+/// the linear scans over it) without bound. Far above any real network.
 const MAX_DISCOVERED_PEERS: usize = 256;
 
-/// Most addresses recorded for one advertised service.
-///
-/// A dual-homed peer legitimately advertises two or three (Wi-Fi and Ethernet,
-/// IPv4 and IPv6). A responder claiming twenty is not describing a real machine.
+/// Most addresses recorded for one service; a real dual-homed peer has two or three.
 const MAX_ADDRESSES_PER_PEER: usize = 8;
 
-/// Fold a freshly resolved service into the peer list.
-///
-/// Two bugs live in the naive version of this, and they pull in opposite
-/// directions.
-///
-/// The first is *dropping* the update. Treating "same fullname" as "already
-/// known" means a peer that changes address — a DHCP renewal, Wi-Fi to
-/// Ethernet — keeps its stale entry forever and the address it is actually
-/// reachable on is never added. Taking only the first address had the same
-/// effect on a dual-homed peer: it was only ever listed on whichever interface
-/// resolved first. So a re-resolve has to *replace* what the service previously
-/// claimed, not be skipped.
-///
-/// The second is *ordering*. Removing the old entries and then discovering
-/// there is no room to re-add them is worse than refusing the newcomer: a LAN
-/// attacker who fills the list makes your real laptop vanish from the UI at its
-/// next routine re-announcement, which is the opposite of what a cap is for.
-/// Retaining first is what makes that impossible — the slots this service just
-/// gave up are available to it again, so a re-announcing peer can always
-/// re-add at least as many entries as it had.
+/// Fold a freshly resolved service into the peer list. A re-resolve *replaces*
+/// the service's previous entries (a peer that moved, or is dual-homed, must be
+/// listed where it is reachable). The retain runs *before* the cap check, so the
+/// slots a service gives up are free for it again and a LAN flood cannot make a
+/// re-announcing real peer vanish.
 fn merge_resolved(peers: &mut Vec<DiscoveredPeer>, fullname: &str, resolved: Vec<DiscoveredPeer>) {
     peers.retain(|p| p.fullname != fullname);
 
@@ -105,8 +64,7 @@ fn merge_resolved(peers: &mut Vec<DiscoveredPeer>, fullname: &str, resolved: Vec
             );
             break;
         }
-        // A second service advertising an endpoint we already list is not a
-        // second peer.
+        // A second service at an endpoint already listed is not a second peer.
         if peers
             .iter()
             .any(|p| p.address == peer.address && p.port == peer.port)
@@ -129,28 +87,13 @@ impl Discovery {
         })
     }
 
-    /// Register this instance on the network.
-    ///
-    /// # Arguments
-    /// * `name` - The user's display name.
-    /// * `port` - The port the app is listening on.
-    ///
-    /// ## What is deliberately *not* advertised
-    ///
-    /// The identity fingerprint used to go in the TXT record, and nothing ever
-    /// read it: the UI offers a nearby peer as an address to dial and nothing
-    /// more, because discovery supplies reachability and never trust — TOFU
-    /// still runs on connect. Broadcasting it therefore bought nothing and told
-    /// every device on the network which long-term identity was sitting at which
-    /// address, which is exactly the linkage someone on a café or office LAN
-    /// would want.
-    ///
-    /// Peers that still advertise one are parsed without complaint (see `poll`),
-    /// so a mixed-version network keeps working.
+    /// Advertise `name` (the display name) on `port`. The identity fingerprint
+    /// is deliberately *not* advertised: nothing read it, and broadcasting it told
+    /// the whole LAN which long-term identity sat at which address. Peers that
+    /// still advertise one are parsed without complaint (see `poll`).
     pub fn register(&mut self, name: &str, port: u16) -> anyhow::Result<()> {
         let properties = service_txt_properties();
 
-        // Construct the service info
         let host_ipv4 = crate::util::primary_local_ipv4().unwrap_or_else(|| "0.0.0.0".to_string());
 
         let service_info = ServiceInfo::new(
@@ -184,12 +127,9 @@ impl Discovery {
         Ok(())
     }
 
-    /// Poll for newly discovered or removed peers.
-    /// Returns a list of currently known peers.
-    ///
-    /// This is non-blocking. It processes events that have arrived since the last call.
+    /// Apply the discovery events that arrived since the last call to
+    /// `discovered_peers`. Non-blocking.
     pub fn poll(&self, discovered_peers: &Arc<Mutex<Vec<DiscoveredPeer>>>) {
-        // Process all pending events
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 ServiceEvent::ServiceResolved(info) => {
@@ -234,8 +174,7 @@ impl Discovery {
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     tracing::info!(fullname = %fullname, "Peer removed from mDNS");
                     if let Ok(mut peers) = discovered_peers.lock() {
-                        // Exact match on the service name mDNS gave us, so a
-                        // departing "laptop-alice" cannot also evict "laptop".
+                        // Exact match, so "laptop-alice" leaving keeps "laptop".
                         peers.retain(|p| p.fullname != fullname);
                     }
                 }
@@ -276,13 +215,8 @@ mod tests {
         assert!(format!("{:?}", peer).contains("Laptop"));
     }
 
-    /// The removal rule, isolated from the daemon: a departing peer must take
-    /// itself out of the list and nothing else.
-    ///
-    /// This is the shape of the bug it replaces. Matching
-    /// `fullname.contains(peer.name)` compared the event's *instance* name
-    /// against the peer's *hostname*, so it usually removed nobody — and when
-    /// the two happened to share a prefix, it removed too many.
+    /// The removal rule, isolated from the daemon: a departing peer takes itself
+    /// out of the list and nothing else (a substring match removed too many).
     #[test]
     fn removing_one_peer_leaves_similarly_named_peers_alone() {
         let mk = |instance: &str, host: &str, last: u8| DiscoveredPeer {
@@ -310,10 +244,8 @@ mod tests {
         );
     }
 
-    /// The TXT record must not carry identity. Discovery answers "something is
-    /// reachable at this address"; deciding whether to trust it is TOFU's job,
-    /// and broadcasting the fingerprint linked a long-term identity to a machine
-    /// for every device on the network.
+    /// The TXT record must not carry identity: trust is TOFU's job, and a
+    /// broadcast fingerprint links a long-term identity to a machine.
     #[test]
     fn the_advertised_txt_record_carries_no_identity() {
         let props = service_txt_properties();
@@ -334,11 +266,8 @@ mod tests {
         }
     }
 
-    /// A peer that changes address must be listed at the new one.
-    ///
-    /// The old dedup treated "same fullname" as "already known" and skipped the
-    /// update, so a DHCP renewal or a move from Wi-Fi to Ethernet left the stale
-    /// address on screen and the reachable one absent.
+    /// A peer that changes address (DHCP renewal, Wi-Fi to Ethernet) is listed at
+    /// the new one, not left at the stale one.
     #[test]
     fn a_peer_that_moved_is_listed_at_its_new_address() {
         let mut peers = vec![peer("laptop._p2p-messenger._tcp.local.", "192.168.1.10")];
@@ -370,8 +299,7 @@ mod tests {
         assert_eq!(addresses, ["192.168.1.42", "fe80::1"]);
     }
 
-    /// The list is bounded. mDNS is unauthenticated LAN input, and the mutex
-    /// holding this vector is one the UI reads on every frame.
+    /// The list is bounded: mDNS is unauthenticated LAN input.
     #[test]
     fn the_peer_list_is_capped() {
         let mut peers = Vec::new();
@@ -386,13 +314,8 @@ mod tests {
         assert_eq!(peers.len(), MAX_DISCOVERED_PEERS);
     }
 
-    /// A flood must not be able to evict a real peer at its next routine
-    /// re-announcement.
-    ///
-    /// This is why the retain runs *before* the cap check: removing a service's
-    /// old entries and then finding no room to re-add them makes the peer
-    /// disappear from the UI, which is strictly worse than refusing the
-    /// newcomer would have been.
+    /// A flood must not evict a real peer at its next re-announcement (why the
+    /// retain runs before the cap check).
     #[test]
     fn a_full_list_does_not_swallow_a_re_announcing_peer() {
         let mut peers = Vec::new();
@@ -434,10 +357,8 @@ mod tests {
         assert_eq!(peers.len(), 1);
     }
 
-    /// Exercises the register → poll → unregister lifecycle when an mDNS daemon is
-    /// available. Sandboxed CI without multicast may be unable to start the
-    /// daemon; in that case the constructor path is still exercised and the test
-    /// does not fail on an environment limitation. `poll` is non-blocking.
+    /// Register, poll, unregister when an mDNS daemon can start (sandboxed CI
+    /// without multicast may have none; that is not a failure).
     #[test]
     fn discovery_lifecycle_is_non_panicking_when_available() {
         if let Ok(mut discovery) = Discovery::new() {

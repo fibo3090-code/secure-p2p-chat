@@ -20,10 +20,8 @@ function Toggle({ on, onChange, label, hint }) {
   );
 }
 
-// Rotate the password protecting the identity file. The key inside is
-// untouched, so history stays readable and contacts keep seeing the same
-// fingerprint — the copy says so, because "change password" in a messenger is
-// exactly the kind of action people expect to cost them their history.
+// Rotate the identity file's password. The key is untouched (history and
+// fingerprint survive), and the copy says so: people expect this to cost history.
 function ChangePasswordDialog({ open, onClose, minLength }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -31,9 +29,8 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // Clear on every close: this component stays mounted, and leaving a typed
-  // password sitting in state (and in the DOM) until the next open is exactly
-  // what a password field must not do.
+  // Clear on every close: this stays mounted, and a typed password must not
+  // linger in state or the DOM.
   useEffect(() => {
     if (open) return;
     setCurrent(""); setNext(""); setConfirm(""); setErr(""); setBusy(false);
@@ -91,8 +88,7 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
   );
 }
 
-// Delete everything on this device. Two guards, because this is the one action
-// that destroys the identity itself and nothing can bring it back: the password
+// Delete everything on this device. Irreversible, so two guards: the password
 // (checked by the backend against the file on disk) and the typed word.
 export const DELETE_WORD = "DELETE";
 
@@ -247,9 +243,7 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
             </div>
           </div>
           <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
-          {/* Losing the identity file is the one failure this app cannot undo,
-              so the row states plainly whether a backup exists rather than
-              offering an Export button with no indication either way. */}
+          {/* A lost identity file cannot be undone, so say whether a backup exists. */}
           <div className={cx("set-row", !backedUp && "is-warn")}>
             <span className="set-row-txt">
               <span className="set-row-label">
@@ -276,9 +270,6 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               <Icon name="copy" size={14} /> {backedUp ? "Export again" : "Export now"}
             </button>
           </div>
-          {/* A security product with no way to rotate its one password is a gap
-              users notice — and a leaked or shoulder-surfed password is exactly
-              the moment someone goes looking for this. */}
           <div className="set-row">
             <span className="set-row-txt">
               <span className="set-row-label">Password</span>

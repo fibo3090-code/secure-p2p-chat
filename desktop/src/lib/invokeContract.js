@@ -1,60 +1,26 @@
 // Cross-check the invoke keys `bridge.js` sends against the parameter names the
-// Rust `#[tauri::command]` handlers declare.
-//
-// ## Why this exists
-//
-// Tauri 2 binds invoke arguments by exact name. A mismatch does not throw, does
-// not log, and does not fail a type check — the command runs with the parameter
-// missing or defaulted, so the call is a **silent no-op**. That footgun has cost
-// this project real bugs already: "messages send but don't arrive" and
-// "fingerprint verify does nothing" were both a JS key that no longer matched a
-// Rust parameter.
-//
-// The Rust bridge tests catch it by driving the real handlers over mock IPC, but
-// they cannot run on Windows: a Rust test-harness executable linking tauri aborts
-// at startup there (`STATUS_ENTRYPOINT_NOT_FOUND` — it lacks the manifest
-// `tauri-build` embeds into the real app binary). So on Windows that class of
-// regression had no coverage at all.
-//
-// This check needs neither tauri nor a webview: it reads both sides as text and
-// compares the names. It therefore runs everywhere `npm test` runs, which is now
-// all three platforms — and it is strictly *more* direct than the IPC tests for
-// this specific question, because it compares the two declarations rather than
-// inferring agreement from behaviour.
-//
-// It does not replace the Rust tests. Those check that a command *works*; this
-// checks that it can be *reached*.
+// Rust `#[tauri::command]` handlers declare. Tauri 2 binds arguments by exact
+// name and a mismatch is a silent no-op ("messages send but don't arrive").
+// The Rust IPC tests catch it too, but cannot run on Windows (a test harness
+// linking tauri aborts at startup there); this reads both sides as text, so it
+// runs wherever `npm test` does. It checks that a command can be *reached*;
+// the Rust tests check that it *works*.
 
-/// Parameters every command receives from the framework rather than from JS.
-/// A caller never sends these, so they must not be treated as missing keys.
+/// Parameters the framework injects; a caller never sends these.
 const INJECTED_PARAMS = new Set(["state", "window", "app", "webview", "handle"]);
 
 /// Neutralise everything that is text rather than code, keeping the source's
-/// exact length and line structure.
+/// exact length and line structure (so offsets stay valid).
 ///
-/// The scan below is a regex over text, so it has to be told what is *code*.
-/// Comments alone are not enough — `invoke("log", { msg: "invoke(x)" })` would
-/// otherwise look like a second, unparseable call — and handling strings
-/// without also handling regex literals is worse than handling neither: a regex
-/// containing a quote, say `/["']/`, opens a string that then swallows real
-/// code up to the next matching quote, and the self-consistent nonsense that
-/// results passes every assertion made against it.
-///
-/// Comments and regex literals are blanked outright; nothing inside them is
-/// ever wanted. String and template literals keep their *contents* — the first
-/// argument to `invoke` is a string, and blanking it would erase the command
-/// name this whole file exists to read — and lose only the structural
-/// characters the scanner keys on: brackets and separators. So `"invoke(x)"`
-/// stops looking like a call site and a brace inside a string stops confusing
-/// the brace matcher, while `"auth_status"` still reads as `auth_status`.
-///
-/// Spaces rather than deletion, so offsets stay intact and a future check that
-/// wants a line number gets the right one.
+/// Comments and regex literals are blanked outright (a regex containing a
+/// quote would otherwise open a string that swallows real code). String and
+/// template literals keep their contents — the command name is a string — and
+/// lose only brackets and separators, so `"invoke(x)"` stops looking like a
+/// call site.
 export function blankNonCode(source) {
     let out = "";
     let i = 0;
-    // Whether a `/` here starts a regex literal or is a division sign is
-    // decided by what came before it — the same rule a JS tokeniser uses.
+    // A `/` starts a regex or is division depending on what came before it.
     let prevSignificant = "";
     const blank = (text) => text.replace(/[^\n]/g, " ");
 
@@ -128,39 +94,22 @@ export function blankNonCode(source) {
 }
 
 /// A `/` starts a regex literal when the previous significant character cannot
-/// end an expression. Deliberately conservative: over-reading a division as a
-/// regex would blank real code, so anything that could be a value ends the
-/// expression.
+/// end an expression. Conservative: misreading a division would blank code.
 function startsRegex(prev) {
     if (prev === "") return true;
     return !/[a-zA-Z0-9_$)\]}"'`]/.test(prev);
 }
 
-/// Count the `invoke(` call sites in a source, so a call the scanner *cannot*
-/// read is a loud failure rather than a silent omission.
-///
-/// This exists because the scanner is a regex, and a regex has an accept set
-/// narrower than the language. A call it does not match simply is not checked —
-/// the contract test then passes by having nothing to compare, which is the
-/// failure mode a contract test must not have.
+/// Count the `invoke(` call sites, so a call the scanner *cannot* read fails
+/// loudly instead of passing by having nothing to compare.
 export function countInvokeSites(source) {
     const matches = blankNonCode(source).match(/\binvoke\s*\(/g);
     return matches ? matches.length : 0;
 }
 
-/// Extract `{ command, keys }` for every `invoke(...)` call in `bridge.js`.
-///
-/// Handles the shapes the file actually uses:
-///   invoke("auth_status")
-///   invoke("mark_read", { id })
-///   invoke("change_password", { current, new: next })
-///   invoke("party_post", { id, channel: { kind, name } })
-///
-/// The argument object is matched by counting braces rather than with `[^}]`.
-/// The old pattern stopped at the first `}`, so a payload with a nested object
-/// did not match at all and the call was skipped — silently, which for a check
-/// whose entire purpose is catching silent no-ops was the wrong way to fail.
-/// `countInvokeSites` is the backstop: anything this misses is still counted.
+/// Extract `{ command, keys }` for every `invoke(...)` call in `bridge.js`,
+/// including nested payload objects (braces are counted, not `[^}]`).
+/// `countInvokeSites` is the backstop for anything this misses.
 export function parseInvokeCalls(source) {
     const code = blankNonCode(source);
     const calls = [];
@@ -201,15 +150,14 @@ function matchingBrace(source, open) {
     return -1;
 }
 
-/// Split an object literal's body on commas that are not inside a nested
-/// brace, bracket or paren.
-function splitTopLevel(inner) {
+/// Split a list on commas that are not inside a nested bracket pair.
+function splitTopLevel(inner, opens = "{[(", closes = "}])") {
     const parts = [];
     let depth = 0;
     let current = "";
     for (const ch of inner) {
-        if (ch === "{" || ch === "[" || ch === "(") depth++;
-        else if (ch === "}" || ch === "]" || ch === ")") depth--;
+        if (opens.includes(ch)) depth++;
+        else if (closes.includes(ch)) depth--;
         if (ch === "," && depth === 0) {
             parts.push(current);
             current = "";
@@ -224,36 +172,15 @@ function splitTopLevel(inner) {
 /// Extract `{ command, params }` for every `#[tauri::command]` in a Rust source.
 export function parseRustCommands(source) {
     const commands = [];
-    // The `(?:<[^>]*>)?` is load-bearing: commands that open a native dialog are
-    // generic over the runtime (`fn open_file<R: tauri::Runtime>(…)`), and a
-    // pattern that demanded `(` straight after the name skipped every one of
-    // them — which would have made this check quietly pass by not looking at the
-    // six commands most likely to be edited.
+    // `(?:<[^>]*>)?`: dialog commands are generic (`fn open_file<R: Runtime>(…)`).
     const re =
         /#\[tauri::command\][\s\S]*?fn\s+([a-z_0-9]+)\s*(?:<[^>]*>)?\s*(\([\s\S]*?\))\s*->/g;
     let m;
     while ((m = re.exec(source)) !== null) {
         const [, command, paramBlock] = m;
         const params = [];
-        // Strip the outer parens, then take each parameter's name — the text
-        // before the first colon at depth zero.
-        const inner = paramBlock.slice(1, -1);
-        let depth = 0;
-        let current = "";
-        const parts = [];
-        for (const ch of inner) {
-            if (ch === "<" || ch === "(" || ch === "[") depth++;
-            else if (ch === ">" || ch === ")" || ch === "]") depth--;
-            if (ch === "," && depth === 0) {
-                parts.push(current);
-                current = "";
-            } else {
-                current += ch;
-            }
-        }
-        if (current.trim()) parts.push(current);
-
-        for (const part of parts) {
+        // Each parameter's name is the text before its first colon.
+        for (const part of splitTopLevel(paramBlock.slice(1, -1), "<([", ">)]")) {
             const name = part.trim().split(":")[0].trim();
             if (!name) continue;
             if (INJECTED_PARAMS.has(name)) continue;
@@ -264,10 +191,8 @@ export function parseRustCommands(source) {
     return commands;
 }
 
-/// Compare the two sides, returning a list of human-readable problems.
-///
-/// Empty means every invoke call names a command that exists and passes exactly
-/// the keys that command declares.
+/// Compare the two sides: human-readable problems, empty when every call names
+/// an existing command and passes exactly its declared keys.
 export function contractProblems(invokeCalls, rustCommands) {
     const problems = [];
     const byName = new Map(rustCommands.map((c) => [c.command, c]));

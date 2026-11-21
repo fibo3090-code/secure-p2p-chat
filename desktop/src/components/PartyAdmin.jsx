@@ -1,9 +1,8 @@
 // Community governance surfaces: the Drive panel (shared files + quota), the
 // audit log, and the channel-access dialog.
 //
-// Everything here is advisory. The server decides who may do what and refuses
-// anything it disagrees with; hiding a control the caller cannot use is about
-// not offering a button that will be rejected, never about enforcement.
+// Advisory only: the server enforces every rule; hiding a control just avoids
+// offering a button that will be refused.
 import { useMemo, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { cx, Button, Input, Modal } from "./ui.jsx";
@@ -289,14 +288,9 @@ export function FilePermissionsDialog({ server, file, onClose, onSubmit }) {
     [server],
   );
 
-  // Downloading what you cannot see, and sharing what you cannot download, are
-  // not coherent — mirror the server's normalisation so the switches behave.
-  //
-  // The cascade follows the *direction* of the switch the user actually moved.
-  // Re-deriving every rule on each change instead meant the implications fought
-  // each other: turning "See it" off while "Share it on" was set re-enabled
-  // download, which re-enabled view, so the click the user made had no visible
-  // effect at all and the only way to revoke access was to guess the order.
+  // Mirror the server's normalisation (no download without view, no share
+  // without download), cascading in the direction of the switch the user moved:
+  // re-deriving every rule let the implications undo the user's click.
   function toggle(key) {
     setPerms((p) => {
       const next = { ...p, [key]: !p[key] };

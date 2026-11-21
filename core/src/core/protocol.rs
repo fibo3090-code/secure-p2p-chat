@@ -1,11 +1,8 @@
 use super::SignatureScheme;
 use serde::{Deserialize, Serialize};
 
-/// Protocol version for forward compatibility
-///
-/// Version 3: ECDH-first handshake (Encrypted Identity Exchange)
-/// v4 adds the ephemeral-key commitment that makes the SAS sound (audit
-/// CRYPTO-02); v3 peers are still accepted, with a warning.
+/// Protocol version. v3: ECDH-first handshake; v4 adds the ephemeral-key commitment that
+/// makes the SAS sound (audit CRYPTO-02). v3 peers are still accepted, with a warning.
 pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Protocol messages exchanged between peers
@@ -17,12 +14,11 @@ pub enum ProtocolMessage {
     /// Ephemeral X25519 public key for forward secrecy
     EphemeralKey { public_key: Vec<u8> },
 
-    /// Supported signature schemes for negotiation (sent before identity proof)
+    /// Supported signature schemes, sent before the identity proof.
     /// Encoded as: u8 count | [u8 scheme]*
-    /// Allows peers to agree on a common signature scheme (RSA-PSS or Ed25519)
     SupportedSignatureSchemes { schemes: Vec<u8> },
 
-    /// Text message (with sequence number for replay protection)
+    /// Text message
     Text {
         text: String,
         timestamp: u64,
@@ -52,32 +48,24 @@ pub enum ProtocolMessage {
     /// File transfer complete
     FileEnd { seq: u64 },
 
-    /// Abort the in-flight file transfer on this chat. Sent by either side
-    /// (sender or receiver) to cancel; the peer stops sending / discards the
-    /// partial file. Shares the per-session replay-protected sequence space.
+    /// Abort the in-flight file transfer on this chat; sent by either side.
     FileCancel { seq: u64 },
 
     /// Keep-alive ping
     Ping { seq: u64 },
 
-    /// Typing indicator - user started typing
+    /// Typing indicator: started
     TypingStart { seq: u64 },
 
-    /// Typing indicator - user stopped typing
+    /// Typing indicator: stopped
     TypingStop { seq: u64 },
 
-    /// Session key rotation (rekeying) - contains random nonce for next key derivation
-    /// After receiving this message, peers independently derive the next session key using:
-    /// next_key = rekey_session_key(current_key, nonce)
-    /// All subsequent messages use the new key.
+    /// Session key rotation: both peers derive the next key as
+    /// `rekey_session_key(current_key, nonce)` and use it for all later frames.
     Rekey { nonce: Vec<u8>, seq: u64 },
 
-    /// Delivery receipt: acknowledges that the frame the peer sent with
-    /// transport sequence `acked_seq` was received and processed (a text
-    /// message recorded, a file finalized). `seq` is this frame's own
-    /// transport sequence, stamped by the session loop like every other
-    /// message. Peers that predate this variant simply drop the frame
-    /// (unknown tag) — sequence gaps are tolerated, so nothing breaks.
+    /// Delivery receipt for the peer's frame with transport sequence `acked_seq`; `seq`
+    /// is this frame's own. Older peers drop the unknown tag (seq gaps are tolerated).
     Ack { acked_seq: u64, seq: u64 },
 }
 
@@ -151,95 +139,56 @@ impl std::fmt::Debug for ProtocolMessage {
     }
 }
 
-/// Identity Proof for Encrypted Handshake (Protocol v3)
-/// Sent inside the encrypted tunnel to prove identity.
+/// Identity proof, sent inside the encrypted tunnel.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IdentityProof {
-    /// Public Key PEM (Identity) - currently only RSA
-    /// Future: could support PEM-encoded Ed25519 keys
+    /// Identity public key PEM (RSA)
     pub public_key_pem: String,
-    /// Signature of the Ephemeral Public Key used in this session
-    /// Signed by the Identity Private Key.
-    /// Format: Sign(SHA256("IDENTITY_PROOF" || ephemeral_pubkey))
+    /// Signature over SHA256("IDENTITY_PROOF" || ephemeral_pubkey) by the identity key
     pub signature: Vec<u8>,
-    /// Protocol Version
     pub version: u32,
-    /// Chat ID (optional here, or separate message)
     pub chat_id: uuid::Uuid,
-    /// Signature scheme used (RSA-PSS or Ed25519)
-    /// Default: RSA-PSS for v3.0 compatibility
+    /// Signature scheme used; defaults to RSA-PSS for v3.0 compatibility.
     ///
-    /// ⚠️ Do **not** add fields to this struct expecting `#[serde(default)]` to
-    /// keep it readable by older peers. bincode is not self-describing: it
-    /// decodes positionally, so a peer built before the new field runs off the
-    /// end of the buffer and the handshake dies with "unexpected end of file".
-    /// Scheme-specific material belongs inside [`Self::signature`], whose
-    /// meaning already depends on `signature_scheme` — see [`Ed25519Proof`].
+    /// ⚠️ Never add fields here expecting `#[serde(default)]` to keep older peers
+    /// reading it: bincode decodes positionally and they fail with "unexpected end of
+    /// file". Scheme-specific material belongs inside [`Self::signature`] (see
+    /// [`Ed25519Proof`]).
     #[serde(default = "default_signature_scheme")]
     pub signature_scheme: SignatureScheme,
 }
 
-/// What [`IdentityProof::signature`] carries when the negotiated scheme is
-/// Ed25519: the signature itself, the subkey that made it, and that subkey's
-/// binding to the RSA identity in `public_key_pem`.
-///
-/// Packed into the existing `signature` field rather than added as new struct
-/// fields, so `IdentityProof` stays byte-identical on the wire for peers that
-/// only speak RSA-PSS. They never negotiate Ed25519, so they never have to
-/// parse this.
+/// What [`IdentityProof::signature`] carries under Ed25519: the signature, the subkey that
+/// made it, and that subkey's binding to the RSA identity. Packed into `signature` so
+/// `IdentityProof` stays byte-identical for RSA-PSS-only peers.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Ed25519Proof {
     /// Ed25519 signature over the identity-proof digest (64 bytes).
     pub signature: Vec<u8>,
     /// The Ed25519 signing subkey (32 bytes).
     pub public: Vec<u8>,
-    /// RSA-PSS signature by the identity over the subkey.
-    ///
-    /// Without it the subkey proves only that somebody holds *some* Ed25519
-    /// key, which is not an identity: an attacker replaying a victim's
-    /// `public_key_pem` could sign with a key of their own choosing.
+    /// RSA-PSS signature by the identity over the subkey; without it the subkey is not
+    /// an identity and a replayed `public_key_pem` could pair with any signing key.
     pub binding: Vec<u8>,
 }
 
-/// Default signature scheme for backward compatibility
 fn default_signature_scheme() -> SignatureScheme {
     SignatureScheme::RsaPss
 }
 
-/// The longest a decimal `u64` can be, which is every number any legacy arm
-/// parses. The legacy arms used to hand the whole remainder of the frame to
-/// `String::from_utf8_lossy` before parsing it, so `PING:` followed by 8 MiB of
-/// `0xFF` allocated ~24 MiB (one replacement character is three bytes) before
-/// the parse could reject it. Bounding the slice first makes the allocation
-/// proportional to what a valid frame could contain.
+/// The longest decimal `u64`, which bounds every legacy numeric field before it is
+/// decoded (so `PING:` plus 8 MiB of junk cannot allocate before the parse fails).
 const MAX_LEGACY_NUMBER_BYTES: usize = 20;
 
-/// Decode a peer-supplied field as UTF-8, or refuse the frame.
-///
-/// `String::from_utf8_lossy` was the wrong tool here twice over.
-///
-/// It **expands**: every invalid byte becomes U+FFFD, three bytes for one. Every
-/// cap in this decoder counts wire bytes, so a 64 KiB `Text` frame of invalid
-/// UTF-8 decoded to 192 KiB, and the 512-chunk ceiling that documents a ~24 MiB
-/// message actually admitted ~72 MiB into the reassembler.
-///
-/// It also **alters**: distinct byte strings collapse onto the same `String`, so
-/// the decoder accepted frames its own encoder could not reproduce — re-encoding
-/// one produced different bytes and, past the cap, a frame that no longer
-/// parsed. A codec whose accept set is wider than its output set has states in
-/// it that nothing downstream was written for.
-///
-/// Refusing is safe: every one of these fields is produced by
-/// [`ProtocolMessage::to_plain_bytes`] from a Rust `String`, so a conforming
-/// peer never sends anything this rejects.
+/// Decode a peer-supplied field as UTF-8, or refuse the frame. Never lossily: every cap
+/// here counts wire bytes and U+FFFD triples each invalid byte, and lossy decoding
+/// accepted frames the encoder cannot reproduce. A conforming peer only ever sends
+/// UTF-8 (every field comes from a Rust `String`).
 fn decode_text(b: &[u8]) -> Option<&str> {
     std::str::from_utf8(b).ok()
 }
 
-/// Decode a legacy arm's trailing field, which is always a decimal number.
-///
-/// Bounded before it is decoded: the parse would reject a long slice anyway, but
-/// only after the whole thing had been turned into a `String`.
+/// Decode a legacy arm's trailing decimal field, bounded before it is decoded.
 fn decode_number_field(b: &[u8]) -> Option<&str> {
     if b.len() > MAX_LEGACY_NUMBER_BYTES {
         return None;
@@ -247,13 +196,9 @@ fn decode_number_field(b: &[u8]) -> Option<&str> {
     decode_text(b)
 }
 
-/// A bounds-checked cursor over one binary frame.
-///
-/// Every read either yields exactly the bytes asked for or `None` — it never
-/// panics and never reads past the end — so a decoder arm is a straight line of
-/// `?`s instead of a running offset checked against `b.len()` by hand before
-/// every field. Trailing bytes after the last field are left unread, as they
-/// always were: the tagged format has never rejected them.
+/// A bounds-checked cursor over one binary frame: every read yields exactly the bytes
+/// asked for or `None`, never panics. Trailing bytes after the last field are left
+/// unread, as the tagged format always has.
 struct Reader<'a> {
     rest: &'a [u8],
 }
@@ -288,9 +233,8 @@ impl<'a> Reader<'a> {
         self.array().map(u64::from_be_bytes)
     }
 
-    /// A `u32` length prefix and the body it announces. The length is checked
-    /// against `allowed` *before* the body is sliced, so a hostile prefix is
-    /// refused without its claimed size ever mattering.
+    /// A `u32` length prefix and the body it announces; the length is checked against
+    /// `allowed` before the body is sliced.
     fn len_prefixed(&mut self, allowed: std::ops::RangeInclusive<usize>) -> Option<&'a [u8]> {
         let len = self.u32()? as usize;
         if !allowed.contains(&len) {
@@ -300,8 +244,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Append `bytes` behind a big-endian `u32` length prefix — the encoder half of
-/// [`Reader::len_prefixed`].
+/// Append `bytes` behind a big-endian `u32` length prefix (encoder half of
+/// [`Reader::len_prefixed`]).
 fn put_len_prefixed(v: &mut Vec<u8>, bytes: &[u8]) {
     v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     v.extend_from_slice(bytes);
@@ -313,8 +257,7 @@ fn legacy_number<T: std::str::FromStr>(field: &[u8]) -> Option<T> {
 }
 
 impl ProtocolMessage {
-    /// The transport sequence number, for every variant that carries one.
-    /// Handshake-only variants have none.
+    /// The transport sequence number; handshake-only variants have none.
     pub fn seq(&self) -> Option<u64> {
         match self {
             Self::Text { seq, .. }
@@ -334,12 +277,8 @@ impl ProtocolMessage {
         }
     }
 
-    /// Overwrite the transport sequence number on variants that carry one.
-    ///
-    /// The session message loop owns a single monotonic outgoing counter and
-    /// stamps it onto every frame it sends (application messages *and* `Rekey`),
-    /// so the receiver's replay check sees one strictly-increasing stream.
-    /// Handshake-only variants have no sequence number and are left unchanged.
+    /// Overwrite the transport sequence number on variants that carry one. The message
+    /// loop stamps one monotonic counter onto every frame it sends (`Rekey` included).
     pub fn set_seq(&mut self, new_seq: u64) {
         match self {
             Self::Text { seq, .. }
@@ -359,29 +298,24 @@ impl ProtocolMessage {
         }
     }
 
-    /// Convert message to plain bytes (binary tagged format)
+    /// Encode as `[type: u8][payload...]`, with big-endian integers and length-prefixed
+    /// blobs.
     pub fn to_plain_bytes(&self) -> Vec<u8> {
-        // Binary tagged format:
-        // [type: u8][payload...]
-        // Multi-field payloads use big-endian integers and length-prefixed blobs.
         let mut v = Vec::new();
         match self {
             Self::Version { version } => {
                 v.push(0u8);
                 v.push(*version);
             }
-
             Self::EphemeralKey { public_key } => {
                 v.push(1u8);
                 put_len_prefixed(&mut v, public_key);
             }
-
             Self::SupportedSignatureSchemes { schemes } => {
                 v.push(9u8);
                 v.push(schemes.len() as u8);
                 v.extend_from_slice(schemes);
             }
-
             Self::Text {
                 text,
                 timestamp,
@@ -392,7 +326,6 @@ impl ProtocolMessage {
                 v.extend_from_slice(&timestamp.to_be_bytes());
                 put_len_prefixed(&mut v, text.as_bytes());
             }
-
             Self::TextChunk {
                 message_id,
                 chunk_index,
@@ -409,7 +342,6 @@ impl ProtocolMessage {
                 v.extend_from_slice(&total_chunks.to_be_bytes());
                 put_len_prefixed(&mut v, text_part.as_bytes());
             }
-
             Self::FileMeta {
                 filename,
                 size,
@@ -420,44 +352,36 @@ impl ProtocolMessage {
                 v.extend_from_slice(&size.to_be_bytes());
                 put_len_prefixed(&mut v, filename.as_bytes());
             }
-
             Self::FileChunk { chunk, seq } => {
                 v.push(4u8);
                 v.extend_from_slice(&seq.to_be_bytes());
                 put_len_prefixed(&mut v, chunk);
             }
-
             Self::FileEnd { seq } => {
                 v.push(5u8);
                 v.extend_from_slice(&seq.to_be_bytes());
             }
-
             Self::FileCancel { seq } => {
                 v.push(12u8);
                 v.extend_from_slice(&seq.to_be_bytes());
             }
-
             Self::Ping { seq } => {
                 v.push(6u8);
                 v.extend_from_slice(&seq.to_be_bytes());
             }
-
             Self::TypingStart { seq } => {
                 v.push(7u8);
                 v.extend_from_slice(&seq.to_be_bytes());
             }
-
             Self::TypingStop { seq } => {
                 v.push(8u8);
                 v.extend_from_slice(&seq.to_be_bytes());
             }
-
             Self::Rekey { nonce, seq } => {
                 v.push(10u8);
                 v.extend_from_slice(&seq.to_be_bytes());
                 put_len_prefixed(&mut v, nonce);
             }
-
             Self::Ack { acked_seq, seq } => {
                 v.push(13u8);
                 v.extend_from_slice(&seq.to_be_bytes());
@@ -467,19 +391,17 @@ impl ProtocolMessage {
         v
     }
 
-    /// Parse message from plain bytes; supports new binary tagged format and falls back to legacy ASCII prefixes.
+    /// Parse the binary tagged format, falling back to the legacy ASCII prefixes.
     pub fn from_plain_bytes(b: &[u8]) -> Option<Self> {
-        // First attempt binary tagged format
         if let Some(bin) = Self::from_binary_tagged(b) {
             return Some(bin);
         }
-        // Fallback: legacy ASCII-prefixed format for compatibility with tests
-        // and older peers. Kept limited and defensive to avoid DoS or injection.
+        // Legacy ASCII format for older peers and tests; kept limited and defensive.
         Self::from_legacy_ascii(b)
     }
 
-    /// The pre-binary ASCII format. Every prefix is distinct and none is a
-    /// prefix of another, so the first match decides the frame.
+    /// The pre-binary ASCII format. No prefix is a prefix of another, so the first match
+    /// decides the frame.
     fn from_legacy_ascii(b: &[u8]) -> Option<Self> {
         if let Some(rest) = b.strip_prefix(b"VERSION:") {
             return legacy_number(rest).map(|version| Self::Version { version });
@@ -507,9 +429,7 @@ impl ProtocolMessage {
         }
 
         if let Some(rest) = b.strip_prefix(b"FILE_META|") {
-            // The filename is kept, so this arm cannot be lossy either — see the
-            // note on `decode_text`. It was the one legacy arm that retained the
-            // string it decoded.
+            // The filename is kept, so it is decoded strictly (see `decode_text`).
             let mut parts = decode_text(rest)?.splitn(3, '|');
             let (seq, raw_filename, size) = (parts.next()?, parts.next()?, parts.next()?);
             let seq = seq.parse::<u64>().ok()?;
@@ -589,9 +509,8 @@ impl ProtocolMessage {
                 let timestamp = r.u64()?;
                 let chunk_index = r.u32()?;
                 let total_chunks = r.u32()?;
-                // Reject a huge `total_chunks` here: the reassembler allocates one
-                // slot per chunk up front, so an unbounded value is a remote-OOM
-                // vector. A capped, non-zero, in-range index is required.
+                // The reassembler allocates one slot per chunk up front, so cap
+                // `total_chunks` (remote-OOM guard) and require an in-range index.
                 if total_chunks == 0
                     || total_chunks > crate::MAX_TEXT_CHUNKS
                     || chunk_index >= total_chunks
@@ -635,7 +554,7 @@ impl ProtocolMessage {
             8 => Self::TypingStop { seq: r.u64()? },
             10 => {
                 let seq = r.u64()?;
-                // At least 16 bytes for sufficient entropy, at most 256.
+                // At least 16 bytes of entropy, at most 256.
                 let nonce = r.len_prefixed(16..=256)?.to_vec();
                 Self::Rekey { nonce, seq }
             }
@@ -655,12 +574,33 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    /// Encode then decode must yield an identical message for every variant.
+    fn decode(msg: &ProtocolMessage) -> Option<ProtocolMessage> {
+        ProtocolMessage::from_plain_bytes(&msg.to_plain_bytes())
+    }
+
+    /// Encode then decode must yield an identical message.
     fn assert_roundtrip(msg: ProtocolMessage) {
-        let bytes = msg.to_plain_bytes();
-        let decoded = ProtocolMessage::from_plain_bytes(&bytes)
-            .unwrap_or_else(|| panic!("decode failed for {:?}", msg));
+        let decoded = decode(&msg).unwrap_or_else(|| panic!("decode failed for {:?}", msg));
         assert_eq!(decoded, msg, "round-trip mismatch for {:?}", msg);
+    }
+
+    fn text_chunk(chunk_index: u32, total_chunks: u32, text_part: String) -> ProtocolMessage {
+        ProtocolMessage::TextChunk {
+            message_id: Uuid::nil(),
+            chunk_index,
+            total_chunks,
+            text_part,
+            timestamp: 1,
+            seq: 1,
+        }
+    }
+
+    fn file_meta(filename: &str, size: u64) -> ProtocolMessage {
+        ProtocolMessage::FileMeta {
+            filename: filename.to_string(),
+            size,
+            seq: 1,
+        }
     }
 
     #[test]
@@ -688,11 +628,7 @@ mod tests {
             timestamp: 123,
             seq: 9,
         });
-        assert_roundtrip(ProtocolMessage::FileMeta {
-            filename: "report.pdf".to_string(),
-            size: 1024,
-            seq: 1,
-        });
+        assert_roundtrip(file_meta("report.pdf", 1024));
         assert_roundtrip(ProtocolMessage::FileChunk {
             chunk: vec![1, 2, 3, 4, 5],
             seq: 2,
@@ -714,7 +650,6 @@ mod tests {
 
     #[test]
     fn roundtrip_edge_values() {
-        // Empty and unicode text.
         assert_roundtrip(ProtocolMessage::Text {
             text: String::new(),
             timestamp: 0,
@@ -725,7 +660,6 @@ mod tests {
             timestamp: u64::MAX,
             seq: u64::MAX,
         });
-        // Empty file chunk and a max-size chunk.
         assert_roundtrip(ProtocolMessage::FileChunk {
             chunk: Vec::new(),
             seq: 1,
@@ -734,32 +668,13 @@ mod tests {
             chunk: vec![0xCD; crate::FILE_CHUNK_SIZE],
             seq: 2,
         });
-        // Largest permitted text chunk part.
-        assert_roundtrip(ProtocolMessage::TextChunk {
-            message_id: Uuid::nil(),
-            chunk_index: 0,
-            total_chunks: 1,
-            text_part: "x".repeat(crate::TEXT_CHUNK_BYTES),
-            timestamp: 1,
-            seq: 1,
-        });
-        // File at exactly the maximum allowed size.
-        assert_roundtrip(ProtocolMessage::FileMeta {
-            filename: "big.bin".to_string(),
-            size: crate::MAX_FILE_SIZE,
-            seq: 1,
-        });
+        assert_roundtrip(text_chunk(0, 1, "x".repeat(crate::TEXT_CHUNK_BYTES)));
+        assert_roundtrip(file_meta("big.bin", crate::MAX_FILE_SIZE));
     }
 
     #[test]
     fn filemeta_sanitizes_path_traversal_on_decode() {
-        let msg = ProtocolMessage::FileMeta {
-            filename: "../../etc/passwd".to_string(),
-            size: 10,
-            seq: 1,
-        };
-        let decoded = ProtocolMessage::from_plain_bytes(&msg.to_plain_bytes()).unwrap();
-        match decoded {
+        match decode(&file_meta("../../etc/passwd", 10)).unwrap() {
             ProtocolMessage::FileMeta { filename, .. } => {
                 assert!(!filename.contains(".."));
                 assert!(!filename.contains('/'));
@@ -770,102 +685,45 @@ mod tests {
 
     #[test]
     fn malformed_inputs_return_none() {
-        // Empty buffer.
-        assert!(ProtocolMessage::from_plain_bytes(&[]).is_none());
-        // Truncated Text (tag present, missing length-prefixed payload).
-        assert!(ProtocolMessage::from_plain_bytes(&[2u8, 0, 0]).is_none());
-        // Unknown tag with no legacy prefix.
-        assert!(ProtocolMessage::from_plain_bytes(&[200u8, 1, 2, 3]).is_none());
-        // Truncated FileEnd (needs 8 bytes of seq).
-        assert!(ProtocolMessage::from_plain_bytes(&[5u8, 0, 0]).is_none());
-        // Truncated Ack (needs 8 bytes of seq + 8 bytes of acked_seq).
-        assert!(ProtocolMessage::from_plain_bytes(&[13u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        for frame in [
+            &[][..],
+            &[2u8, 0, 0],                       // Text missing its payload
+            &[200u8, 1, 2, 3],                  // unknown tag, no legacy prefix
+            &[5u8, 0, 0],                       // FileEnd needs 8 bytes of seq
+            &[13u8, 0, 0, 0, 0, 0, 0, 0, 0, 0], // Ack needs seq + acked_seq
+        ] {
+            assert!(
+                ProtocolMessage::from_plain_bytes(frame).is_none(),
+                "{frame:?}"
+            );
+        }
     }
 
     #[test]
     fn oversized_payloads_are_rejected() {
-        // FileMeta with size above MAX_FILE_SIZE must not decode.
-        let bad = ProtocolMessage::FileMeta {
-            filename: "x".to_string(),
-            size: crate::MAX_FILE_SIZE + 1,
-            seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&bad.to_plain_bytes()).is_none());
-
-        // FileChunk larger than FILE_CHUNK_SIZE must not decode.
-        let bad_chunk = ProtocolMessage::FileChunk {
+        assert!(decode(&file_meta("x", crate::MAX_FILE_SIZE + 1)).is_none());
+        assert!(decode(&ProtocolMessage::FileChunk {
             chunk: vec![0u8; crate::FILE_CHUNK_SIZE + 1],
             seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&bad_chunk.to_plain_bytes()).is_none());
-
-        // EphemeralKey longer than the 256-byte cap must not decode.
-        let bad_eph = ProtocolMessage::EphemeralKey {
+        })
+        .is_none());
+        // EphemeralKey over the 256-byte cap.
+        assert!(decode(&ProtocolMessage::EphemeralKey {
             public_key: vec![0u8; 300],
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&bad_eph.to_plain_bytes()).is_none());
+        })
+        .is_none());
     }
 
+    /// `total_chunks` must be non-zero and capped (it sizes the reassembly buffer, so
+    /// `u32::MAX` was a remote-OOM vector), and the index in range.
     #[test]
     fn textchunk_invariants_enforced_on_decode() {
-        // total_chunks == 0 is invalid.
-        let zero_total = ProtocolMessage::TextChunk {
-            message_id: Uuid::nil(),
-            chunk_index: 0,
-            total_chunks: 0,
-            text_part: "x".to_string(),
-            timestamp: 1,
-            seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&zero_total.to_plain_bytes()).is_none());
-
-        // chunk_index >= total_chunks is invalid.
-        let oob = ProtocolMessage::TextChunk {
-            message_id: Uuid::nil(),
-            chunk_index: 3,
-            total_chunks: 3,
-            text_part: "x".to_string(),
-            timestamp: 1,
-            seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&oob.to_plain_bytes()).is_none());
-    }
-
-    #[test]
-    fn textchunk_total_chunks_cap_enforced_on_decode() {
-        // A frame whose total_chunks exceeds the cap must be rejected before it
-        // can drive a giant reassembly-buffer allocation (remote-OOM guard).
-        let over = ProtocolMessage::TextChunk {
-            message_id: Uuid::nil(),
-            chunk_index: 0,
-            total_chunks: crate::MAX_TEXT_CHUNKS + 1,
-            text_part: "x".to_string(),
-            timestamp: 1,
-            seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&over.to_plain_bytes()).is_none());
-
-        // The exact cap is still allowed.
-        let at_cap = ProtocolMessage::TextChunk {
-            message_id: Uuid::nil(),
-            chunk_index: 0,
-            total_chunks: crate::MAX_TEXT_CHUNKS,
-            text_part: "x".to_string(),
-            timestamp: 1,
-            seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&at_cap.to_plain_bytes()).is_some());
-
-        // A pathological u32::MAX (the original OOM vector) is rejected.
-        let huge = ProtocolMessage::TextChunk {
-            message_id: Uuid::nil(),
-            chunk_index: 0,
-            total_chunks: u32::MAX,
-            text_part: "x".to_string(),
-            timestamp: 1,
-            seq: 1,
-        };
-        assert!(ProtocolMessage::from_plain_bytes(&huge.to_plain_bytes()).is_none());
+        let x = || "x".to_string();
+        assert!(decode(&text_chunk(0, 0, x())).is_none());
+        assert!(decode(&text_chunk(3, 3, x())).is_none());
+        assert!(decode(&text_chunk(0, crate::MAX_TEXT_CHUNKS + 1, x())).is_none());
+        assert!(decode(&text_chunk(0, u32::MAX, x())).is_none());
+        assert!(decode(&text_chunk(0, crate::MAX_TEXT_CHUNKS, x())).is_some());
     }
 
     #[test]
