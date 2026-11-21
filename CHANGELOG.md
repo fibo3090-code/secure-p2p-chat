@@ -13,6 +13,11 @@ predate tagged releases.
 
 ### Fixed
 
+- Hosting behind a double or carrier-grade NAT left the router forwarding the
+  port to this machine for an hour, although the mapping was rejected as
+  unreachable: the router was asked for the forward before its external
+  address was checked. It is checked first now, and a network with no NAT-PMP
+  gateway is detected in about 3 seconds instead of 15.
 - A session dropped with "Decryption failed" when both people sent at once
   — chatting or transferring files in both directions — at a key rotation.
   The host could start a second rotation before the peer had switched to the
