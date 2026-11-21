@@ -282,6 +282,22 @@ impl TransferStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRole {
+    Host,
+    Client,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionStatus {
+    Connecting,
+    Handshaking,
+    FingerprintPending,
+    Active,
+    Disconnected,
+    Error(String),
+}
+
 /// Events sent from a network session to the app.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
