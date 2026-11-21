@@ -72,6 +72,8 @@ struct Harness {
     _app: tauri::App<tauri::test::MockRuntime>,
     webview: tauri::WebviewWindow<tauri::test::MockRuntime>,
     _dir: tempfile::TempDir,
+    /// The poll loop's memory of which prompt it last published.
+    last_prompt: std::cell::RefCell<Option<uuid::Uuid>>,
 }
 
 fn harness_with(bridge: Bridge, dir: tempfile::TempDir) -> Harness {
@@ -87,6 +89,7 @@ fn harness_with(bridge: Bridge, dir: tempfile::TempDir) -> Harness {
         _app: app,
         webview,
         _dir: dir,
+        last_prompt: std::cell::RefCell::new(None),
     }
 }
 
@@ -1630,4 +1633,238 @@ fn start_up_resolves_the_data_dir_and_the_auth_state() {
     assert!(crate::lock_identity(&bridge.identity).is_locked());
     let h = harness_with(bridge, existing);
     assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+}
+
+// ── Backups and diagnostics ─────────────────────────────────────────────────
+
+/// The identity backup is the encrypted file itself, byte for byte (so it is
+/// as safe as the original and opens with the same password), and making one
+/// is recorded and persisted — the app nags about a missing backup from that
+/// record, so it must survive a restart.
+#[test]
+fn an_identity_backup_is_the_encrypted_file_and_is_recorded() {
+    let h = ready_harness();
+    let dest = h._dir.path().join("backup.json");
+    tauri::async_runtime::block_on(crate::commands::auth::backup_identity_to(
+        &h.bridge(),
+        &dest,
+    ))
+    .expect("backup");
+    let original = std::fs::read(h._dir.path().join("identity.json")).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), original);
+    let mut restored = Identity::load(&dest).unwrap();
+    assert!(restored.is_locked());
+    restored
+        .decrypt("bridge-test-passphrase")
+        .expect("the backup opens with the password");
+
+    let key = crate::lock_identity(&h.bridge().identity)
+        .history_key()
+        .unwrap();
+    let saved = p2pem_classic::app::persistence::HistoryFile::load_encrypted(
+        &h.bridge_history_path(),
+        &key,
+    )
+    .expect("the record was persisted");
+    assert!(saved.config.identity_backed_up_at.is_some());
+}
+
+/// A desktop diagnostics bundle is support metadata only: it lands in the
+/// data directory and carries no message text, no peer fingerprint, no
+/// private key, and only a prefix of the user's own fingerprint.
+#[test]
+fn the_desktop_diagnostics_bundle_carries_no_secrets() {
+    let h = ready_harness();
+    let chat = h.seed_chat_with_incoming("Peer", 1);
+    let peer_fp = "ef".repeat(32);
+    let manager = h.bridge().manager.clone();
+    tauri::async_runtime::block_on(async {
+        let mut m = manager.lock().await;
+        let c = m.get_chat_mut(chat).unwrap();
+        c.peer_fingerprint = Some(peer_fp.clone());
+        c.messages.push(messenger_core::types::Message {
+            id: uuid::Uuid::new_v4(),
+            from_me: true,
+            content: messenger_core::types::MessageContent::Text {
+                text: "the secret text".into(),
+            },
+            timestamp: chrono::Utc::now(),
+            delivered: true,
+        });
+    });
+    let bundle = h.ipc("export_diagnostics", json!({})).expect("export");
+    let bundle = std::path::PathBuf::from(bundle.as_str().unwrap());
+    assert!(bundle.starts_with(h._dir.path().join("diagnostics")));
+    let mut everything = String::new();
+    for f in std::fs::read_dir(&bundle).unwrap().flatten() {
+        everything.push_str(&std::fs::read_to_string(f.path()).unwrap());
+    }
+    let own_fp = crate::lock_identity(&h.bridge().identity)
+        .fingerprint
+        .clone();
+    for secret in [
+        "the secret text",
+        peer_fp.as_str(),
+        own_fp.as_str(),
+        "PRIVATE KEY",
+    ] {
+        assert!(
+            !everything.contains(secret),
+            "the bundle leaked {secret:.24}…"
+        );
+    }
+    assert!(
+        everything.contains(&own_fp[..16]),
+        "the fingerprint prefix support needs is missing"
+    );
+}
+
+// ── The core flow, over IPC ─────────────────────────────────────────────────
+
+impl Harness {
+    /// One poll-loop tick for the P2P side: drain session events, then
+    /// publish the head fingerprint prompt the way the loop does.
+    fn tick(&self) {
+        let ctx = crate::PollContext::from_bridge(&self.bridge());
+        let manager = self.bridge().manager.clone();
+        let prompt = tauri::async_runtime::block_on(async move {
+            let mut m = manager.lock().await;
+            m.poll_session_events();
+            m.pending_fingerprint().cloned()
+        });
+        let handle = self._app.handle().clone();
+        ctx.publish_fingerprint_prompt(&handle, prompt, &mut self.last_prompt.borrow_mut());
+    }
+}
+
+fn tick_both(
+    a: &Harness,
+    b: &Harness,
+    label: &str,
+    mut done: impl FnMut(&Harness, &Harness) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        a.tick();
+        b.tick();
+        if done(a, b) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "[{label}] timed out");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn texts_from_peer(h: &Harness, id: &str) -> Vec<String> {
+    h.ipc("get_conversation", json!({ "id": id })).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["from_me"] == false)
+        .filter_map(|m| {
+            m.pointer("/content/text")
+                .and_then(|t| t.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The desktop app's central path, through the commands the webview calls:
+/// host, dial, both safety-code prompts answered, a message sent and
+/// received, and the sender's copy marked delivered by the peer's receipt.
+/// Everything else in this file checks commands one at a time.
+#[test]
+fn two_desktop_apps_connect_verify_and_exchange_a_message() {
+    let host = ready_harness();
+    let client = ready_harness();
+
+    host.ipc_binds("start_host", json!({ "port": 0, "password": null }))
+        .expect("host");
+    let manager = host.bridge().manager.clone();
+    let port = tauri::async_runtime::block_on(async move { manager.lock().await.hosting_port })
+        .expect("hosting");
+    client
+        .ipc_binds(
+            "connect_peer",
+            json!({ "host": "127.0.0.1", "port": port, "password": null }),
+        )
+        .expect("dial");
+
+    tick_both(&host, &client, "both prompted", |h, c| {
+        !h.ipc("pending_fingerprint", json!({})).unwrap().is_null()
+            && !c.ipc("pending_fingerprint", json!({})).unwrap().is_null()
+    });
+    for h in [&host, &client] {
+        let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+        assert_eq!(
+            prompt["sas"].as_str().unwrap().len() > 0,
+            true,
+            "no safety code shown"
+        );
+        h.ipc_binds(
+            "confirm_fingerprint",
+            json!({ "id": prompt["chat_id"], "accept": true }),
+        )
+        .expect("accept");
+    }
+    let connected = |h: &Harness| -> Option<String> {
+        h.ipc("list_conversations", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["connected"] == true && c["placeholder"] != true)
+            .and_then(|c| c["id"].as_str().map(str::to_owned))
+    };
+    tick_both(&host, &client, "both connected", |h, c| {
+        connected(h).is_some() && connected(c).is_some()
+    });
+    let (host_chat, client_chat) = (connected(&host).unwrap(), connected(&client).unwrap());
+
+    client
+        .ipc_binds(
+            "send_message",
+            json!({ "id": client_chat, "text": "hello desktop" }),
+        )
+        .expect("send");
+    tick_both(&host, &client, "message and receipt", |h, c| {
+        texts_from_peer(h, &host_chat) == ["hello desktop"]
+            && c.ipc("get_conversation", json!({ "id": client_chat }))
+                .unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["from_me"] == true && m["delivered"] == true)
+    });
+}
+
+/// mDNS reveals presence on the LAN, so with the setting off the command
+/// starts no browsing at all and reports no peers; on, it lists what has
+/// been discovered.
+#[test]
+fn nearby_peers_are_not_browsed_unless_the_user_opted_in() {
+    let h = ready_harness();
+    let off = h.ipc("list_discovered_peers", json!({})).unwrap();
+    assert_eq!(off, json!({ "enabled": false, "peers": [] }));
+    assert!(
+        crate::lock_or_recover(&h.bridge().discovery).is_none(),
+        "browsing started while off"
+    );
+
+    let manager = h.bridge().manager.clone();
+    tauri::async_runtime::block_on(async move { manager.lock().await.config.enable_mdns = true });
+    crate::lock_or_recover(&h.bridge().discovered).push(messenger_core::network::DiscoveredPeer {
+        name: "Nearby".into(),
+        address: "192.168.1.7".into(),
+        port: 12345,
+        fingerprint: None,
+        fullname: "Nearby._p2p-messenger._tcp.local.".into(),
+    });
+    let on = h.ipc("list_discovered_peers", json!({})).unwrap();
+    assert_eq!(on["enabled"], true);
+    assert!(on["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "Nearby" && p["port"] == 12345));
 }

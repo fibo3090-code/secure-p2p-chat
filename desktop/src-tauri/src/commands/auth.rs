@@ -336,7 +336,18 @@ pub(crate) async fn export_identity<R: tauri::Runtime>(
     let Some(dest) = picked else {
         return Ok(None); // cancelled
     };
-    tokio::fs::copy(&source, &dest)
+    backup_identity_to(&state, &dest).await?;
+    Ok(Some(dest.display().to_string()))
+}
+
+/// Copy the (encrypted) identity file to `dest` and record that a backup
+/// exists, persisting that. The half of [`export_identity`] behind its save
+/// dialog, split out so it is testable without one.
+pub(crate) async fn backup_identity_to(
+    state: &Bridge,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    tokio::fs::copy(&state.identity_path, dest)
         .await
         .map_err(|e| format!("Backup failed: {e}"))?;
     // Record that a backup exists so the app can stop nagging — and, more
@@ -346,7 +357,7 @@ pub(crate) async fn export_identity<R: tauri::Runtime>(
         mgr.config.identity_backed_up_at = Some(chrono::Utc::now().to_rfc3339());
     }
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
-    Ok(Some(dest.display().to_string()))
+    Ok(())
 }
 
 /// Export a support bundle (state metadata + config, never key material) to
