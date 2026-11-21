@@ -107,7 +107,7 @@ prioritised view is in [README.md](README.md).
 | NET-05 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | Unauthenticated peers can create unlimited TOFU prompts, 30-minute sessions and junk conversations |
 | NET-06 | Medium | Fixed | S | [02-network](reports/02-network.md) | A relay host that disconnects while waiting keeps its token slot for the full 5 minutes |
 | NET-07 | Medium | Fixed | S | [02-network](reports/02-network.md) | No per-address cap on pending rendezvous slots; a few IPs can fill the global table |
-| NET-08 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | The punch hello tag is sent before the peer proves anything, so any stranger can reflect it and claim the punched socket |
+| NET-08 | Medium | Fixed | S | [02-network](reports/02-network.md) | The punch hello tag is sent before the peer proves anything, so any stranger can reflect it and claim the punched socket |
 | NET-09 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | The relay control channel is cleartext: token, LAN IPs and pairing are visible and spoofable on path |
 | NET-10 | Medium | Fixed | S/M | [02-network](reports/02-network.md) | Confirming the SAS more than 5 minutes apart kills the session |
 | PERF-06 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | Server history is fully resident; paging scans from message 1; startup re-parses everything |

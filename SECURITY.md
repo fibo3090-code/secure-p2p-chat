@@ -132,7 +132,8 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   simultaneous open from the reused source port), so most sessions go direct
   and the relay only bridges when punching fails (symmetric NAT, CGNAT,
   filtered networks). The punch hello tag is derived from the rendezvous
-  token and is pairing hygiene only — authentication is still the v3
+  token and the sender's role (so a stranger cannot reflect a peer's hello
+  back to claim the punched socket) and is pairing hygiene only — authentication is still the v3
   handshake + TOFU on whichever socket wins. `P2PEM_NO_HOLEPUNCH=1` forces
   the bridged path. Punching also reveals each peer's public *and* LAN
   endpoint to the other (the relay already saw both source addresses)

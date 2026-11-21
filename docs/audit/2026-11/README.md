@@ -20,7 +20,7 @@ the area report for whatever you pick up → [findings-index.md](findings-index.
 | Area reports | 13 (+1 external) |
 | Findings | 348 (3 Critical, 43 High, 126 Medium, 143 Low, 33 Info) |
 | Status | ~95 % VERIFIED by tracing the code; the rest SUSPECTED and labelled |
-| Already fixed | CRYPTO-01 and QUAL-01 (see §1); 21 more and 6 in part after the test-suite audit (see §9) |
+| Already fixed | CRYPTO-01 and QUAL-01 (see §1); 22 more and 6 in part after the test-suite audit (see §9) |
 | Not covered | No dynamic testing of installers, native dialogs, real NATs, or Windows/macOS behaviour; nothing here proves the absence of other defects |
 
 The numbers overcount: the same root cause is often reported by several
@@ -239,6 +239,7 @@ unnoticed.
 | NET-06 | The relay did not read a waiting host's stream, so a host that closed (restart, sleep) kept its token for 5 minutes and its own reconnect was refused "already in use". A waiting host sends nothing, so anything readable — EOF above all — now frees the slot. | Failed (returning host refused). | `relay::tests::a_host_that_left_while_waiting_frees_its_token_at_once` |
 | NET-07 | No per-address cap on waiting slots: six addresses could fill the table and lock every honest host out. One address (IPv6 per /64) may hold 8. | Failed (a 9th slot accepted). | `relay::tests::one_address_cannot_hold_more_than_its_share_of_waiting_slots` (also checks a second address is still served) |
 | NET-11 | The connection password was dropped for relay sessions: anyone holding the token reached the safety-code prompt. Both relay session functions now take it and run the same gate as the direct path. | Failed (prompt reached without the password). | `client/tests/it/reconnect.rs::a_connection_password_is_enforced_over_the_relay` |
+| NET-08 | The punch hello carried one token tag for both directions, sent before the peer proved anything: a stranger who reached the host's punch port echoed it back with the role byte flipped and claimed the socket, so the real punch — and the bridge fallback after it — failed. Tags are now bound to the sender's role (hello v2); producing the reply takes the token. A v1 peer is bridged. | Failed (the reflected hello validated). | `punch::tests::a_reflected_hello_does_not_validate`, `two_holders_of_the_token_validate_each_other`; the real punch still wins in `relay_e2e` |
 | UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
 
 ### Partly fixed
@@ -248,16 +249,27 @@ unnoticed.
 | QUAL-19 | One shared client harness; hosts and relays bind port 0 in tests. | `punch.rs` tests still pick a free port and rebind — a hole punch needs a chosen port, so the race is inherent there. No cached RSA test keys (nextest runs a process per test, so a cache would not survive between tests). |
 | TUI-22 | Tests are hermetic. | The TUI still has no data-dir override, so two TUI peers cannot run on one machine. |
 | CRYPTO-17 | Tests for reflected frames, several rekeys with traffic both ways, a malformed identity nonce, and an invite-fingerprint mismatch on first connect (CRYPTO-04). | No test for a peer reusing our own ephemeral key, or for history rollback (CRYPTO-09, still open). |
-| NET-22 | Reflection, crossing rekeys, silent connection in the handshake (already present), stale direct addresses reaching the relay (NET-12), re-registration after a host left (NET-06), the per-address slot cap (NET-07), the password over relay (NET-11), peers confirming far apart (NET-10). | Punch tag replay (NET-08) and split punch verdicts (NET-15) — see below. |
+| NET-22 | Reflection, crossing rekeys, silent connection in the handshake (already present), stale direct addresses reaching the relay (NET-12), re-registration after a host left (NET-06), the per-address slot cap (NET-07), the password over relay (NET-11), peers confirming far apart (NET-10). | Split punch verdicts (NET-15, SUSPECTED) — see below. |
 | TAURI-27 | `open_file` refusal of received executables, `file_preview` (SVG refused, 4 MiB cap), `set_password`/`unlock` on a ready app, `party_join`'s two steps against a real server (pin written only after a real join), the upload size cap and download core behind the native dialogs, `state_signature` sensitivity, save coalescing, prompt publishing, auto-rehost. | The native dialogs themselves (cannot open headless). |
 | UI-37 | UI-03, UI-04, UI-05, UI-08 and UI-11 each have a test (and a fix). | Smoke tests still cover first paint only, not a flow. |
 
 ### Confirmed still open
 
+- **NET-15 (SUSPECTED).** The punch outcome is decided by each client, not the
+  server, so a split verdict over a very slow link (RTT above 3 s) could leave
+  one side on a punched socket and the other bridged to a closed one. Not
+  reproduced: it needs a delay on one direction of the punch exchange, which
+  loopback tests cannot produce without a fault-injecting proxy.
+
 - **CRYPTO-09 (Low, security).** The history file has no rollback protection:
   an older `history.json.enc` loads normally and restores revoked trust and
-  lifted blocks. Fixing it needs a generation counter kept in `identity.json`,
-  a format change rather than a test.
+  lifted blocks. The report's remedy — a generation counter kept in
+  `identity.json` — would not hold against the attacker it is for: anyone able
+  to write the data directory can put back an old `identity.json` with the old
+  history, and the key does not change, so the pair checks out. Real
+  anti-rollback needs a monotonic counter outside that directory (an OS
+  keychain or TPM). Left open on purpose rather than shipped as a protection
+  that only looks like one.
 
 ## Method and limits
 

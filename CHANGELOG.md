@@ -29,6 +29,10 @@ predate tagged releases.
 - Relay server: a host that disconnected while waiting kept its token for five
   minutes, so its own reconnect was refused; and a few addresses could fill
   the rendezvous table and lock every other host out.
+- Hole punching: a stranger who reached a peer's punch port could echo its
+  hello back and take over the connection attempt, so the punch and the relay
+  fallback both failed. The hello tag is now bound to each side's role;
+  peers on the older version are bridged through the relay instead.
 - A damaged `identity.json` (a nonce of the wrong length) crashed the unlock
   instead of reporting an unreadable identity.
 - Desktop: `set_password` on an unlocked app re-protected the identity under

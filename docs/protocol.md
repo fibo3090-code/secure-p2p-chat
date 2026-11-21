@@ -357,9 +357,13 @@ Flow:
    (`SO_REUSEADDR`/`SO_REUSEPORT`; the control connection itself is dialed
    from a reuse-enabled socket), listens on it, and dials every candidate in
    parallel with retries — a TCP simultaneous open. Every established socket
-   is validated by exchanging a 25-byte hello: magic `P2PPNCH1` (8) + role
+   is validated by exchanging a 25-byte hello: magic `P2PPNCH2` (8) + role
    byte (1; host=0, joiner=1; must differ) + tag (16, first 16 bytes of
-   SHA-256 of the token). The host then sends `0xA5` (SELECT) on its chosen
+   `SHA-256("p2pem-punch-v2|" || role byte || "|" || token)`, the **sender's**
+   role). Each side checks the tag for the other role, so a hello echoed back
+   by a stranger who connected first does not validate (v1 sent one tag both
+   ways and could be reflected — audit NET-08). A v1 peer fails on the magic
+   and the pair is bridged. The host then sends `0xA5` (SELECT) on its chosen
    socket and the joiner confirms with `0x5A` (ACK), so both ends provably
    settle on one connection.
 4. Both reports `success: true` → the server drops both control connections;

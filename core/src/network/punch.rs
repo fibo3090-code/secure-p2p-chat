@@ -51,7 +51,9 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(3);
 /// peer-supplied strings relayed by the server).
 pub(crate) const MAX_PUNCH_CANDIDATES: usize = 8;
 
-const HELLO_MAGIC: &[u8; 8] = b"P2PPNCH1";
+// v2: tags are bound to the sender's role (NET-08). A v1 peer fails on the
+// magic and the pair is bridged, as for any failed punch.
+const HELLO_MAGIC: &[u8; 8] = b"P2PPNCH2";
 const TAG_LEN: usize = 16;
 const HELLO_LEN: usize = HELLO_MAGIC.len() + 1 + TAG_LEN;
 const SELECT_BYTE: u8 = 0xA5;
@@ -72,14 +74,50 @@ impl PunchRole {
             PunchRole::Joiner => 1,
         }
     }
+
+    fn other(self) -> Self {
+        match self {
+            PunchRole::Host => PunchRole::Joiner,
+            PunchRole::Joiner => PunchRole::Host,
+        }
+    }
 }
 
-/// Derive the pairing tag exchanged in hello frames from the rendezvous token.
-fn token_tag(token: &str) -> [u8; TAG_LEN] {
-    let digest = Sha256::digest(token.as_bytes());
+/// The pairing tag a side of the rendezvous sends: derived from the token
+/// *and the sender's role*.
+///
+/// One tag for both directions meant the first hello on a socket — which goes
+/// to whoever connected, before they prove anything — was also the right
+/// answer: a stranger reached the host's punch port, echoed its hello back
+/// with the role byte flipped, and claimed the socket (NET-08). With the tag
+/// bound to the role, the host's hello is useless as a reply; producing the
+/// joiner's tag takes the token.
+fn token_tag(token: &str, role: PunchRole) -> [u8; TAG_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"p2pem-punch-v2|");
+    hasher.update([role.byte()]);
+    hasher.update(b"|");
+    hasher.update(token.as_bytes());
+    let digest = hasher.finalize();
     let mut tag = [0u8; TAG_LEN];
     tag.copy_from_slice(&digest[..TAG_LEN]);
     tag
+}
+
+/// The tag this side sends and the one it must receive.
+#[derive(Clone, Copy)]
+struct HelloTags {
+    ours: [u8; TAG_LEN],
+    theirs: [u8; TAG_LEN],
+}
+
+impl HelloTags {
+    fn new(token: &str, role: PunchRole) -> Self {
+        Self {
+            ours: token_tag(token, role),
+            theirs: token_tag(token, role.other()),
+        }
+    }
 }
 
 /// Turn the relay-observed public endpoint plus the peer's self-reported LAN
@@ -130,7 +168,7 @@ pub(crate) async fn attempt_punch_with_timeout(
     if local_port == 0 {
         bail!("cannot punch without a bound local port");
     }
-    let tag = token_tag(token);
+    let tag = HelloTags::new(token, role);
     let deadline = Instant::now() + budget;
 
     // Validated sockets flow from listener/dialer workers into the selection
@@ -353,13 +391,13 @@ fn reusable_socket(ipv6: bool, local_port: u16) -> Result<TcpSocket> {
 /// Mutual hello exchange on a freshly established socket: proves the other end
 /// is our rendezvous peer (same token, opposite role) before the socket may
 /// enter selection.
-async fn validate(mut stream: TcpStream, role: PunchRole, tag: [u8; TAG_LEN]) -> Result<TcpStream> {
+async fn validate(mut stream: TcpStream, role: PunchRole, tag: HelloTags) -> Result<TcpStream> {
     stream.set_nodelay(true).ok();
     let exchange = async {
         let mut hello = [0u8; HELLO_LEN];
         hello[..HELLO_MAGIC.len()].copy_from_slice(HELLO_MAGIC);
         hello[HELLO_MAGIC.len()] = role.byte();
-        hello[HELLO_MAGIC.len() + 1..].copy_from_slice(&tag);
+        hello[HELLO_MAGIC.len() + 1..].copy_from_slice(&tag.ours);
         stream.write_all(&hello).await?;
 
         let mut peer = [0u8; HELLO_LEN];
@@ -370,7 +408,7 @@ async fn validate(mut stream: TcpStream, role: PunchRole, tag: [u8; TAG_LEN]) ->
         if peer[HELLO_MAGIC.len()] == role.byte() {
             bail!("punch socket loops back to our own role");
         }
-        if peer[HELLO_MAGIC.len() + 1..] != tag {
+        if peer[HELLO_MAGIC.len() + 1..] != tag.theirs {
             bail!("punch pairing tag mismatch");
         }
         anyhow::Ok(())
@@ -390,6 +428,62 @@ mod tests {
     fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         listener.local_addr().expect("local addr").port()
+    }
+
+    /// NET-08: whoever connects to the host's punch port first is sent the
+    /// host's hello. A stranger who echoes it back with the role byte flipped
+    /// must not pass validation — or it claims the punched socket, the real
+    /// joiner's punch fails, and the bridge fallback goes with it.
+    #[tokio::test]
+    async fn a_reflected_hello_does_not_validate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stranger = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hello = [0u8; HELLO_LEN];
+            sock.read_exact(&mut hello).await.unwrap();
+            hello[HELLO_MAGIC.len()] = PunchRole::Joiner.byte();
+            let _ = sock.write_all(&hello).await;
+            // Hold the socket open so a failure is the tag check, not EOF.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let result = validate(
+            stream,
+            PunchRole::Host,
+            HelloTags::new("the-rendezvous-token", PunchRole::Host),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a reflected hello claimed the punched socket"
+        );
+        stranger.abort();
+    }
+
+    /// The honest pair, each side knowing the token, still validates.
+    #[tokio::test]
+    async fn two_holders_of_the_token_validate_each_other() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let joiner = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            validate(
+                sock,
+                PunchRole::Joiner,
+                HelloTags::new("the-rendezvous-token", PunchRole::Joiner),
+            )
+            .await
+            .map(|_| ())
+        });
+        let host = validate(
+            TcpStream::connect(addr).await.unwrap(),
+            PunchRole::Host,
+            HelloTags::new("the-rendezvous-token", PunchRole::Host),
+        )
+        .await;
+        assert!(host.is_ok(), "{:?}", host.err());
+        assert!(joiner.await.unwrap().is_ok());
     }
 
     #[test]
