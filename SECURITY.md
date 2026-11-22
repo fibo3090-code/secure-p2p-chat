@@ -177,9 +177,20 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
     shipped binary. The input is neither peer-controlled nor present at
     runtime. The app's *own* Tauri path resolves `quick-xml` 0.41.0, which is
     already fixed.
-  - **Unmaintained GTK3 bindings** (`gtk`, `gdk`, `atk`, `glib`, … 0.18):
-    Tauri's Linux backend (`muda`, `tao` → `tauri-runtime-wry`) until it moves
-    off GTK3. Not something this project can resolve independently.
+  - **`proc-macro-error` 1.0.4 unmaintained** (RUSTSEC-2024-0370): a proc
+    macro of `glib-macros`, reached through Tauri's Linux GTK3 backend
+    (`muda`/`tao` → `gtk` → `glib`). Build-time only, never linked into the
+    binary. (The GTK3 bindings' own unmaintained advisories were withdrawn
+    upstream in August 2026; this one was not.)
+  - **`paste` 1.0.15 unmaintained** (RUSTSEC-2024-0436): a proc macro, reached
+    via `natpmp → netdev → netlink-packet-utils` (Linux NAT-PMP). Build-time
+    only. (It used to arrive through `image`'s AVIF/EXR codecs too; `image` is
+    now built PNG-only.)
+  - **`zvariant`, `zbus_names`, `zvariant_derive` unmaintained as standalone
+    crates** (RUSTSEC-2026-0370/0371/0372): folded into `zbus` 6, and reached
+    only via `notify-rust → zbus` 5, the Linux desktop-notification path, which
+    has no `zbus` 6 release yet. Unmaintained, not vulnerable; the D-Bus peer is
+    the local session bus, never a network party.
   - **`bincode` 1.3.3 unmaintained** (RUSTSEC-2025-0141): a direct `core`
     dependency used for the relay control protocol. Migration is tracked; the
     frames it decodes are length-bounded by `MAX_PACKET_SIZE` before parsing.

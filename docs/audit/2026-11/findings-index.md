@@ -71,7 +71,7 @@ prioritised view is in [README.md](README.md).
 | DOC-08 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
 | DOC-09 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The USER_GUIDE TUI command reference omits about 16 commands |
 | DOC-10 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | USER_GUIDE describes community pinning wrongly, and the TUI never pins |
-| DOC-11 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `SECURITY.md`'s accepted-advisory list is stale |
+| DOC-11 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | `SECURITY.md`'s accepted-advisory list is stale |
 | DOC-12 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | SECURITY.md and architecture.md understate frontend testing and miscount bridge tests |
 | DOC-13 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `architecture.md` code map is stale after PR #188 |
 | DOC-14 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | `architecture.md` says history is rewritten once per message |
