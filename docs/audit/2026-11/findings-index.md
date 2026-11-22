@@ -162,7 +162,7 @@ prioritised view is in [README.md](README.md).
 | TUI-13 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Blocking work runs on the UI loop: Argon2, full-history save every 30 s, whole-file read for community upload; failures are silent |
 | TUI-14 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Each frame does O(all messages) work, and the loop handles one input event per frame |
 | TUI-15 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:disconnect` deletes the conversation and its history; deletions have no confirmation |
-| TUI-16 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The Party pane's community selection does not change which community commands act on; posts always go to the first channel |
+| TUI-16 | Medium | Fixed | M | [05-tui](reports/05-tui.md) | The Party pane's community selection does not change which community commands act on; posts always go to the first channel |
 | TUI-17 | Medium | Fixed | M | [05-tui](reports/05-tui.md) | The TUI never pins community identities, so every join is first contact; docs say the app pins |
 | TUI-18 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | The selected chat is marked read every tick, even while the user is away |
 | TUI-19 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Settings that do nothing in the TUI, and features missing compared with the desktop app |

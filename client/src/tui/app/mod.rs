@@ -1852,6 +1852,44 @@ mod tests {
         assert_eq!(app.command_field.text(), "quit now");
     }
 
+    /// TUI-16: with two communities joined, choosing one in the pane did not
+    /// change which one `:party-post` and the rest acted on — they went to
+    /// whichever was joined last. The community on screen is the one written to.
+    #[tokio::test]
+    async fn posting_goes_to_the_community_on_screen() {
+        use messenger_core::party::PartyRequest;
+        let (mut app, _data) = app();
+        let (_a, _, mut a_out, _a_keep) = app.party_manager.add_joined_server_for_test("a:1");
+        let (_b, _, mut b_out, _b_keep) = app.party_manager.add_joined_server_for_test("b:1");
+        let ids = app.party_manager.server_ids();
+        app.current_party = Some(ids[0]);
+        app.execute_command(TuiCommand::PartyPane).await;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.current_party,
+            Some(ids[1]),
+            "the pane moved, the target did not"
+        );
+        app.execute_command(TuiCommand::PartyPost("for the second".into()))
+            .await;
+
+        let (first, second) = if ids[1] == _b {
+            (&mut a_out, &mut b_out)
+        } else {
+            (&mut b_out, &mut a_out)
+        };
+        let posted = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<PartyRequest>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| matches!(r, PartyRequest::PostMessage { ref text, .. } if text == "for the second"))
+        };
+        assert!(
+            posted(second),
+            "the post did not reach the community on screen"
+        );
+        assert!(!posted(first), "the post went to the other community");
+    }
+
     /// TUI-17: the TUI pinned no community, so every join was a first contact
     /// and `:party-trust` became a reflex. A join that completes pins the
     /// server's fingerprint; a later join to that address is held to it — a

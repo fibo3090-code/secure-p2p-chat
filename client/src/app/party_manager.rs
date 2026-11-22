@@ -982,6 +982,55 @@ impl PartyManager {
         self.servers.remove(&server_id).is_some()
     }
 
+    /// A joined community with one public channel and no network behind it,
+    /// for shell tests (the TUI's). Returns its id, the channel's id, the
+    /// requests it would send, and a handle that keeps it "connected" while
+    /// held (its connection counts as closed once that is dropped).
+    #[cfg(test)]
+    pub(crate) fn add_joined_server_for_test(
+        &mut self,
+        address: &str,
+    ) -> (
+        Uuid,
+        Uuid,
+        mpsc::UnboundedReceiver<PartyRequest>,
+        Box<dyn std::any::Any>,
+    ) {
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let channel = Uuid::new_v4();
+        let conn = PartyServerConn {
+            address: address.to_string(),
+            username: "me".to_string(),
+            server_name: address.to_string(),
+            server_fingerprint: "FP".to_string(),
+            member_id: Some(Uuid::new_v4()),
+            status: PartyStatus::Joined,
+            channels: vec![messenger_core::party::ChannelInfo {
+                id: channel,
+                name: "general".to_string(),
+                kind: messenger_core::party::ChannelKind::Public,
+                members: Vec::new(),
+            }],
+            members: Vec::new(),
+            messages: HashMap::new(),
+            last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
+            history_requested: HashSet::new(),
+            awaiting: VecDeque::new(),
+            outgoing_tx,
+            incoming_rx,
+            pending_downloads: HashMap::new(),
+            chunked_downloads: HashMap::new(),
+        };
+        let id = Uuid::new_v4();
+        self.servers.insert(id, conn);
+        (id, channel, outgoing_rx, Box::new(incoming_tx))
+    }
+
     pub fn server_ids(&self) -> Vec<Uuid> {
         self.servers.keys().copied().collect()
     }
