@@ -68,7 +68,7 @@ prioritised view is in [README.md](README.md).
 | CRYPTO-04 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
 | CRYPTO-05 | Medium | Fixed | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The connection password is sent to an unverified host |
 | CRYPTO-06 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A second rekey can overwrite the retained old key while old-key frames are still in flight |
-| DOC-08 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
+| DOC-08 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
 | DOC-09 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The USER_GUIDE TUI command reference omits about 16 commands |
 | DOC-10 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | USER_GUIDE describes community pinning wrongly, and the TUI never pins |
 | DOC-11 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `SECURITY.md`'s accepted-advisory list is stale |
@@ -86,7 +86,7 @@ prioritised view is in [README.md](README.md).
 | DOC-27 | Medium | VERIFIED | M | [09-documentation](reports/09-documentation.md) | No operator guide for the community server or relay |
 | DOC-28 | Medium | VERIFIED | M | [09-documentation](reports/09-documentation.md) | No privacy / metadata page |
 | DOC-29 | Medium | VERIFIED | M | [09-documentation](reports/09-documentation.md) | THREAT_MODEL is missing major attack surfaces |
-| DX-04 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `image` builds with all default codecs (AVIF/rav1e, EXR, TIFF…) to write one PNG; this re-creates an advisory acceptance and contradicts `deny.toml` |
+| DX-04 | Medium | Fixed | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `image` builds with all default codecs (AVIF/rav1e, EXR, TIFF…) to write one PNG; this re-creates an advisory acceptance and contradicts `deny.toml` |
 | DX-05 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | World-state checks gate every PR: advisories, yanked crates and floating-stable clippy |
 | DX-06 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Redundant compilation: `build-verification` duplicates what the Linux test leg already compiles |
 | DX-07 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | The frontend job runs everything on three operating systems |
@@ -96,7 +96,7 @@ prioritised view is in [README.md](README.md).
 | DX-11 | Medium | SUSPECTED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `release.yml`: tauri-action is given `tagName`, `releaseName` and a token under a read-only permission block |
 | JOURNEY-06 | Medium | Partly fixed | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Backup covers the identity only; no restore/import; the "Backed up" badge is weak and goes stale after a password change |
 | JOURNEY-07 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Desktop notifications put message plaintext into OS notification stores and on the lock screen |
-| JOURNEY-08 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No single-instance guard: two desktop instances share one identity and race on the history file |
+| JOURNEY-08 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No single-instance guard: two desktop instances share one identity and race on the history file |
 | JOURNEY-09 | Medium | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: both macOS legs may stage an identically named `P2PEM.app.tar.gz`, which the collision check rejects |
 | JOURNEY-10 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The desktop release build has no logs or crash reports, and the diagnostics bundle is almost empty |
 | JOURNEY-11 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | `chat-p2p://` invite links are not registered with the OS, and the IPs they embed are not disclosed |
@@ -115,7 +115,7 @@ prioritised view is in [README.md](README.md).
 | PERF-08 | Medium | Partly fixed | M | [11-performance](reports/11-performance.md) | Server upload spools held in RAM: about 0.5 GiB per member, not bounded server-wide |
 | PERF-09 | Medium | Partly fixed | M | [11-performance](reports/11-performance.md) | Desktop poll loop: unconditional 4 Hz wakeups, each walking every message twice under the lock |
 | PERF-10 | Medium | Fixed | S | [11-performance](reports/11-performance.md) | Nagle plus delayed ACK on direct-P2P and Party connections (latency model) |
-| PERF-11 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | `image` default features compile AV1, EXR, TIFF, WebP and rayon only to encode one PNG |
+| PERF-11 | Medium | Fixed | S | [11-performance](reports/11-performance.md) | `image` default features compile AV1, EXR, TIFF, WebP and rayon only to encode one PNG |
 | PERF-12 | Medium | Partly fixed | S | [11-performance](reports/11-performance.md) | Argon2, RSA and history load run synchronously on async workers and hold locks; no optimized dev profile for crypto |
 | PRIV-02 | Medium | VERIFIED | M | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The same long-term identity key authenticates the user to every community server, so operators can link users across communities and to their P2P identity |
 | PRIV-03 | Medium | VERIFIED | M | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Relay hole punching discloses each peer's public and LAN addresses to whoever holds the token, before verification, and the relay control channel is plaintext |
