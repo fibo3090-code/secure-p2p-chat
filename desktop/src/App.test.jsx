@@ -477,3 +477,26 @@ describe("App — backend events", () => {
     expect(await screen.findByRole("dialog", { name: "Verify Alice" })).toBeTruthy();
   });
 });
+
+describe("App — theme menu", () => {
+  it("applies the chosen theme, remembers it, and closes on a click outside", async () => {
+    const { THEMES, loadTheme } = await import("./lib/themes.js");
+    readyApi();
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    const other = THEMES.find((t) => t.id !== document.documentElement.getAttribute("data-theme"));
+
+    await userEvent.click(screen.getByTitle("Theme"));
+    await userEvent.click(screen.getByRole("button", { name: other.label }));
+    expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
+    expect(loadTheme()).toBe(other.id);
+    expect(screen.queryByRole("button", { name: other.label })).toBeNull();
+
+    // Open again, then click elsewhere: it closes without changing anything.
+    await userEvent.click(screen.getByTitle("Theme"));
+    expect(screen.getByRole("button", { name: other.label })).toBeTruthy();
+    await userEvent.click(screen.getByRole("navigation", { name: "Primary" }));
+    expect(screen.queryByRole("button", { name: other.label })).toBeNull();
+    expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
+  });
+});
