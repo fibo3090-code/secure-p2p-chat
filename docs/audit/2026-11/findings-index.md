@@ -166,7 +166,7 @@ prioritised view is in [README.md](README.md).
 | TUI-17 | Medium | Fixed | M | [05-tui](reports/05-tui.md) | The TUI never pins community identities, so every join is first contact; docs say the app pins |
 | TUI-18 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | The selected chat is marked read every tick, even while the user is away |
 | TUI-19 | Medium | Partly fixed | M | [05-tui](reports/05-tui.md) | Settings that do nothing in the TUI, and features missing compared with the desktop app |
-| TUI-20 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The composer and command box do not scroll, and cursor placement ignores soft wrap |
+| TUI-20 | Medium | Fixed | M | [05-tui](reports/05-tui.md) | The composer and command box do not scroll, and cursor placement ignores soft wrap |
 | TUI-21 | Medium | Partly fixed | M | [05-tui](reports/05-tui.md) | Colours are hard-coded: security text is white (invisible on light themes), no `NO_COLOR`, RGB safety grid |
 | TUI-22 | Medium | Partly fixed | S | [05-tui](reports/05-tui.md) | Unit tests touch the developer's real data directory; the TUI has no data-dir override |
 | TUI-23 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:invite` advertises the configured listen port, not the port actually being hosted |

@@ -11,7 +11,6 @@
 //! correctly.
 
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_width::UnicodeWidthChar;
 
 /// A single- or multi-line editable text buffer with a char-index cursor.
 #[derive(Clone, Default)]
@@ -162,21 +161,10 @@ impl EditableField {
         }
     }
 
-    /// Cursor position for rendering: `(row, col)` in display cells, relative to
-    /// the start of the text. `col` accounts for wide glyphs.
-    pub fn cursor_display(&self) -> (u16, u16) {
-        let mut row = 0u16;
-        let mut col = 0u16;
-        for &c in self.chars.iter().take(self.cursor) {
-            if c == '\n' {
-                row = row.saturating_add(1);
-                col = 0;
-            } else {
-                let w = UnicodeWidthChar::width(c).unwrap_or(0) as u16;
-                col = col.saturating_add(w);
-            }
-        }
-        (row, col)
+    /// The cursor as a char index into [`Self::display_text`]. Where that
+    /// lands on screen depends on the box width: see `ui::layout_input`.
+    pub fn cursor_index(&self) -> usize {
+        self.cursor
     }
 
     // ----- command-history support (single-line use) -----
@@ -292,8 +280,7 @@ mod tests {
         multi.newline();
         multi.insert_str("b");
         assert_eq!(multi.text(), "a\nb");
-        let (row, col) = multi.cursor_display();
-        assert_eq!((row, col), (1, 1));
+        assert_eq!(multi.cursor_index(), 3, "after the newline and the 'b'");
     }
 
     #[test]

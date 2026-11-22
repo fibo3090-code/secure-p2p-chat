@@ -336,34 +336,99 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     f.render_widget(para.scroll((app.message_scroll, 0)), area);
 }
 
+/// Lay the input box's text out in rows of at most `width` columns, and find
+/// the cursor — given as a char index into `text` — on them (TUI-20).
+///
+/// Rows are cut by **display width**, character by character, so this is
+/// exactly what is drawn: the box renders these rows itself rather than
+/// handing the text to a word-wrapper and guessing where the cursor went.
+/// Returns the rows and the cursor's (row, column).
+pub(crate) fn layout_input(text: &str, cursor: usize, width: u16) -> (Vec<String>, u16, u16) {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1) as usize;
+    let mut rows = vec![String::new()];
+    let mut col = 0usize;
+    let mut at: Option<(usize, usize)> = None;
+    for (i, c) in text.chars().enumerate() {
+        if i == cursor {
+            at = Some((rows.len() - 1, col));
+        }
+        if c == '\n' {
+            rows.push(String::new());
+            col = 0;
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if col + w > width && col > 0 {
+            rows.push(String::new());
+            col = 0;
+            // A cursor placed just before this char belongs on the new row.
+            if i == cursor {
+                at = Some((rows.len() - 1, 0));
+            }
+        }
+        rows.last_mut().expect("never empty").push(c);
+        col += w;
+    }
+    let (mut row, mut ccol) = at.unwrap_or((rows.len() - 1, col));
+    // An end cursor on a full row would sit on the border: start the next row.
+    if ccol >= width {
+        rows.push(String::new());
+        row += 1;
+        ccol = 0;
+    }
+    (rows, row as u16, ccol as u16)
+}
+
+/// The input box's text and cursor (char index), command prefix included —
+/// shared by the renderer and the hardware-cursor placement so they agree.
+pub(crate) fn input_text_and_cursor(app: &TuiApp) -> (String, usize) {
+    if app.mode == TuiMode::Command {
+        (
+            format!(":{}", app.command_field.text()),
+            app.command_field.cursor_index() + 1,
+        )
+    } else {
+        (
+            app.input_field.display_text(),
+            app.input_field.cursor_index(),
+        )
+    }
+}
+
+/// The input box's rows, the first one shown, and the cursor relative to it.
+pub(crate) fn input_view(app: &TuiApp, area: Rect) -> (Vec<String>, u16, (u16, u16)) {
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2).max(1);
+    let (text, cursor) = input_text_and_cursor(app);
+    let (rows, row, col) = layout_input(&text, cursor, inner_w);
+    // Keep the cursor's row in view: scroll just far enough down.
+    let offset = row.saturating_sub(inner_h - 1);
+    (rows, offset, (row - offset, col))
+}
+
 fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let (title, text, style, border) = if app.mode == TuiMode::Command {
+    let (title, style, border) = if app.mode == TuiMode::Command {
         (
             " Command ".to_string(),
-            format!(":{}", app.command_field.text()),
             Style::default().fg(Color::Yellow),
             Color::Yellow,
         )
-    } else {
-        let title = if app.focus == TuiFocus::Input {
-            " Message [focus] Enter=send Ctrl+J=newline ".to_string()
-        } else {
-            " Message ".to_string()
-        };
-        let border = if app.focus == TuiFocus::Input {
-            BRAND_ACCENT
-        } else {
-            Color::DarkGray
-        };
+    } else if app.focus == TuiFocus::Input {
         (
-            title,
-            app.input_field.display_text(),
+            " Message [focus] Enter=send Ctrl+J=newline ".to_string(),
             Style::default(),
-            border,
+            BRAND_ACCENT,
         )
+    } else {
+        (" Message ".to_string(), Style::default(), Color::DarkGray)
     };
 
-    let p = Paragraph::new(text)
+    // Rows are laid out here, not by a word-wrapper, so the scroll offset
+    // and the cursor are computed on exactly what is drawn (TUI-20).
+    let (rows, offset, _) = input_view(app, area);
+    let lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
+    let p = Paragraph::new(lines)
         .style(style)
         .block(
             Block::default()
@@ -371,7 +436,7 @@ fn render_input(f: &mut Frame, app: &TuiApp, area: Rect) {
                 .border_style(Style::default().fg(border))
                 .title(title),
         )
-        .wrap(Wrap { trim: false });
+        .scroll((offset, 0));
     f.render_widget(p, area);
 }
 
@@ -479,6 +544,38 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{}…", t)
+    }
+}
+
+#[cfg(test)]
+mod input_layout_tests {
+    use super::layout_input;
+
+    /// TUI-20: rows are cut at the box width — by display width, so a wide
+    /// character never straddles the border — and the cursor is found on
+    /// them, not on the logical line.
+    #[test]
+    fn input_rows_wrap_at_the_box_width_and_carry_the_cursor() {
+        let (rows, row, col) = layout_input("abcdefgh", 8, 3);
+        assert_eq!(rows, ["abc", "def", "gh"]);
+        assert_eq!((row, col), (2, 2), "cursor after the last char");
+
+        let (_, row, col) = layout_input("abcdefgh", 4, 3);
+        assert_eq!((row, col), (1, 1), "cursor before 'e'");
+
+        // A full last row puts an end cursor at the start of the next one,
+        // never on the border.
+        let (rows, row, col) = layout_input("abcdef", 6, 3);
+        assert_eq!((row, col), (2, 0));
+        assert_eq!(rows.len(), 3);
+
+        // Hard newlines start rows; a wide char that would cross the edge
+        // moves down whole.
+        let (rows, _, _) = layout_input("ab\nc", 0, 10);
+        assert_eq!(rows, ["ab", "c"]);
+        let (rows, row, col) = layout_input("ab界", 3, 3);
+        assert_eq!(rows, ["ab", "界"]);
+        assert_eq!((row, col), (1, 2));
     }
 }
 

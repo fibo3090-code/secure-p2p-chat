@@ -213,17 +213,13 @@ where
         return Ok(());
     }
 
-    let (field, prefix) = if app.mode == TuiMode::Command {
-        (&app.command_field, 1u16) // account for the leading ':'
-    } else {
-        (&app.input_field, 0u16)
-    };
-    let (row, col) = field.cursor_display();
-
+    // The same layout the box was drawn with: wrapped rows, scrolled so the
+    // cursor's row is visible (TUI-20).
+    let (_, _, (row, col)) = ui::input_view(app, input_area);
     let max_inner_rows = input_area.height.saturating_sub(2);
     let max_inner_cols = input_area.width.saturating_sub(2);
     let y = input_area.y + 1 + row.min(max_inner_rows.saturating_sub(1));
-    let x = input_area.x + 1 + (col + prefix).min(max_inner_cols.saturating_sub(1));
+    let x = input_area.x + 1 + col.min(max_inner_cols.saturating_sub(1));
 
     terminal.show_cursor()?;
     terminal.set_cursor_position((x, y))?;
@@ -469,6 +465,40 @@ mod tests {
             }
         }
         panic!("{needle:?} is not on screen:\n{text}");
+    }
+
+    /// TUI-20: past three rows the composer clipped the text, so the user
+    /// typed blind, and on a wrapped line the cursor stuck to the border of
+    /// the first row. The box now scrolls to keep the cursor's row in view,
+    /// and the cursor sits where the next character will appear.
+    #[tokio::test]
+    async fn the_composer_scrolls_to_the_cursor_on_wrapped_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        app.focus = TuiFocus::Input;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let input = ui::regions(terminal.size().unwrap().into()).input;
+        let width = (input.width - 2) as usize;
+        // Six rows' worth, ending in a marker that is only visible if the box
+        // followed the cursor down.
+        let text = format!("{}END", "x".repeat(width * 6 - 3));
+        app.input_field.set_text(&text);
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        set_cursor_position(&mut terminal, &app).unwrap();
+        let (x, y) = find(&terminal, "END");
+        assert!(
+            y >= input.y && y < input.y + input.height,
+            "the end of the text is not in the box"
+        );
+        let cursor = terminal.get_cursor_position().unwrap();
+        // The text fills its last row exactly, so the cursor is at the start
+        // of the next row — inside the box, not on its border.
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (input.x + 1, y + 1),
+            "END at ({x}, {y})"
+        );
+        assert!(cursor.y < input.y + input.height - 1);
     }
 
     /// TUI-21: confirmation and fingerprint text was drawn white, which on a
