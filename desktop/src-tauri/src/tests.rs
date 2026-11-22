@@ -2052,6 +2052,40 @@ fn the_desktop_diagnostics_bundle_carries_no_secrets() {
     );
 }
 
+/// QUAL-07 / JOURNEY-10: the shipped app logged to stdout only — which a
+/// release build on Windows does not have — and its diagnostics bundle said in
+/// so many words that it contained no logs. What the app logged is in the
+/// bundle now, scrubbed like the terminal client's.
+#[test]
+fn the_diagnostics_bundle_carries_the_app_log() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let h = ready_harness();
+    let addr = "198.51.100.23";
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(crate::app_logs().clone()),
+        || {
+            tracing::warn!(
+                peer = addr,
+                error = "history save failed: disk full",
+                "save failed"
+            )
+        },
+    );
+    let bundle = h.ipc("export_diagnostics", json!({})).expect("export");
+    let logs = std::fs::read_to_string(
+        std::path::PathBuf::from(bundle.as_str().unwrap()).join("logs.txt"),
+    )
+    .unwrap();
+    assert!(
+        logs.contains("save failed") && logs.contains("disk full"),
+        "the bundle has no log: {logs:?}"
+    );
+    assert!(
+        !logs.contains(addr),
+        "an address reached the bundle: {logs}"
+    );
+}
+
 // ── The core flow, over IPC ─────────────────────────────────────────────────
 
 impl Harness {

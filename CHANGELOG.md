@@ -34,6 +34,9 @@ predate tagged releases.
 
 ### Fixed
 
+- The desktop app's diagnostics bundle now contains its recent log (scrubbed
+  of addresses and identifiers), and a crash leaves a report in the app's data
+  folder. Before, a release build's log went nowhere and the bundle said so.
 - The terminal client's message and command boxes scroll with the cursor, and
   the cursor follows wrapped lines; text past the third row used to be hidden.
 - The terminal client's fingerprint and confirmation text is readable on a

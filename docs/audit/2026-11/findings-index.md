@@ -98,7 +98,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-07 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Desktop notifications put message plaintext into OS notification stores and on the lock screen |
 | JOURNEY-08 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No single-instance guard: two desktop instances share one identity and race on the history file |
 | JOURNEY-09 | Medium | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: both macOS legs may stage an identically named `P2PEM.app.tar.gz`, which the collision check rejects |
-| JOURNEY-10 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The desktop release build has no logs or crash reports, and the diagnostics bundle is almost empty |
+| JOURNEY-10 | Medium | Partly fixed | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The desktop release build has no logs or crash reports, and the diagnostics bundle is almost empty |
 | JOURNEY-11 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | `chat-p2p://` invite links are not registered with the OS, and the IPs they embed are not disclosed |
 | JOURNEY-12 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unaccepted file offers are spooled into the user's Downloads folder and orphaned after a crash |
 | JOURNEY-14 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unsigned installers ship with no install walkthrough |
@@ -127,7 +127,7 @@ prioritised view is in [README.md](README.md).
 | QUAL-04 | Medium | VERIFIED | L | [12-code-quality](reports/12-code-quality.md) | Errors are untyped across every module boundary |
 | QUAL-05 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Server persistence logs and ignores every error and has no transactions or schema versioning |
 | QUAL-06 | Medium | Fixed | S | [12-code-quality](reports/12-code-quality.md) | The TUI log buffer drops every structured field, so the overlay and diagnostics lose the actual error |
-| QUAL-07 | Medium | VERIFIED | S/M | [12-code-quality](reports/12-code-quality.md) | The shipped desktop app has no persistent log, no panic hook, and unused logging dependencies |
+| QUAL-07 | Medium | Fixed | S/M | [12-code-quality](reports/12-code-quality.md) | The shipped desktop app has no persistent log, no panic hook, and unused logging dependencies |
 | QUAL-08 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | The desktop app compiles the terminal UI; `ChatManager` is not in a UI-agnostic crate |
 | QUAL-09 | Medium | VERIFIED | S/M | [12-code-quality](reports/12-code-quality.md) | 36 public functions have no production caller; test helpers are public API |
 | QUAL-10 | Medium | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | A complete second file receiver (async `IncomingFile`) is dead and has already drifted |

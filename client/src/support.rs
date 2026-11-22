@@ -183,6 +183,14 @@ pub fn redact_for_sharing(text: &str) -> String {
 }
 
 pub fn install_panic_hook() {
+    install_panic_hook_in(default_diagnostics_dir());
+}
+
+/// [`install_panic_hook`] writing under `diagnostics_dir/crashes`. The
+/// desktop app passes its own data folder: the default is the terminal
+/// client's, and the desktop shipped with no hook at all, so a crash in a
+/// `panic = "abort"` release left no trace anywhere (QUAL-07).
+pub fn install_panic_hook_in(diagnostics_dir: PathBuf) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -198,7 +206,7 @@ pub fn install_panic_hook() {
             .map(|loc| format!("{}:{}", loc.file(), loc.line()))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let crash_dir = default_diagnostics_dir().join("crashes");
+        let crash_dir = diagnostics_dir.join("crashes");
         let _ = std::fs::create_dir_all(&crash_dir);
         let crash_path =
             crash_dir.join(format!("panic-{}.log", Utc::now().format("%Y%m%d-%H%M%S")));
@@ -221,6 +229,27 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic leaves a report where it was told to, with the message and
+    /// where it happened.
+    #[test]
+    fn a_panic_leaves_a_crash_report_in_the_given_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        install_panic_hook_in(dir.path().to_path_buf());
+        let caught = std::panic::catch_unwind(|| panic!("the crash under test"));
+        // Back to the default hook before asserting, so a failure below is
+        // reported normally.
+        let _ = std::panic::take_hook();
+        assert!(caught.is_err());
+        let reports: Vec<_> = std::fs::read_dir(dir.path().join("crashes"))
+            .expect("no crashes folder")
+            .flatten()
+            .collect();
+        assert_eq!(reports.len(), 1);
+        let report = std::fs::read_to_string(reports[0].path()).unwrap();
+        assert!(report.contains("panic: the crash under test"), "{report}");
+        assert!(report.contains("support.rs"), "no location: {report}");
+    }
 
     #[test]
     fn export_bundle_writes_expected_files() {

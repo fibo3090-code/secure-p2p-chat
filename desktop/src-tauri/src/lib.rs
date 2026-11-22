@@ -329,20 +329,34 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
     ]
 }
 
+/// The in-process log buffer: what the app has logged recently, for the
+/// diagnostics bundle (QUAL-07).
+fn app_logs() -> &'static p2pem_classic::logbuf::LogBuffer {
+    static LOGS: std::sync::OnceLock<p2pem_classic::logbuf::LogBuffer> = std::sync::OnceLock::new();
+    LOGS.get_or_init(p2pem_classic::logbuf::LogBuffer::new)
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Surface ChatManager / core `tracing` logs to stdout (captured by
-    // `tauri dev`). Override with RUST_LOG. Without a subscriber of its own the
-    // bridge is blind.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(default_log_filter(cfg!(debug_assertions)))
-            }),
-        )
-        .try_init();
+    // ChatManager / core `tracing` logs go to stdout (captured by `tauri dev`)
+    // *and* to an in-process buffer, which is what the diagnostics bundle
+    // carries: a release build on Windows has no stdout at all, so without the
+    // buffer every warning and error vanished (QUAL-07). Override with RUST_LOG.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(default_log_filter(cfg!(debug_assertions)))
+                }),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(app_logs().clone())
+            .try_init();
+    }
 
     // One shared tokio runtime for both the ChatManager's spawned tasks and
     // Tauri's async commands. `tauri::async_runtime::set` makes Tauri schedule
@@ -357,6 +371,11 @@ pub fn run() {
     Box::leak(Box::new(rt));
 
     let bridge = init_bridge();
+    // Crash reports go beside the app's own data, where the diagnostics
+    // bundle and "open data folder" already point (QUAL-07).
+    p2pem_classic::support::install_panic_hook_in(
+        bridge.history_path.with_file_name("diagnostics"),
+    );
 
     tauri::Builder::default()
         .manage(bridge)

@@ -444,12 +444,11 @@ pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Resul
         .parent()
         .map(|d| d.join("diagnostics"))
         .ok_or_else(|| "no data directory".to_string())?;
-    // The desktop bridge logs to stdout (tracing subscriber); there is no
-    // in-app log buffer to bundle, so say so instead of shipping an empty file.
-    let logs = "Desktop bridge logs go to stdout (run with `tauri dev` or check the OS console); \
-                no in-app log buffer is captured in this bundle.\n";
+    // The recent log, from the in-process buffer: a release build has no
+    // console to read it from (QUAL-07). `export_diagnostics_bundle` scrubs it.
+    let logs = p2pem_classic::support::format_event_logs(crate::app_logs());
     let bundle = tokio::task::spawn_blocking(move || {
-        p2pem_classic::support::export_diagnostics_bundle(&base_dir, &report, logs)
+        p2pem_classic::support::export_diagnostics_bundle(&base_dir, &report, &logs)
     })
     .await
     .map_err(|e| e.to_string())?
