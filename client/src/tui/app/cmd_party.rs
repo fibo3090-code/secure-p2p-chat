@@ -4,6 +4,8 @@
 //! dispatcher reads as a table.
 
 use super::*;
+use crate::app::party_manager::PartyStatus;
+use crate::app::saved_parties::{load_saved_parties, upsert_saved_party, SavedParty};
 
 /// A readable thread in a community: a channel or a DM with one member.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,11 +24,55 @@ impl TuiApp {
         let Some(privkey) = self.unlocked_private_key() else {
             return;
         };
-        // No expected fingerprint yet: this stops before the credentials are
-        // sent and returns the server's fingerprint for the user to check.
-        // `:party-trust` then passes back exactly that fingerprint, so the
-        // connection that carries the password must present it.
-        self.start_party_dial(address, username, password, privkey, None);
+        // A community joined before is held to the fingerprint pinned then: a
+        // different key at that address is refused before anything is sent.
+        // The TUI kept no pins, so every join was a first contact, and users
+        // learn to type `:party-trust` without looking (TUI-17).
+        let pinned = match load_saved_parties(&self.parties_path()) {
+            Ok(list) => list
+                .into_iter()
+                .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
+                .map(|p| p.fingerprint),
+            Err(e) => {
+                // The file holds every pin; a damaged one stops the join
+                // rather than quietly downgrading it to a first contact.
+                self.toast(ToastLevel::Error, e);
+                return;
+            }
+        };
+        // Without a pin this stops before the credentials are sent and returns
+        // the server's fingerprint for the user to check; `:party-trust` then
+        // passes back exactly that fingerprint.
+        self.start_party_dial(address, username, password, privkey, pinned);
+    }
+
+    /// `parties.json`, beside the history.
+    pub(super) fn parties_path(&self) -> std::path::PathBuf {
+        self.history_path.with_file_name("parties.json")
+    }
+
+    /// Pin each community's fingerprint once it has really joined — not at
+    /// connect time, or a mistyped address would leave a pin for a community
+    /// nobody joined (the desktop's rule).
+    pub(super) fn pin_joined_parties(&mut self) {
+        let path = self.parties_path();
+        for sid in self.party_manager.server_ids() {
+            let Some(conn) = self.party_manager.server(sid) else {
+                continue;
+            };
+            if conn.status != PartyStatus::Joined || !self.pinned_parties.insert(sid) {
+                continue;
+            }
+            upsert_saved_party(
+                &path,
+                SavedParty {
+                    address: conn.address.clone(),
+                    username: conn.username.clone(),
+                    name: conn.server_name.clone(),
+                    fingerprint: conn.server_fingerprint.clone(),
+                },
+            );
+        }
     }
 
     pub(super) async fn cmd_party_trust(&mut self) {

@@ -128,6 +128,9 @@ pub struct TuiApp {
     /// A community connect/trust in flight. One at a time: a second
     /// `:party-connect` while one runs is refused rather than queued.
     party_dial: Option<PartyDialJob>,
+    /// Communities whose fingerprint has been pinned this run (once each, as
+    /// soon as they reach `Joined`).
+    pinned_parties: std::collections::HashSet<Uuid>,
     /// In-flight Party file downloads. `tick` polls them and writes finished
     /// downloads into the download directory.
     pending_party_downloads: Vec<PendingPartyDownload>,
@@ -204,6 +207,7 @@ impl TuiApp {
             party_manager: PartyManager::new(),
             current_party: None,
             pending_party_join: None,
+            pinned_parties: std::collections::HashSet::new(),
             chat_list_state: ListState::default(),
             chat_ids: Vec::new(),
             input_field: EditableField::new(true),
@@ -423,6 +427,7 @@ impl TuiApp {
     pub fn tick(&mut self) {
         self.chat_manager.poll_session_events();
         self.party_manager.poll_events();
+        self.pin_joined_parties();
         self.poll_party_downloads();
         self.chat_manager.cleanup_expired_toasts();
 
@@ -1845,6 +1850,99 @@ mod tests {
         assert_eq!(app.mode, TuiMode::Command);
         assert!(!app.should_quit);
         assert_eq!(app.command_field.text(), "quit now");
+    }
+
+    /// TUI-17: the TUI pinned no community, so every join was a first contact
+    /// and `:party-trust` became a reflex. A join that completes pins the
+    /// server's fingerprint; a later join to that address is held to it — a
+    /// different key is refused with nothing sent and no prompt to wave through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joined_community_is_pinned_and_held_to_its_key() {
+        use crate::app::saved_parties::{load_saved_parties, save_saved_parties, SavedParty};
+        use messenger_server::state::PartyState;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(
+            PartyState::load("Pinned", None, server_dir.path()).unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let key = crate::core::generate_rsa_keypair(crate::RSA_KEY_BITS).unwrap();
+        tokio::spawn(messenger_server::run_accept_loop(
+            listener,
+            state.clone(),
+            Arc::new(key),
+            Arc::new(messenger_server::hub::Hub::new()),
+        ));
+        let (mut app, _data) = app();
+        let parties = app.parties_path();
+        let tick_until = |label: &'static str| {
+            move |app: &mut TuiApp, done: &dyn Fn(&TuiApp) -> bool| {
+                let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                while !done(app) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "[{label}] timed out: {}",
+                        last_toast(app)
+                    );
+                    app.tick();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+
+        // A pin that is not this server's key: refused, nothing sent.
+        save_saved_parties(
+            &parties,
+            &[SavedParty {
+                address: address.clone(),
+                username: "tui".into(),
+                name: String::new(),
+                fingerprint: "00".repeat(32),
+            }],
+        );
+        app.execute_command(TuiCommand::PartyConnect {
+            address: address.clone(),
+            username: "tui".into(),
+            password: None,
+        })
+        .await;
+        tick_until("refused")(&mut app, &|a| a.party_dial.is_none());
+        assert!(
+            last_toast(&app).contains("SECURITY"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(
+            app.pending_party_join.is_none(),
+            "offered to trust a key that does not match the pin"
+        );
+        assert!(
+            state.lock().await.members().is_empty(),
+            "credentials sent to the wrong key"
+        );
+
+        // No pin: the two-step join, and the pin is written once joined.
+        std::fs::remove_file(&parties).unwrap();
+        app.execute_command(TuiCommand::PartyConnect {
+            address: address.clone(),
+            username: "tui".into(),
+            password: None,
+        })
+        .await;
+        tick_until("verify")(&mut app, &|a| a.pending_party_join.is_some());
+        app.execute_command(TuiCommand::PartyTrust).await;
+        tick_until("pinned")(&mut app, &|a| {
+            load_saved_parties(&a.parties_path()).is_ok_and(|l| !l.is_empty())
+        });
+        let saved = load_saved_parties(&parties).unwrap();
+        let sid = app.current_party.unwrap();
+        assert_eq!(
+            saved[0].fingerprint,
+            app.party_manager.server(sid).unwrap().server_fingerprint
+        );
     }
 
     /// TUI-15: `:delete` removes a conversation's history for good, so it

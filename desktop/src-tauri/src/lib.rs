@@ -230,7 +230,7 @@ pub(crate) enum Dialog {
 }
 
 mod commands;
-use commands::party::{upsert_saved_party, SavedParty};
+use p2pem_classic::app::saved_parties::{upsert_saved_party, SavedParty};
 
 // Not on Windows — see the dev-dependencies note in Cargo.toml.
 #[cfg(all(test, not(windows)))]

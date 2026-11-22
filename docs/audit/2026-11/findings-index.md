@@ -70,7 +70,7 @@ prioritised view is in [README.md](README.md).
 | CRYPTO-06 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A second rekey can overwrite the retained old key while old-key frames are still in flight |
 | DOC-08 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
 | DOC-09 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The USER_GUIDE TUI command reference omits about 16 commands |
-| DOC-10 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | USER_GUIDE describes community pinning wrongly, and the TUI never pins |
+| DOC-10 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | USER_GUIDE describes community pinning wrongly, and the TUI never pins |
 | DOC-11 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `SECURITY.md`'s accepted-advisory list is stale |
 | DOC-12 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | SECURITY.md and architecture.md understate frontend testing and miscount bridge tests |
 | DOC-13 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `architecture.md` code map is stale after PR #188 |
@@ -163,7 +163,7 @@ prioritised view is in [README.md](README.md).
 | TUI-14 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Each frame does O(all messages) work, and the loop handles one input event per frame |
 | TUI-15 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:disconnect` deletes the conversation and its history; deletions have no confirmation |
 | TUI-16 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The Party pane's community selection does not change which community commands act on; posts always go to the first channel |
-| TUI-17 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The TUI never pins community identities, so every join is first contact; docs say the app pins |
+| TUI-17 | Medium | Fixed | M | [05-tui](reports/05-tui.md) | The TUI never pins community identities, so every join is first contact; docs say the app pins |
 | TUI-18 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | The selected chat is marked read every tick, even while the user is away |
 | TUI-19 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Settings that do nothing in the TUI, and features missing compared with the desktop app |
 | TUI-20 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The composer and command box do not scroll, and cursor placement ignores soft wrap |
