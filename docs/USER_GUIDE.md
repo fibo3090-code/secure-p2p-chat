@@ -494,8 +494,10 @@ Settings & app
   :quit                                     save and exit (alias :q, :q! to skip confirm)
 ```
 
-`:set` keys: `download-dir`, `listen-port`, `notifications`, `typing`,
-`auto-accept`, `auto-host`, `mdns`, `theme` (`light|dark|midnight|forest|rose`).
+`:set` keys: `download-dir`, `listen-port`, `notifications`,
+`notification-content` (`full|sender|hidden`), `typing`, `auto-accept`,
+`auto-host` (host on the configured port once unlocked), `upnp`. LAN discovery
+(`mdns`) and themes are desktop-app features; the terminal client has neither.
 Booleans accept `on`/`off`. Example: `:set notifications off`.
 
 History is saved automatically (encrypted) on a timer and on exit.

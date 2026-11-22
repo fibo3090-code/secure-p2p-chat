@@ -589,10 +589,9 @@ pub fn settings_keys() -> &'static [&'static str] {
         "notifications",
         "notification-content",
         "typing",
-        "mdns",
         "auto-accept",
-        "theme",
         "auto-host",
+        "upnp",
         "listen-port",
     ]
 }

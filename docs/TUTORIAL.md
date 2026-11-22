@@ -50,8 +50,10 @@ disk.
 You can redo it any time from Settings → Your identity → Identity backup, which
 also tells you whether you have ever made one.
 
-Prefer the terminal? `cargo run --release -p p2pem-classic` opens the TUI, which
-does everything the desktop app does.
+Prefer the terminal? `cargo run --release -p p2pem-classic` opens the TUI. It
+covers the core of the app — connecting, verification, contacts, invites, file
+transfer, communities — but not everything: LAN discovery, themes and some
+community file management are desktop-only.
 
 ## 3. Pick a connection method
 
@@ -229,7 +231,7 @@ Once the first session works, move on to:
 - [../SECURITY.md](../SECURITY.md) for the app’s actual security posture
 - [../THREAT_MODEL.md](../THREAT_MODEL.md) for assumptions and limits
 
-Prefer working in a terminal? The TUI is fully featured and drives the same core
+Prefer working in a terminal? The TUI drives the same core
 — see [USER_GUIDE.md](USER_GUIDE.md#tui-reference).
 
 

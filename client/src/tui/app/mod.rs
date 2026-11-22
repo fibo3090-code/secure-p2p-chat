@@ -43,7 +43,7 @@ use crate::tui::command::{
 };
 use crate::tui::input::EditableField;
 use crate::tui::overlays::{PasswordMode, TuiOverlay};
-use crate::types::{Config, Theme, ToastLevel};
+use crate::types::{Config, ToastLevel};
 use anyhow::Result;
 use ratatui::widgets::ListState;
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1474,8 +1474,24 @@ impl TuiApp {
                 }
                 self.overlay = TuiOverlay::None;
                 self.toast(ToastLevel::Success, "Identity unlocked".to_string());
+                self.host_on_startup_if_configured();
             }
             Err(_) => self.toast(ToastLevel::Error, "Wrong password".to_string()),
+        }
+    }
+
+    /// Honour `auto_host_on_startup` once the identity is open and the saved
+    /// settings are loaded, as the desktop does (TUI-19). A launch flag or a
+    /// listener already running wins: this never replaces either.
+    fn host_on_startup_if_configured(&mut self) {
+        if self.chat_manager.config.auto_host_on_startup
+            && !self.chat_manager.is_hosting
+            && self.pending_command.is_none()
+            && self.deferred_launch.is_none()
+        {
+            let port = self.chat_manager.config.listen_port;
+            self.pending_command = Some(TuiCommand::Host(Some(port)));
+            tracing::info!(port, "hosting on start-up (auto-host)");
         }
     }
 
@@ -1533,7 +1549,11 @@ impl TuiApp {
         // `protect` keeps the key in memory, so no second Argon2 run is needed
         // to stay unlocked (PERF-12).
         let result = self.identity.protect(password);
-        self.finish_password_update(result, "Password set");
+        // First setup is the start-up of a new identity: the same point an
+        // unlock is for an existing one. A password *change* is not.
+        if self.finish_password_update(result, "Password set") {
+            self.host_on_startup_if_configured();
+        }
     }
 
     fn try_change_password(&mut self, current: &str, new: &str) {
@@ -1554,7 +1574,7 @@ impl TuiApp {
     /// Save the re-wrapped identity and re-derive the history key from it.
     /// Success is reported only when every step worked: "Password set" used
     /// to be shown even when the identity could not be reloaded afterwards.
-    fn finish_password_update(&mut self, result: anyhow::Result<()>, done: &str) {
+    fn finish_password_update(&mut self, result: anyhow::Result<()>, done: &str) -> bool {
         let outcome = result
             .and_then(|()| self.identity.save(&self.identity_path))
             .and_then(|()| {
@@ -1577,8 +1597,12 @@ impl TuiApp {
                     .load_history_auto(&self.history_path, &key);
                 self.overlay = TuiOverlay::None;
                 self.toast(ToastLevel::Success, done.to_string());
+                true
             }
-            Err(e) => self.toast(ToastLevel::Error, format!("Password not updated: {e}")),
+            Err(e) => {
+                self.toast(ToastLevel::Error, format!("Password not updated: {e}"));
+                false
+            }
         }
     }
 
@@ -1620,7 +1644,7 @@ impl TuiApp {
     // ---------------------------------------------------------------- settings overlay
 
     fn settings_select(&mut self, delta: i32) {
-        let len = 9i32; // number of settings rows rendered
+        let len = 7i32; // number of settings rows rendered
         let cur = self.settings_list_state.selected().unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(len) as usize;
         self.settings_list_state.select(Some(next));
@@ -1635,17 +1659,7 @@ impl TuiApp {
             3 => cfg.enable_typing_indicators = !cfg.enable_typing_indicators,
             4 => cfg.auto_accept_files = !cfg.auto_accept_files,
             5 => cfg.auto_host_on_startup = !cfg.auto_host_on_startup,
-            6 => cfg.enable_mdns = !cfg.enable_mdns,
-            7 => cfg.enable_upnp = !cfg.enable_upnp,
-            8 => {
-                cfg.theme = match cfg.theme {
-                    Theme::Light => Theme::Dark,
-                    Theme::Dark => Theme::Midnight,
-                    Theme::Midnight => Theme::Forest,
-                    Theme::Forest => Theme::Rose,
-                    Theme::Rose => Theme::Light,
-                }
-            }
+            6 => cfg.enable_upnp = !cfg.enable_upnp,
             _ => {
                 self.toast(
                     ToastLevel::Info,
@@ -1700,37 +1714,21 @@ impl TuiApp {
                 cfg.auto_host_on_startup = b;
                 format!("auto-host = {}", b)
             }),
-            "mdns" => parse_setting_bool(value).map(|b| {
-                cfg.enable_mdns = b;
-                format!("mdns = {}", b)
-            }),
             "upnp" => parse_setting_bool(value).map(|b| {
                 cfg.enable_upnp = b;
                 format!("upnp = {}", b)
             }),
-            "theme" => match value.to_ascii_lowercase().as_str() {
-                "light" => {
-                    cfg.theme = Theme::Light;
-                    Ok("theme = Light".to_string())
+            // Real settings of the desktop app that this client has no use
+            // for: it never browses the LAN or applies a theme, and its
+            // settings live in its own data folder (TUI-19).
+            "mdns" | "theme" => Err(format!(
+                "'{key}' is a setting of the desktop app; the terminal client has no {}",
+                if key == "mdns" {
+                    "LAN discovery"
+                } else {
+                    "themes"
                 }
-                "dark" => {
-                    cfg.theme = Theme::Dark;
-                    Ok("theme = Dark".to_string())
-                }
-                "midnight" => {
-                    cfg.theme = Theme::Midnight;
-                    Ok("theme = Midnight".to_string())
-                }
-                "forest" => {
-                    cfg.theme = Theme::Forest;
-                    Ok("theme = Forest".to_string())
-                }
-                "rose" => {
-                    cfg.theme = Theme::Rose;
-                    Ok("theme = Rose".to_string())
-                }
-                _ => Err("theme: light|dark|midnight|forest|rose".to_string()),
-            },
+            )),
             _ => Err(format!(
                 "Unknown setting '{}'. Keys: {}",
                 key,
@@ -2974,6 +2972,77 @@ mod tests {
         app.last_save = None;
         app.autosave();
         assert!(app.history_path.exists());
+    }
+
+    /// TUI-19: the TUI offered an `auto-host` setting and never hosted on
+    /// start-up — only the desktop honoured it. Unlocking now starts hosting
+    /// on the configured port when it is on, and does nothing when it is off.
+    #[test]
+    fn unlocking_hosts_on_startup_when_the_setting_is_on() {
+        for on in [true, false] {
+            let (mut app, _data) = app();
+            app.history_path = _data.path().join("none.json.enc");
+            let password = format!("pw-{}", Uuid::new_v4());
+            app.identity.encrypt(&password).unwrap();
+            assert!(app.identity.is_locked());
+            app.chat_manager.config.auto_host_on_startup = on;
+            app.chat_manager.config.listen_port = 45678;
+            app.try_unlock(&password);
+            assert!(!app.identity.is_locked());
+            let queued = app.take_pending_command();
+            if on {
+                assert!(
+                    matches!(queued, Some(TuiCommand::Host(Some(45678)))),
+                    "auto-host did not start hosting: {queued:?}"
+                );
+            } else {
+                assert!(queued.is_none(), "hosted with the setting off: {queued:?}");
+            }
+        }
+    }
+
+    /// TUI-19: `mdns` and `theme` were offered and did nothing — the TUI
+    /// never browses the LAN or applies a theme, and its settings live in its
+    /// own data folder, so they do not reach the desktop app either. They are
+    /// refused with the reason; `upnp`, which works, is now listed.
+    #[tokio::test]
+    async fn settings_the_terminal_ignores_are_not_offered() {
+        let (mut app, _data) = app();
+        let before = (
+            app.chat_manager.config.enable_mdns,
+            app.chat_manager.config.theme,
+        );
+        for (key, value) in [("mdns", "on"), ("theme", "light")] {
+            app.execute_command(TuiCommand::Set {
+                key: key.into(),
+                value: value.into(),
+            })
+            .await;
+            assert!(
+                last_toast(&app).contains("desktop app"),
+                ":set {key} said {:?}",
+                last_toast(&app)
+            );
+        }
+        assert_eq!(
+            (
+                app.chat_manager.config.enable_mdns,
+                app.chat_manager.config.theme
+            ),
+            before
+        );
+        let keys = crate::tui::command::settings_keys();
+        assert!(!keys.contains(&"mdns") && !keys.contains(&"theme"));
+        assert!(
+            keys.contains(&"upnp"),
+            "a working setting is missing: {keys:?}"
+        );
+        app.execute_command(TuiCommand::Set {
+            key: "upnp".into(),
+            value: "on".into(),
+        })
+        .await;
+        assert!(app.chat_manager.config.enable_upnp);
     }
 
     /// TUI-13: a failing autosave (disk full, permissions) was a log line no
