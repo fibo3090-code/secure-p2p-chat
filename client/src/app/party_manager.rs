@@ -1721,6 +1721,33 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Err("unknown file".to_string()));
     }
 
+    /// TUI-08 / APP-10: a server that accepts the connection and then says
+    /// nothing used to hold the caller — the TUI's whole UI loop — for as long
+    /// as the OS cared to wait. The dial gives up after
+    /// `PARTY_CONNECT_TIMEOUT`, with an error that says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_never_answers_is_given_up_on() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (_held, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let key = messenger_core::core::generate_rsa_keypair(messenger_core::RSA_KEY_BITS).unwrap();
+        let started = tokio::time::Instant::now();
+        let err = match PartyManager::dial(&address, &key, None).await {
+            Ok(_) => panic!("a silent server was treated as answering"),
+            Err(e) => e.to_string(),
+        };
+        // Either bound may fire first — the handshake's own or the dial's —
+        // and both are 15 s; what matters is that it ends, and says why.
+        assert!(
+            err.contains("15 seconds") || err.contains("timeout (15s)"),
+            "{err}"
+        );
+        assert!(started.elapsed() <= PARTY_CONNECT_TIMEOUT + std::time::Duration::from_secs(1));
+    }
+
     /// Errors carry no request id, so any `Error` used to fail every download
     /// in flight — a refused channel name cancelled an unrelated download.
     #[test]

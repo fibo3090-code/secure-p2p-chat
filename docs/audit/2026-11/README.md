@@ -249,6 +249,42 @@ unnoticed.
 | NET-17 | Each connection accepted on the punch port was validated in a detached task: never aborted, unbounded, and holding a sender on the results channel — so one silent connection kept the whole attempt (and the relay pairing) open for the 3 s validation timeout past its budget. Validations now run in a `JoinSet` owned by the listener worker, at most `MAX_PENDING_VALIDATIONS` (4) at once, and die with the attempt. | Failed (40 validated at once; attempt ended ~3 s late). | `punch::tests::silent_connections_to_the_punch_port_neither_delay_nor_outlive_the_attempt` |
 | UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
 
+### Critical and High findings fixed before this pass — the test that guards each
+
+The index still listed these as open. Each was checked against the code on this
+branch and found fixed; this is the regression guard for each (tests added in
+this pass are marked *new*). Medium and Low statuses were **not** reconciled
+here beyond the findings named elsewhere in this section.
+
+| ID | Guard |
+|---|---|
+| JOURNEY-01, APP-01, QUAL-02, TAURI-30 (one bug, four reports) | `client/tests/it/persistence.rs::an_unreadable_history_fails_cleanly_and_changes_nothing`; desktop `tests::an_unreadable_history_survives_unlock_and_can_be_set_aside` |
+| SRV-01 | `server state::tests::a_channel_of_maximum_size_messages_still_pages_in_frames_that_fit`, `dm_history_of_maximum_size_messages_fits_in_a_frame`; `client/tests/it/party.rs::a_channel_of_maximum_size_messages_is_joinable_and_pages_to_the_end` |
+| CRYPTO-02 | `session::tests::current_peers_commit_to_their_ephemeral_keys` |
+| NET-02 | `session_e2e::silent_connections_do_not_lock_a_real_peer_out_of_the_host`; `host_listener::host_keeps_its_port_through_idle_connections_and_releases_it_for_a_peer` |
+| SRV-02 | `connection::tests::an_evicted_connection_is_closed_rather_than_left_deaf` |
+| SRV-03 | `connection::tests::a_connection_that_never_joins_is_closed`, `a_client_that_stops_reading_is_disconnected_by_the_write_timeout`; `server lib::tests::the_accept_loop_refuses_connections_past_its_cap`, `address_slots_are_capped_and_released` |
+| SRV-04 | `state::tests::being_first_grants_nothing_and_the_claim_token_grants_ownership_once`; `party::the_owner_is_whoever_presents_the_claim_token_not_whoever_is_first`; `server/tests/cli.rs` (no password without `--open`) |
+| SRV-05, TAURI-01, TUI-02, DOC-01 | `party::a_changed_server_identity_is_refused_before_any_credential_is_sent`; desktop `tests::party_join_is_two_steps_and_pins_only_after_a_real_join`; TUI `the_party_commands_work_end_to_end` (nothing reaches the server before `:party-trust`) |
+| SRV-06 | `write_rate::tests::a_burst_is_allowed_then_refused_then_refilled`, `text_bytes_have_their_own_budget` |
+| TUI-01 | `tui::app::tests::typing_into_the_fingerprint_prompt_does_not_answer_it` |
+| TUI-03 | *new* `tui::app::tests::set_password_will_not_replace_a_password_it_was_not_given` (mutation-checked) |
+| TUI-04, JOURNEY-02 | `tui::app::tests::the_first_run_password_prompt_cannot_be_dismissed` |
+| TUI-05 | `tui::app::tests::a_paste_is_text_never_keystrokes`; *new* `tui::tests::a_pasted_command_is_text_not_a_command` (through the run loop) |
+| TUI-06 | None: restoring a real terminal needs a TTY. `TerminalGuard` is RAII and entered before anything can fail (read in code). |
+| TUI-07 | *new*: `the_party_commands_work_end_to_end` now draws the Communities pane and asserts the posted message and the operator warning are on screen |
+| TUI-08 | *new* `party_manager::tests::a_server_that_never_answers_is_given_up_on` (paused clock) |
+| JOURNEY-03, DOC-02 | desktop `tests::delete_all_data_needs_the_password_and_the_word_then_removes_everything`; TUI `wipe_checks_the_password_confirms_then_deletes_everything` |
+| JOURNEY-04, PRIV-01, DOC-03 | `Parties.test.jsx` › says on screen that the operator can read the community; the TUI-07 render assertion |
+| PERF-01 | *new* `App.test.jsx` › a transfer progress event refetches transfers, not conversations (mutation-checked) |
+| PERF-02 | desktop `chats::tests::previews_and_displayed_texts_are_bounded` |
+| PERF-03 | TUI `autosave_skips_an_unchanged_history`; desktop `the_poll_loop_saves_changed_history_once_and_skips_an_unchanged_one` |
+| PERF-04 | `state::tests::the_database_runs_in_wal_mode_with_normal_sync` |
+| PERF-05 | `party_manager::tests::history_pages_are_merged_and_continued` (correctness; the complexity itself is not asserted) |
+| DX-01, DX-03 | Build configuration (`Cargo.toml` profiles, `crate-type = ["rlib"]`); measured, not testable as a unit. |
+| DX-02, JOURNEY-05 | CI configuration (`ci.yml` classifier, `release.yml` permissions); not testable in the suite. |
+| DOC-04 – DOC-07 | Documentation, checked against the text. |
+
 ### Partly fixed
 
 | ID | Done | Still open |

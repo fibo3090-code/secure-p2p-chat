@@ -1803,6 +1803,44 @@ mod tests {
         assert_eq!(app.command_field.text(), "quit now");
     }
 
+    /// TUI-03: `:set-password` re-encrypted an identity that already had a
+    /// password without asking for it, so anyone at an unlocked terminal
+    /// could replace it. It is refused now; `:change-password` needs the
+    /// current one.
+    #[tokio::test]
+    async fn set_password_will_not_replace_a_password_it_was_not_given() {
+        let (mut app, _data) = app();
+        let current = format!("pw-{}", Uuid::new_v4());
+        let intruder = format!("pw-{}", Uuid::new_v4());
+        app.identity.encrypt(&current).unwrap();
+        app.identity.save(&app.identity_path).unwrap();
+
+        app.execute_command(TuiCommand::SetPassword(intruder.clone()))
+            .await;
+        assert!(
+            last_toast(&app).contains(":change-password"),
+            "{}",
+            last_toast(&app)
+        );
+        let on_disk = Identity::load(&app.identity_path).unwrap();
+        assert!(
+            on_disk.clone().decrypt(&current).is_ok(),
+            "the password was changed"
+        );
+        assert!(on_disk.clone().decrypt(&intruder).is_err());
+
+        // The way that is allowed: knowing the current one.
+        app.execute_command(TuiCommand::ChangePassword {
+            current: intruder.clone(),
+            new: format!("pw-{}", Uuid::new_v4()),
+        })
+        .await;
+        assert!(Identity::load(&app.identity_path)
+            .unwrap()
+            .decrypt(&current)
+            .is_ok());
+    }
+
     /// TUI-04 / JOURNEY-02: the first-run password prompt cannot be waved
     /// away, because nothing — not the identity, not the history — can be
     /// saved without it.
@@ -2422,6 +2460,24 @@ mod tests {
         assert!(last_toast(&app).contains(&address), "{}", last_toast(&app));
         app.execute_command(TuiCommand::PartyPane).await;
         assert_eq!(app.overlay, TuiOverlay::Party);
+
+        // TUI-07: the pane shows what was said — the TUI used to be able to
+        // post but never displayed a message — and says, on screen, who else
+        // can read it.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+        terminal.draw(|f| crate::tui::ui::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let shown: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(shown.contains("hello from the terminal"), "{shown}");
+        assert!(shown.contains("operator can read messages"), "{shown}");
         drop(other);
     }
 

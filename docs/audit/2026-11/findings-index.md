@@ -10,49 +10,49 @@ prioritised view is in [README.md](README.md).
 | ID | Severity | Status | Effort | Report | Finding |
 |---|---|---|---|---|---|
 | CRYPTO-01 | Critical | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | The fingerprint and the verified key come from two different PEM parsers, so a preamble spoofs any identity |
-| JOURNEY-01 | Critical | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | An unreadable history file is silently replaced with an empty one right after unlock |
-| SRV-01 | Critical | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Frames built from history, broadcasts or listings can exceed `MAX_PACKET_SIZE`; one member can make the community permanently unjoinable |
-| APP-01 | High | VERIFIED | M | [04-client-core](reports/04-client-core.md) | A failed history load is followed by a save that overwrites the history with empty state |
-| CRYPTO-02 | High | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The SAS has no commitment, so a MITM can grind its last ephemeral key until both SAS values match |
-| DOC-01 | High | VERIFIED | S | [09-documentation](reports/09-documentation.md) | Community verification asks the user to compare a code the operator cannot see, and step 2 is not bound to step 1 |
-| DOC-02 | High | VERIFIED | S | [09-documentation](reports/09-documentation.md) | "Settings → Delete Everything" and a Windows uninstaller data wipe are documented but do not exist |
-| DOC-03 | High | VERIFIED | S | [09-documentation](reports/09-documentation.md) | THREAT_MODEL relies on an "operator can read messages" badge that is not implemented |
-| DOC-04 | High | VERIFIED | M | [09-documentation](reports/09-documentation.md) | `protocol.md` says Party chunked transfer is not implemented and omits 9 shipped message variants |
-| DOC-05 | High | VERIFIED | S | [09-documentation](reports/09-documentation.md) | Wrong server binary path in the build instructions |
-| DOC-06 | High | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The SAS short code is missing from the user verification instructions |
-| DOC-07 | High | VERIFIED | S | [09-documentation](reports/09-documentation.md) | THREAT_MODEL says invite expiry is not enforced |
-| DX-01 | High | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Crypto dependencies compile unoptimised in dev/test: 95% of test time is debug RSA and Argon2 |
-| DX-02 | High | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | The change classifier skips the frontend contract tests when only `desktop/src-tauri/` changes |
-| DX-03 | High | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `desktop` builds a staticlib and a cdylib it never uses (1.8 GB per profile, about 3.6 GB per build plus test), and debuginfo is full everywhere |
-| JOURNEY-02 | High | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | TUI first run: Esc on "set password" runs the whole session on an identity that is never saved |
-| JOURNEY-03 | High | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No way to delete local data; documented "Delete Everything" and uninstaller cleanup do not exist; uninstall leaves identity and history behind |
-| JOURNEY-04 | High | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Users are told everything is end-to-end encrypted with no server copy, but community operators read all community traffic in plaintext |
-| JOURNEY-05 | High | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: `tauri-action` is given `tagName` with a read-only token (pipeline break or attestation bypass) |
+| JOURNEY-01 | Critical | Fixed | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | An unreadable history file is silently replaced with an empty one right after unlock |
+| SRV-01 | Critical | Fixed | M | [03-party-server](reports/03-party-server.md) | Frames built from history, broadcasts or listings can exceed `MAX_PACKET_SIZE`; one member can make the community permanently unjoinable |
+| APP-01 | High | Fixed | M | [04-client-core](reports/04-client-core.md) | A failed history load is followed by a save that overwrites the history with empty state |
+| CRYPTO-02 | High | Fixed | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The SAS has no commitment, so a MITM can grind its last ephemeral key until both SAS values match |
+| DOC-01 | High | Fixed | S | [09-documentation](reports/09-documentation.md) | Community verification asks the user to compare a code the operator cannot see, and step 2 is not bound to step 1 |
+| DOC-02 | High | Fixed | S | [09-documentation](reports/09-documentation.md) | "Settings → Delete Everything" and a Windows uninstaller data wipe are documented but do not exist |
+| DOC-03 | High | Fixed | S | [09-documentation](reports/09-documentation.md) | THREAT_MODEL relies on an "operator can read messages" badge that is not implemented |
+| DOC-04 | High | Fixed | M | [09-documentation](reports/09-documentation.md) | `protocol.md` says Party chunked transfer is not implemented and omits 9 shipped message variants |
+| DOC-05 | High | Fixed | S | [09-documentation](reports/09-documentation.md) | Wrong server binary path in the build instructions |
+| DOC-06 | High | Fixed | S | [09-documentation](reports/09-documentation.md) | The SAS short code is missing from the user verification instructions |
+| DOC-07 | High | Fixed | S | [09-documentation](reports/09-documentation.md) | THREAT_MODEL says invite expiry is not enforced |
+| DX-01 | High | Fixed | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Crypto dependencies compile unoptimised in dev/test: 95% of test time is debug RSA and Argon2 |
+| DX-02 | High | Fixed | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | The change classifier skips the frontend contract tests when only `desktop/src-tauri/` changes |
+| DX-03 | High | Fixed | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `desktop` builds a staticlib and a cdylib it never uses (1.8 GB per profile, about 3.6 GB per build plus test), and debuginfo is full everywhere |
+| JOURNEY-02 | High | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | TUI first run: Esc on "set password" runs the whole session on an identity that is never saved |
+| JOURNEY-03 | High | Fixed | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No way to delete local data; documented "Delete Everything" and uninstaller cleanup do not exist; uninstall leaves identity and history behind |
+| JOURNEY-04 | High | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Users are told everything is end-to-end encrypted with no server copy, but community operators read all community traffic in plaintext |
+| JOURNEY-05 | High | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: `tauri-action` is given `tagName` with a read-only token (pipeline break or attestation bypass) |
 | NET-01 | High | Fixed | S | [02-network](reports/02-network.md) | Transport frames can be reflected back to their sender and are accepted as the peer's |
-| NET-02 | High | VERIFIED | M | [02-network](reports/02-network.md) | The one-shot host listener lets one TCP connection make the host unreachable, repeatedly |
-| PERF-01 | High | VERIFIED | M | [11-performance](reports/11-performance.md) | Desktop refresh: full conversation over IPC, then O(n) Intl formatting in JS, at 4 Hz during transfers |
-| PERF-02 | High | VERIFIED | M | [11-performance](reports/11-performance.md) | One maximum-size peer text (about 24 MiB) is re-processed on every frame, refresh and save |
-| PERF-03 | High | VERIFIED | S | [11-performance](reports/11-performance.md) | Whole-history persistence: O(total history) clone, serialize, encrypt and fsync per save; TUI saves every 30 s unconditionally |
-| PERF-04 | High | VERIFIED | S | [11-performance](reports/11-performance.md) | Server SQLite: autocommit + DELETE journal + `synchronous=FULL` + no statement cache, all under the global lock |
-| PERF-05 | High | VERIFIED | S | [11-performance](reports/11-performance.md) | Client community history merge is quadratic |
-| PRIV-01 | High | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The desktop UI never tells users the community server reads their messages and DMs, and THREAT_MODEL.md claims a badge that does not exist |
+| NET-02 | High | Fixed | M | [02-network](reports/02-network.md) | The one-shot host listener lets one TCP connection make the host unreachable, repeatedly |
+| PERF-01 | High | Fixed | M | [11-performance](reports/11-performance.md) | Desktop refresh: full conversation over IPC, then O(n) Intl formatting in JS, at 4 Hz during transfers |
+| PERF-02 | High | Fixed | M | [11-performance](reports/11-performance.md) | One maximum-size peer text (about 24 MiB) is re-processed on every frame, refresh and save |
+| PERF-03 | High | Fixed | S | [11-performance](reports/11-performance.md) | Whole-history persistence: O(total history) clone, serialize, encrypt and fsync per save; TUI saves every 30 s unconditionally |
+| PERF-04 | High | Fixed | S | [11-performance](reports/11-performance.md) | Server SQLite: autocommit + DELETE journal + `synchronous=FULL` + no statement cache, all under the global lock |
+| PERF-05 | High | Fixed | S | [11-performance](reports/11-performance.md) | Client community history merge is quadratic |
+| PRIV-01 | High | Fixed | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The desktop UI never tells users the community server reads their messages and DMs, and THREAT_MODEL.md claims a badge that does not exist |
 | QUAL-01 | High | Fixed | S | [12-code-quality](reports/12-code-quality.md) | Pasting a crafted v1 invite link crashes the app: string slice on unvalidated PEM |
-| QUAL-02 | High | VERIFIED | S/M | [12-code-quality](reports/12-code-quality.md) | A failed history load leads to the encrypted history being overwritten with an empty one |
-| SRV-02 | High | VERIFIED | S | [03-party-server](reports/03-party-server.md) | When the hub evicts a stuck connection, the socket stays open and the client goes deaf |
-| SRV-03 | High | VERIFIED | M | [03-party-server](reports/03-party-server.md) | No idle, read or write timeouts and no concurrent-connection cap: pre-auth file-descriptor exhaustion, ghost presence, permanently blocked tasks |
-| SRV-04 | High | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Ownership goes to whoever connects first, and servers are open by default |
-| SRV-05 | High | VERIFIED | S | [03-party-server](reports/03-party-server.md) | Users are asked to verify the server with a SAS the operator cannot see and that does not belong to the connection being trusted |
-| SRV-06 | High | VERIFIED | L | [03-party-server](reports/03-party-server.md) | No per-member rate limits on posts, DMs, shares or permission changes; all history kept in RAM forever; no retention |
-| TAURI-01 | High | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The verified community fingerprint is not bound to the credential-sending connection |
-| TAURI-30 | High | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | A history file that fails to decrypt or parse is silently overwritten with empty state after unlock |
-| TUI-01 | High | VERIFIED | S | [05-tui](reports/05-tui.md) | The fingerprint overlay pops up under the user's fingers; `y`/`Enter` accept, `n`/`Esc` reject |
-| TUI-02 | High | VERIFIED | S | [05-tui](reports/05-tui.md) | `:party-trust` does not pin the fingerprint the user verified (TOCTOU on community join) |
-| TUI-03 | High | VERIFIED | M | [05-tui](reports/05-tui.md) | `:set-password` changes the password without the current one (bypasses `change_password`); reports success on partial failure |
-| TUI-04 | High | VERIFIED | S | [05-tui](reports/05-tui.md) | Dismissing the first-run password prompt means the identity is never saved, so the user gets a new identity every launch and earlier history is overwritten |
-| TUI-05 | High | VERIFIED | S | [05-tui](reports/05-tui.md) | A multi-line paste is executed as keystrokes: each line is sent, and lines starting with `:` run as commands |
-| TUI-06 | High | VERIFIED | S | [05-tui](reports/05-tui.md) | The terminal is left in raw mode on the alternate screen on startup errors and panics, and the error message is invisible |
-| TUI-07 | High | VERIFIED | L | [05-tui](reports/05-tui.md) | Community (Party) messages, DMs, the audit log and notices are never displayed; the TUI can post but never read |
-| TUI-08 | High | VERIFIED | M | [05-tui](reports/05-tui.md) | Community connect and trust block the whole UI on a TCP connect with no timeout |
+| QUAL-02 | High | Fixed | S/M | [12-code-quality](reports/12-code-quality.md) | A failed history load leads to the encrypted history being overwritten with an empty one |
+| SRV-02 | High | Fixed | S | [03-party-server](reports/03-party-server.md) | When the hub evicts a stuck connection, the socket stays open and the client goes deaf |
+| SRV-03 | High | Fixed | M | [03-party-server](reports/03-party-server.md) | No idle, read or write timeouts and no concurrent-connection cap: pre-auth file-descriptor exhaustion, ghost presence, permanently blocked tasks |
+| SRV-04 | High | Fixed | M | [03-party-server](reports/03-party-server.md) | Ownership goes to whoever connects first, and servers are open by default |
+| SRV-05 | High | Fixed | S | [03-party-server](reports/03-party-server.md) | Users are asked to verify the server with a SAS the operator cannot see and that does not belong to the connection being trusted |
+| SRV-06 | High | Fixed | L | [03-party-server](reports/03-party-server.md) | No per-member rate limits on posts, DMs, shares or permission changes; all history kept in RAM forever; no retention |
+| TAURI-01 | High | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The verified community fingerprint is not bound to the credential-sending connection |
+| TAURI-30 | High | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | A history file that fails to decrypt or parse is silently overwritten with empty state after unlock |
+| TUI-01 | High | Fixed | S | [05-tui](reports/05-tui.md) | The fingerprint overlay pops up under the user's fingers; `y`/`Enter` accept, `n`/`Esc` reject |
+| TUI-02 | High | Fixed | S | [05-tui](reports/05-tui.md) | `:party-trust` does not pin the fingerprint the user verified (TOCTOU on community join) |
+| TUI-03 | High | Fixed | M | [05-tui](reports/05-tui.md) | `:set-password` changes the password without the current one (bypasses `change_password`); reports success on partial failure |
+| TUI-04 | High | Fixed | S | [05-tui](reports/05-tui.md) | Dismissing the first-run password prompt means the identity is never saved, so the user gets a new identity every launch and earlier history is overwritten |
+| TUI-05 | High | Fixed | S | [05-tui](reports/05-tui.md) | A multi-line paste is executed as keystrokes: each line is sent, and lines starting with `:` run as commands |
+| TUI-06 | High | Fixed | S | [05-tui](reports/05-tui.md) | The terminal is left in raw mode on the alternate screen on startup errors and panics, and the error message is invisible |
+| TUI-07 | High | Fixed | L | [05-tui](reports/05-tui.md) | Community (Party) messages, DMs, the audit log and notices are never displayed; the TUI can post but never read |
+| TUI-08 | High | Fixed | M | [05-tui](reports/05-tui.md) | Community connect and trust block the whole UI on a TCP connect with no timeout |
 | UI-01 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Community first-join SAS check does not cover the connection that receives the credentials |
 | UI-02 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | A late conversation fetch can show A while the composer sends to B |
 | APP-02 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | `send_file` awaits the bounded file lane while the caller holds the `ChatManager` lock |

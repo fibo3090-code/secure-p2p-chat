@@ -10,11 +10,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-const bridge = vi.hoisted(() => ({ api: {}, real: null }));
+const bridge = vi.hoisted(() => ({ api: {}, real: null, handlers: {} }));
 vi.mock("./lib/bridge.js", async (importOriginal) => {
   const actual = await importOriginal();
   bridge.real = actual.api;
-  return { ...actual, api: bridge.api, onBridge: async () => () => {} };
+  // Records what the shell listens for, so a test can play a backend event.
+  const onBridge = async (event, handler) => {
+    bridge.handlers[event] = handler;
+    return () => { if (bridge.handlers[event] === handler) delete bridge.handlers[event]; };
+  };
+  return { ...actual, api: bridge.api, onBridge };
 });
 
 import App from "./App.jsx";
@@ -435,5 +440,40 @@ describe("App — conversation actions", () => {
     await waitFor(() => expect(api.declineTransfer).toHaveBeenCalledWith("t-offer"));
     await waitFor(async () =>
       expect((await toasts()).some((t) => t.level === "error" && /already cancelled/.test(t.message))).toBe(true));
+  });
+});
+
+describe("App — backend events", () => {
+  // PERF-01: during a transfer the backend reports progress several times a
+  // second. Answering each report by refetching every conversation (and
+  // re-rendering them) is what made the window crawl; a progress report
+  // refetches the transfer list only.
+  it("a transfer progress event refetches transfers, not conversations", async () => {
+    const api = readyApi();
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    await waitFor(() => expect(bridge.handlers["transfers-updated"]).toBeTypeOf("function"));
+    api.listConversations.mockClear();
+    api.listTransfers.mockClear();
+
+    await act(async () => { bridge.handlers["transfers-updated"]({ payload: null }); });
+    await waitFor(() => expect(api.listTransfers).toHaveBeenCalledTimes(1));
+    expect(api.listConversations).not.toHaveBeenCalled();
+
+    await act(async () => { bridge.handlers["state-updated"]({ payload: null }); });
+    await waitFor(() => expect(api.listConversations).toHaveBeenCalledTimes(1));
+  });
+
+  it("a fingerprint request from the backend opens the trust prompt", async () => {
+    readyApi();
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
+    await waitFor(() => expect(bridge.handlers["fingerprint-request"]).toBeTypeOf("function"));
+    await act(async () => {
+      bridge.handlers["fingerprint-request"]({
+        payload: { chat_id: "chat-1", peer_name: "Alice", fingerprint: "ab".repeat(32), sas: "123456 🐱🌵🚀" },
+      });
+    });
+    expect(await screen.findByRole("dialog", { name: "Verify Alice" })).toBeTruthy();
   });
 });
