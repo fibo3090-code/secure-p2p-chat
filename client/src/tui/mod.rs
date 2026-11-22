@@ -457,6 +457,71 @@ mod tests {
         );
     }
 
+    /// The cell where `needle` starts on screen.
+    fn find(terminal: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+        let text = screen(terminal);
+        let width = terminal.backend().buffer().area.width as usize;
+        for (y, line) in text.split('\n').enumerate() {
+            if let Some(byte) = line.find(needle) {
+                let x = line[..byte].chars().count();
+                assert!(x < width);
+                return (x as u16, y as u16);
+            }
+        }
+        panic!("{needle:?} is not on screen:\n{text}");
+    }
+
+    /// TUI-21: confirmation and fingerprint text was drawn white, which on a
+    /// light terminal is white on white — the fingerprint is the backstop for
+    /// the safety code. Body text uses the terminal's own foreground.
+    #[tokio::test]
+    async fn body_text_uses_the_terminals_own_foreground() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        app.overlay = crate::tui::overlays::TuiOverlay::ConfirmQuit;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let (x, y) = find(&terminal, "Save history and exit?");
+        let cell = &terminal.backend().buffer()[(x, y)];
+        assert_eq!(
+            cell.fg,
+            Color::Reset,
+            "confirmation text forced to {:?}",
+            cell.fg
+        );
+    }
+
+    /// `NO_COLOR` (no-color.org) is honoured: nothing on screen carries a
+    /// colour, while emphasis (bold, reverse) is kept — it is how the
+    /// selection stays visible.
+    #[tokio::test]
+    async fn no_color_draws_without_colour() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        app.chat_manager
+            .create_local_chat_for_test(uuid::Uuid::new_v4(), "Somebody".into());
+        app.monochrome = true;
+        app.overlay = crate::tui::overlays::TuiOverlay::ConfirmQuit;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let coloured: Vec<_> = buf
+            .content()
+            .iter()
+            .filter(|c| c.fg != Color::Reset || c.bg != Color::Reset)
+            .map(|c| (c.symbol().to_string(), c.fg, c.bg))
+            .take(5)
+            .collect();
+        assert!(
+            coloured.is_empty(),
+            "coloured cells under NO_COLOR: {coloured:?}"
+        );
+        assert!(
+            buf.content().iter().any(|c| !c.modifier.is_empty()),
+            "emphasis was stripped along with colour"
+        );
+    }
+
     /// `:q!` skips the confirmation, and with it the confirmation's own save:
     /// the loop's save on the way out is the only one it gets.
     #[tokio::test]

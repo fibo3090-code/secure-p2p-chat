@@ -57,6 +57,18 @@ pub fn ui(f: &mut Frame, app: &mut TuiApp) {
         render_command_suggestions(f, app, r.input);
     }
     overlays::render_overlay(f, app, f.area());
+    if app.monochrome {
+        strip_colour(f.buffer_mut());
+    }
+}
+
+/// `NO_COLOR`: drop every cell's colour after drawing, keeping its emphasis.
+/// Done once over the finished frame rather than at each of the many styling
+/// sites, so a new widget cannot forget it (TUI-21).
+fn strip_colour(buf: &mut ratatui::buffer::Buffer) {
+    for cell in buf.content.iter_mut() {
+        cell.set_fg(Color::Reset).set_bg(Color::Reset);
+    }
 }
 
 /// Floating autocomplete menu shown above the command box while typing a `:`command.

@@ -317,9 +317,9 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
     f.render_widget(Paragraph::new(grid_lines), rows[3]);
 
     f.render_widget(
-        Paragraph::new(fingerprint.to_string())
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::White)),
+        // The terminal's own foreground: white was white-on-white on a
+        // light theme, and this is the backstop for the safety code (TUI-21).
+        Paragraph::new(fingerprint.to_string()).wrap(Wrap { trim: true }),
         rows[4],
     );
     f.render_widget(
@@ -481,9 +481,7 @@ fn render_identity(f: &mut Frame, app: &TuiApp, full: Rect) {
         .collect();
     f.render_widget(Paragraph::new(grid_lines), rows[1]);
     f.render_widget(
-        Paragraph::new(app.identity_fingerprint())
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::White)),
+        Paragraph::new(app.identity_fingerprint()).wrap(Wrap { trim: true }),
         rows[2],
     );
     f.render_widget(
@@ -912,8 +910,7 @@ fn render_confirm(f: &mut Frame, title: &str, message: &str, full: Rect) {
     f.render_widget(
         Paragraph::new(message)
             .wrap(Wrap { trim: false })
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::White)),
+            .alignment(Alignment::Center),
         inner,
     );
 }

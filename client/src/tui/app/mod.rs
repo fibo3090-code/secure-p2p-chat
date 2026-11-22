@@ -107,6 +107,9 @@ pub struct TuiApp {
     pub mode: TuiMode,
     pub status_line: String,
     pub should_quit: bool,
+    /// Draw without colour: `NO_COLOR` is set (no-color.org). Emphasis
+    /// (bold, reverse) is kept, colour is dropped from every cell.
+    pub monochrome: bool,
     pub overlay: TuiOverlay,
     pub overlay_scroll: u16,
     /// Selected row in the Transfers overlay (index into the id-sorted list).
@@ -245,6 +248,7 @@ impl TuiApp {
             identity_path,
             history_path,
             pending_command: None,
+            monochrome: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             deferred_fingerprint: None,
             pending_party_downloads: Vec::new(),
             pending_party_saves: Vec::new(),

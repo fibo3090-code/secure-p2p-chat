@@ -399,6 +399,10 @@ command — so you can drive the whole app from the keyboard (or script it).
 
 Chat-list markers: `H` hosting · `●` connected · `○` offline · `*` unread.
 
+Set `NO_COLOR=1` to draw without colour (bold and reverse video are kept). The
+safety-code digits and emoji, and the fingerprint text, carry everything you
+need to verify a contact; the coloured grid is only a visual aid.
+
 ### Command autocomplete
 
 In command mode, start typing a command name and a popup of matching commands

@@ -34,6 +34,8 @@ predate tagged releases.
 
 ### Fixed
 
+- The terminal client's fingerprint and confirmation text is readable on a
+  light background (it was white), and `NO_COLOR` is honoured.
 - The terminal client now says when history cannot be saved to disk (once,
   until a save works again) instead of only logging it, and refuses a
   community upload over the size limit before reading the file.
