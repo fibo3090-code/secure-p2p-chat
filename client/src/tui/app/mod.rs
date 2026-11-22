@@ -1753,7 +1753,7 @@ impl TuiApp {
     }
 
     pub fn copy_logs(&mut self) {
-        let log_text = crate::support::format_event_logs(&self.logs);
+        let log_text = crate::support::shareable_event_logs(&self.logs);
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => match clipboard.set_text(log_text) {
                 Ok(()) => self.toast(ToastLevel::Success, "Logs copied to clipboard".to_string()),

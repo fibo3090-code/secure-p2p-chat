@@ -69,6 +69,15 @@ pub struct DiagnosticsReport {
 
 /// Render the retained log events as plain text for the clipboard and the
 /// diagnostics bundle.
+/// The event log as it may leave the machine — copied to the clipboard or
+/// put in a diagnostics bundle: [`format_event_logs`] scrubbed by
+/// [`redact_for_sharing`]. One function for both, because log lines now carry
+/// their structured fields (fingerprints, addresses — QUAL-06) and a copy is
+/// usually pasted into a public issue, exactly like the bundle.
+pub fn shareable_event_logs(logs: &LogBuffer) -> String {
+    redact_for_sharing(&format_event_logs(logs))
+}
+
 pub fn format_event_logs(logs: &LogBuffer) -> String {
     let mut log_text = String::new();
     for event in logs.events() {
@@ -294,5 +303,25 @@ mod tests {
         );
         // Short hex (an 8-char fingerprint prefix) is kept: it identifies nothing alone.
         assert_eq!(redact_for_sharing("fp abcd1234"), "fp abcd1234");
+    }
+
+    /// What leaves the machine is scrubbed, fields included.
+    #[test]
+    fn the_shareable_log_keeps_the_error_and_drops_identifiers() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = LogBuffer::new();
+        let fp = "ab".repeat(32);
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(logs.clone()),
+            || {
+                tracing::warn!(peer = %fp, addr = "203.0.113.7:12345", error = "handshake timed out", "dial failed");
+            },
+        );
+        let out = shareable_event_logs(&logs);
+        assert!(
+            out.contains("dial failed") && out.contains("handshake timed out"),
+            "{out}"
+        );
+        assert!(!out.contains(&fp) && !out.contains("203.0.113.7"), "{out}");
     }
 }
