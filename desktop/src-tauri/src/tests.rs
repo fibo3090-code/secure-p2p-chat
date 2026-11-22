@@ -1776,6 +1776,38 @@ fn the_poll_loop_rehosts_a_consumed_direct_listener_only() {
     assert!(!m.check_rehost_needed(), "the listener was not re-opened");
 }
 
+/// PERF-09: the poll loop woke four times a second for the life of the app,
+/// window in front or not — for a messenger left open all day, that wakeup is
+/// most of what it costs. In the background and quiet it slows to once a
+/// second; anything moving (a message, a transfer, a prompt) or the window
+/// coming forward puts it straight back.
+#[test]
+fn the_poll_loop_slows_down_only_when_backgrounded_and_quiet() {
+    use crate::{poll_delay, POLL_FAST, POLL_IDLE_AFTER, POLL_SLOW};
+    let just_now = std::time::Duration::ZERO;
+    let long_ago = POLL_IDLE_AFTER * 3;
+    assert_eq!(
+        poll_delay(true, long_ago),
+        POLL_FAST,
+        "in front of the user"
+    );
+    assert_eq!(
+        poll_delay(false, just_now),
+        POLL_FAST,
+        "something just moved"
+    );
+    assert_eq!(
+        poll_delay(false, POLL_IDLE_AFTER - std::time::Duration::from_millis(1)),
+        POLL_FAST
+    );
+    assert_eq!(poll_delay(false, POLL_IDLE_AFTER), POLL_SLOW);
+    assert_eq!(poll_delay(false, long_ago), POLL_SLOW);
+    assert!(
+        POLL_SLOW <= std::time::Duration::from_secs(1),
+        "a backgrounded message must still notify promptly"
+    );
+}
+
 // ── Start-up (init_bridge) ──────────────────────────────────────────────────
 
 /// Run the real start-up path over `dir` (`P2PEM_DATA_DIR`), restoring the

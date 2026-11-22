@@ -88,7 +88,7 @@ impl std::fmt::Debug for VerifiedParty {
 }
 
 /// Connection lifecycle status for a joined server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PartyStatus {
     Connecting,
     Joined,

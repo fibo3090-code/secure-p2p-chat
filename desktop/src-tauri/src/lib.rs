@@ -506,11 +506,16 @@ fn init_bridge() -> Bridge {
 /// state. The poll loop emits `state-updated` only when this changes, so an
 /// idle app no longer makes the webview refetch conversations four times a
 /// second.
-fn ui_signature(mgr: &ChatManager) -> u64 {
+///
+/// Takes the already computed `state_signature`: the poll
+/// loop needs both each tick, and computing the state signature walks every
+/// message of every conversation — twice per tick was half the loop's cost
+/// (PERF-09).
+fn ui_signature_from(mgr: &ChatManager, state_sig: u64) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    state_signature(mgr).hash(&mut h);
+    state_sig.hash(&mut h);
     for id in mgr.chat_ids() {
         mgr.is_connected(&id).hash(&mut h);
         // TOFU trust: accepting a fingerprint flips the conversation's
@@ -560,7 +565,7 @@ fn party_signature(p: &PartyManager) -> u64 {
     for sid in p.server_ids() {
         sid.hash(&mut h);
         if let Some(conn) = p.server(sid) {
-            format!("{:?}", conn.status).hash(&mut h);
+            conn.status.hash(&mut h);
             conn.server_name.hash(&mut h);
             // Hash what is actually *shown*, not how many rows there are. Hashing
             // the counts meant a member going online or offline — the count is
@@ -660,22 +665,42 @@ struct PollMemory {
     joined_recorded: std::collections::HashSet<Uuid>,
 }
 
+/// Poll period while the user is looking, or something has just moved.
+const POLL_FAST: Duration = Duration::from_millis(250);
+/// Poll period in the background once nothing has moved for
+/// [`POLL_IDLE_AFTER`]. A message arriving then is seen — and notified — at
+/// most this late, and the first one puts the loop back on [`POLL_FAST`].
+const POLL_SLOW: Duration = Duration::from_secs(1);
+const POLL_IDLE_AFTER: Duration = Duration::from_secs(10);
+
+/// How long the poll loop sleeps next (PERF-09). Four wakeups a second, for
+/// as long as the app is open, is what an idle messenger costs a laptop
+/// battery: it keeps the CPU out of its deep idle states.
+fn poll_delay(focused: bool, quiet_for: Duration) -> Duration {
+    if focused || quiet_for < POLL_IDLE_AFTER {
+        POLL_FAST
+    } else {
+        POLL_SLOW
+    }
+}
+
 /// Periodically drain network events and notify the webview to refresh.
 fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
     tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
         let mut memory = PollMemory::default();
+        let mut last_activity = std::time::Instant::now();
+        let mut delay = POLL_FAST;
         let mut last_rehost = std::time::Instant::now();
         // Floor between poll-driven history writes — see `save_history_if_changed`.
         let mut last_save = std::time::Instant::now() - HISTORY_SAVE_MIN_INTERVAL;
         loop {
-            interval.tick().await;
+            tokio::time::sleep(delay).await;
             let party_sig = ctx.poll_parties(&mut memory.joined_recorded).await;
             if last_rehost.elapsed() >= REHOST_CHECK_INTERVAL {
                 last_rehost = std::time::Instant::now();
                 ctx.auto_rehost().await;
             }
-            let (prompt, toasts, sig, ui_sig, transfer_sig) = {
+            let (prompt, toasts, sig, ui_sig, transfer_sig, focused) = {
                 let mut m = ctx.manager.lock().await;
                 m.poll_session_events();
                 // Drain ChatManager's internal toasts (Connected, errors,
@@ -689,14 +714,19 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                 // could no longer find the fingerprint to persist, and a second
                 // peer's prompt silently replaced the first one's.
                 let prompt = m.pending_fingerprint().cloned();
+                let sig = state_signature(&m);
                 (
                     prompt,
                     toasts,
-                    state_signature(&m),
-                    ui_signature(&m),
+                    sig,
+                    ui_signature_from(&m, sig),
                     transfer_signature(&m),
+                    m.ui_presence().focused,
                 )
             };
+            // Anything that moved — or a prompt waiting on the user — keeps
+            // the loop fast for a while.
+            let mut moved = !toasts.is_empty() || prompt.is_some();
             if ctx.save_history_if_changed(sig, last_save).await {
                 last_save = std::time::Instant::now();
             }
@@ -712,7 +742,9 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
             // TOFU prompt appeared, so its fallback polling always runs).
             let transfers_moved = memory.last_transfer_sig != Some(transfer_sig);
             memory.last_transfer_sig = Some(transfer_sig);
+            moved |= transfers_moved || memory.last_party_sig != Some(party_sig);
             if memory.last_ui_sig != Some(ui_sig) || new_prompt {
+                moved = true;
                 memory.last_ui_sig = Some(ui_sig);
                 // A full refresh refetches the transfers too.
                 let _ = app.emit("state-updated", ());
@@ -724,6 +756,10 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
                 memory.last_party_sig = Some(party_sig);
                 let _ = app.emit("party-updated", ());
             }
+            if moved {
+                last_activity = std::time::Instant::now();
+            }
+            delay = poll_delay(focused, last_activity.elapsed());
         }
     });
 }
