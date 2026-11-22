@@ -11,6 +11,15 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Security
+
+- The connection password is no longer sent to the host. The client proves it
+  knows the password with a value bound to that one connection, so someone
+  posing as the host — before you have compared the safety code — no longer
+  learns it. A host on an older version that asks for a password is refused,
+  with a message to update it; older clients can still connect to an updated
+  host.
+
 ### Fixed
 
 - Relay with hole punching: over a slow link one side could end up on the

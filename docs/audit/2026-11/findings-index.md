@@ -64,9 +64,9 @@ prioritised view is in [README.md](README.md).
 | APP-08 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party history paging skips a range when a live broadcast arrives before the first page |
 | APP-09 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Chunked-text reassembly is bounded by message count, not bytes (hundreds of MiB per chat) |
 | APP-10 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party `connect_and_join` has no TCP connect timeout, and the desktop holds the `PartyManager` lock across it |
-| CRYPTO-03 | Medium | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Both directions share one key and one AAD, and decrypt never checks the role bit, so frames can be reflected |
+| CRYPTO-03 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Both directions share one key and one AAD, and decrypt never checks the role bit, so frames can be reflected |
 | CRYPTO-04 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
-| CRYPTO-05 | Medium | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The connection password is sent to an unverified host |
+| CRYPTO-05 | Medium | Fixed | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The connection password is sent to an unverified host |
 | CRYPTO-06 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | A second rekey can overwrite the retained old key while old-key frames are still in flight |
 | DOC-08 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The TUI `:set` key list, `settings_keys()` and help text all omit `upnp`, which the guide uses |
 | DOC-09 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | The USER_GUIDE TUI command reference omits about 16 commands |

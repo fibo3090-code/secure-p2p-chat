@@ -136,6 +136,7 @@ where
         stream,
         &tunnel.cipher,
         &tunnel.transport_aad,
+        tunnel.peer_version,
         connection_password,
     )
     .await?;
@@ -447,6 +448,40 @@ pub struct EstablishedTunnel {
     /// try ephemeral keys until both victims' safety codes match, so the code
     /// is only a weak check and the user is told to compare the fingerprint.
     pub sas_committed: bool,
+    /// The protocol version the peer announced. The connection-password gate
+    /// reads it: from [`PASSWORD_PROOF_VERSION`] the password is proved, never
+    /// sent.
+    pub peer_version: u32,
+}
+
+/// First protocol version whose client proves the connection password
+/// instead of sending it (audit CRYPTO-05).
+pub const PASSWORD_PROOF_VERSION: u32 = 5;
+
+/// Domain separator for the connection-password proof.
+const PASSWORD_PROOF_LABEL: &[u8] = b"p2pem-v5-connection-password-proof";
+
+/// What a v5+ client sends in place of the connection password.
+///
+/// The gate runs before the user has compared the safety code, so the host it
+/// talks to may not be the host at all. The password used to cross in clear
+/// (inside the tunnel, but to whoever is on the other end of it): anyone
+/// impersonating the host collected it from every client and used it on the
+/// real one. This value is HKDF-SHA256 with the label and the handshake
+/// transcript as salt and the password as input keying material — so an HMAC
+/// keyed by the transcript — and only someone who knows the password *and*
+/// shares this transcript can produce it. A man in the middle runs two
+/// handshakes with two transcripts and cannot relay it; a fake host can only
+/// try guesses offline. Frozen by a known-answer test.
+pub fn password_proof(password: &str, transcript: &[u8]) -> [u8; 32] {
+    let mut salt = Vec::with_capacity(PASSWORD_PROOF_LABEL.len() + transcript.len());
+    salt.extend_from_slice(PASSWORD_PROOF_LABEL);
+    salt.extend_from_slice(transcript);
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), password.as_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(b"client", &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
 }
 
 /// First protocol version in which the client commits to its ephemeral key.
@@ -776,6 +811,7 @@ impl TunnelKeys {
         peer: &IdentityProof,
         scheme: SignatureScheme,
         sas_committed: bool,
+        peer_version: u32,
     ) -> Result<EstablishedTunnel> {
         // Parsed by the same strict decoder `verify_identity_proof` used, so
         // the fingerprint names exactly the key the signature was checked with.
@@ -788,6 +824,7 @@ impl TunnelKeys {
             transport_aad: self.transport_aad,
             signature_scheme: scheme,
             sas_committed,
+            peer_version,
         })
     }
 }
@@ -867,7 +904,7 @@ where
     )
     .await?;
     let client_proof = recv_identity_proof(stream, &keys, &client_ephemeral, scheme, US).await?;
-    keys.established(&client_proof, scheme, committed)
+    keys.established(&client_proof, scheme, committed, peer_version)
 }
 
 /// Run the client side of the Protocol v3 handshake over `stream`. Mirror of
@@ -933,7 +970,7 @@ where
         scheme,
     )
     .await?;
-    keys.established(&host_proof, scheme, committed)
+    keys.established(&host_proof, scheme, committed, peer_version)
 }
 
 /// Constant-time comparison so a wrong connection password cannot be recovered
@@ -980,6 +1017,7 @@ async fn host_password_gate<S>(
     stream: &mut S,
     cipher: &AesCipher,
     aad: &[u8],
+    peer_version: u32,
     expected: Option<&str>,
 ) -> Result<()>
 where
@@ -992,7 +1030,15 @@ where
         .decrypt_from_peer(&resp_ct, Some(aad))
         .ok_or_else(|| anyhow!("Failed to decrypt password response"))?;
     if let Some(pw) = expected {
-        if !constant_time_eq(&resp, pw.as_bytes()) {
+        let admitted = if peer_version >= PASSWORD_PROOF_VERSION {
+            constant_time_eq(&resp, &password_proof(pw, aad))
+        } else {
+            // A client from before the proof sends the password itself.
+            // Accepting it exposes nobody but that client, which already
+            // sends it to whoever answers.
+            constant_time_eq(&resp, pw.as_bytes())
+        };
+        if !admitted {
             return Err(PasswordRefused.into());
         }
     }
@@ -1004,6 +1050,7 @@ async fn client_password_gate<S>(
     stream: &mut S,
     cipher: &AesCipher,
     aad: &[u8],
+    peer_version: u32,
     password: Option<&str>,
 ) -> Result<()>
 where
@@ -1016,14 +1063,24 @@ where
     let required = flag.first().copied() == Some(1);
     // Always reply (even empty) so the host's receive completes and both sides
     // converge on the same outcome.
-    let payload: Vec<u8> = if required {
-        password.map(|p| p.as_bytes().to_vec()).unwrap_or_default()
-    } else {
-        Vec::new()
+    let proves = peer_version >= PASSWORD_PROOF_VERSION;
+    let payload: Vec<u8> = match password {
+        Some(p) if required && proves => password_proof(p, aad).to_vec(),
+        // Nothing to say, or a host from before the proof, which wants the
+        // password itself — before the user has checked who it is. Not sent:
+        // anyone posing as this host would collect it (CRYPTO-05).
+        _ => Vec::new(),
     };
     send_packet(stream, &cipher.encrypt(&payload, Some(aad))).await?;
     if required && password.is_none() {
         return Err(anyhow!("This host requires a connection password"));
+    }
+    if required && !proves {
+        return Err(anyhow!(
+            "This host runs an older version that asks for the connection password in a way \
+             that would hand it to anyone posing as the host, so it was not sent. Update the \
+             app on the host."
+        ));
     }
     Ok(())
 }
@@ -1129,6 +1186,7 @@ where
             stream,
             &tunnel.cipher,
             &tunnel.transport_aad,
+            tunnel.peer_version,
             connection_password.as_deref(),
         )
         .await,
@@ -1180,6 +1238,7 @@ where
             stream,
             &tunnel.cipher,
             &tunnel.transport_aad,
+            tunnel.peer_version,
             connection_password.as_deref(),
         )
         .await,
@@ -2343,6 +2402,189 @@ mod tests {
         assert_eq!(client.signature_scheme, SignatureScheme::Ed25519);
         assert_eq!(client.peer_fingerprint, expected_host_fp.unwrap());
         assert_eq!(host.peer_fingerprint, expected_client_fp.unwrap());
+    }
+
+    /// The proof is what a v5 client and host both compute; if either side's
+    /// label, salt or info drifted, every password-protected connection would
+    /// fail. Pinned by a known answer computed with Python's `hmac` (HKDF by
+    /// hand), not by comparing the function with itself.
+    #[test]
+    fn the_password_proof_matches_its_known_answer() {
+        let transcript: Vec<u8> = (0u8..32).collect();
+        assert_eq!(
+            hex::encode(password_proof("correct horse battery staple", &transcript)),
+            "ee5b734bce4cb7dec82ea3decfcf34c7f5bfc1473b1b254d91638b2021da9151"
+        );
+        assert_ne!(
+            password_proof("correct horse battery staple", &transcript[1..]),
+            password_proof("correct horse battery staple", &transcript),
+            "bound to the transcript"
+        );
+    }
+
+    /// Both halves of a handshake, with the streams kept for what follows it.
+    async fn tunnels_with_streams(
+        host_version: u32,
+        client_version: u32,
+    ) -> (
+        (EstablishedTunnel, tokio::io::DuplexStream),
+        (EstablishedTunnel, tokio::io::DuplexStream),
+    ) {
+        let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
+        let (mut host_stream, mut client_stream) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            let t = host_handshake_as(
+                &mut host_stream,
+                &host_priv,
+                uuid::Uuid::new_v4(),
+                host_version.to_be_bytes(),
+            )
+            .await
+            .unwrap();
+            (t, host_stream)
+        });
+        let client = client_handshake_as(
+            &mut client_stream,
+            &client_priv,
+            uuid::Uuid::new_v4(),
+            client_version.to_be_bytes(),
+        )
+        .await
+        .unwrap();
+        (host.await.unwrap(), (client, client_stream))
+    }
+
+    /// The host's side of the gate, played by hand: ask for a password and
+    /// return exactly what the client sent back.
+    async fn ask_for_password(
+        tunnel: &EstablishedTunnel,
+        stream: &mut tokio::io::DuplexStream,
+    ) -> Vec<u8> {
+        send_packet(
+            stream,
+            &tunnel.cipher.encrypt(&[1], Some(&tunnel.transport_aad)),
+        )
+        .await
+        .unwrap();
+        let ct = recv_packet_with_timeout(stream).await.unwrap();
+        tunnel
+            .cipher
+            .decrypt_from_peer(&ct, Some(&tunnel.transport_aad))
+            .unwrap()
+    }
+
+    /// CRYPTO-05: the gate runs before the user has compared the safety code,
+    /// so whoever answers may be posing as the host. It used to receive the
+    /// password in clear. Now it receives a proof bound to its own transcript:
+    /// no password, nothing it can replay to the real host.
+    #[tokio::test]
+    async fn a_host_nobody_has_verified_never_receives_the_password() {
+        let password = "a password worth stealing";
+        let v = PROTOCOL_VERSION as u32;
+        let ((fake, mut fake_stream), (client, mut client_stream)) =
+            tunnels_with_streams(v, v).await;
+        let gate = tokio::spawn(async move {
+            client_password_gate(
+                &mut client_stream,
+                &client.cipher,
+                &client.transport_aad,
+                client.peer_version,
+                Some(password),
+            )
+            .await
+        });
+        let got = ask_for_password(&fake, &mut fake_stream).await;
+        gate.await.unwrap().unwrap();
+
+        assert!(
+            !got.windows(password.len())
+                .any(|w| w == password.as_bytes()),
+            "the password crossed the wire"
+        );
+        assert_eq!(got, password_proof(password, &fake.transport_aad));
+        // And it is useless on any other connection.
+        let ((other, _), _) = tunnels_with_streams(v, v).await;
+        assert_ne!(got, password_proof(password, &other.transport_aad));
+    }
+
+    /// A host from before the proof asks for the password itself. Sending it
+    /// would undo the fix — a fake host need only claim to be old — so the
+    /// client refuses, sends nothing, and says why.
+    #[tokio::test]
+    async fn an_older_host_asking_for_the_password_is_not_given_it() {
+        let ((old_host, mut host_stream), (client, mut client_stream)) =
+            tunnels_with_streams(4, PROTOCOL_VERSION as u32).await;
+        assert_eq!(client.peer_version, 4);
+        let gate = tokio::spawn(async move {
+            client_password_gate(
+                &mut client_stream,
+                &client.cipher,
+                &client.transport_aad,
+                client.peer_version,
+                Some("secret-secret"),
+            )
+            .await
+        });
+        let got = ask_for_password(&old_host, &mut host_stream).await;
+        let err = gate.await.unwrap().unwrap_err().to_string();
+        assert!(got.is_empty(), "something was sent: {got:?}");
+        assert!(err.contains("Update the app on the host"), "{err}");
+    }
+
+    /// The host side: a current client proves, an older one still sends the
+    /// password itself and is still let in, and a wrong answer either way is
+    /// refused.
+    #[tokio::test]
+    async fn the_host_admits_the_right_password_from_old_and_new_clients_only() {
+        let password = "the right password";
+        for (client_version, right, wrong) in [
+            (
+                PROTOCOL_VERSION as u32,
+                None,                           // the proof, computed below from the transcript
+                b"the right password".to_vec(), // plaintext is not a proof
+            ),
+            (
+                4,
+                Some(password.as_bytes().to_vec()),
+                b"a wrong password".to_vec(),
+            ),
+        ] {
+            for answer_right in [true, false] {
+                let ((host, mut host_stream), (client, mut client_stream)) =
+                    tunnels_with_streams(PROTOCOL_VERSION as u32, client_version).await;
+                let answer = if answer_right {
+                    right
+                        .clone()
+                        .unwrap_or_else(|| password_proof(password, &client.transport_aad).to_vec())
+                } else {
+                    wrong.clone()
+                };
+                let client_side = tokio::spawn(async move {
+                    let _flag = recv_packet_with_timeout(&mut client_stream).await.unwrap();
+                    send_packet(
+                        &mut client_stream,
+                        &client.cipher.encrypt(&answer, Some(&client.transport_aad)),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let res = host_password_gate(
+                    &mut host_stream,
+                    &host.cipher,
+                    &host.transport_aad,
+                    host.peer_version,
+                    Some(password),
+                )
+                .await;
+                client_side.await.unwrap();
+                assert_eq!(
+                    res.is_ok(),
+                    answer_right,
+                    "client v{client_version}, right answer: {answer_right}"
+                );
+            }
+        }
     }
 
     /// Run both handshake halves announcing the given versions.

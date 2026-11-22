@@ -66,7 +66,9 @@ Oversized packets are rejected.
 
 ### Protocol generation
 
-Current peers announce version **4** and accept `>= 3`. v4 adds the
+Current peers announce version **5** and accept `>= 3`. v5 changes only the
+connection-password gate (below): the client proves the password instead of
+sending it. v4 adds the
 ephemeral-key commitment (step 2 below); with a v3 peer on either side it is
 skipped, the handshake otherwise proceeds as before, and both apps warn that
 the safety code is a weak check for that peer and the fingerprint should be
@@ -124,14 +126,27 @@ the established, transcript-bound tunnel *after* identity verification and *befo
 the peer is surfaced for fingerprint confirmation:
 
 - The host sends an encrypted one-byte flag indicating whether a password is required.
-- The client replies with the (encrypted) password, or an empty payload when none is
-  required.
-- The host compares the supplied password to the expected one in constant time; a
-  mismatch (or a missing password) aborts the session before any TOFU prompt.
+- A **v5** client replies with a *proof*, never the password:
+  `HKDF-SHA256(salt = "p2pem-v5-connection-password-proof" || transport_aad,
+  ikm = password, info = "client", L = 32)` — an HMAC keyed by the transcript
+  (`session::password_proof`, pinned by a known-answer test). An empty payload
+  when no password is required.
+- The host compares in constant time: against the proof for a v5+ client, against
+  the password itself for an older one. A mismatch (or a missing password) aborts
+  the session before any TOFU prompt.
 
-Both frames are encrypted with the session cipher and bound to the transport AAD, so
-the password is never exposed and is replay-protected by the session's nonces. When
-the host has no password configured, the flag is `0` and the exchange is a no-op.
+The gate runs before the user has compared the safety code, so the peer may be
+posing as the host. Sending the password there — as every client before v5 did —
+handed it to anyone who could impersonate the host (a malicious relay, a spoofed
+invite address, a LAN attacker), who then used it on the real one (audit
+CRYPTO-05). The proof is bound to this handshake's transcript, which a man in the
+middle cannot share with the real host (it runs two handshakes), so it cannot be
+relayed; a fake host can only try guesses offline, which a strong password
+defeats. **Downgrade:** a fake host could simply announce v4 to be sent the
+password, so a v5 client never sends it to a host older than v5 — it sends an
+empty reply and reports that the host must be updated. A v5 host still admits a
+v4 client's plaintext answer: that exposes only the old client. When the host has
+no password configured, the flag is `0` and the exchange is a no-op.
 
 ### Transcript binding
 
