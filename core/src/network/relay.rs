@@ -193,7 +193,11 @@ pub async fn serve_relay(listener: TcpListener, wait_timeout: Duration) -> Resul
         // descriptors). Propagating it with `?` would take the whole rendezvous
         // down for the life of the process over a single hiccup.
         let (stream, addr) = match listener.accept().await {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                // Bridged bytes are someone's frames; see NET-04 in `framing.rs`.
+                accepted.0.set_nodelay(true).ok();
+                accepted
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "relay accept failed; continuing to listen");
                 tokio::time::sleep(Duration::from_millis(50)).await;

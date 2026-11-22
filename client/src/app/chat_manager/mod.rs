@@ -107,6 +107,10 @@ pub struct PendingFingerprint {
     pub session_id: Uuid,
 }
 
+/// Safety-code prompts that may wait at once. A real user verifies one or two
+/// peers at a time; past this a caller is refused, not queued (audit NET-05).
+pub const MAX_QUEUED_PROMPTS: usize = 8;
+
 /// Main chat manager - orchestrates sessions, messages, and file transfers
 pub struct ChatManager {
     pub chats: HashMap<Uuid, Chat>,
@@ -436,6 +440,19 @@ impl ChatManager {
             .find(|p| p.session_id == request.session_id)
         {
             *slot = request;
+            return;
+        }
+        // Anyone can complete a handshake with a throwaway key; an unbounded
+        // queue let one machine bury the real prompts (audit NET-05).
+        if self.fingerprint_verification_requests.len() >= MAX_QUEUED_PROMPTS {
+            tracing::warn!(peer = %request.peer_name, "Too many unverified connections; refused one");
+            self.answer_fingerprint_check(request.session_id, false);
+            self.add_toast(
+                ToastLevel::Warning,
+                format!(
+                    "Refused a connection: {MAX_QUEUED_PROMPTS} others are already waiting to be verified"
+                ),
+            );
             return;
         }
         self.fingerprint_verification_requests.push_back(request);

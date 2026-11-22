@@ -185,7 +185,7 @@ impl ChatManager {
     }
 
     /// Tell a session task the outcome of its fingerprint check.
-    fn answer_fingerprint_check(&self, session_id: Uuid, accept: bool) {
+    pub(super) fn answer_fingerprint_check(&self, session_id: Uuid, accept: bool) {
         if let Some(tx) = self.fingerprint_confirm_senders.get(&session_id) {
             if let Err(e) = tx.send(accept) {
                 tracing::error!(%session_id, "Failed to answer the fingerprint check: {}", e);
@@ -335,8 +335,32 @@ impl ChatManager {
                 // transfer is tracked under.
                 self.fail_incoming_transfers(chat_id, "connection lost");
 
+                // Incoming conversations this session opened that were never
+                // verified and hold nothing: a caller that hung up before the
+                // user accepted it. Kept, each throwaway key left a persisted
+                // "Peer ab12…" behind forever (audit NET-05). Resolved before
+                // the mapping goes — it is how they are found.
+                let abandoned: Vec<Uuid> = self
+                    .chat_id_mapping
+                    .iter()
+                    .filter(|(incoming, session)| **session == chat_id && **incoming != chat_id)
+                    .map(|(incoming, _)| *incoming)
+                    .filter(|incoming| {
+                        self.chats.get(incoming).is_some_and(|c| {
+                            c.peer_fingerprint.is_none()
+                                && c.messages.is_empty()
+                                && !c.title_is_custom
+                                && !c.is_host_placeholder
+                        }) && !self.contact_to_chat.values().any(|v| v == incoming)
+                    })
+                    .collect();
+
                 self.teardown_session(chat_id);
                 self.chat_id_mapping.retain(|_, v| *v != chat_id);
+                for incoming in abandoned {
+                    tracing::info!(%incoming, "Dropped an incoming conversation that was never verified");
+                    self.chats.remove(&incoming);
+                }
 
                 // A listener that died without ever accepting anyone leaves its
                 // placeholder chat behind, and `check_rehost_needed()` then

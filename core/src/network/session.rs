@@ -198,7 +198,10 @@ pub async fn run_host_session(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, addr) = match accepted {
-                    Ok(pair) => pair,
+                    Ok(pair) => {
+                        pair.0.set_nodelay(true).ok(); // Every frame is small and latency-bound; see NET-04 in `framing.rs`.
+                        pair
+                    }
                     Err(e) => {
                         // A transient EMFILE must not end hosting; back off
                         // briefly so it cannot spin either.
@@ -289,7 +292,10 @@ pub async fn connect_first_reachable(
     let mut last_err: Option<anyhow::Error> = None;
     for (i, (host, port)) in targets.iter().enumerate() {
         match tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), *port))).await {
-            Ok(Ok(stream)) => return Ok((stream, host.clone(), *port)),
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true).ok(); // Every frame is small and latency-bound; see NET-04 in `framing.rs`.
+                return Ok((stream, host.clone(), *port));
+            }
             Ok(Err(e)) => {
                 tracing::warn!(host = %host, port = %port, error = %e, "Candidate address refused/unreachable");
                 last_err = Some(e.into());
@@ -2099,6 +2105,27 @@ mod tests {
             }
             other => panic!("expected Warning event, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_first_reachable_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (stream, _, _) = connect_first_reachable(&[("127.0.0.1".to_string(), port)], &events)
+            .await
+            .unwrap();
+        assert!(
+            stream.nodelay().unwrap(),
+            "NET-04: Nagle left on a session socket"
+        );
+        let reusable = crate::network::punch::connect_reusable("127.0.0.1", port)
+            .await
+            .unwrap();
+        assert!(
+            reusable.nodelay().unwrap(),
+            "NET-04: Nagle left on the relay socket"
+        );
     }
 
     #[tokio::test]

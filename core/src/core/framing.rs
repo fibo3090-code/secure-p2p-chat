@@ -17,12 +17,15 @@ where
         ));
     }
 
-    // Send length header (4 bytes big-endian)
-    let header = (len as u32).to_be_bytes();
-    stream.write_all(&header).await?;
-
-    // Send payload
-    stream.write_all(payload).await?;
+    // Header (4 bytes big-endian) and payload in ONE write. Two writes let
+    // Nagle hold the payload until the header's segment is ACKed, and the
+    // receiver delays that ACK: ~40 ms per small message on Linux, up to
+    // 200 ms on Windows (audit NET-04). The copy costs less than the AEAD
+    // that produced the payload.
+    let mut frame = Vec::with_capacity(4 + len);
+    frame.extend_from_slice(&(len as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame).await?;
     stream.flush().await?;
 
     tracing::trace!("Sent packet: {} bytes", len);
@@ -76,6 +79,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-04: the header and the payload went out in two writes. With Nagle
+    /// on, the payload then waits for the header's ACK, which the receiver
+    /// holds on its delayed-ACK timer — about 40 ms per small message on
+    /// Linux, up to 200 ms on Windows. One frame is one write.
+    #[tokio::test]
+    async fn a_frame_is_one_write() {
+        struct Writes(Vec<Vec<u8>>);
+        impl tokio::io::AsyncWrite for Writes {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.0.push(buf.to_vec());
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut w = Writes(Vec::new());
+        send_packet(&mut w, b"hello").await.unwrap();
+        assert_eq!(w.0, vec![[&5u32.to_be_bytes()[..], b"hello"].concat()]);
+    }
 
     #[tokio::test]
     async fn test_framing_roundtrip() {

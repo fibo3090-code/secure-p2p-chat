@@ -445,7 +445,10 @@ pub(crate) async fn connect_reusable(host: &str, port: u16) -> Result<TcpStream>
             }
         };
         match socket.connect(addr).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                stream.set_nodelay(true).ok(); // Every frame is small and latency-bound; see NET-04 in `framing.rs`.
+                return Ok(stream);
+            }
             Err(e) => last_err = Some(e.into()),
         }
     }

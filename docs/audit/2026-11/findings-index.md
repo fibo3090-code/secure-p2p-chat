@@ -103,8 +103,8 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-12 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unaccepted file offers are spooled into the user's Downloads folder and orphaned after a crash |
 | JOURNEY-14 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unsigned installers ship with no install walkthrough |
 | NET-03 | Medium | Fixed | S | [02-network](reports/02-network.md) | Two host rekeys can happen before the client switches, after which old-key frames are undecryptable |
-| NET-04 | Medium | VERIFIED | S | [02-network](reports/02-network.md) | No `TCP_NODELAY` and a two-write frame cause delayed-ACK stalls on every small message |
-| NET-05 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | Unauthenticated peers can create unlimited TOFU prompts, 30-minute sessions and junk conversations |
+| NET-04 | Medium | Fixed | S | [02-network](reports/02-network.md) | No `TCP_NODELAY` and a two-write frame cause delayed-ACK stalls on every small message |
+| NET-05 | Medium | Fixed | M | [02-network](reports/02-network.md) | Unauthenticated peers can create unlimited TOFU prompts, 30-minute sessions and junk conversations |
 | NET-06 | Medium | Fixed | S | [02-network](reports/02-network.md) | A relay host that disconnects while waiting keeps its token slot for the full 5 minutes |
 | NET-07 | Medium | Fixed | S | [02-network](reports/02-network.md) | No per-address cap on pending rendezvous slots; a few IPs can fill the global table |
 | NET-08 | Medium | Fixed | S | [02-network](reports/02-network.md) | The punch hello tag is sent before the peer proves anything, so any stranger can reflect it and claim the punched socket |

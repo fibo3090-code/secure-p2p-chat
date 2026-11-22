@@ -459,6 +459,8 @@ impl PartyManager {
         // this while holding their UI loop or the party lock (TUI-08, APP-10).
         let client = tokio::time::timeout(PARTY_CONNECT_TIMEOUT, async {
             let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+            // Frames are small and latency-bound: no Nagle (audit NET-04).
+            stream.set_nodelay(true).ok();
             PartyClient::connect(stream, privkey, Uuid::new_v4()).await
         })
         .await

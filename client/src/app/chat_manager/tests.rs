@@ -2398,6 +2398,79 @@ fn concurrent_tofu_prompts_queue_instead_of_overwriting() {
     drop(confirm_rx);
 }
 
+/// NET-05: any machine can complete the handshake with a throwaway key, and
+/// each such caller queued a safety-code prompt. Nothing bounded the queue,
+/// so one machine could bury the real prompts under hundreds. Past the cap a
+/// caller is refused (its session told to abort) and the user is told why.
+#[test]
+fn unverified_callers_cannot_queue_prompts_without_limit() {
+    let mut mgr = ChatManager::default();
+    let mut answers = Vec::new();
+    for i in 0..(MAX_QUEUED_PROMPTS + 5) {
+        let session = Uuid::new_v4();
+        mgr.create_local_chat_for_test(session, format!("Peer {i}"));
+        let (tx, rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(session, tx);
+        mgr.handle_tofu_verification(session, &format!("FP-{i}"), "Peer", "");
+        answers.push(rx);
+    }
+    assert_eq!(mgr.pending_fingerprint_count(), MAX_QUEUED_PROMPTS);
+    for (i, rx) in answers.iter_mut().enumerate() {
+        let got = rx.try_recv().ok();
+        if i < MAX_QUEUED_PROMPTS {
+            assert_eq!(got, None, "caller {i} is waiting for the user");
+        } else {
+            assert_eq!(got, Some(false), "caller {i} should have been refused");
+        }
+    }
+    assert!(
+        mgr.toasts
+            .iter()
+            .any(|t| t.message.contains("waiting to be verified")),
+        "{:?}",
+        mgr.toasts.iter().map(|t| &t.message).collect::<Vec<_>>()
+    );
+}
+
+/// NET-05: a caller that hung up without being verified left a persisted
+/// "Peer ab12…" conversation behind — one per throwaway key, forever. An
+/// incoming conversation that was never verified and holds nothing goes with
+/// its session; one the user accepted, or one with messages, stays.
+#[test]
+fn a_caller_that_leaves_unverified_leaves_no_conversation() {
+    for accept in [false, true] {
+        let mut mgr = ChatManager::default();
+        let listener = Uuid::new_v4();
+        mgr.create_local_chat_for_test(listener, "Host on :12345".into());
+        mgr.chats.get_mut(&listener).unwrap().is_host_placeholder = true;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        mgr.add_fingerprint_confirm_sender_for_test(listener, tx);
+        let offered = Uuid::new_v4();
+        mgr.handle_session_event(
+            listener,
+            SessionEvent::NewConnection {
+                peer_addr: "198.51.100.9:50000".into(),
+                fingerprint: "ab".repeat(32),
+                sas: "123456".into(),
+                chat_id: offered,
+            },
+        );
+        assert!(
+            mgr.chats.contains_key(&offered),
+            "an incoming conversation was opened"
+        );
+        if accept {
+            mgr.confirm_fingerprint(listener, true).unwrap();
+        }
+        mgr.handle_session_event(listener, SessionEvent::Disconnected);
+        assert_eq!(
+            mgr.chats.contains_key(&offered),
+            accept,
+            "accepted: {accept} — a verified conversation must survive its session, an unverified empty one must not"
+        );
+    }
+}
+
 /// A prompt for a session that died can never be answered; leaving it queued
 /// would block every peer behind it.
 #[test]
