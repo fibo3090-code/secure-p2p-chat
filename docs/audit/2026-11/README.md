@@ -283,6 +283,7 @@ unnoticed.
 | PRIV-06, JOURNEY-07 | Desktop notifications put the message text into the OS notification store and on the lock screen, outside the app's encryption, with no way to say less. New `Config::notification_content` (`full` / `sender_only` / `hidden`, `serde(default)` → `sender_only`): by default a notification names the sender, not the message. Settable in the desktop Settings (offered only while notifications are on) and with `:set notification-content` in the TUI; an older frontend that omits it does not reset it. | New behaviour. | `chat_manager::tests::a_notification_says_only_what_the_setting_allows`; config back-compat in `types.rs`; desktop `settings_roundtrip_and_validation`; `Settings.test.jsx` › saves the chosen level; TUI `set_command_toggles_config` |
 | PRIV-04 (part) | The diagnostics bundle — made to be attached to a public issue — carried live relay tokens, peer IPs and full fingerprints in its logs, in files written 0644. Its files are written with `write_file_atomic` (0600), 32+-hex runs and IPv4 addresses in the logs become `<hex>`/`<ip>`, and the README says what may remain (file and contact names) and to read `logs.txt` first. Names are not recognised by shape, so that half stays open. | — | `support::tests::export_bundle_writes_expected_files`, `redaction_removes_secrets_and_keeps_the_rest` |
 | PRIV-05 | A release desktop build logged at debug level by default (file names, peer addresses, frame metadata) to stdout, which on Linux can persist in the systemd journal. Release builds default to `warn,p2pem_desktop=info`; debug builds keep debug; `RUST_LOG` still overrides. | — | desktop `tests::a_release_build_does_not_log_at_debug_level_by_default` |
+| PERF-06, PERF-10, PERF-08 (part) | Covered by fixes above: server history keeps only a resident tail and pages from SQLite; Nagle is the same defect as NET-04; upload memory is bounded server-wide by SRV-07 (spools are still in RAM). | — | see SRV-01/NET-04/SRV-07 rows |
 | UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
 
 ### Critical and High findings fixed before this pass — the test that guards each
@@ -351,6 +352,14 @@ here beyond the findings named elsewhere in this section.
   refuses a crowd behind one NAT without a word. Each needs a design decision
   (what to audit; a confusables skeleton and a new dependency; a refusal message
   before the handshake) rather than a bug fix.
+
+- **PRIV-02, PRIV-03 (Medium, privacy).** One long-term identity key
+  authenticates the user to every community, so operators can link a user
+  across communities; and the relay hands each peer the other's public and LAN
+  addresses before either has verified the other. Both are design decisions —
+  a per-community key derived from the identity, and sending LAN candidates
+  only after verification — that change what the protocol promises, not bugs a
+  test can pin.
 
 - **CRYPTO-09 (Low, security).** The history file has no rollback protection:
   an older `history.json.enc` loads normally and restores revoked trust and

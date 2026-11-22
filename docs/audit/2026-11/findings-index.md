@@ -110,11 +110,11 @@ prioritised view is in [README.md](README.md).
 | NET-08 | Medium | Fixed | S | [02-network](reports/02-network.md) | The punch hello tag is sent before the peer proves anything, so any stranger can reflect it and claim the punched socket |
 | NET-09 | Medium | VERIFIED | M | [02-network](reports/02-network.md) | The relay control channel is cleartext: token, LAN IPs and pairing are visible and spoofable on path |
 | NET-10 | Medium | Fixed | S/M | [02-network](reports/02-network.md) | Confirming the SAS more than 5 minutes apart kills the session |
-| PERF-06 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | Server history is fully resident; paging scans from message 1; startup re-parses everything |
+| PERF-06 | Medium | Fixed | S | [11-performance](reports/11-performance.md) | Server history is fully resident; paging scans from message 1; startup re-parses everything |
 | PERF-07 | Medium | VERIFIED | M | [11-performance](reports/11-performance.md) | P2P receive path has no backpressure; chunk writes are blocking I/O under the manager lock |
-| PERF-08 | Medium | VERIFIED | M | [11-performance](reports/11-performance.md) | Server upload spools held in RAM: about 0.5 GiB per member, not bounded server-wide |
+| PERF-08 | Medium | Partly fixed | M | [11-performance](reports/11-performance.md) | Server upload spools held in RAM: about 0.5 GiB per member, not bounded server-wide |
 | PERF-09 | Medium | VERIFIED | M | [11-performance](reports/11-performance.md) | Desktop poll loop: unconditional 4 Hz wakeups, each walking every message twice under the lock |
-| PERF-10 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | Nagle plus delayed ACK on direct-P2P and Party connections (latency model) |
+| PERF-10 | Medium | Fixed | S | [11-performance](reports/11-performance.md) | Nagle plus delayed ACK on direct-P2P and Party connections (latency model) |
 | PERF-11 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | `image` default features compile AV1, EXR, TIFF, WebP and rayon only to encode one PNG |
 | PERF-12 | Medium | VERIFIED | S | [11-performance](reports/11-performance.md) | Argon2, RSA and history load run synchronously on async workers and hold locks; no optimized dev profile for crypto |
 | PRIV-02 | Medium | VERIFIED | M | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The same long-term identity key authenticates the user to every community server, so operators can link users across communities and to their P2P identity |
