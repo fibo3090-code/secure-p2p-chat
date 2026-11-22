@@ -372,7 +372,19 @@ async fn file_message_path(
 }
 
 /// Open a file with the OS default app, or reveal it in the file manager.
+/// Under `cfg(test)` the request is recorded (`tests::opened`) instead.
 fn open_path_os(path: &Path, reveal: bool) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        crate::tests::opened::record(path, reveal);
+        Ok(())
+    }
+    #[cfg(not(test))]
+    launch_with_os(path, reveal)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn launch_with_os(path: &Path, reveal: bool) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -459,19 +471,102 @@ const RISKY_EXTENSIONS: &[&str] = &[
     "pkg",
     "deb",
     "rpm",
+    // Windows launchers, installers, add-ins and scriptlets (TAURI-06)
+    "appref-ms",
+    "settingcontent-ms",
+    "library-ms",
+    "search-ms",
+    "diagcab",
+    "appinstaller",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "xll",
+    "wsc",
+    "sct",
+    "vb",
+    "ws",
+    "ps1xml",
+    "psc1",
+    "jnlp",
+    "website",
+    "mde",
+    "cab",
+    // Disk images: mounting one presents its contents without the download's
+    // protections
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "dmg",
+    // Macro-enabled Office documents
+    "docm",
+    "dotm",
+    "xlsm",
+    "xltm",
+    "xlam",
+    "pptm",
+    "potm",
+    "ppam",
+    // Opens in a browser with a `file://` origin, script and all
+    "html",
+    "htm",
+    "xhtml",
+    "mht",
+    "mhtml",
+    "svg",
+    // macOS launchers and scripts
+    "terminal",
+    "tool",
+    "scpt",
+    "applescript",
+    "workflow",
+    "webloc",
+    "inetloc",
+    "fileloc",
+    "mpkg",
 ];
 
-/// The reason opening `path` would be handing a peer's file to the OS to
-/// execute, or `None` when it is ordinary content.
+/// Received content that opens on a click without asking: types whose default
+/// handler displays or plays them. Everything else — documents, archives,
+/// anything unnamed — gets a confirmation first, because the list of things
+/// that run code when opened is open-ended and a deny-list is always missing
+/// one (TAURI-06). Mirrored in `desktop/src/lib/bridge.js`, checked by
+/// `bridge.test.js`.
+const INERT_EXTENSIONS: &[&str] = &[
+    // Raster images (SVG is not one: it can carry script)
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif",
+    // Documents that only display
+    "pdf", "txt", "md", "csv", "log", // Audio
+    "mp3", "wav", "ogg", "oga", "flac", "m4a", "aac", "opus", // Video
+    "mp4", "m4v", "mov", "mkv", "webm", "avi",
+];
+
+/// Why opening `path` needs the user's say-so, or `None` when it is content
+/// known to be inert.
 ///
-/// Returns the extension so the warning can name what it is about — "this is a
-/// .exe" is actionable, "this file may be dangerous" is not.
-fn execution_risk(path: &Path) -> Option<String> {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let lower = ext.to_ascii_lowercase();
-        if RISKY_EXTENSIONS.contains(&lower.as_str()) {
-            return Some(lower);
-        }
+/// `kind` names the extension (empty when there is none), or "executable" for
+/// a Unix file with an exec bit, so the warning can say what it is about.
+/// `runs` is true when the OS would *execute* it, rather than merely hand it
+/// to an application that might.
+#[derive(Debug, PartialEq)]
+struct OpenRisk {
+    kind: String,
+    runs: bool,
+}
+
+fn execution_risk(path: &Path) -> Option<OpenRisk> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if RISKY_EXTENSIONS.contains(&ext.as_str()) {
+        return Some(OpenRisk {
+            kind: ext,
+            runs: true,
+        });
     }
     // On Unix the executable bit decides, with or without an extension: a peer
     // can send a file named `notes` that runs on click.
@@ -480,11 +575,22 @@ fn execution_risk(path: &Path) -> Option<String> {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                return Some("executable".to_string());
+                return Some(OpenRisk {
+                    kind: "executable".to_string(),
+                    runs: true,
+                });
             }
         }
     }
-    None
+    if INERT_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    // Not known to run, not known to be safe. With no extension at all,
+    // `xdg-open` sniffs the content — a PE file can reach Wine.
+    Some(OpenRisk {
+        kind: ext,
+        runs: false,
+    })
 }
 
 /// Outcome of [`open_file`]: either it opened, or it was held back because the
@@ -492,8 +598,12 @@ fn execution_risk(path: &Path) -> Option<String> {
 #[derive(Serialize)]
 pub(crate) struct OpenOutcome {
     opened: bool,
-    /// The risky extension (or "executable"), when `opened` is false.
+    /// The extension that held the open back (empty when the file has none,
+    /// "executable" for an exec bit), when `opened` is false.
     blocked: Option<String>,
+    /// The OS would execute it, as opposed to it being a type not known to be
+    /// inert. The two get different warnings: a .docx is not a program.
+    runs: bool,
     /// The file's name, for the confirmation prompt.
     filename: Option<String>,
 }
@@ -522,10 +632,11 @@ pub(crate) async fn open_file(
         return Err(format!("File no longer exists on disk: {}", path.display()));
     }
     if !reveal && !from_me && !confirm.unwrap_or(false) {
-        if let Some(kind) = execution_risk(&path) {
+        if let Some(risk) = execution_risk(&path) {
             return Ok(OpenOutcome {
                 opened: false,
-                blocked: Some(kind),
+                blocked: Some(risk.kind),
+                runs: risk.runs,
                 filename: path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -537,6 +648,7 @@ pub(crate) async fn open_file(
     Ok(OpenOutcome {
         opened: true,
         blocked: None,
+        runs: false,
         filename: None,
     })
 }

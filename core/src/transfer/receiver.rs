@@ -207,6 +207,7 @@ impl IncomingFile {
 
         // Atomic rename onto the name we just reserved.
         tokio::fs::rename(&self.tmp_path, &final_path).await?;
+        crate::util::mark_as_downloaded(&final_path);
 
         tracing::info!("File saved to: {:?}", final_path);
 
@@ -364,6 +365,7 @@ impl IncomingFileSync {
             std::fs::remove_file(&final_path).ok();
             return Err(e.into());
         }
+        crate::util::mark_as_downloaded(&final_path);
         tracing::info!("File saved to: {:?}", final_path);
 
         Ok(final_path)
@@ -381,6 +383,27 @@ impl IncomingFileSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TAURI-06: a received file carries the Internet zone, so SmartScreen
+    /// and Office Protected View apply when it is opened — the in-app
+    /// confirmation is one click, and the OS's own checks are the second line.
+    #[cfg(windows)]
+    #[test]
+    fn a_received_file_is_marked_as_coming_from_the_internet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut incoming = IncomingFileSync::new(dir.path(), "setup.exe", 3).unwrap();
+        incoming.write_chunk(b"MZ!").unwrap();
+        let path = incoming.finalize().unwrap();
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        let zone = std::fs::read_to_string(&stream).expect("no Zone.Identifier stream");
+        assert!(zone.contains("ZoneId=3"), "{zone}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"MZ!",
+            "the tag touched the content"
+        );
+    }
 
     /// APP-03: a peer that declares N bytes and ends after fewer made finalize
     /// fail — and leave the partial spool in the download folder, invisible to

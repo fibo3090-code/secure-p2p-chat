@@ -193,7 +193,7 @@ describe("ChatPane file cards", () => {
   it("turns a blocked open into a question, and only runs it after confirmation", async () => {
     const openFile = vi.fn(async (_id, _msg, _reveal, confirm) =>
       confirm ? { opened: true, blocked: null, filename: "holiday.jpg.exe" }
-              : { opened: false, blocked: "exe", filename: "holiday.jpg.exe" });
+              : { opened: false, blocked: "exe", runs: true, filename: "holiday.jpg.exe" });
     installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);
@@ -207,8 +207,37 @@ describe("ChatPane file cards", () => {
     expect(openFile).toHaveBeenLastCalledWith("chat-1", "f1", false, true);
   });
 
+  // TAURI-06: a type not known to be inert asks too, but honestly — a .docx
+  // is not a program, and telling people it is teaches them to click past
+  // the warning that matters.
+  it("asks before opening a type it cannot vouch for, without calling it a program", async () => {
+    const openFile = vi.fn(async (_id, _msg, _reveal, confirm) =>
+      confirm ? { opened: true, blocked: null, runs: false, filename: "report.docx" }
+              : { opened: false, blocked: "docx", runs: false, filename: "report.docx" });
+    installApi({ openFile });
+
+    render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ name: "report.docx" })] })} />);
+    await userEvent.click(screen.getByTitle("Open file"));
+    const dialog = await screen.findByRole("dialog", { name: /Open this file/i });
+    expect(dialog.textContent).toMatch(/\.docx/);
+    expect(screen.queryByRole("dialog", { name: /run as a program/i })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /Open anyway/ }));
+    expect(openFile).toHaveBeenLastCalledWith("chat-1", "f1", false, true);
+  });
+
+  it("holds back a file with no extension — an empty kind is still a refusal", async () => {
+    const openFile = vi.fn(async () => ({ opened: false, blocked: "", runs: false, filename: "README" }));
+    installApi({ openFile });
+
+    render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg({ name: "README" })] })} />);
+    await userEvent.click(screen.getByTitle("Open file"));
+    const dialog = await screen.findByRole("dialog", { name: /Open this file/i });
+    expect(dialog.textContent).toMatch(/no extension/);
+  });
+
   it("lets the user back out of a blocked open without running anything", async () => {
-    const openFile = vi.fn(async () => ({ opened: false, blocked: "exe", filename: "x.exe" }));
+    const openFile = vi.fn(async () => ({ opened: false, blocked: "exe", runs: true, filename: "x.exe" }));
     installApi({ openFile });
 
     render(<ChatPane {...base} contact={contactFixture({ messages: [fileMsg()] })} />);

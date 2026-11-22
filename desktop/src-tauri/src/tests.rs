@@ -1108,12 +1108,25 @@ impl Harness {
 /// would launch a program on the test machine.
 #[test]
 fn opening_a_received_executable_needs_confirmation() {
+    let _serial = opened_test();
     let h = ready_harness();
     let files = tempfile::tempdir().unwrap();
-    for (name, kind) in [
-        ("setup.exe", "exe"),
-        ("holiday.JPG.Lnk", "lnk"),
-        ("launcher.desktop", "desktop"),
+    // `runs`: the OS would execute it (the warning says so). Otherwise the
+    // type is simply not one known to be inert — macro documents, archives,
+    // HTML, disk images and anything unnamed can all run code, but saying
+    // "this is a program" about a .docx would be false (TAURI-06).
+    for (name, kind, runs) in [
+        ("setup.exe", "exe", true),
+        ("holiday.JPG.Lnk", "lnk", true),
+        ("launcher.desktop", "desktop", true),
+        ("disk.iso", "iso", true),
+        ("budget.xlsm", "xlsm", true),
+        ("page.html", "html", true),
+        ("vector.svg", "svg", true),
+        ("Open me.terminal", "terminal", true),
+        ("report.docx", "docx", false),
+        ("archive.zip", "zip", false),
+        ("README", "", false),
     ] {
         let path = files.path().join(name);
         std::fs::write(&path, b"payload").unwrap();
@@ -1126,8 +1139,55 @@ fn opening_a_received_executable_needs_confirmation() {
             .expect("a held-back open is an outcome, not an error");
         assert_eq!(outcome["opened"], false, "{name} was opened without asking");
         assert_eq!(outcome["blocked"], kind, "{name}");
+        assert_eq!(outcome["runs"], runs, "{name}");
         assert_eq!(outcome["filename"], name);
     }
+    assert!(opened::take().is_empty(), "a held-back file reached the OS");
+
+    // Known-inert content opens on click; a confirmed risky one opens too;
+    // revealing never asks; the user's own sends are not gated.
+    let mut expect = Vec::new();
+    for name in [
+        "photo.JPG",
+        "report.pdf",
+        "notes.txt",
+        "song.mp3",
+        "clip.mp4",
+    ] {
+        let path = files.path().join(name);
+        std::fs::write(&path, b"content").unwrap();
+        let (chat, msg) = h.seed_file_message(&path, false);
+        let outcome = h
+            .ipc(
+                "open_file",
+                json!({ "id": chat.to_string(), "msg": msg.to_string(), "reveal": false }),
+            )
+            .unwrap();
+        assert_eq!(outcome["opened"], true, "{name} was held back");
+        expect.push((path, false));
+    }
+    let risky = files.path().join("setup.exe");
+    let (chat, msg) = h.seed_file_message(&risky, false);
+    for (reveal, confirm) in [(false, true), (true, false)] {
+        let outcome = h
+            .ipc(
+                "open_file",
+                json!({ "id": chat.to_string(), "msg": msg.to_string(), "reveal": reveal, "confirm": confirm }),
+            )
+            .unwrap();
+        assert_eq!(outcome["opened"], true);
+        expect.push((risky.clone(), reveal));
+    }
+    let (chat, msg) = h.seed_file_message(&risky, true);
+    let outcome = h
+        .ipc(
+            "open_file",
+            json!({ "id": chat.to_string(), "msg": msg.to_string(), "reveal": false }),
+        )
+        .unwrap();
+    assert_eq!(outcome["opened"], true, "the user's own send was gated");
+    expect.push((risky.clone(), false));
+    assert_eq!(opened::take(), expect);
 
     // On Unix the exec bit decides, whatever the name.
     #[cfg(unix)]
@@ -2168,6 +2228,31 @@ pub(crate) mod dialogs {
         ANSWERS.lock().unwrap().clear();
         ASKED.lock().unwrap().clear();
     }
+}
+
+/// What `open_path_os` would have handed the OS, recorded instead of
+/// launched — a test that really opened a file would start a program on the
+/// machine running it.
+pub(crate) mod opened {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OPENED: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+    pub(super) static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn record(path: &Path, reveal: bool) {
+        OPENED.lock().unwrap().push((path.to_path_buf(), reveal));
+    }
+
+    pub(super) fn take() -> Vec<(PathBuf, bool)> {
+        std::mem::take(&mut *OPENED.lock().unwrap())
+    }
+}
+
+fn opened_test() -> std::sync::MutexGuard<'static, ()> {
+    let guard = opened::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    opened::take();
+    guard
 }
 
 fn dialog_test() -> std::sync::MutexGuard<'static, ()> {

@@ -258,6 +258,28 @@ pub fn has_hidden_characters(name: &str) -> bool {
     })
 }
 
+/// Tag a file received from a peer the way a browser tags a download, so the
+/// OS applies its own protections when it is opened (TAURI-06): on Windows a
+/// `Zone.Identifier` stream with `ZoneId=3` (Internet) is what makes
+/// SmartScreen check an executable and Office open a document in Protected
+/// View. Best effort — a filesystem without alternate data streams (FAT, some
+/// network shares) simply does not get the tag.
+///
+/// macOS needs no code: the desktop bundle sets `LSFileQuarantineEnabled`, so
+/// the system quarantines every file the app writes. Linux has no equivalent.
+pub fn mark_as_downloaded(path: &Path) {
+    #[cfg(windows)]
+    {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        if let Err(e) = std::fs::write(&stream, b"[ZoneTransfer]\r\nZoneId=3\r\n") {
+            tracing::debug!(path = %path.display(), "could not mark a received file as downloaded: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 /// Reduce a peer-supplied name to something safe to create on this machine and
 /// honest to display.
 ///

@@ -13,6 +13,13 @@ predate tagged releases.
 
 ### Security
 
+- Opening a file a contact sent now asks first unless it is a picture, PDF,
+  plain text, audio or video. Previously only a fixed list of program types
+  asked, and it missed disk images, macro-enabled Office documents, HTML and
+  several Windows and macOS launchers, which opened on one click. Received
+  files are also marked as downloaded from the Internet (Windows) or
+  quarantined (macOS), so the system's own checks apply when they are opened.
+
 - Notifications no longer show the message text by default — only who wrote
   it. Notification text is kept by the operating system and can appear on the
   lock screen, outside the app's encryption. Settings → "What notifications

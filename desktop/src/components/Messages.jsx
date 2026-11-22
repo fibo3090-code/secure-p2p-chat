@@ -492,7 +492,12 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   const openFile = useCallback(async (m) => {
     try {
       const r = await api.openFile(contactId, m.id, false);
-      if (r && r.blocked) setRiskyOpen({ msg: m, kind: r.blocked, filename: r.filename || m.name });
+      // `opened === false`, not `blocked`: a file with no extension is held
+      // back with an empty kind, which is falsy. An answer that does not say
+      // whether it runs gets the stronger warning.
+      if (r && r.opened === false) {
+        setRiskyOpen({ msg: m, kind: r.blocked ?? "", runs: r.runs !== false, filename: r.filename || m.name });
+      }
     } catch (e) { toast(friendlyError(e), "error"); }
   }, [contactId]);
   const confirmRiskyOpen = async () => {
@@ -634,7 +639,33 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         </button>
       </div>
 
-      {riskyOpen && (
+      {riskyOpen && !riskyOpen.runs && (
+        <Modal open onClose={() => setRiskyOpen(null)} width={440}
+          title="Open this file?" icon="alert">
+          <div className="creator-pane">
+            <p className="creator-lead">
+              <strong>{riskyOpen.filename}</strong>{" "}
+              {riskyOpen.kind
+                ? <>is a <code>.{riskyOpen.kind}</code> file.</>
+                : <>has no extension, so your system will guess what to open it with.</>}{" "}
+              Pictures, PDFs, text, audio and video open straight away; other
+              kinds of file can contain code that runs when they are opened —
+              macros, scripts, installers.
+            </p>
+            <p className="creator-lead">
+              It came from <strong>{contact.name}</strong>. Open it if you were
+              expecting it from them.
+            </p>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <Button icon="x" onClick={() => setRiskyOpen(null)}>Don't open</Button>
+              <Button variant="danger" icon="alert" onClick={confirmRiskyOpen}>
+                Open anyway
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {riskyOpen && riskyOpen.runs && (
         <Modal open onClose={() => setRiskyOpen(null)} width={440}
           title="This file will run as a program" icon="alert">
           <div className="creator-pane">

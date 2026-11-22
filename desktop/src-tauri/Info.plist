@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the bundle's generated Info.plist by the Tauri CLI.
+
+  LSFileQuarantineEnabled: every file the app writes gets the
+  com.apple.quarantine attribute, so a file received from a peer is checked by
+  Gatekeeper when it is opened, as a browser download would be (audit
+  TAURI-06). Windows gets the equivalent Zone.Identifier stream from
+  messenger_core::util::mark_as_downloaded.
+-->
+<plist version="1.0">
+<dict>
+  <key>LSFileQuarantineEnabled</key>
+  <true/>
+</dict>
+</plist>

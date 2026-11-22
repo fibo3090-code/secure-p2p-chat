@@ -10,9 +10,15 @@
 // exercised is a user's machine.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import {
   isOpenableUrl,
   executionRisk,
+  openGate,
+  RISKY_EXTENSIONS,
+  INERT_EXTENSIONS,
   friendlyError,
   summaryToConv,
   chatToContact,
@@ -21,6 +27,8 @@ import {
   fmtWhen,
   api,
 } from "./bridge.js";
+
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 describe("isOpenableUrl", () => {
   it("allows http and https", () => {
@@ -77,6 +85,33 @@ describe("executionRisk", () => {
     for (const name of ["photo.png", "report.pdf", "notes.txt", "archive.zip", "README", ""]) {
       expect(executionRisk(name)).toBeNull();
     }
+  });
+});
+
+describe("openGate", () => {
+  it("opens known-inert content without asking", () => {
+    for (const name of ["photo.PNG", "report.pdf", "notes.txt", "song.mp3", "clip.webm"]) {
+      expect(openGate(name)).toBeNull();
+    }
+  });
+
+  it("asks about anything else, saying whether it would run", () => {
+    expect(openGate("setup.exe")).toEqual({ kind: "exe", runs: true });
+    expect(openGate("page.html")).toEqual({ kind: "html", runs: true });
+    expect(openGate("report.docx")).toEqual({ kind: "docx", runs: false });
+    expect(openGate("README")).toEqual({ kind: "", runs: false });
+  });
+
+  // The mock's lists mirror the bridge's. A copy that drifts makes the mock
+  // open something the app would hold back, and the dialog goes untested.
+  it("mirrors both lists in commands/chats.rs exactly", () => {
+    const rust = readFileSync(resolve(repo, "desktop/src-tauri/src/commands/chats.rs"), "utf8");
+    const list = (name) => {
+      const body = rust.match(new RegExp(`const ${name}: &\\[&str\\] = &\\[([\\s\\S]*?)\\];`))[1];
+      return [...body.replace(/\/\/.*$/gm, "").matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+    };
+    expect([...RISKY_EXTENSIONS].sort()).toEqual(list("RISKY_EXTENSIONS"));
+    expect([...INERT_EXTENSIONS].sort()).toEqual(list("INERT_EXTENSIONS"));
   });
 });
 
@@ -144,7 +179,7 @@ describe("the dev mock", () => {
     expect(risky.from_me).toBe(false);
 
     const blocked = await api.openFile(chat.id, risky.id, false, false);
-    expect(blocked).toEqual({ opened: false, blocked: "exe", filename: "holiday.jpg.exe" });
+    expect(blocked).toEqual({ opened: false, blocked: "exe", runs: true, filename: "holiday.jpg.exe" });
 
     const confirmed = await api.openFile(chat.id, risky.id, false, true);
     expect(confirmed.opened).toBe(true);
