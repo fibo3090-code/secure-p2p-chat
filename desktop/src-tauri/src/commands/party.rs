@@ -165,13 +165,10 @@ fn server_dto(
             username: m.username.clone(),
             online: m.online,
             is_me: conn.member_id == Some(m.id),
-            dm_messages: conn
-                .member_id
-                .map(|me| {
-                    let thread = messenger_core::party::dm_thread_id(me, m.id);
-                    conn.messages.get(&thread).map_or(0, |v| v.len())
-                })
-                .unwrap_or(0),
+            dm_messages: conn.member_id.map_or(0, |me| {
+                let thread = messenger_core::party::dm_thread_id(me, m.id);
+                conn.messages.get(&thread).map_or(0, |v| v.len())
+            }),
             role: role_str(m.role),
         })
         .collect();

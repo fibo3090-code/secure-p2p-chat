@@ -1178,6 +1178,12 @@ mod tests {
             std::iter::from_fn(|| self.out.try_recv().ok()).collect()
         }
 
+        fn download(&mut self, hash: &str) -> oneshot::Receiver<Result<Vec<u8>, String>> {
+            self.mgr
+                .request_download(self.id, hash.to_string())
+                .unwrap()
+        }
+
         fn send_file(&mut self, channel: Uuid, name: &str, data: Vec<u8>) -> Result<()> {
             self.mgr
                 .send_file(self.id, channel, name.into(), "x".into(), data)
@@ -1506,7 +1512,7 @@ mod tests {
         let data = b"downloaded file contents".to_vec();
         let hash = blob_hash(&data);
 
-        let mut rx = fx.mgr.request_download(fx.id, hash.clone()).unwrap();
+        let mut rx = fx.download(&hash);
         assert_eq!(
             fx.out.try_recv().unwrap(),
             PartyRequest::DownloadFile { hash: hash.clone() }
@@ -1525,7 +1531,7 @@ mod tests {
     async fn a_download_whose_bytes_do_not_match_its_hash_is_refused() {
         let mut fx = Fx::new();
         let hash = blob_hash(b"the real file");
-        let rx = fx.mgr.request_download(fx.id, hash.clone()).unwrap();
+        let rx = fx.download(&hash);
         fx.respond(PartyResponse::FileData {
             hash,
             data: b"something else entirely".to_vec(),
@@ -1548,7 +1554,7 @@ mod tests {
         let hash = blob_hash(&payload);
         fx.known_file(channel, &hash, payload.len() as u64);
 
-        let mut rx = fx.mgr.request_download(fx.id, hash.clone()).unwrap();
+        let mut rx = fx.download(&hash);
         assert_eq!(
             fx.out.try_recv().unwrap(),
             PartyRequest::DownloadChunk {
@@ -1610,7 +1616,7 @@ mod tests {
         let (mut fx, _) = Fx::joined();
         let hash = "ab".repeat(32);
         fx.known_file(Uuid::new_v4(), &hash, MAX_PARTY_FILE_BYTES);
-        let mut rx = fx.mgr.request_download(fx.id, hash.clone()).unwrap();
+        let mut rx = fx.download(&hash);
         fx.respond(PartyResponse::FileChunk {
             hash,
             offset: 0,
@@ -1626,10 +1632,7 @@ mod tests {
     #[test]
     fn request_download_fails_when_the_server_reports_an_error() {
         let (mut fx, _) = Fx::joined();
-        let mut rx = fx
-            .mgr
-            .request_download(fx.id, "deadbeef".to_string())
-            .unwrap();
+        let mut rx = fx.download("deadbeef");
         fx.respond(PartyResponse::Error("unknown file".to_string()));
         assert_eq!(rx.try_recv().unwrap(), Err("unknown file".to_string()));
     }
@@ -1638,10 +1641,7 @@ mod tests {
     #[test]
     fn an_unrelated_server_error_does_not_fail_a_download() {
         let (mut fx, _) = Fx::joined();
-        let mut rx = fx
-            .mgr
-            .request_download(fx.id, "deadbeef".to_string())
-            .unwrap();
+        let mut rx = fx.download("deadbeef");
         fx.respond(PartyResponse::Error("channel name is taken".to_string()));
         assert!(rx.try_recv().is_err(), "the download is still in flight");
         assert_eq!(
@@ -1653,10 +1653,7 @@ mod tests {
     #[test]
     fn remove_server_forgets_it_and_fails_inflight_downloads() {
         let (mut fx, _) = Fx::joined();
-        let mut rx = fx
-            .mgr
-            .request_download(fx.id, "abc123".to_string())
-            .unwrap();
+        let mut rx = fx.download("abc123");
 
         assert!(fx.mgr.remove_server(fx.id), "the server is removed");
         assert!(fx.mgr.server(fx.id).is_none());
@@ -1848,12 +1845,8 @@ mod tests {
             "a full page must be followed by the next one"
         );
 
-        fx.respond(PartyResponse::History(vec![envelope(
-            channel,
-            me,
-            batch + 1,
-            "tail",
-        )]));
+        let tail = envelope(channel, me, batch + 1, "tail");
+        fx.respond(PartyResponse::History(vec![tail]));
         assert_eq!(
             fx.thread(channel).len(),
             MAX_HISTORY_BATCH + 1,
@@ -1879,12 +1872,8 @@ mod tests {
             "a page trimmed for size must be continued"
         );
 
-        fx.respond(PartyResponse::History(vec![envelope(
-            channel,
-            me,
-            count + 1,
-            "tail",
-        )]));
+        let tail = envelope(channel, me, count + 1, "tail");
+        fx.respond(PartyResponse::History(vec![tail]));
         assert!(
             fx.out.try_recv().is_err(),
             "a small final page must not be followed by another request"
@@ -2027,7 +2016,7 @@ mod tests {
         let mut fx = Fx::new();
         let data = b"the real file".to_vec();
         let hash = blob_hash(&data);
-        let rx = fx.mgr.request_download(fx.id, hash.clone()).unwrap();
+        let rx = fx.download(&hash);
         fx.respond(PartyResponse::FileData {
             hash,
             data: data.clone(),

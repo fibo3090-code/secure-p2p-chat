@@ -1147,15 +1147,10 @@ mod tests {
         assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
 
         // The wrong AAD must fail to authenticate.
-        send_framed(
-            &mut a,
-            &cipher,
-            aad,
-            &mut tx_seq,
-            &PartyRequest::ListMembers.to_bytes(),
-        )
-        .await
-        .unwrap();
+        let list = PartyRequest::ListMembers.to_bytes();
+        send_framed(&mut a, &cipher, aad, &mut tx_seq, &list)
+            .await
+            .unwrap();
         assert!(recv_framed(&mut b, &peer, b"wrong-aad", &mut rx_seq)
             .await
             .is_err());

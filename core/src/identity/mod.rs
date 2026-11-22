@@ -245,9 +245,7 @@ impl Identity {
             .encrypted_private_key
             .as_ref()
             .ok_or_else(|| anyhow!("Encrypted private key not found"))?;
-        let wrong_password = || anyhow!("Decryption failed (likely wrong password)");
-
-        if let Some(ap) = &self.argon_params {
+        let pem = if let Some(ap) = &self.argon_params {
             if ap.m_cost_kib > MAX_ARGON_M_COST_KIB
                 || ap.t_cost > MAX_ARGON_T_COST
                 || ap.p_cost > MAX_ARGON_P_COST
@@ -267,23 +265,20 @@ impl Identity {
             )
             .map_err(|e| anyhow!("Stored Argon2 parameters are unusable: {}", e))?;
             let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-            let pem = Self::unwrap_private_key(&argon, password, salt, nonce, ciphertext)
-                .ok_or_else(wrong_password)?;
-            self.private_key_pem_plaintext = Some(pem);
-            return Ok(());
-        }
-
-        // No recorded parameters: a file from before `argon_params`, written by
-        // one of two earlier schemes. Trying both leaks nothing — the missing
-        // field is visible in the JSON.
-        for argon in &[strict_argon()?, Argon2::default()] {
-            if let Some(pem) = Self::unwrap_private_key(argon, password, salt, nonce, ciphertext) {
-                self.private_key_pem_plaintext = Some(pem);
-                return Ok(());
-            }
-        }
-
-        Err(wrong_password())
+            Self::unwrap_private_key(&argon, password, salt, nonce, ciphertext)
+        } else {
+            // No recorded parameters: a file from before `argon_params`, written
+            // by one of two earlier schemes. Trying both leaks nothing — the
+            // missing field is visible in the JSON.
+            [strict_argon()?, Argon2::default()]
+                .iter()
+                .find_map(|argon| {
+                    Self::unwrap_private_key(argon, password, salt, nonce, ciphertext)
+                })
+        };
+        let pem = pem.ok_or_else(|| anyhow!("Decryption failed (likely wrong password)"))?;
+        self.private_key_pem_plaintext = Some(pem);
+        Ok(())
     }
 
     /// Unsupported: identities must stay encrypted on disk.

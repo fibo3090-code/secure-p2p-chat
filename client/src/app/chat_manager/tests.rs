@@ -254,20 +254,25 @@ fn marking_read_clears_unread_and_resolves_session_ids() {
 
 // ── TOFU ────────────────────────────────────────────────────────────────────
 
+/// Run TOFU for `fingerprint` on a new incoming session. Returns whether the
+/// user was prompted, and the session's automatic verdict if there was one.
+fn incoming_tofu(mgr: &mut ChatManager, fingerprint: &str, sas: &str) -> (bool, Option<bool>) {
+    let (session_id, _) = incoming_chat(mgr);
+    let mut rx = confirm_channel(mgr, session_id);
+    mgr.handle_tofu_verification(session_id, fingerprint, "Peer", sas);
+    (mgr.pending_fingerprint().is_some(), rx.try_recv().ok())
+}
+
 #[test]
 fn host_prompts_for_an_unknown_incoming_fingerprint() {
     let mut mgr = ChatManager::default();
-    let (session_id, _) = incoming_chat(&mut mgr);
-    let mut rx = confirm_channel(&mut mgr, session_id);
-
-    mgr.handle_tofu_verification(session_id, "UNKNOWN-FP", "Peer", "12-34-56");
-
+    let (prompted, verdict) = incoming_tofu(&mut mgr, "UNKNOWN-FP", "12-34-56");
     assert!(
-        mgr.pending_fingerprint().is_some(),
+        prompted,
         "host must prompt to verify an unknown incoming peer"
     );
-    assert!(
-        rx.try_recv().is_err(),
+    assert_eq!(
+        verdict, None,
         "host must not auto-confirm an unknown incoming peer"
     );
 }
@@ -276,17 +281,13 @@ fn host_prompts_for_an_unknown_incoming_fingerprint() {
 fn host_auto_accepts_a_returning_known_fingerprint() {
     let (mut mgr, prior) = manager_with_chat("Known");
     mgr.get_chat_mut(prior).unwrap().peer_fingerprint = Some("KNOWN-FP".into());
-    let (session_id, _) = incoming_chat(&mut mgr);
-    let mut rx = confirm_channel(&mut mgr, session_id);
-
-    mgr.handle_tofu_verification(session_id, "KNOWN-FP", "Peer", "12-34-56");
-
+    let (prompted, verdict) = incoming_tofu(&mut mgr, "KNOWN-FP", "12-34-56");
     assert!(
-        mgr.pending_fingerprint().is_none(),
+        !prompted,
         "a known fingerprint must not trigger another prompt"
     );
     assert_eq!(
-        rx.try_recv().ok(),
+        verdict,
         Some(true),
         "a known fingerprint must be auto-confirmed"
     );
@@ -297,17 +298,10 @@ fn blocked_contact_fingerprint_is_auto_rejected() {
     let mut mgr = ChatManager::default();
     let contact_id = mgr.add_contact("Mallory".into(), None, Some("BLOCKED-FP".into()), None);
     mgr.block_contact(contact_id).unwrap();
-    let (session_id, _) = incoming_chat(&mut mgr);
-    let mut rx = confirm_channel(&mut mgr, session_id);
-
-    mgr.handle_tofu_verification(session_id, "BLOCKED-FP", "Mallory", "");
-
-    assert!(
-        mgr.pending_fingerprint().is_none(),
-        "a blocked fingerprint must not prompt the user"
-    );
+    let (prompted, verdict) = incoming_tofu(&mut mgr, "BLOCKED-FP", "");
+    assert!(!prompted, "a blocked fingerprint must not prompt the user");
     assert_eq!(
-        rx.try_recv().ok(),
+        verdict,
         Some(false),
         "a blocked fingerprint must be rejected automatically"
     );
@@ -329,13 +323,9 @@ fn blocking_a_contact_imported_with_an_uppercase_fingerprint_holds() {
         .import_contact(mgr.parse_invite_link(&link).unwrap())
         .unwrap();
     mgr.block_contact(contact_id).unwrap();
-    let (session_id, _) = incoming_chat(&mut mgr);
-    let mut rx = confirm_channel(&mut mgr, session_id);
-
-    mgr.handle_tofu_verification(session_id, &mallory.fingerprint, "Mallory", "");
-
-    assert!(mgr.pending_fingerprint().is_none());
-    assert_eq!(rx.try_recv().ok(), Some(false), "the block must hold");
+    let (prompted, verdict) = incoming_tofu(&mut mgr, &mallory.fingerprint, "");
+    assert!(!prompted);
+    assert_eq!(verdict, Some(false), "the block must hold");
 }
 
 /// Typed fingerprints are stored canonically, as the handshake presents them.

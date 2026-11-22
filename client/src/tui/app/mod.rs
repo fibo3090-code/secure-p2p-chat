@@ -810,8 +810,8 @@ impl TuiApp {
             }
             TuiOverlay::Contacts => match key.code {
                 KeyCode::Esc => self.overlay = TuiOverlay::None,
-                KeyCode::Down => self.contacts_select_next(),
-                KeyCode::Up => self.contacts_select_prev(),
+                KeyCode::Down => self.contacts_select(true),
+                KeyCode::Up => self.contacts_select(false),
                 KeyCode::Enter => self.connect_selected_contact(),
                 _ => {}
             },
@@ -1322,24 +1322,17 @@ impl TuiApp {
 
     // ---------------------------------------------------------------- contacts overlay
 
-    fn contacts_select_next(&mut self) {
-        if self.contact_ids.is_empty() {
+    /// Move the contact selection one row, wrapping at either end.
+    fn contacts_select(&mut self, down: bool) {
+        let len = self.contact_ids.len();
+        if len == 0 {
             return;
         }
-        let i = self
-            .contacts_list_state
-            .selected()
-            .map_or(0, |i| (i + 1) % self.contact_ids.len());
-        self.contacts_list_state.select(Some(i));
-    }
-
-    fn contacts_select_prev(&mut self) {
-        if self.contact_ids.is_empty() {
-            return;
-        }
-        let i = match self.contacts_list_state.selected() {
-            Some(0) | None => self.contact_ids.len() - 1,
-            Some(i) => i - 1,
+        let i = match (self.contacts_list_state.selected(), down) {
+            (None, true) => 0,
+            (Some(i), true) => (i + 1) % len,
+            (None | Some(0), false) => len - 1,
+            (Some(i), false) => i - 1,
         };
         self.contacts_list_state.select(Some(i));
     }
@@ -1744,17 +1737,12 @@ mod tests {
         app.chat_list_state.select(Some(a_idx));
         app.tick();
         // A message arrives in B (not selected).
+        let hi = crate::types::MessageContent::Text { text: "hi".into() };
         app.chat_manager
             .get_chat_mut(b)
             .unwrap()
             .messages
-            .push(crate::types::Message {
-                id: Uuid::new_v4(),
-                from_me: false,
-                content: crate::types::MessageContent::Text { text: "hi".into() },
-                timestamp: chrono::Utc::now(),
-                delivered: false,
-            });
+            .push(crate::types::Message::received(hi, chrono::Utc::now()));
         app.update_unread();
         assert!(app.is_unread(&b));
         assert!(!app.is_unread(&a));

@@ -83,9 +83,7 @@ pub(crate) fn focus_color(focused: bool) -> Color {
 
 fn selected_style(selected: bool) -> Style {
     if selected {
-        Style::default()
-            .fg(BRAND_ACCENT)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(BRAND_ACCENT).bold()
     } else {
         Style::default()
     }
@@ -98,9 +96,7 @@ fn dim<'a>(text: impl Into<std::borrow::Cow<'a, str>>) -> Span<'a> {
 fn heading(text: &str) -> Line<'_> {
     Line::from(Span::styled(
         text,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Yellow).bold(),
     ))
 }
 
@@ -121,11 +117,7 @@ fn hint(f: &mut Frame, text: &str, area: Rect) {
 
 fn highlight_list<'a>(items: impl IntoIterator<Item = ListItem<'a>>) -> List<'a> {
     List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default().bg(Color::DarkGray).bold())
         .highlight_symbol("> ")
 }
 
@@ -204,10 +196,7 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
 fn clear_and_block(f: &mut Frame, area: Rect, title: &str) -> Rect {
     f.render_widget(Clear, area);
-    let title = Span::styled(
-        format!(" {} ", title),
-        Style::default().add_modifier(Modifier::BOLD),
-    );
+    let title = Span::styled(format!(" {} ", title), Style::default().bold());
     let block = block(title, BRAND_ACCENT);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -228,9 +217,7 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
         if let Some((name, usage, desc)) = command_help(topic) {
             lines.push(Line::from(Span::styled(
                 usage,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Green).bold(),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(desc));
@@ -305,8 +292,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
     .split(inner);
 
     f.render_widget(
-        Paragraph::new(format!("Connecting to {}", peer_name))
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(format!("Connecting to {}", peer_name)).style(Style::default().bold()),
         rows[0],
     );
 
@@ -321,11 +307,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
         f.render_widget(
             Paragraph::new(sas.to_string())
                 .alignment(ratatui::layout::Alignment::Center)
-                .style(
-                    Style::default()
-                        .fg(BRAND_ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                .style(Style::default().fg(BRAND_ACCENT).bold()),
             rows[2],
         );
     } else {
@@ -454,8 +436,7 @@ fn render_identity(f: &mut Frame, app: &TuiApp, full: Rect) {
     .split(inner);
 
     f.render_widget(
-        Paragraph::new(format!("Name: {}", app.identity_name))
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(format!("Name: {}", app.identity_name)).style(Style::default().bold()),
         rows[0],
     );
     render_grid_and_hex(f, &app.identity_fingerprint(), rows[1], rows[2]);
@@ -593,14 +574,8 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
     // the right (and that :party-post writes to).
     let threads = app.party_threads();
     let thread_sel = app.party_thread_sel.min(threads.len().saturating_sub(1));
-    let section = |label: &'static str| {
-        Line::styled(
-            label,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
+    let section =
+        |label: &'static str| Line::styled(label, Style::default().fg(Color::DarkGray).bold());
     let mut left: Vec<Line> = Vec::new();
     left.push(Line::from(dim(format!(
         "{}  ({})",

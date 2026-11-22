@@ -128,13 +128,6 @@ where
     Ok(tunnel)
 }
 
-/// Tell the user, before the prompt, that this peer's safety code is weak.
-fn warn_if_legacy_sas(to_app_tx: &mpsc::UnboundedSender<SessionEvent>, tunnel: &EstablishedTunnel) {
-    if !tunnel.sas_committed {
-        let _ = to_app_tx.send(SessionEvent::Warning(LEGACY_SAS_WARNING.to_string()));
-    }
-}
-
 /// The prompt that surfaces an incoming peer for verification.
 fn new_connection_prompt(peer_label: String, tunnel: &EstablishedTunnel) -> SessionEvent {
     SessionEvent::NewConnection {
@@ -167,9 +160,7 @@ pub async fn run_host_session(
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     tracing::info!("Host listening on port {}", port);
 
-    to_app_tx
-        .send(SessionEvent::Listening { port })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
+    emit(&to_app_tx, SessionEvent::Listening { port })?;
 
     type Attempt = (TcpStream, std::net::SocketAddr, Result<EstablishedTunnel>);
     let mut pending: tokio::task::JoinSet<Attempt> = tokio::task::JoinSet::new();
@@ -235,7 +226,6 @@ pub async fn run_host_session(
     pending.abort_all();
     tracing::info!("Client connected from {}", peer_addr);
 
-    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = new_connection_prompt(peer_addr.to_string(), &tunnel);
     verify_then_run(
         &mut stream,
@@ -894,6 +884,13 @@ where
 /// How long a handshaken peer waits for the user to compare the SAS.
 const FINGERPRINT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Send an event the session cannot continue without the app hearing.
+fn emit(to_app_tx: &mpsc::UnboundedSender<SessionEvent>, event: SessionEvent) -> Result<()> {
+    to_app_tx
+        .send(event)
+        .map_err(|e| anyhow!("Send error: {}", e))
+}
+
 /// Report a failure to the app before returning it, so the UI says *why* the
 /// connection went away rather than only that it did.
 fn reported<T>(to_app_tx: &mpsc::UnboundedSender<SessionEvent>, result: Result<T>) -> Result<T> {
@@ -930,8 +927,9 @@ async fn await_user_confirmation(
     Err(anyhow!(error))
 }
 
-/// Common to both roles after the handshake and password gate: surface the peer for
-/// verification, wait for the user, then run the message loop.
+/// Common to both roles after the handshake and password gate: warn if the peer's
+/// safety code is weak, surface the peer for verification, wait for the user, then
+/// run the message loop.
 #[allow(clippy::too_many_arguments)]
 async fn verify_then_run<S>(
     stream: &mut S,
@@ -946,13 +944,12 @@ async fn verify_then_run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    to_app_tx
-        .send(prompt)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
+    if !tunnel.sas_committed {
+        let _ = to_app_tx.send(SessionEvent::Warning(LEGACY_SAS_WARNING.to_string()));
+    }
+    emit(&to_app_tx, prompt)?;
     await_user_confirmation(&mut confirm_rx, &to_app_tx, chat_id).await?;
-    to_app_tx
-        .send(SessionEvent::Ready)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
+    emit(&to_app_tx, SessionEvent::Ready)?;
     run_message_loop(
         stream,
         tunnel.cipher,
@@ -993,7 +990,6 @@ where
         )
         .await,
     )?;
-    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = new_connection_prompt(peer_label, &tunnel);
     verify_then_run(
         stream,
@@ -1025,11 +1021,12 @@ pub async fn run_client_session_over_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    to_app_tx
-        .send(SessionEvent::Connected {
+    emit(
+        &to_app_tx,
+        SessionEvent::Connected {
             peer: peer_label.clone(),
-        })
-        .map_err(|e| anyhow!("Send error: {}", e))?;
+        },
+    )?;
 
     let tunnel = client_handshake(stream, &privkey, chat_id).await?;
 
@@ -1045,7 +1042,6 @@ where
         .await,
     )?;
 
-    warn_if_legacy_sas(&to_app_tx, &tunnel);
     let prompt = SessionEvent::ShowFingerprintVerification {
         fingerprint: tunnel.peer_fingerprint.clone(),
         peer_name: peer_label,
@@ -1507,9 +1503,7 @@ where
         }
     }
 
-    to_app_tx
-        .send(SessionEvent::Disconnected)
-        .map_err(|e| anyhow!("Send error: {}", e))?;
+    emit(&to_app_tx, SessionEvent::Disconnected)?;
 
     Ok(())
 }

@@ -804,15 +804,9 @@ mod tests {
     async fn a_token_can_be_reused_once_its_pairing_is_over() {
         let relay_addr = start_relay().await;
         let token = generate_relay_token();
+        let delay = Duration::from_millis(100);
         for round in 0..2 {
-            let (host, join) = pair(
-                &relay_addr,
-                &token,
-                false,
-                false,
-                Duration::from_millis(100),
-            )
-            .await;
+            let (host, join) = pair(&relay_addr, &token, false, false, delay).await;
             let host = host.unwrap_or_else(|e| panic!("round {round} host: {e}"));
             let join = join.unwrap_or_else(|e| panic!("round {round} joiner: {e}"));
             exchange_ping_pong(host, join).await;

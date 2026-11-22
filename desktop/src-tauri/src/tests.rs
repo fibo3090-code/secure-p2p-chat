@@ -66,15 +66,25 @@ fn harness() -> Harness {
 /// A harness that has completed password setup and is fully "ready".
 fn ready_harness() -> Harness {
     let h = harness();
-    h.ipc(
-        "set_password",
-        json!({ "password": "bridge-test-passphrase" }),
-    )
-    .expect("set_password");
+    h.set_password();
     h
 }
 
 impl Harness {
+    /// Complete first-run setup with the test passphrase.
+    fn set_password(&self) {
+        self.ipc(
+            "set_password",
+            json!({ "password": "bridge-test-passphrase" }),
+        )
+        .expect("set_password");
+    }
+
+    /// The `state` field `auth_status` reports.
+    fn auth_state(&self) -> Value {
+        self.ipc("auth_status", json!({})).unwrap()["state"].take()
+    }
+
     /// Where this harness's bridge keeps the encrypted history.
     fn bridge_history_path(&self) -> std::path::PathBuf {
         self._dir.path().join("history.json.enc")
@@ -116,24 +126,19 @@ impl Harness {
         }
         res
     }
-}
 
-impl Harness {
     /// Append a peer text message to a chat, as if it arrived over the wire.
     fn push_incoming(&self, id: uuid::Uuid, text: &str) {
+        use messenger_core::types::{Message, MessageContent};
         use tauri::Manager;
         let manager = self._app.state::<Bridge>().manager.clone();
+        let content = MessageContent::Text {
+            text: text.to_string(),
+        };
         tauri::async_runtime::block_on(async move {
             if let Some(chat) = manager.lock().await.get_chat_mut(id) {
-                chat.messages.push(messenger_core::types::Message {
-                    id: uuid::Uuid::new_v4(),
-                    from_me: false,
-                    content: messenger_core::types::MessageContent::Text {
-                        text: text.to_string(),
-                    },
-                    timestamp: chrono::Utc::now(),
-                    delivered: false,
-                });
+                chat.messages
+                    .push(Message::received(content, chrono::Utc::now()));
             }
         });
     }
@@ -196,8 +201,7 @@ const LOCAL_ORIGIN: &str = "tauri://localhost";
 #[test]
 fn fresh_identity_requires_password_setup() {
     let h = harness();
-    let status = h.ipc("auth_status", json!({})).unwrap();
-    assert_eq!(status["state"], "set_password");
+    assert_eq!(h.auth_state(), "set_password");
 
     // The barrier: every post-auth command must refuse to run.
     for (cmd, args) in [
@@ -234,13 +238,8 @@ fn fresh_identity_requires_password_setup() {
     }
 
     // Setup completes → the same surface opens up.
-    h.ipc(
-        "set_password",
-        json!({ "password": "bridge-test-passphrase" }),
-    )
-    .unwrap();
-    let status = h.ipc("auth_status", json!({})).unwrap();
-    assert_eq!(status["state"], "ready");
+    h.set_password();
+    assert_eq!(h.auth_state(), "ready");
     let settings = h.ipc("get_settings", json!({})).unwrap();
     assert_eq!(settings["listen_port"], 12345);
 }
@@ -260,14 +259,11 @@ fn set_password_enforces_the_length_floor() {
         err_text(&err)
     );
     // The rejection must not half-apply: setup is still pending.
-    assert_eq!(
-        h.ipc("auth_status", json!({})).unwrap()["state"],
-        "set_password"
-    );
+    assert_eq!(h.auth_state(), "set_password");
 
     h.ipc("set_password", json!({ "password": "a".repeat(min) }))
         .expect("an acceptable password was refused");
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
+    assert_eq!(h.auth_state(), "ready");
 }
 
 /// An identity file that exists but cannot be read is a distinct terminal
@@ -310,11 +306,7 @@ fn an_unreadable_history_survives_unlock_and_can_be_set_aside() {
     let h = harness();
     std::fs::write(h.bridge_history_path(), b"written by a future version").unwrap();
 
-    h.ipc(
-        "set_password",
-        json!({ "password": "bridge-test-passphrase" }),
-    )
-    .expect("set_password");
+    h.set_password();
     let status = h.ipc("history_status", json!({})).unwrap();
     assert!(
         status["error"].is_string(),
@@ -399,7 +391,7 @@ fn locked_identity_requires_unlock() {
     bridge.needs_password_setup = std::sync::atomic::AtomicBool::new(false);
     let h = harness_with(bridge, dir);
 
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+    assert_eq!(h.auth_state(), "unlock");
     let err = h.ipc("get_settings", json!({})).expect_err("gated");
     assert_eq!(err_text(&err), "Unlock required");
 
@@ -407,11 +399,11 @@ fn locked_identity_requires_unlock() {
         .ipc("unlock", json!({ "password": "wrong" }))
         .expect_err("wrong password accepted");
     assert_eq!(err_text(&err), "Wrong password");
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+    assert_eq!(h.auth_state(), "unlock");
 
     h.ipc("unlock", json!({ "password": "right-password-1234" }))
         .expect("unlock");
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
+    assert_eq!(h.auth_state(), "ready");
 }
 
 /// Every argument-taking command, with the exact payload keys `bridge.js`
@@ -627,8 +619,7 @@ fn change_password_rotates_the_file_and_keeps_history_readable() {
     .expect("change_password");
 
     // Still unlocked, same identity, same conversation.
-    let status = h.ipc("auth_status", json!({})).unwrap();
-    assert_eq!(status["state"], "ready");
+    assert_eq!(h.auth_state(), "ready");
     let after = h
         .ipc("get_conversation", json!({ "id": id.to_string() }))
         .expect("conversation after the change");
