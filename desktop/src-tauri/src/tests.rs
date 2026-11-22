@@ -445,6 +445,66 @@ fn locked_identity_requires_unlock() {
     assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
 }
 
+/// TAURI-07: `unlock` ran Argon2 (64 MiB, ~0.5–2 s) with the identity mutex
+/// held, on a runtime worker — every command that reads the identity, and the
+/// poll loop behind them, waited it out with the window frozen. The key is
+/// derived on a blocking thread from a copy; the mutex is free meanwhile.
+#[test]
+fn unlocking_does_not_hold_the_identity_while_the_key_is_derived() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut identity = Identity::new_with_plaintext("Tester".to_string()).expect("identity");
+    identity.encrypt("right-password-1234").expect("encrypt");
+    let mut bridge = fresh_bridge(dir.path());
+    identity.save(&bridge.identity_path).expect("save identity");
+    bridge.identity = Arc::new(StdMutex::new(
+        Identity::load(&bridge.identity_path).unwrap(),
+    ));
+    bridge.needs_password_setup = std::sync::atomic::AtomicBool::new(false);
+    let shared = bridge.identity.clone();
+    let h = harness_with(bridge, dir);
+    assert!(shared.lock().unwrap().is_locked());
+
+    // While `unlock` is in flight, sample the mutex. Free *and* still locked
+    // means the key is being derived without holding it. Dispatch overhead
+    // alone accounts for a sample or two; a derivation done under the lock
+    // gives none at all, so demand a run that only Argon2 is long enough for.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (running, stop) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let watcher = {
+        let (shared, running, stop) = (shared.clone(), running.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut free_while_locked = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                if running.load(Ordering::SeqCst) {
+                    if let Ok(id) = shared.try_lock() {
+                        if id.is_locked() {
+                            free_while_locked += 1;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            free_while_locked
+        })
+    };
+    let started = std::time::Instant::now();
+    running.store(true, Ordering::SeqCst);
+    h.ipc("unlock", json!({ "password": "right-password-1234" }))
+        .expect("unlock");
+    running.store(false, Ordering::SeqCst);
+    stop.store(true, Ordering::SeqCst);
+    let elapsed = started.elapsed();
+    assert!(!shared.lock().unwrap().is_locked());
+    let free = watcher.join().unwrap();
+    assert!(
+        free >= 20,
+        "the identity mutex was free for only {free} samples of a {elapsed:?} unlock"
+    );
+}
+
 // ── Invoke-key contract with bridge.js ──────────────────────────────────────
 
 /// Every argument-taking command, called with the exact payload keys

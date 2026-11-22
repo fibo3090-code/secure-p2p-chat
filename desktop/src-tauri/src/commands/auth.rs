@@ -61,6 +61,14 @@ fn ensure_identity_loaded(state: &Bridge) -> Result<(), String> {
     }
 }
 
+/// Serialises the commands that run Argon2 over the identity (`unlock`,
+/// `set_password`, `change_password`). They derive on a *copy*, off the
+/// identity mutex (TAURI-07: holding it for the ~1 s of Argon2 froze every
+/// command that reads the identity, and the poll loop behind them), so without
+/// this two of them could each finish against the same starting state — two
+/// setups writing different passwords, or two unlocks both reloading history.
+static AUTH_OP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Unlock an existing, password-protected identity and load history.
 #[tauri::command]
 pub(crate) async fn unlock(
@@ -68,6 +76,7 @@ pub(crate) async fn unlock(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_identity_loaded(&state)?;
+    let _auth = AUTH_OP.lock().await;
     // Already unlocked: nothing to do. Running the body again re-ran Argon2
     // and reloaded the history file over the live state — `apply_history`
     // replaces, so everything not yet saved (saves are coalesced) was dropped
@@ -75,14 +84,19 @@ pub(crate) async fn unlock(
     if !crate::lock_identity(&state.identity).is_locked() && !state.needs_password_setup() {
         return Ok(());
     }
-    let key = {
-        let mut id = crate::lock_identity(&state.identity);
-        id.decrypt(&password)
+    let candidate = crate::lock_identity(&state.identity).clone();
+    let (candidate, key) = tokio::task::spawn_blocking(move || {
+        let mut candidate = candidate;
+        candidate
+            .decrypt(&password)
             .map_err(|_| "Wrong password".to_string())?;
-        let key = id.history_key().map_err(|e| e.to_string())?;
-        state.password_setup_done();
-        key
-    };
+        let key = candidate.history_key().map_err(|e| e.to_string())?;
+        Ok::<_, String>((candidate, key))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *crate::lock_identity(&state.identity) = candidate;
+    state.password_setup_done();
     let mut mgr = state.manager.lock().await;
     mgr.set_history_key(key);
     if let Err(e) = mgr.load_history_auto(&state.history_path, &key) {
@@ -128,21 +142,27 @@ pub(crate) async fn set_password(
     // while unlocked, so `encrypt` would happily re-wrap `identity.json` under
     // whatever the caller sent — no current password asked. Anything able to
     // invoke a command could lock the owner out of their identity and history.
+    let _auth = AUTH_OP.lock().await;
     if !state.needs_password_setup() {
         return Err("A password is already set — use Change password instead".to_string());
     }
-    let key = {
-        let mut id = crate::lock_identity(&state.identity);
+    let path = state.identity_path.clone();
+    let candidate = crate::lock_identity(&state.identity).clone();
+    let (candidate, key) = tokio::task::spawn_blocking(move || {
+        let mut id = candidate;
         // `encrypt` enforces the length floor; the message it returns is
         // already user-facing, so pass it straight through to the screen.
         id.encrypt(&password).map_err(|e| e.to_string())?;
-        id.save(&state.identity_path).map_err(|e| e.to_string())?;
+        id.save(&path).map_err(|e| e.to_string())?;
         // Decrypt in memory so we remain unlocked for this session.
         id.decrypt(&password).map_err(|e| e.to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
-        state.password_setup_done();
-        key
-    };
+        Ok::<_, String>((id, key))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *crate::lock_identity(&state.identity) = candidate;
+    state.password_setup_done();
     // Load any existing history the same way `unlock` does. Without this, the
     // first post-setup session starts from an empty manager and the next save
     // could overwrite an existing `history.json.enc` with empty state.
@@ -174,6 +194,7 @@ pub(crate) async fn change_password(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
+    let _auth = AUTH_OP.lock().await;
     let path = state.identity_path.clone();
     // Argon2 at 64 MiB × 3 passes runs twice here (verify + re-wrap), which is
     // ~1s of CPU — off the async runtime so the UI keeps painting.

@@ -151,7 +151,7 @@ prioritised view is in [README.md](README.md).
 | TAURI-04 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | `party_join` holds the party mutex across an untimed TCP connect and handshake, freezing the whole poll loop |
 | TAURI-05 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | No single-instance guard: two app instances race on one identity, history file and port |
 | TAURI-06 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Received files carry no Mark-of-the-Web or quarantine attribute, and the "executes on open" list has gaps |
-| TAURI-07 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Argon2 runs on async runtime workers under a std mutex; sync commands block the main thread on it |
+| TAURI-07 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Argon2 runs on async runtime workers under a std mutex; sync commands block the main thread on it |
 | TAURI-08 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | mDNS keeps advertising and browsing after the user turns it off or hosting stops |
 | TAURI-09 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Every `state-updated` re-serializes the whole open conversation, up to 4×/s during transfers |
 | TAURI-31 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `export_identity` can destroy the identity it is backing up, and records "backed up" for any destination |
