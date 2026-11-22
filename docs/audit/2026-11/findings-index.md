@@ -63,7 +63,7 @@ prioritised view is in [README.md](README.md).
 | APP-07 | Medium | Fixed | M | [04-client-core](reports/04-client-core.md) | Unaccepted, peer-controlled spools live in the user's Downloads folder and are never swept |
 | APP-08 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Party history paging skips a range when a live broadcast arrives before the first page |
 | APP-09 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Chunked-text reassembly is bounded by message count, not bytes (hundreds of MiB per chat) |
-| APP-10 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party `connect_and_join` has no TCP connect timeout, and the desktop holds the `PartyManager` lock across it |
+| APP-10 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Party `connect_and_join` has no TCP connect timeout, and the desktop holds the `PartyManager` lock across it |
 | CRYPTO-03 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Both directions share one key and one AAD, and decrypt never checks the role bit, so frames can be reflected |
 | CRYPTO-04 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
 | CRYPTO-05 | Medium | Fixed | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The connection password is sent to an unverified host |
@@ -74,10 +74,10 @@ prioritised view is in [README.md](README.md).
 | DOC-11 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `SECURITY.md`'s accepted-advisory list is stale |
 | DOC-12 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | SECURITY.md and architecture.md understate frontend testing and miscount bridge tests |
 | DOC-13 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `architecture.md` code map is stale after PR #188 |
-| DOC-14 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `architecture.md` says history is rewritten once per message |
-| DOC-15 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` claims `connect_to_contact` has a relay fallback |
-| DOC-16 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` says chunked upload ids are client-chosen |
-| DOC-17 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` says unaccepted files do not reach the download directory |
+| DOC-14 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | `architecture.md` says history is rewritten once per message |
+| DOC-15 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` claims `connect_to_contact` has a relay fallback |
+| DOC-16 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` says chunked upload ids are client-chosen |
+| DOC-17 | Medium | Fixed | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` says unaccepted files do not reach the download directory |
 | DOC-18 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `server_tiers.md` lists moderation powers that do not exist |
 | DOC-19 | Medium | VERIFIED | S | [09-documentation](reports/09-documentation.md) | No single local command set matches CI; CONTRIBUTING, DEVELOPER_GUIDE, the PR template and README disagree |
 | DOC-20 | Medium | VERIFIED | M | [09-documentation](reports/09-documentation.md) | `platform_spec.md` "Current State" was verified at 1.15.0 and contradicts itself |

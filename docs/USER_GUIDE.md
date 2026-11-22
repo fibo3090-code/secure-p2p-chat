@@ -344,6 +344,10 @@ Rules:
 - outgoing files must exist locally
 - cloud-only placeholders must be downloaded first
 - received files are stored in the configured download directory
+- unless auto-accept is on, an incoming file waits for you to accept it. While
+  it waits, what has arrived so far sits in the download directory as a
+  hidden-in-plain-sight `tmp_…` file (at most 64 MiB per conversation); it gets
+  its real name only when you accept, and is deleted if you decline
 
 If you see transfer problems:
 

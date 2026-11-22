@@ -305,8 +305,10 @@ These are real limitations, not hidden assumptions:
 - the desktop crate's *bridge* is tested over mock IPC, but the webview itself cannot be driven headlessly here — rendering is verified by `npm run build` + `npm test` over the frontend's pure logic
 - there is no mobile client
 - **history writes are O(total history) per change.** The whole `HistoryFile` is
-  re-serialized, encrypted, and rewritten whenever the conversation surface
-  changes, which for an active chat means once per message. Compact JSON keeps
+  re-serialized, encrypted, and rewritten on every save. Saves are coalesced —
+  the desktop writes at most once per `HISTORY_SAVE_MIN_INTERVAL` (3 s), the
+  TUI autosaves only when the persisted signature moved — but each one still
+  costs the whole history. Compact JSON keeps
   the constant factor down, and the write is atomic + `fsync`ed, but the cost
   still grows with history size and there is no retention policy or incremental
   format. A per-conversation or append-only store is the real fix
