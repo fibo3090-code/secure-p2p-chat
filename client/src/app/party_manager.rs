@@ -1140,6 +1140,10 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 // Same sentinel, same reasoning as `Message` above: a history
                 // page is no more trustworthy than a broadcast.
                 let page = items.iter().filter(|e| e.channel == th && e.seq != 0);
+                // Where *this page* ends — not the newest seq in the thread,
+                // which a live broadcast may have pushed far ahead: asking
+                // after that skipped everything in between (APP-08).
+                let page_end = page.clone().map(|e| e.seq).max();
                 let existing = conn.messages.entry(th).or_default();
                 // Merge rather than replace: history is paged now, so a later
                 // page must not throw away the earlier one. Server-assigned
@@ -1165,8 +1169,7 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
 
                 // A full page means there is probably more behind it.
                 if page_was_full {
-                    if let Some(last) = existing.iter().rfind(|e| e.seq > 0) {
-                        let since_seq = last.seq;
+                    if let Some(since_seq) = page_end {
                         let _ = conn.send(match dm_peers.get(&th) {
                             Some(&with) => PartyRequest::FetchDmHistory { with, since_seq },
                             None => PartyRequest::FetchHistory {
@@ -2122,6 +2125,46 @@ mod tests {
             mgr.server(id).unwrap().messages[&channel].len(),
             MAX_HISTORY_BATCH + 1,
             "a later page must not throw away the earlier one"
+        );
+    }
+
+    /// APP-08: the next page was asked for from the highest seq in the
+    /// *thread*, not the end of the page just received. A message broadcast
+    /// while the first page was on its way (seq 501, say) then made the client
+    /// ask for "everything after 501", and 201..=500 were never fetched —
+    /// silently, on any busy community.
+    #[test]
+    fn a_live_message_arriving_first_does_not_skip_history() {
+        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let me = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+
+        let live = MAX_HISTORY_BATCH as u64 * 2 + 101;
+        tx.send(Incoming::Response(PartyResponse::Message(envelope(
+            channel, me, live, "live",
+        ))))
+        .unwrap();
+        let page: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
+            .map(|seq| envelope(channel, me, seq, &format!("m{seq}")))
+            .collect();
+        tx.send(Incoming::Response(PartyResponse::History(page)))
+            .unwrap();
+        mgr.poll_events();
+
+        let asked: Vec<u64> = std::iter::from_fn(|| out.try_recv().ok())
+            .filter_map(|r| match r {
+                PartyRequest::FetchHistory {
+                    channel: c,
+                    since_seq,
+                } if c == channel => Some(since_seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![MAX_HISTORY_BATCH as u64],
+            "the next page must start where this one ended, not after the live message"
         );
     }
 

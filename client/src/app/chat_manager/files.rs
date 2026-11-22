@@ -377,7 +377,11 @@ impl ChatManager {
             .filter_map(|(id, t)| {
                 (t.chat_id == chat_id
                     && t.direction == TransferDirection::Incoming
-                    && t.status.is_active())
+                    && t.status.is_active()
+                    // A held offer whose last byte arrived is complete on
+                    // disk and waits only for the user; failing it deleted a
+                    // finished download because the sender hung up (APP-05).
+                    && !self.pending_file_end.contains_key(id))
                 .then_some(*id)
             })
             .collect();

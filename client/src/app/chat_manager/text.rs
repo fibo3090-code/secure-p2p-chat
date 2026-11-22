@@ -7,7 +7,23 @@ pub(super) struct IncomingTextMessage {
     pub(super) timestamp_millis: u64,
     pub(super) parts: Vec<Option<String>>,
     pub(super) updated_at: std::time::Instant,
+    /// When the first chunk arrived. The idle timeout alone restarts with
+    /// every chunk, so a trickle kept a buffer alive forever (APP-09).
+    pub(super) started_at: std::time::Instant,
+    /// Bytes held in `parts`, for the budgets below.
+    pub(super) bytes: usize,
 }
+
+/// Partial large-message bytes one conversation may hold. One maximum-size
+/// message (`MAX_TEXT_CHUNKS` × `TEXT_CHUNK_BYTES`, about 24 MiB) fits; the 16
+/// partial-message slots alone allowed ~384 MiB (APP-09).
+pub(super) const MAX_PARTIAL_TEXT_BYTES_PER_CHAT: usize = 32 * 1024 * 1024;
+
+/// The same, across every conversation.
+pub(super) const MAX_PARTIAL_TEXT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+
+/// Longest a large message may take to arrive, however steadily it trickles.
+pub(super) const INCOMING_TEXT_MAX_AGE: Duration = Duration::from_secs(600);
 
 impl ChatManager {
     pub(super) fn build_text_protocol_messages(
@@ -88,8 +104,10 @@ impl ChatManager {
 
         let now = std::time::Instant::now();
         let before = self.incoming_text_messages.len();
-        self.incoming_text_messages
-            .retain(|_, pending| now.duration_since(pending.updated_at) < INCOMING_TEXT_TIMEOUT);
+        self.incoming_text_messages.retain(|_, pending| {
+            now.duration_since(pending.updated_at) < INCOMING_TEXT_TIMEOUT
+                && now.duration_since(pending.started_at) < INCOMING_TEXT_MAX_AGE
+        });
         for _ in self.incoming_text_messages.len()..before {
             self.add_toast(
                 ToastLevel::Warning,
@@ -126,13 +144,40 @@ impl ChatManager {
                 bail!("Too many concurrent large messages in flight for this chat");
             }
         }
+        // Byte budgets, before anything is stored: a chunk that would cross
+        // one drops the message it belongs to, so it cannot be held open.
+        let replaced = self
+            .incoming_text_messages
+            .get(&key)
+            .and_then(|m| m.parts.get(chunk_index as usize))
+            .and_then(|p| p.as_ref())
+            .map_or(0, String::len);
+        let (in_chat, in_total) = self.incoming_text_messages.iter().fold(
+            (0usize, 0usize),
+            |(chat, total), ((c, _), m)| {
+                (
+                    chat + if *c == chat_id { m.bytes } else { 0 },
+                    total + m.bytes,
+                )
+            },
+        );
+        let grows = text_part.len().saturating_sub(replaced);
+        if in_chat + grows > MAX_PARTIAL_TEXT_BYTES_PER_CHAT
+            || in_total + grows > MAX_PARTIAL_TEXT_BYTES_TOTAL
+        {
+            self.incoming_text_messages.remove(&key);
+            bail!("Large incoming messages are using too much memory; this one was dropped");
+        }
+        let now = std::time::Instant::now();
         let entry = self
             .incoming_text_messages
             .entry(key)
             .or_insert_with(|| IncomingTextMessage {
                 timestamp_millis,
                 parts: vec![None; total_chunks as usize],
-                updated_at: std::time::Instant::now(),
+                updated_at: now,
+                started_at: now,
+                bytes: 0,
             });
 
         if entry.parts.len() != total_chunks as usize {
@@ -145,7 +190,8 @@ impl ChatManager {
         }
 
         entry.timestamp_millis = timestamp_millis;
-        entry.updated_at = std::time::Instant::now();
+        entry.updated_at = now;
+        entry.bytes = entry.bytes - replaced + text_part.len();
         entry.parts[index] = Some(text_part);
 
         if entry.parts.iter().all(Option::is_some) {

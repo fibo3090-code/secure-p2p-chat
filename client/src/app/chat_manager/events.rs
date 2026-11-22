@@ -735,6 +735,12 @@ impl ChatManager {
             }
             Err(e) => {
                 tracing::error!("Failed to write chunk: {}", e);
+                // Tell the sender, or it streams the rest of the file (up to
+                // MAX_FILE_SIZE) into nothing and then reports it sent; and
+                // close the stream, so its remaining chunks go nowhere
+                // (APP-04).
+                self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
+                self.incoming_streams.remove(&chat_id);
                 self.set_transfer_status(transfer_id, TransferStatus::Failed(e.to_string()));
                 self.discard_spool(transfer_id, "write failed");
                 self.add_toast(ToastLevel::Error, format!("File transfer error: {}", e));

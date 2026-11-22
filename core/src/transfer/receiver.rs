@@ -320,7 +320,17 @@ impl IncomingFileSync {
     }
 
     /// Finalize the file transfer
-    pub fn finalize(mut self) -> Result<PathBuf> {
+    pub fn finalize(self) -> Result<PathBuf> {
+        // Whatever goes wrong, the spool does not stay behind: a short
+        // `FileEnd` used to leave the partial file in the download folder,
+        // invisible to the app and outside every cap (APP-03).
+        let spool = self.tmp_path.clone();
+        self.finish().inspect_err(|_| {
+            std::fs::remove_file(&spool).ok();
+        })
+    }
+
+    fn finish(mut self) -> Result<PathBuf> {
         // Flush and sync
         self.file.flush()?;
         self.file.sync_all()?;
@@ -347,8 +357,13 @@ impl IncomingFileSync {
         // folder.
         let final_path = reserve_unique_path_sync(&self.dest_dir, &self.filename)?;
 
-        // Rename onto the name we just reserved.
-        std::fs::rename(&self.tmp_path, &final_path)?;
+        // Rename onto the name we just reserved — and give the name back if
+        // that fails, or an empty placeholder is left where the file was meant
+        // to be.
+        if let Err(e) = std::fs::rename(&self.tmp_path, &final_path) {
+            std::fs::remove_file(&final_path).ok();
+            return Err(e.into());
+        }
         tracing::info!("File saved to: {:?}", final_path);
 
         Ok(final_path)
@@ -366,6 +381,29 @@ impl IncomingFileSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// APP-03: a peer that declares N bytes and ends after fewer made finalize
+    /// fail — and leave the partial spool in the download folder, invisible to
+    /// the app and outside every cap once the transfer row was gone. Any
+    /// failure to finalize removes what the transfer put on disk.
+    #[test]
+    fn a_failed_finalize_leaves_nothing_in_the_download_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut incoming = IncomingFileSync::new(dir.path(), "short.bin", 10).unwrap();
+        incoming.write_chunk(b"12345").unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the spool"
+        );
+        assert!(incoming.finalize().is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
     use tempfile::TempDir;
 
     #[tokio::test]

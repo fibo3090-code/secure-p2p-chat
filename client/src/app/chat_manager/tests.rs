@@ -1638,6 +1638,8 @@ fn stale_incoming_large_message_is_discarded() {
             timestamp_millis: 1,
             parts: vec![Some("partial".to_string()), None],
             updated_at: std::time::Instant::now() - Duration::from_secs(121),
+            started_at: std::time::Instant::now() - Duration::from_secs(121),
+            bytes: 7,
         },
     );
 
@@ -1652,6 +1654,96 @@ fn stale_incoming_large_message_is_discarded() {
             .any(|toast| toast.message.contains("large incoming message")),
         "cleanup should surface a warning toast"
     );
+}
+
+/// APP-09: the 16 partial-message slots per chat were the only bound, and
+/// each could hold 511 of 512 parts — about 384 MiB from one verified peer.
+/// The buffered bytes are budgeted: the chunk that would cross the budget is
+/// refused and its message dropped, so the total never passes it.
+#[test]
+fn partial_large_messages_are_held_to_a_byte_budget() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat = Uuid::new_v4();
+    let part = "x".repeat(crate::TEXT_CHUNK_BYTES);
+    let buffered =
+        |mgr: &ChatManager| -> usize { mgr.incoming_text_messages.values().map(|m| m.bytes).sum() };
+    let mut refused = 0;
+    // Spread over the 16 slots, as a peer would, never completing any.
+    'outer: for message in 0..crate::MAX_CONCURRENT_PARTIAL_TEXT_PER_CHAT {
+        let id = Uuid::from_u128(message as u128 + 1);
+        for index in 0..(crate::MAX_TEXT_CHUNKS - 1) {
+            match mgr.register_incoming_text_chunk(
+                chat,
+                id,
+                index,
+                crate::MAX_TEXT_CHUNKS,
+                part.clone(),
+                1,
+            ) {
+                Ok(_) => {}
+                Err(_) => {
+                    refused += 1;
+                    assert!(
+                        !mgr.incoming_text_messages.contains_key(&(chat, id)),
+                        "the message that crossed the budget is dropped, not kept half-open"
+                    );
+                    if refused > 3 {
+                        break 'outer;
+                    }
+                    continue 'outer;
+                }
+            }
+            assert!(buffered(&mgr) <= super::text::MAX_PARTIAL_TEXT_BYTES_PER_CHAT);
+        }
+    }
+    assert!(refused > 0, "nothing was ever refused");
+
+    // Another conversation still has its own room — up to the global budget.
+    assert!(mgr
+        .register_incoming_text_chunk(Uuid::new_v4(), Uuid::new_v4(), 0, 2, part.clone(), 1)
+        .is_ok());
+}
+
+/// The budget must not refuse what it exists to allow: one message of the
+/// largest size the protocol permits still arrives whole.
+#[test]
+fn a_maximum_size_message_still_fits_the_budget() {
+    assert!(
+        crate::MAX_TEXT_CHUNKS as usize * crate::TEXT_CHUNK_BYTES
+            <= super::text::MAX_PARTIAL_TEXT_BYTES_PER_CHAT
+    );
+    let mut mgr = ChatManager::new(Config::default());
+    let (chat, id) = (Uuid::new_v4(), Uuid::new_v4());
+    let part = "y".repeat(crate::TEXT_CHUNK_BYTES);
+    let mut done = None;
+    for index in 0..crate::MAX_TEXT_CHUNKS {
+        done = mgr
+            .register_incoming_text_chunk(chat, id, index, crate::MAX_TEXT_CHUNKS, part.clone(), 1)
+            .unwrap();
+    }
+    let (text, _) = done.expect("reassembled");
+    assert_eq!(
+        text.len(),
+        crate::MAX_TEXT_CHUNKS as usize * crate::TEXT_CHUNK_BYTES
+    );
+    assert!(mgr.incoming_text_messages.is_empty());
+}
+
+/// APP-09: the timeout restarted with every chunk, so one chunk a minute kept
+/// a buffer forever. A message has `super::text::INCOMING_TEXT_MAX_AGE` to arrive in all.
+#[test]
+fn a_trickled_large_message_cannot_stay_open_forever() {
+    let mut mgr = ChatManager::new(Config::default());
+    let (chat, id) = (Uuid::new_v4(), Uuid::new_v4());
+    mgr.register_incoming_text_chunk(chat, id, 0, 4, "a".into(), 1)
+        .unwrap();
+    // Recently active, but started long ago.
+    let entry = mgr.incoming_text_messages.get_mut(&(chat, id)).unwrap();
+    entry.started_at =
+        std::time::Instant::now() - super::text::INCOMING_TEXT_MAX_AGE - Duration::from_secs(1);
+    entry.updated_at = std::time::Instant::now();
+    mgr.cleanup_stale_incoming_text_messages();
+    assert!(mgr.incoming_text_messages.is_empty());
 }
 
 #[test]
@@ -2602,6 +2694,137 @@ fn declining_a_file_tells_the_sender_to_stop() {
         matches!(frame, ProtocolMessage::FileCancel { .. }),
         "expected FileCancel, got {:?}",
         frame
+    );
+}
+
+/// APP-04: a chunk that cannot be written — a full disk, or a peer sending
+/// past the size it declared — failed the transfer here and told the sender
+/// nothing. It kept streaming (up to 10 GiB) into nothing, then reported
+/// "File sent". The sender is told to stop, and the stream is closed so the
+/// rest of its chunks are not routed anywhere.
+#[test]
+fn a_chunk_that_cannot_be_written_tells_the_sender_to_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+    mgr.config.auto_accept_files = true;
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let mut app_rx = wire_session_for_test(&mut mgr, chat_id);
+
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "four.bin".into(),
+            size: 4,
+            seq: 1,
+        }),
+    );
+    // Past the declared size: the receiver refuses to write it.
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: vec![0u8; 64],
+            seq: 2,
+        }),
+    );
+
+    let frames: Vec<ProtocolMessage> = std::iter::from_fn(|| app_rx.try_recv().ok()).collect();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, ProtocolMessage::FileCancel { .. })),
+        "the sender was not told: {frames:?}"
+    );
+    assert!(
+        !mgr.incoming_streams.contains_key(&chat_id),
+        "the dead transfer still owns the stream"
+    );
+}
+
+/// APP-05: a held offer whose last byte had arrived is not "stuck" — the file
+/// is complete on disk and waits only for the user. A disconnect failed it
+/// anyway and deleted the file, so a peer that sent and quit (or a network
+/// blip) cost the recipient the whole download. It stays acceptable, and
+/// accepting it after the session is gone still saves it.
+#[test]
+fn a_complete_offer_survives_the_sender_hanging_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let _app_rx = wire_session_for_test(&mut mgr, chat_id);
+    for frame in [
+        ProtocolMessage::FileMeta {
+            filename: "done.txt".into(),
+            size: 5,
+            seq: 1,
+        },
+        ProtocolMessage::FileChunk {
+            chunk: b"hello".to_vec(),
+            seq: 2,
+        },
+        ProtocolMessage::FileEnd { seq: 3 },
+    ] {
+        mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(frame));
+    }
+    let transfer_id = *mgr
+        .active_transfers
+        .iter()
+        .find(|(_, t)| t.status == TransferStatus::AwaitingAcceptance)
+        .expect("held for the user")
+        .0;
+
+    mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+    assert_eq!(
+        mgr.active_transfers
+            .get(&transfer_id)
+            .map(|t| t.status.clone()),
+        Some(TransferStatus::AwaitingAcceptance),
+        "a complete offer was failed by the disconnect"
+    );
+
+    mgr.accept_incoming_file(transfer_id)
+        .expect("accept offline");
+    assert_eq!(
+        std::fs::read(dir.path().join("done.txt")).unwrap(),
+        b"hello"
+    );
+}
+
+/// The other half of the rule: an offer still *streaming* when the session
+/// dies is incomplete, and is failed and cleaned up as before.
+#[test]
+fn an_incomplete_offer_is_still_failed_by_a_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let _app_rx = wire_session_for_test(&mut mgr, chat_id);
+    for frame in [
+        ProtocolMessage::FileMeta {
+            filename: "half.txt".into(),
+            size: 10,
+            seq: 1,
+        },
+        ProtocolMessage::FileChunk {
+            chunk: b"hello".to_vec(),
+            seq: 2,
+        },
+    ] {
+        mgr.handle_session_event(chat_id, SessionEvent::MessageReceived(frame));
+    }
+    mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+    assert!(mgr
+        .active_transfers
+        .values()
+        .all(|t| matches!(t.status, TransferStatus::Failed(_))));
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "spool left behind"
     );
 }
 

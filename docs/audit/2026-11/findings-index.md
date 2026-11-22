@@ -56,13 +56,13 @@ prioritised view is in [README.md](README.md).
 | UI-01 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Community first-join SAS check does not cover the connection that receives the credentials |
 | UI-02 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | A late conversation fetch can show A while the composer sends to B |
 | APP-02 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | `send_file` awaits the bounded file lane while the caller holds the `ChatManager` lock |
-| APP-03 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | A received file whose finalize fails leaves its spool, and possibly an empty placeholder, in Downloads |
-| APP-04 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | A local disk-write error on receive does not tell the sender to stop |
-| APP-05 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | A fully received offer awaiting the user's decision is destroyed when the peer disconnects |
+| APP-03 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | A received file whose finalize fails leaves its spool, and possibly an empty placeholder, in Downloads |
+| APP-04 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | A local disk-write error on receive does not tell the sender to stop |
+| APP-05 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | A fully received offer awaiting the user's decision is destroyed when the peer disconnects |
 | APP-06 | Medium | VERIFIED | M | [04-client-core](reports/04-client-core.md) | `FileCancel` carries no transfer id, so with transfers both ways it cancels the wrong one |
 | APP-07 | Medium | VERIFIED | M | [04-client-core](reports/04-client-core.md) | Unaccepted, peer-controlled spools live in the user's Downloads folder and are never swept |
-| APP-08 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party history paging skips a range when a live broadcast arrives before the first page |
-| APP-09 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Chunked-text reassembly is bounded by message count, not bytes (hundreds of MiB per chat) |
+| APP-08 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Party history paging skips a range when a live broadcast arrives before the first page |
+| APP-09 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Chunked-text reassembly is bounded by message count, not bytes (hundreds of MiB per chat) |
 | APP-10 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party `connect_and_join` has no TCP connect timeout, and the desktop holds the `PartyManager` lock across it |
 | CRYPTO-03 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Both directions share one key and one AAD, and decrypt never checks the role bit, so frames can be reflected |
 | CRYPTO-04 | Medium | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | An invite's fingerprint is never compared with the fingerprint presented on first connection |
