@@ -467,7 +467,6 @@ impl PartyState {
             tracing::info!("migrated legacy party_state.json snapshot into party.db");
         }
 
-        let has_channels = table_count(&conn, CountedTable::Channels)? > 0;
         let mut state = Self::new(name, password);
         state.db = Some(conn);
         state.blob_dir = Some(blob_dir.clone());
@@ -476,7 +475,7 @@ impl PartyState {
         // in a live one). No content hash starts with `staging_`.
         sweep_staging_files(&blob_dir);
 
-        if has_channels {
+        if table_count(state.db.as_ref().unwrap(), CountedTable::Channels)? > 0 {
             // The database is authoritative; rebuild the in-memory model from it.
             state.reload_from_db()?;
             // A community with an Owner needs no claim; one without keeps the
