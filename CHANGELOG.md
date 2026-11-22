@@ -40,7 +40,9 @@ predate tagged releases.
   received. The second copy now says the app is already running and touches
   nothing.
 - Unlocking no longer freezes the desktop window while the password is
-  checked; the key is derived in the background.
+  checked; the key is derived in the background. Setting or changing the
+  password is about twice as fast: the key is derived once instead of twice,
+  and the four Argon2 lanes now run in parallel.
 - Relay with hole punching: over a slow link one side could end up on the
   direct connection and the other bridged to a closed one, so neither could
   talk. The relay server's verdict now decides for both. A peer can no longer

@@ -150,12 +150,11 @@ pub(crate) async fn set_password(
     let candidate = crate::lock_identity(&state.identity).clone();
     let (candidate, key) = tokio::task::spawn_blocking(move || {
         let mut id = candidate;
-        // `encrypt` enforces the length floor; the message it returns is
-        // already user-facing, so pass it straight through to the screen.
-        id.encrypt(&password).map_err(|e| e.to_string())?;
+        // `protect` is `encrypt` (which enforces the length floor, with a
+        // user-facing message to pass straight to the screen) keeping the key
+        // in memory, so this session stays unlocked on one Argon2 run, not two.
+        id.protect(&password).map_err(|e| e.to_string())?;
         id.save(&path).map_err(|e| e.to_string())?;
-        // Decrypt in memory so we remain unlocked for this session.
-        id.decrypt(&password).map_err(|e| e.to_string())?;
         let key = id.history_key().map_err(|e| e.to_string())?;
         Ok::<_, String>((id, key))
     })

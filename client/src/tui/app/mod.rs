@@ -1480,8 +1480,10 @@ impl TuiApp {
             );
             return;
         }
-        let result = self.identity.migrate_legacy_plaintext(password);
-        self.finish_password_update(result, password, "Password set");
+        // `protect` keeps the key in memory, so no second Argon2 run is needed
+        // to stay unlocked (PERF-12).
+        let result = self.identity.protect(password);
+        self.finish_password_update(result, "Password set");
     }
 
     fn try_change_password(&mut self, current: &str, new: &str) {
@@ -1496,30 +1498,33 @@ impl TuiApp {
             return;
         }
         let result = self.identity.change_password(current, new);
-        self.finish_password_update(result, new, "Password changed");
+        self.finish_password_update(result, "Password changed");
     }
 
     /// Save the re-wrapped identity and re-derive the history key from it.
     /// Success is reported only when every step worked: "Password set" used
     /// to be shown even when the identity could not be reloaded afterwards.
-    fn finish_password_update(&mut self, result: anyhow::Result<()>, password: &str, done: &str) {
+    fn finish_password_update(&mut self, result: anyhow::Result<()>, done: &str) {
         let outcome = result
             .and_then(|()| self.identity.save(&self.identity_path))
             .and_then(|()| {
-                // Re-deriving the key needs the plaintext, which encrypt()
-                // cleared, so reload and decrypt.
-                let mut reloaded = Identity::load(&self.identity_path)?;
-                reloaded.decrypt(password)?;
-                let key = reloaded.history_key()?;
-                Ok((reloaded, key))
+                // Both `protect` and `change_password` leave the identity
+                // unlocked, so the key is in hand. The file is reloaded only to
+                // prove it reads back — re-decrypting it as well cost another
+                // full Argon2 run (PERF-12).
+                let reloaded = Identity::load(&self.identity_path)?;
+                anyhow::ensure!(
+                    reloaded.fingerprint == self.identity.fingerprint && reloaded.is_encrypted(),
+                    "the saved identity does not match the one in use"
+                );
+                self.identity.history_key()
             });
         match outcome {
-            Ok((reloaded, key)) => {
+            Ok(key) => {
                 self.chat_manager.set_history_key(key);
                 let _ = self
                     .chat_manager
                     .load_history_auto(&self.history_path, &key);
-                self.identity = reloaded;
                 self.overlay = TuiOverlay::None;
                 self.toast(ToastLevel::Success, done.to_string());
             }

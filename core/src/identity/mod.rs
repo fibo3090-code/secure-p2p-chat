@@ -269,6 +269,8 @@ impl Identity {
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
+        #[cfg(test)]
+        tests::derivations::bump();
         argon2
             .hash_password_into(password.as_bytes(), &salt, &mut key_bytes[..])
             .map_err(|e| anyhow!("Failed to derive key with Argon2: {}", e))?;
@@ -292,6 +294,18 @@ impl Identity {
         // Clear the plaintext key from memory
         self.private_key_pem_plaintext = None;
 
+        Ok(())
+    }
+
+    /// Set the first password and **stay unlocked**: [`Identity::encrypt`]
+    /// without discarding the key in memory. Setup used to `encrypt` and then
+    /// `decrypt` just to get the key back, paying for Argon2 twice (PERF-12).
+    /// The file written by [`Identity::save`] is the same either way — the
+    /// plaintext key is never serialised.
+    pub fn protect(&mut self, password: &str) -> Result<()> {
+        let pem = self.private_key_pem_plaintext.clone();
+        self.encrypt(password)?;
+        self.private_key_pem_plaintext = pem;
         Ok(())
     }
 
@@ -339,6 +353,8 @@ impl Identity {
         ciphertext: &[u8],
     ) -> Option<Zeroizing<String>> {
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
+        #[cfg(test)]
+        tests::derivations::bump();
         argon
             .hash_password_into(password.as_bytes(), salt, &mut key_bytes[..])
             .ok()?;
@@ -1409,6 +1425,21 @@ mod tests {
         }
     }
 
+    /// Argon2 runs on this thread, counted.
+    pub(super) mod derivations {
+        use std::cell::Cell;
+        thread_local!(static COUNT: Cell<u32> = const { Cell::new(0) });
+        pub(in crate::identity) fn bump() {
+            COUNT.with(|c| c.set(c.get() + 1));
+        }
+        pub(in crate::identity) fn reset() {
+            COUNT.with(|c| c.set(0));
+        }
+        pub(in crate::identity) fn count() -> u32 {
+            COUNT.with(Cell::get)
+        }
+    }
+
     // ── Argon2 key-derivation compatibility ─────────────────────────────────
     //
     // This app has written three on-disk shapes over its life: keys wrapped
@@ -1453,6 +1484,61 @@ mod tests {
             Version::V0x13,
             Params::new(65536, 3, 4, Some(KEY_SIZE)).unwrap(),
         )
+    }
+
+    /// The wrapping key for the strict parameters, pinned against the
+    /// reference C implementation (argon2-cffi 25.1, `hash_secret_raw`, type
+    /// ID, v19). What it guards: every identity file opens only if this
+    /// derivation never changes — a crate upgrade, or turning on the
+    /// `parallel` feature (PERF-12), must reproduce these bytes exactly.
+    #[test]
+    fn the_wrapping_key_matches_the_reference_implementation() {
+        let mut key = [0u8; KEY_SIZE];
+        strict_argon()
+            .hash_password_into(
+                b"correct horse battery staple",
+                b"p2pem-kat-salt!!",
+                &mut key,
+            )
+            .unwrap();
+        assert_eq!(
+            hex::encode(key),
+            "e6e1221008715771c9ac2c8b0317d37f4301e772a202accc6224e51946701a8e"
+        );
+    }
+
+    /// PERF-12: first-time setup ran Argon2 twice — `encrypt`, then `decrypt`
+    /// only to get back the key `encrypt` had just thrown away. `protect`
+    /// wraps once and keeps the key, and what reaches the disk is the same
+    /// encrypted file `encrypt` writes.
+    #[test]
+    fn protecting_an_identity_derives_once_and_stays_unlocked() {
+        let mut identity = Identity::new_with_plaintext("Setup".to_string()).unwrap();
+        let history_key = identity.history_key().unwrap();
+        derivations::reset();
+        identity.protect("a-long-enough-password").unwrap();
+        assert_eq!(derivations::count(), 1, "Argon2 ran more than once");
+        assert!(identity.is_encrypted());
+        assert!(!identity.is_locked(), "setup left the identity locked");
+        assert_eq!(identity.history_key().unwrap(), history_key);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        identity.save(&path).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("PRIVATE KEY"),
+            "the plaintext key was written"
+        );
+        let mut reopened = Identity::load(&path).unwrap();
+        assert!(reopened.is_locked());
+        reopened.decrypt("a-long-enough-password").unwrap();
+        assert_eq!(reopened.history_key().unwrap(), history_key);
+
+        // Same floor as `encrypt`, and a refusal changes nothing.
+        let mut fresh = Identity::new_with_plaintext("Short".to_string()).unwrap();
+        assert!(fresh.protect("short").is_err());
+        assert!(!fresh.is_encrypted() && !fresh.is_locked());
     }
 
     #[test]
