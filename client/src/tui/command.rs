@@ -380,6 +380,21 @@ impl<'a> Args<'a> {
         non_empty(self.rest, || self.usage())
     }
 
+    /// Everything after the first `n` words, spaces inside kept — for a
+    /// secret, which may be a passphrase. Taking one word cut
+    /// `correct horse battery staple` down to `correct` (TUI-11).
+    fn rest_after(&self, n: usize) -> Option<String> {
+        self.took_rest.set(true);
+        let mut rest = self.rest;
+        for _ in 0..n {
+            rest = rest.trim_start();
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            rest = &rest[end..];
+        }
+        let rest = rest.trim();
+        (!rest.is_empty()).then(|| rest.to_string())
+    }
+
     /// The remainder after `first` (a word already taken with [`Self::word`]),
     /// required — for `<target> <free text>` commands.
     fn text_after(&self, first: &str) -> Result<String, String> {
@@ -394,6 +409,22 @@ fn non_empty(s: &str, usage: impl FnOnce() -> String) -> Result<String, String> 
     } else {
         Ok(s.to_string())
     }
+}
+
+/// What of `raw` may go into the command history: the line itself, or — for
+/// a command that carries a secret — the line without it. Recalling a typed
+/// password with ↑, or reading it off the screen later, was TUI-11.
+pub fn history_entry(raw: &str) -> String {
+    let line = raw.trim().trim_start_matches(':').trim();
+    let mut words = line.split_whitespace();
+    let cmd = words.next().unwrap_or_default();
+    let keep = match cmd {
+        "unlock" | "set-password" | "change-password" | "connection-password" => 0,
+        "party-connect" => 2,
+        _ => return raw.to_string(),
+    };
+    let kept: Vec<&str> = std::iter::once(cmd).chain(words.take(keep)).collect();
+    format!(":{}", kept.join(" "))
 }
 
 /// Parse a raw command-line string (with or without the leading `:`).
@@ -439,7 +470,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         },
         "disconnect" => C::Disconnect,
         "stop-host" => C::StopHost,
-        "connection-password" => C::ConnectionPassword(a.opt_string()),
+        "connection-password" => C::ConnectionPassword(a.rest_after(0)),
         "lock" => C::Lock(parse_bool(a.word()?)?),
 
         "contacts" => C::Contacts,
@@ -472,7 +503,7 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         "party-connect" => C::PartyConnect {
             address: a.word()?.to_string(),
             username: a.word()?.to_string(),
-            password: a.opt_string(),
+            password: a.rest_after(2),
         },
         "party-trust" => C::PartyTrust,
         "party-post" => C::PartyPost(a.text()?),
@@ -518,8 +549,8 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
             "reject" | "n" | "deny" => C::Verify(false),
             other => return Err(format!("Expected accept or reject, got '{}'", other)),
         },
-        "unlock" => C::Unlock(a.opt_string()),
-        "set-password" => C::SetPassword(a.word()?.to_string()),
+        "unlock" => C::Unlock(a.rest_after(0)),
+        "set-password" => C::SetPassword(a.rest_after(0).ok_or_else(|| a.usage())?),
         "change-password" => C::ChangePassword {
             current: a.word()?.to_string(),
             new: a.word()?.to_string(),
@@ -570,6 +601,44 @@ pub use parse_bool as parse_setting_bool;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TUI-11: a secret is the rest of the line (a passphrase has spaces), and
+    /// the command history keeps the line without it.
+    #[test]
+    fn a_password_is_the_rest_of_the_line_and_never_reaches_history() {
+        assert_eq!(
+            parse_command(":set-password correct horse battery staple").unwrap(),
+            TuiCommand::SetPassword("correct horse battery staple".into())
+        );
+        assert_eq!(
+            parse_command(":unlock  two words ").unwrap(),
+            TuiCommand::Unlock(Some("two words".into()))
+        );
+        assert_eq!(
+            parse_command(":party-connect host:1 ada pass with spaces").unwrap(),
+            TuiCommand::PartyConnect {
+                address: "host:1".into(),
+                username: "ada".into(),
+                password: Some("pass with spaces".into())
+            }
+        );
+        assert_eq!(parse_command(":unlock").unwrap(), TuiCommand::Unlock(None));
+        assert!(parse_command(":set-password").is_err());
+
+        for (typed, kept) in [
+            (":unlock hunter2 hunter2", ":unlock"),
+            (":set-password correct horse", ":set-password"),
+            (":change-password old new", ":change-password"),
+            (":connection-password s3cret", ":connection-password"),
+            (
+                ":party-connect host:1 ada s3cret",
+                ":party-connect host:1 ada",
+            ),
+            (":connect 10.0.0.1:9000", ":connect 10.0.0.1:9000"),
+        ] {
+            assert_eq!(history_entry(typed), kept, "{typed}");
+        }
+    }
 
     /// A word the parser does not use must be an error, not dropped. With the
     /// port written after a space, `:connect 10.0.0.5 9000` dialled the

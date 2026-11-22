@@ -868,8 +868,12 @@ fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) 
         PasswordMode::Unlock => {
             "Your identity is encrypted. Enter your password to unlock messaging and history."
         }
+        PasswordMode::Set if app.new_password_first.is_some() => {
+            "Type the same password again to confirm it. There is no way to recover it."
+        }
         PasswordMode::Set => {
-            "Protect your private key with a password. You'll need it on next launch."
+            "Protect your private key with a password (at least 12 characters). \
+             You'll need it on next launch, and it cannot be recovered."
         }
     };
     let rows = Layout::default()

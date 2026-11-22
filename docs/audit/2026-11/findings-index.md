@@ -157,8 +157,8 @@ prioritised view is in [README.md](README.md).
 | TAURI-31 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `export_identity` can destroy the identity it is backing up, and records "backed up" for any destination |
 | TUI-09 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | Multi-line messages have their newlines removed when rendered, and scroll height is miscomputed |
 | TUI-10 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | CLI launch flags are dropped for a password-protected identity; `--port` is ignored by `--connect`; no flag validation |
-| TUI-11 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | Passwords are typed in clear on the command line, kept in command history, and truncated at the first space |
-| TUI-12 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | Setting a password has no confirmation field and no length hint |
+| TUI-11 | Medium | Partly fixed | S | [05-tui](reports/05-tui.md) | Passwords are typed in clear on the command line, kept in command history, and truncated at the first space |
+| TUI-12 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | Setting a password has no confirmation field and no length hint |
 | TUI-13 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Blocking work runs on the UI loop: Argon2, full-history save every 30 s, whole-file read for community upload; failures are silent |
 | TUI-14 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Each frame does O(all messages) work, and the loop handles one input event per frame |
 | TUI-15 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:disconnect` deletes the conversation and its history; deletions have no confirmation |

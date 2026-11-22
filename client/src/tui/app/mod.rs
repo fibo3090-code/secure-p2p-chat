@@ -95,6 +95,10 @@ pub struct TuiApp {
     pub input_field: EditableField,
     pub command_field: EditableField,
     pub password_field: EditableField,
+    /// The first entry of a new password, waiting for the confirming second.
+    /// Typed once, a typo became the password of the only key to the history
+    /// (TUI-12). Never persisted; zeroized on drop by `Zeroizing`.
+    pub(crate) new_password_first: Option<zeroize::Zeroizing<String>>,
     pub message_scroll: u16,
     pub stick_to_bottom: bool,
     pub identity_name: String,
@@ -213,6 +217,7 @@ impl TuiApp {
             input_field: EditableField::new(true),
             command_field: EditableField::new(false),
             password_field: EditableField::new(false).masked(true),
+            new_password_first: None,
             message_scroll: 0,
             stick_to_bottom: true,
             identity_name: identity.name.clone(),
@@ -721,7 +726,8 @@ impl TuiApp {
 
     pub fn submit_command(&mut self) {
         let raw = self.command_field.text();
-        self.command_field.push_history(&raw);
+        self.command_field
+            .push_history(&crate::tui::command::history_entry(&raw));
         match parse_command(&raw) {
             Ok(cmd) => self.pending_command = Some(cmd),
             Err(e) => self.toast(ToastLevel::Error, e),
@@ -1030,6 +1036,7 @@ impl TuiApp {
                 // Unlocking can be put off: closing the prompt leaves the app
                 // locked, and nothing is saved while it is.
                 self.password_field.clear();
+                self.new_password_first = None;
                 self.overlay = TuiOverlay::None;
             }
             KeyCode::Enter => {
@@ -1037,7 +1044,7 @@ impl TuiApp {
                 self.password_field.clear();
                 match mode {
                     PasswordMode::Unlock => self.try_unlock(&pw),
-                    PasswordMode::Set => self.try_set_password(&pw),
+                    PasswordMode::Set => self.enter_new_password(pw),
                 }
             }
             _ => {
@@ -1419,6 +1426,32 @@ impl TuiApp {
                 self.toast(ToastLevel::Success, "Identity unlocked".to_string());
             }
             Err(_) => self.toast(ToastLevel::Error, "Wrong password".to_string()),
+        }
+    }
+
+    /// A new password is typed twice and must match (TUI-12): the first entry
+    /// is checked against the floor and held; the second sets it or starts over.
+    fn enter_new_password(&mut self, password: String) {
+        match self.new_password_first.take() {
+            None => {
+                if password.chars().count() < crate::MIN_PASSWORD_LEN {
+                    self.toast(
+                        ToastLevel::Error,
+                        format!(
+                            "Password must be at least {} characters",
+                            crate::MIN_PASSWORD_LEN
+                        ),
+                    );
+                    return;
+                }
+                self.new_password_first = Some(zeroize::Zeroizing::new(password));
+                self.toast(ToastLevel::Info, "Type it again to confirm".to_string());
+            }
+            Some(first) if *first == password => self.try_set_password(&password),
+            Some(_) => self.toast(
+                ToastLevel::Error,
+                "The two passwords did not match — nothing was set. Type a new one.".to_string(),
+            ),
         }
     }
 
@@ -2070,6 +2103,49 @@ mod tests {
         let addrs = format!("{:?} {:?}", contact.address, contact.addresses);
         assert!(addrs.contains(":40999"), "{addrs}");
         assert!(!addrs.contains(":12345"), "{addrs}");
+    }
+
+    /// TUI-12: a new password was typed once, so a typo became the password
+    /// of the only key to the history. It is typed twice; a mismatch sets
+    /// nothing, and one below the floor is refused at the first entry.
+    #[test]
+    fn a_new_password_must_be_typed_twice() {
+        let (mut app, _data) = app();
+        assert!(!app.identity.is_encrypted());
+        app.overlay = TuiOverlay::Password {
+            mode: PasswordMode::Set,
+        };
+        let enter = |app: &mut TuiApp, text: &str| {
+            for c in text.chars() {
+                app.handle_key_event(key(c));
+            }
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+
+        enter(&mut app, "short");
+        assert!(
+            last_toast(&app).contains("at least"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(app.new_password_first.is_none());
+
+        enter(&mut app, "first long password");
+        enter(&mut app, "first long passwerd");
+        assert!(
+            !app.identity.is_encrypted(),
+            "a mistyped confirmation set the password"
+        );
+        assert!(
+            last_toast(&app).contains("did not match"),
+            "{}",
+            last_toast(&app)
+        );
+
+        enter(&mut app, "the real password");
+        enter(&mut app, "the real password");
+        assert!(app.identity.is_encrypted(), "{}", last_toast(&app));
+        assert!(app.new_password_first.is_none());
     }
 
     /// TUI-03: `:set-password` re-encrypted an identity that already had a

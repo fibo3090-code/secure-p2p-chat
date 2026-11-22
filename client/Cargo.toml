@@ -16,6 +16,7 @@ name = "p2pem-classic"
 path = "src/main.rs"
 
 [dependencies]
+zeroize = { workspace = true }
 # Shared core (crypto, protocol, identity, transport)
 messenger-core = { workspace = true }
 
