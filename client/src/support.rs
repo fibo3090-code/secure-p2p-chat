@@ -111,18 +111,66 @@ pub fn export_diagnostics_bundle(
     let logs_path = bundle_dir.join("logs.txt");
     let readme_path = bundle_dir.join("README.txt");
 
+    // Owner-only, like everything else the app writes about its user, and the
+    // logs scrubbed: this bundle is made to be attached to a public issue, and
+    // it carried live relay tokens, peer addresses and full fingerprints in
+    // world-readable files (audit PRIV-04).
+    let write = |path: &Path, body: &[u8]| {
+        messenger_core::util::write_file_atomic(path, body)
+            .with_context(|| format!("failed to write {}", path.display()))
+    };
     let report_json = serde_json::to_string_pretty(report)?;
-    std::fs::write(&report_path, report_json)
-        .with_context(|| format!("failed to write {}", report_path.display()))?;
-    std::fs::write(&logs_path, logs)
-        .with_context(|| format!("failed to write {}", logs_path.display()))?;
-    std::fs::write(
+    write(&report_path, report_json.as_bytes())?;
+    write(&logs_path, redact_for_sharing(logs).as_bytes())?;
+    write(
         &readme_path,
-        "Diagnostics bundle for support.\nShare diagnostics.json and logs.txt when reporting a bug.\nPrivate keys are not included.\n",
-    )
-    .with_context(|| format!("failed to write {}", readme_path.display()))?;
+        b"Diagnostics bundle for support.\n\
+          Share diagnostics.json and logs.txt when reporting a bug.\n\
+          Private keys and message text are not included. Relay tokens, IP addresses\n\
+          and long fingerprints in the logs are replaced with <hex> / <ip>, but file\n\
+          names and contact names may remain: read logs.txt before sharing it.\n",
+    )?;
 
     Ok(bundle_dir)
+}
+
+/// Scrub what must not leave the machine from text meant to be shared: runs of
+/// 32+ hex digits (relay tokens, fingerprints, hashes) become `<hex>` and IPv4
+/// addresses `<ip>`. Best effort by shape — a short fingerprint prefix, which
+/// identifies nothing alone, is kept, and names are not recognised.
+pub fn redact_for_sharing(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let core = word.trim_end_matches('.');
+        let tail = &word[core.len()..];
+        let is_hex = core.len() >= 32 && core.chars().all(|c| c.is_ascii_hexdigit());
+        let parts: Vec<&str> = core.split('.').collect();
+        let is_ipv4 = parts.len() == 4
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.len() <= 3 && p.parse::<u16>().is_ok_and(|n| n <= 255));
+        if is_hex {
+            out.push_str("<hex>");
+            out.push_str(tail);
+        } else if is_ipv4 {
+            out.push_str("<ip>");
+            out.push_str(tail);
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 pub fn install_panic_hook() {
@@ -203,9 +251,48 @@ mod tests {
             },
         };
 
-        let bundle_dir = export_diagnostics_bundle(dir.path(), &report, "hello logs").unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let fp = "ab".repeat(32);
+        let logs = format!("relay token {token} from 192.168.1.20:12345 peer {fp}.");
+        let bundle_dir = export_diagnostics_bundle(dir.path(), &report, &logs).unwrap();
         assert!(bundle_dir.join("diagnostics.json").exists());
-        assert!(bundle_dir.join("logs.txt").exists());
         assert!(bundle_dir.join("README.txt").exists());
+
+        // PRIV-04: the bundle is meant to be attached to a public issue, and
+        // its logs carried live relay tokens, peer addresses and full
+        // fingerprints, in files any local user could read.
+        let written = std::fs::read_to_string(bundle_dir.join("logs.txt")).unwrap();
+        for leaked in [token, "192.168.1.20", fp.as_str()] {
+            assert!(
+                !written.contains(leaked),
+                "{leaked} left in the shared logs: {written}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in ["diagnostics.json", "logs.txt", "README.txt"] {
+                let mode = std::fs::metadata(bundle_dir.join(f))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{f} is {:o}", mode & 0o777);
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_removes_secrets_and_keeps_the_rest() {
+        let out = redact_for_sharing(
+            "v1.2.3 dialled 10.0.0.5:9000 with 0123456789ABCDEF0123456789ABCDEF; port 12345 ok",
+        );
+        assert_eq!(out, "v1.2.3 dialled <ip>:9000 with <hex>; port 12345 ok");
+        // Not addresses: too few parts, or an octet out of range.
+        assert_eq!(
+            redact_for_sharing("1.2.3 and 1.2.3.999"),
+            "1.2.3 and 1.2.3.999"
+        );
+        // Short hex (an 8-char fingerprint prefix) is kept: it identifies nothing alone.
+        assert_eq!(redact_for_sharing("fp abcd1234"), "fp abcd1234");
     }
 }
