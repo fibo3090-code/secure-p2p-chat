@@ -772,8 +772,25 @@ impl PartyState {
         // The quota check is provisional: content the server already holds costs
         // nothing, but that is only knowable once the bytes have arrived, so the
         // pessimistic answer is the one to give before accepting them.
+        // Spools are held in memory until they finish, so what is already in
+        // flight counts: checked one at a time, four 100 MiB uploads each
+        // passed a 128 MiB allowance (SRV-07).
+        let in_flight = |only: Option<Uuid>| -> u64 {
+            self.uploads
+                .values()
+                .filter(|p| only.is_none_or(|m| p.uploader == m))
+                .map(|p| p.declared)
+                .sum()
+        };
+        if in_flight(None).saturating_add(size) > self.max_upload_spool_bytes {
+            return Err(
+                "the server is busy receiving other uploads — try again shortly".to_string(),
+            );
+        }
         if let Some(limit) = self.member_blob_limit(uploader) {
-            let used = self.member_blob_bytes(uploader);
+            let used = self
+                .member_blob_bytes(uploader)
+                .saturating_add(in_flight(Some(uploader)));
             if used.saturating_add(size) > limit {
                 return Err(format!(
                     "this would exceed your {} file storage allowance ({} of it already used)",

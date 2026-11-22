@@ -64,6 +64,11 @@ const MAX_TOTAL_BLOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// feature to everyone else, so storage is also budgeted per member. Admins are
 /// exempt — they are the ones who clean up when it fills.
 const MAX_MEMBER_BLOB_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+
+/// Bytes every chunked upload in flight may declare, together. Their spools
+/// are held in memory until they finish, so without this one server's RAM was
+/// bounded only by members × 4 × 100 MiB (audit SRV-07).
+const MAX_UPLOAD_SPOOL_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// Most audit entries retained in memory and returned to an admin.
 const MAX_AUDIT_ENTRIES: usize = 1000;
 /// Most channels one server will hold. Channel creation is open to every joined
@@ -392,6 +397,8 @@ pub struct PartyState {
     reservations: HashMap<Uuid, Reservation>,
     /// Per-member ceiling on distinct uploaded bytes. Admins are exempt.
     max_member_blob_bytes: u64,
+    /// See `MAX_UPLOAD_SPOOL_BYTES`.
+    max_upload_spool_bytes: u64,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
     max_blob_bytes: u64,
     /// Most members this server registers (see [`MAX_MEMBERS`]).
@@ -454,6 +461,7 @@ impl PartyState {
             uploads: HashMap::new(),
             reservations: HashMap::new(),
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
+            max_upload_spool_bytes: MAX_UPLOAD_SPOOL_BYTES,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             max_members: MAX_MEMBERS,
             resident_history: RESIDENT_HISTORY,
@@ -471,6 +479,11 @@ impl PartyState {
     /// Override the per-member storage allowance (bytes of distinct content).
     pub fn set_max_member_blob_bytes(&mut self, bytes: u64) {
         self.max_member_blob_bytes = bytes;
+    }
+
+    /// Override the server-wide budget for upload bytes in flight (tests).
+    pub fn set_max_upload_spool_bytes(&mut self, bytes: u64) {
+        self.max_upload_spool_bytes = bytes;
     }
 
     /// Override how many of each thread's newest envelopes stay in memory on
@@ -532,6 +545,16 @@ impl PartyState {
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        // Owner-only, and on every load so a directory an older version made
+        // is closed too. `party.db` holds every message and DM in plaintext,
+        // and under a 022 umask it and every blob were world-readable on a
+        // shared host (SRV-11). The directory's mode covers everything in it,
+        // including files created later under the default umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;
@@ -1505,6 +1528,12 @@ impl PartyState {
         }
         if !self.is_member(to) {
             return Err("recipient is not a member of this server".to_string());
+        }
+        // A Guest is read-only everywhere, DMs included: demotion is the one
+        // moderation tool, and it did not stop DM spam (SRV-08). Files and
+        // shares already checked this; text did not.
+        if !self.role_of(from).can_write() {
+            return Err("your role on this server is read-only".to_string());
         }
         validate_message_text(&text)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);

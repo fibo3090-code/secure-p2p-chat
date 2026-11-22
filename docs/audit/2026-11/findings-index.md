@@ -122,7 +122,7 @@ prioritised view is in [README.md](README.md).
 | PRIV-04 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The TUI log buffer and "Export diagnostics" bundle capture relay tokens, peer IPs, file names and paths, contact names and the external IP, under a README that implies the bundle is safe to share |
 | PRIV-05 | Medium | SUSPECTED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Desktop debug logging (filenames, peer addresses, frame metadata) goes to stdout, which on Linux plausibly persists in the systemd journal |
 | PRIV-06 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Desktop notifications show message text by default with no "hide content" option |
-| PRIV-09 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The community server writes plaintext `party.db` and `blobs/` under the default umask, and server logs record member IPs at info |
+| PRIV-09 | Medium | Partly fixed | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The community server writes plaintext `party.db` and `blobs/` under the default umask, and server logs record member IPs at info |
 | QUAL-03 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Session runners take 8–9 positional arguments; `SessionChannels` exists but stays client-private |
 | QUAL-04 | Medium | VERIFIED | L | [12-code-quality](reports/12-code-quality.md) | Errors are untyped across every module boundary |
 | QUAL-05 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Server persistence logs and ignores every error and has no transactions or schema versioning |
@@ -134,14 +134,14 @@ prioritised view is in [README.md](README.md).
 | QUAL-11 | Medium | VERIFIED | S/M | [12-code-quality](reports/12-code-quality.md) | Stringly-typed seams: transport carried as a `"p2p:"`/`"relay:"` prefix; roles and kinds mapped twice |
 | QUAL-12 | Medium | VERIFIED | S | [12-code-quality](reports/12-code-quality.md) | Swallowed results that hide real failures (judged list) |
 | QUAL-13 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | `ChatManager` is a god object with 11 public mutable fields; validation happens only at load time |
-| SRV-07 | Medium | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Chunked-upload spools live in RAM, bounded only per member (4 × 100 MiB) and outside every quota |
-| SRV-08 | Medium | VERIFIED | S | [03-party-server](reports/03-party-server.md) | Moderation is largely missing, and a Guest can still send DMs |
+| SRV-07 | Medium | Fixed | M | [03-party-server](reports/03-party-server.md) | Chunked-upload spools live in RAM, bounded only per member (4 × 100 MiB) and outside every quota |
+| SRV-08 | Medium | Partly fixed | S | [03-party-server](reports/03-party-server.md) | Moderation is largely missing, and a Guest can still send DMs |
 | SRV-09 | Medium | VERIFIED | S-M | [03-party-server](reports/03-party-server.md) | Any member can push admin actions out of the visible audit log; the audit table grows without bound |
-| SRV-10 | Medium | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Multi-row operations are not transactional and refcounts are not reconciled on load: crashes leak blobs or delete files still in use |
-| SRV-11 | Medium | VERIFIED | S | [03-party-server](reports/03-party-server.md) | `party.db` and blobs (plaintext channels and DMs) are created with default permissions |
-| SRV-12 | Medium | VERIFIED | S | [03-party-server](reports/03-party-server.md) | Every mutation is an autocommit fsync made while the global state lock is held; no WAL |
-| SRV-13 | Medium | VERIFIED | M | [03-party-server](reports/03-party-server.md) | O(n) and O(n·m) work per request while holding the global lock |
-| SRV-14 | Medium | VERIFIED | S | [03-party-server](reports/03-party-server.md) | `DownloadFile` reads a whole blob (up to 100 MiB) into memory and then fails to send it |
+| SRV-10 | Medium | Fixed | M | [03-party-server](reports/03-party-server.md) | Multi-row operations are not transactional and refcounts are not reconciled on load: crashes leak blobs or delete files still in use |
+| SRV-11 | Medium | Fixed | S | [03-party-server](reports/03-party-server.md) | `party.db` and blobs (plaintext channels and DMs) are created with default permissions |
+| SRV-12 | Medium | Fixed | S | [03-party-server](reports/03-party-server.md) | Every mutation is an autocommit fsync made while the global state lock is held; no WAL |
+| SRV-13 | Medium | Partly fixed | M | [03-party-server](reports/03-party-server.md) | O(n) and O(n·m) work per request while holding the global lock |
+| SRV-14 | Medium | Fixed | S | [03-party-server](reports/03-party-server.md) | `DownloadFile` reads a whole blob (up to 100 MiB) into memory and then fails to send it |
 | SRV-15 | Medium | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Username uniqueness is ASCII case-only; homoglyphs and non-ASCII case variants allow impersonation |
 | SRV-16 | Medium | VERIFIED | M | [03-party-server](reports/03-party-server.md) | Per-IP connection limit silently refuses groups behind one NAT; password guessing scales with source addresses |
 | SUPPLY-01 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The process gap: new RustSec advisories break unrelated Rust PRs, frontend PRs merge green past them, and the daily audit only files an issue |

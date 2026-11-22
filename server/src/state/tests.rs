@@ -1065,6 +1065,9 @@ fn a_guest_cannot_write_anywhere() {
     assert!(state
         .create_channel_of_kind(bob, "mine", ChannelKind::Public, vec![])
         .is_err());
+    // SRV-08: nor a DM — demotion is the only moderation there is, and a Guest
+    // who could still DM everyone was not stopped by it.
+    assert!(state.post_dm(bob, owner, "hi".to_string()).is_err());
     // Reading is still allowed.
     state
         .post_message(owner, chan, "welcome".to_string())
@@ -1650,6 +1653,48 @@ fn an_incomplete_upload_cannot_be_finished() {
 
 /// Everything checkable is checked before a byte moves — otherwise the
 /// server spools a hundred megabytes and only then says no.
+/// SRV-07: each chunked upload was checked against the member's allowance on
+/// its own, while its bytes sit in RAM until it finishes — four 100 MiB
+/// uploads each passed a 128 MiB allowance, and nothing bounded the total
+/// across members. What a member already has in flight counts against them,
+/// and the server bounds what all uploads together may hold.
+#[test]
+fn uploads_in_flight_count_against_the_allowance_and_a_server_budget() {
+    let mut state = PartyState::new("Srv", None);
+    let _owner = join_owner(&mut state, "owner");
+    let bob = state.join("bob", None, None).unwrap();
+    let carol = state.join("carol", None, None).unwrap();
+    let channel = state.default_channel();
+    let octet = || "application/octet-stream".to_string();
+    let start = |state: &mut PartyState, who, size| {
+        state.start_upload(
+            who,
+            "f".into(),
+            octet(),
+            size,
+            UploadTarget::Channel(channel),
+        )
+    };
+
+    state.set_max_member_blob_bytes(150);
+    start(&mut state, bob, 100).expect("the first fits");
+    let err = start(&mut state, bob, 100).unwrap_err();
+    assert!(
+        err.contains("allowance"),
+        "a second 100 passed a 150 allowance: {err}"
+    );
+
+    // Across members: the in-flight budget.
+    state.set_max_member_blob_bytes(MAX_MEMBER_BLOB_BYTES);
+    state.set_max_upload_spool_bytes(250);
+    start(&mut state, carol, 100).expect("still room");
+    let err = start(&mut state, carol, 100).unwrap_err();
+    assert!(
+        err.contains("busy"),
+        "past the server's in-flight budget: {err}"
+    );
+}
+
 #[test]
 fn uploads_are_refused_up_front_on_size_quota_and_permission() {
     let mut state = PartyState::new("Srv", None);
@@ -3429,4 +3474,19 @@ fn retention_prunes_in_memory_history_too() {
     let report = s.prune_expired(messenger_core::util::current_timestamp_millis() + 120_000);
     assert_eq!(report.messages, 1);
     assert_eq!(s.history_since(alice, channel, 0).len(), 1);
+}
+
+/// SRV-11: the data directory holds every message and DM in plaintext. It is
+/// owner-only after a load — including one an older version created open.
+#[cfg(unix)]
+#[test]
+fn the_data_directory_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("party-data");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _state = PartyState::load("Srv", None, &dir).unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "data directory left {mode:o}");
 }

@@ -258,6 +258,11 @@ unnoticed.
 | APP-05 | A disconnect failed — and deleted — a held offer that was already complete on disk. Complete offers stay acceptable after the session is gone; incomplete ones are still failed and cleaned up. | Failed (`Failed("connection lost")`). | `a_complete_offer_survives_the_sender_hanging_up`, `an_incomplete_offer_is_still_failed_by_a_disconnect` |
 | APP-02 | `send_file` awaited room on the bounded file lane while holding the manager lock; a lane full from an earlier send behind a stalled peer froze every command and the poll loop. A full lane is now an immediate "try again". | Failed (blocked past a 2 s timeout). | `chat_manager::tests::a_full_file_lane_refuses_a_send_instead_of_freezing_the_app` |
 | APP-07, JOURNEY-12 | Spools in the download folder (`tmp_<uuid>_<name>`) were never removed after a crash or an exit with an offer held. Loading the history sweeps names of exactly that shape, and nothing while a receive is live. They still live in the download folder while in use — finalizing is a rename, which needs one filesystem. | Mutation-checked (the live-receive guard). | `chat_manager::tests::leftover_spools_are_swept_and_nothing_else_is` |
+| SRV-07 | Chunked uploads were checked against the allowance one at a time while their bytes sat in RAM — four 100 MiB uploads each passed a 128 MiB allowance — and nothing bounded the total across members. A member's in-flight bytes count against them, and all uploads together are held to `MAX_UPLOAD_SPOOL_BYTES` (512 MiB). Spools are still in memory; moving them to disk is the larger fix the report suggests. | Failed (second upload accepted). | `state::tests::uploads_in_flight_count_against_the_allowance_and_a_server_budget` |
+| SRV-08 (part) | A Guest — read-only everywhere — could still send DMs, so demotion, the only moderation there is, did not stop DM spam. Refused now. Kick, ban and message deletion remain missing (feature work). | Failed. | `state::tests::a_guest_cannot_write_anywhere` (DM case added) |
+| SRV-14 | `DownloadFile` returned a whole blob of any size in one frame: a member could make the server read 100 MiB per request, and the reply broke the frame limit. Past `MAX_INLINE_FILE_BYTES` it answers "download it in chunks", after the access check. | Failed (a read was planned). | `dispatch::tests::a_whole_file_download_is_refused_past_the_inline_limit` |
+| SRV-11, PRIV-09 (part) | The data directory (`party.db`: every message and DM in plaintext) and the blobs were created under the default umask — world-readable on a shared host. The directory is set to 0700 on every load, which also closes one an older version made. Server logs still record member IPs at info (PRIV-09's other half). | — | `state::tests::the_data_directory_is_owner_only` |
+| SRV-10, SRV-12, SRV-13 (part) | Already fixed: multi-row mutations are one transaction, the database runs in WAL with `synchronous=NORMAL`, history is paged from a resident tail instead of scanned from message 1. `files_for`'s per-member work (the rest of SRV-13) is unchanged. | — | `state::tests::multi_row_mutations_commit_as_one_transaction`, `the_database_runs_in_wal_mode_with_normal_sync` |
 | UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
 
 ### Critical and High findings fixed before this pass — the test that guards each
@@ -319,6 +324,13 @@ here beyond the findings named elsewhere in this section.
   rendezvous token and LAN candidates are visible on path. TOFU and the SAS
   still stop silent impersonation. Fixing it means an encrypted control
   channel pinned to the relay's key — a design change, not a test.
+
+- **SRV-09, SRV-15, SRV-16 (Medium).** The audit log can be flooded with
+  self-service entries and is never pruned; usernames are unique only up to
+  ASCII case, so homoglyphs (`аdmin` with a Cyrillic а) pass; the per-IP limit
+  refuses a crowd behind one NAT without a word. Each needs a design decision
+  (what to audit; a confusables skeleton and a new dependency; a refusal message
+  before the handshake) rather than a bug fix.
 
 - **CRYPTO-09 (Low, security).** The history file has no rollback protection:
   an older `history.json.enc` loads normally and restores revoked trust and
