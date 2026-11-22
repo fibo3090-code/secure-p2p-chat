@@ -110,6 +110,25 @@ describe("Creator — dialling a peer", () => {
   });
 });
 
+describe("Creator — my invite link", () => {
+  // UI-07: the link was fetched once and cached for the whole session, but it
+  // carries the address, the external address and the display name — all of
+  // which change. Each open of the invite tab asks again.
+  it("is fetched afresh each time the invite tab opens", async () => {
+    let n = 0;
+    const api = installApi({
+      myInviteLink: vi.fn(async () => `chat-p2p://invite/v${++n}`),
+      listDiscoveredPeers: { enabled: false, peers: [] },
+    });
+    const { rerender } = render(<Creator open onClose={() => {}} initialMode="invite" />);
+    expect(await screen.findByText("chat-p2p://invite/v1")).toBeTruthy();
+    rerender(<Creator open={false} onClose={() => {}} initialMode="invite" />);
+    rerender(<Creator open onClose={() => {}} initialMode="invite" />);
+    expect(await screen.findByText("chat-p2p://invite/v2")).toBeTruthy();
+    expect(api.myInviteLink).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("Creator — hosting", () => {
   it("rejects a bad listening port", async () => {
     const api = installApi({ listDiscoveredPeers: { enabled: false, peers: [] } });

@@ -175,10 +175,10 @@ prioritised view is in [README.md](README.md).
 | UI-04 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Stale Communities history responses can render under the wrong channel header |
 | UI-05 | Medium | Fixed | S/M | [07-react-frontend](reports/07-react-frontend.md) | Community read marks never survive a restart or rejoin |
 | UI-06 | Medium | Fixed | M | [07-react-frontend](reports/07-react-frontend.md) | Whole-conversation refetch on every UI tick, up to 4 Hz during transfers |
-| UI-07 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | The invite link is fetched once and cached for the whole session |
+| UI-07 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | The invite link is fetched once and cached for the whole session |
 | UI-08 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Modal focus management overrides every `autoFocus` inside a dialog |
-| UI-09 | Medium | SUSPECTED | S | [07-react-frontend](reports/07-react-frontend.md) | Toast live regions are `display:none` when empty, so the first announcement may be lost |
-| UI-10 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | `--faint` text fails WCAG AA contrast in every theme |
+| UI-09 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Toast live regions are `display:none` when empty, so the first announcement may be lost |
+| UI-10 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | `--faint` text fails WCAG AA contrast in every theme |
 | UI-11 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Peer-supplied text is not bidi-isolated; linked URLs can display spoofed |
 | UI-12 | Medium | SUSPECTED | M | [07-react-frontend](reports/07-react-frontend.md) | The file-permission dialog does not reflect the current grant, so Save can revoke rights |
 | QUAL-14 | Low/Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Logic duplicated between the TUI and the desktop shell, already drifting |

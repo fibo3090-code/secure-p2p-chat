@@ -14,7 +14,7 @@
 :root[data-theme="dark"]{
   --bg:#0a0e16; --s1:#0f1521; --s2:#141c2a; --s3:#1d2738; --s4:#243144;
   --border:rgba(148,163,184,.10); --border-2:rgba(148,163,184,.17);
-  --text:#e9eef6; --dim:#94a3b8; --faint:#5b6a80;
+  --text:#e9eef6; --dim:#94a3b8; --faint:#798699;
   --accent-ink:#04121d;
   --mine:color-mix(in oklab,var(--accent) 17%,var(--s2));
   --mine-bd:color-mix(in oklab,var(--accent) 34%,transparent);
@@ -24,7 +24,7 @@
 :root[data-theme="light"]{
   --bg:#e8ecf2; --s1:#ffffff; --s2:#f5f7fa; --s3:#eaeef4; --s4:#dfe5ee;
   --border:rgba(15,23,42,.09); --border-2:rgba(15,23,42,.14);
-  --text:#0f1b2d; --dim:#51637a; --faint:#8392a6;
+  --text:#0f1b2d; --dim:#51637a; --faint:#5c6a7d;
   --accent-ink:#ffffff;
   --mine:color-mix(in oklab,var(--accent) 13%,#fff);
   --mine-bd:color-mix(in oklab,var(--accent) 30%,transparent);
