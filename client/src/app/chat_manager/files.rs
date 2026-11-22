@@ -36,6 +36,20 @@ struct SpawnFileStream {
     failed: Arc<AtomicBool>,
 }
 
+/// The outcome of a background `finalize`, sent back to the manager.
+pub(super) struct Finalized {
+    transfer_id: Uuid,
+    ack_seq: Option<u64>,
+    bytes_received: u64,
+    result: Result<std::path::PathBuf, String>,
+}
+
+/// Holds a background `finalize` until released, so a test can observe the
+/// window between `FileEnd` and the file landing (PERF-07).
+#[cfg(test)]
+pub(super) static FINALIZE_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+
 impl ChatManager {
     /// Remove spools left in the download folder by an earlier run.
     ///
@@ -427,7 +441,9 @@ impl ChatManager {
                     // A held offer whose last byte arrived is complete on
                     // disk and waits only for the user; failing it deleted a
                     // finished download because the sender hung up (APP-05).
-                    && !self.pending_file_end.contains_key(id))
+                    && !self.pending_file_end.contains_key(id)
+                    // Every byte is in; only the write to disk is left.
+                    && !self.finalizing.contains(id))
                 .then_some(*id)
             })
             .collect();
@@ -572,7 +588,67 @@ impl ChatManager {
             return;
         };
         let bytes_received = incoming.bytes_received();
-        match incoming.finalize() {
+        // `finalize` is an fsync of up to `MAX_FILE_SIZE` and a rename: run
+        // inline it held the manager lock — every command and the poll loop —
+        // for as long as the disk took (PERF-07). Without a runtime (plain
+        // unit tests) there is nothing to hand it to, so it stays inline.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            let result = incoming.finalize().map_err(|e| e.to_string());
+            self.complete_finalized(Finalized {
+                transfer_id,
+                ack_seq,
+                bytes_received,
+                result,
+            });
+            return;
+        };
+        self.finalizing.insert(transfer_id);
+        let done = self.finalized_tx.clone();
+        runtime.spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(gate) = FINALIZE_GATE.lock().unwrap().take() {
+                let _ = gate.recv();
+            }
+            let result = incoming.finalize().map_err(|e| e.to_string());
+            let _ = done.send(Finalized {
+                transfer_id,
+                ack_seq,
+                bytes_received,
+                result,
+            });
+        });
+    }
+
+    /// Outcomes of background finalizes, applied on the poll that sees them.
+    pub(super) fn drain_finalized(&mut self) {
+        while let Ok(done) = self.finalized_rx.try_recv() {
+            self.complete_finalized(done);
+        }
+    }
+
+    /// Record a finished write: the file joins the conversation, or the
+    /// transfer fails with the reason.
+    fn complete_finalized(&mut self, done: Finalized) {
+        let Finalized {
+            transfer_id,
+            ack_seq,
+            bytes_received,
+            result,
+        } = done;
+        self.finalizing.remove(&transfer_id);
+        // Cancelled while it was being written: honour the cancel, and do not
+        // leave a file behind that nothing in the app points at.
+        let still_wanted = self
+            .active_transfers
+            .get(&transfer_id)
+            .is_some_and(|t| t.status.is_active());
+        if !still_wanted {
+            if let Ok(path) = &result {
+                std::fs::remove_file(path).ok();
+            }
+            return;
+        }
+        match result {
             Ok(final_path) => {
                 if let Some(mut transfer) = self.active_transfers.remove(&transfer_id) {
                     transfer.status = TransferStatus::Completed;

@@ -6,6 +6,7 @@ use super::*;
 impl ChatManager {
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
+        self.drain_finalized();
         self.cleanup_stale_incoming_text_messages();
         self.sync_outgoing_transfer_progress();
         self.poll_upnp_result();

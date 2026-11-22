@@ -1768,6 +1768,83 @@ fn mapped_session_ping_updates_actual_chat() {
     );
 }
 
+/// PERF-07: `finalize` — `sync_all` of up to 10 GiB, then the rename — ran
+/// inside `handle_session_event`, i.e. under the manager lock, so every
+/// command and the poll loop waited for the disk. It runs on a blocking
+/// thread now and completes on a later poll. Until then the file is not in
+/// the chat, and a disconnect in that window does not fail it: the last byte
+/// has arrived, only the write to disk is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalizing_a_received_file_happens_off_the_manager() {
+    let temp_dir = tempdir().unwrap();
+    let config = Config {
+        download_dir: temp_dir.path().join("downloads"),
+        temp_dir: temp_dir.path().join("temp"),
+        auto_accept_files: true,
+        ..Config::default()
+    };
+    let mut mgr = ChatManager::new(config);
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Big file".to_string());
+    let payload = b"the whole file";
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "big.bin".to_string(),
+            size: payload.len() as u64,
+            seq: 1,
+        }),
+    );
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileChunk {
+            chunk: payload.to_vec(),
+            seq: 2,
+        }),
+    );
+
+    // Hold the disk write until the test says so.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    *files::FINALIZE_GATE.lock().unwrap() = Some(gate);
+    mgr.handle_session_event(
+        chat_id,
+        SessionEvent::MessageReceived(ProtocolMessage::FileEnd { seq: 3 }),
+    );
+    let in_chat = |mgr: &ChatManager| {
+        mgr.chats[&chat_id]
+            .messages
+            .iter()
+            .any(|m| matches!(&m.content, MessageContent::File { path: Some(_), .. }))
+    };
+    assert!(
+        !in_chat(&mgr),
+        "the file was finalized inline, under the caller"
+    );
+
+    // The sender hangs up while the write is still in progress.
+    mgr.handle_session_event(chat_id, SessionEvent::Disconnected);
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !in_chat(&mgr) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the finalized file never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mgr.poll_session_events();
+    }
+    let path = mgr.chats[&chat_id]
+        .messages
+        .iter()
+        .find_map(|m| match &m.content {
+            MessageContent::File { path: Some(p), .. } => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), payload);
+    assert!(mgr.active_transfers.is_empty());
+}
+
 #[test]
 fn sequential_incoming_files_do_not_reuse_completed_transfer_state() {
     let temp_dir = tempdir().unwrap();

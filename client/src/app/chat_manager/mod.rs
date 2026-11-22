@@ -158,6 +158,12 @@ pub struct ChatManager {
     /// FileEnd's wire seq, for the delivery receipt) until the user accepts
     /// (finalize) or declines (delete).
     pending_file_end: HashMap<Uuid, u64>,
+    /// Incoming transfers being written to disk off the manager (PERF-07):
+    /// every byte has arrived, `finalize` (fsync + rename) is running on a
+    /// blocking thread, and its outcome comes back on `finalized_rx`.
+    finalizing: std::collections::HashSet<Uuid>,
+    finalized_tx: tokio::sync::mpsc::UnboundedSender<files::Finalized>,
+    finalized_rx: tokio::sync::mpsc::UnboundedReceiver<files::Finalized>,
     /// The incoming transfer each conversation's wire is streaming into right
     /// now: set by `FileMeta`, cleared by `FileEnd` or `FileCancel`.
     ///
@@ -274,6 +280,7 @@ impl Default for UiPresence {
 
 impl ChatManager {
     pub fn new(config: Config) -> Self {
+        let (finalized_tx, finalized_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             chats: HashMap::new(),
             contacts: HashMap::new(),
@@ -290,6 +297,9 @@ impl ChatManager {
             outgoing_transfers: HashMap::new(),
             incoming_files: HashMap::new(),
             pending_file_end: HashMap::new(),
+            finalizing: Default::default(),
+            finalized_tx,
+            finalized_rx,
             incoming_streams: HashMap::new(),
             incoming_text_messages: HashMap::new(),
             toasts: Vec::new(),
