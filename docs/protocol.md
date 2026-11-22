@@ -341,9 +341,9 @@ Requests (client → server): `Host { token }` / `Join { token }` (legacy,
 always bridged) and `HostV2 { token, punch }` / `JoinV2 { token, punch }`
 (punch-capable; `punch.local_addrs` lists LAN candidates as `ip:port`,
 already carrying the punch source port). Responses (server → client):
-`Waiting`, `Paired`, `Error(String)`, and `PunchStart { peer_public,
-peer_locals }`. After a `PunchStart`, each client answers with a
-`PunchOutcome { success }` report.
+`Waiting`, `Paired`, `Error(String)`, `PunchStart { peer_public,
+peer_locals }` and `PunchConfirmed` (appended last). After a `PunchStart`,
+each client answers with a `PunchOutcome { success }` report.
 
 Flow:
 
@@ -352,7 +352,9 @@ Flow:
    it is never self-reported.
 2. If **both** registered punch-capable, the server sends each side a
    `PunchStart` with the other's observed public endpoint and LAN candidates,
-   then waits (bounded) for both `PunchOutcome`s.
+   then waits (bounded) for both `PunchOutcome`s. Peer-listed LAN
+   candidates that no other machine could have — loopback, link-local,
+   broadcast — are never dialled (audit NET-16).
 3. Each peer re-binds the control connection's local port
    (`SO_REUSEADDR`/`SO_REUSEPORT`; the control connection itself is dialed
    from a reuse-enabled socket), listens on it, and dials every candidate in
@@ -366,10 +368,18 @@ Flow:
    and the pair is bridged. The host then sends `0xA5` (SELECT) on its chosen
    socket and the joiner confirms with `0x5A` (ACK), so both ends provably
    settle on one connection.
-4. Both reports `success: true` → the server drops both control connections;
-   the session runs on the punched socket (peer label `p2p:<addr>`).
-   Anything else → the server sends `Paired` to both and bridges bytes
-   (`copy_bidirectional`; peer label `relay:<server>`).
+4. **The server's verdict decides, not either side's own result.** Both
+   reports `success: true` → the server sends `PunchConfirmed` to both and
+   drops the control connections; the session runs on the punched socket
+   (peer label `p2p:<addr>`). Anything else → `Paired` to both and the bytes
+   are bridged (`copy_bidirectional`; peer label `relay:<server>`). A client
+   whose own punch succeeded therefore waits for the verdict and, on
+   `Paired`, drops its direct socket and takes the bridge: over a slow link
+   one side's selection can time out after the other's completed, and a
+   client that left on its own success stranded the other bridged to a
+   closed connection (audit NET-15). A server from before `PunchConfirmed`
+   closes the control connection after a two-sided success, which a client
+   reads the same way.
 
 The punch hello tag is rendezvous pairing, not authentication: whichever
 socket wins carries the full v3 handshake (ECDH, identity proof, TOFU).

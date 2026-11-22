@@ -13,6 +13,11 @@ predate tagged releases.
 
 ### Fixed
 
+- Relay with hole punching: over a slow link one side could end up on the
+  direct connection and the other bridged to a closed one, so neither could
+  talk. The relay server's verdict now decides for both. A peer can no longer
+  point the punch at the host's own loopback or link-local services, and
+  connections to the punch port that say nothing no longer delay it.
 - Terminal client: a command given more words than it takes ignored the rest
   silently, so `:connect 10.0.0.5 9000` dialled port 12345. It now says which
   word was unexpected and shows the usage.

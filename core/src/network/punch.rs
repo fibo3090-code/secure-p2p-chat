@@ -51,6 +51,10 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(3);
 /// peer-supplied strings relayed by the server).
 pub(crate) const MAX_PUNCH_CANDIDATES: usize = 8;
 
+/// Connections to the punch port being validated at once; more are closed
+/// unread (NET-17). One honest peer needs one or two.
+const MAX_PENDING_VALIDATIONS: usize = 4;
+
 // v2: tags are bound to the sender's role (NET-08). A v1 peer fails on the
 // magic and the pair is bridged, as for any failed punch.
 const HELLO_MAGIC: &[u8; 8] = b"P2PPNCH2";
@@ -120,16 +124,51 @@ impl HelloTags {
     }
 }
 
+/// Faults the relay tests inject, in test builds only, for one rendezvous
+/// token so concurrent tests are unaffected: a joiner ACK delayed past the
+/// host's selection grace — what an RTT above `SELECT_GRACE` does (NET-15) —
+/// and a shorter punch budget, so such a test does not wait out
+/// `PUNCH_TIMEOUT`.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    pub(crate) struct Fault {
+        pub token: String,
+        pub budget: Duration,
+        pub joiner_ack_delay: Duration,
+    }
+
+    pub(crate) static FAULT: Mutex<Option<Fault>> = Mutex::new(None);
+
+    pub(crate) fn for_token(token: &str) -> Option<(Duration, Duration)> {
+        FAULT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|f| f.token == token)
+            .map(|f| (f.budget, f.joiner_ack_delay))
+    }
+}
+
 /// Turn the relay-observed public endpoint plus the peer's self-reported LAN
 /// candidates into a deduplicated, sanity-filtered dial list (public first).
 pub(crate) fn parse_candidates(peer_public: &str, peer_locals: &[String]) -> Vec<SocketAddr> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for raw in std::iter::once(peer_public).chain(peer_locals.iter().map(String::as_str)) {
+    let locals = peer_locals.iter().map(|l| (l.as_str(), true));
+    for (raw, peer_listed) in std::iter::once((peer_public, false)).chain(locals) {
         let Ok(addr) = raw.parse::<SocketAddr>() else {
             continue;
         };
         if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+            continue;
+        }
+        // The peer chose these, and the host dials each for the whole punch
+        // window: a loopback or link-local one is a probe of the host's own
+        // services (NET-16). The public address is what the relay observed.
+        if peer_listed && !is_lan_reachable(addr.ip()) {
             continue;
         }
         if seen.insert(addr) {
@@ -142,6 +181,21 @@ pub(crate) fn parse_candidates(peer_public: &str, peer_locals: &[String]) -> Vec
     out
 }
 
+/// Could another machine on the LAN have this address? Not loopback, not
+/// link-local (which also needs an interface the peer cannot name), not
+/// broadcast.
+fn is_lan_reachable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_link_local() || v4.is_broadcast()),
+        std::net::IpAddr::V6(v6) => {
+            // fe80::/10, written out: `Ipv6Addr::is_unicast_link_local` is
+            // newer than the MSRV.
+            let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            !(v6.is_loopback() || link_local)
+        }
+    }
+}
+
 /// Try to hole punch a direct TCP connection to the peer. `local_port` must be
 /// the local port of the relay control connection (its NAT mapping is what the
 /// punch reuses). Returns a mutually confirmed, validated stream, or an error
@@ -152,7 +206,11 @@ pub(crate) async fn attempt_punch(
     peer_candidates: &[SocketAddr],
     token: &str,
 ) -> Result<TcpStream> {
-    attempt_punch_with_timeout(role, local_port, peer_candidates, token, PUNCH_TIMEOUT).await
+    #[cfg(test)]
+    let budget = test_hooks::for_token(token).map_or(PUNCH_TIMEOUT, |(budget, _)| budget);
+    #[cfg(not(test))]
+    let budget = PUNCH_TIMEOUT;
+    attempt_punch_with_timeout(role, local_port, peer_candidates, token, budget).await
 }
 
 pub(crate) async fn attempt_punch_with_timeout(
@@ -190,11 +248,23 @@ pub(crate) async fn attempt_punch_with_timeout(
             Ok(listener) => {
                 let tx = validated_tx.clone();
                 workers.spawn(async move {
+                    // Owned by this worker, so they are aborted with it at the
+                    // deadline (or by `abort_all`) — a detached task kept its
+                    // socket and a sender on `tx` for the whole validation
+                    // timeout, holding the attempt open past its budget.
+                    let mut validations: JoinSet<()> = JoinSet::new();
                     loop {
                         match timeout_at(deadline, listener.accept()).await {
                             Ok(Ok((stream, _))) => {
+                                while validations.try_join_next().is_some() {}
+                                if validations.len() >= MAX_PENDING_VALIDATIONS {
+                                    // Anyone can reach this port; an honest
+                                    // peer needs one or two at a time.
+                                    drop(stream);
+                                    continue;
+                                }
                                 let tx = tx.clone();
-                                tokio::spawn(async move {
+                                validations.spawn(async move {
                                     match validate(stream, role, tag).await {
                                         Ok(valid) => {
                                             let _ = tx.send(valid).await;
@@ -243,7 +313,13 @@ pub(crate) async fn attempt_punch_with_timeout(
 
     let result = match role {
         PunchRole::Host => select_as_host(validated_rx, deadline).await,
-        PunchRole::Joiner => select_as_joiner(validated_rx, deadline).await,
+        PunchRole::Joiner => {
+            #[cfg(test)]
+            let ack_delay = test_hooks::for_token(token).map_or(Duration::ZERO, |(_, d)| d);
+            #[cfg(not(test))]
+            let ack_delay = Duration::ZERO;
+            select_as_joiner(validated_rx, deadline, ack_delay).await
+        }
     };
     workers.abort_all();
     result
@@ -287,31 +363,17 @@ async fn confirm_selection(mut stream: TcpStream) -> Result<TcpStream> {
 async fn select_as_joiner(
     mut validated_rx: mpsc::Receiver<TcpStream>,
     deadline: Instant,
+    ack_delay: Duration,
 ) -> Result<TcpStream> {
     let select_deadline = deadline + SELECT_GRACE * 2;
     let mut waiters: JoinSet<Result<TcpStream>> = JoinSet::new();
     let mut rx_open = true;
     loop {
         tokio::select! {
-            maybe = validated_rx.recv(), if rx_open => match maybe {
-                Some(mut stream) => {
-                    waiters.spawn(async move {
-                        let mut sel = [0u8; 1];
-                        stream.read_exact(&mut sel).await?;
-                        if sel[0] != SELECT_BYTE {
-                            bail!("unexpected selection byte {:#x}", sel[0]);
-                        }
-                        stream.write_all(&[ACK_BYTE]).await?;
-                        Ok(stream)
-                    });
-                }
-                None => {
-                    rx_open = false;
-                    if waiters.is_empty() {
-                        bail!("hole punch produced no usable connection");
-                    }
-                }
-            },
+            // A waiter that has finished wins over the deadline firing in the
+            // same poll: dropping a confirmed socket there gave a split
+            // verdict for no reason (NET-15).
+            biased;
             joined = waiters.join_next(), if !waiters.is_empty() => {
                 match joined {
                     Some(Ok(Ok(stream))) => return Ok(stream),
@@ -322,6 +384,29 @@ async fn select_as_joiner(
                         bail!("hole punch produced no usable connection");
                     }
                     _ => {}
+                }
+            },
+            maybe = validated_rx.recv(), if rx_open => match maybe {
+                Some(mut stream) => {
+                    waiters.spawn(async move {
+                        let mut sel = [0u8; 1];
+                        stream.read_exact(&mut sel).await?;
+                        if sel[0] != SELECT_BYTE {
+                            bail!("unexpected selection byte {:#x}", sel[0]);
+                        }
+                        // Zero outside tests (see `test_hooks`).
+                        if !ack_delay.is_zero() {
+                            sleep(ack_delay).await;
+                        }
+                        stream.write_all(&[ACK_BYTE]).await?;
+                        Ok(stream)
+                    });
+                }
+                None => {
+                    rx_open = false;
+                    if waiters.is_empty() {
+                        bail!("hole punch produced no usable connection");
+                    }
                 }
             },
             _ = tokio::time::sleep_until(select_deadline) => bail!("hole punch timed out"),
@@ -428,6 +513,111 @@ mod tests {
     fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         listener.local_addr().expect("local addr").port()
+    }
+
+    /// NET-16: the LAN candidates are whatever the peer chose to list, and the
+    /// host dials each for the whole punch window from its punch port. A
+    /// loopback or link-local entry turned that into a probe of the host's
+    /// own local services. Only addresses a LAN peer could actually have are
+    /// dialled; the relay-observed public address is kept as the relay saw
+    /// it (on loopback in these tests).
+    #[test]
+    fn a_peer_cannot_aim_the_punch_at_the_hosts_own_machine() {
+        let dialled = parse_candidates(
+            "198.51.100.7:4000",
+            &[
+                "127.0.0.1:22".into(),
+                "127.8.9.10:631".into(),
+                "[::1]:22".into(),
+                "169.254.1.2:80".into(),
+                "[fe80::1]:80".into(),
+                "255.255.255.255:9".into(),
+                "0.0.0.0:4000".into(),
+                "192.168.1.5:4000".into(),
+                "10.0.0.9:4000".into(),
+                "[fd00::5]:4000".into(),
+                "[2001:db8::5]:4000".into(),
+            ],
+        );
+        let dialled: Vec<String> = dialled.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            dialled,
+            [
+                "198.51.100.7:4000",
+                "192.168.1.5:4000",
+                "10.0.0.9:4000",
+                "[fd00::5]:4000",
+                "[2001:db8::5]:4000"
+            ]
+        );
+        assert_eq!(
+            parse_candidates("127.0.0.1:5000", &[]),
+            ["127.0.0.1:5000".parse::<SocketAddr>().unwrap()],
+            "the relay-observed address is the relay's word, not the peer's"
+        );
+    }
+
+    /// NET-17: every connection accepted on the punch port was validated in a
+    /// detached task that the attempt never cancelled. Each held a sender on
+    /// the results channel, so one connection that said nothing kept the
+    /// whole attempt — and the relay pairing waiting on it — open for the
+    /// 3 s validation timeout past its own budget, and any number of them
+    /// could be opened.
+    #[tokio::test]
+    async fn silent_connections_to_the_punch_port_neither_delay_nor_outlive_the_attempt() {
+        let port = free_port();
+        // Nothing listens there: the attempt can only end by its budget.
+        let dead: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let budget = Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        let attempt = tokio::spawn(async move {
+            attempt_punch_with_timeout(
+                PunchRole::Host,
+                port,
+                &[dead],
+                "the-rendezvous-token",
+                budget,
+            )
+            .await
+        });
+        // Open silent connections while the listener is up.
+        let mut silent = Vec::new();
+        for _ in 0..200 {
+            if silent.len() == 40 {
+                break;
+            }
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => silent.push(s),
+                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+        assert!(!silent.is_empty(), "the punch listener never came up");
+
+        assert!(attempt.await.unwrap().is_err());
+        let took = started.elapsed();
+        assert!(
+            took < budget + Duration::from_secs(1),
+            "silent connections held the attempt open for {took:?}"
+        );
+
+        // And none of them is still held once it is over: each reads to EOF
+        // (after the host's hello, for those it got as far as validating).
+        let mut validated = 0;
+        for mut s in silent {
+            let mut buf = Vec::new();
+            match timeout(Duration::from_millis(500), s.read_to_end(&mut buf)).await {
+                Ok(_) => {
+                    if !buf.is_empty() {
+                        validated += 1;
+                    }
+                }
+                Err(_) => panic!("a connection outlived the attempt"),
+            }
+        }
+        assert!(
+            validated <= MAX_PENDING_VALIDATIONS,
+            "{validated} connections validated at once"
+        );
     }
 
     /// NET-08: whoever connects to the host's punch port first is sent the

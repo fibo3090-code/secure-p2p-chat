@@ -55,6 +55,11 @@ const RELAY_RATE_WINDOW: Duration = Duration::from_secs(30);
 /// the worst and bridging. Must exceed the client-side punch budget plus the
 /// selection grace, with margin for slow links.
 const PUNCH_REPORT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a client whose punch succeeded waits for the server's verdict.
+/// Longer than the server waits for the *other* side's report, so the verdict
+/// always arrives first.
+const PUNCH_VERDICT_TIMEOUT: Duration = Duration::from_secs(25);
 /// Longest candidate string the server will forward (abuse guard).
 const MAX_CANDIDATE_CHARS: usize = 64;
 
@@ -105,6 +110,11 @@ enum RelayResponse {
         peer_public: String,
         peer_locals: Vec<String>,
     },
+    /// Both sides reported a direct connection: use it. The server's verdict
+    /// is the one that counts (NET-15) — a side whose own punch succeeded
+    /// still takes the bridge when this is `Paired` instead. Appended
+    /// variant; a client from before it never reads past its own success.
+    PunchConfirmed,
 }
 
 /// Client → server report closing a punch round.
@@ -362,6 +372,12 @@ async fn relay_attempt(
         };
         match response {
             RelayResponse::Waiting => continue,
+            // Only ever an answer to our own punch report, read above.
+            RelayResponse::PunchConfirmed => {
+                return Err(AttemptError::Fatal(anyhow!(
+                    "Relay confirmed a punch that was never attempted"
+                )))
+            }
             RelayResponse::Paired => {
                 tracing::info!("Relay session paired (bridged) via {}:{}", host, port);
                 return Ok(RelayStream::Relayed(stream));
@@ -384,10 +400,33 @@ async fn relay_attempt(
                 let candidates = parse_candidates(&peer_public, &peer_locals);
                 match attempt_punch(role, local_port, &candidates, token).await {
                     Ok(direct) => {
-                        // Best-effort: the server only uses this to skip the
-                        // bridge; the direct socket is already confirmed.
-                        let _ =
-                            send_relay_message(&mut stream, &PunchOutcome { success: true }).await;
+                        if send_relay_message(&mut stream, &PunchOutcome { success: true })
+                            .await
+                            .is_err()
+                        {
+                            // No server left to bridge through: the direct
+                            // socket is the only path there is.
+                            return Ok(RelayStream::Direct(direct));
+                        }
+                        // Our side succeeding is not enough: over a slow link
+                        // the peer's half of the exchange can time out after
+                        // ours completed, and then it is bridged — to us, if
+                        // we stayed. So wait for the server's verdict (NET-15).
+                        let verdict = tokio::time::timeout(
+                            PUNCH_VERDICT_TIMEOUT,
+                            recv_relay_message::<RelayResponse>(&mut stream),
+                        )
+                        .await;
+                        if let Ok(Ok(RelayResponse::Paired)) = verdict {
+                            tracing::info!(
+                                "hole punch succeeded here but not for the peer; bridging"
+                            );
+                            drop(direct);
+                            return Ok(RelayStream::Relayed(stream));
+                        }
+                        // `PunchConfirmed` — or a server from before it, which
+                        // closes the control connection after a two-sided
+                        // success and bridges (`Paired`) otherwise.
                         tracing::info!(
                             peer = %direct.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
                             "hole punch succeeded; relay is out of the path"
@@ -644,6 +683,10 @@ async fn host_flow(
         match coordinate_punch(&mut stream, &mut peer_stream, host_caps, joiner_caps).await {
             Ok(true) => {
                 tracing::info!("Relay peers hole punched a direct connection");
+                // Best-effort: a client that does not hear it treats the
+                // closing control connection the same way.
+                let _ = send_relay_message(&mut stream, &RelayResponse::PunchConfirmed).await;
+                let _ = send_relay_message(&mut peer_stream, &RelayResponse::PunchConfirmed).await;
                 return Ok(());
             }
             Ok(false) => tracing::debug!("Hole punch failed on at least one side; bridging"),
@@ -891,6 +934,46 @@ mod tests {
         let join = join_task.await.unwrap().unwrap();
         assert!(matches!(host, RelayStream::Direct(_)));
         assert!(matches!(join, RelayStream::Direct(_)));
+        exchange_ping_pong(host, join).await;
+    }
+
+    /// NET-15: the two sides decide their punch outcome separately, so they
+    /// can disagree. Over an RTT above the host's 3 s selection grace, the
+    /// joiner ACKs and succeeds while the host's wait for that ACK times out.
+    /// The joiner used to leave on its direct socket at once, and the server
+    /// then bridged the host to the joiner's closed control connection: both
+    /// sessions failed where a bridged one would have worked. Whatever they
+    /// end up on, the two sides must agree, and bytes must flow.
+    #[tokio::test]
+    async fn a_split_punch_verdict_leaves_both_peers_on_the_same_path() {
+        use crate::network::punch::test_hooks::{Fault, FAULT};
+        let relay_addr = start_relay().await;
+        let token = generate_relay_token();
+        *FAULT.lock().unwrap() = Some(Fault {
+            token: token.clone(),
+            budget: Duration::from_millis(1500),
+            joiner_ack_delay: Duration::from_millis(3500),
+        });
+
+        let host_task = tokio::spawn({
+            let relay_addr = relay_addr.clone();
+            let token = token.clone();
+            async move { connect_to_relay_with(&relay_addr, &token, true, true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let join_task = tokio::spawn({
+            let relay_addr = relay_addr.clone();
+            let token = token.clone();
+            async move { connect_to_relay_with(&relay_addr, &token, false, true).await }
+        });
+
+        let host = host_task.await.unwrap().unwrap();
+        let join = join_task.await.unwrap().unwrap();
+        assert_eq!(
+            matches!(host, RelayStream::Direct(_)),
+            matches!(join, RelayStream::Direct(_)),
+            "split verdict: host {host:?}, joiner {join:?}"
+        );
         exchange_ping_pong(host, join).await;
     }
 

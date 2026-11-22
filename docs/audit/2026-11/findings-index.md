@@ -232,9 +232,9 @@ prioritised view is in [README.md](README.md).
 | NET-12 | Low | Fixed | S | [02-network](reports/02-network.md) | `connect_to_contact` never falls back to the relay when direct addresses fail |
 | NET-13 | Low | VERIFIED | S | [02-network](reports/02-network.md) | A UPnP / NAT-PMP mapping that fails the routable check is created and then leaked |
 | NET-14 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Client-side relay I/O has no timeouts |
-| NET-15 | Low | SUSPECTED | M | [02-network](reports/02-network.md) | Punch outcome is decided per client, not by the server, so split verdicts break both peers |
-| NET-16 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Peer-supplied punch candidates include loopback and link-local; the host dials them |
-| NET-17 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Punch listener spawns detached, unbounded validation tasks |
+| NET-15 | Low | Fixed | M | [02-network](reports/02-network.md) | Punch outcome is decided per client, not by the server, so split verdicts break both peers |
+| NET-16 | Low | Fixed | S | [02-network](reports/02-network.md) | Peer-supplied punch candidates include loopback and link-local; the host dials them |
+| NET-17 | Low | Fixed | S | [02-network](reports/02-network.md) | Punch listener spawns detached, unbounded validation tasks |
 | NET-18 | Low | VERIFIED | S | [02-network](reports/02-network.md) | mDNS advertises the user's display name and machine hostname; peer names are unsanitised |
 | NET-19 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Desktop defaults to `messenger_core=debug`, logging every frame |
 | PERF-13 | Low | VERIFIED | S | [11-performance](reports/11-performance.md) | Release builds log every frame at debug level |
