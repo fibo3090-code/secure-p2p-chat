@@ -1305,6 +1305,82 @@ fn party_join_is_two_steps_and_pins_only_after_a_real_join() {
 
 /// A wrong password is a rejection the pane can show — and a community the
 /// user never got into is not pinned.
+/// TAURI-03: hosting and dialling shared one password field. Dialling with
+/// no password cleared it, so the next auto-rehost listened with none — the
+/// host's protection gone without a word — and the hosting password was the
+/// one offered to every host dialled. Each now has its own.
+#[test]
+fn dialling_without_a_password_leaves_the_host_s_in_place() {
+    let h = ready_harness();
+    h.ipc_binds(
+        "start_host",
+        json!({ "port": 0, "password": "the-host-password" }),
+    )
+    .expect("host");
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _ = h.ipc_binds(
+        "connect_peer",
+        json!({ "host": "127.0.0.1", "port": dead, "password": null }),
+    );
+    let manager = h.bridge().manager.clone();
+    let (host_pw, dial_pw) = tauri::async_runtime::block_on(async move {
+        let m = manager.lock().await;
+        (m.connection_password.clone(), m.dial_password.clone())
+    });
+    assert_eq!(
+        host_pw.as_deref(),
+        Some("the-host-password"),
+        "the host lost its password"
+    );
+    assert_eq!(
+        dial_pw, None,
+        "the hosting password would be offered to the dialled host"
+    );
+}
+
+/// TAURI-04: `party_join` held the community lock across the connect and
+/// handshake. The poll loop takes that lock first every tick, so while a join
+/// waited on an address that never answers — up to `PARTY_CONNECT_TIMEOUT` —
+/// no session event, toast, save or community update went anywhere. The dial
+/// runs without the lock now; only attaching the result takes it.
+#[test]
+fn a_join_waiting_on_a_silent_server_does_not_hold_the_community_lock() {
+    let h = ready_harness();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    // Accepts, then says nothing.
+    std::thread::spawn(move || {
+        let _held: Vec<_> = listener.incoming().take(1).collect();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    });
+    // Watch the lock while the join waits on the test thread.
+    let party = h.bridge().party.clone();
+    let watcher = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if party.try_lock().is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    });
+    let res = h.ipc(
+        "party_join",
+        json!({ "address": address, "username": "u", "password": "", "fingerprint": null }),
+    );
+    assert!(res.is_err(), "a silent server cannot be joined");
+    assert!(
+        watcher.join().unwrap(),
+        "the community lock was held for the whole dial"
+    );
+}
+
 #[test]
 fn a_rejected_party_join_is_reported_and_never_pinned() {
     let h = ready_harness();
@@ -1669,6 +1745,35 @@ fn an_identity_backup_is_the_encrypted_file_and_is_recorded() {
     assert!(saved.config.identity_backed_up_at.is_some());
 }
 
+/// TAURI-31: nothing stopped the backup's destination being the identity
+/// file itself — the save dialog opens wherever the user points it, and on
+/// Linux copying a file onto itself truncates it — destroying the only key to
+/// the history while recording "backed up". The source is refused as a
+/// destination, through any path that names it, and nothing is recorded.
+#[test]
+fn backing_up_onto_the_identity_itself_is_refused() {
+    let h = ready_harness();
+    let identity = h._dir.path().join("identity.json");
+    let before = std::fs::read(&identity).unwrap();
+    for dest in [
+        identity.clone(),
+        h._dir.path().join(".").join("identity.json"),
+    ] {
+        let err = tauri::async_runtime::block_on(crate::commands::auth::backup_identity_to(
+            &h.bridge(),
+            &dest,
+        ))
+        .unwrap_err();
+        assert!(err.contains("itself"), "{err}");
+    }
+    assert_eq!(
+        std::fs::read(&identity).unwrap(),
+        before,
+        "the identity was damaged"
+    );
+    assert!(h.ipc("get_settings", json!({})).unwrap()["identity_backed_up_at"].is_null());
+}
+
 /// A desktop diagnostics bundle is support metadata only: it lands in the
 /// data directory and carries no message text, no peer fingerprint, no
 /// private key, and only a prefix of the user's own fingerprint.
@@ -1873,6 +1978,19 @@ fn nearby_peers_are_not_browsed_unless_the_user_opted_in() {
         .unwrap()
         .iter()
         .any(|p| p["name"] == "Nearby" && p["port"] == 12345));
+    assert!(crate::lock_or_recover(&h.bridge().discovery).is_some());
+
+    // TAURI-08: turning it off used to change only the flag — the daemon kept
+    // browsing and any registration kept announcing the user's name and port.
+    let mut settings = h.ipc("get_settings", json!({})).unwrap();
+    settings["enable_mdns"] = json!(false);
+    h.ipc_binds("update_settings", json!({ "settings": settings }))
+        .expect("update");
+    assert!(
+        crate::lock_or_recover(&h.bridge().discovery).is_none(),
+        "mDNS still running after the user turned it off"
+    );
+    assert!(crate::lock_or_recover(&h.bridge().discovered).is_empty());
 }
 
 // ── Commands behind a native dialog ─────────────────────────────────────────

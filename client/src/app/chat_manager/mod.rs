@@ -213,9 +213,15 @@ pub struct ChatManager {
     /// `config.listen_port` when the user typed another one in the Host
     /// dialog). This is what "share this address" displays must use.
     pub hosting_port: Option<u16>,
-    /// Optional P2P connection password: required from peers when hosting, and
-    /// supplied to the host when connecting. Verified inside the encrypted tunnel.
+    /// Optional P2P connection password *required from peers when hosting*.
+    /// Only the hosting paths (and auto-rehost) read it. Verified inside the
+    /// encrypted tunnel.
     pub connection_password: Option<String>,
+    /// The password this app answers with when it *dials*. Kept apart from
+    /// the host's: one shared field sent the hosting password to every host
+    /// dialled, and a dial without a password cleared it — so the next
+    /// auto-rehost listened with none (TAURI-03).
+    pub dial_password: Option<String>,
     /// When true, the conversation is locked: no auto-rehost, so no new peer joins.
     pub conversation_locked: bool,
     /// External `host:port` discovered via UPnP when hosting (None until a
@@ -298,6 +304,7 @@ impl ChatManager {
             rehost_failures: 0,
             hosting_port: None,
             connection_password: None,
+            dial_password: None,
             conversation_locked: false,
             external_address: None,
             pending_upnp: None,
@@ -483,7 +490,19 @@ impl ChatManager {
     /// it; when connecting, it is the password supplied to the host. Set this
     /// before calling `start_host` / `connect_to_host`.
     pub fn set_connection_password(&mut self, password: Option<String>) {
+        let password = password.filter(|p| !p.is_empty());
+        self.dial_password = password.clone();
+        self.connection_password = password;
+    }
+
+    /// Set only the password this app's listener requires.
+    pub fn set_host_password(&mut self, password: Option<String>) {
         self.connection_password = password.filter(|p| !p.is_empty());
+    }
+
+    /// Set only the password this app answers with when it dials.
+    pub fn set_dial_password(&mut self, password: Option<String>) {
+        self.dial_password = password.filter(|p| !p.is_empty());
     }
 
     /// Whether a connection password is currently configured.

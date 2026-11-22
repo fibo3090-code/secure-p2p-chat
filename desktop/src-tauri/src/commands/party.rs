@@ -2,6 +2,7 @@
 //! and the saved-communities file (parties.json) with fingerprint pinning.
 use crate::*;
 use messenger_core::party::{ChannelKind, FilePermissions, Role, UploadTarget};
+use p2pem_classic::app::party_manager::{PartyDial, PartyManager};
 
 // ── Communities (Party servers) ─────────────────────────────────────────────
 //
@@ -343,11 +344,22 @@ pub(crate) async fn party_join(
         // before, and the step-one prompt never appears for a pinned address.
         .or_else(|| fingerprint.filter(|f| !f.trim().is_empty()));
 
-    let mut party = state.party.lock().await;
-    let outcome = party
-        .connect_and_join(&address, &username, password, &pk, pinned.as_deref())
+    // Dial with no lock held: the poll loop takes the community lock first
+    // every tick, and holding it across a connect to an address that never
+    // answers stopped every session event, toast and save for up to
+    // PARTY_CONNECT_TIMEOUT (TAURI-04). Only attaching the result needs it.
+    let dialled = PartyManager::dial(&address, &pk, pinned.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+    let mut party = state.party.lock().await;
+    let outcome = match dialled {
+        PartyDial::NeedsVerification { fingerprint, sas } => {
+            PartyJoinOutcome::NeedsVerification { fingerprint, sas }
+        }
+        PartyDial::Verified(verified) => party
+            .attach(&address, &username, password, *verified)
+            .map_err(|e| e.to_string())?,
+    };
 
     let (sid, fingerprint) = match outcome {
         PartyJoinOutcome::NeedsVerification { fingerprint, sas } => {

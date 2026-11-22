@@ -94,7 +94,7 @@ prioritised view is in [README.md](README.md).
 | DX-09 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | No single local command equivalent to CI; the four documented check lists disagree |
 | DX-10 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Secret scan: the CI copy installs gitleaks unverified, and PRs rescan the whole history every time |
 | DX-11 | Medium | SUSPECTED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `release.yml`: tauri-action is given `tagName`, `releaseName` and a token under a read-only permission block |
-| JOURNEY-06 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Backup covers the identity only; no restore/import; the "Backed up" badge is weak and goes stale after a password change |
+| JOURNEY-06 | Medium | Partly fixed | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Backup covers the identity only; no restore/import; the "Backed up" badge is weak and goes stale after a password change |
 | JOURNEY-07 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Desktop notifications put message plaintext into OS notification stores and on the lock screen |
 | JOURNEY-08 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No single-instance guard: two desktop instances share one identity and race on the history file |
 | JOURNEY-09 | Medium | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: both macOS legs may stage an identically named `P2PEM.app.tar.gz`, which the collision check rejects |
@@ -147,14 +147,14 @@ prioritised view is in [README.md](README.md).
 | SUPPLY-01 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The process gap: new RustSec advisories break unrelated Rust PRs, frontend PRs merge green past them, and the daily audit only files an issue |
 | SUPPLY-02 | Medium | SUSPECTED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | tauri-action is given `tagName`/`releaseName`, which makes it try to create or upload to the GitHub release, contradicting the attest-then-publish design |
 | TAURI-02 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `set_password` re-keys an unlocked, already-protected identity without the current password; `unlock` is re-entrant |
-| TAURI-03 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | One `connection_password` serves both hosting and dialling: the host password leaks to dialled peers and is lost on auto-rehost |
-| TAURI-04 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | `party_join` holds the party mutex across an untimed TCP connect and handshake, freezing the whole poll loop |
+| TAURI-03 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | One `connection_password` serves both hosting and dialling: the host password leaks to dialled peers and is lost on auto-rehost |
+| TAURI-04 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | `party_join` holds the party mutex across an untimed TCP connect and handshake, freezing the whole poll loop |
 | TAURI-05 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | No single-instance guard: two app instances race on one identity, history file and port |
 | TAURI-06 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Received files carry no Mark-of-the-Web or quarantine attribute, and the "executes on open" list has gaps |
 | TAURI-07 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Argon2 runs on async runtime workers under a std mutex; sync commands block the main thread on it |
-| TAURI-08 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | mDNS keeps advertising and browsing after the user turns it off or hosting stops |
-| TAURI-09 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Every `state-updated` re-serializes the whole open conversation, up to 4×/s during transfers |
-| TAURI-31 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `export_identity` can destroy the identity it is backing up, and records "backed up" for any destination |
+| TAURI-08 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | mDNS keeps advertising and browsing after the user turns it off or hosting stops |
+| TAURI-09 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Every `state-updated` re-serializes the whole open conversation, up to 4×/s during transfers |
+| TAURI-31 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `export_identity` can destroy the identity it is backing up, and records "backed up" for any destination |
 | TUI-09 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | Multi-line messages have their newlines removed when rendered, and scroll height is miscomputed |
 | TUI-10 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | CLI launch flags are dropped for a password-protected identity; `--port` is ignored by `--connect`; no flag validation |
 | TUI-11 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | Passwords are typed in clear on the command line, kept in command history, and truncated at the first space |
@@ -174,7 +174,7 @@ prioritised view is in [README.md](README.md).
 | UI-03 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Communities composer draft is shared across channels, DMs and servers |
 | UI-04 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Stale Communities history responses can render under the wrong channel header |
 | UI-05 | Medium | Fixed | S/M | [07-react-frontend](reports/07-react-frontend.md) | Community read marks never survive a restart or rejoin |
-| UI-06 | Medium | VERIFIED | M | [07-react-frontend](reports/07-react-frontend.md) | Whole-conversation refetch on every UI tick, up to 4 Hz during transfers |
+| UI-06 | Medium | Fixed | M | [07-react-frontend](reports/07-react-frontend.md) | Whole-conversation refetch on every UI tick, up to 4 Hz during transfers |
 | UI-07 | Medium | VERIFIED | S | [07-react-frontend](reports/07-react-frontend.md) | The invite link is fetched once and cached for the whole session |
 | UI-08 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Modal focus management overrides every `autoFocus` inside a dialog |
 | UI-09 | Medium | SUSPECTED | S | [07-react-frontend](reports/07-react-frontend.md) | Toast live regions are `display:none` when empty, so the first announcement may be lost |

@@ -349,9 +349,30 @@ pub(crate) async fn backup_identity_to(
     state: &Bridge,
     dest: &std::path::Path,
 ) -> Result<(), String> {
+    // Never onto the source. The dialog opens wherever the user points it, and
+    // copying a file onto itself truncates it on Linux — destroying the only
+    // key to the history and then recording "backed up" (TAURI-31). Compared
+    // canonically, so `./identity.json` or a symlink cannot slip past; the
+    // destination need not exist yet, so its directory is what is resolved.
+    let canonical = |p: &std::path::Path| -> Option<std::path::PathBuf> {
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+        Some(std::fs::canonicalize(dir).ok()?.join(p.file_name()?))
+    };
+    let source = std::fs::canonicalize(&state.identity_path).ok();
+    let target = std::fs::canonicalize(dest).ok().or_else(|| canonical(dest));
+    if source.is_some() && source == target {
+        return Err("Choose somewhere other than the identity file itself for the backup".into());
+    }
     tokio::fs::copy(&state.identity_path, dest)
         .await
         .map_err(|e| format!("Backup failed: {e}"))?;
+    // A backup that cannot be read back is not one: only record it if it
+    // parses as an identity (a short write on a full disk returns Ok too).
+    if let Err(e) = messenger_core::identity::Identity::load(dest) {
+        return Err(format!(
+            "The backup could not be read back ({e}); it was not recorded"
+        ));
+    }
     // Record that a backup exists so the app can stop nagging — and, more
     // importantly, so it *can* nag when one never happened.
     {
@@ -502,6 +523,13 @@ pub(crate) async fn update_settings(
         mgr.config.auto_accept_files = settings.auto_accept_files;
         mgr.config.auto_connect = settings.auto_connect;
         mgr.config.enable_mdns = settings.enable_mdns;
+    }
+    // Off means off now, not at the next launch: dropping the daemon
+    // unregisters any advertisement and stops browsing (TAURI-08), and what it
+    // found is forgotten with it.
+    if !settings.enable_mdns {
+        *crate::lock_or_recover(&state.discovery) = None;
+        crate::lock_or_recover(&state.discovered).clear();
     }
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(())

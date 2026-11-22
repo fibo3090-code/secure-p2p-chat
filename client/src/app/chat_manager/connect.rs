@@ -356,7 +356,7 @@ impl ChatManager {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         tracing::info!(chat_id = %chat_id, host = %host, port = %port, candidates = %targets.len(), "connect_to_host called");
 
-        let password = self.connection_password.clone();
+        let password = self.dial_password.clone();
         self.spawn_session(chat_id, "Connection failed", move |ch| async move {
             run_client_session_direct_or_relay(
                 &targets,
@@ -385,7 +385,7 @@ impl ChatManager {
     ) -> Result<Uuid> {
         let chat_id = existing_chat_id.unwrap_or_else(Uuid::new_v4);
         let (server, token) = (relay_server.to_string(), token.to_string());
-        let password = self.connection_password.clone();
+        let password = self.dial_password.clone();
         self.spawn_session(chat_id, "Relay connection failed", move |ch| async move {
             run_client_session_via_relay(
                 &server,
