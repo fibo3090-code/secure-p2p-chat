@@ -55,12 +55,12 @@ prioritised view is in [README.md](README.md).
 | TUI-08 | High | Fixed | M | [05-tui](reports/05-tui.md) | Community connect and trust block the whole UI on a TCP connect with no timeout |
 | UI-01 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Community first-join SAS check does not cover the connection that receives the credentials |
 | UI-02 | High | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | A late conversation fetch can show A while the composer sends to B |
-| APP-02 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | `send_file` awaits the bounded file lane while the caller holds the `ChatManager` lock |
+| APP-02 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | `send_file` awaits the bounded file lane while the caller holds the `ChatManager` lock |
 | APP-03 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | A received file whose finalize fails leaves its spool, and possibly an empty placeholder, in Downloads |
 | APP-04 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | A local disk-write error on receive does not tell the sender to stop |
 | APP-05 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | A fully received offer awaiting the user's decision is destroyed when the peer disconnects |
-| APP-06 | Medium | VERIFIED | M | [04-client-core](reports/04-client-core.md) | `FileCancel` carries no transfer id, so with transfers both ways it cancels the wrong one |
-| APP-07 | Medium | VERIFIED | M | [04-client-core](reports/04-client-core.md) | Unaccepted, peer-controlled spools live in the user's Downloads folder and are never swept |
+| APP-06 | Medium | Partly fixed | M | [04-client-core](reports/04-client-core.md) | `FileCancel` carries no transfer id, so with transfers both ways it cancels the wrong one |
+| APP-07 | Medium | Fixed | M | [04-client-core](reports/04-client-core.md) | Unaccepted, peer-controlled spools live in the user's Downloads folder and are never swept |
 | APP-08 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Party history paging skips a range when a live broadcast arrives before the first page |
 | APP-09 | Medium | Fixed | S | [04-client-core](reports/04-client-core.md) | Chunked-text reassembly is bounded by message count, not bytes (hundreds of MiB per chat) |
 | APP-10 | Medium | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Party `connect_and_join` has no TCP connect timeout, and the desktop holds the `PartyManager` lock across it |
@@ -100,7 +100,7 @@ prioritised view is in [README.md](README.md).
 | JOURNEY-09 | Medium | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: both macOS legs may stage an identically named `P2PEM.app.tar.gz`, which the collision check rejects |
 | JOURNEY-10 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The desktop release build has no logs or crash reports, and the diagnostics bundle is almost empty |
 | JOURNEY-11 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | `chat-p2p://` invite links are not registered with the OS, and the IPs they embed are not disclosed |
-| JOURNEY-12 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unaccepted file offers are spooled into the user's Downloads folder and orphaned after a crash |
+| JOURNEY-12 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unaccepted file offers are spooled into the user's Downloads folder and orphaned after a crash |
 | JOURNEY-14 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Unsigned installers ship with no install walkthrough |
 | NET-03 | Medium | Fixed | S | [02-network](reports/02-network.md) | Two host rekeys can happen before the client switches, after which old-key frames are undecryptable |
 | NET-04 | Medium | Fixed | S | [02-network](reports/02-network.md) | No `TCP_NODELAY` and a two-write frame cause delayed-ACK stalls on every small message |

@@ -256,6 +256,8 @@ unnoticed.
 | APP-03 | A failed `finalize` (a short `FileEnd`, a failed rename) left the partial spool — and on a failed rename an empty placeholder — in the download folder. Both are removed. | Failed (spool left behind). | `receiver::tests::a_failed_finalize_leaves_nothing_in_the_download_folder` |
 | APP-04 | A chunk that could not be written failed the transfer locally and told the sender nothing, so it streamed the rest into nothing and reported "sent". It now sends `FileCancel` and closes the stream. | Failed (no frame sent). | `chat_manager::tests::a_chunk_that_cannot_be_written_tells_the_sender_to_stop` |
 | APP-05 | A disconnect failed — and deleted — a held offer that was already complete on disk. Complete offers stay acceptable after the session is gone; incomplete ones are still failed and cleaned up. | Failed (`Failed("connection lost")`). | `a_complete_offer_survives_the_sender_hanging_up`, `an_incomplete_offer_is_still_failed_by_a_disconnect` |
+| APP-02 | `send_file` awaited room on the bounded file lane while holding the manager lock; a lane full from an earlier send behind a stalled peer froze every command and the poll loop. A full lane is now an immediate "try again". | Failed (blocked past a 2 s timeout). | `chat_manager::tests::a_full_file_lane_refuses_a_send_instead_of_freezing_the_app` |
+| APP-07, JOURNEY-12 | Spools in the download folder (`tmp_<uuid>_<name>`) were never removed after a crash or an exit with an offer held. Loading the history sweeps names of exactly that shape, and nothing while a receive is live. They still live in the download folder while in use — finalizing is a rename, which needs one filesystem. | Mutation-checked (the live-receive guard). | `chat_manager::tests::leftover_spools_are_swept_and_nothing_else_is` |
 | UI-01, UI-02, NET-01 | Found already fixed in code, each with a passing regression test. | — | `Parties.test.jsx` › binds the join to the fingerprint; `App.test.jsx` deferred `getConversation`; `session::tests::a_reflected_frame_is_not_accepted_as_the_peers` |
 
 ### Critical and High findings fixed before this pass — the test that guards each
@@ -306,6 +308,17 @@ here beyond the findings named elsewhere in this section.
 | UI-37 | UI-03, UI-04, UI-05, UI-08 and UI-11 each have a test (and a fix). | Smoke tests still cover first paint only, not a flow (the flow is covered over IPC by the bridge tests, and per component by vitest). |
 
 ### Confirmed still open
+
+- **APP-06 (Medium).** `FileCancel` carries no transfer id, so with files moving
+  both ways on one conversation a decline can cancel the wrong one. A real fix is
+  a protocol change (a direction or transfer id on the frame, negotiated by
+  version so an old peer is not sent a frame it would silently ignore); the
+  one-outgoing-send-per-chat guard already limits it to that two-way case.
+
+- **NET-09 (Medium, privacy).** The relay control channel is cleartext: the
+  rendezvous token and LAN candidates are visible on path. TOFU and the SAS
+  still stop silent impersonation. Fixing it means an encrypted control
+  channel pinned to the relay's key — a design change, not a test.
 
 - **CRYPTO-09 (Low, security).** The history file has no rollback protection:
   an older `history.json.enc` loads normally and restores revoked trust and

@@ -37,6 +37,43 @@ struct SpawnFileStream {
 }
 
 impl ChatManager {
+    /// Remove spools left in the download folder by an earlier run.
+    ///
+    /// A receive spools to `tmp_<uuid>_<name>` *in the download folder*,
+    /// because finalizing is a rename and a rename needs one filesystem. After
+    /// a crash, or an exit with an offer still held, nothing removed them:
+    /// peer-chosen bytes under a peer-chosen extension, where indexers,
+    /// thumbnailers and the user would find them (APP-07). Only names of that
+    /// exact shape are touched, and nothing at all while any receive is live.
+    /// Returns how many were removed.
+    pub fn sweep_orphaned_spools(&mut self) -> usize {
+        if !self.incoming_files.is_empty() {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.config.download_dir) else {
+            return 0;
+        };
+        let is_spool = |name: &str| {
+            name.strip_prefix("tmp_")
+                .and_then(|rest| rest.get(..36).zip(rest.get(36..37)))
+                .is_some_and(|(id, sep)| sep == "_" && Uuid::parse_str(id).is_ok())
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(is_spool)
+                && entry.file_type().is_ok_and(|t| t.is_file())
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "Removed spools left by an earlier run");
+        }
+        removed
+    }
+
     /// Send a file to a chat.
     ///
     /// The transfer is registered and its chunks are streamed from a spawned
@@ -75,21 +112,30 @@ impl ChatManager {
         // Placeholder seq: the session loop stamps the real monotonic wire
         // sequence onto every frame it writes. FileMeta rides the bounded `file`
         // lane so it stays ordered ahead of the chunks the stream task queues.
-        {
-            let chat = self
-                .chats
-                .get_mut(&chat_id)
-                .ok_or_else(|| anyhow::anyhow!("Chat not found for sending file"))?;
-            chat.send_seq += 1;
+        if !self.chats.contains_key(&chat_id) {
+            bail!("Chat not found for sending file");
         }
+        // `try_send`, never `send().await`: the caller holds the manager lock,
+        // and a lane still full from an earlier send behind a stalled peer
+        // parked the await — freezing every command and the poll loop with it
+        // (APP-02). A full lane is a moment's wait for the user, not a hang.
         file_tx
-            .send(ProtocolMessage::FileMeta {
+            .try_send(ProtocolMessage::FileMeta {
                 filename: filename.clone(),
                 size: file_size,
                 seq: 0,
             })
-            .await
-            .map_err(|_| anyhow!("Session closed before file metadata was queued"))?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => anyhow!(
+                    "The previous file is still being flushed to this peer — try again in a moment."
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow!("Session closed before file metadata was queued")
+                }
+            })?;
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.send_seq += 1;
+        }
 
         let chat = self
             .chats

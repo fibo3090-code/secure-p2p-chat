@@ -2828,6 +2828,103 @@ fn an_incomplete_offer_is_still_failed_by_a_disconnect() {
     );
 }
 
+/// APP-02: `send_file` awaited room on the bounded file lane while the caller
+/// held the manager lock. A lane still full from a cancelled send, behind a
+/// stalled peer, parked that await — and with it every desktop command and the
+/// poll loop, which all need the lock: the app froze. A full lane is now an
+/// immediate "busy, try again".
+#[tokio::test]
+async fn a_full_file_lane_refuses_a_send_instead_of_freezing_the_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, b"data").unwrap();
+    let mut mgr = ChatManager::default();
+    let chat_id = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat_id, "Peer".into());
+    let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    let (file_tx, _file_rx) = mpsc::channel(1);
+    // Left over from an earlier send the peer never drained.
+    file_tx
+        .try_send(ProtocolMessage::FileChunk {
+            chunk: vec![0],
+            seq: 0,
+        })
+        .unwrap();
+    mgr.add_session_for_test(
+        chat_id,
+        SessionHandle {
+            from_app_tx: app_tx,
+            file_tx,
+        },
+    );
+
+    let res = tokio::time::timeout(Duration::from_secs(2), mgr.send_file(chat_id, file))
+        .await
+        .expect("send_file blocked on a full lane while holding the manager");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("try again"), "{err}");
+    assert!(
+        mgr.active_outgoing_transfer_id_for_chat(chat_id).is_none(),
+        "a refused send must not leave a transfer behind"
+    );
+}
+
+/// APP-07: spools live in the download folder (`tmp_<uuid>_<name>`, because
+/// finalizing is a rename), and after a crash or an exit with an offer still
+/// held nothing ever removed them — peer-chosen bytes under a peer-chosen
+/// extension, in ~/Downloads, forever. Loading the history sweeps them; it
+/// touches nothing else, and nothing while a receive is in flight.
+#[test]
+fn leftover_spools_are_swept_and_nothing_else_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let orphan = dir
+        .path()
+        .join(format!("tmp_{}_invoice.pdf", Uuid::new_v4()));
+    let mine = dir.path().join("tmp_notes.txt");
+    let lookalike = dir
+        .path()
+        .join("tmp_not-a-uuid-at-all-but-36-chars-x_y.txt");
+    for p in [&orphan, &mine, &lookalike] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    let mut mgr = ChatManager::default();
+    mgr.config.download_dir = dir.path().to_path_buf();
+
+    assert_eq!(mgr.sweep_orphaned_spools(), 1);
+    assert!(!orphan.exists(), "the orphaned spool survived");
+    assert!(
+        mine.exists() && lookalike.exists(),
+        "a file the app did not write was removed"
+    );
+
+    // With a receive in flight its own spool must not be touched.
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    let _rx = wire_session_for_test(&mut mgr, chat);
+    mgr.handle_session_event(
+        chat,
+        SessionEvent::MessageReceived(ProtocolMessage::FileMeta {
+            filename: "live.bin".into(),
+            size: 10,
+            seq: 1,
+        }),
+    );
+    assert_eq!(mgr.sweep_orphaned_spools(), 0);
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tmp_"))
+            .count(),
+        3,
+        "the live spool was removed"
+    );
+}
+
 /// A disconnect mid-receive must fail the transfer, not leave a progress row
 /// stuck at its last byte count with the chat's incoming slot still occupied.
 #[test]
