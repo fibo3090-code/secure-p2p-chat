@@ -714,6 +714,11 @@ impl TuiApp {
         self.status_line = format!("{}  │  sessions:{}  │  {}", chat_label, sessions, hint);
     }
 
+    /// A command was submitted and has not run yet.
+    pub fn has_pending_command(&self) -> bool {
+        self.pending_command.is_some()
+    }
+
     pub fn take_pending_command(&mut self) -> Option<TuiCommand> {
         self.pending_command.take()
     }

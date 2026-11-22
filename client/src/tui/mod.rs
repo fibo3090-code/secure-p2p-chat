@@ -276,7 +276,14 @@ where
             return Ok(());
         }
 
-        if let Some(event) = events.next_event(Duration::from_millis(100))? {
+        // Wait for input, then take everything else already waiting before
+        // the next frame (TUI-14): one tick and one redraw per *key* made a
+        // fast typist, a held key or a paste delivered as keys crawl. Capped so
+        // a flood still repaints, and stopped at a submitted command, which
+        // has to run before more input — the app holds only one.
+        let mut next = events.next_event(Duration::from_millis(100))?;
+        let mut handled = 0;
+        while let Some(event) = next {
             // On Windows, crossterm reports both key-press and key-release events;
             // only act on presses so each keystroke registers once.
             match event {
@@ -289,9 +296,17 @@ where
                 app.shutdown_save();
                 return Ok(());
             }
+            handled += 1;
+            if handled >= MAX_EVENTS_PER_FRAME || app.has_pending_command() {
+                break;
+            }
+            next = events.next_event(Duration::ZERO)?;
         }
     }
 }
+
+/// Input handled between two frames at most; see `run_app`.
+const MAX_EVENTS_PER_FRAME: usize = 512;
 
 #[cfg(test)]
 mod tests {
@@ -302,11 +317,13 @@ mod tests {
 
     /// A scripted terminal. When the script runs out the loop is ended with an
     /// error, so a test that forgets to quit fails instead of hanging.
-    struct Script(VecDeque<Event>, VecDeque<Box<dyn FnOnce()>>);
+    /// The third field counts *blocking* polls — the one wait per frame — so
+    /// a test can see how many frames an input took.
+    struct Script(VecDeque<Event>, VecDeque<Box<dyn FnOnce()>>, usize);
 
     impl Script {
         fn new(events: impl IntoIterator<Item = Event>) -> Self {
-            Script(events.into_iter().collect(), VecDeque::new())
+            Script(events.into_iter().collect(), VecDeque::new(), 0)
         }
 
         /// Run `f` (between frames, as an idle poll) before the first event.
@@ -317,7 +334,13 @@ mod tests {
     }
 
     impl EventSource for Script {
-        fn next_event(&mut self, _timeout: Duration) -> Result<Option<Event>> {
+        fn next_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+            if timeout.is_zero() {
+                // "Anything else already waiting?" — a script with nothing
+                // left simply has nothing waiting.
+                return Ok(self.0.pop_front());
+            }
+            self.2 += 1;
             if let Some(f) = self.1.pop_front() {
                 f();
                 return Ok(None);
@@ -394,6 +417,43 @@ mod tests {
         assert!(
             reader.chats.contains_key(&chat),
             "the conversation did not survive the quit"
+        );
+    }
+
+    /// TUI-14: the loop handled one event per frame, so a burst of input —
+    /// a fast typist, a key held down, a paste the terminal delivers as keys —
+    /// cost a full tick and a full redraw *per key*. Everything already
+    /// waiting is handled before the next frame.
+    #[tokio::test]
+    async fn a_burst_of_keys_is_handled_in_one_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        app.chat_manager
+            .create_local_chat_for_test(uuid::Uuid::new_v4(), "Kept".into());
+        let key = app.chat_manager.history_key.expect("key");
+        assert!(app.chat_manager.config.enable_notifications);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // Two commands typed in one burst. Draining must stop at the first
+        // Enter: the app holds one pending command, and a second submitted in
+        // the same frame would silently replace it.
+        let mut events = vec![press(':')];
+        events.extend("set notifications off".chars().map(press));
+        events.push(enter());
+        events.extend([press(':'), press('q'), press('!'), enter()]);
+        let keys = events.len();
+        let mut script = Script::new(events);
+        let history = dir.path().join("history.json.enc");
+        run_app(&mut terminal, app, &mut script)
+            .await
+            .expect("the loop ended by quitting");
+        assert!(script.0.is_empty());
+        assert!(script.2 <= 3, "{keys} keys took {} frames", script.2);
+        // The first command ran: its setting is in the saved history.
+        let mut reader = crate::app::ChatManager::default();
+        assert!(reader.load_history_auto(&history, &key).expect("readable"));
+        assert!(
+            !reader.config.enable_notifications,
+            "the first command of the burst was lost"
         );
     }
 
