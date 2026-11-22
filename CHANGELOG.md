@@ -34,6 +34,9 @@ predate tagged releases.
 
 ### Fixed
 
+- The terminal client now says when history cannot be saved to disk (once,
+  until a save works again) instead of only logging it, and refuses a
+  community upload over the size limit before reading the file.
 - `--relay-server` now logs to stderr (filtered by `RUST_LOG`); it printed
   nothing at all, not even that it was listening. A relay token passed on the
   command line is no longer written into the event log.

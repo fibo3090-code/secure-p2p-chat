@@ -385,7 +385,7 @@ impl TuiApp {
             .unwrap_or("file")
             .to_string();
         let mime = crate::util::guess_mime(p).to_string();
-        match std::fs::read(p) {
+        match read_party_upload(p) {
             Ok(data) => {
                 match self
                     .party_manager
@@ -395,7 +395,7 @@ impl TuiApp {
                     Err(e) => self.toast(ToastLevel::Error, format!("Share failed: {e}")),
                 }
             }
-            Err(e) => self.toast(ToastLevel::Error, format!("Could not read {path}: {e}")),
+            Err(e) => self.toast(ToastLevel::Error, format!("Could not share {path}: {e}")),
         }
     }
 
@@ -645,5 +645,50 @@ impl TuiApp {
                 None => self.toast(ToastLevel::Error, format!("No channel called '#{channel}'")),
             }
         }
+    }
+}
+
+/// Read a file to share in a community, refusing one over the server's limit
+/// **before** reading it (TUI-13). `send_file` refuses it too, but only once
+/// the whole file is in memory: naming a 10 GB file meant a 10 GB allocation
+/// and a frozen terminal, for an answer that was known from its size.
+fn read_party_upload(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use messenger_core::party::MAX_PARTY_FILE_BYTES;
+    use messenger_core::util::format_size;
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".to_string());
+    }
+    if meta.len() > MAX_PARTY_FILE_BYTES {
+        return Err(format!(
+            "it is {}, and a community accepts files up to {}",
+            format_size(meta.len()),
+            format_size(MAX_PARTY_FILE_BYTES)
+        ));
+    }
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::read_party_upload;
+    use messenger_core::party::MAX_PARTY_FILE_BYTES;
+
+    #[test]
+    fn an_oversized_file_is_refused_from_its_size_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.iso");
+        // Sparse: the size is real, the bytes never touch the disk.
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_PARTY_FILE_BYTES + 1)
+            .unwrap();
+        let err = read_party_upload(&big).unwrap_err();
+        assert!(err.contains("accepts files up to"), "{err}");
+
+        let ok = dir.path().join("ok.txt");
+        std::fs::write(&ok, b"hello").unwrap();
+        assert_eq!(read_party_upload(&ok).unwrap(), b"hello");
+        assert_eq!(read_party_upload(dir.path()).unwrap_err(), "not a file");
     }
 }

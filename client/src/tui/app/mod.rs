@@ -150,6 +150,11 @@ pub struct TuiApp {
     /// Set by a background autosave whose write failed; the next tick clears
     /// `saved_signature` so the state is written again.
     autosave_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A background autosave was started and its outcome not yet read.
+    autosave_pending: bool,
+    /// The last save failed and the user has been told; cleared by the next
+    /// save that works, so a failure is reported once per streak (TUI-13).
+    save_failing: bool,
     last_rehost: Option<Instant>,
     typing_active: bool,
     last_typing_activity: Option<Instant>,
@@ -248,6 +253,8 @@ impl TuiApp {
             saved_signature: None,
             save_in_flight: Default::default(),
             autosave_failed: Default::default(),
+            autosave_pending: false,
+            save_failing: false,
             last_rehost: None,
             typing_active: false,
             last_typing_activity: None,
@@ -519,8 +526,13 @@ impl TuiApp {
     /// taken here.
     fn autosave(&mut self) {
         use std::sync::atomic::Ordering;
-        if self.autosave_failed.swap(false, Ordering::SeqCst) {
-            self.saved_signature = None;
+        if self.autosave_pending && !self.save_in_flight.load(Ordering::SeqCst) {
+            self.autosave_pending = false;
+            let failed = self.autosave_failed.swap(false, Ordering::SeqCst);
+            if failed {
+                self.saved_signature = None;
+            }
+            self.record_save_outcome(!failed);
         }
         if self.chat_manager.history_key.is_none() || self.chat_manager.chats.is_empty() {
             return;
@@ -547,12 +559,19 @@ impl TuiApp {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // No runtime (unit tests): save inline.
             match history.save_encrypted(&self.history_path, &key) {
-                Ok(()) => self.saved_signature = Some(sig),
-                Err(e) => tracing::warn!("TUI history save failed: {}", e),
+                Ok(()) => {
+                    self.saved_signature = Some(sig);
+                    self.record_save_outcome(true);
+                }
+                Err(e) => {
+                    tracing::warn!("TUI history save failed: {}", e);
+                    self.record_save_outcome(false);
+                }
             }
             return;
         };
         self.save_in_flight.store(true, Ordering::SeqCst);
+        self.autosave_pending = true;
         let in_flight = self.save_in_flight.clone();
         let path = self.history_path.clone();
         // Recorded optimistically; a failed write clears it below so the next
@@ -581,8 +600,30 @@ impl TuiApp {
             std::thread::sleep(Duration::from_millis(10));
         }
         match self.chat_manager.save_history(&self.history_path) {
-            Ok(()) => self.saved_signature = Some(self.chat_manager.persisted_signature()),
-            Err(e) => tracing::warn!("TUI history save failed: {}", e),
+            Ok(()) => {
+                self.saved_signature = Some(self.chat_manager.persisted_signature());
+                self.record_save_outcome(true);
+            }
+            Err(e) => {
+                tracing::warn!("TUI history save failed: {}", e);
+                self.record_save_outcome(false);
+            }
+        }
+    }
+
+    /// Tell the user when history stops reaching the disk — once per streak
+    /// of failures, not every 30 s. A save that works ends the streak.
+    fn record_save_outcome(&mut self, ok: bool) {
+        if ok {
+            self.save_failing = false;
+        } else if !self.save_failing {
+            self.save_failing = true;
+            self.toast(
+                ToastLevel::Error,
+                "History could not be saved to disk — recent messages will be lost on exit \
+                 until this is fixed (Ctrl+L copies the log with the reason)"
+                    .to_string(),
+            );
         }
     }
 
@@ -2924,6 +2965,56 @@ mod tests {
         app.last_save = None;
         app.autosave();
         assert!(app.history_path.exists());
+    }
+
+    /// TUI-13: a failing autosave (disk full, permissions) was a log line no
+    /// one could see, so the user went on believing history was being kept.
+    /// The first failure of a streak says so; the ones after it in the same
+    /// streak do not repeat it every 30 s; a save that works ends the streak.
+    #[test]
+    fn a_failing_autosave_is_reported_once_per_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _data) = app();
+        // A directory where the file should be: every write fails.
+        let blocked = dir.path().join("history.json.enc");
+        std::fs::create_dir(&blocked).unwrap();
+        app.history_path = blocked.clone();
+        app.chat_manager.history_load_error = None;
+        app.chat_manager.set_history_key(rand::random());
+        app.chat_manager.toasts.clear();
+        let failures = |app: &TuiApp| {
+            app.chat_manager
+                .toasts
+                .iter()
+                .filter(|t| t.message.contains("could not be saved"))
+                .count()
+        };
+
+        for round in 0..3 {
+            app.chat_manager
+                .create_local_chat_for_test(Uuid::new_v4(), format!("chat {round}"));
+            app.last_save = None;
+            app.autosave();
+        }
+        assert_eq!(failures(&app), 1, "{:?}", app.chat_manager.toasts);
+
+        // The disk recovers: the streak ends quietly…
+        std::fs::remove_dir(&blocked).unwrap();
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "ok".into());
+        app.last_save = None;
+        app.autosave();
+        assert!(blocked.is_file());
+        assert_eq!(failures(&app), 1);
+
+        // …so the next failure is news again.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "again".into());
+        app.last_save = None;
+        app.autosave();
+        assert_eq!(failures(&app), 2);
     }
 
     #[tokio::test]
