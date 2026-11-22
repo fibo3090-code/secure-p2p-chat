@@ -248,3 +248,28 @@ describe("Settings", () => {
   });
 });
 
+
+describe("Settings — what notifications show", () => {
+  // PRIV-06: notification text lands in the OS notification store and on the
+  // lock screen, outside the app's encryption. The choice is offered, saved
+  // through the bridge, and absent while notifications are off.
+  it("saves the chosen level and is offered only while notifications are on", async () => {
+    const api = installApi({
+      getSettings: { ...settings, enable_notifications: true, notification_content: "sender_only" },
+      updateSettings: vi.fn(async () => {}),
+    });
+    const { unmount } = render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
+    const select = await screen.findByLabelText("What notifications show");
+    expect(select.value).toBe("sender_only");
+    await userEvent.selectOptions(select, "hidden");
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ notification_content: "hidden" }),
+    ));
+    unmount();
+
+    installApi({ getSettings: { ...settings, enable_notifications: false } });
+    render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
+    await screen.findByText("Desktop notifications");
+    expect(screen.queryByLabelText("What notifications show")).toBeNull();
+  });
+});

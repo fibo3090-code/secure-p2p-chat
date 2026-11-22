@@ -208,7 +208,7 @@ function makeMock() {
   const now = new Date().toISOString();
   let authState = new URLSearchParams(location.search).get("mock") || "ready";
   const mockSettings = {
-    download_dir: "~/Downloads", enable_notifications: true,
+    download_dir: "~/Downloads", enable_notifications: true, notification_content: "sender_only",
     enable_typing_indicators: true, auto_host_on_startup: false, listen_port: 12345, enable_upnp: false,
     auto_accept_files: false, auto_connect: false, enable_mdns: false,
   };

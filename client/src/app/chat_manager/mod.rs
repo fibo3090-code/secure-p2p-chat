@@ -639,13 +639,26 @@ impl ChatManager {
         if !self.should_notify_for(chat_id) {
             return;
         }
-        let title = self
+        let (title, body) = self.notification_text(chat_id, body);
+        self.show_notification(&title, &body);
+    }
+
+    /// The title and body a notification for `chat_id` shows, by the user's
+    /// `notification_content` setting — split from showing it so it can be
+    /// tested.
+    pub(super) fn notification_text(&self, chat_id: Uuid, body: &str) -> (String, String) {
+        use crate::types::NotificationContent;
+        let sender = self
             .chats
             .get(&chat_id)
             .map(|c| c.title.as_str())
             .filter(|t| !t.is_empty())
             .unwrap_or("New message");
-        self.show_notification(title, body);
+        match self.config.notification_content {
+            NotificationContent::Full => (sender.to_string(), body.to_string()),
+            NotificationContent::SenderOnly => (sender.to_string(), "New message".to_string()),
+            NotificationContent::Hidden => ("P2PEM".to_string(), "New message".to_string()),
+        }
     }
 
     /// Show desktop notification

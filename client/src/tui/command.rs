@@ -587,6 +587,7 @@ pub fn settings_keys() -> &'static [&'static str] {
     &[
         "download-dir",
         "notifications",
+        "notification-content",
         "typing",
         "mdns",
         "auto-accept",

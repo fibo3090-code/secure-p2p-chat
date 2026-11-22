@@ -13,6 +13,11 @@ predate tagged releases.
 
 ### Security
 
+- Notifications no longer show the message text by default — only who wrote
+  it. Notification text is kept by the operating system and can appear on the
+  lock screen, outside the app's encryption. Settings → "What notifications
+  show" (or `:set notification-content` in the terminal) offers full text or
+  nothing at all.
 - The connection password is no longer sent to the host. The client proves it
   knows the password with a value bound to that one connection, so someone
   posing as the host — before you have compared the safety code — no longer

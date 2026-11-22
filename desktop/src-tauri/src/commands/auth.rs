@@ -466,6 +466,7 @@ pub(crate) struct SettingsDto {
     auto_accept_files: bool,
     auto_connect: bool,
     enable_mdns: bool,
+    notification_content: messenger_core::types::NotificationContent,
     /// RFC 3339 timestamp of the last identity backup, or `null` if there has
     /// never been one. Read-only — it is set by `export_identity`, not by the
     /// settings form.
@@ -482,6 +483,9 @@ pub(crate) struct SettingsUpdate {
     auto_accept_files: bool,
     auto_connect: bool,
     enable_mdns: bool,
+    /// Optional so a client that predates the setting can still save.
+    #[serde(default)]
+    notification_content: Option<messenger_core::types::NotificationContent>,
 }
 
 #[tauri::command]
@@ -498,6 +502,7 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
         auto_accept_files: mgr.config.auto_accept_files,
         auto_connect: mgr.config.auto_connect,
         enable_mdns: mgr.config.enable_mdns,
+        notification_content: mgr.config.notification_content,
         identity_backed_up_at: mgr.config.identity_backed_up_at.clone(),
     })
 }
@@ -523,6 +528,9 @@ pub(crate) async fn update_settings(
         mgr.config.auto_accept_files = settings.auto_accept_files;
         mgr.config.auto_connect = settings.auto_connect;
         mgr.config.enable_mdns = settings.enable_mdns;
+        if let Some(content) = settings.notification_content {
+            mgr.config.notification_content = content;
+        }
     }
     // Off means off now, not at the next launch: dropping the daemon
     // unregisters any advertisement and stops browsing (TAURI-08), and what it

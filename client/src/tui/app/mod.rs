@@ -1620,6 +1620,19 @@ impl TuiApp {
                 cfg.enable_notifications = b;
                 format!("notifications = {}", b)
             }),
+            "notification-content" => {
+                use crate::types::NotificationContent as N;
+                match value.to_ascii_lowercase().as_str() {
+                    "full" => Ok(N::Full),
+                    "sender" | "sender-only" => Ok(N::SenderOnly),
+                    "hidden" | "none" => Ok(N::Hidden),
+                    _ => Err("notification-content is full, sender or hidden".to_string()),
+                }
+                .map(|n| {
+                    cfg.notification_content = n;
+                    format!("notification-content = {value}")
+                })
+            }
             "typing" => parse_setting_bool(value).map(|b| {
                 cfg.enable_typing_indicators = b;
                 format!("typing = {}", b)
@@ -2925,6 +2938,29 @@ mod tests {
         })
         .await;
         assert_eq!(app.chat_manager.config.listen_port, 4242);
+
+        // PRIV-06: what a notification shows, settable from the TUI too.
+        use crate::types::NotificationContent;
+        for (typed, want) in [
+            ("hidden", NotificationContent::Hidden),
+            ("full", NotificationContent::Full),
+        ] {
+            app.execute_command(TuiCommand::Set {
+                key: "notification-content".into(),
+                value: typed.into(),
+            })
+            .await;
+            assert_eq!(app.chat_manager.config.notification_content, want);
+        }
+        app.execute_command(TuiCommand::Set {
+            key: "notification-content".into(),
+            value: "loud".into(),
+        })
+        .await;
+        assert_eq!(
+            app.chat_manager.config.notification_content,
+            NotificationContent::Full
+        );
     }
 
     #[tokio::test]

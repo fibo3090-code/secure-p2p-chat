@@ -2960,6 +2960,29 @@ fn disconnecting_keeps_the_conversation_and_its_history() {
     assert!(!mgr.disconnect_chat(chat), "nothing left to close");
 }
 
+/// PRIV-06 / JOURNEY-07: a notification put the message text into the OS's
+/// notification store and on the lock screen, outside the app's encryption,
+/// with no way to say less. By default it names the sender only; "hidden"
+/// names nobody; "full" is the old behaviour, on request.
+#[test]
+fn a_notification_says_only_what_the_setting_allows() {
+    use crate::types::NotificationContent;
+    let mut mgr = ChatManager::default();
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Alice".into());
+    assert_eq!(
+        mgr.config.notification_content,
+        NotificationContent::SenderOnly
+    );
+
+    let shown = |mgr: &ChatManager| mgr.notification_text(chat, "the secret plan");
+    assert_eq!(shown(&mgr), ("Alice".into(), "New message".into()));
+    mgr.config.notification_content = NotificationContent::Hidden;
+    assert_eq!(shown(&mgr), ("P2PEM".into(), "New message".into()));
+    mgr.config.notification_content = NotificationContent::Full;
+    assert_eq!(shown(&mgr), ("Alice".into(), "the secret plan".into()));
+}
+
 /// A disconnect mid-receive must fail the transfer, not leave a progress row
 /// stuck at its last byte count with the chat's incoming slot still occupied.
 #[test]

@@ -95,7 +95,7 @@ prioritised view is in [README.md](README.md).
 | DX-10 | Medium | VERIFIED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | Secret scan: the CI copy installs gitleaks unverified, and PRs rescan the whole history every time |
 | DX-11 | Medium | SUSPECTED | S | [10-dx-ci-tests](reports/10-dx-ci-tests.md) | `release.yml`: tauri-action is given `tagName`, `releaseName` and a token under a read-only permission block |
 | JOURNEY-06 | Medium | Partly fixed | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Backup covers the identity only; no restore/import; the "Backed up" badge is weak and goes stale after a password change |
-| JOURNEY-07 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Desktop notifications put message plaintext into OS notification stores and on the lock screen |
+| JOURNEY-07 | Medium | Fixed | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Desktop notifications put message plaintext into OS notification stores and on the lock screen |
 | JOURNEY-08 | Medium | VERIFIED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | No single-instance guard: two desktop instances share one identity and race on the history file |
 | JOURNEY-09 | Medium | SUSPECTED | S | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | Release: both macOS legs may stage an identically named `P2PEM.app.tar.gz`, which the collision check rejects |
 | JOURNEY-10 | Medium | VERIFIED | M | [08-user-journey-footprint](reports/08-user-journey-footprint.md) | The desktop release build has no logs or crash reports, and the diagnostics bundle is almost empty |
@@ -121,7 +121,7 @@ prioritised view is in [README.md](README.md).
 | PRIV-03 | Medium | VERIFIED | M | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Relay hole punching discloses each peer's public and LAN addresses to whoever holds the token, before verification, and the relay control channel is plaintext |
 | PRIV-04 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The TUI log buffer and "Export diagnostics" bundle capture relay tokens, peer IPs, file names and paths, contact names and the external IP, under a README that implies the bundle is safe to share |
 | PRIV-05 | Medium | SUSPECTED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Desktop debug logging (filenames, peer addresses, frame metadata) goes to stdout, which on Linux plausibly persists in the systemd journal |
-| PRIV-06 | Medium | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Desktop notifications show message text by default with no "hide content" option |
+| PRIV-06 | Medium | Fixed | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Desktop notifications show message text by default with no "hide content" option |
 | PRIV-09 | Medium | Partly fixed | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The community server writes plaintext `party.db` and `blobs/` under the default umask, and server logs record member IPs at info |
 | QUAL-03 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Session runners take 8–9 positional arguments; `SessionChannels` exists but stays client-private |
 | QUAL-04 | Medium | VERIFIED | L | [12-code-quality](reports/12-code-quality.md) | Errors are untyped across every module boundary |

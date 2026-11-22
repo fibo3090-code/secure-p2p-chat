@@ -645,6 +645,25 @@ fn settings_roundtrip_and_validation() {
     assert!(err_text(&err).contains("listen port"));
     let s = h.ipc("get_settings", json!({})).unwrap();
     assert_eq!(s["listen_port"], 23456);
+
+    // PRIV-06: what notifications show. Private by default, settable, and
+    // an update that does not mention it (an older frontend) leaves it alone.
+    assert_eq!(s["notification_content"], "sender_only");
+    let mut with = s.clone();
+    with["notification_content"] = json!("hidden");
+    h.ipc_binds("update_settings", json!({ "settings": with }))
+        .expect("set");
+    let mut without = h.ipc("get_settings", json!({})).unwrap();
+    without
+        .as_object_mut()
+        .unwrap()
+        .remove("notification_content");
+    h.ipc_binds("update_settings", json!({ "settings": without }))
+        .expect("update");
+    assert_eq!(
+        h.ipc("get_settings", json!({})).unwrap()["notification_content"],
+        "hidden"
+    );
 }
 
 /// Changing the password must re-encrypt the identity file and nothing else.

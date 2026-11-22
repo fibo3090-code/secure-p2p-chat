@@ -412,6 +412,9 @@ pub struct Config {
     /// and a fingerprint on the local network.
     #[serde(default)]
     pub enable_mdns: bool,
+    /// What a notification shows; see [`NotificationContent`].
+    #[serde(default)]
+    pub notification_content: NotificationContent,
     /// Ask the router (UPnP/IGD) to forward the listening port when hosting,
     /// and embed the discovered external address in invites. Disabled by
     /// default: it opens a port on the router and reveals the external IP to
@@ -426,6 +429,22 @@ pub struct Config {
     /// identity file — as a line of small print the user reads once.
     #[serde(default)]
     pub identity_backed_up_at: Option<String>,
+}
+
+/// What a desktop notification shows. The text goes into OS notification
+/// stores (Windows' `wpndatabase.db`, macOS' notification centre) and onto the
+/// lock screen, outside the app's encryption, so the default shows who wrote
+/// but not what (audit PRIV-06 / JOURNEY-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationContent {
+    /// Sender and message text.
+    Full,
+    /// Sender only.
+    #[default]
+    SenderOnly,
+    /// Neither: "New message".
+    Hidden,
 }
 
 /// Theme options
@@ -474,6 +493,7 @@ impl Default for Config {
             listen_port: crate::PORT_DEFAULT,
             auto_trust_on_first_use: false,
             enable_mdns: false,
+            notification_content: NotificationContent::SenderOnly,
             enable_upnp: false,
             relay_server: None,
             identity_backed_up_at: None,
@@ -555,6 +575,8 @@ mod tests {
         assert!(!c.enable_mdns);
         assert!(!c.enable_upnp);
         assert!(c.relay_server.is_none());
+        // A config saved before the setting existed gets the private default.
+        assert_eq!(c.notification_content, NotificationContent::SenderOnly);
     }
 
     #[test]
