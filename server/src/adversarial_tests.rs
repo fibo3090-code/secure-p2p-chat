@@ -4,7 +4,7 @@
 //! server anything. Each test sends something no UI would, and asserts the
 //! server refuses it or stays consistent.
 
-use messenger_core::party::{MessagePayload, PartyRequest, PartyResponse};
+use messenger_core::party::{PartyRequest, PartyResponse};
 use uuid::Uuid;
 
 use crate::dispatch::{handle_request, ConnState};
@@ -149,7 +149,7 @@ fn every_request_before_joining_is_refused() {
     for req in requests {
         let out = handle_request(&mut state, &mut conn, req);
         assert!(
-            matches!(out.replies.as_slice(), [PartyResponse::Error(_)])
+            matches!(out.replies.as_slice(), [PartyResponse::Error(m)] if m == "join required")
                 && out.broadcast.is_empty()
                 && out.directed.is_empty()
                 && out.deferred.is_none(),
@@ -159,5 +159,4 @@ fn every_request_before_joining_is_refused() {
     }
     assert!(state.channels().iter().all(|c| c.name != "mine"));
     assert!(state.history_since(Uuid::nil(), general, 0).is_empty());
-    let _ = MessagePayload::Text(String::new());
 }

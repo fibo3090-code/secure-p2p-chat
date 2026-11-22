@@ -41,11 +41,9 @@ impl History {
         let complete_from = if complete {
             1
         } else {
-            tail.first()
-                .map(|e| e.seq)
-                .unwrap_or(last_seq.saturating_add(1))
+            tail.first().map_or(last_seq.saturating_add(1), |e| e.seq)
         };
-        let last_seq = last_seq.max(tail.last().map(|e| e.seq).unwrap_or(0));
+        let last_seq = last_seq.max(tail.last().map_or(0, |e| e.seq));
         Self {
             resident: tail.into(),
             last_seq,

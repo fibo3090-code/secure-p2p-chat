@@ -25,17 +25,13 @@ pub fn load_or_create_server_identity(data_dir: &Path) -> Result<RsaPrivateKey> 
     } else {
         let key = generate_rsa_keypair(RSA_KEY_BITS)?;
         let pem = pem_encode_private(&key)?;
-        write_private_pem(&path, &pem)?;
+        // Atomic and owner-only **from creation** (`write_file_atomic`: 0600
+        // temp file, fsync, rename), so the key is never world-readable and
+        // never truncated.
+        messenger_core::util::write_file_atomic(&path, pem.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(key)
     }
-}
-
-/// Write a private-key PEM atomically and owner-only **from creation**
-/// (`write_file_atomic`: 0600 temp file, fsync, rename), so the key is never
-/// world-readable and never truncated.
-fn write_private_pem(path: &Path, pem: &str) -> Result<()> {
-    messenger_core::util::write_file_atomic(path, pem.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]

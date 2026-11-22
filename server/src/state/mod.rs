@@ -211,6 +211,17 @@ struct Channel {
     history: History,
 }
 impl Channel {
+    /// A new, empty channel of `kind` with no explicit members.
+    fn new(name: &str, kind: ChannelKind) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            kind,
+            members: Vec::new(),
+            history: History::new(),
+        }
+    }
+
     fn info(&self) -> ChannelInfo {
         ChannelInfo {
             id: self.id,
@@ -351,19 +362,12 @@ impl PartyState {
     /// Create a new in-memory Administered server with a default `general` channel
     /// and no durable backing store. Mutations are not persisted.
     pub fn new(name: impl Into<String>, password: Option<String>) -> Self {
-        let general = Channel {
-            id: Uuid::new_v4(),
-            name: "general".to_string(),
-            kind: ChannelKind::Public,
-            members: Vec::new(),
-            history: History::new(),
-        };
         Self {
             name: name.into(),
             password,
             tier: TrustTier::Administered,
             members: HashMap::new(),
-            channels: vec![general],
+            channels: vec![Channel::new("general", ChannelKind::Public)],
             dm_threads: HashMap::new(),
             blobs: HashMap::new(),
             file_refs: Vec::new(),
@@ -463,6 +467,7 @@ impl PartyState {
             tracing::info!("migrated legacy party_state.json snapshot into party.db");
         }
 
+        let has_channels = table_count(&conn, CountedTable::Channels)? > 0;
         let mut state = Self::new(name, password);
         state.db = Some(conn);
         state.blob_dir = Some(blob_dir.clone());
@@ -471,7 +476,7 @@ impl PartyState {
         // in a live one). No content hash starts with `staging_`.
         sweep_staging_files(&blob_dir);
 
-        if state.count_channels()? > 0 {
+        if has_channels {
             // The database is authoritative; rebuild the in-memory model from it.
             state.reload_from_db()?;
             // A community with an Owner needs no claim; one without keeps the
@@ -546,9 +551,7 @@ impl PartyState {
         });
         let id = match returning {
             Some(id) => {
-                if let Some(m) = self.members.get_mut(&id) {
-                    m.online = true;
-                }
+                self.set_online(id, true);
                 id
             }
             None => {
@@ -874,13 +877,7 @@ impl PartyState {
             ));
         }
         let position = self.channels.len();
-        let channel = Channel {
-            id: Uuid::new_v4(),
-            name: name.to_string(),
-            kind: ChannelKind::Public,
-            members: Vec::new(),
-            history: History::new(),
-        };
+        let channel = Channel::new(name, ChannelKind::Public);
         let info = channel.info();
         self.persist_channel(&channel, position);
         self.channels.push(channel);
@@ -1035,14 +1032,11 @@ impl PartyState {
         let Some(position) = self.channels.iter().position(|c| c.id == channel) else {
             return Err("unknown channel".to_string());
         };
-        let name = {
-            let c = &mut self.channels[position];
-            c.kind = kind;
-            c.members = members;
-            c.name.clone()
-        };
-        let c = &self.channels[position];
-        self.persist_channel(c, position);
+        let c = &mut self.channels[position];
+        c.kind = kind;
+        c.members = members;
+        let name = c.name.clone();
+        self.persist_channel(&self.channels[position], position);
         let detail = format!("#{name} is now {}", kind.label().to_lowercase());
         self.record_audit(actor, "channel.access", &detail);
         Ok(detail)
@@ -1102,10 +1096,8 @@ impl PartyState {
     /// closed for an unknown channel.
     fn member_can_read_channel(&self, member: Uuid, channel: Uuid) -> bool {
         let role = self.role_of(member);
-        match self.channel(channel) {
-            Some(c) => c.kind.may_read(role, c.members.contains(&member)),
-            None => false,
-        }
+        self.channel(channel)
+            .is_some_and(|c| c.kind.may_read(role, c.members.contains(&member)))
     }
 
     /// Whether `member` may *post* to `channel`, per their role and the channel's
@@ -1177,14 +1169,11 @@ impl PartyState {
             None => resident_pruned,
         };
 
-        let expired: Vec<FileRef> = self
-            .file_refs
-            .iter()
-            .filter(|r| r.shared_at < cutoff)
-            .cloned()
-            .collect();
+        let (expired, kept): (Vec<FileRef>, Vec<FileRef>) = std::mem::take(&mut self.file_refs)
+            .into_iter()
+            .partition(|r| r.shared_at < cutoff);
+        self.file_refs = kept;
         for entry in &expired {
-            self.file_refs.retain(|r| r.id != entry.id);
             self.delete_file_ref_row(entry.id);
             self.release_blob(&entry.hash);
         }

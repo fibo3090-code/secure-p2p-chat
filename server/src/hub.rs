@@ -51,16 +51,7 @@ impl Hub {
     /// Push `resp` to every connection except `except` (the originator),
     /// evicting any whose queue is full (see [`BROADCAST_QUEUE_DEPTH`]).
     pub fn broadcast_except(&self, except: Uuid, resp: PartyResponse) {
-        let mut conns = self.conns.lock().unwrap();
-        let mut stuck: Vec<Uuid> = Vec::new();
-        for (id, conn) in conns.iter() {
-            if *id != except {
-                Self::push(*id, conn, resp.clone(), &mut stuck);
-            }
-        }
-        for id in stuck {
-            conns.remove(&id);
-        }
+        self.push_where(resp, |id, _| id != except);
     }
 
     /// Push `resp` to every connection belonging to `member` *except* `except`
@@ -68,16 +59,7 @@ impl Hub {
     /// originating connection reaches the sender's other devices without
     /// duplicating the row it already appended.
     pub fn send_to_member_except(&self, member: Uuid, except: Uuid, resp: PartyResponse) {
-        let mut conns = self.conns.lock().unwrap();
-        let mut stuck: Vec<Uuid> = Vec::new();
-        for (id, conn) in conns.iter() {
-            if conn.member == member && *id != except {
-                Self::push(*id, conn, resp.clone(), &mut stuck);
-            }
-        }
-        for id in stuck {
-            conns.remove(&id);
-        }
+        self.push_where(resp, |id, conn| conn.member == member && id != except);
     }
 
     /// Push `resp` to every registered connection, including the originator
@@ -96,17 +78,25 @@ impl Hub {
             .any(|c| c.member == member)
     }
 
+    /// Push `resp` to every connection `wanted` selects, evicting any whose
+    /// queue is full.
+    fn push_where(&self, resp: PartyResponse, wanted: impl Fn(Uuid, &Conn) -> bool) {
+        self.conns
+            .lock()
+            .unwrap()
+            .retain(|id, conn| !wanted(*id, conn) || Self::push(*id, conn, resp.clone()));
+    }
+
     /// Non-blocking send: the critical section must never await, so a full
-    /// queue means "this client is not reading".
-    fn push(id: Uuid, conn: &Conn, resp: PartyResponse, stuck: &mut Vec<Uuid>) {
+    /// queue means "this client is not reading". Returns whether to keep it.
+    fn push(id: Uuid, conn: &Conn, resp: PartyResponse) -> bool {
         match conn.tx.try_send(resp) {
-            Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 tracing::warn!(conn = %id, "dropping a connection that stopped reading its socket");
-                stuck.push(id);
+                false
             }
-            // The receiver is gone; `unregister` will clean it up.
-            Err(TrySendError::Closed(_)) => {}
+            // `Closed`: the receiver is gone; `unregister` will clean it up.
+            Ok(()) | Err(TrySendError::Closed(_)) => true,
         }
     }
 

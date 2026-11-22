@@ -61,131 +61,126 @@ impl PartyState {
         out
     }
 
-    pub(super) fn persist_member(&self, m: &Member) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_member_row(conn, m.id, &m.username, m.fingerprint.as_deref(), m.role)
-        {
-            tracing::error!(error = %e, "failed to persist party member");
+    /// Mirror one mutation to the database, when there is one. A failure is
+    /// only logged: memory has already moved on (see [`Self::with_tx`]).
+    fn mirror<T>(&self, what: &str, write: impl FnOnce(&Connection) -> rusqlite::Result<T>) {
+        if let Some(conn) = &self.db {
+            if let Err(e) = write(conn) {
+                tracing::error!(error = %e, "failed to {what}");
+            }
         }
     }
 
+    pub(super) fn persist_member(&self, m: &Member) {
+        self.mirror("persist party member", |conn| {
+            insert_member_row(conn, m.id, &m.username, m.fingerprint.as_deref(), m.role)
+        });
+    }
+
     pub(super) fn persist_file_ref(&self, r: &FileRef) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = execute_cached(
-            conn,
-            "INSERT OR REPLACE INTO file_refs
-                (id, hash, name, uploader, location, is_dm, shared_at, default_perms, grants)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                r.id.to_string(),
-                r.hash,
-                r.name,
-                r.uploader.to_string(),
-                r.location.to_string(),
-                r.is_dm as i64,
-                r.shared_at as i64,
-                serde_json::to_string(&r.default_perms).expect("FilePermissions serializes"),
-                serde_json::to_string(
-                    &r.grants
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), *v))
-                        .collect::<HashMap<String, FilePermissions>>()
-                )
-                .expect("grants serialize")
-            ],
-        ) {
-            tracing::error!(error = %e, "failed to persist file reference");
-        }
+        self.mirror("persist file reference", |conn| {
+            execute_cached(
+                conn,
+                "INSERT OR REPLACE INTO file_refs
+                    (id, hash, name, uploader, location, is_dm, shared_at, default_perms, grants)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    r.id.to_string(),
+                    r.hash,
+                    r.name,
+                    r.uploader.to_string(),
+                    r.location.to_string(),
+                    r.is_dm as i64,
+                    r.shared_at as i64,
+                    serde_json::to_string(&r.default_perms).expect("FilePermissions serializes"),
+                    serde_json::to_string(
+                        &r.grants
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), *v))
+                            .collect::<HashMap<String, FilePermissions>>()
+                    )
+                    .expect("grants serialize")
+                ],
+            )
+        });
     }
 
     /// Delete exactly one share. Deleting by `(hash, location)` would drop every
     /// share of that content in that place while only one refcount was released.
     pub(super) fn delete_file_ref_row(&self, id: Uuid) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = execute_cached(
-            conn,
-            "DELETE FROM file_refs WHERE id = ?1",
-            params![id.to_string()],
-        ) {
-            tracing::error!(error = %e, "failed to delete file reference");
-        }
+        self.mirror("delete file reference", |conn| {
+            execute_cached(
+                conn,
+                "DELETE FROM file_refs WHERE id = ?1",
+                params![id.to_string()],
+            )
+        });
     }
 
     pub(super) fn delete_blob_row(&self, hash: &str) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = execute_cached(conn, "DELETE FROM blobs WHERE hash = ?1", params![hash]) {
-            tracing::error!(error = %e, "failed to delete blob row");
-        }
+        self.mirror("delete blob row", |conn| {
+            execute_cached(conn, "DELETE FROM blobs WHERE hash = ?1", params![hash])
+        });
     }
 
     /// Remove a channel's rows — its messages, its file references and the
     /// channel itself — as one transaction.
     pub(super) fn delete_channel_rows(&self, channel: Uuid) {
-        let Some(conn) = &self.db else { return };
         let id = channel.to_string();
-        let result = atomically(conn, |conn| {
-            for sql in [
-                "DELETE FROM messages WHERE channel_id = ?1",
-                "DELETE FROM file_refs WHERE location = ?1",
-                "DELETE FROM channels WHERE id = ?1",
-            ] {
-                execute_cached(conn, sql, params![id])?;
-            }
-            Ok(())
+        self.mirror("delete channel rows", |conn| {
+            atomically(conn, |conn| {
+                for sql in [
+                    "DELETE FROM messages WHERE channel_id = ?1",
+                    "DELETE FROM file_refs WHERE location = ?1",
+                    "DELETE FROM channels WHERE id = ?1",
+                ] {
+                    execute_cached(conn, sql, params![id])?;
+                }
+                Ok(())
+            })
         });
-        if let Err(e) = result {
-            tracing::error!(error = %e, "failed to delete channel rows");
-        }
     }
 
     pub(super) fn persist_audit(&self, r: &AuditRecord) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = execute_cached(
-            conn,
-            "INSERT INTO audit (at, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![r.at as i64, r.actor.to_string(), r.action, r.detail],
-        ) {
-            tracing::error!(error = %e, "failed to persist audit entry");
-        }
+        self.mirror("persist audit entry", |conn| {
+            execute_cached(
+                conn,
+                "INSERT INTO audit (at, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![r.at as i64, r.actor.to_string(), r.action, r.detail],
+            )
+        });
     }
 
     pub(super) fn persist_channel(&self, c: &Channel, position: usize) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_channel_row(conn, c.id, &c.name, c.kind, &c.members, position) {
-            tracing::error!(error = %e, "failed to persist party channel");
-        }
+        self.mirror("persist party channel", |conn| {
+            insert_channel_row(conn, c.id, &c.name, c.kind, &c.members, position)
+        });
     }
 
     pub(super) fn persist_message(&self, e: &Envelope) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_message_row(conn, e) {
-            tracing::error!(error = %e, "failed to persist party message");
-        }
+        self.mirror("persist party message", |conn| insert_message_row(conn, e));
     }
 
     pub(super) fn persist_dm(&self, thread_id: Uuid, e: &Envelope) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_dm_message_row(conn, thread_id, e) {
-            tracing::error!(error = %e, "failed to persist party direct message");
-        }
+        self.mirror("persist party direct message", |conn| {
+            insert_dm_message_row(conn, thread_id, e)
+        });
     }
 
     pub(super) fn persist_blob_row(&self, hash: &str, size: u64, mime: &str, refcount: u32) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = insert_blob_row(conn, hash, size, mime, refcount) {
-            tracing::error!(error = %e, "failed to persist file blob row");
-        }
+        self.mirror("persist file blob row", |conn| {
+            insert_blob_row(conn, hash, size, mime, refcount)
+        });
     }
 
     pub(super) fn persist_blob_refcount(&self, hash: &str, refcount: u32) {
-        let Some(conn) = &self.db else { return };
-        if let Err(e) = execute_cached(
-            conn,
-            "UPDATE blobs SET refcount = ?1 WHERE hash = ?2",
-            params![refcount, hash],
-        ) {
-            tracing::error!(error = %e, "failed to update file blob refcount");
-        }
+        self.mirror("update file blob refcount", |conn| {
+            execute_cached(
+                conn,
+                "UPDATE blobs SET refcount = ?1 WHERE hash = ?2",
+                params![refcount, hash],
+            )
+        });
     }
 
     /// Rebuild the in-memory model from the database. Presence resets to offline.
@@ -199,16 +194,10 @@ impl PartyState {
         let mut members = HashMap::new();
         {
             let mut stmt = conn.prepare("SELECT id, username, fingerprint, role FROM members")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
             for row in rows {
-                let (id, username, fingerprint, role) = row?;
+                let (id, username, fingerprint, role): (String, String, Option<String>, String) =
+                    row?;
                 let id = Uuid::parse_str(&id)?;
                 members.insert(
                     id,
@@ -229,15 +218,9 @@ impl PartyState {
         {
             let mut stmt =
                 conn.prepare("SELECT id, name, kind, members FROM channels ORDER BY position ASC")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-            let raw: Vec<(String, String, String, String)> = rows.collect::<Result<_, _>>()?;
+            let raw: Vec<(String, String, String, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<Result<_, _>>()?;
             for (id, name, kind, members) in raw {
                 let id = Uuid::parse_str(&id)?;
                 let kind: ChannelKind = serde_json::from_str(&kind)?;
@@ -273,15 +256,9 @@ impl PartyState {
         let mut blobs = HashMap::new();
         {
             let mut stmt = conn.prepare("SELECT hash, size, mime, refcount FROM blobs")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?;
-            let raw: Vec<(String, i64, String, i64)> = rows.collect::<Result<_, _>>()?;
+            let raw: Vec<(String, i64, String, i64)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<Result<_, _>>()?;
             let blob_dir = self
                 .blob_dir
                 .as_ref()
@@ -356,15 +333,10 @@ impl PartyState {
             let mut stmt = conn
                 .prepare("SELECT at, actor, action, detail FROM audit ORDER BY id DESC LIMIT ?1")?;
             let rows = stmt.query_map(params![MAX_AUDIT_ENTRIES as i64], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             for row in rows {
-                let (at, actor, action, detail) = row?;
+                let (at, actor, action, detail): (i64, String, String, String) = row?;
                 audit.push(AuditRecord {
                     at: at as u64,
                     actor: Uuid::parse_str(&actor)?,
@@ -457,26 +429,17 @@ pub(super) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE file_refs ADD COLUMN grants TEXT NOT NULL DEFAULT '{}'",
     ] {
         if let Err(e) = conn.execute(sql, []) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
+            if !e.to_string().contains("duplicate column name") {
                 return Err(e);
             }
         }
     }
-    conn.execute(
-        "UPDATE file_refs SET id = lower(hex(randomblob(16))) WHERE id IS NULL OR id = ''",
-        [],
-    )?;
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS file_refs_id ON file_refs (id)",
-        [],
-    )?;
-    // Channel deletion removes references by location.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS file_refs_location ON file_refs (location)",
-        [],
-    )?;
-    Ok(())
+    conn.execute_batch(
+        "UPDATE file_refs SET id = lower(hex(randomblob(16))) WHERE id IS NULL OR id = '';
+         CREATE UNIQUE INDEX IF NOT EXISTS file_refs_id ON file_refs (id);
+         -- Channel deletion removes references by location.
+         CREATE INDEX IF NOT EXISTS file_refs_location ON file_refs (location);",
+    )
 }
 
 /// Tune a freshly opened database for a server that writes on every request
@@ -578,15 +541,6 @@ pub(super) fn table_count(conn: &Connection, table: CountedTable) -> rusqlite::R
         [],
         |r| r.get(0),
     )
-}
-
-impl PartyState {
-    pub(super) fn count_channels(&self) -> rusqlite::Result<i64> {
-        match &self.db {
-            Some(conn) => table_count(conn, CountedTable::Channels),
-            None => Ok(0),
-        }
-    }
 }
 
 pub(super) fn insert_member_row(

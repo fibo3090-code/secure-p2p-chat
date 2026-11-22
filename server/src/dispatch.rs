@@ -650,7 +650,7 @@ mod tests {
     /// the RSA handshake (and the accept loop's per-IP limiter).
     #[test]
     fn repeated_wrong_passwords_exhaust_the_connection() {
-        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut state = PartyState::new("Srv", Some("pw".into()));
         let mut conn = ConnState::default();
         for _ in 0..MAX_JOIN_ATTEMPTS {
             let resp = join(&mut state, &mut conn, "alice", Some("nope"));
@@ -680,7 +680,7 @@ mod tests {
             &mut state,
             &mut bob,
             PartyRequest::Join {
-                username: "bob".to_string(),
+                username: "bob".into(),
                 password: None,
             },
         );
@@ -710,7 +710,7 @@ mod tests {
             &mut alice_conn,
             PartyRequest::SendDm {
                 to: bob,
-                text: "hello".to_string(),
+                text: "hello".into(),
             },
         );
 
@@ -752,7 +752,7 @@ mod tests {
             &mut owner_conn,
             PartyRequest::PostMessage {
                 channel: private,
-                text: "members only".to_string(),
+                text: "members only".into(),
             },
         );
 
@@ -781,7 +781,7 @@ mod tests {
             &mut conn,
             PartyRequest::PostMessage {
                 channel,
-                text: "hello all".to_string(),
+                text: "hello all".into(),
             },
         );
         assert!(matches!(&out.broadcast[..], [PartyResponse::Message(_)]));
@@ -799,7 +799,7 @@ mod tests {
             &mut conn,
             PartyRequest::SendDm {
                 to: me,
-                text: "note to self".to_string(),
+                text: "note to self".into(),
             },
         );
         assert_eq!(out.directed.len(), 1);
@@ -810,7 +810,7 @@ mod tests {
     /// gets it right is not punished.
     #[test]
     fn a_successful_join_is_unaffected_by_an_earlier_mistake() {
-        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut state = PartyState::new("Srv", Some("pw".into()));
         let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", Some("nope"));
         let resp = join(&mut state, &mut conn, "alice", Some("pw"));
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn wrong_password_is_rejected_and_leaves_connection_unjoined() {
-        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut state = PartyState::new("Srv", Some("pw".into()));
         let mut conn = ConnState::default();
         let resp = join(&mut state, &mut conn, "alice", Some("nope"));
         assert!(matches!(resp[..], [PartyResponse::JoinRejected { .. }]));
@@ -837,30 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn actions_before_join_require_join() {
-        let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::default();
-        for req in [
-            PartyRequest::ListMembers,
-            PartyRequest::ListChannels,
-            PartyRequest::PostMessage {
-                channel: Uuid::new_v4(),
-                text: "hi".to_string(),
-            },
-            PartyRequest::FetchHistory {
-                channel: Uuid::new_v4(),
-                since_seq: 0,
-            },
-        ] {
-            let resp = handle_request(&mut state, &mut conn, req).replies;
-            assert!(
-                matches!(resp[..], [PartyResponse::Error(ref m)] if m == "join required"),
-                "expected join-required error, got {resp:?}"
-            );
-        }
-    }
-
-    #[test]
     fn post_then_fetch_history_round_trips_through_dispatch() {
         let mut state = PartyState::new("Srv", None);
         let channel = state.default_channel();
@@ -872,7 +848,7 @@ mod tests {
             &mut conn,
             PartyRequest::PostMessage {
                 channel,
-                text: "first message".to_string(),
+                text: "first message".into(),
             },
         );
         match &posted.replies[..] {
@@ -903,7 +879,7 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 assert_eq!(
                     items[0].payload,
-                    MessagePayload::Text("first message".to_string())
+                    MessagePayload::Text("first message".into())
                 );
             }
             other => panic!("expected History, got {other:?}"),
@@ -933,7 +909,7 @@ mod tests {
             &mut state,
             &mut conn,
             PartyRequest::CreateChannel {
-                name: "random".to_string(),
+                name: "random".into(),
             },
         );
         // The creator gets their own filtered list; everyone else is nudged to
@@ -943,20 +919,6 @@ mod tests {
             &out.broadcast[..],
             [PartyResponse::DirectoryChanged]
         ));
-    }
-
-    #[test]
-    fn create_channel_before_join_requires_join() {
-        let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::default();
-        let out = handle_request(
-            &mut state,
-            &mut conn,
-            PartyRequest::CreateChannel {
-                name: "x".to_string(),
-            },
-        );
-        assert!(matches!(&out.replies[..], [PartyResponse::Error(m)] if m == "join required"));
     }
 
     /// Drive a dispatch to completion the way `connection.rs` does: perform any
@@ -995,17 +957,15 @@ mod tests {
     fn post_file_acks_the_poster_and_broadcasts_a_file_message() {
         let mut state = PartyState::new("Srv", None);
         let mut conn = ConnState::default();
-        join(&mut state, &mut conn, "alice", None);
+        let me = joined_id(&mut state, &mut conn, "alice");
         let channel = state.default_channel();
-
-        let me = conn.member().unwrap();
         let out = handle_request(
             &mut state,
             &mut conn,
             PartyRequest::PostFile {
                 channel,
-                name: "pic.png".to_string(),
-                mime: "image/png".to_string(),
+                name: "pic.png".into(),
+                mime: "image/png".into(),
                 data: b"\x89PNG data".to_vec(),
             },
         );
@@ -1026,17 +986,15 @@ mod tests {
     fn download_returns_bytes_for_known_and_errors_for_unknown() {
         let mut state = PartyState::new("Srv", None);
         let mut conn = ConnState::default();
-        join(&mut state, &mut conn, "alice", None);
+        let me = joined_id(&mut state, &mut conn, "alice");
         let channel = state.default_channel();
-
-        let me = conn.member().unwrap();
         let post = handle_request(
             &mut state,
             &mut conn,
             PartyRequest::PostFile {
                 channel,
-                name: "f.bin".to_string(),
-                mime: "application/octet-stream".to_string(),
+                name: "f.bin".into(),
+                mime: "application/octet-stream".into(),
                 data: b"payload".to_vec(),
             },
         );
@@ -1052,13 +1010,12 @@ mod tests {
         // `handle_request` only authorises; the read is deferred to the runtime.
         let ok = handle_request(&mut state, &mut conn, PartyRequest::DownloadFile { hash });
         assert!(ok.replies.is_empty(), "the bytes must not be read inline");
-        let reply = match ok.deferred {
-            Some(Deferred::Download { hash, offset, plan }) => {
-                let total = plan.total();
-                download_reply(hash, offset, total, plan.perform())
-            }
-            other => panic!("expected a deferred download, got {other:?}"),
-        };
+        assert!(
+            matches!(ok.deferred, Some(Deferred::Download { .. })),
+            "expected a deferred download, got {:?}",
+            ok.deferred
+        );
+        let reply = settle(&mut state, me, ok);
         assert!(
             matches!(&reply.replies[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
         );
@@ -1086,7 +1043,7 @@ mod tests {
         let mut state = PartyState::new("Srv", None);
         let mut alice = ConnState::default();
         let mut bob = ConnState::default();
-        joined_id(&mut state, &mut alice, "alice");
+        let me = joined_id(&mut state, &mut alice, "alice");
         let bob_id = joined_id(&mut state, &mut bob, "bob");
         let channel = state.default_channel();
         let post = |text: &str| PartyRequest::PostMessage {
@@ -1114,7 +1071,6 @@ mod tests {
 
         // A refused DM is attributed to its thread, and governance gets an
         // ordinary error.
-        let me = alice.member().unwrap();
         let dm = handle_request(
             &mut state,
             &mut alice,

@@ -166,8 +166,7 @@ impl BlobReadPlan {
     /// The blob's full size, whichever shape the plan took.
     pub fn total(&self) -> u64 {
         match self {
-            Self::Resident { total, .. } => *total,
-            Self::OnDisk { total, .. } => *total,
+            Self::Resident { total, .. } | Self::OnDisk { total, .. } => *total,
         }
     }
 
@@ -223,8 +222,7 @@ impl PartyState {
         let mut total = 0u64;
         for r in self.file_refs.iter().filter(|r| r.uploader == member) {
             if seen.insert(r.hash.as_str()) {
-                total = total
-                    .saturating_add(self.blobs.get(&r.hash).map(|b| b.size).unwrap_or_default());
+                total = total.saturating_add(self.blobs.get(&r.hash).map_or(0, |b| b.size));
             }
         }
         // Reservations count too, or several uploads that each fit could
@@ -462,8 +460,7 @@ impl PartyState {
                 }
             }
         };
-        let updated = self.file_refs[index].clone();
-        self.persist_file_ref(&updated);
+        self.persist_file_ref(&self.file_refs[index]);
         self.record_audit(actor, "file.permissions", &detail);
         Ok(detail)
     }
@@ -560,36 +557,32 @@ impl PartyState {
         let mut out: Vec<FileEntry> = self
             .file_refs
             .iter()
-            .filter(|r| self.effective_perms(member, r).view)
-            .map(|r| {
-                let (location_name, is_dm) = if r.is_dm {
-                    (self.dm_location_name(member, r.location), true)
+            .filter_map(|r| {
+                let perms = self.effective_perms(member, r);
+                if !perms.view {
+                    return None;
+                }
+                let location_name = if r.is_dm {
+                    self.dm_location_name(member, r.location)
                 } else {
-                    (
-                        self.channel(r.location)
-                            .map(|c| format!("#{}", c.name))
-                            .unwrap_or_else(|| "#unknown".to_string()),
-                        false,
-                    )
+                    self.channel(r.location)
+                        .map_or_else(|| "#unknown".to_string(), |c| format!("#{}", c.name))
                 };
-                FileEntry {
+                let blob = self.blobs.get(&r.hash);
+                Some(FileEntry {
                     hash: r.hash.clone(),
                     name: r.name.clone(),
-                    size: self.blobs.get(&r.hash).map(|b| b.size).unwrap_or_default(),
-                    mime: self
-                        .blobs
-                        .get(&r.hash)
-                        .map(|b| b.mime.clone())
-                        .unwrap_or_default(),
+                    size: blob.map_or(0, |b| b.size),
+                    mime: blob.map(|b| b.mime.clone()).unwrap_or_default(),
                     uploader: r.uploader,
                     uploader_name: self.username_of(r.uploader),
                     location: r.location,
                     location_name,
-                    is_dm,
+                    is_dm: r.is_dm,
                     shared_at: r.shared_at,
-                    can_delete: self.effective_perms(member, r).delete,
-                    perms: self.effective_perms(member, r),
-                }
+                    can_delete: perms.delete,
+                    perms,
+                })
             })
             .collect();
         // Total order, so page boundaries are stable between requests.
@@ -849,9 +842,8 @@ impl PartyState {
         // Release the claim first: the bytes are now recorded or discarded.
         self.reservations.remove(&staged.id);
 
-        let hash = match staged.hash.clone() {
-            Some(hash) => hash,
-            None => return Err("upload was never written".to_string()),
+        let Some(hash) = staged.hash.clone() else {
+            return Err("upload was never written".to_string());
         };
         let uploader = staged.uploader;
         let target = staged.target;
@@ -1016,9 +1008,7 @@ impl PartyState {
     /// here because a staged upload's `Drop` cannot reach the state.
     pub fn cancel_connection_uploads(&mut self, member: Uuid, ids: &[Uuid]) {
         for id in ids {
-            if self.uploads.get(id).is_some_and(|p| p.uploader == member) {
-                self.uploads.remove(id);
-            }
+            self.cancel_upload(member, *id);
             if self
                 .reservations
                 .get(id)

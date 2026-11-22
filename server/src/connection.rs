@@ -377,6 +377,8 @@ mod tests {
     };
     use messenger_core::RSA_KEY_BITS;
     use rsa::RsaPrivateKey;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::DuplexStream;
 
@@ -487,6 +489,15 @@ mod tests {
             .any(|m| m.id == id && m.online)
     }
 
+    /// The served task's result, once it ends (failing with `why` if it has
+    /// not within 30 seconds).
+    async fn ended(served: Served, why: &str) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(30), served)
+            .await
+            .expect(why)
+            .unwrap()
+    }
+
     fn short_limits() -> ConnectionLimits {
         let t = Duration::from_millis(500);
         ConnectionLimits {
@@ -512,41 +523,38 @@ mod tests {
 
     impl tokio::io::AsyncRead for Severable {
         fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
+        ) -> Poll<std::io::Result<()>> {
             if self.is_cut() {
-                return std::task::Poll::Pending;
+                return Poll::Pending;
             }
-            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+            Pin::new(&mut self.inner).poll_read(cx, buf)
         }
     }
 
     impl tokio::io::AsyncWrite for Severable {
         fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
             buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
+        ) -> Poll<std::io::Result<usize>> {
             if self.is_cut() {
-                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
-            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+            Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
         }
 
         fn poll_shutdown(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
         }
     }
 
@@ -582,10 +590,7 @@ mod tests {
         let reply = post(&mut bob, channel, "anyone there?").await;
         assert!(matches!(reply, PartyResponse::MessagePosted { .. }));
 
-        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
-            .await
-            .expect("the connection task ends")
-            .unwrap();
+        let outcome = ended(served, "the connection task ends").await;
         assert!(outcome.is_err(), "the failed write is still reported");
         assert!(
             !hub.member_is_connected(alice_id),
@@ -694,7 +699,7 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 assert_eq!(
                     items[0].payload,
-                    MessagePayload::Text("hello server".to_string())
+                    MessagePayload::Text("hello server".into())
                 );
             }
             other => panic!("expected History, got {other:?}"),
@@ -735,7 +740,7 @@ mod tests {
         match bob.recv().await.unwrap() {
             PartyResponse::Message(env) => {
                 assert_eq!(env.channel, channel);
-                assert_eq!(env.payload, MessagePayload::Text("hi bob".to_string()));
+                assert_eq!(env.payload, MessagePayload::Text("hi bob".into()));
             }
             other => panic!("expected broadcast Message, got {other:?}"),
         }
@@ -756,7 +761,7 @@ mod tests {
             &mut alice,
             PartyRequest::SendDm {
                 to: bob_id,
-                text: "hey bob".to_string(),
+                text: "hey bob".into(),
             },
         )
         .await;
@@ -768,7 +773,7 @@ mod tests {
                     env.channel,
                     messenger_core::party::dm_thread_id(alice_id, bob_id)
                 );
-                assert_eq!(env.payload, MessagePayload::Text("hey bob".to_string()));
+                assert_eq!(env.payload, MessagePayload::Text("hey bob".into()));
             }
             other => panic!("expected DM Message, got {other:?}"),
         }
@@ -785,10 +790,7 @@ mod tests {
         match history {
             PartyResponse::History(items) => {
                 assert_eq!(items.len(), 1);
-                assert_eq!(
-                    items[0].payload,
-                    MessagePayload::Text("hey bob".to_string())
-                );
+                assert_eq!(items[0].payload, MessagePayload::Text("hey bob".into()));
             }
             other => panic!("expected DM history, got {other:?}"),
         }
@@ -819,7 +821,7 @@ mod tests {
         let channels = request(
             &mut owner,
             PartyRequest::CreateChannelOfKind {
-                name: "secret".to_string(),
+                name: "secret".into(),
                 kind: ChannelKind::Private,
                 members: vec![bob_id],
             },
@@ -853,7 +855,7 @@ mod tests {
                 r,
                 PartyResponse::Message(env)
                     if env.channel == private
-                        && env.payload == MessagePayload::Text("members only".to_string())
+                        && env.payload == MessagePayload::Text("members only".into())
             )),
             "a channel member must receive the message; got {bobs:?}"
         );
@@ -886,8 +888,8 @@ mod tests {
         let upload = match request(
             &mut client,
             PartyRequest::StartUpload {
-                name: "big.bin".to_string(),
-                mime: "application/octet-stream".to_string(),
+                name: "big.bin".into(),
+                mime: "application/octet-stream".into(),
                 size: payload.len() as u64,
                 target: UploadTarget::Channel(channel),
             },
@@ -1071,10 +1073,7 @@ mod tests {
         let (state, hub) = fixture();
         let (stream, served) = spawn_with_limits(state, hub, 1 << 16, short_limits());
         let mut client = handshake(stream).await;
-        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
-            .await
-            .expect("closed after the join deadline")
-            .unwrap();
+        let outcome = ended(served, "closed after the join deadline").await;
         assert!(outcome.unwrap_err().to_string().contains("did not join"));
         assert!(client.recv().await.is_err(), "the client sees it close");
     }
@@ -1101,10 +1100,7 @@ mod tests {
     async fn a_peer_that_never_handshakes_is_closed() {
         let (state, hub) = fixture();
         let (_silent, served) = spawn_with_limits(state, hub, 1 << 16, short_limits());
-        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
-            .await
-            .expect("closed at the handshake deadline")
-            .unwrap();
+        let outcome = ended(served, "closed at the handshake deadline").await;
         assert!(outcome.is_err());
     }
 
@@ -1129,10 +1125,7 @@ mod tests {
             let reply = post(&mut bob, channel, format!("{i}{}", "z".repeat(2048))).await;
             assert!(matches!(reply, PartyResponse::MessagePosted { .. }));
         }
-        let outcome = tokio::time::timeout(Duration::from_secs(30), served)
-            .await
-            .expect("the stuck write times out")
-            .unwrap();
+        let outcome = ended(served, "the stuck write times out").await;
         assert!(outcome.unwrap_err().to_string().contains("timed out"));
         assert!(!hub.member_is_connected(alice_id));
         drop(alice);
