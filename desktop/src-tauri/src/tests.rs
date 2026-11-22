@@ -2318,3 +2318,17 @@ fn a_community_file_is_shared_and_saved_under_a_name_that_shows_what_it_is() {
         "sanitising must not hide what it is: {file_name:?}"
     );
 }
+
+/// PRIV-05: a release build logged at debug level by default — file names,
+/// peer addresses and frame metadata on stdout, which on Linux can land in the
+/// systemd journal. Only a development build does now.
+#[test]
+fn a_release_build_does_not_log_at_debug_level_by_default() {
+    let release = crate::default_log_filter(false);
+    assert!(
+        !release.contains("debug") && !release.contains("trace"),
+        "{release}"
+    );
+    assert!(tracing_subscriber::EnvFilter::try_new(release).is_ok());
+    assert!(crate::default_log_filter(true).contains("debug"));
+}

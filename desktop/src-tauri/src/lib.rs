@@ -236,6 +236,18 @@ use p2pem_classic::app::saved_parties::{upsert_saved_party, SavedParty};
 #[cfg(all(test, not(windows)))]
 mod tests;
 
+/// The log filter when `RUST_LOG` is not set. Debug builds log at debug level
+/// for development; a release build does not. Its debug output names files,
+/// peer addresses and frame metadata, and on Linux stdout can end up in the
+/// systemd journal, outside the app's encryption (audit PRIV-05).
+pub(crate) fn default_log_filter(debug_build: bool) -> &'static str {
+    if debug_build {
+        "info,p2pem_classic=debug,messenger_core=debug"
+    } else {
+        "warn,p2pem_desktop=info"
+    }
+}
+
 /// The full command registration, shared by the real app and the test harness
 /// so a command can never be reachable in tests but unregistered in the app
 /// (or vice versa).
@@ -324,7 +336,7 @@ pub fn run() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,p2pem_classic=debug,messenger_core=debug")
+                tracing_subscriber::EnvFilter::new(default_log_filter(cfg!(debug_assertions)))
             }),
         )
         .try_init();
