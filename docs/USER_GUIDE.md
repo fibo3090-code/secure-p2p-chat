@@ -568,7 +568,7 @@ The app also supports panic/crash logging to help support and debugging.
 
 - check the connection status
 - reconnect manually if needed
-- inspect the log terminal or TUI diagnostics output
+- copy the event log (`Ctrl+L` in the terminal client) or export a diagnostics bundle (`:diagnostics`, or Settings → Diagnostics in the desktop app); a relay server logs to its stderr, filtered by `RUST_LOG`
 - if one side is much older, large-message chunking compatibility may be involved
 
 ### Fingerprint changed

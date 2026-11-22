@@ -34,10 +34,20 @@ async fn relay_server_mode_serves_a_rendezvous() {
         .local_addr()
         .unwrap()
         .port();
+    // A token on the command line (meaningless to a relay, but it is what a
+    // user mistypes) must not be echoed into the log.
+    let secret = "relay-token-that-must-not-be-logged";
     let mut child = client()
-        .args(["--relay-server", "--port", &port.to_string()])
+        .args([
+            "--relay-server",
+            "--port",
+            &port.to_string(),
+            "--relay-token",
+            secret,
+        ])
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("start the relay");
     let relay = format!("127.0.0.1:{port}");
@@ -68,9 +78,17 @@ async fn relay_server_mode_serves_a_rendezvous() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let _ = child.kill();
-    let _ = child.wait();
+    let output = child.wait_with_output().expect("relay output");
     assert!(
         answer.to_lowercase().contains("unknown relay token"),
         "not a relay answering: {answer}"
     );
+    // TUI-24: a daemon that logs nowhere cannot be operated. The relay writes
+    // to stderr (the TUI cannot — it owns the screen).
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains(&format!("Relay server listening on port {port}")),
+        "the relay logged nothing useful: {log:?}"
+    );
+    assert!(!log.contains(secret), "the relay token was logged: {log}");
 }

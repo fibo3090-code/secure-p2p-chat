@@ -82,7 +82,7 @@ client/src/
   main.rs         entry point: terminal UI + relay-server mode
   lib.rs          client exports; re-exports messenger-core
   support.rs      diagnostics export and panic/crash support
-  logbuf.rs       bounded in-process tracing buffer (log overlay + diagnostics)
+  logbuf.rs       bounded in-process tracing buffer (Ctrl+L copy + diagnostics)
   colorgrid.rs    fingerprint safety-grid colours as plain (r,g,b) — toolkit-agnostic
   app/
     chat_manager/   ChatManager split by concern:

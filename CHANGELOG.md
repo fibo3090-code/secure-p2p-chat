@@ -34,6 +34,9 @@ predate tagged releases.
 
 ### Fixed
 
+- `--relay-server` now logs to stderr (filtered by `RUST_LOG`); it printed
+  nothing at all, not even that it was listening. A relay token passed on the
+  command line is no longer written into the event log.
 - Opening the desktop app a second time no longer starts a second copy over
   the same data. The two copies each rewrote the whole message history from
   their own memory, so the one that saved last erased what only the other had

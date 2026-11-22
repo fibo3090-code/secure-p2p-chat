@@ -170,7 +170,7 @@ prioritised view is in [README.md](README.md).
 | TUI-21 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Colours are hard-coded: security text is white (invisible on light themes), no `NO_COLOR`, RGB safety grid |
 | TUI-22 | Medium | Partly fixed | S | [05-tui](reports/05-tui.md) | Unit tests touch the developer's real data directory; the TUI has no data-dir override |
 | TUI-23 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:invite` advertises the configured listen port, not the port actually being hosted |
-| TUI-24 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | No log output anywhere (relay server is silent; `RUST_LOG` has no visible effect); docs reference a log view that does not exist |
+| TUI-24 | Medium | Partly fixed | M | [05-tui](reports/05-tui.md) | No log output anywhere (relay server is silent; `RUST_LOG` has no visible effect); docs reference a log view that does not exist |
 | UI-03 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Communities composer draft is shared across channels, DMs and servers |
 | UI-04 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Stale Communities history responses can render under the wrong channel header |
 | UI-05 | Medium | Fixed | S/M | [07-react-frontend](reports/07-react-frontend.md) | Community read marks never survive a restart or rejoin |

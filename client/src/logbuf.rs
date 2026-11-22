@@ -1,7 +1,8 @@
 //! In-process ring buffer of recent `tracing` events.
 //!
-//! The TUI's log overlay and the diagnostics bundle both need to show what the
-//! app has been doing. That used to come from `egui_tracing::EventCollector` —
+//! The TUI's copy-logs action (Ctrl+L) and the diagnostics bundle both need the
+//! recent history of what the app has been doing. That used to come from
+//! `egui_tracing::EventCollector` —
 //! an egui crate pulled in purely for its collector, which kept the terminal UI
 //! (and, transitively, the Tauri desktop bridge) depending on a GUI toolkit
 //! that no longer ships. This is the same capability with no such dependency:

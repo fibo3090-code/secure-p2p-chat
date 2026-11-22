@@ -11,7 +11,7 @@ use p2pem_classic::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(
     author,
     version,
@@ -71,20 +71,36 @@ To keep using the terminal interface, run without `--gui`.";
 async fn main() -> anyhow::Result<()> {
     support::install_panic_hook();
 
-    // Retained in memory for the log overlay (Ctrl+L) and diagnostics bundles,
-    // in addition to whatever the environment's RUST_LOG selects.
+    let args = Args::parse();
+
+    // Retained in memory for Ctrl+L (copy logs) and diagnostics bundles, in
+    // addition to whatever the environment's RUST_LOG selects. The relay is a
+    // daemon with no screen, so it also logs to stderr (TUI-24); the TUI
+    // cannot, because stderr is the terminal it is drawing on.
     let logs = LogBuffer::new();
+    let stderr = args.relay_server.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(false)
+    });
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,p2pem_classic=debug".into()),
         )
         .with(logs.clone())
+        .with(stderr)
         .init();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Application starting");
-    let args = Args::parse();
-    tracing::debug!(?args, "Parsed CLI arguments");
+    // The relay token is a rendezvous secret: whoever has it can take the
+    // other end of the pairing. The log ends up in clipboard copies and
+    // diagnostics bundles, so it never carries the token.
+    let logged = Args {
+        relay_token: args.relay_token.as_ref().map(|_| "<redacted>".to_string()),
+        ..args.clone()
+    };
+    tracing::debug!(args = ?logged, "Parsed CLI arguments");
 
     if args.gui {
         eprintln!("{GUI_RETIRED_NOTICE}");
