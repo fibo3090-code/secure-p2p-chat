@@ -155,6 +155,10 @@ pub struct TuiApp {
     pub suggestion_index: usize,
     /// Optional command name to show in the help overlay.
     pub help_topic: Option<String>,
+    /// Launch options (`--host`, `--connect`…) waiting for the identity to be
+    /// unlocked: run before it, they failed on the locked key and were lost
+    /// (TUI-10).
+    pub(crate) deferred_launch: Option<crate::tui::TuiLaunchConfig>,
 }
 
 impl TuiApp {
@@ -242,6 +246,7 @@ impl TuiApp {
             command_suggestions: Vec::new(),
             suggestion_index: 0,
             help_topic: None,
+            deferred_launch: None,
         };
         app.sync_chat_ids();
         app.refresh_status_line();
@@ -332,6 +337,11 @@ impl TuiApp {
     /// At startup, greet the user with a password overlay when appropriate:
     /// unlock a locked identity, or set a password on a new/unencrypted one.
     /// Called by `run()` (kept out of `new()` so tests start overlay-free).
+    /// Whether the identity's key is still behind its password.
+    pub fn identity_locked(&self) -> bool {
+        self.identity.is_locked()
+    }
+
     pub fn prompt_auth_if_needed(&mut self) {
         if self.identity.is_locked() {
             self.overlay = TuiOverlay::Password {

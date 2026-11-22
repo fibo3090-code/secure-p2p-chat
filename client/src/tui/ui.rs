@@ -241,15 +241,34 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         if msg.from_me && msg.delivered {
             content.push_str(" ✓");
         }
-        plain_texts.push(format!("{}{}{}", ts, prefix, content));
+        // One screen line per line of the message: ratatui drops a `\n`
+        // inside a span, which glued "a\nb" into "ab" (TUI-09). The first
+        // carries the time and sender; the rest are indented under it — and
+        // the text the scroll height is measured on is indented the same way.
+        let indent = " ".repeat(ts.chars().count() + prefix.chars().count());
+        plain_texts.push(format!(
+            "{}{}{}",
+            ts,
+            prefix,
+            content.replace('\n', &format!("\n{indent}"))
+        ));
+        let mut segments = content.split('\n');
+        let first = segments.next().unwrap_or_default().to_string();
+        let rest: Vec<String> = segments.map(str::to_string).collect();
         lines.push(Line::from(vec![
             Span::styled(ts, Style::default().fg(Color::DarkGray)),
             Span::styled(
                 prefix,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(content),
+            Span::raw(first),
         ]));
+        for segment in rest {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::raw(segment),
+            ]));
+        }
     }
 
     let connected = app.chat_manager.is_connected(&chat_id);
@@ -472,6 +491,50 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| ui(f, app)).expect("draw");
+    }
+
+    /// TUI-09: a message was one `Line` with the text in a single `Span`, and
+    /// ratatui drops control characters inside a span — so "line one\nline
+    /// two" rendered as "line oneline two". Each line of a message is its own
+    /// line on screen.
+    #[test]
+    fn a_multi_line_message_keeps_its_lines() {
+        let (mut app, _data) = test_app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        app.chat_manager.get_chat_mut(chat).unwrap().messages.push(
+            messenger_core::types::Message {
+                id: Uuid::new_v4(),
+                from_me: false,
+                content: messenger_core::types::MessageContent::Text {
+                    text: "first line\nsecond line".into(),
+                },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            },
+        );
+        app.tick();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal.draw(|f| ui(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("first line"))
+            .expect("first line shown");
+        assert!(
+            !rows[first].contains("second line"),
+            "joined: {}",
+            rows[first]
+        );
+        assert!(
+            rows.get(first + 1)
+                .is_some_and(|r| r.contains("second line")),
+            "the second line is not below the first: {rows:#?}"
+        );
     }
 
     #[test]

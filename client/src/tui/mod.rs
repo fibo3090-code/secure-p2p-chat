@@ -91,7 +91,7 @@ pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
 
     let mut app = TuiApp::new(logs)?;
     app.prompt_auth_if_needed();
-    apply_launch_config(&mut app, &launch).await;
+    start_launch(&mut app, launch).await;
 
     let res = run_app(&mut terminal, app, &mut CrosstermEvents).await;
 
@@ -108,6 +108,35 @@ pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
     Ok(())
 }
 
+/// Run the launch options now, or — with the identity still locked — once it
+/// is unlocked. Run before the unlock they all failed on the locked key and
+/// were lost: every launch after the first, since the first sets a password
+/// (TUI-10).
+async fn start_launch(app: &mut TuiApp, launch: TuiLaunchConfig) {
+    let any = launch.host
+        || launch.connect.is_some()
+        || launch.host_relay.is_some()
+        || launch.relay_connect.is_some();
+    if !any {
+        return;
+    }
+    if app.identity_locked() {
+        app.deferred_launch = Some(launch);
+    } else {
+        apply_launch_config(app, &launch).await;
+    }
+}
+
+/// The deferred half of [`start_launch`]: called each turn of the loop.
+async fn run_deferred_launch(app: &mut TuiApp) {
+    if app.identity_locked() {
+        return;
+    }
+    if let Some(launch) = app.deferred_launch.take() {
+        apply_launch_config(app, &launch).await;
+    }
+}
+
 async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
     if launch.host {
         app.execute_command(TuiCommand::Host(Some(launch.port)))
@@ -115,9 +144,17 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
     }
 
     if let Some(target) = launch.connect.as_deref() {
-        match TuiApp::parse_command(&format!(":connect {}", target)) {
-            Ok(cmd @ TuiCommand::Connect { .. }) => app.execute_command(cmd).await,
-            Ok(_) => {}
+        // `--port` is the default for a target that names none: `--connect
+        // 1.2.3.4 --port 9000` dialled 12345 (TUI-10).
+        match crate::util::parse_host_port(target.trim(), Some(launch.port)) {
+            Ok((host, port)) if !target.trim().contains(char::is_whitespace) => {
+                app.execute_command(TuiCommand::Connect { host, port })
+                    .await
+            }
+            Ok(_) => app.chat_manager.add_toast(
+                crate::types::ToastLevel::Error,
+                format!("Invalid --connect: '{target}' is not one address"),
+            ),
             Err(e) => app.chat_manager.add_toast(
                 crate::types::ToastLevel::Error,
                 format!("Invalid --connect: {}", e),
@@ -225,6 +262,7 @@ where
 {
     loop {
         app.tick();
+        run_deferred_launch(&mut app).await;
 
         if let Some(cmd) = app.take_pending_command() {
             app.execute_command(cmd).await;
@@ -535,6 +573,72 @@ mod tests {
             toasts(&app)
         );
         assert!(app.chat_manager.chats.is_empty());
+    }
+
+    /// TUI-10 (a): after the first run the identity is locked at launch, and
+    /// the flags ran before the unlock prompt was answered — failing on the
+    /// locked key and lost. They wait for the unlock now.
+    #[tokio::test]
+    async fn launch_flags_wait_for_the_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = format!("pw-{}", uuid::Uuid::new_v4());
+        let mut identity =
+            messenger_core::identity::Identity::new_with_plaintext("T".into()).unwrap();
+        identity.encrypt(&password).unwrap();
+        identity.save(&dir.path().join("identity.json")).unwrap();
+        let mut app = app_in(&dir);
+        assert!(app.identity_locked());
+
+        start_launch(
+            &mut app,
+            TuiLaunchConfig {
+                host: true,
+                ..launch()
+            },
+        )
+        .await;
+        assert!(
+            app.chat_manager.hosting_port.is_none(),
+            "hosted on a locked identity"
+        );
+        run_deferred_launch(&mut app).await;
+        assert!(
+            app.chat_manager.hosting_port.is_none(),
+            "ran before the unlock"
+        );
+
+        app.execute_command(crate::tui::app::TuiCommand::Unlock(Some(password)))
+            .await;
+        assert!(!app.identity_locked());
+        run_deferred_launch(&mut app).await;
+        assert!(
+            app.chat_manager.hosting_port.is_some(),
+            "{:?}",
+            toasts(&app)
+        );
+        assert!(app.deferred_launch.is_none(), "it runs once");
+    }
+
+    /// TUI-10 (b): `--port` is the port `--connect` uses when the target names
+    /// none; it used to dial 12345 whatever `--port` said.
+    #[tokio::test]
+    async fn connect_uses_the_port_flag_when_the_target_names_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(&dir);
+        apply_launch_config(
+            &mut app,
+            &TuiLaunchConfig {
+                connect: Some("127.0.0.1".into()),
+                port: 9,
+                ..launch()
+            },
+        )
+        .await;
+        assert!(
+            toasts(&app).iter().any(|t| t.contains("127.0.0.1:9")),
+            "{:?}",
+            toasts(&app)
+        );
     }
 
     #[tokio::test]
