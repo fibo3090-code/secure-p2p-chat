@@ -149,7 +149,7 @@ prioritised view is in [README.md](README.md).
 | TAURI-02 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `set_password` re-keys an unlocked, already-protected identity without the current password; `unlock` is re-entrant |
 | TAURI-03 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | One `connection_password` serves both hosting and dialling: the host password leaks to dialled peers and is lost on auto-rehost |
 | TAURI-04 | Medium | Fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | `party_join` holds the party mutex across an untimed TCP connect and handshake, freezing the whole poll loop |
-| TAURI-05 | Medium | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | No single-instance guard: two app instances race on one identity, history file and port |
+| TAURI-05 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | No single-instance guard: two app instances race on one identity, history file and port |
 | TAURI-06 | Medium | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Received files carry no Mark-of-the-Web or quarantine attribute, and the "executes on open" list has gaps |
 | TAURI-07 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Argon2 runs on async runtime workers under a std mutex; sync commands block the main thread on it |
 | TAURI-08 | Medium | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | mDNS keeps advertising and browsing after the user turns it off or hosting stops |

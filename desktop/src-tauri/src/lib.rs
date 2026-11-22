@@ -59,6 +59,9 @@ struct Bridge {
     /// Shared with the poll loop so a command's save and the loop's save do not
     /// both write the same bytes. See [`SavedSig`].
     saved_sig: SavedSig,
+    /// Exclusive lock on `<data_dir>/.lock`, held for the life of the process
+    /// (TAURI-05). `None` only where no data dir could be resolved.
+    _instance_lock: Option<std::fs::File>,
 }
 
 impl Bridge {
@@ -379,6 +382,32 @@ pub fn run() {
 }
 
 /// Build the identity + manager from the desktop app's data directory.
+/// Take the exclusive advisory lock on `<data>/.lock` that marks the folder as
+/// in use. The OS releases it when the process exits, however it exits, so a
+/// crash never leaves the folder stuck.
+fn acquire_instance_lock(data: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data.join(".lock"))
+        .map_err(|e| format!("Could not open the data folder's lock file: {e}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "P2PEM is already running with the data folder {}. Close the other \
+             window first: two copies would each overwrite the other's message history.",
+            data.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => {
+            // A filesystem without locking support should not make the app
+            // unusable; it only loses this guard.
+            tracing::warn!("could not lock the data folder ({e}); continuing without the single-instance guard");
+            Ok(file)
+        }
+    }
+}
+
 fn init_bridge() -> Bridge {
     // The data dir holds `identity.json` (this peer's key/fingerprint) and the
     // encrypted history. It uses the desktop app's OWN identifier ("P2PEM"), NOT
@@ -403,14 +432,27 @@ fn init_bridge() -> Bridge {
     // changes the fingerprint every contact verified. When that happens the app
     // starts in an error state that the shell surfaces, and touches nothing.
     let mut init_error: Option<String> = None;
+    let mut instance_lock: Option<std::fs::File> = None;
     let (history_path, identity, is_new) = if let Some(data) = data_dir {
         std::fs::create_dir_all(&data).ok();
         tracing::info!(data_dir = %data.display(), "using data directory");
-        match Identity::get_or_create(&data, "User") {
+        // One instance per data folder (TAURI-05). Two would each rewrite the
+        // whole history from their own copy, and the last writer silently
+        // destroys what only the other had received.
+        let locked = match acquire_instance_lock(&data) {
+            Ok(file) => {
+                instance_lock = Some(file);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        match locked
+            .and_then(|()| Identity::get_or_create(&data, "User").map_err(|e| e.to_string()))
+        {
             Ok((id, isnew)) => (data.join("history.json.enc"), id, isnew),
             Err(e) => {
-                tracing::error!("identity load failed: {e}");
-                init_error = Some(e.to_string());
+                tracing::error!("start-up refused: {e}");
+                init_error = Some(e);
                 // A throwaway in-memory identity so the app can boot far enough
                 // to *show* the error. Every command is refused while
                 // `init_error` is set, so it is never saved or used on the wire.
@@ -455,6 +497,7 @@ fn init_bridge() -> Bridge {
         pending_fp: Arc::new(StdMutex::new(None)),
         init_error,
         saved_sig: Arc::new(StdMutex::new(None)),
+        _instance_lock: instance_lock,
     }
 }
 

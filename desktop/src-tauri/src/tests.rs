@@ -55,6 +55,7 @@ fn fresh_bridge(dir: &std::path::Path) -> Bridge {
         pending_fp: Arc::new(StdMutex::new(None)),
         init_error: None,
         saved_sig: Arc::new(StdMutex::new(None)),
+        _instance_lock: None,
     }
 }
 
@@ -1788,6 +1789,62 @@ fn start_up_resolves_the_data_dir_and_the_auth_state() {
     assert!(crate::lock_identity(&bridge.identity).is_locked());
     let h = harness_with(bridge, existing);
     assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+}
+
+/// TAURI-05: a second launch over the same data folder used to load the same
+/// identity and history, after which each process rewrote the whole history
+/// from its own copy — the last writer won and the other's messages were
+/// gone. The second instance now boots into the error state and writes
+/// nothing; once the first exits, the folder is usable again.
+#[test]
+fn a_second_instance_on_the_same_data_folder_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut identity = Identity::new_with_plaintext("Owner".into()).unwrap();
+    identity.encrypt("the-owners-password").unwrap();
+    identity.save(&dir.path().join("identity.json")).unwrap();
+    let first = boot_in(dir.path());
+    assert!(first.init_error.is_none());
+    let identity_before = std::fs::read(dir.path().join("identity.json")).unwrap();
+
+    let second = boot_in(dir.path());
+    let err = second
+        .init_error
+        .clone()
+        .expect("a second instance booted over a folder already in use");
+    assert!(err.contains("already running"), "unexpected error: {err}");
+    assert_eq!(
+        std::fs::read(dir.path().join("identity.json")).unwrap(),
+        identity_before,
+        "the second instance touched the identity"
+    );
+    drop(second);
+
+    // Another folder is unaffected (P2PEM_DATA_DIR test peers).
+    let other = tempfile::tempdir().unwrap();
+    assert!(boot_in(other.path()).init_error.is_none());
+
+    drop(first);
+    let third = boot_in(dir.path());
+    assert!(
+        third.init_error.is_none(),
+        "the folder stayed locked after its instance exited"
+    );
+
+    // "Delete all data" still leaves nothing behind, lock file included.
+    let h = harness_with(third, dir);
+    h.ipc("unlock", json!({ "password": "the-owners-password" }))
+        .expect("unlock");
+    h.ipc(
+        "delete_all_data",
+        json!({ "password": "the-owners-password", "confirm": "DELETE" }),
+    )
+    .expect("wipe");
+    assert!(
+        !h._dir.path().exists(),
+        "the wipe left the data folder behind: {:?}",
+        std::fs::read_dir(h._dir.path())
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
 }
 
 // ── Backups and diagnostics ─────────────────────────────────────────────────

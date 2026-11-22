@@ -27,6 +27,13 @@ predate tagged releases.
 
 ### Fixed
 
+- Opening the desktop app a second time no longer starts a second copy over
+  the same data. The two copies each rewrote the whole message history from
+  their own memory, so the one that saved last erased what only the other had
+  received. The second copy now says the app is already running and touches
+  nothing.
+- Unlocking no longer freezes the desktop window while the password is
+  checked; the key is derived in the background.
 - Relay with hole punching: over a slow link one side could end up on the
   direct connection and the other bridged to a closed one, so neither could
   talk. The relay server's verdict now decides for both. A peer can no longer

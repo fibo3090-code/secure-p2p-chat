@@ -957,6 +957,12 @@ impl ChatManager {
         for dir in dirs.iter().filter(|d| d.is_dir()) {
             std::fs::remove_dir_all(dir)?;
         }
+        // The desktop's single-instance lock file. Best effort: it is still
+        // held by this process, which some platforms refuse to unlink, and a
+        // stray empty lock file is no reason to fail a wipe that has worked.
+        if !data_dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(data_dir.join(".lock"));
+        }
         if !data_dir.as_os_str().is_empty() && data_dir.is_dir() {
             match std::fs::remove_dir(data_dir) {
                 Ok(()) => tracing::info!("App data directory deleted: {}", data_dir.display()),
