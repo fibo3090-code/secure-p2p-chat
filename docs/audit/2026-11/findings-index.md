@@ -161,15 +161,15 @@ prioritised view is in [README.md](README.md).
 | TUI-12 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | Setting a password has no confirmation field and no length hint |
 | TUI-13 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Blocking work runs on the UI loop: Argon2, full-history save every 30 s, whole-file read for community upload; failures are silent |
 | TUI-14 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Each frame does O(all messages) work, and the loop handles one input event per frame |
-| TUI-15 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | `:disconnect` deletes the conversation and its history; deletions have no confirmation |
+| TUI-15 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:disconnect` deletes the conversation and its history; deletions have no confirmation |
 | TUI-16 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The Party pane's community selection does not change which community commands act on; posts always go to the first channel |
 | TUI-17 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The TUI never pins community identities, so every join is first contact; docs say the app pins |
-| TUI-18 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | The selected chat is marked read every tick, even while the user is away |
+| TUI-18 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | The selected chat is marked read every tick, even while the user is away |
 | TUI-19 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Settings that do nothing in the TUI, and features missing compared with the desktop app |
 | TUI-20 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | The composer and command box do not scroll, and cursor placement ignores soft wrap |
 | TUI-21 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | Colours are hard-coded: security text is white (invisible on light themes), no `NO_COLOR`, RGB safety grid |
 | TUI-22 | Medium | Partly fixed | S | [05-tui](reports/05-tui.md) | Unit tests touch the developer's real data directory; the TUI has no data-dir override |
-| TUI-23 | Medium | VERIFIED | S | [05-tui](reports/05-tui.md) | `:invite` advertises the configured listen port, not the port actually being hosted |
+| TUI-23 | Medium | Fixed | S | [05-tui](reports/05-tui.md) | `:invite` advertises the configured listen port, not the port actually being hosted |
 | TUI-24 | Medium | VERIFIED | M | [05-tui](reports/05-tui.md) | No log output anywhere (relay server is silent; `RUST_LOG` has no visible effect); docs reference a log view that does not exist |
 | UI-03 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Communities composer draft is shared across channels, DMs and servers |
 | UI-04 | Medium | Fixed | S | [07-react-frontend](reports/07-react-frontend.md) | Stale Communities history responses can render under the wrong channel header |

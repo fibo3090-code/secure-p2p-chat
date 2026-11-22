@@ -450,6 +450,17 @@ impl TuiApp {
     /// inside the encrypted history), not per-session bookkeeping — so a message
     /// that arrived while the app was closed is still unread on the next launch.
     fn update_unread(&mut self) {
+        // Only while someone is at the terminal. Marking every tick made a
+        // message that arrived while the user was away read the moment it
+        // landed — and persisted as read: the bug the read mark exists to
+        // prevent (TUI-18). The next keypress brings them back, and the next
+        // tick marks it.
+        let present = self
+            .last_interaction
+            .is_some_and(|t| t.elapsed() < PRESENCE_IDLE);
+        if !present {
+            return;
+        }
         if let Some(selected) = self.selected_chat_id() {
             self.chat_manager.mark_chat_read(selected);
         }
@@ -879,6 +890,14 @@ impl TuiApp {
                 }
                 _ => self.overlay = TuiOverlay::None,
             },
+            TuiOverlay::ConfirmDeleteChat { chat_id } => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                    self.chat_manager.delete_chat(chat_id);
+                    self.save_history_now();
+                    self.toast(ToastLevel::Info, "Conversation deleted".to_string());
+                }
+                self.overlay = TuiOverlay::None;
+            }
             TuiOverlay::ConfirmClearHistory => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     let path = self.history_path.clone();
@@ -1234,7 +1253,7 @@ impl TuiApp {
             TuiCommand::Name(name) => self.cmd_name(name),
             TuiCommand::Backup(dest) => self.cmd_backup(dest),
             TuiCommand::Rename(title) => self.cmd_rename(title),
-            TuiCommand::DeleteChat => self.disconnect_selected(),
+            TuiCommand::DeleteChat => self.delete_selected(),
             TuiCommand::ClearHistory => self.overlay = TuiOverlay::ConfirmClearHistory,
             TuiCommand::HistoryReset => self.cmd_history_reset(),
             TuiCommand::Wipe { password } => self.cmd_wipe(&password),
@@ -1273,11 +1292,26 @@ impl TuiApp {
                     .unwrap_or(false);
                 if is_placeholder {
                     self.chat_manager.stop_hosting();
+                    self.save_history_now();
+                } else if self.chat_manager.disconnect_chat(chat_id) {
+                    // The session only: the conversation and its history stay
+                    // (TUI-15). `:delete` is what removes them.
+                    self.toast(
+                        ToastLevel::Info,
+                        "Disconnected — the conversation is kept".to_string(),
+                    );
                 } else {
-                    self.chat_manager.delete_chat(chat_id);
+                    self.toast(ToastLevel::Info, "Not connected".to_string());
                 }
-                self.save_history_now();
             }
+            None => self.toast(ToastLevel::Warning, "No chat selected".to_string()),
+        }
+    }
+
+    /// `:delete`: asks first — the conversation's history goes with it.
+    fn delete_selected(&mut self) {
+        match self.selected_chat_id() {
+            Some(chat_id) => self.overlay = TuiOverlay::ConfirmDeleteChat { chat_id },
             None => self.toast(ToastLevel::Warning, "No chat selected".to_string()),
         }
     }
@@ -1801,6 +1835,95 @@ mod tests {
         assert_eq!(app.mode, TuiMode::Command);
         assert!(!app.should_quit);
         assert_eq!(app.command_field.text(), "quit now");
+    }
+
+    /// TUI-15: `:delete` removes a conversation's history for good, so it
+    /// asks first; anything but `y`/Enter keeps it.
+    #[tokio::test]
+    async fn deleting_a_conversation_asks_first() {
+        let (mut app, _data) = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        app.tick();
+        app.execute_command(TuiCommand::DeleteChat).await;
+        assert_eq!(app.overlay, TuiOverlay::ConfirmDeleteChat { chat_id: chat });
+        app.handle_key_event(key('n'));
+        assert!(
+            app.chat_manager.chats.contains_key(&chat),
+            "deleted without a yes"
+        );
+        assert_eq!(app.overlay, TuiOverlay::None);
+
+        app.execute_command(TuiCommand::DeleteChat).await;
+        app.handle_key_event(key('y'));
+        assert!(!app.chat_manager.chats.contains_key(&chat));
+
+        // `:disconnect` on a conversation with no session deletes nothing.
+        let other = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(other, "Other".into());
+        app.tick();
+        app.execute_command(TuiCommand::Disconnect).await;
+        assert!(
+            app.chat_manager.chats.contains_key(&other),
+            ":disconnect deleted a conversation"
+        );
+    }
+
+    /// TUI-18: the open conversation was marked read on every tick, so a
+    /// message that arrived while the user was away was read — and saved as
+    /// read — before anyone saw it. Away, it stays unread; back, it is read.
+    #[test]
+    fn a_message_that_arrives_while_away_stays_unread() {
+        let (mut app, _data) = app();
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        app.tick();
+        assert_eq!(app.selected_chat_id(), Some(chat));
+        app.chat_manager.get_chat_mut(chat).unwrap().messages.push(
+            messenger_core::types::Message {
+                id: Uuid::new_v4(),
+                from_me: false,
+                content: messenger_core::types::MessageContent::Text { text: "hi".into() },
+                timestamp: chrono::Utc::now(),
+                delivered: false,
+            },
+        );
+
+        app.last_interaction = Some(Instant::now() - PRESENCE_IDLE - Duration::from_secs(1));
+        app.tick();
+        assert_eq!(
+            app.chat_manager.unread_count(chat),
+            1,
+            "read while nobody was there"
+        );
+
+        app.last_interaction = Some(Instant::now());
+        app.tick();
+        assert_eq!(app.chat_manager.unread_count(chat), 0);
+    }
+
+    /// TUI-23: after `:host 9000`, `:invite` embedded the *configured* port
+    /// (12345), so the link it copied pointed where nobody was listening. It
+    /// uses the port actually hosted.
+    #[tokio::test]
+    async fn an_invite_names_the_port_being_hosted() {
+        let (mut app, _data) = app();
+        if crate::util::primary_local_ipv4().is_none() {
+            return; // no LAN address to embed on this machine
+        }
+        app.chat_manager.config.listen_port = 12345;
+        app.chat_manager.hosting_port = Some(40999);
+        app.execute_command(TuiCommand::Invite(None)).await;
+        let TuiOverlay::Invite { link } = &app.overlay else {
+            panic!("no invite: {}", last_toast(&app));
+        };
+        let contact = app.chat_manager.parse_invite_link(link).unwrap();
+        let addrs = format!("{:?} {:?}", contact.address, contact.addresses);
+        assert!(addrs.contains(":40999"), "{addrs}");
+        assert!(!addrs.contains(":12345"), "{addrs}");
     }
 
     /// TUI-03: `:set-password` re-encrypted an identity that already had a

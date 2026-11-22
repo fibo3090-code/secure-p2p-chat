@@ -46,6 +46,10 @@ pub enum TuiOverlay {
     },
     ConfirmQuit,
     ConfirmClearHistory,
+    /// `:delete` on a conversation: deleting its history cannot be undone.
+    ConfirmDeleteChat {
+        chat_id: uuid::Uuid,
+    },
     /// `:wipe` after the password checked out: the last step before deleting
     /// everything. Only Ctrl+Y proceeds.
     ConfirmWipe,
@@ -109,6 +113,13 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             f,
             "Quit?",
             "Save history and exit? (y = quit, n = cancel)",
+            area,
+        ),
+        TuiOverlay::ConfirmDeleteChat { .. } => render_confirm(
+            f,
+            "Delete this conversation?",
+            "Its messages are deleted from this device and cannot be recovered. \
+             (y = delete, n = cancel)",
             area,
         ),
         TuiOverlay::ConfirmClearHistory => render_confirm(

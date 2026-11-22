@@ -157,7 +157,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         ":connect-relay <relay[:port]> <token>",
         "Connect to a peer through a relay",
     ),
-    ("disconnect", ":disconnect", "Disconnect / remove the selected chat"),
+    ("disconnect", ":disconnect", "Close the selected chat's connection (the chat and its history are kept)"),
     ("stop-host", ":stop-host", "Stop listening (tear down the host)"),
     (
         "connection-password",
@@ -275,7 +275,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Show the community's activity log (admins only)",
     ),
     ("rename", ":rename <title>", "Rename the selected chat"),
-    ("delete", ":delete", "Delete the selected chat"),
+    ("delete", ":delete", "Delete the selected chat and its history (asks first)"),
     ("clear-history", ":clear-history", "Erase all chats and contacts"),
     (
         "history-reset",

@@ -739,6 +739,21 @@ impl ChatManager {
         self.awaiting_ack.retain(|(sid, _), _| *sid != session_id);
     }
 
+    /// Close a conversation's session and keep the conversation — its history,
+    /// title and trust. Runs the same path as a connection that dropped, so no
+    /// part of the teardown can be forgotten. Returns whether a session was
+    /// open. (The TUI's `:disconnect` used to delete the conversation and its
+    /// history instead, irreversibly — TUI-15.)
+    pub fn disconnect_chat(&mut self, chat_id: Uuid) -> bool {
+        let session = self.session_for_chat(chat_id);
+        if !self.sessions.contains_key(&session) {
+            return false;
+        }
+        self.abort_session_task(session);
+        self.handle_session_event(session, SessionEvent::Disconnected);
+        true
+    }
+
     /// Remove a listening placeholder chat together with its session.
     pub(super) fn remove_host_placeholder(&mut self, id: Uuid) {
         self.chats.remove(&id);

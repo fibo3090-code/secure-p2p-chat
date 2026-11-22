@@ -2925,6 +2925,41 @@ fn leftover_spools_are_swept_and_nothing_else_is() {
     );
 }
 
+/// TUI-15: closing a connection must not cost the conversation. The TUI's
+/// `:disconnect` deleted it — history and all, saved at once. This closes the
+/// session through the same path as a dropped connection and keeps the rest.
+#[test]
+fn disconnecting_keeps_the_conversation_and_its_history() {
+    let mut mgr = ChatManager::default();
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    mgr.get_chat_mut(chat).unwrap().peer_fingerprint = Some("ab".repeat(32));
+    mgr.get_chat_mut(chat)
+        .unwrap()
+        .messages
+        .push(messenger_core::types::Message {
+            id: Uuid::new_v4(),
+            from_me: false,
+            content: messenger_core::types::MessageContent::Text {
+                text: "kept".into(),
+            },
+            timestamp: chrono::Utc::now(),
+            delivered: false,
+        });
+    let _rx = wire_session_for_test(&mut mgr, chat);
+    assert!(mgr.is_connected(&chat));
+
+    assert!(mgr.disconnect_chat(chat));
+    assert!(!mgr.is_connected(&chat));
+    assert!(!mgr.sessions.contains_key(&chat));
+    assert_eq!(
+        mgr.get_chat(chat).unwrap().messages.len(),
+        1,
+        "the history went with it"
+    );
+    assert!(!mgr.disconnect_chat(chat), "nothing left to close");
+}
+
 /// A disconnect mid-receive must fail the transfer, not leave a progress row
 /// stuck at its last byte count with the chat's incoming slot still occupied.
 #[test]
