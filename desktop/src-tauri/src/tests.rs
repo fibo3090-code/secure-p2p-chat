@@ -925,6 +925,50 @@ fn invite_link_roundtrip_creates_contact() {
         .expect_err("imported a garbage link");
 }
 
+/// TAURI-18: the invite advertised the *settings* port while the app was
+/// listening on another — a host started on a free port, or one the user
+/// picked — so every peer who used the link dialled a closed port. A live
+/// listener's port is what goes in the link.
+#[test]
+fn the_invite_advertises_the_port_actually_listening() {
+    let h = ready_harness();
+    assert!(
+        messenger_core::util::primary_local_ipv4().is_some(),
+        "this test needs a LAN address to put in the invite"
+    );
+    h.ipc("start_host", json!({ "port": 0, "password": null }))
+        .expect("host on a free port");
+    let manager = h.bridge().manager.clone();
+    let (live, configured) = tauri::async_runtime::block_on(async {
+        let m = manager.lock().await;
+        (m.hosting_port.expect("listening"), m.config.listen_port)
+    });
+    assert_ne!(live, configured, "the test needs the two ports to differ");
+    let link = h.ipc("my_invite_link", json!({})).unwrap();
+    let contact = tauri::async_runtime::block_on(async {
+        manager
+            .lock()
+            .await
+            .parse_invite_link(link.as_str().unwrap())
+            .unwrap()
+    });
+    let advertised: Vec<String> = contact
+        .address
+        .into_iter()
+        .chain(contact.addresses)
+        .collect();
+    assert!(
+        advertised.iter().any(|a| a.ends_with(&format!(":{live}"))),
+        "the live port {live} is not in {advertised:?}"
+    );
+    assert!(
+        !advertised
+            .iter()
+            .any(|a| a.ends_with(&format!(":{configured}"))),
+        "the settings port {configured} is advertised: {advertised:?}"
+    );
+}
+
 // ── Conversations ───────────────────────────────────────────────────────────
 
 #[test]

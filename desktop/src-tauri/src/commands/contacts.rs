@@ -66,14 +66,18 @@ pub(crate) async fn list_contacts(
 
 /// The current user's signed invite link. Embeds every reachable candidate
 /// address in priority order — the UPnP external mapping first (reachable
-/// from outside the LAN), then the local IP + configured listen port — so
+/// from outside the LAN), then the local IP + the live listener's port (the
+/// configured one when not hosting) — so
 /// peers try them in turn.
 #[tauri::command]
 pub(crate) async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
     let addresses = {
         let mgr = state.manager.lock().await;
-        let port = mgr.config.listen_port;
+        // The port actually listening, when there is one: the settings value
+        // only says where the next host will bind, and a link pointing there
+        // sends every peer to a closed port (TAURI-18).
+        let port = mgr.hosting_port.unwrap_or(mgr.config.listen_port);
         let mut addrs = Vec::new();
         if let Some(ext) = mgr.external_address.clone() {
             addrs.push(ext);

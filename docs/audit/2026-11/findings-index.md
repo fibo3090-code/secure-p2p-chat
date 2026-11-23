@@ -282,7 +282,7 @@ prioritised view is in [README.md](README.md).
 | TAURI-15 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Desktop notifications block under the manager lock and expose message previews |
 | TAURI-16 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Release builds log at debug level to stdout only; the log plugin is a dead dependency; diagnostics have no logs |
 | TAURI-17 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `change_password` can revert a concurrent display-name change |
-| TAURI-18 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The invite link advertises the settings port, not the live listener port |
+| TAURI-18 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The invite link advertises the settings port, not the live listener port |
 | TAURI-19 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `open_file` / `open_url` leave zombie processes on Unix and duplicate the `open` crate |
 | TAURI-20 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `unlock` reports every failure as "Wrong password" |
 | TAURI-21 | Low | Partly fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `panic = "abort"`: any command panic is a whole-app crash that skips the history flush |
