@@ -600,6 +600,33 @@ pub use parse_bool as parse_setting_bool;
 
 #[cfg(test)]
 mod tests {
+    /// DOC-09: the user guide's command reference had fallen 15 commands
+    /// behind `COMMANDS` (and described `:disconnect` as deleting the chat).
+    /// Every command the TUI accepts is documented, and nothing documented is
+    /// missing from the TUI.
+    #[test]
+    fn the_user_guide_documents_every_command() {
+        let guide = include_str!("../../../docs/USER_GUIDE.md");
+        let documented: std::collections::BTreeSet<&str> = guide
+            .lines()
+            .filter_map(|l| l.strip_prefix("  :"))
+            .filter_map(|l| l.split([' ', '!']).next())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let known: std::collections::BTreeSet<&str> =
+            super::COMMANDS.iter().map(|(name, _, _)| *name).collect();
+        let undocumented: Vec<_> = known.difference(&documented).collect();
+        let unknown: Vec<_> = documented.difference(&known).collect();
+        assert!(
+            undocumented.is_empty(),
+            "missing from docs/USER_GUIDE.md: {undocumented:?}"
+        );
+        assert!(
+            unknown.is_empty(),
+            "documented but not a command: {unknown:?}"
+        );
+    }
+
     use super::*;
 
     /// TUI-11: a secret is the rest of the line (a passphrase has spaces), and

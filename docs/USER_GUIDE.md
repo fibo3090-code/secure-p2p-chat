@@ -451,8 +451,10 @@ Connections
   :connect <host[:port]>                    connect to a hosting peer
   :host-relay <relay[:port]> [token]        host via a relay (copies an invite)
   :connect-relay <relay[:port]> <token>     connect through a relay
-  :disconnect                               remove / disconnect the selected chat
+  :disconnect                               close the selected chat's connection (history kept)
   :stop-host                                stop listening
+  :connection-password [password]           set/clear the P2P connection password
+  :lock <on|off>                            refuse (on) or allow (off) new connections to this chat
 
 Contacts & invites
   :contacts                                 open the contacts list
@@ -470,6 +472,8 @@ Messaging & files
   :rename <title>                           rename the selected chat
   :delete                                   delete the selected chat
   :clear-history                            erase all chats and contacts
+  :accept                                   accept the incoming file offer
+  :decline                                  decline the incoming file offer
 
 Party servers
   :party-connect <host[:port]> <username> [password]
@@ -480,6 +484,16 @@ Party servers
   :party-dm <username|#> <message>          direct-message a Party member
   :party-create-channel <name>              create a Party channel
   :party-status                             show joined Party servers
+  :party-send-file <path>                   share a file in the current channel
+  :party-files                              refresh the shared-file list and your storage
+  :party-download <name|hash>               save a shared file to your download folder
+  :party-delete-file <name|hash>            delete a file you shared (any, as an admin)
+  :party-role <username> <guest|member|admin>
+                                             change a member's role (admins)
+  :party-channel-access <#channel> <public|private|locked|announce> [members…]
+                                             change who can read and post (admins)
+  :party-delete-channel <#channel>          delete a channel and its history (admins)
+  :party-audit                              show the community's activity log (admins)
 
 Identity & security
   :identity                                 show your fingerprint + safety grid
@@ -488,6 +502,9 @@ Identity & security
   :set-password <password>                  set a password on an unprotected identity
   :change-password <current> <new>          change your password
   :history-reset                            set an unreadable history file aside
+  :name <name>                              change your display name
+  :backup <path>                            export an encrypted identity backup
+  :wipe <password>                          delete identity, history and communities here, then quit
 
 Settings & app
   :settings                                 open the settings panel
