@@ -107,7 +107,9 @@ pub(crate) async fn import_invite(
     let signed = ChatManager::invite_link_is_signed(&link);
     let mut mgr = state.manager.lock().await;
     let contact = mgr.parse_invite_link(&link).map_err(|e| e.to_string())?;
-    let id = mgr.import_contact(contact).map_err(|e| e.to_string())?;
+    let id = mgr
+        .import_contact_from_link(contact, signed)
+        .map_err(|e| e.to_string())?;
     let dto = contact_dto(mgr.get_contact(id).expect("just inserted"));
     drop(mgr);
     // Contacts are not covered by the poll loop's change signature, so an

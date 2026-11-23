@@ -3198,3 +3198,51 @@ async fn clearing_history_stops_hosting_for_good() {
         "auto-rehost would reopen the port"
     );
 }
+
+/// APP-15: an unsigned (v1) link can be written by anyone: it only has to
+/// name a fingerprint with its matching public key, both of which are public.
+/// Importing one for a contact the user already had replaced that contact's
+/// name and address — a verified contact's next dial went wherever the forger
+/// said. An unsigned link may add a contact, never change an existing one; a
+/// signed link, which only the key's owner can make, still refreshes it.
+#[test]
+fn an_unsigned_invite_cannot_change_an_existing_contact() {
+    use crate::identity::Identity;
+    let peer = Identity::new_with_plaintext("Real Bob".into()).unwrap();
+    let mut mgr = ChatManager::new(Config::default());
+    let signed = peer
+        .generate_signed_invite_link(Some("192.0.2.10:12345".into()))
+        .unwrap();
+    let contact = mgr.parse_invite_link(&signed).unwrap();
+    let id = mgr.import_contact_from_link(contact, true).unwrap();
+    mgr.contacts.get_mut(&id).unwrap().trust_state = TrustState::Verified;
+
+    // A forger's v1 link: Bob's (public) key and fingerprint, their address.
+    let forged = mgr
+        .generate_invite_link(
+            "Bob (new number)",
+            Some("203.0.113.66:12345".into()),
+            &peer.fingerprint,
+            &peer.public_key_pem,
+        )
+        .unwrap();
+    let contact = mgr.parse_invite_link(&forged).unwrap();
+    let err = mgr.import_contact_from_link(contact, false).unwrap_err();
+    assert!(err.to_string().contains("unsigned"), "{err}");
+    let kept = &mgr.contacts[&id];
+    assert_eq!(kept.name, "Real Bob");
+    assert_eq!(kept.address.as_deref(), Some("192.0.2.10:12345"));
+    assert_eq!(kept.trust_state, TrustState::Verified);
+
+    // Bob's own signed link with a new address is a genuine refresh.
+    let moved = peer
+        .generate_signed_invite_link(Some("192.0.2.20:12345".into()))
+        .unwrap();
+    let contact = mgr.parse_invite_link(&moved).unwrap();
+    assert_eq!(mgr.import_contact_from_link(contact, true).unwrap(), id);
+    assert_eq!(
+        mgr.contacts[&id].address.as_deref(),
+        Some("192.0.2.20:12345")
+    );
+    assert_eq!(mgr.contacts[&id].trust_state, TrustState::Verified);
+}

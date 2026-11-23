@@ -185,7 +185,7 @@ prioritised view is in [README.md](README.md).
 | QUAL-19 | Low/Medium | Partly fixed | M | [12-code-quality](reports/12-code-quality.md) | Test fixtures copy-pasted across test binaries; port allocation is racy |
 | APP-11 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | After a Party disconnect, unconfirmed sends stay on screen and upload offers stay in memory |
 | APP-12 | Low | VERIFIED | M | [04-client-core](reports/04-client-core.md) | Messages typed during the handshake return `Ok` and can vanish without an error |
-| APP-15 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | An unsigned (v1) invite can silently overwrite an existing, even Verified, contact's address and name |
+| APP-15 | Low | Fixed | S | [04-client-core](reports/04-client-core.md) | An unsigned (v1) invite can silently overwrite an existing, even Verified, contact's address and name |
 | APP-16 | Low | Fixed | S | [04-client-core](reports/04-client-core.md) | `clear_history` / `delete_all_data` leave `is_hosting`, `hosting_port` and UPnP state set, so auto-rehost restarts the listener |
 | APP-17 | Low | Fixed | S | [04-client-core](reports/04-client-core.md) | `delete_chat` leaves `contact_to_chat` entries pointing at the deleted chat |
 | APP-18 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Blocking a contact does not cover a fingerprint-less contact or a pending TOFU prompt |

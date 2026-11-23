@@ -13,6 +13,10 @@ predate tagged releases.
 
 ### Security
 
+- An old-style (unsigned) invite link can no longer change a contact you
+  already have. Anyone can write such a link for a known person, and importing
+  one used to replace that contact's name and address.
+
 - Opening a file a contact sent now asks first unless it is a picture, PDF,
   plain text, audio or video. Previously only a fixed list of program types
   asked, and it missed disk images, macro-enabled Office documents, HTML and

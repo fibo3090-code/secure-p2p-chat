@@ -118,7 +118,8 @@ impl TuiApp {
         match self.chat_manager.parse_invite_link(&link) {
             Ok(contact) => {
                 let name = contact.name.clone();
-                if let Err(e) = self.chat_manager.import_contact(contact) {
+                let signed = crate::app::ChatManager::invite_link_is_signed(&link);
+                if let Err(e) = self.chat_manager.import_contact_from_link(contact, signed) {
                     self.toast(ToastLevel::Error, e.to_string());
                     return;
                 }
