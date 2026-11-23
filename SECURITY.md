@@ -182,6 +182,13 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   - **`bincode` 1.3.3 unmaintained** (RUSTSEC-2025-0141): a direct `core`
     dependency used for the relay control protocol. Migration is tracked; the
     frames it decodes are length-bounded by `MAX_PACKET_SIZE` before parsing.
+  - **`chrono` 0.4 unmaintained** (RUSTSEC-2026-0543): a direct dependency of
+    `core`, the terminal client and the desktop app, used for message,
+    identity and Party timestamps. Unmaintained, with no known vulnerability.
+    Its serialised form is stored in history files, `identity.json` and the
+    Party server's database, so replacing it (`time` or `jiff`) needs a
+    format-compatibility plan rather than a version bump; tracked as a
+    migration.
 
   Re-evaluate on every Tauri upgrade; everything else in the tree is kept
   current via in-semver `cargo update`.
