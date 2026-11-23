@@ -841,6 +841,10 @@ impl ChatManager {
         self.teardown_session(session_id);
         self.chat_id_mapping
             .retain(|incoming, session| *incoming != chat_id && *session != session_id);
+        // The contact stays; its link to a conversation that no longer exists
+        // does not, or the next connect aims at a dead chat id (APP-17).
+        self.contact_to_chat
+            .retain(|_, chat| *chat != chat_id && !incoming.contains(chat));
 
         self.add_toast(ToastLevel::Info, "Chat deleted".to_string());
         tracing::debug!(remaining_chats = %self.chats.len(), remaining_sessions = %self.sessions.len(), "Chat deleted");
@@ -854,6 +858,10 @@ impl ChatManager {
             sessions = %self.sessions.len(),
             "Clearing all history and state"
         );
+        // Every session task, the listener's included, is aborted below; the
+        // hosting flags must go with it or auto-rehost reopens the port at
+        // once (APP-16). `stop_hosting` also releases the UPnP mapping.
+        self.stop_hosting();
         self.chats.clear();
         self.contacts.clear();
         self.contact_to_chat.clear();

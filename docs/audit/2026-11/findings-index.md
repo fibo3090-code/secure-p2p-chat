@@ -186,8 +186,8 @@ prioritised view is in [README.md](README.md).
 | APP-11 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | After a Party disconnect, unconfirmed sends stay on screen and upload offers stay in memory |
 | APP-12 | Low | VERIFIED | M | [04-client-core](reports/04-client-core.md) | Messages typed during the handshake return `Ok` and can vanish without an error |
 | APP-15 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | An unsigned (v1) invite can silently overwrite an existing, even Verified, contact's address and name |
-| APP-16 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | `clear_history` / `delete_all_data` leave `is_hosting`, `hosting_port` and UPnP state set, so auto-rehost restarts the listener |
-| APP-17 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | `delete_chat` leaves `contact_to_chat` entries pointing at the deleted chat |
+| APP-16 | Low | Fixed | S | [04-client-core](reports/04-client-core.md) | `clear_history` / `delete_all_data` leave `is_hosting`, `hosting_port` and UPnP state set, so auto-rehost restarts the listener |
+| APP-17 | Low | Fixed | S | [04-client-core](reports/04-client-core.md) | `delete_chat` leaves `contact_to_chat` entries pointing at the deleted chat |
 | APP-18 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Blocking a contact does not cover a fingerprint-less contact or a pending TOFU prompt |
 | APP-19 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | The `awaiting_ack` cap clears every conversation's pending receipts at once |
 | APP-20 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Received timestamps are inconsistent and peer-controlled for large messages |

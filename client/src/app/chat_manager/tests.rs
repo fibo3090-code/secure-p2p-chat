@@ -3130,3 +3130,71 @@ async fn a_second_concurrent_file_send_is_refused() {
         err
     );
 }
+
+/// APP-17: deleting a conversation left the contact pointing at it, so the
+/// next "connect" to that contact aimed at a chat id that no longer existed.
+/// The association goes with the chat; the contact itself stays.
+#[test]
+fn deleting_a_chat_unlinks_its_contact() {
+    let mut mgr = ChatManager::new(Config::default());
+    let chat_id = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    let contact = mgr.add_contact(
+        "Contact".to_string(),
+        Some("127.0.0.1:12345".to_string()),
+        None,
+        None,
+    );
+    let other = mgr.add_contact(
+        "Other".to_string(),
+        Some("127.0.0.1:12346".to_string()),
+        None,
+        None,
+    );
+    mgr.create_local_chat_for_test(chat_id, "Chat".to_string());
+    mgr.create_local_chat_for_test(kept, "Kept".to_string());
+    mgr.contact_to_chat.insert(contact, chat_id);
+    mgr.contact_to_chat.insert(other, kept);
+
+    mgr.delete_chat(chat_id);
+
+    assert!(
+        mgr.contacts.contains_key(&contact),
+        "the contact was deleted with the chat"
+    );
+    assert_eq!(
+        mgr.contact_to_chat.get(&contact),
+        None,
+        "still linked to a deleted chat"
+    );
+    assert_eq!(
+        mgr.contact_to_chat.get(&other),
+        Some(&kept),
+        "an unrelated link was dropped"
+    );
+}
+
+/// APP-16: `clear_history` aborted every session task — the listener
+/// included — but left `is_hosting` and `hosting_port` set, so auto-rehost
+/// promptly opened the port again: "erase everything" quietly resumed
+/// listening. Clearing stops hosting outright.
+#[tokio::test]
+async fn clearing_history_stops_hosting_for_good() {
+    let dir = tempdir().unwrap();
+    let mut mgr = ChatManager::new(Config::default());
+    let key = crate::identity::Identity::new_with_plaintext("H".into())
+        .unwrap()
+        .private_key()
+        .unwrap();
+    mgr.start_host(0, key).await.unwrap();
+    assert!(mgr.is_hosting && mgr.hosting_port.is_some());
+
+    mgr.clear_history(&dir.path().join("history.json.enc"));
+
+    assert!(!mgr.is_hosting, "still marked as hosting");
+    assert_eq!(mgr.hosting_port, None);
+    assert!(
+        !mgr.check_rehost_needed(),
+        "auto-rehost would reopen the port"
+    );
+}
