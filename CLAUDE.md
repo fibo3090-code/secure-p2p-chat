@@ -13,7 +13,7 @@ Cargo **workspace** with four members (root `src/` and `tests/` are vestigial �
 | `messenger-server` | `server/` | Party/Community server (hub, dispatch, connection, state). **lib + bin**: `main.rs` only parses args and binds; `lib.rs` holds `run_accept_loop` and the modules, so a test can stand a real server up in process |
 | `p2pem-desktop` | `desktop/src-tauri/` | **The shipped app**: Tauri 2 shell wrapping the React/Vite web UI in `desktop/src/` |
 
-⚠️ **There is one desktop app.** The egui GUI (`client/src/gui/`) and its
+⚠️ **There is one desktop app.** The deleted egui GUI (`client/src/gui/`) and its
 `eframe`/`egui`/`egui_commonmark`/`egui_tracing` dependencies are deleted, along
 with `setup.iss` and `build-and-package.ps1`. Do not reintroduce a second
 front-end: the whole point was that a customer on the releases page should not

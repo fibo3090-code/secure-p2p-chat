@@ -14,6 +14,7 @@ mod common;
 
 mod cli;
 mod contacts;
+mod docs;
 mod file_transfer;
 mod manager;
 mod party;

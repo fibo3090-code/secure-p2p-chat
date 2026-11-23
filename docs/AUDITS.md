@@ -67,7 +67,7 @@ shared core (all fixed unless noted; verified against current code):
   it. Fixed with autosave (poll loop + per-mutation + on-close).
 - **Party `DownloadFile` had no access control** — any member could fetch any blob by
   hash. Fixed with `blob_bytes_for(member, hash)` (channel-member / DM-participant
-  check); covered by server `state.rs` tests.
+  check); covered by `server/src/state/tests.rs`.
 
 ### 2026-08 — medium/low sweep
 

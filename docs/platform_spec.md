@@ -933,14 +933,13 @@ onion routing / anonymity layer, post-quantum migration, hardware-backed identit
 
 ## 13. Verification & Test Coverage
 
-The `core` + `client` + `server` crates pass **457 automated tests**
-(`cargo nextest run -p messenger-core -p p2pem-classic -p messenger-server`).
-`--workspace` adds the **17 desktop-bridge tests**, which CI runs on Linux and
+The Rust suite is `cargo nextest run --workspace --profile ci` (plus
+`cargo test --workspace --doc`). The desktop-bridge tests in it run on Linux and
 macOS only (skipped on Windows, where a Rust test harness linking Tauri aborts at
-startup, and unbuildable without the GTK/WebKit dev packages). The frontend adds
-**37 tests** (`cd desktop && npm test`). Together they span unit, integration,
-and end-to-end suites. Counts drift with every change; re-measure rather than
-trusting these numbers:
+startup, and unbuildable without the GTK/WebKit dev packages). The frontend has
+vitest (`cd desktop && npm test`: pure modules + jsdom component tests) and
+Playwright smoke tests (`npm run smoke`). No counts here on purpose — they were
+wrong within a week every time; run the suites to see them:
 
 - **Protocol** (`core/src/core/protocol.rs`): round-trip symmetry for every
   `ProtocolMessage` variant, edge values (empty/unicode/max-size), malformed and
