@@ -20,6 +20,14 @@ ignore = [
                          # decryption, which is what the attack targets.
     "RUSTSEC-2024-0436", # paste unmaintained (transitive, proc-macro/build-time)
     "RUSTSEC-2025-0141", # bincode unmaintained (direct in core, migration pending)
+    # chrono unmaintained (announced upstream, chronotope/chrono#1768; no
+    # release is affected by a known vulnerability). A direct dependency of
+    # core, client and desktop only -- nothing else in the tree pulls it. Its
+    # serde form (RFC 3339 strings) is inside every saved history file,
+    # identity.json and the Party server's rows and frames, so swapping it for
+    # `time`/`jiff` is a format-compatibility migration, not a bump.
+    # Unmaintained, not vulnerable (accepted 2026-11-23).
+    "RUSTSEC-2026-0543",
     # RUSTSEC-2024-0411 through -0420 (the gtk-rs GTK3 binding family: gtk,
     # gdk, atk, gtk-sys, gdk-sys, atk-sys, gdkx11, gdkx11-sys, gdkwayland-sys,
     # gtk3-macros) were accepted here as unmaintained. All ten were **withdrawn
