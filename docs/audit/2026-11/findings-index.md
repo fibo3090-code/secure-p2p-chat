@@ -199,8 +199,8 @@ prioritised view is in [README.md](README.md).
 | CRYPTO-09 | Low | VERIFIED | M | [01-crypto-protocol](reports/01-crypto-protocol.md) | The history file has no AAD, no anti-rollback, and random nonces under one fixed key |
 | CRYPTO-10 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Gaps in key-material hygiene |
 | CRYPTO-11 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Packets before authentication may be up to 8 MiB |
-| CRYPTO-12 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | `has_hidden_characters` and `is_forbidden_char` miss several invisible and direction-changing characters |
-| CRYPTO-13 | Low | SUSPECTED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | The Windows reserved-name list is incomplete |
+| CRYPTO-12 | Low | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | `has_hidden_characters` and `is_forbidden_char` miss several invisible and direction-changing characters |
+| CRYPTO-13 | Low | Fixed | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | The Windows reserved-name list is incomplete |
 | CRYPTO-14 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Peer identity keys have no minimum strength |
 | CRYPTO-16 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Security docs disagree with the code |
 | DOC-22 | Low | VERIFIED | S | [09-documentation](reports/09-documentation.md) | `CLAUDE.md` tool rules give commands that do not work, and its layout note is stale |

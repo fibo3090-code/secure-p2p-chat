@@ -218,9 +218,11 @@ pub const MAX_FILENAME_BYTES: usize = 150;
 /// that says nothing about why.
 #[rustfmt::skip]
 const WINDOWS_RESERVED: &[&str] = &[
-    "con", "prn", "aux", "nul",
-    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
-    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "con", "prn", "aux", "nul", "conin$", "conout$",
+    "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "com\u{00B9}", "com\u{00B2}", "com\u{00B3}",
+    "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "lpt\u{00B9}", "lpt\u{00B2}", "lpt\u{00B3}",
 ];
 
 /// True for characters that must never survive into a filename we display or
@@ -233,7 +235,16 @@ const WINDOWS_RESERVED: &[&str] = &[
 /// user was shown a lie, which is the whole point of the trick.
 fn is_forbidden_char(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
+        || matches!(
+            c,
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{061C}' // Arabic letter mark, a bidi mark like the two above
+                | '\u{2028}' // line separator: not `is_control`, still a line break
+                | '\u{2029}' // paragraph separator
+        )
 }
 
 /// True when `name` contains a character that is invisible, or that changes how
@@ -253,7 +264,11 @@ pub fn has_hidden_characters(name: &str) -> bool {
                     | '\u{180E}'                // Mongolian vowel separator
                     | '\u{200B}'..='\u{200D}'  // zero-width space / (non-)joiner
                     | '\u{2060}'..='\u{2064}'  // word joiner, invisible operators
-                    | '\u{FEFF}' // byte-order mark / zero-width no-break space
+                    | '\u{FEFF}'               // byte-order mark / zero-width no-break space
+                    | '\u{034F}'               // combining grapheme joiner
+                    | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers (blank)
+                    | '\u{FE00}'..='\u{FE0F}' // variation selectors
+                    | '\u{E0000}'..='\u{E007F}' // tag characters (CRYPTO-12)
             )
     })
 }
@@ -318,10 +333,13 @@ pub fn sanitize_filename(filename: &str) -> String {
 
     // 4. A reserved device name is only reserved as the *stem*, so prefixing is
     //    enough and keeps the name recognisable.
+    //    Win32 ignores trailing spaces and dots in the stem, so `CON .txt` is
+    //    the console too (CRYPTO-13).
     let stem = sanitized
         .split('.')
         .next()
         .unwrap_or("")
+        .trim_end_matches([' ', '.'])
         .to_ascii_lowercase();
     if WINDOWS_RESERVED.contains(&stem.as_str()) {
         sanitized = format!("_{sanitized}");
@@ -568,6 +586,75 @@ pub fn primary_local_ipv4() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// CRYPTO-12: characters that render as nothing, or change how the text
+    /// around them is drawn, but slipped past the name checks — a username of
+    /// Hangul fillers looks blank, `admin` plus a tag character looks like
+    /// `admin`.
+    #[test]
+    fn names_hiding_these_characters_are_refused() {
+        for c in [
+            '\u{061C}', // Arabic letter mark (bidi)
+            '\u{2028}',
+            '\u{2029}', // line / paragraph separator
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}', // Hangul fillers
+            '\u{034F}', // combining grapheme joiner
+            '\u{FE00}',
+            '\u{FE0F}', // variation selectors
+            '\u{E0001}',
+            '\u{E0061}',
+            '\u{E007F}', // tag characters
+        ] {
+            let name = format!("ad{c}min");
+            assert!(
+                super::has_hidden_characters(&name),
+                "U+{:04X} passed",
+                c as u32
+            );
+        }
+        assert!(!super::has_hidden_characters("admin"));
+        assert!(!super::has_hidden_characters("Zoë 李"));
+        // A filename keeps neither a line break nor a bidi mark: either one
+        // rearranges the file card that draws it.
+        for c in ['\u{2028}', '\u{2029}', '\u{061C}'] {
+            let cleaned = super::sanitize_filename(&format!("report{c}.pdf"));
+            assert!(
+                !cleaned.contains(c),
+                "U+{:04X} kept in {cleaned:?}",
+                c as u32
+            );
+        }
+    }
+
+    /// CRYPTO-13: Windows reserves more device names than the list had, and
+    /// ignores trailing spaces and dots in the stem: `CON .txt` is `CON`.
+    #[test]
+    fn every_reserved_windows_device_name_is_defused() {
+        for name in [
+            "COM0.txt",
+            "LPT0.log",
+            "COM\u{00B9}.txt",
+            "COM\u{00B2}",
+            "COM\u{00B3}.dat",
+            "LPT\u{00B9}.txt",
+            "LPT\u{00B2}",
+            "lpt\u{00B3}.x",
+            "CONIN$.txt",
+            "conout$",
+            "CON .txt",
+            "nul. .txt",
+            "Aux  .md",
+        ] {
+            let cleaned = super::sanitize_filename(name);
+            assert!(cleaned.starts_with('_'), "{name:?} became {cleaned:?}");
+        }
+        for name in ["console.txt", "com10.txt", "lpt.txt", "nullify.md"] {
+            assert_eq!(super::sanitize_filename(name), name);
+        }
+    }
+
     use super::*;
 
     #[test]
