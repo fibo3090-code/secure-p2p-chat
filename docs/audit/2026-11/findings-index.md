@@ -191,7 +191,7 @@ prioritised view is in [README.md](README.md).
 | APP-18 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Blocking a contact does not cover a fingerprint-less contact or a pending TOFU prompt |
 | APP-19 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | The `awaiting_ack` cap clears every conversation's pending receipts at once |
 | APP-20 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Received timestamps are inconsistent and peer-controlled for large messages |
-| APP-21 | Low | VERIFIED | M | [04-client-core](reports/04-client-core.md) | Blocking file I/O on the manager lock and runtime worker during receive and finalize |
+| APP-21 | Low | Partly fixed | M | [04-client-core](reports/04-client-core.md) | Blocking file I/O on the manager lock and runtime worker during receive and finalize |
 | APP-22 | Low | VERIFIED | M | [04-client-core](reports/04-client-core.md) | O(n) scans per event and whole-history clones per save |
 | APP-23 | Low | VERIFIED | S | [04-client-core](reports/04-client-core.md) | Concurrent downloads of the same Party file collide |
 | CRYPTO-07 | Low | VERIFIED | S | [01-crypto-protocol](reports/01-crypto-protocol.md) | Signature-scheme negotiation is not covered by the transcript or signatures |
@@ -236,8 +236,8 @@ prioritised view is in [README.md](README.md).
 | NET-16 | Low | Fixed | S | [02-network](reports/02-network.md) | Peer-supplied punch candidates include loopback and link-local; the host dials them |
 | NET-17 | Low | Fixed | S | [02-network](reports/02-network.md) | Punch listener spawns detached, unbounded validation tasks |
 | NET-18 | Low | VERIFIED | S | [02-network](reports/02-network.md) | mDNS advertises the user's display name and machine hostname; peer names are unsanitised |
-| NET-19 | Low | VERIFIED | S | [02-network](reports/02-network.md) | Desktop defaults to `messenger_core=debug`, logging every frame |
-| PERF-13 | Low | VERIFIED | S | [11-performance](reports/11-performance.md) | Release builds log every frame at debug level |
+| NET-19 | Low | Fixed | S | [02-network](reports/02-network.md) | Desktop defaults to `messenger_core=debug`, logging every frame |
+| PERF-13 | Low | Fixed | S | [11-performance](reports/11-performance.md) | Release builds log every frame at debug level |
 | PERF-14 | Low | VERIFIED | S | [11-performance](reports/11-performance.md) | Finished outgoing transfers are never pruned; every tick clones all of them |
 | PERF-15 | Low | VERIFIED | M | [11-performance](reports/11-performance.md) | Hub fan-out deep-clones and re-serializes per connection; member directory broadcast is O(N²) on join storms |
 | PERF-16 | Low | VERIFIED | M | [11-performance](reports/11-performance.md) | Image previews as base64 `data:` URLs over JSON IPC |
@@ -272,21 +272,21 @@ prioritised view is in [README.md](README.md).
 | SUPPLY-04 | Low | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | CI's secret-scan job installs gitleaks with no checksum (`curl \| sudo tar`) |
 | SUPPLY-05 | Low | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The committed `desktop/dist` is effectively unreviewable in PRs, and the staleness check ignores whitespace |
 | SUPPLY-06 | Low | VERIFIED | M | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The accepted-advisory list has no structured reasons or expiry; RUSTSEC-2023-0071's rationale is narrower than the advisory; 55 crates are duplicated, including two RustCrypto generations |
-| SUPPLY-07 | Low | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Unused `tauri-plugin-log` and `log` dependencies add build-script and transitive surface |
+| SUPPLY-07 | Low | Fixed | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Unused `tauri-plugin-log` and `log` dependencies add build-script and transitive surface |
 | SUPPLY-08 | Low | VERIFIED | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | Dev-only npm advisories (2 high, 8 moderate), and release builds run npm lifecycle scripts |
 | TAURI-10 | Low | SUSPECTED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Shutdown flush only covers `CloseRequested`; concurrent saves can land an older snapshot last |
 | TAURI-11 | Low | SUSPECTED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `open_url` validates by string prefix and launches through `rundll32 url.dll,FileProtocolHandler` on Windows |
 | TAURI-12 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `core:default` grants the webview more core IPC than it uses |
 | TAURI-13 | Low | SUSPECTED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | No navigation or new-window guard on the main webview |
-| TAURI-14 | Low | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Poll-loop cost: two full O(total messages) passes, four times a second, forever |
+| TAURI-14 | Low | Partly fixed | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | Poll-loop cost: two full O(total messages) passes, four times a second, forever |
 | TAURI-15 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Desktop notifications block under the manager lock and expose message previews |
-| TAURI-16 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Release builds log at debug level to stdout only; the log plugin is a dead dependency; diagnostics have no logs |
+| TAURI-16 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Release builds log at debug level to stdout only; the log plugin is a dead dependency; diagnostics have no logs |
 | TAURI-17 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `change_password` can revert a concurrent display-name change |
 | TAURI-18 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The invite link advertises the settings port, not the live listener port |
 | TAURI-19 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `open_file` / `open_url` leave zombie processes on Unix and duplicate the `open` crate |
 | TAURI-20 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `unlock` reports every failure as "Wrong password" |
-| TAURI-21 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `panic = "abort"`: any command panic is a whole-app crash that skips the history flush |
-| TAURI-22 | Low | SUSPECTED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `send_file` awaits the bounded file lane while holding the manager mutex |
+| TAURI-21 | Low | Partly fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `panic = "abort"`: any command panic is a whole-app crash that skips the history flush |
+| TAURI-22 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `send_file` awaits the bounded file lane while holding the manager mutex |
 | TAURI-23 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Data-directory fallbacks and permissions |
 | TAURI-32 | Low | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | No restore or import path, although the UI tells users to "restore it over the file" |
 | TAURI-33 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The backup covers only the identity; conversations, contacts and trust states have no backup path, and the UI does not say so |
