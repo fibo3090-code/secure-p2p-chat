@@ -13,6 +13,10 @@ predate tagged releases.
 
 ### Security
 
+- A peer whose identity key is weaker than 2048-bit RSA is refused, and
+  Ed25519 signatures are checked strictly (a weak key could otherwise make one
+  signature valid for any message).
+
 - An old-style (unsigned) invite link can no longer change a contact you
   already have. Anyone can write such a link for a known person, and importing
   one used to replace that contact's name and address.

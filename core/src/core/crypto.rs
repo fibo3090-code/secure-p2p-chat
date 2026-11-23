@@ -58,6 +58,24 @@ const PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
 /// (identity proofs, invites, community servers) passes through here, so a
 /// second block, a preamble or trailing text is refused outright.
 pub fn pem_decode_public(pem: &str) -> Result<RsaPublicKey> {
+    let key = parse_public_block(pem)?;
+    // A floor, not only the crate's ceiling (CRYPTO-14): a contact's 1024-bit
+    // key is one anyone who factors it can later impersonate. Every key this
+    // app generates is `RSA_KEY_BITS`, so nothing genuine is refused.
+    let bits = rsa::traits::PublicKeyParts::size(&key) * 8;
+    if bits < crate::RSA_KEY_BITS {
+        return Err(anyhow!(
+            "RSA key is {bits} bits; identity keys must be at least {} bits",
+            crate::RSA_KEY_BITS
+        ));
+    }
+    Ok(key)
+}
+
+/// The strict single-block parse behind [`pem_decode_public`], without the
+/// strength floor: a fingerprint *describes* a key, it does not accept one as
+/// an identity, and the frozen history-key vector is a 1024-bit key.
+fn parse_public_block(pem: &str) -> Result<RsaPublicKey> {
     let trimmed = pem.trim();
     let single_block = trimmed.starts_with(PUBLIC_KEY_BEGIN)
         && trimmed.ends_with(PUBLIC_KEY_END)
@@ -118,7 +136,7 @@ pub fn fingerprint_public_key(key: &RsaPublicKey) -> Result<String> {
 /// malformed PEM is an error rather than a fingerprint of its bytes.
 pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> Result<String> {
     let pem = std::str::from_utf8(pem_bytes).map_err(|e| anyhow!("PEM is not UTF-8: {}", e))?;
-    fingerprint_public_key(&pem_decode_public(pem)?)
+    fingerprint_public_key(&parse_public_block(pem)?)
 }
 
 // ============================================================================
@@ -319,9 +337,11 @@ pub fn verify_ed25519(
     data: &[u8],
     signature: &Signature,
 ) -> Result<()> {
-    use ed25519_dalek::Verifier as Ed25519VerifierTrait;
+    // `verify_strict`, not `verify`: the permissive check accepts weak
+    // (small-order) keys and malleable signatures — with the identity point as
+    // the key, one signature verifies every message (CRYPTO-14).
     verifying_key
-        .verify(data, signature)
+        .verify_strict(data, signature)
         .map_err(|e| anyhow!("Ed25519 signature verification failed: {}", e))
 }
 
@@ -1173,6 +1193,33 @@ mod tests {
             "an older peer still connects, over RSA-PSS"
         );
         assert_eq!(negotiate_signature_scheme(&ours, &[]), None);
+    }
+
+    #[test]
+    fn a_peer_identity_key_under_2048_bits_is_refused() {
+        // CRYPTO-14: the rsa crate caps key size from above, not below, so a
+        // contact's 512- or 1024-bit key was taken as an identity — one anyone
+        // who factors it can later impersonate.
+        let weak = rsa::RsaPrivateKey::new(&mut OsRng, 1024).unwrap();
+        let pem = pem_encode_public(&RsaPublicKey::from(&weak)).unwrap();
+        let err = pem_decode_public(&pem).unwrap_err().to_string();
+        assert!(err.contains("1024") && err.contains("2048"), "{err}");
+        let ok = rsa::RsaPrivateKey::new(&mut OsRng, crate::RSA_KEY_BITS).unwrap();
+        assert!(pem_decode_public(&pem_encode_public(&RsaPublicKey::from(&ok)).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn ed25519_verification_rejects_a_small_order_key() {
+        // CRYPTO-14: with the identity point as the public key, R = identity
+        // and s = 0 satisfy the plain verification equation for *any*
+        // message. `verify_strict` refuses weak keys and such signatures.
+        let mut key = [0u8; 32];
+        key[0] = 1;
+        let weak = Ed25519VerifyingKey::from_bytes(&key).unwrap();
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let forged = Signature::from_bytes(&sig);
+        assert!(verify_ed25519(&weak, b"anything at all", &forged).is_err());
     }
 
     #[test]
