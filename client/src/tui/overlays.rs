@@ -196,6 +196,7 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
             ("↑/↓", "select chat / scroll messages / command history"),
             ("PgUp/PgDn", "scroll messages"),
             ("Ctrl+L", "copy logs to clipboard"),
+            ("Ctrl+C", "quit (asks; Ctrl+C again to confirm)"),
             ("y / n", "confirm / cancel in confirm overlays"),
             (
                 "Ctrl+Y / Ctrl+N",

@@ -397,6 +397,7 @@ command — so you can drive the whole app from the keyboard (or script it).
 - `Ctrl+L` — copy the event log to the clipboard
 - `Esc` — close an overlay / leave command mode / focus the chat list
 - `q` — quit (asks to confirm) when the input is not focused
+- `Ctrl+C` — quit from anywhere (asks to confirm; `Ctrl+C` again confirms)
 - `?` — open the help overlay
 - The message view auto-scrolls to the newest message; scroll up to read
   back, and it re-sticks to the bottom when you return there.

@@ -650,6 +650,11 @@ impl TuiApp {
         if !self.is_unlocked() {
             return;
         }
+        // One pending-command slot: a command the user just submitted runs
+        // first, and the rehost waits a turn rather than replacing it (TUI-27).
+        if self.pending_command.is_some() {
+            return;
+        }
         self.last_rehost = Some(Instant::now());
         // Rebind the port actually in use, not the settings default — the user
         // may have hosted on another one, and rehosting elsewhere silently
@@ -827,6 +832,21 @@ impl TuiApp {
         // Any keystroke means the user is at the terminal; `report_presence`
         // uses this to gate desktop notifications.
         self.last_interaction = Some(Instant::now());
+        // Ctrl+C is how people leave a terminal program, and raw mode turns
+        // SIGINT into this key: ask to quit from anywhere, and let a second
+        // one confirm (TUI-25).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if matches!(self.overlay, TuiOverlay::ConfirmQuit) {
+                self.save_history_now();
+                self.should_quit = true;
+            } else {
+                if self.mode == TuiMode::Command {
+                    self.cancel_command_mode();
+                }
+                self.overlay = TuiOverlay::ConfirmQuit;
+            }
+            return;
+        }
         if self.overlay.is_open() {
             self.handle_overlay_key(key);
             return;
@@ -3007,6 +3027,59 @@ mod tests {
                 assert!(queued.is_none(), "hosted with the setting off: {queued:?}");
             }
         }
+    }
+
+    /// TUI-25: raw mode swallows SIGINT and no key handled Ctrl+C, so the
+    /// universal way out of a terminal program did nothing at all. It asks to
+    /// quit from anywhere — the composer included, where it used to be lost —
+    /// and a second Ctrl+C confirms, saving like `y` does.
+    #[test]
+    fn ctrl_c_asks_to_quit_and_a_second_one_quits() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let (mut second, _data2) = app();
+        let (mut first, _data) = app();
+        first.focus = TuiFocus::Input;
+        first.input_field.set_text("half a sentence");
+        first.handle_key_event(ctrl_c);
+        assert!(
+            matches!(first.overlay, TuiOverlay::ConfirmQuit),
+            "Ctrl+C did nothing"
+        );
+        assert_eq!(first.input_field.text(), "half a sentence");
+        assert!(!first.should_quit);
+        first.handle_key_event(ctrl_c);
+        assert!(first.should_quit, "the second Ctrl+C did not quit");
+
+        // From command mode too.
+        second.enter_command_mode();
+        second.handle_key_event(ctrl_c);
+        assert!(matches!(second.overlay, TuiOverlay::ConfirmQuit));
+    }
+
+    /// TUI-27: auto-rehost wrote its `Host` into the single pending-command
+    /// slot whatever was there, so a command the user had just submitted —
+    /// queued for the next loop turn — was silently replaced. It waits a turn
+    /// instead.
+    #[test]
+    fn auto_rehost_never_replaces_a_submitted_command() {
+        let (mut app, _data) = app();
+        app.chat_manager.is_hosting = true;
+        app.chat_manager.hosting_port = Some(45679);
+        assert!(app.chat_manager.check_rehost_needed());
+        app.pending_command = Some(TuiCommand::Help(None));
+        app.last_rehost = None;
+        app.auto_rehost();
+        assert!(
+            matches!(app.take_pending_command(), Some(TuiCommand::Help(None))),
+            "the user's command was replaced"
+        );
+        // With the slot free, it rehosts as before.
+        app.last_rehost = None;
+        app.auto_rehost();
+        assert!(matches!(
+            app.take_pending_command(),
+            Some(TuiCommand::Host(Some(45679)))
+        ));
     }
 
     /// TUI-19: `mdns` and `theme` were offered and did nothing — the TUI

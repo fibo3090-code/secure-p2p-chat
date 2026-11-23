@@ -291,9 +291,9 @@ prioritised view is in [README.md](README.md).
 | TAURI-32 | Low | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | No restore or import path, although the UI tells users to "restore it over the file" |
 | TAURI-33 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The backup covers only the identity; conversations, contacts and trust states have no backup path, and the UI does not say so |
 | TAURI-34 | Low | VERIFIED | M | [06-tauri-bridge](reports/06-tauri-bridge.md) | No in-app way to delete the identity or all local data |
-| TUI-25 | Low | VERIFIED | S | [05-tui](reports/05-tui.md) | Ctrl+C does nothing, and Esc has a destructive meaning in one overlay |
+| TUI-25 | Low | Fixed | S | [05-tui](reports/05-tui.md) | Ctrl+C does nothing, and Esc has a destructive meaning in one overlay |
 | TUI-26 | Low | VERIFIED | S | [05-tui](reports/05-tui.md) | Message timestamps show UTC hours with no date; all incoming messages are labelled "Peer" |
-| TUI-27 | Low | VERIFIED | S | [05-tui](reports/05-tui.md) | Auto-rehost can overwrite a command the user just submitted |
+| TUI-27 | Low | Fixed | S | [05-tui](reports/05-tui.md) | Auto-rehost can overwrite a command the user just submitted |
 | TUI-28 | Low | VERIFIED | S | [05-tui](reports/05-tui.md) | In-app help and documentation are inaccurate or incomplete |
 | TUI-29 | Low | SUSPECTED | S | [05-tui](reports/05-tui.md) | Clipboard: contents may vanish on Linux, the Identity overlay overwrites the clipboard without asking, and failures are hidden |
 | TUI-30 | Low | SUSPECTED | S | [05-tui](reports/05-tui.md) | Windows: AltGr characters are probably dropped from all text fields |
