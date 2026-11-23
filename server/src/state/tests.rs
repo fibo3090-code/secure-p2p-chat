@@ -270,6 +270,59 @@ fn presence_can_be_toggled() {
     assert!(state.members()[0].online);
 }
 
+/// QUAL-05: a message whose row could not be written was still appended in
+/// memory and confirmed to the sender — and gone after the next restart, the
+/// server-side twin of "Ok + a toast". Persisting comes first now: a failed
+/// write refuses the post (which `dispatch` answers `ActionFailed`, so the
+/// client takes the row back), leaves nothing in memory, and does not burn a
+/// sequence number.
+#[test]
+fn a_message_the_database_refuses_is_not_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let channel = state.default_channel();
+    let alice = state.join("alice", None, Some("FP-A".to_string())).unwrap();
+    let bob = state.join("bob", None, Some("FP-B".to_string())).unwrap();
+    // Every insert fails from here on, as on a full disk.
+    state
+        .db
+        .as_ref()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_msg BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+             CREATE TRIGGER refuse_dm BEFORE INSERT ON dm_messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+
+    let err = state
+        .post_message(alice, channel, "lost on restart".to_string())
+        .unwrap_err();
+    assert!(err.contains("could not store"), "{err}");
+    assert!(
+        state.history_since(alice, channel, 0).is_empty(),
+        "kept in memory anyway"
+    );
+    assert!(state.post_dm(alice, bob, "lost too".to_string()).is_err());
+    assert!(state
+        .dm_history(messenger_core::party::dm_thread_id(alice, bob), 0)
+        .is_empty());
+
+    // The disk recovers: the next post is stored, numbered as the first.
+    state
+        .db
+        .as_ref()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_msg; DROP TRIGGER refuse_dm;")
+        .unwrap();
+    let posted = state
+        .post_message(alice, channel, "kept".to_string())
+        .unwrap();
+    assert_eq!(posted.seq, 1, "the refused post used up a sequence number");
+    drop(state);
+    let reloaded = PartyState::load("Srv", None, dir.path()).unwrap();
+    assert_eq!(reloaded.history_since(alice, channel, 0).len(), 1);
+}
+
 #[test]
 fn durable_state_persists_and_reloads() {
     let dir = tempfile::tempdir().unwrap();

@@ -34,6 +34,9 @@ predate tagged releases.
 
 ### Fixed
 
+- A community server that cannot write a message to its database (a full
+  disk, say) now refuses it, so the sender's app takes it back off the screen.
+  It used to confirm the message and lose it at the next restart.
 - The desktop app's diagnostics bundle now contains its recent log (scrubbed
   of addresses and identifiers), and a crash leaves a report in the app's data
   folder. Before, a release build's log went nowhere and the bundle said so.

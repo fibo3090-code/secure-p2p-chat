@@ -473,10 +473,9 @@ impl PartyState {
         self.record_file_ref(actor, &meta, location, is_dm);
 
         let envelope = if is_dm {
-            self.append_dm_message(actor, location, MessagePayload::File(meta))
+            self.append_dm_message(actor, location, MessagePayload::File(meta))?
         } else {
-            self.append_channel_message(actor, location, MessagePayload::File(meta))
-                .expect("checked above")
+            self.append_channel_message(actor, location, MessagePayload::File(meta))?
         };
         let detail = format!("shared {} again", source.name);
         self.record_audit(actor, "file.share", &detail);
@@ -1359,7 +1358,13 @@ impl PartyState {
     ) -> Result<Envelope, String> {
         self.record_file_ref(sender, &meta, channel, false);
         self.append_channel_message(sender, channel, MessagePayload::File(meta))
-            .ok_or_else(|| "channel no longer exists".to_string())
+            .map_err(|e| {
+                if e == "unknown channel" {
+                    "channel no longer exists".to_string()
+                } else {
+                    e
+                }
+            })
     }
 
     /// Store a file and send it as a direct message to `to`. Returns the assigned
@@ -1385,7 +1390,7 @@ impl PartyState {
     ) -> Result<Envelope, String> {
         let thread_id = messenger_core::party::dm_thread_id(from, to);
         self.record_file_ref(from, &meta, thread_id, true);
-        Ok(self.append_dm_message(from, thread_id, MessagePayload::File(meta)))
+        self.append_dm_message(from, thread_id, MessagePayload::File(meta))
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.

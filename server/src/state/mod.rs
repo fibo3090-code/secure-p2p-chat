@@ -1351,7 +1351,6 @@ impl PartyState {
         validate_message_text(&text)?;
         self.member_can_post_to_channel(sender, channel)?;
         self.append_channel_message(sender, channel, MessagePayload::Text(text))
-            .ok_or_else(|| "unknown channel".to_string())
     }
 
     /// How long the community keeps messages and shared files. Without a
@@ -1420,29 +1419,40 @@ impl PartyState {
         report
     }
 
-    /// Append a message to `channel` under the next sequence number, keep it
-    /// in memory (subject to the resident cap) and persist it. `None` for an
-    /// unknown channel. Every channel message — text, file, re-share — is
-    /// appended here, so numbering has one source.
+    /// Append a message to `channel` under the next sequence number: persist
+    /// it, then keep it in memory (subject to the resident cap). Every channel
+    /// message — text, file, re-share — is appended here, so numbering has one
+    /// source.
+    ///
+    /// **Persisted first** (QUAL-05): a row that cannot be written refuses the
+    /// message, leaving memory and the sequence untouched, instead of a
+    /// confirmation for something the next restart would lose.
     fn append_channel_message(
         &mut self,
         sender: Uuid,
         channel: Uuid,
         payload: MessagePayload,
-    ) -> Option<Envelope> {
+    ) -> Result<Envelope, String> {
         let (tier, cap) = (self.tier, self.history_cap());
-        let chan = self.channel_mut(channel)?;
+        let seq = self
+            .channel_mut(channel)
+            .ok_or_else(|| "unknown channel".to_string())?
+            .history
+            .next_seq();
         let envelope = Envelope {
             tier,
             sender,
             channel,
-            seq: chan.history.next_seq(),
+            seq,
             timestamp: current_timestamp_millis(),
             payload,
         };
-        chan.history.push(envelope.clone(), cap);
-        self.persist_message(&envelope);
-        Some(envelope)
+        self.persist_message(&envelope)?;
+        self.channel_mut(channel)
+            .expect("checked above")
+            .history
+            .push(envelope.clone(), cap);
+        Ok(envelope)
     }
 
     /// The DM twin of [`Self::append_channel_message`], creating the thread
@@ -1452,26 +1462,32 @@ impl PartyState {
         sender: Uuid,
         thread_id: Uuid,
         payload: MessagePayload,
-    ) -> Envelope {
+    ) -> Result<Envelope, String> {
         let (tier, cap) = (self.tier, self.history_cap());
-        let thread = self
+        let seq = self
             .dm_threads
-            .entry(thread_id)
-            .or_insert_with(|| DmThread {
-                id: thread_id,
-                history: History::new(),
-            });
+            .get(&thread_id)
+            .map_or_else(|| History::new().next_seq(), |t| t.history.next_seq());
         let envelope = Envelope {
             tier,
             sender,
             channel: thread_id,
-            seq: thread.history.next_seq(),
+            seq,
             timestamp: current_timestamp_millis(),
             payload,
         };
-        thread.history.push(envelope.clone(), cap);
-        self.persist_dm(thread_id, &envelope);
-        envelope
+        // Persisted first, as for channels; a refused first message does not
+        // leave an empty thread behind either.
+        self.persist_dm(thread_id, &envelope)?;
+        self.dm_threads
+            .entry(thread_id)
+            .or_insert_with(|| DmThread {
+                id: thread_id,
+                history: History::new(),
+            })
+            .history
+            .push(envelope.clone(), cap);
+        Ok(envelope)
     }
 
     /// One page of a thread's history after `since_seq`: from memory when the
@@ -1537,7 +1553,7 @@ impl PartyState {
         }
         validate_message_text(&text)?;
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        Ok(self.append_dm_message(from, thread_id, MessagePayload::Text(text)))
+        self.append_dm_message(from, thread_id, MessagePayload::Text(text))
     }
 
     /// Direct-message history for a thread strictly after `since_seq`, paged the

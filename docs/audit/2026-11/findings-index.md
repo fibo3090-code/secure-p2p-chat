@@ -125,7 +125,7 @@ prioritised view is in [README.md](README.md).
 | PRIV-09 | Medium | Partly fixed | S | [13-privacy-supply-chain](reports/13-privacy-supply-chain.md) | The community server writes plaintext `party.db` and `blobs/` under the default umask, and server logs record member IPs at info |
 | QUAL-03 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Session runners take 8–9 positional arguments; `SessionChannels` exists but stays client-private |
 | QUAL-04 | Medium | VERIFIED | L | [12-code-quality](reports/12-code-quality.md) | Errors are untyped across every module boundary |
-| QUAL-05 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | Server persistence logs and ignores every error and has no transactions or schema versioning |
+| QUAL-05 | Medium | Partly fixed | M | [12-code-quality](reports/12-code-quality.md) | Server persistence logs and ignores every error and has no transactions or schema versioning |
 | QUAL-06 | Medium | Fixed | S | [12-code-quality](reports/12-code-quality.md) | The TUI log buffer drops every structured field, so the overlay and diagnostics lose the actual error |
 | QUAL-07 | Medium | Fixed | S/M | [12-code-quality](reports/12-code-quality.md) | The shipped desktop app has no persistent log, no panic hook, and unused logging dependencies |
 | QUAL-08 | Medium | VERIFIED | M | [12-code-quality](reports/12-code-quality.md) | The desktop app compiles the terminal UI; `ChatManager` is not in a UI-agnostic crate |
