@@ -158,14 +158,15 @@ The Tauri 2 desktop app (`p2pem-desktop`) adds a system-webview + IPC surface:
   (CONIKS/Keybase-style) to detect a malicious key swap presented consistently
   to a victim from the start. Out-of-band fingerprint comparison remains the
   backstop.
-- `rsa` is still a dependency (for RSA-PSS **signatures**), so the upstream
-  timing advisory `RUSTSEC-2023-0071` still appears in audits — but the attack
-  it describes targets RSA **decryption**, which this product does not perform
-  (the RSA encrypt/decrypt functions were removed). Migrating identity
-  signatures to Ed25519 (the wire already negotiates a scheme field) would drop
-  `rsa` from the security-critical path entirely.
+- `rsa` is still a dependency (for RSA-PSS **signatures**). Since 0.10 it does
+  its private-key arithmetic in constant time (`crypto-bigint`), which fixes the
+  Marvin timing advisory `RUSTSEC-2023-0071`; the product never performed RSA
+  **decryption**, the operation that attack targets, in any case (the RSA
+  encrypt/decrypt functions were removed). Migrating identity signatures to
+  Ed25519 (the wire already negotiates a scheme field) would drop `rsa` from
+  the security-critical path entirely.
 - `bincode` remains a tracked dependency migration concern
-- Known-accepted `cargo audit` findings beyond `rsa` above, each with the exact
+- Known-accepted `cargo audit` findings, each with the exact
   path that pulls it (verified with `cargo tree --target all -i`, since a
   "transitively via Tauri" hand-wave was wrong here once already):
   - **`quick-xml` 0.39.4** (RUSTSEC-2026-0194/0195, both DoS-on-hostile-XML):

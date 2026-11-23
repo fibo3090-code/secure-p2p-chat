@@ -27,7 +27,7 @@ use messenger_server::hub::Hub;
 use messenger_server::run_accept_loop;
 use messenger_server::state::PartyState;
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -46,7 +46,7 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 /// temp dir so the SQLite and blob-store paths are the ones under test.
 /// Step one of a first join: connect without credentials and learn the
 /// server's fingerprint, as the user would see it before accepting.
-async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
+async fn learn_fingerprint(address: &str, key: &rsa::PrivateKey) -> String {
     match PartyManager::new()
         .connect_and_join(address, "probe", None, key, None)
         .await

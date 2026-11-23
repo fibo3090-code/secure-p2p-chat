@@ -1123,14 +1123,14 @@ impl TuiApp {
     /// The private key, if the identity is unlocked. Prompts for the password
     /// (or toasts why the key is unreadable) otherwise, so a command can just
     /// `let Some(key) = self.unlocked_private_key() else { return };`.
-    fn unlocked_private_key(&mut self) -> Option<rsa::RsaPrivateKey> {
+    fn unlocked_private_key(&mut self) -> Option<rsa::PrivateKey> {
         if !self.require_unlocked() {
             return None;
         }
         self.private_key()
     }
 
-    fn private_key(&mut self) -> Option<rsa::RsaPrivateKey> {
+    fn private_key(&mut self) -> Option<rsa::PrivateKey> {
         match self.identity.private_key() {
             Ok(k) => Some(k),
             Err(e) => {

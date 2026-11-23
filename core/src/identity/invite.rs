@@ -14,7 +14,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
 use crate::core::crypto::{fingerprint_pubkey, pem_decode_public, rsa_sign_pss, rsa_verify_pss};
@@ -220,7 +220,7 @@ mod tests {
     use crate::core::{generate_rsa_keypair, pem_encode_public};
 
     fn payload(key: &RsaPrivateKey, timestamp: u64) -> SignedInvitePayload {
-        let pem = pem_encode_public(&rsa::RsaPublicKey::from(key)).unwrap();
+        let pem = pem_encode_public(&rsa::PublicKey::from(key)).unwrap();
         SignedInvitePayload {
             version: 2,
             timestamp,
@@ -344,11 +344,11 @@ mod tests {
     fn an_invite_carrying_two_keys_is_refused() {
         let victim = generate_rsa_keypair(2048).unwrap();
         let attacker = generate_rsa_keypair(2048).unwrap();
-        let victim_pem = pem_encode_public(&rsa::RsaPublicKey::from(&victim)).unwrap();
+        let victim_pem = pem_encode_public(&rsa::PublicKey::from(&victim)).unwrap();
         let crafted = format!(
             "x{}\n{}",
             victim_pem.trim_end(),
-            pem_encode_public(&rsa::RsaPublicKey::from(&attacker)).unwrap()
+            pem_encode_public(&rsa::PublicKey::from(&attacker)).unwrap()
         );
         let now = now_secs();
         let mut forged = payload(&victim, now);

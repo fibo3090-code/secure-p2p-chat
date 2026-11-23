@@ -12,8 +12,9 @@ use rsa::{
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey},
     pkcs8::{DecodePublicKey, EncodePublicKey},
     pss::{Signature as RsaSignature, SigningKey, VerifyingKey},
+    sha2::Sha256 as RsaSha256,
     signature::{RandomizedSigner, SignatureEncoding, Verifier as RsaVerifier},
-    RsaPrivateKey, RsaPublicKey,
+    PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,9 +25,21 @@ use crate::AES_KEY_SIZE;
 /// Default RSA key size used in tests and key generation
 pub const RSA_KEY_BITS: usize = 2048;
 
+/// The operating system's CSPRNG, in the `rand_core` 0.10 form `rsa` 0.10
+/// takes.
+///
+/// The rest of the workspace is on `rand` 0.8 (`rand_core` 0.6), whose `OsRng`
+/// `rsa` no longer accepts; this is the same source (`getrandom`), reached
+/// directly rather than through a second `rand` version. It is fallible, so
+/// every caller uses the `try_` form and an RNG failure is an `Err`, never a
+/// panic.
+fn rsa_rng() -> getrandom::SysRng {
+    getrandom::SysRng
+}
+
 /// Generate RSA keypair (blocking operation)
 pub fn generate_rsa_keypair(bits: usize) -> Result<RsaPrivateKey> {
-    RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| anyhow!("RSA keygen failed: {}", e))
+    RsaPrivateKey::new(&mut rsa_rng(), bits).map_err(|e| anyhow!("RSA keygen failed: {}", e))
 }
 
 /// Generate RSA keypair asynchronously (non-blocking for GUI)
@@ -136,13 +149,15 @@ pub fn fingerprint_pubkey(pem_bytes: &[u8]) -> Result<String> {
 /// # Returns
 /// Raw RSA-PSS signature bytes
 pub fn rsa_sign_pss(privkey: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
-    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
+    // Salt length is the digest size (32 bytes), as `rsa` 0.9 used; the
+    // signatures are wire-compatible in both directions.
+    let signing_key = SigningKey::<RsaSha256>::new(privkey.clone());
 
     // Sign with randomized signing for enhanced security
-    // SigningKey::<Sha256>::sign_with_rng automatically applies SHA-256 hashing
+    // SigningKey::<Sha256>::try_sign_with_rng automatically applies SHA-256 hashing
     let signature = signing_key
-        .sign_with_rng(&mut rng, data)
+        .try_sign_with_rng(&mut rsa_rng(), data)
+        .map_err(|e| anyhow!("RSA-PSS signing failed: {}", e))?
         .to_bytes()
         .to_vec();
 
@@ -161,7 +176,7 @@ pub fn rsa_sign_pss(privkey: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
 pub fn rsa_verify_pss(pubkey: &RsaPublicKey, data: &[u8], signature: &[u8]) -> Result<()> {
     use rsa::signature::Verifier as RsaVerifier;
 
-    let verifying_key = VerifyingKey::<Sha256>::new(pubkey.clone());
+    let verifying_key = VerifyingKey::<RsaSha256>::new(pubkey.clone());
 
     // Convert byte slice to RSA Signature type
     let rsa_signature = rsa::pss::Signature::try_from(signature)
@@ -279,10 +294,10 @@ pub fn cross_sign_ed25519(
     privkey: &RsaPrivateKey,
     ed_public: &Ed25519VerifyingKey,
 ) -> Result<Vec<u8>> {
-    let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-    let mut rng = OsRng;
+    let signing_key = SigningKey::<RsaSha256>::new(privkey.clone());
     Ok(signing_key
-        .sign_with_rng(&mut rng, &ed25519_binding_digest(ed_public))
+        .try_sign_with_rng(&mut rsa_rng(), &ed25519_binding_digest(ed_public))
+        .map_err(|e| anyhow!("Ed25519 binding signature failed: {}", e))?
         .to_vec())
 }
 
@@ -292,7 +307,7 @@ pub fn verify_ed25519_binding(
     ed_public: &Ed25519VerifyingKey,
     signature: &[u8],
 ) -> Result<()> {
-    let verifying_key = VerifyingKey::<Sha256>::new(rsa_public.clone());
+    let verifying_key = VerifyingKey::<RsaSha256>::new(rsa_public.clone());
     let sig = RsaSignature::try_from(signature)
         .map_err(|e| anyhow!("Malformed Ed25519 binding signature: {}", e))?;
     RsaVerifier::verify(&verifying_key, &ed25519_binding_digest(ed_public), &sig)

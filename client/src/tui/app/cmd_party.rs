@@ -69,7 +69,7 @@ impl TuiApp {
         address: String,
         username: String,
         password: Option<String>,
-        privkey: rsa::RsaPrivateKey,
+        privkey: rsa::PrivateKey,
         expected: Option<String>,
     ) {
         if self.party_dial.is_some() {

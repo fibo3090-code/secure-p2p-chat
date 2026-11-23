@@ -1,8 +1,5 @@
 use anyhow::{anyhow, Result};
-use rand::rngs::OsRng;
-use rsa::pss::{SigningKey, VerifyingKey};
-use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -18,8 +15,9 @@ use crate::core::{
     cross_sign_ed25519, derive_ed25519_subkey, derive_session_key, ed25519_public_from_bytes,
     ed25519_signature_from_bytes, fingerprint_pubkey, generate_ephemeral_keypair,
     negotiate_signature_scheme, parse_x25519_public, pem_decode_public, pem_encode_public,
-    recv_packet, send_packet, sign_ed25519, verify_ed25519, verify_ed25519_binding, AesCipher,
-    Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
+    recv_packet, rsa_sign_pss, rsa_verify_pss, send_packet, sign_ed25519, verify_ed25519,
+    verify_ed25519_binding, AesCipher, Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage,
+    SignatureScheme, PROTOCOL_VERSION,
 };
 use crate::network::ratelimit::RateLimiter;
 use crate::types::SessionEvent;
@@ -444,9 +442,9 @@ fn build_identity_signature(
     let digest = hasher.finalize();
     match scheme {
         SignatureScheme::RsaPss => {
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            Ok(signing_key.sign_with_rng(&mut rng, &digest).to_vec())
+            // The pre-hashed transcript digest is the PSS *message* (hashed
+            // again inside), exactly as before; changing that breaks every peer.
+            rsa_sign_pss(privkey, &digest)
         }
         SignatureScheme::Ed25519 => {
             let signing_key = derive_ed25519_subkey(privkey)?;
@@ -492,15 +490,8 @@ fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> 
     let digest = hasher.finalize();
 
     match proof.signature_scheme {
-        SignatureScheme::RsaPss => {
-            let verifying_key = VerifyingKey::<Sha256>::new(peer_pubkey);
-            verifying_key
-                .verify(
-                    &digest,
-                    &rsa::pss::Signature::try_from(proof.signature.as_slice())?,
-                )
-                .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
-        }
+        SignatureScheme::RsaPss => rsa_verify_pss(&peer_pubkey, &digest, &proof.signature)
+            .map_err(|e| anyhow!("Identity signature verification failed: {}", e)),
         SignatureScheme::Ed25519 => {
             // The subkey blob is carried inside the signature field, so it is
             // just as peer-controlled as the proof around it.
@@ -2026,12 +2017,10 @@ mod tests {
             let cipher = AesCipher::new(&host_aes_key)?;
 
             // 4. Send Identity Proof (Encrypted)
-            let signing_key = SigningKey::<Sha256>::new(host_privkey.clone());
-            let mut rng = OsRng;
             let mut hasher = Sha256::new();
             hasher.update(b"IDENTITY_PROOF");
             hasher.update(host_ephemeral_public.as_bytes());
-            let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+            let signature = rsa_sign_pss(&host_privkey, &hasher.finalize())?;
 
             let my_proof = IdentityProof {
                 public_key_pem: pem_encode_public(&RsaPublicKey::from(&host_privkey))?,
@@ -2097,12 +2086,10 @@ mod tests {
             assert_eq!(host_proof.version, PROTOCOL_VERSION as u32);
 
             // 5. Send Client Identity Proof (Encrypted)
-            let signing_key = SigningKey::<Sha256>::new(client_privkey.clone());
-            let mut rng = OsRng;
             let mut hasher = Sha256::new();
             hasher.update(b"IDENTITY_PROOF");
             hasher.update(client_ephemeral_public.as_bytes());
-            let signature = signing_key.sign_with_rng(&mut rng, &hasher.finalize());
+            let signature = rsa_sign_pss(&client_privkey, &hasher.finalize())?;
 
             let my_proof = IdentityProof {
                 public_key_pem: pem_encode_public(&RsaPublicKey::from(&client_privkey))?,
@@ -2138,12 +2125,12 @@ mod tests {
         let host_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let expected_host_fp = fingerprint_pubkey(
-            pem_encode_public(&rsa::RsaPublicKey::from(&host_priv))
+            pem_encode_public(&rsa::PublicKey::from(&host_priv))
                 .unwrap()
                 .as_bytes(),
         );
         let expected_client_fp = fingerprint_pubkey(
-            pem_encode_public(&rsa::RsaPublicKey::from(&client_priv))
+            pem_encode_public(&rsa::PublicKey::from(&client_priv))
                 .unwrap()
                 .as_bytes(),
         );
@@ -2273,7 +2260,7 @@ mod tests {
         let ephemeral = [7u8; 32];
         let signature =
             build_identity_signature(SignatureScheme::Ed25519, &identity, &ephemeral).unwrap();
-        let pem = pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap();
+        let pem = pem_encode_public(&rsa::PublicKey::from(&identity)).unwrap();
         let proof = |sig: Vec<u8>| IdentityProof {
             public_key_pem: pem.clone(),
             signature: sig,
@@ -2350,7 +2337,7 @@ mod tests {
             let identity = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
             let signature = build_identity_signature(scheme, &identity, &[3u8; 32]).unwrap();
             let bytes = bincode::serialize(&IdentityProof {
-                public_key_pem: pem_encode_public(&rsa::RsaPublicKey::from(&identity)).unwrap(),
+                public_key_pem: pem_encode_public(&rsa::PublicKey::from(&identity)).unwrap(),
                 signature,
                 version: PROTOCOL_VERSION as u32,
                 chat_id: uuid::Uuid::new_v4(),

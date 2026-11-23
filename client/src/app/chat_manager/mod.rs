@@ -27,7 +27,7 @@ use crate::network::{
 };
 use crate::transfer::IncomingFileSync;
 use crate::types::*;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use text::IncomingTextMessage;
 
 /// Session handle for communication with network task

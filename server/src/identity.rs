@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use messenger_core::core::{generate_rsa_keypair, pem_decode_private, pem_encode_private};
 use messenger_core::RSA_KEY_BITS;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 
 const IDENTITY_FILE: &str = "server_identity.pem";
 
@@ -50,7 +50,7 @@ fn write_private_pem(path: &Path, pem: &str) -> Result<()> {
 mod tests {
     use super::*;
     use messenger_core::core::{fingerprint_pubkey, pem_encode_public};
-    use rsa::RsaPublicKey;
+    use rsa::PublicKey as RsaPublicKey;
 
     fn fingerprint(key: &RsaPrivateKey) -> String {
         fingerprint_pubkey(

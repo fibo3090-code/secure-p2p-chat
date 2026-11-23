@@ -15,7 +15,7 @@ use messenger_core::network::host_handshake;
 use messenger_core::party::{
     recv_framed, send_framed, FrameSeq, PartyRequest, PartyResponse, MAX_PARTY_PAYLOAD_BYTES,
 };
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
@@ -449,7 +449,7 @@ mod tests {
         ChannelKind, MessagePayload, PartyClient, UploadTarget, PARTY_CHUNK_BYTES,
     };
     use messenger_core::RSA_KEY_BITS;
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey as RsaPrivateKey;
     use tokio::io::DuplexStream;
 
     type TestClient = PartyClient<DuplexStream>;
