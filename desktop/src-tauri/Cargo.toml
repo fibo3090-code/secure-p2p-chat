@@ -34,6 +34,7 @@ messenger-core = { workspace = true }
 
 tokio = { workspace = true }
 uuid = { workspace = true }
+anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }

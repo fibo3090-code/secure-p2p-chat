@@ -506,6 +506,35 @@ fn unlocking_does_not_hold_the_identity_while_the_key_is_derived() {
     );
 }
 
+/// TAURI-20: every unlock failure read "Wrong password", including a file
+/// whose salt or nonce is gone — damage no amount of retyping can fix, sent
+/// round in a loop of retries. A wrong password still says so; a damaged
+/// file says it is damaged and where to go from there.
+#[test]
+fn unlock_tells_a_damaged_identity_from_a_wrong_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut identity = Identity::new_with_plaintext("Tester".to_string()).expect("identity");
+    identity.encrypt("right-password-1234").expect("encrypt");
+    let mut bridge = fresh_bridge(dir.path());
+    identity.save(&bridge.identity_path).expect("save identity");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&bridge.identity_path).unwrap()).unwrap();
+    json["nonce"] = json!([1, 2, 3]);
+    std::fs::write(&bridge.identity_path, json.to_string()).unwrap();
+    bridge.identity = Arc::new(StdMutex::new(
+        Identity::load(&bridge.identity_path).unwrap(),
+    ));
+    bridge.needs_password_setup = std::sync::atomic::AtomicBool::new(false);
+    let h = harness_with(bridge, dir);
+
+    let failure = h
+        .ipc("unlock", json!({ "password": "right-password-1234" }))
+        .unwrap_err();
+    let err = err_text(&failure).to_string();
+    assert!(err.contains("damaged"), "a damaged file read as: {err}");
+    assert!(!err.contains("Wrong password"), "{err}");
+}
+
 // ── Invoke-key contract with bridge.js ──────────────────────────────────────
 
 /// Every argument-taking command, called with the exact payload keys

@@ -69,6 +69,19 @@ fn ensure_identity_loaded(state: &Bridge) -> Result<(), String> {
 /// setups writing different passwords, or two unlocks both reloading history.
 static AUTH_OP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// What to tell the user when `decrypt` fails: only a wrong password asks for
+/// the password again; anything else is a damaged file (TAURI-20).
+fn unlock_error(e: &anyhow::Error) -> String {
+    if e.is::<messenger_core::identity::WrongPassword>() {
+        "Wrong password".to_string()
+    } else {
+        format!(
+            "Your identity file is damaged and cannot be opened ({e}). Restore it from a \
+             backup (Settings → Identity backup) — retyping the password will not help."
+        )
+    }
+}
+
 /// Unlock an existing, password-protected identity and load history.
 #[tauri::command]
 pub(crate) async fn unlock(
@@ -87,9 +100,7 @@ pub(crate) async fn unlock(
     let candidate = crate::lock_identity(&state.identity).clone();
     let (candidate, key) = tokio::task::spawn_blocking(move || {
         let mut candidate = candidate;
-        candidate
-            .decrypt(&password)
-            .map_err(|_| "Wrong password".to_string())?;
+        candidate.decrypt(&password).map_err(|e| unlock_error(&e))?;
         let key = candidate.history_key().map_err(|e| e.to_string())?;
         Ok::<_, String>((candidate, key))
     })

@@ -1476,7 +1476,15 @@ impl TuiApp {
                 self.toast(ToastLevel::Success, "Identity unlocked".to_string());
                 self.host_on_startup_if_configured();
             }
-            Err(_) => self.toast(ToastLevel::Error, "Wrong password".to_string()),
+            // Only a wrong password is worth retyping; anything else is a
+            // damaged file (TAURI-20).
+            Err(e) if e.is::<crate::identity::WrongPassword>() => {
+                self.toast(ToastLevel::Error, "Wrong password".to_string())
+            }
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("Your identity file is damaged and cannot be opened ({e}); restore it from a backup"),
+            ),
         }
     }
 

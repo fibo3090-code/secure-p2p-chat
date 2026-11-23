@@ -284,7 +284,7 @@ prioritised view is in [README.md](README.md).
 | TAURI-17 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `change_password` can revert a concurrent display-name change |
 | TAURI-18 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | The invite link advertises the settings port, not the live listener port |
 | TAURI-19 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `open_file` / `open_url` leave zombie processes on Unix and duplicate the `open` crate |
-| TAURI-20 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `unlock` reports every failure as "Wrong password" |
+| TAURI-20 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `unlock` reports every failure as "Wrong password" |
 | TAURI-21 | Low | Partly fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `panic = "abort"`: any command panic is a whole-app crash that skips the history flush |
 | TAURI-22 | Low | Fixed | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | `send_file` awaits the bounded file lane while holding the manager mutex |
 | TAURI-23 | Low | VERIFIED | S | [06-tauri-bridge](reports/06-tauri-bridge.md) | Data-directory fallbacks and permissions |

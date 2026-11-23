@@ -89,6 +89,22 @@ pub struct ArgonParams {
 }
 
 // Custom Serialize implementation to skip the private key field
+/// The one `decrypt` failure that a different password could fix: the stored
+/// parameters are sound and the key simply did not open. Every other error
+/// from `decrypt` means the file itself is damaged, and the UIs say so instead
+/// of asking for the password again (TAURI-20). Test with
+/// `err.is::<WrongPassword>()`.
+#[derive(Debug)]
+pub struct WrongPassword;
+
+impl std::fmt::Display for WrongPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Decryption failed (likely wrong password)")
+    }
+}
+
+impl std::error::Error for WrongPassword {}
+
 impl Serialize for Identity {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -389,7 +405,16 @@ impl Identity {
             .encrypted_private_key
             .as_ref()
             .ok_or_else(|| anyhow!("Encrypted private key not found"))?;
-        let wrong_password = || anyhow!("Decryption failed (likely wrong password)");
+        let wrong_password = || anyhow::Error::new(WrongPassword);
+        // A nonce of the wrong length is damage, not a password problem: say
+        // so, rather than letting the unwrap below fail as if the password
+        // were wrong (TAURI-20).
+        if nonce.len() != NONCE_SIZE {
+            bail!(
+                "Stored nonce is {} bytes, expected {NONCE_SIZE}",
+                nonce.len()
+            );
+        }
 
         if let Some(ap) = &self.argon_params {
             if ap.m_cost_kib > MAX_ARGON_M_COST_KIB
