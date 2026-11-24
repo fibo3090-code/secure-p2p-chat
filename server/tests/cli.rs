@@ -7,6 +7,8 @@
 //!   an owner nobody can ever be.
 //! - Started, it prints the fingerprint members verify and, while nobody owns
 //!   the community, the one-time owner claim token.
+//! - `--retain-days` prunes at start-up, not only an hour later: the
+//!   retention task's first tick is immediate.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -98,5 +100,77 @@ fn an_open_server_starts_and_prints_its_fingerprint_and_claim_token() {
     assert!(
         dir.path().join("server_identity.pem").exists(),
         "the identity members pin was not persisted"
+    );
+}
+
+/// Count the messages `party.db` holds for any channel.
+fn stored_messages(dir: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(dir.join("party.db")).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// SRV-06 retention, wired end to end: history older than `--retain-days` is
+/// gone as soon as the server starts (an operator who sets a limit expects it
+/// to hold now, not after the first hourly tick), the newest message of the
+/// channel is kept, and nothing younger is touched. The pruning rules are
+/// unit-tested in `state`; this is the part only `main` does.
+#[test]
+fn retention_prunes_old_history_at_start_up() {
+    use messenger_server::state::PartyState;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut state = PartyState::load("Retained", None, dir.path()).unwrap();
+        let alice = state.join("alice", None, None).unwrap();
+        let channel = state.default_channel();
+        for text in ["old one", "old two", "recent", "newest"] {
+            state.post_message(alice, channel, text.into()).unwrap();
+        }
+    }
+    // Backdate the first two by three days.
+    let three_days_ago = messenger_core::util::current_timestamp_millis() as i64 - 3 * 86_400_000;
+    let conn = rusqlite::Connection::open(dir.path().join("party.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE messages SET envelope = json_set(envelope, '$.timestamp', ?1)
+              WHERE json_extract(envelope, '$.payload.Text') IN ('old one', 'old two')",
+            [three_days_ago],
+        )
+        .unwrap();
+    drop(conn);
+    assert_eq!(changed, 2, "the fixture did not backdate two messages");
+    assert_eq!(stored_messages(dir.path()), 4);
+
+    let mut child = server()
+        .args(["--port", "0", "--open", "--retain-days", "1", "--data-dir"])
+        .arg(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the server");
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut pruned = None;
+    while Instant::now() < deadline && pruned.is_none() {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            if line.contains("retention: pruned expired history") {
+                pruned = Some(line);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let pruned = pruned.expect("no pruning at start-up");
+    assert!(pruned.contains("messages=2"), "{pruned}");
+    assert_eq!(
+        stored_messages(dir.path()),
+        2,
+        "the recent history was not kept"
     );
 }

@@ -751,73 +751,106 @@ fn poll_delay(focused: bool, quiet_for: Duration) -> Duration {
     }
 }
 
+/// The poll loop's clocks and memory, carried from one tick to the next.
+struct PollState {
+    memory: PollMemory,
+    last_activity: std::time::Instant,
+    last_rehost: std::time::Instant,
+    /// Floor between poll-driven history writes — see `save_history_if_changed`.
+    last_save: std::time::Instant,
+}
+
+impl PollState {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            memory: PollMemory::default(),
+            last_activity: now,
+            last_rehost: now,
+            last_save: now - HISTORY_SAVE_MIN_INTERVAL,
+        }
+    }
+}
+
 /// Periodically drain network events and notify the webview to refresh.
 fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
     tauri::async_runtime::spawn(async move {
-        let mut memory = PollMemory::default();
-        let mut last_activity = std::time::Instant::now();
+        let mut state = PollState::new();
         let mut delay = POLL_FAST;
-        let mut last_rehost = std::time::Instant::now();
-        // Floor between poll-driven history writes — see `save_history_if_changed`.
-        let mut last_save = std::time::Instant::now() - HISTORY_SAVE_MIN_INTERVAL;
         loop {
             tokio::time::sleep(delay).await;
-            let party_sig = ctx.poll_parties(&mut memory.joined_recorded).await;
-            if last_rehost.elapsed() >= REHOST_CHECK_INTERVAL {
-                last_rehost = std::time::Instant::now();
-                ctx.auto_rehost().await;
-            }
-            let (prompt, toasts, sig, ui_sig, transfer_sig, focused) = {
-                let mut m = ctx.manager.lock().await;
-                m.poll_session_events();
-                // Drain ChatManager's internal toasts (Connected, errors,
-                // "connection refused", …) so the webview can surface them.
-                let toasts: Vec<(&'static str, String)> = std::mem::take(&mut m.toasts)
-                    .into_iter()
-                    .map(|t| (toast_level_str(t.level), t.message))
-                    .collect();
-                // Peek, never take: the manager keeps the prompt until the user
-                // actually answers it. Taking it here meant `confirm_fingerprint`
-                // could no longer find the fingerprint to persist, and a second
-                // peer's prompt silently replaced the first one's.
-                let prompt = m.pending_fingerprint().cloned();
-                let sig = state_signature(&m);
-                (
-                    prompt,
-                    toasts,
-                    sig,
-                    ui_signature_from(&m, sig),
-                    transfer_signature(&m),
-                    m.ui_presence().focused,
-                )
-            };
-            // Anything that moved — or a prompt waiting on the user — keeps
-            // the loop fast for a while.
-            let mut moved = !toasts.is_empty() || prompt.is_some();
-            if ctx.save_history_if_changed(sig, last_save).await {
-                last_save = std::time::Instant::now();
-            }
-            for (level, message) in toasts {
-                let _ = app.emit(
-                    "toast",
-                    serde_json::json!({ "level": level, "message": message }),
-                );
-            }
-            let new_prompt =
-                ctx.publish_fingerprint_prompt(&app, prompt, &mut memory.last_fp_session);
-            // Emit refresh events only for what changed (see `refresh_events`).
-            let (events, changed) =
-                memory.refresh_events(ui_sig, transfer_sig, party_sig, new_prompt);
-            moved |= changed;
-            for event in events {
-                let _ = app.emit(event, ());
-            }
-            if moved {
-                last_activity = std::time::Instant::now();
-            }
-            delay = poll_delay(focused, last_activity.elapsed());
+            delay = ctx.tick(&app, &mut state).await;
         }
     });
+}
+
+impl PollContext {
+    /// One pass of the poll loop: drain the network and the Communities,
+    /// persist what changed, tell the webview, and say how long to sleep
+    /// before the next pass. Separate from the loop so a test can run the
+    /// loop's real body on a mock runtime, one tick at a time.
+    async fn tick<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        state: &mut PollState,
+    ) -> Duration {
+        let party_sig = self.poll_parties(&mut state.memory.joined_recorded).await;
+        if state.last_rehost.elapsed() >= REHOST_CHECK_INTERVAL {
+            state.last_rehost = std::time::Instant::now();
+            self.auto_rehost().await;
+        }
+        let (prompt, toasts, sig, ui_sig, transfer_sig, focused) = {
+            let mut m = self.manager.lock().await;
+            m.poll_session_events();
+            // Drain ChatManager's internal toasts (Connected, errors,
+            // "connection refused", …) so the webview can surface them.
+            let toasts: Vec<(&'static str, String)> = std::mem::take(&mut m.toasts)
+                .into_iter()
+                .map(|t| (toast_level_str(t.level), t.message))
+                .collect();
+            // Peek, never take: the manager keeps the prompt until the user
+            // actually answers it. Taking it here meant `confirm_fingerprint`
+            // could no longer find the fingerprint to persist, and a second
+            // peer's prompt silently replaced the first one's.
+            let prompt = m.pending_fingerprint().cloned();
+            let sig = state_signature(&m);
+            (
+                prompt,
+                toasts,
+                sig,
+                ui_signature_from(&m, sig),
+                transfer_signature(&m),
+                m.ui_presence().focused,
+            )
+        };
+        // Anything that moved — or a prompt waiting on the user — keeps
+        // the loop fast for a while.
+        let mut moved = !toasts.is_empty() || prompt.is_some();
+        if self.save_history_if_changed(sig, state.last_save).await {
+            state.last_save = std::time::Instant::now();
+        }
+        for (level, message) in toasts {
+            let _ = app.emit(
+                "toast",
+                serde_json::json!({ "level": level, "message": message }),
+            );
+        }
+        let new_prompt =
+            self.publish_fingerprint_prompt(app, prompt, &mut state.memory.last_fp_session);
+        // Emit refresh events only for what changed (see `refresh_events`).
+        let (events, changed) =
+            state
+                .memory
+                .refresh_events(ui_sig, transfer_sig, party_sig, new_prompt);
+        moved |= changed;
+        for event in events {
+            let _ = app.emit(event, ());
+        }
+        if moved {
+            state.last_activity = std::time::Instant::now();
+        }
+        poll_delay(focused, state.last_activity.elapsed())
+    }
 }
 
 impl PollContext {

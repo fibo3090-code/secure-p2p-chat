@@ -2779,3 +2779,88 @@ fn a_release_build_does_not_log_at_debug_level_by_default() {
     assert!(tracing_subscriber::EnvFilter::try_new(release).is_ok());
     assert!(crate::default_log_filter(true).contains("debug"));
 }
+
+/// The poll loop's own body, one tick at a time on the mock runtime: what the
+/// webview is told and what reaches disk. Each piece is tested on its own
+/// (`refresh_events`, `poll_delay`, the signatures); this pins that the loop
+/// actually wires them together — a toast raised by the core is drained and
+/// emitted exactly once, the first tick paints everything, a quiet tick sends
+/// nothing, a new message refreshes the chat surface and is written to the
+/// history, and the loop slows down only once nothing has moved for a while.
+#[test]
+fn a_poll_tick_emits_what_changed_and_persists_it() {
+    use messenger_core::types::ToastLevel;
+    use tauri::Listener;
+    let h = ready_harness();
+    let chat = h.seed_chat_with_incoming("Peer", 0);
+    let ctx = crate::PollContext::from_bridge(&h.bridge());
+    let handle = h._app.handle().clone();
+    let heard: Arc<StdMutex<Vec<(String, String)>>> = Arc::default();
+    for event in [
+        "toast",
+        "state-updated",
+        "transfers-updated",
+        "party-updated",
+    ] {
+        let heard = heard.clone();
+        handle.listen_any(event, move |e| {
+            heard
+                .lock()
+                .unwrap()
+                .push((event.to_string(), e.payload().to_string()));
+        });
+    }
+    let tick = |state: &mut crate::PollState| {
+        let delay = tauri::async_runtime::block_on(ctx.tick(&handle, state));
+        (std::mem::take(&mut *heard.lock().unwrap()), delay)
+    };
+    let names = |events: &[(String, String)]| -> Vec<String> {
+        events.iter().map(|(n, _)| n.clone()).collect()
+    };
+    let history = h.bridge().history_path.clone();
+    let _ = std::fs::remove_file(&history);
+
+    let manager = h.bridge().manager.clone();
+    tauri::async_runtime::block_on(async {
+        manager
+            .lock()
+            .await
+            .add_toast(ToastLevel::Error, "connection refused".into());
+    });
+    let mut state = crate::PollState::new();
+    let (events, delay) = tick(&mut state);
+    assert_eq!(
+        names(&events),
+        ["toast", "state-updated", "party-updated"],
+        "the first tick paints everything"
+    );
+    let toast: Value = serde_json::from_str(&events[0].1).unwrap();
+    assert_eq!(
+        toast,
+        json!({ "level": "error", "message": "connection refused" })
+    );
+    assert_eq!(delay, crate::POLL_FAST);
+    assert!(history.exists(), "the first tick did not save the history");
+    assert!(tauri::async_runtime::block_on(manager.lock())
+        .toasts
+        .is_empty());
+
+    let (events, _) = tick(&mut state);
+    assert!(events.is_empty(), "a quiet tick sent {events:?}");
+
+    // A message arrives: the chat surface refreshes and the history is
+    // written again once the save floor allows it.
+    std::fs::remove_file(&history).unwrap();
+    h.push_incoming(chat, "hello");
+    state.last_save = std::time::Instant::now() - crate::HISTORY_SAVE_MIN_INTERVAL;
+    let (events, _) = tick(&mut state);
+    assert_eq!(names(&events), ["state-updated"]);
+    assert!(history.exists(), "the new message was not saved");
+
+    // Nothing moved for longer than the idle threshold, window unfocused:
+    // the loop backs off.
+    state.last_activity = std::time::Instant::now() - crate::POLL_IDLE_AFTER;
+    let (events, delay) = tick(&mut state);
+    assert!(events.is_empty());
+    assert_eq!(delay, crate::POLL_SLOW);
+}
