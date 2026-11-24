@@ -929,6 +929,27 @@ mod tests {
         }
     }
 
+    /// A legacy numeric field is bounded at the longest decimal `u64` (20 bytes)
+    /// before it is parsed: `u64::MAX` itself still decodes, but anything longer
+    /// is refused — including padding that `trim` would otherwise have parsed
+    /// down to a number, so the decoder accepts nothing its encoder cannot make.
+    #[test]
+    fn legacy_number_fields_are_capped_at_the_longest_u64() {
+        let max = format!("PING:{}", u64::MAX);
+        assert_eq!(max.len() - "PING:".len(), 20);
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(max.as_bytes()),
+            Some(ProtocolMessage::Ping { seq: u64::MAX })
+        );
+        let padded = format!("PING:{}7", " ".repeat(20));
+        assert!(
+            ProtocolMessage::from_plain_bytes(padded.as_bytes()).is_none(),
+            "a 21-byte padded number was accepted"
+        );
+        let padded = format!("FILE_END:{}9", " ".repeat(40));
+        assert!(ProtocolMessage::from_plain_bytes(padded.as_bytes()).is_none());
+    }
+
     #[test]
     fn legacy_ascii_formats_still_parse() {
         assert_eq!(
