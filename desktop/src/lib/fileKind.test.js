@@ -10,11 +10,12 @@ describe("fileKind", () => {
   it("mirrors the bridge's list of extensions that execute", () => {
     const rust = readFileSync(resolve(here, "../../src-tauri/src/commands/chats.rs"), "utf8");
     // The list is a whitespace-separated string literal (`\` continues it
-    // across lines); an array of literals is accepted too.
+    // across lines, CRLF in a Windows checkout); an array of literals is
+    // accepted too.
     const list = rust.match(/const RISKY_EXTENSIONS: &str = "([^"]*)";/);
     const array = rust.match(/const RISKY_EXTENSIONS: &\[&str\] = &\[([\s\S]*?)\];/);
     const fromRust = list
-      ? list[1].replace(/\\\n/g, " ").split(/\s+/).filter(Boolean)
+      ? list[1].replace(/\\\r?\n/g, " ").split(/\s+/).filter(Boolean)
       : [...array[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(fromRust.length).toBeGreaterThan(40);
     expect([...RISKY_EXTENSIONS].sort()).toEqual([...fromRust].sort());
