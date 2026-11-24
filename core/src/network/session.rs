@@ -1913,6 +1913,51 @@ mod tests {
         }
     }
 
+    /// Delivery receipts are matched on the wire sequence `send` reports: a
+    /// whole text, the *final* chunk of a long one, and a file's `FileEnd`
+    /// each report the seq they went out with; a middle chunk or a ping
+    /// reports nothing, or the receipt FIFO would fall out of step.
+    #[tokio::test]
+    async fn send_reports_the_seq_of_each_frame_that_completes_a_message() {
+        let key: [u8; 32] = rand::random();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, b"aad".to_vec(), tx);
+        let chunk = |chunk_index| ProtocolMessage::TextChunk {
+            message_id: uuid::Uuid::nil(),
+            chunk_index,
+            total_chunks: 2,
+            text_part: "x".into(),
+            timestamp: 0,
+            seq: 0,
+        };
+        let frames = [
+            ProtocolMessage::Text {
+                text: "hi".into(),
+                timestamp: 0,
+                seq: 0,
+            },
+            chunk(0),
+            chunk(1),
+            ProtocolMessage::Ping { seq: 0 },
+            ProtocolMessage::FileEnd { seq: 0 },
+        ];
+        for frame in frames {
+            transport.send(frame).await.unwrap();
+        }
+        let reported: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| format!("{e:?}"))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                format!("{:?}", SessionEvent::TextSendComplete { seq: 1 }),
+                format!("{:?}", SessionEvent::TextSendComplete { seq: 3 }),
+                format!("{:?}", SessionEvent::FileSendComplete { seq: 5 }),
+            ]
+        );
+    }
+
     /// EXT-01: a client's `Rekey` must not move the host's key.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
