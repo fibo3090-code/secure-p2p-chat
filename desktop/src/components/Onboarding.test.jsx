@@ -92,7 +92,10 @@ describe("SetPasswordScreen", () => {
 
   it("shows the new identity's fingerprint", () => {
     render(<SetPasswordScreen minLength={12} fingerprint={"ab".repeat(32)} onSet={async () => ""} />);
-    expect(screen.getByText(/^abababab/)).toBeTruthy();
+    // Grouped in fours for reading, and labelled — an unlabelled hex string
+    // above a password field explained nothing.
+    expect(screen.getByText(/^abab abab/)).toBeTruthy();
+    expect(screen.getByText("Your new fingerprint")).toBeTruthy();
   });
 });
 

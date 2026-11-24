@@ -1,12 +1,58 @@
 // Settings pane — identity, messaging/privacy, hosting, files, appearance, about.
 // Only settings the runtime actually honors are shown; every change saves
 // immediately (config persists inside the encrypted history file).
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { cx, Avatar, Button, Modal, PasswordInput } from "./ui.jsx";
+import { cx, Avatar, Button, Modal, PasswordInput, Page } from "./ui.jsx";
 import { THEMES } from "../lib/themes.js";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
+
+// Section index for a long settings page. The subtitle used to list the
+// sections as plain monospace text — a navigation bar pretending to be prose.
+const SECTIONS = [
+  ["set-identity", "Identity", "user"],
+  ["set-privacy", "Privacy", "lock"],
+  ["set-hosting", "Hosting", "radio"],
+  ["set-files", "Files", "folder"],
+  ["set-appearance", "Appearance", "palette"],
+  ["set-support", "Support", "info"],
+  ["set-about", "How it works", "shieldCheck"],
+];
+
+function SettingsNav() {
+  const [active, setActive] = useState(SECTIONS[0][0]);
+  const navRef = useRef(null);
+  useEffect(() => {
+    // Highlight the section in view. jsdom has no IntersectionObserver, and a
+    // static first item is a fine fallback anywhere it is missing.
+    if (typeof IntersectionObserver === "undefined") return undefined;
+    const root = navRef.current?.parentElement?.querySelector(".page-scroll") || null;
+    const seen = new Map();
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((e) => seen.set(e.target.id, e.isIntersecting));
+      const first = SECTIONS.find(([id]) => seen.get(id));
+      if (first) setActive(first[0]);
+    }, { root, rootMargin: "0px 0px -60% 0px" });
+    SECTIONS.forEach(([id]) => { const el = document.getElementById(id); if (el) io.observe(el); });
+    return () => io.disconnect();
+  }, []);
+  return (
+    <nav className="set-nav" aria-label="Settings sections" ref={navRef}>
+      {SECTIONS.map(([id, label, icon]) => (
+        <a key={id} href={`#${id}`} className={cx("set-nav-item", active === id && "is-active")}
+          aria-current={active === id ? "true" : undefined}
+          onClick={(e) => {
+            e.preventDefault();
+            setActive(id);
+            document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}>
+          <Icon name={icon} size={16} /> {label}
+        </a>
+      ))}
+    </nav>
+  );
+}
 
 function Toggle({ on, onChange, label, hint }) {
   return (
@@ -20,8 +66,10 @@ function Toggle({ on, onChange, label, hint }) {
   );
 }
 
-// Rotate the identity file's password. The key is untouched (history and
-// fingerprint survive), and the copy says so: people expect this to cost history.
+// Rotate the password protecting the identity file. The key inside is
+// untouched, so history stays readable and contacts keep seeing the same
+// fingerprint — the copy says so, because "change password" in a messenger is
+// exactly the kind of action people expect to cost them their history.
 function ChangePasswordDialog({ open, onClose, minLength }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -29,8 +77,9 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // Clear on every close: this stays mounted, and a typed password must not
-  // linger in state or the DOM.
+  // Clear on every close: this component stays mounted, and leaving a typed
+  // password sitting in state (and in the DOM) until the next open is exactly
+  // what a password field must not do.
   useEffect(() => {
     if (open) return;
     setCurrent(""); setNext(""); setConfirm(""); setErr(""); setBusy(false);
@@ -88,7 +137,8 @@ function ChangePasswordDialog({ open, onClose, minLength }) {
   );
 }
 
-// Delete everything on this device. Irreversible, so two guards: the password
+// Delete everything on this device. Two guards, because this is the one action
+// that destroys the identity itself and nothing can bring it back: the password
 // (checked by the backend against the file on disk) and the typed word.
 export const DELETE_WORD = "DELETE";
 
@@ -218,32 +268,45 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
   }
 
   return (
-    <div className="chat-pane">
-      <header className="chat-head">
-        <div className="chat-head-l">
-          <div className="chat-head-info">
-            <div className="chat-head-name">Settings</div>
-            <div className="chat-head-sub mono">identity · privacy · hosting · files · appearance</div>
-          </div>
-        </div>
-      </header>
-
-      <div className="chat-scroll" style={{ padding: 24, maxWidth: 620 }}>
-        <section className="set-block">
-          <div className="set-h">Your identity</div>
-          <div className="set-id">
-            <Avatar name={identity?.name} size={46} />
-            <div>
-              <input className="set-id-name-input" value={nameDraft} maxLength={48}
-                aria-label="Display name"
-                onChange={(e) => setNameDraft(e.target.value)}
-                onBlur={commitName}
-                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} />
-              <code className="set-id-fp">{(identity?.fingerprint || "").replace(/(.{4})/g, "$1 ").trim()}</code>
+    <Page title="Settings" bodyClass="set-layout" nav={<SettingsNav />}
+      sub="Changes save as you make them.">
+      <div className="set-scroll">
+        <section className="set-block" id="set-identity" aria-labelledby="set-identity-h">
+          <h2 className="set-h" id="set-identity-h">Your identity</h2>
+          {/* One identity card: who you are to others, the key that proves it,
+              and what that means — instead of a card, a loose caption and a
+              wrapped hex block. */}
+          <div className="id-card">
+            <div className="set-id">
+              <Avatar name={identity?.name} size={48} />
+              <div className="set-id-main">
+                <input className="set-id-name-input" value={nameDraft} maxLength={48}
+                  aria-label="Display name" title="Click to rename"
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onBlur={commitName}
+                  onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()} />
+                <div className="set-id-fprow">
+                  <span className="set-id-fplabel">Fingerprint</span>
+                  <code className="set-id-fp" title={identity?.fingerprint || ""}>
+                    {(identity?.fingerprint || "").replace(/(.{4})/g, "$1 ").trim()}
+                  </code>
+                  <button className="set-id-copy" aria-label="Copy your fingerprint" title="Copy"
+                    onClick={() => navigator.clipboard?.writeText(identity?.fingerprint || "")
+                      .then(() => toast("Fingerprint copied", "success"))
+                      .catch(() => toast("Could not copy", "error"))}>
+                    <Icon name="copy" size={14} />
+                  </button>
+                </div>
+              </div>
             </div>
+            <p className="set-id-foot">
+              Your name goes into the invite links you share. Your keys are stored encrypted
+              on this device and never leave it.
+            </p>
           </div>
-          <div className="set-note">Your display name goes into the invite links you share. Keys are stored encrypted on this device and never leave it.</div>
-          {/* A lost identity file cannot be undone, so say whether a backup exists. */}
+          {/* Losing the identity file is the one failure this app cannot undo,
+              so the row states plainly whether a backup exists rather than
+              offering an Export button with no indication either way. */}
           <div className={cx("set-row", !backedUp && "is-warn")}>
             <span className="set-row-txt">
               <span className="set-row-label">
@@ -270,6 +333,9 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               <Icon name="copy" size={14} /> {backedUp ? "Export again" : "Export now"}
             </button>
           </div>
+          {/* A security product with no way to rotate its one password is a gap
+              users notice — and a leaked or shoulder-surfed password is exactly
+              the moment someone goes looking for this. */}
           <div className="set-row">
             <span className="set-row-txt">
               <span className="set-row-label">Password</span>
@@ -289,16 +355,16 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
 
         {s && (
           <>
-            <section className="set-block">
-              <div className="set-h">Messaging &amp; privacy</div>
+            <section className="set-block" id="set-privacy" aria-labelledby="set-privacy-h">
+              <h2 className="set-h" id="set-privacy-h">Messaging &amp; privacy</h2>
               <Toggle label="Desktop notifications" hint="Notify when a message arrives in the background"
                 on={s.enable_notifications} onChange={(v) => apply({ enable_notifications: v })} />
               <Toggle label="Send typing indicators" hint="Peers can see when you are typing (they see nothing when off)"
                 on={s.enable_typing_indicators} onChange={(v) => apply({ enable_typing_indicators: v })} />
             </section>
 
-            <section className="set-block">
-              <div className="set-h">Hosting</div>
+            <section className="set-block" id="set-hosting" aria-labelledby="set-hosting-h">
+              <h2 className="set-h" id="set-hosting-h">Hosting</h2>
               <Toggle label="Host automatically on startup" hint="Start listening for peers as soon as the app unlocks"
                 on={s.auto_host_on_startup} onChange={(v) => apply({ auto_host_on_startup: v })} />
               <Toggle label="UPnP port mapping" hint="Ask the router to make the host reachable from the internet; the external address goes into your invite"
@@ -319,14 +385,14 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
               </div>
             </section>
 
-            <section className="set-block">
-              <div className="set-h">Files</div>
+            <section className="set-block" id="set-files" aria-labelledby="set-files-h">
+              <h2 className="set-h" id="set-files-h">Files</h2>
               <Toggle label="Auto-accept incoming files" hint="When off, each incoming file must be accepted in the conversation before it is saved"
                 on={s.auto_accept_files} onChange={(v) => apply({ auto_accept_files: v })} />
               <div className="set-row">
                 <span className="set-row-txt">
                   <span className="set-row-label">Download folder</span>
-                  <span className="set-row-hint mono">{s.download_dir}</span>
+                  <span className="set-row-hint set-path">{s.download_dir}</span>
                 </span>
                 <button className="set-change" onClick={changeDownloadDir}>
                   <Icon name="folder" size={14} /> Change
@@ -336,8 +402,8 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
           </>
         )}
 
-        <section className="set-block">
-          <div className="set-h">Appearance</div>
+        <section className="set-block" id="set-appearance" aria-labelledby="set-appearance-h">
+          <h2 className="set-h" id="set-appearance-h">Appearance</h2>
           <div className="set-themes">
             {THEMES.map((t) => (
               <button key={t.id} className={cx("set-theme", theme === t.id && "is-active")} onClick={() => setTheme(t.id)}>
@@ -349,8 +415,8 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
           </div>
         </section>
 
-        <section className="set-block">
-          <div className="set-h">Support</div>
+        <section className="set-block" id="set-support" aria-labelledby="set-support-h">
+          <h2 className="set-h" id="set-support-h">Support</h2>
           <div className="set-row">
             <span className="set-row-txt">
               <span className="set-row-label">Export diagnostics</span>
@@ -389,8 +455,8 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
         </section>
         <DeleteAllDialog open={wipeOpen} onClose={() => setWipeOpen(false)} />
 
-        <section className="set-block">
-          <div className="set-h">How P2PEM works</div>
+        <section className="set-block" id="set-about" aria-labelledby="set-about-h">
+          <h2 className="set-h" id="set-about-h">How P2PEM works</h2>
           <div className="set-note">
             P2PEM is an encrypted peer-to-peer messenger: conversations go directly
             between you and your peer (or through a blind relay that only forwards
@@ -412,6 +478,6 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
           </div>
         </section>
       </div>
-    </div>
+    </Page>
   );
 }

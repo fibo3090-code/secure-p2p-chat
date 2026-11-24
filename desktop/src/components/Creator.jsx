@@ -2,15 +2,15 @@
 // wait for a peer (Host), or share/import an invite link (Invite).
 import { useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { Modal, Button, Input, PasswordInput } from "./ui.jsx";
+import { cx, Modal, Button, Input, PasswordInput } from "./ui.jsx";
 import { api, friendlyError } from "../lib/bridge.js";
 import { parsePort } from "../lib/parse.js";
 import { toast } from "../lib/toast.js";
 
 const MODES = [
-  { id: "connect", icon: "send", label: "Connect" },
-  { id: "host", icon: "server", label: "Host" },
-  { id: "invite", icon: "user", label: "Invite" },
+  { id: "connect", icon: "send", label: "Dial" },
+  { id: "host", icon: "radio", label: "Host" },
+  { id: "invite", icon: "link", label: "Invite link" },
 ];
 
 function CopyLine({ value }) {
@@ -35,14 +35,15 @@ function CopyLine({ value }) {
   );
 }
 
+
+const DEFAULT_PORT = 12345;
+
 const TRANSPORTS = [
   { id: "direct", icon: "plug", label: "Direct" },
   { id: "relay", icon: "satellite", label: "Via relay" },
 ];
 
-const DEFAULT_PORT = 12345;
-
-export function Creator({ open, onClose, initialMode }) {
+export function Creator({ open, onClose, initialMode, initialRelay = false }) {
   const [mode, setMode] = useState(initialMode || "connect");
   const [transport, setTransport] = useState("direct");
   const [addr, setAddr] = useState("");
@@ -62,7 +63,8 @@ export function Creator({ open, onClose, initialMode }) {
   // Open on the tab the caller asked for (the get-started panel's suggestions).
   useEffect(() => {
     if (open && initialMode) setMode(initialMode);
-  }, [open, initialMode]);
+    if (open) setTransport(initialRelay ? "relay" : "direct");
+  }, [open, initialMode, initialRelay]);
 
   // Clear per-attempt state on close: this stays mounted, and a connection
   // password meant for host A was once silently sent to host B.
@@ -193,35 +195,46 @@ export function Creator({ open, onClose, initialMode }) {
     });
   }
 
+  // How the bytes travel, chosen up front for dialling and hosting: a direct
+  // connection, or through a relay when neither side can accept one.
+  const viaRelay = transport === "relay";
+  const transportPicker = (mode === "connect" || mode === "host") && (
+    <div className="seg seg-sub" role="radiogroup" aria-label="How to connect">
+      {TRANSPORTS.map((t) => (
+        <button key={t.id} role="radio" aria-checked={transport === t.id}
+          className={cx("seg-btn", transport === t.id && "is-active")}
+          onClick={() => { setTransport(t.id); reset(); }}>
+          <Icon name={t.icon} size={14} />{t.label}
+        </button>
+      ))}
+    </div>
+  );
+  let primary = null;
+  if (mode === "connect" && !viaRelay) primary = <Button icon="send" onClick={connect} disabled={busy}>Connect</Button>;
+  if (mode === "connect" && viaRelay) primary = <Button icon="satellite" onClick={relayConnect} disabled={busy}>Connect</Button>;
+  if (mode === "host" && !viaRelay) primary = <Button icon="radio" onClick={host} disabled={busy}>Start hosting</Button>;
+  if (mode === "host" && viaRelay) primary = <Button icon="satellite" onClick={relayHost} disabled={busy}>Open relay session</Button>;
+  if (mode === "invite") primary = <Button icon="userPlus" onClick={doImport} disabled={busy}>Add</Button>;
+
   return (
-    <Modal open={open} onClose={onClose} width={460} title="New connection" icon="plus"
-      sub="Start an encrypted conversation">
-      <div className="creator-seg">
+    <Modal open={open} onClose={onClose} width={480} title="New connection" icon="plus"
+      sub="Start an end-to-end encrypted conversation">
+      <div className="seg" role="tablist" aria-label="How to connect">
         {MODES.map((m) => (
-          <button key={m.id} className={mode === m.id ? "is-active" : ""}
+          <button key={m.id} role="tab" aria-selected={mode === m.id} className={cx("seg-btn", mode === m.id && "is-active")}
             onClick={() => { setMode(m.id); reset(); }}>
-            <Icon name={m.icon} size={18} />{m.label}
+            <Icon name={m.icon} size={15} />{m.label}
           </button>
         ))}
       </div>
+      {transportPicker}
 
-      {(mode === "connect" || mode === "host") && (
-        <div className="creator-seg creator-seg-sub">
-          {TRANSPORTS.map((t) => (
-            <button key={t.id} className={transport === t.id ? "is-active" : ""}
-              onClick={() => { setTransport(t.id); reset(); }}>
-              <Icon name={t.icon} size={15} />{t.label}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {mode === "connect" && transport === "direct" && (
+      {mode === "connect" && !viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead"><strong>Dial a peer</strong> who is hosting. You'll verify their fingerprint before any message is trusted.</p>
+          <p className="creator-lead">Dial someone who is already hosting. You'll compare a safety code before anything is trusted.</p>
           {nearby && nearby.length > 0 && (
             <div className="creator-nearby">
-              <span className="creator-nearby-h"><Icon name="search" size={13} /> Nearby peers</span>
+              <span className="creator-nearby-h"><Icon name="search" size={13} /> Nearby</span>
               {nearby.map((p) => (
                 <button key={`${p.address}:${p.port}`} className="creator-nearby-row"
                   onClick={() => setAddr(`${p.address}:${p.port}`)}>
@@ -231,96 +244,108 @@ export function Creator({ open, onClose, initialMode }) {
               ))}
             </div>
           )}
-          <div className="creator-row">
-            <Input value={addr} autoFocus placeholder="192.168.1.20:12345"
+          <div className="field">
+            <label className="field-label" htmlFor="cr-addr">Their address</label>
+            <Input id="cr-addr" mono value={addr} autoFocus placeholder="192.168.1.20:12345"
               onChange={(e) => setAddr(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && connect()} />
-            <Button icon="send" onClick={connect} disabled={busy}>Connect</Button>
           </div>
-          <div className="creator-row">
-            <PasswordInput value={password} placeholder="Connection password (if the host set one)"
+          <div className="field">
+            <label className="field-label" htmlFor="cr-pass">Connection password <span className="field-opt">if they set one</span></label>
+            <PasswordInput id="cr-pass" value={password} autoComplete="off"
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && connect()} />
           </div>
         </div>
       )}
 
-      {mode === "connect" && transport === "relay" && (
+      {mode === "connect" && viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead"><strong>Dial through a relay.</strong> The relay only forwards bytes — your conversation stays end-to-end encrypted and you still verify the fingerprint.</p>
-          <div className="creator-row">
-            <Input value={relay} autoFocus placeholder="relay.example.com:9000"
+          <p className="creator-lead">Use the relay and token the other person shared with you.</p>
+          <div className="field">
+            <label className="field-label" htmlFor="cr-relay">Relay address</label>
+            <Input id="cr-relay" mono value={relay} autoFocus placeholder="relay.example.com:9000"
               onChange={(e) => setRelay(e.target.value)} />
           </div>
-          <div className="creator-row">
-            <Input value={relayToken} placeholder="Connection token from your peer"
+          <div className="field">
+            <label className="field-label" htmlFor="cr-token">Token from your peer</label>
+            <Input id="cr-token" value={relayToken} placeholder="Connection token from your peer"
               onChange={(e) => setRelayToken(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && relayConnect()} />
-            <Button icon="satellite" onClick={relayConnect} disabled={busy}>Connect</Button>
           </div>
         </div>
       )}
 
-      {mode === "host" && transport === "direct" && (
+      {mode === "host" && !viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead"><strong>Wait for a peer</strong> to dial you. Share your address (or an invite link) and keep the app open.</p>
-          <div className="creator-row">
-            <Input value={port} onChange={(e) => setPort(e.target.value)} style={{ maxWidth: 130 }} />
-            <Button variant="ghost" icon="server" onClick={host} disabled={busy}>Start hosting</Button>
-          </div>
-          <div className="creator-row">
-            <PasswordInput value={password} placeholder="Require a connection password (optional)"
-              onChange={(e) => setPassword(e.target.value)} />
+          <p className="creator-lead">Wait for someone to dial you. Share your address or invite link, and keep the app open.</p>
+          <div className="field-grid is-port">
+            <div className="field">
+              <label className="field-label" htmlFor="cr-port">Port</label>
+              <Input id="cr-port" mono value={port} onChange={(e) => setPort(e.target.value)} inputMode="numeric" />
+            </div>
+            <div className="field">
+              <label className="field-label" htmlFor="cr-hpass">Require a password <span className="field-opt">optional</span></label>
+              <PasswordInput id="cr-hpass" value={password} autoComplete="new-password"
+                onChange={(e) => setPassword(e.target.value)} />
+            </div>
           </div>
           {hostAddr && (
-            <>
-              <p className="creator-lead" style={{ marginTop: 10 }}><strong>Share this address</strong> with your peer:</p>
+            <div className="field">
+              <span className="field-label">Share this address</span>
               <CopyLine value={hostAddr.local || "address unavailable — share an invite link instead"} />
               {hostAddr.external && (
                 <>
-                  <p className="creator-lead" style={{ marginTop: 6 }}>Reachable from the internet (UPnP):</p>
+                  <span className="field-hint">Reachable from the internet (UPnP):</span>
                   <CopyLine value={hostAddr.external} />
                 </>
               )}
-            </>
+            </div>
           )}
         </div>
       )}
 
-      {mode === "host" && transport === "relay" && (
+      {mode === "host" && viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead"><strong>Host through a relay</strong> — no port-forwarding needed. The relay brokers the connection; share the relay address and token below with your peer.</p>
-          <div className="creator-row">
-            <Input value={relay} autoFocus placeholder="relay.example.com:9000"
+          <p className="creator-lead">No port forwarding needed: the relay brokers the connection. You'll get a token to share.</p>
+          <div className="field">
+            <label className="field-label" htmlFor="cr-hrelay">Relay address</label>
+            <Input id="cr-hrelay" mono value={relay} autoFocus placeholder="relay.example.com:9000"
               onChange={(e) => setRelay(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && relayHost()} />
-            <Button variant="ghost" icon="satellite" onClick={relayHost} disabled={busy}>Open relay</Button>
           </div>
           {hostToken && (
-            <>
-              <p className="creator-lead" style={{ marginTop: 10 }}><strong>Connection token</strong> — share with your peer alongside <code>{relay.trim()}</code>:</p>
+            <div className="field">
+              <span className="field-label">Share this token, along with <code>{relay.trim()}</code></span>
               <CopyLine value={hostToken} />
-            </>
+            </div>
           )}
         </div>
       )}
 
       {mode === "invite" && (
         <div className="creator-pane">
-          <p className="creator-lead"><strong>Your invite link</strong> — send it to a friend; it carries your address, fingerprint and key.</p>
-          <CopyLine value={myLink} />
-          <p className="creator-lead" style={{ marginTop: 6 }}><strong>Have a link?</strong> Paste it to add the contact and connect.</p>
-          <div className="creator-row">
-            <Input value={importLink} placeholder="chat-p2p://invite/…"
+          <div className="field">
+            <span className="field-label">Your invite link</span>
+            <CopyLine value={myLink} />
+            <span className="field-hint">Send it however you already talk. It carries your address and key — they'll still compare a safety code with you.</span>
+          </div>
+          <div className="field">
+            <label className="field-label" htmlFor="cr-import">Have their link? Paste it</label>
+            <Input id="cr-import" value={importLink} placeholder="chat-p2p://invite/…"
               onChange={(e) => setImportLink(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && doImport()} />
-            <Button icon="plus" onClick={doImport} disabled={busy}>Add</Button>
           </div>
         </div>
       )}
 
-      {err && <div className="onb-err" style={{ marginTop: 14 }}><Icon name="alert" size={13} /> {err}</div>}
-      {note && <div className="creator-lead" style={{ marginTop: 14, color: "var(--success)" }}>{note}</div>}
+      {err && <div className="onb-err" style={{ marginTop: 12 }}><Icon name="alert" size={13} /> {err}</div>}
+      {note && <div className="creator-lead" style={{ marginTop: 12, color: "var(--success)" }}>{note}</div>}
+
+      <div className="modal-foot">
+        <span />
+        <div className="modal-foot-actions">{primary}</div>
+      </div>
     </Modal>
   );
 }

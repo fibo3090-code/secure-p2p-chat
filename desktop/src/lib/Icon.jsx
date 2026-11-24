@@ -11,6 +11,8 @@ import {
   Megaphone, MessageSquare, Monitor, Moon, Paperclip, Pencil, Plug, Plus, RefreshCw,
   Satellite, Search, Send, Server, Settings, Shield, ShieldCheck, Sun,
   Trash2, TriangleAlert, User, Users, X,
+  CheckCheck, RadioTower, FileWarning, FileText, FileImage, SquarePen, Ban, ShieldAlert,
+  Palette, Bell, HardDrive, Network, Link, UserPlus,
 } from "lucide-react";
 
 const MAP = {
@@ -25,6 +27,9 @@ const MAP = {
   swap: ArrowLeftRight, more: EllipsisVertical, edit: Pencil, info: Info,
   plug: Plug, satellite: Satellite, hash: Hash, monitor: Monitor,
   folder: Folder, megaphone: Megaphone,
+  checkCheck: CheckCheck, radio: RadioTower, fileWarn: FileWarning, fileText: FileText,
+  fileImage: FileImage, compose: SquarePen, ban: Ban, shieldAlert: ShieldAlert,
+  palette: Palette, bell: Bell, drive: HardDrive, network: Network, link: Link, userPlus: UserPlus,
 };
 
 function IconInner({ name, size = 18, ...rest }) {

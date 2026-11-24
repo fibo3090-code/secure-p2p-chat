@@ -66,7 +66,7 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 /// Chrome accent (borders, key hints) from design/tokens.json. Semantic colors
 /// (success/warning/error/info) stay separate: they carry meaning, not brand.
-pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x3e, 0x8d, 0xd2);
+pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x4a, 0x68, 0xec);
 
 /// A bordered block in `color`.
 pub(crate) fn block<'a>(title: impl Into<Line<'a>>, color: Color) -> Block<'a> {

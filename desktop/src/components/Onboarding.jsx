@@ -2,6 +2,7 @@
 // password capture wired to the bridge. Also the app's boot screen: the first
 // thing a user ever sees is `BootScreen`, so it has to be able to explain
 // itself when the bridge is slow or fails rather than render nothing.
+import { Logo } from "./Logo.jsx";
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Button, PasswordInput } from "./ui.jsx";
@@ -11,7 +12,7 @@ import { friendlyError } from "../lib/bridge.js";
 function Brand({ sub }) {
   return (
     <div className="brand">
-      <span className="brand-mark"><Icon name="shieldCheck" size={26} /></span>
+      <span className="brand-mark"><Logo size={56} /></span>
       <div>
         <div className="brand-name">P2PEM</div>
         <div className="brand-sub">{sub || "Encrypted peer-to-peer messenger"}</div>
@@ -149,7 +150,12 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
           This password encrypts your identity and message history on this device.
           There is no account and no recovery — nobody, including us, can reset it.
         </div>
-        {fingerprint && <code className="onb-fp-code">{fingerprint.slice(0, 32)}…</code>}
+        {fingerprint && (
+          <div className="onb-field">
+            <span className="onb-flabel">Your new fingerprint</span>
+            <code className="onb-fp-code" title={fingerprint}>{fingerprint.slice(0, 32).replace(/(.{4})/g, "$1 ").trim()} …</code>
+          </div>
+        )}
         <div className="onb-field">
           <PasswordInput value={pw} autoFocus placeholder={`New password (${min}+ characters)`} disabled={busy}
             autoComplete="new-password"

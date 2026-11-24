@@ -1,8 +1,9 @@
-// Communities (Party servers): multi-channel rooms served by `messenger-server`,
-// driven through the party_* commands and refreshed on `party-updated`.
+// Communities (Party servers) — administered, multi-channel, persistent rooms
+// served by the `messenger-server` crate, driven live through the Tauri bridge
+// (party_* commands) and refreshed on the `party-updated` event.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
+import { cx, Avatar, Button, Input, PasswordInput, Page } from "./ui.jsx";
 import { api, onBridge, fmtTime, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
@@ -11,8 +12,10 @@ import {
   ROLES, kindIcon,
 } from "./PartyAdmin.jsx";
 
-// Roles this viewer may assign to `member`, mirroring the server's rule
-// (`Role::may_assign`, and never at or above your own).
+// Roles this viewer may actually assign to `member`, mirroring the server's rule
+// (`Role::may_assign` plus the "not at or above your own" check). Rendering the
+// full list meant an admin was offered `admin` for a peer admin — pre-selected,
+// even — and every attempt came back refused.
 function assignableRoles(myRole, member) {
   if (member.is_me || member.role === "owner") return [];
   const rank = { guest: 0, member: 1, admin: 2, owner: 3 };
@@ -30,7 +33,9 @@ const STATUS_LABEL = {
   disconnected: "Disconnected",
 };
 
-// Mirror the server's caps for immediate feedback; the server stays authoritative.
+// Mirror the server-side caps (`messenger-server` state.rs: MAX_USERNAME_CHARS /
+// MAX_CHANNEL_NAME_CHARS) so the UI gives immediate feedback instead of relying on
+// a server rejection. The server remains authoritative.
 const MAX_USERNAME_CHARS = 32;
 const MAX_CHANNEL_NAME_CHARS = 64;
 
@@ -46,12 +51,14 @@ function JoinForm({ onJoined, onCancel, initial }) {
   const [saved, setSaved] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  // A never-seen server: nothing (not even the username) is sent until the
-  // user confirms the code.
+  // A server whose identity has never been seen before. Nothing has been sent
+  // to it yet — not the username, not the password — until the user confirms
+  // the code below.
   const [verify, setVerify] = useState(null);
 
   useEffect(() => {
-    // Not cosmetic: parties.json holds every pin, and joining refuses without it.
+    // A failure here is not cosmetic: parties.json holds the pinned fingerprint
+    // of every community, and the bridge refuses to join when it cannot be read.
     api.partySaved()
       .then((s) => setSaved(s || []))
       .catch((e) => { setSaved([]); setErr(friendlyError(e)); });
@@ -78,88 +85,149 @@ function JoinForm({ onJoined, onCancel, initial }) {
   }
 
   const join = () => joinWith(address, username, password);
+  const pickedSaved = saved.find((p) => p.address === address.trim() && p.username === username.trim());
+  // With saved communities, the blank form waits behind "Join another
+  // community" — picking one of yours is the common path.
+  const [another, setAnother] = useState(false);
+  // A known community only needs its password; the address and username are
+  // already right, so they stay folded unless the user asks to edit them.
+  const [editDetails, setEditDetails] = useState(false);
+  const showForm = saved.length === 0 || !!pickedSaved || another;
+  const passRef = useRef(null);
+  // Field-level errors sit on the field they are about, not at the bottom of
+  // the form under the password box.
+  const errField = err === "Enter the server address." ? "addr"
+    : /^(Choose a username|Username must)/.test(err) ? "user" : null;
+  const fieldErr = (id) => errField === id && (
+    <div className="onb-err" id={`party-${id}-err`}><Icon name="alert" size={13} /> {err}</div>
+  );
+
+  // Said once, as a calm callout rather than a bold clause buried in the middle
+  // of a paragraph: what a community is, and the one thing it is not.
+  const notE2E = (
+    <div className="callout is-warn">
+      <Icon name="shieldAlert" size={16} />
+      <p>
+        <strong>Communities are not end-to-end encrypted.</strong> Messages, DMs and
+        files are stored on the server, readable by whoever runs it. For private
+        conversations, use a direct chat.
+      </p>
+    </div>
+  );
 
   if (verify) {
     return (
-      <div className="chat-pane chat-empty">
-        <div className="chat-empty-inner" style={{ maxWidth: 460 }}>
-          <span className="chat-empty-ic"><Icon name="lock" size={28} /></span>
-          <div className="chat-empty-h">Verify this community server</div>
-          <div className="chat-empty-p">
+      <Page title="Communities" sub="Check the server before anything is sent to it.">
+        <section className="card is-focus">
+          <div className="card-ic"><Icon name="fingerprint" size={22} /></div>
+          <h2 className="card-title">Verify this community server</h2>
+          <p className="card-lead">
             You have never joined <code>{verify.address}</code> before. Your username and
             password have <strong>not</strong> been sent yet. Check that this fingerprint
             matches the one the operator gave you — their server prints it every time it
             starts:
-          </div>
+          </p>
           <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
-          <div className="chat-empty-p">
-            Messages, DMs and files you post in a community are <strong>not end-to-end
-            encrypted</strong>: they are stored on the server readable by its operator.
-          </div>
-          <div className="party-join">
-            <Button icon="check" disabled={busy} full
-              onClick={() => joinWith(verify.address, verify.username, verify.password, verify.fingerprint)}>
-              The fingerprint matches — join
-            </Button>
-            <Button variant="ghost" full disabled={busy}
+          {notE2E}
+          <div className="card-actions">
+            <Button variant="ghost" disabled={busy}
               onClick={() => { setVerify(null); setBusy(false); }}>
               Cancel
             </Button>
+            <Button icon="check" disabled={busy}
+              onClick={() => joinWith(verify.address, verify.username, verify.password, verify.fingerprint)}>
+              The fingerprint matches — join
+            </Button>
           </div>
-        </div>
-      </div>
+        </section>
+      </Page>
     );
   }
 
   return (
-    <div className="chat-pane chat-empty">
-      <div className="chat-empty-inner" style={{ maxWidth: 440 }}>
-        <span className="chat-empty-ic"><Icon name="users" size={28} /></span>
-        <div className="chat-empty-h">Join a community</div>
-        <div className="chat-empty-p">
-          Communities are administered, multi-channel rooms that keep history on a
-          server someone runs. <strong>They are not end-to-end encrypted:</strong> the
-          operator can read every message, DM and file posted there. The first time you
-          join one you will be asked to check its fingerprint with the operator before
-          anything is sent.
-        </div>
-        {saved.length > 0 && (
-          <div className="party-saved">
-            <div className="party-saved-h">Your communities</div>
-            {saved.map((p) => (
-              // Selecting fills the form, never joins: joining from the card sent
-              // whatever password was in the shared box to the wrong community.
-              <button key={p.address} className="party-saved-card" disabled={busy}
-                title={`Fill in ${p.username}@${p.address}`}
-                onClick={() => { setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); }}>
-                <Avatar name={p.name || p.address} size={28} party />
-                <span className="party-saved-txt">
-                  <span className="party-saved-name">{p.name || p.address}</span>
-                  <span className="party-saved-sub mono">{p.username} · {p.address}</span>
-                </span>
-                <Icon name="chevronRight" size={14} />
-              </button>
-            ))}
-            <div className="party-saved-hint">
-              Pick one to fill the form below, then add its password if it has one and press
-              Connect &amp; join.
-            </div>
+    <Page title="Communities"
+      sub="Shared, multi-channel rooms hosted on a server someone runs."
+      actions={onCancel && <Button variant="ghost" icon="arrowLeft" onClick={onCancel}>Back</Button>}>
+      {notE2E}
+      {saved.length > 0 && (
+        <section>
+          <h2 className="section-h">Your communities</h2>
+          <div className="list-card">
+            {saved.map((p) => {
+              const picked = p.address === address.trim() && p.username === username.trim();
+              return (
+                // Selecting a saved community fills the form; it does not join.
+                // Joining straight from the card sent whatever happened to be in
+                // the shared password box — so a password typed for one
+                // community went to whichever card was clicked next.
+                <button key={p.address} className={cx("list-row", picked && "is-picked")} disabled={busy}
+                  title={`Fill in ${p.username}@${p.address}`} aria-pressed={picked}
+                  onClick={() => {
+                    setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); setEditDetails(false);
+                    // Next step is the password (if it has one), then Join.
+                    setTimeout(() => passRef.current?.focus(), 0);
+                  }}>
+                  <Avatar name={p.name || p.address} size={36} party />
+                  <span className="list-row-main">
+                    <span className="list-row-name">{p.name || p.address}</span>
+                    <span className="list-row-sub">Username: {p.username} · <span className="mono">{p.address}</span></span>
+                  </span>
+                  <span className={cx("list-row-use", picked && "is-on")}>{picked ? <><Icon name="check" size={14} /> Selected</> : "Rejoin"}</span>
+                </button>
+              );
+            })}
           </div>
-        )}
-        <div className="party-join">
-          <Input value={address} autoFocus placeholder="server address · 192.168.1.20:12345"
-            onChange={(e) => setAddress(e.target.value)} />
-          <Input value={username} placeholder="username" maxLength={MAX_USERNAME_CHARS}
-            onChange={(e) => setUsername(e.target.value)} />
-          <PasswordInput value={password} placeholder="server password (optional)"
-            onChange={(e) => setPassword(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && join()} />
-          <Button icon="users" onClick={join} disabled={busy} full>Connect &amp; join</Button>
-          {onCancel && <Button variant="ghost" onClick={onCancel} full>Cancel</Button>}
-          {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+        </section>
+      )}
+      {!showForm && (
+        <div>
+          <Button variant="ghost" icon="plus" onClick={() => setAnother(true)}>Join another community</Button>
         </div>
-      </div>
-    </div>
+      )}
+      {showForm && <form className="card" onSubmit={(e) => { e.preventDefault(); void join(); }}>
+        <h2 className="card-title">{pickedSaved ? `Rejoin ${pickedSaved.name || pickedSaved.address}` : "Join a community"}</h2>
+        <p className="card-lead">
+          {pickedSaved
+            ? "Add its password if it has one, then join."
+            : "Ask the operator for the server address and, if it has one, its password. The first time, you'll check its fingerprint before anything is sent."}
+        </p>
+        {pickedSaved && !editDetails ? (
+          <p className="field-hint">
+            As <strong>{pickedSaved.username}</strong> on <span className="mono">{pickedSaved.address}</span>
+            {" · "}<button type="button" className="chat-empty-link" onClick={() => setEditDetails(true)}>Edit details</button>
+          </p>
+        ) : (
+                <div className="field-grid">
+          <div className="field">
+            <label className="field-label" htmlFor="party-addr">Server address</label>
+            <Input id="party-addr" mono value={address} autoFocus placeholder="192.168.1.20:12345"
+              aria-invalid={errField === "addr" || undefined}
+              aria-describedby={errField === "addr" ? "party-addr-err" : undefined}
+              onChange={(e) => setAddress(e.target.value)} />
+            {fieldErr("addr")}
+          </div>
+          <div className="field">
+            <label className="field-label" htmlFor="party-user">Username</label>
+            <Input id="party-user" value={username} placeholder="How others will see you" maxLength={MAX_USERNAME_CHARS}
+              aria-invalid={errField === "user" || undefined}
+              aria-describedby={errField === "user" ? "party-user-err" : undefined}
+              onChange={(e) => setUsername(e.target.value)} />
+            {fieldErr("user")}
+          </div>
+        </div>
+        )}
+        <div className="field">
+          <label className="field-label" htmlFor="party-pass">Server password <span className="field-opt">optional</span></label>
+          <PasswordInput id="party-pass" ref={passRef} value={password} placeholder="Leave empty if the server has none"
+            autoComplete="off"
+            onChange={(e) => setPassword(e.target.value)} />
+        </div>
+        {err && !errField && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+        <div className="card-actions">
+          <Button icon="users" type="submit" disabled={busy}>Connect &amp; join</Button>
+        </div>
+      </form>}
+    </Page>
   );
 }
 
@@ -178,7 +246,9 @@ function MessageRow({ m, onDownload, downloading }) {
       <div className="msg-bubble">
         {!mine && <span className="msg-author">{m.sender_name}</span>}
         {isFile ? (
-          // A download is a server round trip, so the click must show progress.
+          // A download is a round trip to the community server, so the click
+          // must visibly do something — without this the button looked inert
+          // and invited repeat clicks that each queued another request.
           <button className="msg-file"
             title={downloading ? "Downloading…" : `Download ${m.text}`}
             onClick={() => onDownload(m)} disabled={!m.hash || downloading}>
@@ -231,7 +301,8 @@ export function Parties() {
         if (dm) markRead(sid, `dm-${dm}`, srv.members.find((m) => m.id === dm)?.dm_messages);
         else if (cid) markRead(sid, cid, srv.channels.find((c) => c.id === cid)?.messages);
       }
-      // Forget marks for communities the user has left.
+      // Forget marks for communities the user has left, so the persisted store
+      // does not grow without bound as servers come and go.
       pruneTo(list);
       setUnread(computeUnread(list).byKey);
       setServers(list);
@@ -247,14 +318,16 @@ export function Parties() {
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
 
-  // Opening the Drive or log requests it; the answer lands on a later tick.
+  // Opening the Drive or the log asks the server for it; the answer arrives
+  // asynchronously and lands in the next `party-updated` tick.
   useEffect(() => {
     if (!sid || view === "chat") return;
     const ask = view === "drive" ? api.partyRefreshFiles : api.partyRefreshAudit;
     ask(sid).catch(() => {});
   }, [sid, view]);
 
-  // Toast a completed governance action once, then clear it.
+  // Surface a completed governance action once, then clear it so it does not
+  // re-toast on every poll.
   useEffect(() => {
     if (!server?.last_notice) return;
     toast(server.last_notice, "success");
@@ -283,7 +356,8 @@ export function Parties() {
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    // `view`: returning from the Drive/log mounts a fresh pane at scrollTop 0.
+    // `view` matters: the chat pane unmounts for the Drive and log, so coming
+    // back mounts a fresh node at scrollTop 0 and the thread looks scrolled up.
   }, [msgs.length, cid, dm, view]);
 
   if (!servers.length || adding) {
@@ -299,8 +373,9 @@ export function Parties() {
   const threadName = dm ? `✉ ${peer?.username || "member"}` : `# ${channel?.name || ""}`;
   const connected = server?.status === "joined";
   const isAdmin = server?.my_role === "admin" || server?.my_role === "owner";
-  // Guests are read-only, and a channel's kind can refuse members; the server
-  // decides, this lets the composer explain itself.
+  // A guest is read-only everywhere; a channel's kind can also refuse an
+  // ordinary member. The server decides either way — this only means the
+  // composer explains itself instead of accepting a message that gets refused.
   const readOnly = server?.my_role === "guest";
   const canSend = connected && !readOnly && (dm ? true : channel?.can_post !== false);
   const composerHint = !connected
@@ -324,7 +399,8 @@ export function Parties() {
     } catch (e) { setDraft(text); toast(friendlyError(e), "error"); }
   }
 
-  // Share a file into the active channel or DM; a cancelled picker is a no-op.
+  // Share a file into the active channel or DM. The native picker opens in the
+  // bridge; a cancelled dialog is a no-op.
   async function sendFile() {
     if (!server || !connected) return;
     try {
@@ -335,9 +411,12 @@ export function Parties() {
     } catch (e) { toast(friendlyError(e), "error"); }
   }
 
-  // Download a file and save it via the native dialog, tracked per hash so the
-  // card shows it is working. A message names the file in `text`, a Drive row
-  // in `name`.
+  // Download a file message's bytes and save them via the native dialog.
+  // Tracked per content hash so the card shows it is working: the request can
+  // take as long as the server takes to answer, and a click with no feedback
+  // is indistinguishable from a broken button.
+  // Accepts both shapes: a message card names the file in `text`, a Drive row
+  // in `name`. Reading only one of them saved the file as `undefined`.
   async function downloadFile(m) {
     if (!server || !m.hash || downloading[m.hash]) return;
     const filename = m.text || m.name || "file";
@@ -396,7 +475,8 @@ export function Parties() {
     catch (e) { toast(friendlyError(e), "error"); }
   }
 
-  // Re-share a file by reference (the bytes are already on the server).
+  // Re-share a file into another channel or DM. The bytes are already on the
+  // server, so this is a reference rather than an upload.
   async function shareFile(f, dest) {
     if (!server) return;
     try {
@@ -429,10 +509,12 @@ export function Parties() {
     try { await api.partyClearError(server.id); loadServers(); } catch { /* ignore */ }
   }
 
-  // Leave (two-click confirm). The server keeps the membership.
+  // Leave (two-click confirm): drops the connection and forgets the community
+  // locally. The server keeps the membership, so rejoining later resumes it.
   async function leave() {
     if (!server) return;
-    // The first click arms it; the label says the pin goes too.
+    // The first click arms it; the label switches to spell out that the pinned
+    // fingerprint goes with it.
     if (!confirmLeave) { setConfirmLeave(true); return; }
     setConfirmLeave(false);
     try {
@@ -443,14 +525,18 @@ export function Parties() {
     } catch (e) { toast(friendlyError(e), "error"); }
   }
 
-  // Rejoin: open the join form prefilled with address + username.
+  // Rejoin a dropped/rejected community: open the join form prefilled with the
+  // stored address + username (a password can be typed there if needed). A
+  // successful rejoin replaces this entry (deduped by address in the bridge).
   function rejoin() {
     if (!server) return;
     setPrefill({ address: server.address, username: server.username || "" });
     setAdding(true);
   }
 
-  // Remove a dead entry (two-click: this also discards its pin).
+  // Remove a dead entry without rejoining. Two-click like `leave`: this also
+  // discards the community's pinned fingerprint, so rejoining afterwards is an
+  // unverified first contact again.
   async function removeServer() {
     if (!server) return;
     if (!confirmLeave) { setConfirmLeave(true); return; }
@@ -550,7 +636,9 @@ export function Parties() {
                   <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
                 )}
               </button>
-              {/* Only roles the server would accept for this member. */}
+              {/* Offered only where the server would actually agree: you cannot
+                  change your own role, the owner's, or that of a peer at your
+                  own level, and you can only grant roles below your own. */}
               {assignableRoles(server?.my_role, m).length > 0 && (
                 <select className="party-rolesel" value={m.role}
                   title={`Role for ${m.username}`}
@@ -578,8 +666,9 @@ export function Parties() {
                   {STATUS_LABEL[server?.status] || server?.status}
                   {server?.status_detail ? `: ${server.status_detail}` : ""}
                 </span>
-                {/* Always shown: the operator can read community traffic
-                    (audit JOURNEY-04 / PRIV-01). */}
+                {/* Always on screen, not only at join time: community traffic is
+                    stored readable by the operator, and a DM here looks like
+                    any other DM (audit JOURNEY-04 / PRIV-01). */}
                 <span className="set-badge is-warn party-operator-badge"
                   title="Messages, DMs and files in this community are stored on the server unencrypted. Whoever runs it — or gets into it — can read them.">
                   Operator can read messages
@@ -679,7 +768,8 @@ export function Parties() {
               </button>
               <textarea className="composer-input" rows={1}
                 placeholder={composerHint}
-                // The placeholder is not an accessible name.
+                // The placeholder is the only thing that says *why* the box is
+                // disabled, and a placeholder is not an accessible name.
                 aria-label={composerHint}
                 disabled={!canSend}
                 value={draft} onChange={(e) => setDraft(e.target.value)}

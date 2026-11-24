@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onBridge, summaryToConv, chatToContact, friendlyError } from "./lib/bridge.js";
 import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
-import { cx, Avatar, usePopover } from "./components/ui.jsx";
+import { Logo } from "./components/Logo.jsx";
+import { cx, Avatar } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
 import { BootScreen, LockScreen, SetPasswordScreen, BackupPrompt } from "./components/Onboarding.jsx";
 import { Creator } from "./components/Creator.jsx";
@@ -15,10 +16,12 @@ import { Toasts } from "./components/Toasts.jsx";
 import { HistoryBanner } from "./components/HistoryBanner.jsx";
 import { RenameDialog, ConfirmDelete, InfoDialog } from "./components/ChatDialogs.jsx";
 import { toast } from "./lib/toast.js";
-import { THEMES, loadTheme, saveTheme } from "./lib/themes.js";
+import { loadTheme, saveTheme } from "./lib/themes.js";
 
 function RailBtn({ icon, label, active, onClick, badge }) {
-  // Fold the badge count into the accessible name; hide the visual duplicate.
+  // The badge is a bare number next to an icon, so a reader announced "Chats"
+  // whether or not anything was waiting. Fold the count into the accessible
+  // name and hide the visual duplicate.
   const unreadLabel = badge > 0 ? `, ${badge} unread` : "";
   return (
     <button className={cx("rail-btn", active && "is-active")} onClick={onClick} title={label}
@@ -30,36 +33,15 @@ function RailBtn({ icon, label, active, onClick, badge }) {
   );
 }
 
-function ThemeMenu({ theme, setTheme }) {
-  const [open, setOpen, ref] = usePopover();
-  return (
-    <div className="theme-wrap" ref={ref}>
-      <button className="tb-icon" title="Theme" onClick={() => setOpen((o) => !o)}>
-        <Icon name="settings" size={16} />
-      </button>
-      {open && (
-        <div className="theme-menu">
-          {THEMES.map((t) => (
-            <button key={t.id} className={cx("theme-opt", theme === t.id && "is-active")}
-              onClick={() => { setTheme(t.id); setOpen(false); }}>
-              <span className="theme-dot" style={{ background: t.swatch }} />
-              {t.label}
-              {theme === t.id && <span className="theme-check"><Icon name="check" size={15} /></span>}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Backoff for the startup `auth_status` handshake: quick first, then slower.
+// Backoff for the startup `auth_status` handshake: quick first retries so a
+// slow bridge is invisible, then back off so a hard failure doesn't spin.
 const BOOT_RETRY_MS = [400, 800, 1600, 3200, 6400, 10000];
 
 export default function App() {
   const [auth, setAuth] = useState(null);
-  // Boot state: a failed or slow `auth_status` is shown and retried, never a
-  // blank window.
+  // Boot state. `auth === null` used to render nothing at all, so a single
+  // failed or slow `auth_status` left a permanently blank window with no
+  // message, no spinner and no recovery. Now the failure is visible and retried.
   const [bootError, setBootError] = useState("");
   const [bootAttempt, setBootAttempt] = useState(0);
   // Shown once, right after a new identity is created.
@@ -72,28 +54,39 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
   const [creatorOpen, setCreatorOpen] = useState(false);
-  // Which tab the connection dialog opens on (set by the get-started paths).
+  // Which tab the connection dialog opens on, so the get-started suggestions
+  // land the user on the path they picked instead of a generic dialog.
   const [creatorMode, setCreatorMode] = useState("connect");
+  const [creatorRelay, setCreatorRelay] = useState(false);
   const [fpReq, setFpReq] = useState(null);
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [infoTarget, setInfoTarget] = useState(null);
-  // Unread comes from the bridge's persisted read mark. The refs mirror the
-  // open conversation and visibility for the event-driven refresh.
+  // Unread is computed by the bridge from a read mark persisted inside the
+  // encrypted history, so a message that arrived while the app was closed is
+  // still unread on the next launch. The refs mirror the open conversation and
+  // visibility so the event-driven refresh never reads a stale closure.
   const activeIdRef = useRef(null);
   const visibleRef = useRef(true);
   const [transfers, setTransfers] = useState([]);
+  // Saved contacts, so an offline conversation can offer "Reconnect" — the
+  // notice used to say "reconnect to this peer" with nothing on screen that did.
+  const [savedContacts, setSavedContacts] = useState([]);
   const [partyUnread, setPartyUnread] = useState(0);
-  // Conversation lock: no new peer can connect; existing sessions keep running.
+  // Conversation lock: when on, no new peer can connect (listener stopped,
+  // auto-rehost paused). Existing sessions keep running.
   const [locked, setLockedState] = useState(false);
-  // Whether the user has the window in front of them, pushed to the bridge for
-  // notifications (`visible` is tracked separately; see below).
+  // Does the user actually have the window in front of them? Pushed down to the
+  // bridge so "notify when a message arrives in the background" means it.
+  // `visible` is tracked separately because it is the far more reliable of the
+  // two signals — see the effect below.
   const [focused, setFocused] = useState(true);
   const [visible, setVisible] = useState(true);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
-  const openCreator = useCallback((mode = "connect") => {
+  const openCreator = useCallback((mode = "connect", relay = false) => {
     setCreatorMode(mode);
+    setCreatorRelay(relay);
     setCreatorOpen(true);
   }, []);
 
@@ -109,7 +102,8 @@ export default function App() {
     return status;
   }, []);
 
-  // Keep trying until the bridge answers, showing every failure.
+  // Keep trying until the bridge answers. Every failure is shown, so the user
+  // knows the app is working on it rather than staring at an empty window.
   useEffect(() => {
     if (auth) return undefined;
     let cancelled = false;
@@ -127,10 +121,15 @@ export default function App() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [auth, bootAttempt, refreshAuth]);
 
-  // `visible` (visibilityState, reliable) gates clearing unread, so a webview
-  // under-reporting `hasFocus()` cannot leave conversations badged forever.
-  // `focused` (visible AND hasFocus) gates notifications, which need more
-  // confidence that the user is looking.
+  // Window focus + visibility, tracked separately because they are trusted
+  // differently:
+  //
+  // - `visible` (visibilityState) is reliable across webviews and is what gates
+  //   clearing unread. If it were gated on focus instead, a webview that
+  //   under-reports `hasFocus()` would leave conversations badged forever —
+  //   a worse failure than an occasional extra notification.
+  // - `focused` (visible AND hasFocus) is what the notification gate uses:
+  //   suppressing a popup needs *more* confidence that the user is looking.
   useEffect(() => {
     const update = () => {
       const vis = document.visibilityState === "visible";
@@ -152,8 +151,8 @@ export default function App() {
 
   const ready = auth?.state === "ready";
 
-  // An unreadable history file blocks saving: ask once per unlock, keep the
-  // banner up until resolved.
+  // An unreadable history file blocks saving until the user decides; ask once
+  // per unlock and keep the banner up until it is resolved.
   const [historyIssue, setHistoryIssue] = useState(null);
   useEffect(() => {
     if (!ready) return;
@@ -162,7 +161,9 @@ export default function App() {
       .catch(() => {});
   }, [ready]);
 
-  // Tell the bridge what is on screen (ChatManager owns no window handle).
+  // Tell the bridge what is on screen. ChatManager owns no window handle, so
+  // without this it cannot tell a background message from one the user is
+  // reading right now.
   useEffect(() => {
     if (!ready) return;
     api.setPresence(focused, activeId).catch(() => {});
@@ -172,24 +173,32 @@ export default function App() {
     if (!ready) return;
     try {
       const list = await api.listConversations();
-      // Optimistic: the open conversation reads as zero before `mark_read`
-      // round-trips.
+      // `unread` comes from the bridge (a persisted read mark), so it is already
+      // correct across restarts. The only local adjustment is optimistic: the
+      // conversation the user is looking at right now reads as zero immediately,
+      // instead of flashing a badge until `mark_read` round-trips.
       const cur = activeIdRef.current;
       setConvs(list.map((c) => (
         c.id === cur && visibleRef.current ? { ...c, unread: 0 } : c
       )));
       // Live file-transfer progress, shown in the chat pane.
       api.listTransfers().then(setTransfers).catch(() => {});
-      // The bridge queues TOFU prompts: adopt the head, and drop ours when the
-      // queue is empty (a dead session's dialog could never be answered).
+      // The pending TOFU prompt is authoritative state on the bridge, which
+      // holds a queue: adopt whichever is at the head (so a second peer's
+      // prompt is surfaced once the first is answered, instead of being lost),
+      // and drop ours when there is none left — a prompt whose session already
+      // died can never be answered, and an undismissable dialog for it would
+      // wedge the app.
       api.pendingFingerprint()
         .then((p) => setFpReq((cur) => (p && cur && cur.chat_id === p.chat_id ? cur : p)))
         .catch(() => {});
       api.lockState().then(setLockedState).catch(() => {});
+      api.listContacts().then((l) => setSavedContacts(l || [])).catch(() => {});
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
-            // The user may have switched meanwhile.
+            // The user may have switched while this was in flight; showing it
+            // now would put A on screen with B as the recipient.
             if (activeIdRef.current !== cur) return;
             setActive(chatToContact(chat, list.find((c) => c.id === cur)?.connected));
           }).catch(() => {});
@@ -203,22 +212,24 @@ export default function App() {
     if (!ready) return;
     refresh();
     const u1 = onBridge("state-updated", () => refresh());
-    // Only transfer progress moved: refetch transfers only (PERF-01).
+    // Only transfer progress moved: refetch the transfer list, not every
+    // conversation (PERF-01).
     const u5 = onBridge("transfers-updated", () => {
       api.listTransfers().then(setTransfers).catch(() => {});
     });
     const u2 = onBridge("fingerprint-request", (e) => setFpReq(e.payload));
     const u3 = onBridge("toast", (e) => toast(e.payload.message, e.payload.level));
-    // Communities unread for the rail badge, computed here so it badges on
-    // any tab.
+    // Communities unread total for the rail badge — computed here (not in the
+    // Parties pane) so messages arriving while another tab is open still badge.
     const u4 = onBridge("party-updated", async () => {
       try { setPartyUnread(computeUnread(await api.partyList()).total); } catch { /* ignore */ }
     });
     return () => { [u1, u2, u3, u4, u5].forEach((u) => u.then((f) => f())); };
   }, [ready, refresh]);
 
-  // Mark the visible conversation read, keyed on its message count so an
-  // arrival there is marked too without firing every idle poll.
+  // Clear the read mark for the conversation the user is actually looking at.
+  // Keyed on that conversation's message count so an arrival in the open chat
+  // is marked read too, without firing on every idle poll.
   const activeMessages = convs.find((c) => c.id === activeId)?.messages ?? 0;
   useEffect(() => {
     if (!ready || !activeId || !visible) return;
@@ -232,8 +243,9 @@ export default function App() {
     );
   }
 
-  // The identity file could not be read and the backend refuses to replace
-  // it: nothing to retry, so explain and stop.
+  // Startup found an identity file it could not read. The backend refuses to
+  // replace it (that would abandon the user's history and their contacts'
+  // trust), so there is nothing to retry — explain and stop.
   if (auth.state === "error") {
     return <BootScreen fatal error={auth.error || "The identity could not be loaded."} />;
   }
@@ -249,7 +261,9 @@ export default function App() {
         try {
           await api.setPassword(pw);
           await refreshAuth();
-          // A new identity is when a backup matters most: ask once, with the action.
+          // A brand-new identity is exactly when a backup matters and exactly
+          // when nobody thinks to make one — so ask here, once, with the action
+          // attached rather than only a warning that it can't be reset.
           setBackupPrompt(true);
           return "";
         } catch (e) { return friendlyError(e); }
@@ -266,11 +280,13 @@ export default function App() {
   async function openConv(id) {
     setActiveId(id);
     activeIdRef.current = id;
-    // Clear the badge locally now; `mark_read` persists it.
+    // Opening a conversation reads it. Clear the badge locally for an instant
+    // response; `mark_read` persists it so the badge stays cleared next launch.
     setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, unread: 0 } : c)));
     api.markRead(id).catch(() => {});
     setNav("chats");
-    // Drafts are per-conversation, so unsent text cannot go to the wrong peer.
+    // Drafts are per-conversation: clear on switch so unsent text can't follow
+    // the user into another thread and be sent to the wrong recipient.
     setDraft("");
     try {
       const chat = await api.getConversation(id);
@@ -282,12 +298,15 @@ export default function App() {
 
   async function send() {
     const text = draft.trim();
-    // Send only to the selected conversation on screen; mid-switch they can
-    // differ (audit UI-02).
+    // Send to the conversation that is on screen, and only when it is the
+    // selected one. They can differ for a moment while a switch is loading;
+    // sending to `activeId` then delivered the text to a conversation other
+    // than the one the user was looking at (audit UI-02).
     const target = active && active.id === activeId ? active.id : null;
     if (!text || !target) return;
     setDraft("");
-    // Restore the draft on failure, only into the conversation it was meant for.
+    // Restore the draft if the send fails, so a transient error doesn't lose
+    // what the user typed — but only into the conversation it was meant for.
     try { await api.sendMessage(target, text); }
     catch (e) {
       if (activeIdRef.current === target) setDraft(text);
@@ -295,6 +314,25 @@ export default function App() {
       return;
     }
     refresh();
+  }
+
+  // The saved contact behind a conversation: the bridge's own association
+  // first, then a matching verified fingerprint.
+  function contactFor(c) {
+    if (!c) return null;
+    return savedContacts.find((k) => k.chat_id === c.id)
+      || (c.fingerprint ? savedContacts.find((k) => k.fingerprint === c.fingerprint) : null)
+      || null;
+  }
+
+  async function reconnect(c) {
+    const k = contactFor(c);
+    if (!k) return;
+    try {
+      await api.connectContact(k.id);
+      toast(`Connecting to ${c.name}…`, "info");
+      refresh();
+    } catch (e) { toast(friendlyError(e), "error"); }
   }
 
   async function sendFile(c) {
@@ -320,38 +358,16 @@ export default function App() {
 
   return (
     <div className="app-root">
-      {/* Skip links, first in tab order, hidden until focused (.skip-link). */}
+      {/* Skip links, first in the tab order. The window opens focused on the
+          titlebar, so a keyboard user reaching the message box crossed the lock
+          button, "New connection", the theme menu, five rail buttons and every
+          conversation in the list — twenty-plus stops before typing, every
+          launch. Hidden until focused (see .skip-link). */}
       <a className="skip-link" href="#main-content">Skip to main content</a>
       {nav === "chats" && activeId && (
         <a className="skip-link" href="#composer-input">Skip to message box</a>
       )}
       <div className="hex-bg" />
-      <header className="titlebar">
-        <div className="tb-left">
-          <span className="tb-brand"><Icon name="shieldCheck" size={16} /> P2PEM</span>
-          <span className={cx("tb-status", connCount && "is-on")}>
-            <span className="tb-status-dot" />
-            {connCount ? `${connCount} peer${connCount > 1 ? "s" : ""} connected` : "No active peers"}
-          </span>
-        </div>
-        <div className="tb-right">
-          <button className={cx("tb-icon", locked && "is-locked")}
-            title={locked
-              ? "Conversation locked: no new peer can connect. Click to unlock."
-              : "Lock the conversation: stop listening and refuse new peers."}
-            onClick={async () => {
-              try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Locked — no new peers can connect" : "Unlocked", "info"); }
-              catch (e) { toast(friendlyError(e), "error"); }
-            }}>
-            <Icon name={locked ? "lock" : "unlock"} size={16} />
-          </button>
-          <button className="tb-btn" onClick={() => openCreator()}>
-            <Icon name="plus" size={15} /> New connection
-          </button>
-          <ThemeMenu theme={theme} setTheme={setTheme} />
-        </div>
-      </header>
-
       {historyIssue && (
         <HistoryBanner issue={historyIssue} onSetAside={async () => {
           const moved = await api.setAsideHistory();
@@ -360,8 +376,18 @@ export default function App() {
         }} />
       )}
       <div className="app-body">
-        {/* Labelled, so this landmark is distinguishable from the others. */}
+        {/* role + label are explicit: <nav> carries the landmark implicitly, but
+            an unlabelled one is announced only as "navigation", and this app has
+            more than one region a reader will call that. Naming it is what makes
+            the landmark list usable. */}
         <nav className="rail" role="navigation" aria-label="Primary">
+          {/* The app's one brand moment inside the shell. There is no app-wide
+              title bar any more: the window already has one, and ours only held
+              controls that each had a better home (theme → Settings, new
+              conversation → the list header, the peer gate → the rail foot). */}
+          <div className="rail-brand" title="P2PEM">
+            <Logo size={36} title="P2PEM" />
+          </div>
           <div className="rail-nav">
             <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}
               badge={convs.reduce((n, c) => n + (c.unread || 0), 0)} />
@@ -372,7 +398,23 @@ export default function App() {
             <RailBtn icon="settings" label="Settings" active={nav === "settings"} onClick={() => setNav("settings")} />
           </div>
           <div className="rail-foot">
-            <button className={cx("rail-id", nav === "settings" && "is-active")}
+            {/* The peer gate. It used to be a bare padlock in the title bar,
+                which read as "the app is unlocked" or "not encrypted" — the
+                opposite of what it does. It says what it does, in words. */}
+            <button className={cx("rail-btn", "rail-gate", locked && "is-closed")}
+              role="switch" aria-checked={!locked}
+              aria-label={locked ? "New peers: closed. Activate to accept new peers again." : "New peers: open. Activate to refuse new peers."}
+              title={locked
+                ? "Closed to new peers — nobody new can connect. Existing conversations keep working."
+                : "Open to new peers — anyone with your address or invite can ask to connect."}
+              onClick={async () => {
+                try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Closed to new peers" : "Open to new peers", "info"); }
+                catch (e) { toast(friendlyError(e), "error"); }
+              }}>
+              <Icon name={locked ? "ban" : "radio"} size={19} />
+              <span className="rail-label">{locked ? "Closed" : "Accepting"}</span>
+            </button>
+            <button className="rail-id"
               title={`${auth.name} — open your identity settings`}
               aria-label={`${auth.name} — open your identity settings`}
               onClick={() => setNav("settings")}>
@@ -385,20 +427,35 @@ export default function App() {
           <>
             <aside className="col-list">
               <ConvList contacts={contacts} activeId={activeId} onSelect={openConv}
-                onAdd={() => openCreator()} query={query} setQuery={setQuery} />
+                onAdd={() => openCreator()} query={query} setQuery={setQuery}
+                connectedCount={connCount} gateClosed={locked} />
             </aside>
             <main className="col-main" id="main-content" tabIndex={-1}>
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
-                // No conversations at all: show the get-started panel.
+                reconnectContact={contactFor(active)}
+                onReconnect={reconnect}
+                // A user with no conversations at all gets the get-started
+                // panel rather than "select a conversation" with nothing to select.
                 isFirstRun={convs.length === 0}
+                gateClosed={locked}
+                waiting={(() => {
+                  const unread = convs.filter((c) => (c.unread || 0) > 0);
+                  return unread.length ? {
+                    total: unread.reduce((n, c) => n + c.unread, 0), chats: unread.length,
+                    firstId: unread[0].id, firstName: unread[0].title,
+                  } : null;
+                })()}
+                onJump={(id) => id && openConv(id)}
                 onStart={openCreator}
-                // Never swallow a failed cancel.
+                // A swallowed failure here is a cancel button that does
+                // nothing, on a transfer the user is actively trying to stop.
                 onCancelTransfer={(id) =>
                   api.cancelTransfer(id).catch((e) => toast(`Could not cancel: ${friendlyError(e)}`, "error"))}
                 transfers={transfers.filter((t) =>
-                  // Finished files already show as messages: surface only
-                  // in-flight work and failures.
+                  // done/cancelled rows can linger in the snapshot until the next
+                  // transfer; the completed file already shows as a message, so
+                  // only surface in-flight work and failures (with their reason).
                   t.chat_id === activeId && t.status !== "done" && t.status !== "cancelled")}
                 onAcceptTransfer={async (t) => {
                   try { await api.acceptTransfer(t.id); refresh(); } catch (e) { toast(friendlyError(e), "error"); }
@@ -407,8 +464,9 @@ export default function App() {
                   try { await api.declineTransfer(t.id); refresh(); } catch (e) { toast(friendlyError(e), "error"); }
                 }}
                 onVerify={async (c) => {
-                  // A pending TOFU request opens accept/reject; otherwise show
-                  // the read-only fingerprint.
+                  // Open the accept/reject dialog only when a real TOFU request
+                  // is pending for this chat; an established chat has nothing to
+                  // confirm, so show the read-only fingerprint instead.
                   try {
                     const p = await api.pendingFingerprint();
                     if (p && p.chat_id === c.id) { setFpReq(p); return; }
@@ -422,20 +480,23 @@ export default function App() {
           </>
         )}
         {nav === "contacts" && (
-          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }}
+            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) void openConv(id); }}
+            connectedChats={new Set(convs.filter((c) => c.connected).map((c) => c.id))} /></main>
         )}
         {nav === "settings" && (
           <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
         )}
         {nav === "parties" && <main className="col-full" id="main-content" tabIndex={-1}><Parties /></main>}
-        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}
+        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onPair={(mode) => openCreator(mode, true)} /></main>}
       </div>
 
-      <Creator open={creatorOpen} initialMode={creatorMode} onClose={() => setCreatorOpen(false)} />
+      <Creator open={creatorOpen} initialMode={creatorMode} initialRelay={creatorRelay} onClose={() => setCreatorOpen(false)} />
       <Verify req={fpReq} onClose={() => setFpReq(null)} />
       <RenameDialog target={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={doRename} />
       <ConfirmDelete target={deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete} />
-      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)} />
+      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)}
+        onRename={(c) => setRenameTarget(c)} onDelete={(c) => setDeleteTarget(c)} />
       <Toasts />
     </div>
   );
