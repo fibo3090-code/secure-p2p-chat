@@ -969,6 +969,24 @@ mod tests {
         );
     }
 
+    /// The display name both UIs set: trimmed, never empty, at most 48
+    /// *characters* (a name in a non-Latin script must not hit the limit at a
+    /// third of its length), and a refused name leaves the old one in place.
+    #[test]
+    fn set_name_trims_and_enforces_its_limits() {
+        let mut identity = fresh("Old");
+        identity.set_name("  Maya  ").unwrap();
+        assert_eq!(identity.name, "Maya");
+
+        for bad in ["", "   ", &"x".repeat(49)] {
+            assert!(identity.set_name(bad).is_err(), "{bad:?} accepted");
+            assert_eq!(identity.name, "Maya", "a refused name replaced the old one");
+        }
+        let longest = "é".repeat(48); // 96 bytes, 48 characters
+        identity.set_name(&longest).unwrap();
+        assert_eq!(identity.name, longest);
+    }
+
     #[test]
     fn test_decryption_with_wrong_password_fails() {
         let mut identity = fresh("Test User");
