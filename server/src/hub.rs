@@ -1,10 +1,6 @@
-//! Connection hub for broadcast fan-out (Phase 1, slice 3).
-//!
-//! Each live connection registers an outbound channel keyed by a unique connection
-//! id. When a member posts a message, the runtime pushes the resulting
-//! [`PartyResponse::Message`] to every *other* registered connection, which then
-//! writes it down its own tunnel. Uses a `std::sync::Mutex` because the critical
-//! section never awaits.
+//! Connection hub for broadcast fan-out: each joined connection registers its
+//! outbound sender under a connection id, and the runtime pushes responses to
+//! the others through it. A `std::sync::Mutex`: the critical section never awaits.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -15,17 +11,10 @@ use uuid::Uuid;
 
 /// Responses that may queue for one connection before it is considered stuck.
 ///
-/// This lane used to be unbounded, which meant a client that joined and then
-/// stopped reading its socket accumulated every broadcast on the server's heap
-/// with nothing to stop it — the cheapest possible memory exhaustion against a
-/// community server. Bounded, a stuck client is disconnected instead: it has
-/// already missed messages, and `FetchHistory` is how it catches up on
-/// reconnect.
-///
-/// Eviction closes the connection because the hub holds the connection's
-/// *only* sender: dropping it here makes the connection task's `recv` return
-/// `None`, and the task ends (see `connection::serve_connection_with`). Were
-/// the task to keep a copy, an evicted client would stay connected and deaf.
+/// Bounded, so a client that stopped reading cannot grow the server's heap: it
+/// is evicted and catches up via `FetchHistory` on reconnect. The hub holds the
+/// connection's *only* sender, so eviction also ends the connection task (see
+/// `connection::serve_connection_with`).
 pub const BROADCAST_QUEUE_DEPTH: usize = 256;
 
 struct Conn {
@@ -59,58 +48,28 @@ impl Hub {
         self.conns.lock().unwrap().remove(&conn_id);
     }
 
-    /// Push `resp` to every connection except `except` (the originator). Dead
-    /// senders (closed receivers) are ignored; they are cleaned up on unregister.
-    /// A connection whose queue is full has stopped draining its socket and is
-    /// dropped from the hub — see [`BROADCAST_QUEUE_DEPTH`].
+    /// Push `resp` to every connection except `except` (the originator),
+    /// evicting any whose queue is full (see [`BROADCAST_QUEUE_DEPTH`]).
     pub fn broadcast_except(&self, except: Uuid, resp: PartyResponse) {
-        let mut conns = self.conns.lock().unwrap();
-        let mut stuck: Vec<Uuid> = Vec::new();
-        for (id, conn) in conns.iter() {
-            if *id != except {
-                Self::push(*id, conn, resp.clone(), &mut stuck);
-            }
-        }
-        for id in stuck {
-            conns.remove(&id);
-        }
+        self.push_where(resp, |id, _| id != except);
     }
 
     /// Push `resp` to every connection belonging to `member` *except* `except`
-    /// (DM delivery). Pass [`Uuid::nil`] to reach all of them — no real
-    /// connection id is nil.
-    ///
-    /// The exclusion is what makes a DM show up on the sender's other devices.
-    /// The originating connection already appended the message optimistically and
-    /// gets a `MessagePosted` ack, so echoing to it too would duplicate the
-    /// message; every *other* connection of the same member has no idea the send
-    /// happened and would otherwise never learn about it — which is why a DM sent
-    /// from one device used to be invisible on that member's second device, while
-    /// a channel post (fanned out by connection, not by member) was not.
+    /// (DM delivery; [`Uuid::nil`] reaches all of them). Excluding the
+    /// originating connection reaches the sender's other devices without
+    /// duplicating the row it already appended.
     pub fn send_to_member_except(&self, member: Uuid, except: Uuid, resp: PartyResponse) {
-        let mut conns = self.conns.lock().unwrap();
-        let mut stuck: Vec<Uuid> = Vec::new();
-        for (id, conn) in conns.iter() {
-            if conn.member == member && *id != except {
-                Self::push(*id, conn, resp.clone(), &mut stuck);
-            }
-        }
-        for id in stuck {
-            conns.remove(&id);
-        }
+        self.push_where(resp, |id, conn| conn.member == member && id != except);
     }
 
-    /// Push `resp` to every registered connection, including the originator.
-    /// Used for directory refreshes, where the originating connection is gone
-    /// (a disconnect) or is not special (a presence change).
+    /// Push `resp` to every registered connection, including the originator
+    /// (directory refreshes).
     pub fn broadcast_all(&self, resp: PartyResponse) {
         self.broadcast_except(Uuid::nil(), resp);
     }
 
-    /// Whether `member` still has at least one registered connection.
-    ///
-    /// Presence is per-member but connections are per-device, so a member with
-    /// two clients open must not be marked offline when the first one closes.
+    /// Whether `member` still has at least one registered connection (presence
+    /// is per member, connections per device).
     pub fn member_is_connected(&self, member: Uuid) -> bool {
         self.conns
             .lock()
@@ -119,18 +78,25 @@ impl Hub {
             .any(|c| c.member == member)
     }
 
-    /// Non-blocking send. The critical section holds a `std::sync::Mutex` and
-    /// must never await, so a full queue is treated as "this client is not
-    /// reading" rather than something to wait on.
-    fn push(id: Uuid, conn: &Conn, resp: PartyResponse, stuck: &mut Vec<Uuid>) {
+    /// Push `resp` to every connection `wanted` selects, evicting any whose
+    /// queue is full.
+    fn push_where(&self, resp: PartyResponse, wanted: impl Fn(Uuid, &Conn) -> bool) {
+        self.conns
+            .lock()
+            .unwrap()
+            .retain(|id, conn| !wanted(*id, conn) || Self::push(*id, conn, resp.clone()));
+    }
+
+    /// Non-blocking send: the critical section must never await, so a full
+    /// queue means "this client is not reading". Returns whether to keep it.
+    fn push(id: Uuid, conn: &Conn, resp: PartyResponse) -> bool {
         match conn.tx.try_send(resp) {
-            Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 tracing::warn!(conn = %id, "dropping a connection that stopped reading its socket");
-                stuck.push(id);
+                false
             }
-            // The receiver is gone; `unregister` will clean it up.
-            Err(TrySendError::Closed(_)) => {}
+            // `Closed`: the receiver is gone; `unregister` will clean it up.
+            Ok(()) | Err(TrySendError::Closed(_)) => true,
         }
     }
 

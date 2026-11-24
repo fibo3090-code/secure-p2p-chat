@@ -1,68 +1,58 @@
-/// Key Rotation (Rekeying) Integration Tests
-///
-/// Tests for periodic session key rotation to provide perfect forward secrecy.
-/// Ensures that:
-/// - Keys can be rotated correctly with HKDF
-/// - Rotation happens at correct message/time intervals
-/// - Both peers rotate to the same key
-/// - Messages continue to flow correctly after rotation
+//! Session key rotation (rekey): HKDF rotation is deterministic, both peers
+//! reach the same key, and messages keep flowing across a rotation.
 use p2pem_classic::core::{generate_rekey_nonce, rekey_session_key, AesCipher, ProtocolMessage};
 use p2pem_classic::AES_KEY_SIZE;
 use rand::Rng;
 use std::time::Instant;
 
+fn random_key() -> [u8; AES_KEY_SIZE] {
+    rand::thread_rng().r#gen()
+}
+
+fn random_nonce() -> [u8; 16] {
+    rand::thread_rng().r#gen()
+}
+
+/// Encrypt with `enc`, decrypt with `dec`, and check the plaintext survives.
+fn assert_round_trip(enc: &AesCipher, dec: &AesCipher, plaintext: &[u8]) {
+    let encrypted = enc.encrypt(plaintext, None);
+    assert_eq!(dec.decrypt(&encrypted, None).unwrap(), plaintext);
+}
+
 #[test]
 fn test_rekey_basic_key_derivation() {
-    // Test that rekeying produces deterministic keys
-    // Use cryptographically secure random values instead of hardcoded constants
-    let original_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let nonce: [u8; 16] = rand::thread_rng().r#gen();
-
+    let original_key = random_key();
+    let nonce = random_nonce();
     let rotated_key_1 = rekey_session_key(&original_key, &nonce);
     let rotated_key_2 = rekey_session_key(&original_key, &nonce);
-
-    // Same input should produce same output
-    assert_eq!(rotated_key_1, rotated_key_2);
-
-    // Output should be different from input
+    assert_eq!(rotated_key_1, rotated_key_2, "deterministic");
     assert_ne!(rotated_key_1, original_key);
 }
 
 #[test]
 fn test_rekey_different_nonces_different_keys() {
-    // Different nonces should produce different keys
-    // Use cryptographically secure random values
-    let original_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let nonce_1: [u8; 16] = rand::thread_rng().r#gen();
-    let mut nonce_2: [u8; 16] = rand::thread_rng().r#gen();
-
-    // Ensure nonces are different
+    let original_key = random_key();
+    let nonce_1 = random_nonce();
+    let mut nonce_2 = random_nonce();
     if nonce_1 == nonce_2 {
         nonce_2[0] = nonce_2[0].wrapping_add(1);
     }
-
-    let key_1 = rekey_session_key(&original_key, &nonce_1);
-    let key_2 = rekey_session_key(&original_key, &nonce_2);
-
-    assert_ne!(key_1, key_2);
+    assert_ne!(
+        rekey_session_key(&original_key, &nonce_1),
+        rekey_session_key(&original_key, &nonce_2)
+    );
 }
 
 #[test]
 fn test_rekey_message_encoding_decoding() {
-    // Test that REKEY messages can be serialized and deserialized
     let nonce = generate_rekey_nonce();
     let seq = 42u64;
-
-    let rekey_msg = ProtocolMessage::Rekey {
+    let bytes = ProtocolMessage::Rekey {
         nonce: nonce.to_vec(),
         seq,
-    };
-
-    let bytes = rekey_msg.to_plain_bytes();
-    let parsed = ProtocolMessage::from_plain_bytes(&bytes);
-
-    assert!(parsed.is_some());
-    match parsed {
+    }
+    .to_plain_bytes();
+    match ProtocolMessage::from_plain_bytes(&bytes) {
         Some(ProtocolMessage::Rekey {
             nonce: parsed_nonce,
             seq: parsed_seq,
@@ -70,155 +60,87 @@ fn test_rekey_message_encoding_decoding() {
             assert_eq!(parsed_nonce.as_slice(), &nonce);
             assert_eq!(parsed_seq, seq);
         }
-        _ => panic!("Expected Rekey message"),
+        other => panic!("Expected Rekey message, got {other:?}"),
     }
 }
 
 #[test]
 fn test_rekey_nonce_generation() {
-    // Test that generated nonces are properly sized and random
     let nonce_1 = generate_rekey_nonce();
     let nonce_2 = generate_rekey_nonce();
-
     assert_eq!(nonce_1.len(), 16);
     assert_eq!(nonce_2.len(), 16);
-
-    // Nonces should be different (with overwhelming probability)
-    assert_ne!(nonce_1, nonce_2);
+    assert_ne!(nonce_1, nonce_2, "random (with overwhelming probability)");
 }
 
 #[test]
 fn test_rekey_cipher_reset() {
-    // Test that new ciphers created with rotated keys work correctly
-    // Use cryptographically secure random values
-    let key_1: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    let key_1 = random_key();
     let cipher_1 = AesCipher::new(&key_1).unwrap();
-
     let plaintext = b"Test message before rekey";
     let encrypted_1 = cipher_1.encrypt(plaintext, None);
+    assert_eq!(cipher_1.decrypt(&encrypted_1, None).unwrap(), plaintext);
 
-    // Verify decryption works
-    let decrypted_1 = cipher_1.decrypt(&encrypted_1, None).unwrap();
-    assert_eq!(plaintext, &decrypted_1[..]);
-
-    // Rekey with a nonce
-    let nonce = generate_rekey_nonce();
-    let key_2 = rekey_session_key(&key_1, &nonce);
+    // A cipher on the rotated key works independently...
+    let key_2 = rekey_session_key(&key_1, &generate_rekey_nonce());
     let cipher_2 = AesCipher::new(&key_2).unwrap();
+    assert_round_trip(&cipher_2, &cipher_2, b"Test message after rekey");
 
-    // New cipher should work independently
-    let plaintext_2 = b"Test message after rekey";
-    let encrypted_2 = cipher_2.encrypt(plaintext_2, None);
-    let decrypted_2 = cipher_2.decrypt(&encrypted_2, None).unwrap();
-    assert_eq!(plaintext_2, &decrypted_2[..]);
-
-    // Old cipher can still decrypt its own messages
-    let old_decrypt = cipher_1.decrypt(&encrypted_1, None).unwrap();
-    assert_eq!(plaintext, &old_decrypt[..]);
+    // ...and the old one can still decrypt its own messages.
+    assert_eq!(cipher_1.decrypt(&encrypted_1, None).unwrap(), plaintext);
 }
 
 #[test]
 fn test_rekey_sequence_produces_correct_chain() {
-    // Test that multiple rekeying operations produce a proper key chain
-    // and verify deterministic reproduction of the chain
-    // Use cryptographically secure random values
-    let initial_key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let mut current_key = initial_key;
-    let mut key_chain = vec![current_key];
-
-    // Perform multiple rekeying operations and build the key chain
-    // Use cryptographically secure random nonces
-    let mut nonces = Vec::new();
-    for _ in 0..5 {
-        let nonce: [u8; 16] = rand::thread_rng().r#gen();
-        nonces.push(nonce);
-    }
-
-    for nonce in &nonces {
-        let prev_key = current_key;
-        current_key = rekey_session_key(&current_key, nonce);
-
-        // Verify each key is different from the previous one
-        assert_ne!(current_key, prev_key);
-
-        // Can create a cipher with this key
-        let _ = AesCipher::new(&current_key).unwrap();
-
-        key_chain.push(current_key);
-    }
-
-    // Now verify deterministic reproduction: rebuild the chain from the same initial key and nonces
-    let mut reproduced_key = initial_key;
-    let mut reproduced_chain = vec![reproduced_key];
-
-    for nonce in &nonces {
-        reproduced_key = rekey_session_key(&reproduced_key, nonce);
-        reproduced_chain.push(reproduced_key);
-    }
-
-    // Chains must match exactly, proving deterministic key derivation
-    assert_eq!(
-        key_chain, reproduced_chain,
-        "Key chain is not deterministic"
-    );
+    let initial_key = random_key();
+    let nonces: Vec<[u8; 16]> = (0..5).map(|_| random_nonce()).collect();
+    let chain = |check: bool| {
+        let mut key = initial_key;
+        let mut chain = vec![key];
+        for nonce in &nonces {
+            let prev = key;
+            key = rekey_session_key(&key, nonce);
+            if check {
+                assert_ne!(key, prev, "each key differs from the previous one");
+                AesCipher::new(&key).unwrap();
+            }
+            chain.push(key);
+        }
+        chain
+    };
+    let key_chain = chain(true);
+    assert_eq!(key_chain, chain(false), "Key chain is not deterministic");
     assert_eq!(key_chain.len(), 6); // initial + 5 rotations
 }
 
 #[test]
 fn test_rekey_bidirectional_peers() {
-    // Simulate two peers rekeying to the same key
-    // Use cryptographically secure random values
-
-    // Alice's side
-    let alice_key_1: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
+    // Both peers start from the same ECDH key and rotate with the same nonce.
+    let shared = random_key();
     let nonce = generate_rekey_nonce();
-    let alice_key_2 = rekey_session_key(&alice_key_1, &nonce);
+    let alice_key = rekey_session_key(&shared, &nonce);
+    let bob_key = rekey_session_key(&shared, &nonce);
+    assert_eq!(alice_key, bob_key);
 
-    // Bob's side
-    let bob_key_1 = alice_key_1; // Same starting key from ECDH
-    let bob_key_2 = rekey_session_key(&bob_key_1, &nonce);
-
-    // Both should derive the same next key
-    assert_eq!(alice_key_2, bob_key_2);
-
-    // Create ciphers with the rotated keys
-    let alice_cipher = AesCipher::new(&alice_key_2).unwrap();
-    let bob_cipher = AesCipher::new(&bob_key_2).unwrap();
-
-    // Test cross-encryption/decryption
-    let alice_msg = b"Hello from Alice after rekey";
-    let alice_encrypted = alice_cipher.encrypt(alice_msg, None);
-    let alice_decrypted = bob_cipher.decrypt(&alice_encrypted, None).unwrap();
-    assert_eq!(alice_msg, &alice_decrypted[..]);
-
-    // And the reverse
-    let bob_msg = b"Hello from Bob after rekey";
-    let bob_encrypted = bob_cipher.encrypt(bob_msg, None);
-    let bob_decrypted = alice_cipher.decrypt(&bob_encrypted, None).unwrap();
-    assert_eq!(bob_msg, &bob_decrypted[..]);
+    let alice = AesCipher::new(&alice_key).unwrap();
+    let bob = AesCipher::new(&bob_key).unwrap();
+    assert_round_trip(&alice, &bob, b"Hello from Alice after rekey");
+    assert_round_trip(&bob, &alice, b"Hello from Bob after rekey");
 }
 
+/// Guards against rekeying becoming expensive (a password-hashing KDF would
+/// stall the message loop every REKEY_MESSAGE_COUNT messages). The bound is
+/// enormous on purpose: 1000 HKDFs take milliseconds, and a tight bound
+/// flaked on loaded CI runners.
 #[test]
 fn test_rekey_timing_performance() {
-    // Guards against rekeying accidentally becoming an expensive operation —
-    // swapping the HKDF for a password-hashing KDF, say, which would stall the
-    // message loop every REKEY_MESSAGE_COUNT messages.
-    //
-    // The bound is deliberately enormous. 1000 HKDF-SHA256 derivations take
-    // single-digit milliseconds even unoptimised, so anything near this ceiling
-    // is a change of algorithm rather than a slow machine. It used to assert
-    // 100ms, which is within the noise of a loaded CI runner sharing cores with
-    // a dozen other test binaries — the test failed for reasons that had
-    // nothing to do with the code it was guarding.
-    let key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let nonce: [u8; 16] = rand::thread_rng().r#gen();
-
+    let key = random_key();
+    let nonce = random_nonce();
     let start = Instant::now();
     for _ in 0..1000 {
         let _ = rekey_session_key(&key, &nonce);
     }
     let elapsed = start.elapsed();
-
     assert!(
         elapsed.as_secs() < 5,
         "1000 rekeys took {}ms — that is not a slow machine, that is a different KDF",
@@ -228,61 +150,39 @@ fn test_rekey_timing_performance() {
 
 #[test]
 fn test_rekey_key_independence() {
-    // Test that rotating from two different starting keys produces different results
-    // Use cryptographically secure random values
-    let key_a: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let mut key_b: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-    let nonce: [u8; 16] = rand::thread_rng().r#gen();
-
-    // Ensure keys are different
+    let key_a = random_key();
+    let mut key_b = random_key();
     if key_a == key_b {
         key_b[0] = key_b[0].wrapping_add(1);
     }
-
-    let rotated_a = rekey_session_key(&key_a, &nonce);
-    let rotated_b = rekey_session_key(&key_b, &nonce);
-
-    // Different starting keys should produce different rotated keys
-    assert_ne!(rotated_a, rotated_b);
+    let nonce = random_nonce();
+    assert_ne!(
+        rekey_session_key(&key_a, &nonce),
+        rekey_session_key(&key_b, &nonce)
+    );
 }
 
 #[test]
 fn test_rekey_message_preservation() {
-    // Test that messages are correctly preserved through encryption/decryption
-    // even with rekeying
-    // Use cryptographically secure random values
-    let key: [u8; AES_KEY_SIZE] = rand::thread_rng().r#gen();
-
-    // Create multiple messages
-    let messages = vec![
+    let key = random_key();
+    let messages = [
         b"First message".to_vec(),
         b"Second message with more content".to_vec(),
         b"Third message with special chars: @#$%^&*()".to_vec(),
     ];
-
-    // Encrypt with original key
     let cipher = AesCipher::new(&key).unwrap();
-    let mut encrypted_msgs = Vec::new();
-    for msg in &messages {
-        encrypted_msgs.push(cipher.encrypt(msg, None));
-    }
+    let encrypted: Vec<_> = messages.iter().map(|m| cipher.encrypt(m, None)).collect();
 
-    // Rekey
-    let nonce = generate_rekey_nonce();
-    let new_key = rekey_session_key(&key, &nonce);
-    let new_cipher = AesCipher::new(&new_key).unwrap();
-
-    // Encrypt new messages with new key
+    let new_cipher = AesCipher::new(&rekey_session_key(&key, &generate_rekey_nonce())).unwrap();
     let new_message = b"Message after rekey";
     let encrypted_new = new_cipher.encrypt(new_message, None);
 
-    // Verify all old messages are still decryptable (with old cipher)
-    for (i, encrypted) in encrypted_msgs.iter().enumerate() {
-        let decrypted = cipher.decrypt(encrypted, None).unwrap();
-        assert_eq!(messages[i], decrypted);
+    // Old messages still decrypt with the old cipher, new with the new one.
+    for (msg, enc) in messages.iter().zip(&encrypted) {
+        assert_eq!(&cipher.decrypt(enc, None).unwrap(), msg);
     }
-
-    // Verify new message is decryptable with new cipher
-    let decrypted_new = new_cipher.decrypt(&encrypted_new, None).unwrap();
-    assert_eq!(new_message, &decrypted_new[..]);
+    assert_eq!(
+        new_cipher.decrypt(&encrypted_new, None).unwrap(),
+        new_message
+    );
 }

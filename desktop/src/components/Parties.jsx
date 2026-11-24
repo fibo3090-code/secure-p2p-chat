@@ -1,6 +1,5 @@
-// Communities (Party servers) — administered, multi-channel, persistent rooms
-// served by the `messenger-server` crate, driven live through the Tauri bridge
-// (party_* commands) and refreshed on the `party-updated` event.
+// Communities (Party servers): multi-channel rooms served by `messenger-server`,
+// driven through the party_* commands and refreshed on `party-updated`.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
@@ -12,10 +11,8 @@ import {
   ROLES, kindIcon,
 } from "./PartyAdmin.jsx";
 
-// Roles this viewer may actually assign to `member`, mirroring the server's rule
-// (`Role::may_assign` plus the "not at or above your own" check). Rendering the
-// full list meant an admin was offered `admin` for a peer admin — pre-selected,
-// even — and every attempt came back refused.
+// Roles this viewer may assign to `member`, mirroring the server's rule
+// (`Role::may_assign`, and never at or above your own).
 function assignableRoles(myRole, member) {
   if (member.is_me || member.role === "owner") return [];
   const rank = { guest: 0, member: 1, admin: 2, owner: 3 };
@@ -33,9 +30,7 @@ const STATUS_LABEL = {
   disconnected: "Disconnected",
 };
 
-// Mirror the server-side caps (`messenger-server` state.rs: MAX_USERNAME_CHARS /
-// MAX_CHANNEL_NAME_CHARS) so the UI gives immediate feedback instead of relying on
-// a server rejection. The server remains authoritative.
+// Mirror the server's caps for immediate feedback; the server stays authoritative.
 const MAX_USERNAME_CHARS = 32;
 const MAX_CHANNEL_NAME_CHARS = 64;
 
@@ -51,14 +46,12 @@ function JoinForm({ onJoined, onCancel, initial }) {
   const [saved, setSaved] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  // A server whose identity has never been seen before. Nothing has been sent
-  // to it yet — not the username, not the password — until the user confirms
-  // the code below.
+  // A never-seen server: nothing (not even the username) is sent until the
+  // user confirms the code.
   const [verify, setVerify] = useState(null);
 
   useEffect(() => {
-    // A failure here is not cosmetic: parties.json holds the pinned fingerprint
-    // of every community, and the bridge refuses to join when it cannot be read.
+    // Not cosmetic: parties.json holds every pin, and joining refuses without it.
     api.partySaved()
       .then((s) => setSaved(s || []))
       .catch((e) => { setSaved([]); setErr(friendlyError(e)); });
@@ -134,10 +127,8 @@ function JoinForm({ onJoined, onCancel, initial }) {
           <div className="party-saved">
             <div className="party-saved-h">Your communities</div>
             {saved.map((p) => (
-              // Selecting a saved community fills the form; it does not join.
-              // Joining straight from the card sent whatever happened to be in
-              // the shared password box — so a password typed for one
-              // community went to whichever card was clicked next.
+              // Selecting fills the form, never joins: joining from the card sent
+              // whatever password was in the shared box to the wrong community.
               <button key={p.address} className="party-saved-card" disabled={busy}
                 title={`Fill in ${p.username}@${p.address}`}
                 onClick={() => { setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); }}>
@@ -187,9 +178,7 @@ function MessageRow({ m, onDownload, downloading }) {
       <div className="msg-bubble">
         {!mine && <span className="msg-author">{m.sender_name}</span>}
         {isFile ? (
-          // A download is a round trip to the community server, so the click
-          // must visibly do something — without this the button looked inert
-          // and invited repeat clicks that each queued another request.
+          // A download is a server round trip, so the click must show progress.
           <button className="msg-file"
             title={downloading ? "Downloading…" : `Download ${m.text}`}
             onClick={() => onDownload(m)} disabled={!m.hash || downloading}>
@@ -242,8 +231,7 @@ export function Parties() {
         if (dm) markRead(sid, `dm-${dm}`, srv.members.find((m) => m.id === dm)?.dm_messages);
         else if (cid) markRead(sid, cid, srv.channels.find((c) => c.id === cid)?.messages);
       }
-      // Forget marks for communities the user has left, so the persisted store
-      // does not grow without bound as servers come and go.
+      // Forget marks for communities the user has left.
       pruneTo(list);
       setUnread(computeUnread(list).byKey);
       setServers(list);
@@ -259,16 +247,14 @@ export function Parties() {
     } catch { /* ignore */ }
   }, [sid, cid, dm]);
 
-  // Opening the Drive or the log asks the server for it; the answer arrives
-  // asynchronously and lands in the next `party-updated` tick.
+  // Opening the Drive or log requests it; the answer lands on a later tick.
   useEffect(() => {
     if (!sid || view === "chat") return;
     const ask = view === "drive" ? api.partyRefreshFiles : api.partyRefreshAudit;
     ask(sid).catch(() => {});
   }, [sid, view]);
 
-  // Surface a completed governance action once, then clear it so it does not
-  // re-toast on every poll.
+  // Toast a completed governance action once, then clear it.
   useEffect(() => {
     if (!server?.last_notice) return;
     toast(server.last_notice, "success");
@@ -297,8 +283,7 @@ export function Parties() {
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    // `view` matters: the chat pane unmounts for the Drive and log, so coming
-    // back mounts a fresh node at scrollTop 0 and the thread looks scrolled up.
+    // `view`: returning from the Drive/log mounts a fresh pane at scrollTop 0.
   }, [msgs.length, cid, dm, view]);
 
   if (!servers.length || adding) {
@@ -314,9 +299,8 @@ export function Parties() {
   const threadName = dm ? `✉ ${peer?.username || "member"}` : `# ${channel?.name || ""}`;
   const connected = server?.status === "joined";
   const isAdmin = server?.my_role === "admin" || server?.my_role === "owner";
-  // A guest is read-only everywhere; a channel's kind can also refuse an
-  // ordinary member. The server decides either way — this only means the
-  // composer explains itself instead of accepting a message that gets refused.
+  // Guests are read-only, and a channel's kind can refuse members; the server
+  // decides, this lets the composer explain itself.
   const readOnly = server?.my_role === "guest";
   const canSend = connected && !readOnly && (dm ? true : channel?.can_post !== false);
   const composerHint = !connected
@@ -340,8 +324,7 @@ export function Parties() {
     } catch (e) { setDraft(text); toast(friendlyError(e), "error"); }
   }
 
-  // Share a file into the active channel or DM. The native picker opens in the
-  // bridge; a cancelled dialog is a no-op.
+  // Share a file into the active channel or DM; a cancelled picker is a no-op.
   async function sendFile() {
     if (!server || !connected) return;
     try {
@@ -352,12 +335,9 @@ export function Parties() {
     } catch (e) { toast(friendlyError(e), "error"); }
   }
 
-  // Download a file message's bytes and save them via the native dialog.
-  // Tracked per content hash so the card shows it is working: the request can
-  // take as long as the server takes to answer, and a click with no feedback
-  // is indistinguishable from a broken button.
-  // Accepts both shapes: a message card names the file in `text`, a Drive row
-  // in `name`. Reading only one of them saved the file as `undefined`.
+  // Download a file and save it via the native dialog, tracked per hash so the
+  // card shows it is working. A message names the file in `text`, a Drive row
+  // in `name`.
   async function downloadFile(m) {
     if (!server || !m.hash || downloading[m.hash]) return;
     const filename = m.text || m.name || "file";
@@ -416,8 +396,7 @@ export function Parties() {
     catch (e) { toast(friendlyError(e), "error"); }
   }
 
-  // Re-share a file into another channel or DM. The bytes are already on the
-  // server, so this is a reference rather than an upload.
+  // Re-share a file by reference (the bytes are already on the server).
   async function shareFile(f, dest) {
     if (!server) return;
     try {
@@ -450,12 +429,10 @@ export function Parties() {
     try { await api.partyClearError(server.id); loadServers(); } catch { /* ignore */ }
   }
 
-  // Leave (two-click confirm): drops the connection and forgets the community
-  // locally. The server keeps the membership, so rejoining later resumes it.
+  // Leave (two-click confirm). The server keeps the membership.
   async function leave() {
     if (!server) return;
-    // The first click arms it; the label switches to spell out that the pinned
-    // fingerprint goes with it.
+    // The first click arms it; the label says the pin goes too.
     if (!confirmLeave) { setConfirmLeave(true); return; }
     setConfirmLeave(false);
     try {
@@ -466,18 +443,14 @@ export function Parties() {
     } catch (e) { toast(friendlyError(e), "error"); }
   }
 
-  // Rejoin a dropped/rejected community: open the join form prefilled with the
-  // stored address + username (a password can be typed there if needed). A
-  // successful rejoin replaces this entry (deduped by address in the bridge).
+  // Rejoin: open the join form prefilled with address + username.
   function rejoin() {
     if (!server) return;
     setPrefill({ address: server.address, username: server.username || "" });
     setAdding(true);
   }
 
-  // Remove a dead entry without rejoining. Two-click like `leave`: this also
-  // discards the community's pinned fingerprint, so rejoining afterwards is an
-  // unverified first contact again.
+  // Remove a dead entry (two-click: this also discards its pin).
   async function removeServer() {
     if (!server) return;
     if (!confirmLeave) { setConfirmLeave(true); return; }
@@ -577,9 +550,7 @@ export function Parties() {
                   <span className="party-unread">{unread[`${server.id}|dm-${m.id}`]}</span>
                 )}
               </button>
-              {/* Offered only where the server would actually agree: you cannot
-                  change your own role, the owner's, or that of a peer at your
-                  own level, and you can only grant roles below your own. */}
+              {/* Only roles the server would accept for this member. */}
               {assignableRoles(server?.my_role, m).length > 0 && (
                 <select className="party-rolesel" value={m.role}
                   title={`Role for ${m.username}`}
@@ -607,9 +578,8 @@ export function Parties() {
                   {STATUS_LABEL[server?.status] || server?.status}
                   {server?.status_detail ? `: ${server.status_detail}` : ""}
                 </span>
-                {/* Always on screen, not only at join time: community traffic is
-                    stored readable by the operator, and a DM here looks like
-                    any other DM (audit JOURNEY-04 / PRIV-01). */}
+                {/* Always shown: the operator can read community traffic
+                    (audit JOURNEY-04 / PRIV-01). */}
                 <span className="set-badge is-warn party-operator-badge"
                   title="Messages, DMs and files in this community are stored on the server unencrypted. Whoever runs it — or gets into it — can read them.">
                   Operator can read messages
@@ -709,8 +679,7 @@ export function Parties() {
               </button>
               <textarea className="composer-input" rows={1}
                 placeholder={composerHint}
-                // The placeholder is the only thing that says *why* the box is
-                // disabled, and a placeholder is not an accessible name.
+                // The placeholder is not an accessible name.
                 aria-label={composerHint}
                 disabled={!canSend}
                 value={draft} onChange={(e) => setDraft(e.target.value)}

@@ -4,20 +4,10 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Write `bytes` to `path` so that the file is either the old content or the
-/// new content, never a truncated mix of the two.
-///
-/// Writes to a uniquely-named temporary file **in the same directory** (a
-/// rename is only atomic within one filesystem), `fsync`s it so the data is on
-/// disk before anything points at it, then renames over the destination. On
-/// Unix the containing directory is `fsync`ed too, so the rename itself
-/// survives a power loss; the file is created 0600 from the start rather than
-/// being widened and then narrowed.
-///
-/// This exists because the in-place `truncate + write` it replaced could leave
-/// `identity.json` empty after a crash, full disk, or power loss — and that
-/// file is the only key to the user's encrypted history, so a partial write is
-/// indistinguishable from destroying the account.
+/// Write `bytes` to `path` atomically: a unique temp file in the same directory
+/// (0600 from creation), fsync, rename over the destination, then fsync the
+/// directory on Unix. `identity.json` is the only key to the history, so a
+/// partial write must be impossible.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
@@ -29,8 +19,7 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create directory {}", dir.display()))?;
 
-    // Unique name: two processes writing the same file must not share a temp
-    // and corrupt each other's write.
+    // Unique name, so concurrent writers never share a temp file.
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", path.display()))?
@@ -51,8 +40,6 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("failed to write {}", tmp.display()))?;
-        // Durability before visibility: without this the rename can land while
-        // the data is still only in the page cache.
         file.sync_all()
             .with_context(|| format!("failed to flush {}", tmp.display()))?;
         Ok(())
@@ -63,16 +50,13 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(e);
     }
 
-    // `rename` replaces the destination atomically on both Unix and Windows.
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::Error::new(e)
             .context(format!("failed to replace {} atomically", path.display())));
     }
 
-    // Make the rename itself durable. Best-effort: some filesystems refuse to
-    // open a directory for sync, and a missing directory fsync is a much
-    // smaller risk than the partial write this function exists to prevent.
+    // Best-effort: some filesystems refuse to open a directory for sync.
     #[cfg(unix)]
     {
         if let Ok(d) = std::fs::File::open(&dir) {
@@ -122,13 +106,10 @@ mod atomic_write_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"x");
     }
 
-    /// The original file must survive a failed write, since it is the only copy
-    /// of the user's identity.
+    /// The original must survive a failed write (parent is a regular file).
     #[test]
     fn a_failed_write_leaves_the_original_intact() {
         let dir = tempfile::tempdir().unwrap();
-        // A path whose "parent" is an existing regular file: creating the temp
-        // inside it cannot succeed.
         let blocker = dir.path().join("not-a-dir");
         std::fs::write(&blocker, b"original").unwrap();
         let doomed = blocker.join("child.json");
@@ -157,22 +138,9 @@ mod atomic_write_tests {
     }
 }
 
-/// Decode a bincode frame, refusing anything left over after it.
-///
-/// `bincode::deserialize` stops at the end of the value and ignores whatever
-/// follows, so `frame || junk` decodes to exactly the same thing as `frame`.
-/// That gives two distinct byte strings one meaning — an on-path attacker who
-/// can append to a frame changes its bytes without changing what the peer
-/// reads, and a digest, a cache key or an equality check over the raw frame
-/// disagrees with the decoder about whether two frames are the same.
-///
-/// Every frame in this project is produced by `bincode::serialize` and carried
-/// in a length-delimited envelope, so nothing a conforming peer sends has
-/// trailing bytes and refusing them costs nothing.
-///
-/// The options are the ones `bincode::serialize` itself uses — fixed-width
-/// integers, little-endian — with trailing bytes rejected instead of allowed,
-/// so this reads exactly what the matching `serialize` wrote and nothing wider.
+/// Decode a bincode frame, refusing trailing bytes: plain `bincode::deserialize`
+/// decodes `frame || junk` as `frame`, giving two byte strings one meaning.
+/// Same options as `bincode::serialize` (fixint, little-endian) otherwise.
 pub fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     use bincode::Options;
     bincode::DefaultOptions::new()
@@ -182,7 +150,7 @@ pub fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .deserialize(bytes)
         .map_err(|e| anyhow!("malformed frame: {e}"))
 }
-/// Get current timestamp in milliseconds since Unix epoch
+
 pub fn current_timestamp_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -190,32 +158,22 @@ pub fn current_timestamp_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Generate random bytes
 pub fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     rand::thread_rng().fill_bytes(&mut buf);
     buf
 }
 
-/// Convert bytes to hex string
 pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
-/// Longest filename this function will emit, in **bytes**.
-///
-/// The limit that matters is the operating system's, and it is a byte limit
-/// (255 on Linux/macOS) — not a character one. The receivers also prepend
-/// `tmp_<uuid>_` (41 bytes) before creating the spool file, so a name that is
-/// legal on its own can still make `File::create` fail with `ENAMETOOLONG`.
-/// Budgeting 150 bytes leaves room for that prefix and for the `_1`, `_2`
-/// disambiguating suffixes added on a name collision.
+/// Longest filename [`sanitize_filename`] emits, in **bytes** (the OS limit is
+/// 255 bytes); leaves room for the receiver's `tmp_<uuid>_` prefix and `_N`
+/// collision suffixes.
 pub const MAX_FILENAME_BYTES: usize = 150;
 
-/// Windows treats these as device names in *any* directory and with any
-/// extension, so `Downloads\CON` or `Downloads\NUL.txt` do not name files at
-/// all — the rename onto them fails, and the transfer dies with an I/O error
-/// that says nothing about why.
+/// Windows device names, reserved in any directory and with any extension.
 #[rustfmt::skip]
 const WINDOWS_RESERVED: &[&str] = &[
     "con", "prn", "aux", "nul",
@@ -223,27 +181,16 @@ const WINDOWS_RESERVED: &[&str] = &[
     "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
-/// True for characters that must never survive into a filename we display or
-/// create: C0/C1 control codes (a newline in a chat file card, a `\r` that
-/// rewrites the line in a terminal UI) and the Unicode bidirectional overrides.
-///
-/// The bidi ones are the interesting case. `U+202E RIGHT-TO-LEFT OVERRIDE`
-/// makes `photo_gnp.exe` *render* as `photo_exe.png` in every UI that draws the
-/// name — the extension check still sees `.exe` and refuses to open it, but the
-/// user was shown a lie, which is the whole point of the trick.
+/// C0/C1 controls and bidi overrides, which must never survive into a filename
+/// (U+202E renders `photo_gnp.exe` as `photo_exe.png`).
 fn is_forbidden_char(c: char) -> bool {
     c.is_control()
         || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
 }
 
-/// True when `name` contains a character that is invisible, or that changes how
-/// the text around it is drawn, rather than being part of the name.
-///
-/// That is control codes, the bidirectional overrides and isolates, and the
-/// zero-width and joiner characters. A display name containing one can pass
-/// for another (`ad\u{200B}min` renders as `admin`; `\u{202E}nimda` renders as
-/// `admin` too) or render as nothing at all, so names other people will read —
-/// community usernames and channel names — refuse them outright.
+/// True when `name` contains an invisible or text-direction-changing character
+/// (control, bidi, zero-width, joiners): `ad\u{200B}min` renders as `admin`.
+/// Names other people read (usernames, channel names) refuse them.
 pub fn has_hidden_characters(name: &str) -> bool {
     name.chars().any(|c| {
         is_forbidden_char(c)
@@ -258,44 +205,23 @@ pub fn has_hidden_characters(name: &str) -> bool {
     })
 }
 
-/// Reduce a peer-supplied name to something safe to create on this machine and
-/// honest to display.
-///
-/// Guards, in order: path separators and shell-hostile characters, control and
-/// bidi-override characters, `..` traversal, Windows reserved device names,
-/// Windows' silent stripping of trailing dots/spaces, and a **byte** length
-/// budget ([`MAX_FILENAME_BYTES`]) that keeps the extension intact.
+/// Reduce a peer-supplied name to something safe to create and honest to
+/// display: no separators, control/bidi characters, `..`, Windows device names
+/// or trailing dots/spaces, within a byte budget that keeps the extension.
 pub fn sanitize_filename(filename: &str) -> String {
-    // 1. Map anything that is a path separator or otherwise forbidden to `_`.
-    //    This is per-character, so it cannot change the length in bytes in a way
-    //    that matters below.
+    // Map path separators, shell-hostile, control and bidi characters to `_`.
     let mapped: String = filename
         .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
         .chars()
         .map(|c| if is_forbidden_char(c) { '_' } else { c })
         .collect();
 
-    // 2. Cut to the byte budget, then 3. tidy.
-    //
-    // The order matters and getting it wrong was exploitable twice over. Both
-    // the traversal collapse and the trailing-dot strip used to run *before*
-    // truncation, and truncation then put back what they had removed:
-    //
-    //   - `"A"*145 + ".exe." + "Z"*30` truncates to `AAA…AAA.exe.`, and Windows
-    //     silently drops that trailing dot to create `…​.exe`. `Path::extension()`
-    //     on the dotted name returns `Some("")`, so the desktop app's "this file
-    //     will run as a program" gate never fired for a file the OS then treated
-    //     as an executable. A peer picks the filename, so a peer picked that.
-    //
-    //   - Truncating between two dots separated by a multi-byte character
-    //     brought them together, re-creating a `..` the collapse had removed.
-    //
-    // Tidying after truncation fixes both, and only ever shrinks the name, so
-    // the budget still holds afterwards.
+    // Truncate *then* tidy: tidying first let truncation re-create a trailing
+    // dot (`AAA….exe.`, which Windows turns into a `.exe` the open gate missed)
+    // or a `..` from two dots around a cut multi-byte char.
     let mut sanitized = tidy_edges(&truncate_filename_bytes(&mapped, MAX_FILENAME_BYTES));
 
-    // 4. A reserved device name is only reserved as the *stem*, so prefixing is
-    //    enough and keeps the name recognisable.
+    // Reserved names are reserved only as the stem, so prefixing defuses them.
     let stem = sanitized
         .split('.')
         .next()
@@ -303,8 +229,7 @@ pub fn sanitize_filename(filename: &str) -> String {
         .to_ascii_lowercase();
     if WINDOWS_RESERVED.contains(&stem.as_str()) {
         sanitized = format!("_{sanitized}");
-        // The prefix can push a name that sat exactly on the budget one byte
-        // over it, and re-truncating can expose a trailing dot all over again.
+        // The prefix can push the name over budget; re-truncate and re-tidy.
         if sanitized.len() > MAX_FILENAME_BYTES {
             sanitized = tidy_edges(&truncate_filename_bytes(&sanitized, MAX_FILENAME_BYTES));
         }
@@ -317,19 +242,10 @@ pub fn sanitize_filename(filename: &str) -> String {
     }
 }
 
-/// Collapse traversal components and strip the edge characters an operating
-/// system would quietly discard, so the name on disk is the name that was
-/// checked.
-///
-/// Only ever shrinks its input, which is what lets it run *after* truncation
-/// without breaking the byte budget.
-///
-/// Idempotent by construction: it loops until no `..` remains and removes *all*
-/// leading and trailing dots and spaces, so a second pass has nothing to do.
-/// `sanitizing_is_idempotent` in `core/tests/fuzz_parsers.rs` asserts that,
-/// because a sanitiser whose output differs from its own fixed point means the
-/// name written to disk depends on how many times it happened to be sanitised —
-/// and that is precisely how both bugs above hid.
+/// Collapse `..` and strip leading/trailing dots and spaces (which the OS would
+/// silently discard), so the name on disk is the name that was checked. Only
+/// shrinks its input, so it can run after truncation, and is idempotent
+/// (asserted by `sanitizing_is_idempotent` in `core/tests/fuzz_parsers.rs`).
 fn tidy_edges(name: &str) -> String {
     let mut out = name.to_string();
     while out.contains("..") {
@@ -338,16 +254,14 @@ fn tidy_edges(name: &str) -> String {
     out.trim_matches(|c: char| c == '.' || c == ' ').to_string()
 }
 
-/// Cut `name` to at most `budget` bytes on a character boundary, preserving the
-/// extension when there is one. Truncating blindly would drop `.pdf` off a long
-/// name and leave the user with a file their system cannot open.
+/// Cut `name` to at most `budget` bytes on a char boundary, keeping a short
+/// extension so the file still opens.
 fn truncate_filename_bytes(name: &str, budget: usize) -> String {
     if name.len() <= budget {
         return name.to_string();
     }
 
-    // Only treat a short trailing segment as an extension; a "." in the middle
-    // of a very long name is not one.
+    // Only a short trailing segment counts as an extension.
     let ext = name
         .rsplit_once('.')
         .map(|(_, ext)| ext)
@@ -359,7 +273,6 @@ fn truncate_filename_bytes(name: &str, budget: usize) -> String {
         &name[..name.len() - ext.len() - 1]
     };
 
-    // `+ 1` for the dot we re-add below.
     let stem_budget = budget.saturating_sub(if ext.is_empty() { 0 } else { ext.len() + 1 });
     let mut end = stem_budget.min(stem.len());
     while end > 0 && !stem.is_char_boundary(end) {
@@ -374,21 +287,10 @@ fn truncate_filename_bytes(name: &str, budget: usize) -> String {
     }
 }
 
-/// Parse a user-facing endpoint string into `(host, port)`.
-///
-/// Supports:
-/// - `hostname:1234`
-/// - `127.0.0.1:1234`
-/// - `[::1]:1234` (and `[fe80::1%eth0]:1234`)
-/// - `hostname` / `127.0.0.1` / `::1` / `[::1]` when `default_port` is provided
-///
-/// The input is split into a host and an optional port by its shape, and both
-/// halves are then held to the same rules whatever the shape was: a host must
-/// be non-empty with no spaces or control characters, and a port must be plain
-/// digits in `1..=65535`. Checking each shape separately is how `[]:80` came to
-/// mean "the empty host", `:0` a dialable port, and — with a default port — a
-/// pasted `http://example.com:8080` a hostname that only failed much later,
-/// with a confusing DNS error.
+/// Parse `host:port`, `[v6]:port`, or a bare host / v4 / v6 / `[v6]` when
+/// `default_port` is given. Every shape is held to the same rules: non-empty
+/// host without spaces or control chars, port plain digits in `1..=65535`, and
+/// no URLs.
 pub fn parse_host_port(input: &str, default_port: Option<u16>) -> Result<(String, u16)> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -412,8 +314,7 @@ pub fn parse_host_port(input: &str, default_port: Option<u16>) -> Result<(String
         };
         (host, port)
     } else if trimmed.matches(':').count() > 1 {
-        // More than one colon and no brackets: only a bare IPv6 address, which
-        // cannot carry a port of its own.
+        // Several colons, no brackets: only a bare IPv6 address, which has no port.
         if !is_ipv6_literal(trimmed) {
             return Err(anyhow!(
                 "Not a valid address; write an IPv6 address with a port as [addr]:port"
@@ -442,8 +343,7 @@ pub fn parse_host_port(input: &str, default_port: Option<u16>) -> Result<(String
     Ok((host.to_string(), port))
 }
 
-/// A port as a user types it: plain digits (no sign), and not 0, which cannot
-/// be dialled.
+/// Plain digits, no sign, and not 0 (cannot be dialled).
 fn parse_port(text: &str) -> Result<u16> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return Err(anyhow!("Invalid port"));
@@ -455,13 +355,13 @@ fn parse_port(text: &str) -> Result<u16> {
     }
 }
 
-/// An IPv6 address, optionally with a `%zone` suffix.
+/// IPv6 address, optionally with a `%zone` suffix.
 fn is_ipv6_literal(text: &str) -> bool {
     let address = text.split_once('%').map_or(text, |(address, _)| address);
     address.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
-/// Render a normalized address string, adding brackets around IPv6 literals.
+/// `host:port`, bracketing IPv6 literals.
 pub fn format_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{}]:{}", host, port)
@@ -470,7 +370,7 @@ pub fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// Format file size in human-readable format
+/// Human-readable file size.
 pub fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut size = bytes as f64;
@@ -484,16 +384,9 @@ pub fn format_size(bytes: u64) -> String {
     format!("{:.2} {}", size, UNITS[unit_idx])
 }
 
-/// The one spelling of a fingerprint every comparison is made against:
-/// trimmed, lowercase hex — exactly what [`crate::core::fingerprint_pubkey`]
-/// produces for a key presented in a handshake.
-///
-/// Fingerprints also arrive from people: invite links (whose binding check is
-/// case-insensitive) and typed `:contact-add` arguments. Stored verbatim, an
-/// uppercase one never equalled the handshake's lowercase one, and the
-/// trust code compares exactly — so **blocking** such a contact blocked
-/// nothing, and a verified one was prompted for again. Normalise at the
-/// boundary instead of remembering to compare case-insensitively everywhere.
+/// Canonical fingerprint spelling (trimmed lowercase hex, as `fingerprint_pubkey`
+/// emits). Normalise human-supplied fingerprints at the boundary: trust checks
+/// compare exactly, so an uppercase one stored verbatim blocked/verified nothing.
 pub fn canonical_fingerprint(fp: &str) -> String {
     fp.trim().to_ascii_lowercase()
 }
@@ -507,9 +400,7 @@ pub fn format_fingerprint_short(fp: &str) -> String {
     }
 }
 
-/// A minimal extension → MIME guess for common file types; defaults to
-/// `application/octet-stream`. Display metadata only — never used for security
-/// decisions.
+/// Extension -> MIME guess for display only; never used for security decisions.
 pub fn guess_mime(path: &std::path::Path) -> &'static str {
     let ext = path
         .extension()
@@ -532,11 +423,9 @@ pub fn guess_mime(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// Best-effort discovery of the primary local IPv4 address.
-/// Uses a UDP "connect" to a public resolver to learn the outbound interface.
+/// Best-effort primary local IPv4, learned via a UDP "connect" (sends nothing).
 pub fn primary_local_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    // Destination is never actually contacted for UDP connect; safe placeholder.
     socket.connect("8.8.8.8:80").ok()?;
     match socket.local_addr().ok()? {
         SocketAddr::V4(v4) => Some(v4.ip().to_string()),
@@ -562,9 +451,6 @@ mod tests {
         );
     }
 
-    /// The name is created on disk, so the budget that matters is the OS's
-    /// **byte** limit — and the receivers prepend `tmp_<uuid>_` before creating
-    /// the spool file, so the emitted name must leave room for that.
     #[test]
     fn sanitize_filename_budgets_bytes_not_chars() {
         let ascii = sanitize_filename(&format!("{}.pdf", "a".repeat(400)));
@@ -575,8 +461,7 @@ mod tests {
         );
         assert!(ascii.ends_with(".pdf"), "the extension must survive");
 
-        // Multi-byte characters: 400 chars is 1600 bytes, and the cut must land
-        // on a character boundary (a panic here would be a slicing bug).
+        // Multi-byte: the cut must land on a char boundary.
         let wide = sanitize_filename(&format!("{}.txt", "é".repeat(400)));
         assert!(wide.len() <= MAX_FILENAME_BYTES);
         assert!(wide.ends_with(".txt"));
@@ -585,8 +470,6 @@ mod tests {
         assert!(MAX_FILENAME_BYTES + "tmp_".len() + 36 + 1 < 255);
     }
 
-    /// `CON`/`NUL`/`COM1` are devices on Windows in every directory and with any
-    /// extension, so creating or renaming onto them fails.
     #[test]
     fn sanitize_filename_defuses_windows_device_names() {
         for reserved in ["CON", "nul", "Com1.txt", "LPT9.log", "aux"] {
@@ -601,8 +484,7 @@ mod tests {
         assert_eq!(sanitize_filename("console.log"), "console.log");
     }
 
-    /// U+202E makes `photo_gnp.exe` render as `photo_exe.png`. The open gate
-    /// still reads the real extension, but the user must not be shown a lie.
+    /// U+202E makes `photo_gnp.exe` render as `photo_exe.png`.
     #[test]
     fn sanitize_filename_strips_control_and_bidi_characters() {
         let spoofed = sanitize_filename("photo_\u{202E}gnp.exe");
@@ -618,13 +500,11 @@ mod tests {
         }
     }
 
-    /// Windows silently drops trailing dots and spaces, so `evil.exe .` would
-    /// land as `evil.exe` — decide that here instead of letting the OS do it.
+    /// Windows silently drops trailing dots and spaces (`evil.exe .` -> `evil.exe`).
     #[test]
     fn sanitize_filename_strips_trailing_dots_and_spaces() {
         assert_eq!(sanitize_filename("report.pdf . "), "report.pdf");
-        // A name made only of dots and spaces has nothing left to keep, so it
-        // must still come out as something creatable rather than empty.
+        // Nothing left to keep must still yield a creatable, non-empty name.
         for nothing in ["...", "   ", ". . .", ""] {
             let out = sanitize_filename(nothing);
             assert!(!out.is_empty(), "{nothing:?} sanitized to an empty name");

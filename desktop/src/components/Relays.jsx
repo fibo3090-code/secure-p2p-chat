@@ -1,27 +1,19 @@
-// Relays surface — a relay is a blind byte-broker that lets two peers pair when
-// neither can dial the other (no port-forwarding). It retains no data; a relayed
-// conversation is still an end-to-end-encrypted, fingerprint-verified DM.
-//
-// Honest by design: this pane only exposes actions the backend actually backs
-// (connect/host via relay through the bridge, run a local relay). Saved-relay
-// and live-route tracking don't exist yet, so they're shown as explicit empty
-// states rather than fabricated data.
+// Relays surface. A relay is a blind byte-broker that pairs two peers when neither
+// can dial the other; a relayed conversation is still an end-to-end-encrypted,
+// fingerprint-verified DM. Only actions the backend backs are offered; saved
+// relays and live routes do not exist yet, so they show as explicit empty states.
 import { useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { Button, Input } from "./ui.jsx";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
-// The crate that actually provides `--relay-server` (see client/src/main.rs).
-// This is a copy-paste command: a wrong crate name here is a user typing it into
-// a terminal and being told the package does not exist.
+// The crate that provides `--relay-server` (client/src/main.rs); users paste this.
 const LOCAL_RELAY_CMD = "cargo run --release -p p2pem-classic -- --relay-server --port 9000";
 
 function Copyable({ value }) {
   const [done, setDone] = useState(false);
-  // writeText returns a promise, so a sync try/catch never sees a rejection:
-  // "Copied ✓" appeared even when the clipboard was blocked and nothing was
-  // copied. Await it, and say so when it fails.
+  // writeText is async: await it, or "Copied ✓" shows when nothing was copied.
   async function copy() {
     try {
       await navigator.clipboard?.writeText(value);

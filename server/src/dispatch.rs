@@ -1,12 +1,9 @@
-//! Party request dispatcher (Phase 1, slice 1b).
+//! Party request dispatcher: the pure, network-free protocol layer.
 //!
-//! The pure protocol-handling layer: given the per-connection session state and an
-//! incoming [`PartyRequest`], it applies the request to the shared [`PartyState`]
-//! and produces the [`PartyResponse`]s to send back. It enforces the "must join
-//! before acting" rule and is completely network-free, so it is unit-tested
-//! directly. The runtime (next slice) owns the transport and fan-out: it decrypts
-//! a request off the v3 tunnel, calls [`handle_request`], encrypts the replies, and
-//! separately broadcasts newly posted messages to other online members.
+//! Given a connection's session state and a [`PartyRequest`], it applies the
+//! request to the shared [`PartyState`] and produces the [`PartyResponse`]s to
+//! send back and fan out, enforcing "join before acting". The runtime
+//! (`connection.rs`) owns transport, fan-out and deferred I/O.
 
 use messenger_core::party::{
     ChannelKind, Envelope, PartyRequest, PartyResponse, UploadTarget, PARTY_CHUNK_BYTES,
@@ -16,31 +13,17 @@ use uuid::Uuid;
 
 use crate::state::{BlobReadPlan, PartyState, StagedUpload};
 
-/// The outcome of handling one request:
-/// - `replies` go back to the requesting connection;
-/// - `broadcast` responses are pushed to all *other* connected members (a posted
-///   channel message, or a refreshed channel list);
-/// - `directed` responses are delivered to a specific member's connections (DMs).
-///
-/// The runtime fans `broadcast`/`directed` out via the connection hub.
+/// The outcome of handling one request: `replies` go back to the requester,
+/// `broadcast` to every *other* connection, `directed` to one member's
+/// connections (via the hub).
 #[derive(Debug, Default)]
 pub struct Dispatch {
     pub replies: Vec<PartyResponse>,
     pub broadcast: Vec<PartyResponse>,
     pub directed: Vec<(Uuid, PartyResponse)>,
-    /// Work the runtime must do **after** releasing the state lock, and which
-    /// produces further replies of its own. `None` for almost every request.
-    ///
-    /// This exists because two operations move real bytes — a blob read and a
-    /// blob write, each up to `MAX_PARTY_FILE_BYTES` — and doing them inside
-    /// `handle_request` means doing them with the state mutex held, so one
-    /// member's 100 MiB transfer stalls every other member's messages for its
-    /// whole duration. Deciding *whether* they may happen is a question about
-    /// state and stays here; performing them is not.
-    ///
-    /// `handle_request` remains sync and network-free. The runtime
-    /// (`connection.rs`) is what knows how to await, so it owns the second half:
-    /// see [`Deferred`].
+    /// Work the runtime must do **after** releasing the state lock (a blob read
+    /// or write, up to `MAX_PARTY_FILE_BYTES`), which produces further replies
+    /// of its own. Deciding *whether* it may happen stays here.
     pub deferred: Option<Deferred>,
 }
 
@@ -77,20 +60,21 @@ impl Dispatch {
         }
     }
 
-    /// `Ok` for a successful administrative action, `Error` for a refused one.
-    fn outcome(result: Result<String, String>) -> Self {
-        Self::reply(match result {
-            Ok(msg) => PartyResponse::Ok(msg),
-            Err(e) => PartyResponse::Error(e),
-        })
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self::reply(PartyResponse::Error(msg.into()))
     }
 
-    /// A send the client is already showing was refused.
-    ///
-    /// `ActionFailed`, not `Error`: the client appends posts, DMs and uploads
-    /// optimistically, so a refusal has to be attributable to *that* message
-    /// or the row stays on screen looking delivered. `thread` is the channel or
-    /// DM thread it belongs to (`nil` when the server cannot tell).
+    /// `Ok` for a successful administrative action, `Error` for a refused one.
+    fn outcome(result: Result<String, String>) -> Self {
+        match result {
+            Ok(msg) => Self::reply(PartyResponse::Ok(msg)),
+            Err(e) => Self::error(e),
+        }
+    }
+
+    /// A send the client is already showing was refused. `ActionFailed`, not
+    /// `Error`, so the client can take that optimistic row back off the screen;
+    /// `thread` is its channel or DM thread (`nil` when unknown).
     pub fn action_failed(thread: Uuid, reason: String) -> Self {
         Self::reply(PartyResponse::ActionFailed {
             channel: thread,
@@ -99,29 +83,20 @@ impl Dispatch {
     }
 }
 
-/// Turn the result of phase 3 into the replies and fan-out it produces.
-///
-/// The same shapes `FinishUpload` used to build inline, kept here beside every
-/// other response shape rather than in the runtime — which should know only
-/// *when* the I/O happens, not what the answer looks like.
+/// Turn the result of upload phase 3 into the replies and fan-out it produces.
 pub fn upload_committed(
     state: &PartyState,
     member: Uuid,
     result: Result<(Envelope, UploadTarget), String>,
 ) -> Dispatch {
     match result {
-        // A file posted to a channel fans out exactly like a text post: broadcast
-        // when the channel is open to everyone, directed at the readers when it
-        // is not.
+        // A file fans out exactly like a text post.
         Ok((env, target)) => posted(state, member, target, env),
         Err(reason) => Dispatch::action_failed(Uuid::nil(), reason),
     }
 }
 
 /// Turn a performed download into the reply it answers.
-///
-/// Split out so the shape of the answer lives beside every other response shape
-/// rather than in the runtime, which should only know *when* to do the I/O.
 pub fn download_reply(
     hash: String,
     offset: Option<u64>,
@@ -136,9 +111,7 @@ pub fn download_reply(
             total,
             data,
         }),
-        // The read failed after access was granted — the blob's last reference
-        // was deleted while this was in flight, or the file is gone. Same answer
-        // as an unknown hash, which is also what it now is.
+        // Gone since access was granted: answer as for an unknown hash.
         (None, _) => unknown_file(),
     }
 }
@@ -147,17 +120,12 @@ pub fn download_reply(
 /// may not see — deliberately the same, so the endpoint never confirms that a
 /// file it will not hand over exists.
 fn unknown_file() -> Dispatch {
-    Dispatch::reply(PartyResponse::Error(UNKNOWN_FILE_ERROR.to_string()))
+    Dispatch::error(UNKNOWN_FILE_ERROR)
 }
 
 /// How many rejected `Join` attempts a single connection may make before it is
-/// refused outright.
-///
-/// Password guessing is the attack this bounds. Without a limit one TCP
-/// connection can carry an unlimited stream of `Join` frames, so an attacker
-/// pays for one RSA handshake and then guesses as fast as the link allows. With
-/// it they must redo the full v3 handshake every three guesses — and the accept
-/// loop's per-IP limiter bounds how often they may do *that*.
+/// refused outright, so one handshake cannot buy unlimited password guesses
+/// (reconnecting is then bounded by the accept loop's per-IP limiter).
 pub const MAX_JOIN_ATTEMPTS: u32 = 3;
 
 /// Per-connection session state. A connection must `Join` before any other
@@ -169,9 +137,8 @@ pub struct ConnState {
     peer_fingerprint: Option<String>,
     /// Rejected join attempts on this connection (see [`MAX_JOIN_ATTEMPTS`]).
     join_failures: u32,
-    /// Chunked uploads this connection started and has not finished. Tracked
-    /// here so they can be discarded when the connection ends, and so the
-    /// per-connection concurrency cap has something to count.
+    /// Uploads (and staged reservations) this connection has in flight, so a
+    /// disconnect can release them.
     uploads: Vec<Uuid>,
 }
 
@@ -179,10 +146,8 @@ impl ConnState {
     /// Create connection state carrying the handshake-verified peer fingerprint.
     pub fn with_fingerprint(fingerprint: String) -> Self {
         Self {
-            member: None,
             peer_fingerprint: Some(fingerprint),
-            join_failures: 0,
-            uploads: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -197,9 +162,8 @@ impl ConnState {
         self.uploads.retain(|u| *u != upload);
     }
 
-    /// Record an id for an upload that did not come from `StartUpload` — an
-    /// inline one, which has no client-supplied id but still holds a
-    /// reservation that a disconnect must release.
+    /// Record an inline upload's minted id: it holds a reservation that a
+    /// disconnect must release.
     pub fn track_upload(&mut self, upload: Uuid) {
         self.uploads.push(upload);
     }
@@ -226,13 +190,9 @@ fn posted(state: &PartyState, member: Uuid, target: UploadTarget, env: Envelope)
     }
 }
 
-/// Where a stored DM envelope has to be delivered: to the recipient, and to the
-/// sender's *other* connections.
-///
-/// The runtime excludes the originating connection when it fans `directed` out,
-/// so the sender's own client is not sent a duplicate of the message it already
-/// appended optimistically — but its other devices, which know nothing about the
-/// send, are. A self-DM collapses to a single entry so it is not delivered twice.
+/// Where a stored DM envelope has to be delivered: the recipient, and the
+/// sender's *other* connections (the runtime skips the originating one, which
+/// appended it optimistically). A self-DM is delivered once.
 fn dm_delivery(from: Uuid, to: Uuid, env: Envelope) -> Vec<(Uuid, PartyResponse)> {
     if from == to {
         return vec![(to, PartyResponse::Message(env))];
@@ -243,15 +203,9 @@ fn dm_delivery(from: Uuid, to: Uuid, env: Envelope) -> Vec<(Uuid, PartyResponse)
     ]
 }
 
-/// How a stored channel message reaches everyone else.
-///
-/// A channel every joined member may read can simply be broadcast. A `Private`
-/// one cannot: `broadcast_except` pushes to every registered connection, so a
-/// member who is not in the channel — and who is correctly not shown it in
-/// `ListChannels` — would still receive every live message posted to it. Those
-/// are delivered by member instead, to exactly the people allowed to read them.
-/// The runtime excludes the originating connection either way, so the poster is
-/// not sent a copy of what it already appended.
+/// How a stored channel message reaches everyone else: broadcast when every
+/// member may read the channel, otherwise directed to exactly its readers (a
+/// broadcast would leak a private channel's messages).
 fn channel_fanout(state: &PartyState, env: Envelope) -> Dispatch {
     let ack = PartyResponse::MessagePosted {
         channel: env.channel,
@@ -284,13 +238,9 @@ fn upload_thread(member: Uuid, target: UploadTarget) -> Uuid {
     }
 }
 
-/// Reply with the requester's own filtered channel list, and nudge everyone else
-/// to re-fetch theirs.
-///
-/// The list cannot simply be broadcast any more: `channels_for` filters private
-/// channels per member, while the hub sends one identical frame to every
-/// connection. Broadcasting one member's view would either leak the private
-/// channels to everyone or hide them from the people who are in them.
+/// Reply with the requester's own filtered channel list and nudge everyone
+/// else to re-fetch theirs: `channels_for` filters private channels per member,
+/// so one member's view must never be broadcast.
 fn channel_list_refresh(state: &PartyState, member: Uuid) -> Dispatch {
     Dispatch {
         replies: vec![PartyResponse::Channels(state.channels_for(member))],
@@ -307,17 +257,13 @@ fn channel_change(state: &PartyState, member: Uuid, result: Result<String, Strin
             out.replies.push(PartyResponse::Ok(msg));
             out
         }
-        Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+        Err(e) => Dispatch::error(e),
     }
 }
 
 /// Phase 1 of an inline upload (`PostFile` / `SendFileDm`): check it and take
-/// the bytes, deferring the write until the lock is released.
-///
-/// Inline uploads take the same three phases as chunked ones — see
-/// `begin_inline_upload` for why the 4 MiB cap is not reason enough to keep a
-/// second path. The minted id is tracked on the connection because the upload
-/// holds a storage reservation that a disconnect has to release.
+/// the bytes, deferring the write. The minted id is tracked on the connection
+/// because its storage reservation must be released on disconnect.
 fn begin_inline_upload(
     state: &mut PartyState,
     conn: &mut ConnState,
@@ -356,7 +302,7 @@ pub fn handle_request(state: &mut PartyState, conn: &mut ConnState, req: PartyRe
         (None, PartyRequest::Join { username, password }) => {
             join(state, conn, &username, password.as_deref())
         }
-        (None, _) => Dispatch::reply(PartyResponse::Error("join required".to_string())),
+        (None, _) => Dispatch::error("join required"),
         (Some(member), req) => handle_member_request(state, conn, member, req),
     }
 }
@@ -367,9 +313,7 @@ fn join(
     username: &str,
     password: Option<&str>,
 ) -> Dispatch {
-    // Rate limit: a connection gets a small number of rejected attempts and is
-    // then done. Otherwise one handshake buys unlimited password guesses down
-    // the same socket.
+    // A few rejected attempts per connection, then it is spent.
     if conn.join_failures >= MAX_JOIN_ATTEMPTS {
         return Dispatch::reply(PartyResponse::JoinRejected {
             reason: "too many failed attempts on this connection — reconnect to try again"
@@ -385,11 +329,7 @@ fn join(
                     server_name: state.name().to_string(),
                     tier: state.tier(),
                 }],
-                // Everyone else's directory just went stale: either a new member
-                // appeared or a returning one came back online. Nothing used to
-                // announce this, so every client's member list was frozen at the
-                // moment *it* joined — new members never showed up and the
-                // online dots never changed.
+                // Everyone else's directory just went stale.
                 broadcast: vec![PartyResponse::Members(state.members())],
                 ..Dispatch::default()
             }
@@ -403,13 +343,9 @@ fn join(
     }
 }
 
-/// The text bytes a request writes, if it is a write at all.
-///
-/// Every request that changes state is a write: posts, DMs, uploads, shares,
-/// and governance actions (which also cost an audit row each, and which a
-/// member could otherwise loop to push real admin actions out of the visible
-/// audit log). Reads are free, and so are the later steps of an upload that
-/// was already admitted — its chunks are bounded by the size it declared.
+/// The text bytes a request writes, if it is a write at all. Every state
+/// change counts, governance included (each costs an audit row); reads and the
+/// chunks of an already admitted upload are free.
 fn write_cost(req: &PartyRequest) -> Option<usize> {
     match req {
         PartyRequest::PostMessage { text, .. } | PartyRequest::SendDm { text, .. } => {
@@ -430,12 +366,9 @@ fn write_cost(req: &PartyRequest) -> Option<usize> {
     }
 }
 
-/// The answer to a write refused by the rate limit.
-///
-/// A send the client is already showing gets `ActionFailed`, exactly as any
-/// other refused send does, so the client takes the row back off the screen
-/// instead of leaving it looking delivered — and so the reply stays in step
-/// with the client's FIFO of awaited answers.
+/// The answer to a write refused by the rate limit: `ActionFailed` for a send
+/// the client is showing (so the row is retracted and its FIFO stays in step),
+/// `Error` otherwise.
 fn rate_limited(member: Uuid, req: &PartyRequest, reason: String) -> Dispatch {
     match req {
         PartyRequest::PostMessage { channel, .. } | PartyRequest::PostFile { channel, .. } => {
@@ -447,7 +380,7 @@ fn rate_limited(member: Uuid, req: &PartyRequest, reason: String) -> Dispatch {
         PartyRequest::StartUpload { target, .. } | PartyRequest::ShareFile { target, .. } => {
             Dispatch::action_failed(upload_thread(member, *target), reason)
         }
-        _ => Dispatch::reply(PartyResponse::Error(reason)),
+        _ => Dispatch::error(reason),
     }
 }
 
@@ -464,12 +397,9 @@ fn handle_member_request(
         }
     }
     match req {
-        PartyRequest::Join { .. } => Dispatch::reply(PartyResponse::Error(
-            "already joined on this connection".to_string(),
-        )),
+        PartyRequest::Join { .. } => Dispatch::error("already joined on this connection"),
         PartyRequest::ListMembers => Dispatch::reply(PartyResponse::Members(state.members())),
-        // Filtered: a private channel does not advertise its existence to
-        // somebody who is not in it.
+        // Filtered per member.
         PartyRequest::ListChannels => {
             Dispatch::reply(PartyResponse::Channels(state.channels_for(member)))
         }
@@ -520,24 +450,16 @@ fn handle_member_request(
         }
 
         // --- Governance and file management ---------------------------------
-        //
-        // A new or changed channel alters what everyone may see, and private
-        // channels are filtered per member, so each connection needs its *own*
-        // view rather than one shared list (see `channel_list_refresh`).
+        // Channel changes answer with the requester's own filtered list (see
+        // `channel_list_refresh`).
         PartyRequest::CreateChannel { name } => {
-            match state.create_channel_of_kind(member, &name, ChannelKind::Public, vec![]) {
-                Ok(_) => channel_list_refresh(state, member),
-                Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-            }
+            create_channel(state, member, &name, ChannelKind::Public, vec![])
         }
         PartyRequest::CreateChannelOfKind {
             name,
             kind,
             members,
-        } => match state.create_channel_of_kind(member, &name, kind, members) {
-            Ok(_) => channel_list_refresh(state, member),
-            Err(e) => Dispatch::reply(PartyResponse::Error(e)),
-        },
+        } => create_channel(state, member, &name, kind, members),
         PartyRequest::DeleteChannel { channel } => {
             let result = state.delete_channel(member, channel);
             channel_change(state, member, result)
@@ -555,12 +477,8 @@ fn handle_member_request(
             role,
         } => match state.set_role(member, target, role) {
             Ok(msg) => Dispatch {
-                // A role change alters what the member may *do* and what they
-                // may *see*: `channels_for` filters by role, so a demoted admin
-                // would keep listing private channels until something else
-                // happened to refresh them. The server still refuses the reads,
-                // so that is stale UI rather than a leak — but it is still
-                // wrong on screen.
+                // A role change can change what the member may *see* too, so
+                // refresh their channel list as well.
                 replies: vec![
                     PartyResponse::Members(state.members()),
                     PartyResponse::Channels(state.channels_for(member)),
@@ -572,7 +490,7 @@ fn handle_member_request(
                 ],
                 ..Dispatch::default()
             },
-            Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+            Err(e) => Dispatch::error(e),
         },
         PartyRequest::ListFiles => Dispatch::reply(PartyResponse::Files(state.files_for(member))),
         PartyRequest::ListFilesPage { offset } => {
@@ -595,7 +513,7 @@ fn handle_member_request(
         PartyRequest::FetchAuditLog { limit } => {
             match state.audit_log(member, limit.clamp(1, 1000) as usize) {
                 Ok(entries) => Dispatch::reply(PartyResponse::AuditLog(entries)),
-                Err(e) => Dispatch::reply(PartyResponse::Error(e)),
+                Err(e) => Dispatch::error(e),
             }
         }
         PartyRequest::FetchQuota => Dispatch::reply(PartyResponse::Quota(state.quota_for(member))),
@@ -620,33 +538,20 @@ fn handle_member_request(
             match state.upload_chunk(member, upload, &data) {
                 Ok(()) => Dispatch::default(),
                 Err(reason) => {
-                    // A failed chunk ends the upload on *both* sides. Clearing
-                    // only the connection's id left the spool in `PartyState`
-                    // with nothing able to reach it — holding the member's
-                    // concurrency slot and its bytes until the connection
-                    // dropped. "chunk is too large" is the reachable case: it
-                    // returns before the state removes anything.
+                    // A failed chunk ends the upload on *both* sides, or the
+                    // spool would hold the member's slot until disconnect.
                     state.cancel_upload(member, upload);
                     conn.finish_upload(upload);
-                    Dispatch::reply(PartyResponse::Error(reason))
+                    Dispatch::error(reason)
                 }
             }
         }
         PartyRequest::FinishUpload { upload } => {
-            // Phase 1 only: check it and take the bytes. The write is deferred,
-            // because it is up to `MAX_PARTY_FILE_BYTES` of hashing and I/O and
-            // doing it here does it with the state lock held.
-            //
-            // The connection's own list is cleared *after* the call, not before.
-            // Clearing it first meant an error path that left the spool in
-            // `PartyState` also left the connection believing it had nothing in
-            // flight — so the concurrency cap read zero and the disconnect
-            // sweep, gated on this same list, never ran.
+            // Phase 1 only; the write is deferred. The connection's list is
+            // cleared only on failure: on success the id stays listed until
+            // `connection.rs` finishes the deferred phase, because until then
+            // it is a reservation a disconnect must release.
             match state.begin_upload(member, upload) {
-                // Stays listed on the connection until the deferred phase
-                // finishes: between here and the commit it is a *reservation*,
-                // and a disconnect in that window has to release it.
-                // `connection.rs` clears it after.
                 Ok(staged) => Dispatch::defer(Deferred::Upload(Box::new(staged))),
                 Err(reason) => {
                     conn.finish_upload(upload);
@@ -667,6 +572,19 @@ fn handle_member_request(
                 Err(reason) => Dispatch::action_failed(upload_thread(member, target), reason),
             }
         }
+    }
+}
+
+fn create_channel(
+    state: &mut PartyState,
+    member: Uuid,
+    name: &str,
+    kind: ChannelKind,
+    members: Vec<Uuid>,
+) -> Dispatch {
+    match state.create_channel_of_kind(member, name, kind, members) {
+        Ok(_) => channel_list_refresh(state, member),
+        Err(e) => Dispatch::error(e),
     }
 }
 
@@ -732,7 +650,7 @@ mod tests {
     /// the RSA handshake (and the accept loop's per-IP limiter).
     #[test]
     fn repeated_wrong_passwords_exhaust_the_connection() {
-        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut state = PartyState::new("Srv", Some("pw".into()));
         let mut conn = ConnState::default();
         for _ in 0..MAX_JOIN_ATTEMPTS {
             let resp = join(&mut state, &mut conn, "alice", Some("nope"));
@@ -750,28 +668,19 @@ mod tests {
         assert_eq!(conn.member(), None);
     }
 
-    /// Everyone already connected has to be told the directory changed, or their
-    /// member list stays frozen at the moment they themselves joined — new
-    /// members never appear and the online dots never move.
+    /// Everyone already connected has to be told the directory changed, or
+    /// their member list stays frozen at the moment they joined.
     #[test]
     fn joining_broadcasts_the_refreshed_directory() {
         let mut state = PartyState::new("Srv", None);
-        let mut alice = ConnState::default();
-        handle_request(
-            &mut state,
-            &mut alice,
-            PartyRequest::Join {
-                username: "alice".to_string(),
-                password: None,
-            },
-        );
+        join(&mut state, &mut ConnState::default(), "alice", None);
 
         let mut bob = ConnState::default();
         let out = handle_request(
             &mut state,
             &mut bob,
             PartyRequest::Join {
-                username: "bob".to_string(),
+                username: "bob".into(),
                 password: None,
             },
         );
@@ -788,28 +697,20 @@ mod tests {
     }
 
     /// A DM must be delivered to the recipient *and* echoed to the sender's other
-    /// devices. The runtime excludes the originating connection, so the echo
-    /// cannot duplicate the message on the client that sent it.
+    /// devices (the runtime skips the originating connection).
     #[test]
     fn a_dm_is_directed_to_both_participants() {
         let mut state = PartyState::new("Srv", None);
         let mut alice_conn = ConnState::default();
-        let alice = match &join(&mut state, &mut alice_conn, "alice", None)[..] {
-            [PartyResponse::Joined { member_id, .. }] => *member_id,
-            other => panic!("expected Joined, got {other:?}"),
-        };
-        let mut bob_conn = ConnState::default();
-        let bob = match &join(&mut state, &mut bob_conn, "bob", None)[..] {
-            [PartyResponse::Joined { member_id, .. }] => *member_id,
-            other => panic!("expected Joined, got {other:?}"),
-        };
+        let alice = joined_id(&mut state, &mut alice_conn, "alice");
+        let bob = joined_id(&mut state, &mut ConnState::default(), "bob");
 
         let out = handle_request(
             &mut state,
             &mut alice_conn,
             PartyRequest::SendDm {
                 to: bob,
-                text: "hello".to_string(),
+                text: "hello".into(),
             },
         );
 
@@ -829,13 +730,8 @@ mod tests {
             .all(|(_, r)| matches!(r, PartyResponse::Message(_))));
     }
 
-    /// A private channel's messages must not be broadcast.
-    ///
-    /// `broadcast_except` pushes to every registered connection, so fanning a
-    /// private channel out that way handed its live traffic to members who are
-    /// correctly not shown the channel at all — they would not see it in
-    /// `ListChannels` and could not fetch its history, but every message posted
-    /// to it arrived on their socket anyway.
+    /// A private channel's messages must not be broadcast: that handed its live
+    /// traffic to members correctly not shown the channel at all.
     #[test]
     fn a_private_channel_is_delivered_only_to_its_members() {
         let mut state = PartyState::new("Srv", None);
@@ -856,7 +752,7 @@ mod tests {
             &mut owner_conn,
             PartyRequest::PostMessage {
                 channel: private,
-                text: "members only".to_string(),
+                text: "members only".into(),
             },
         );
 
@@ -885,7 +781,7 @@ mod tests {
             &mut conn,
             PartyRequest::PostMessage {
                 channel,
-                text: "hello all".to_string(),
+                text: "hello all".into(),
             },
         );
         assert!(matches!(&out.broadcast[..], [PartyResponse::Message(_)]));
@@ -897,16 +793,13 @@ mod tests {
     fn a_self_dm_is_delivered_once() {
         let mut state = PartyState::new("Srv", None);
         let mut conn = ConnState::default();
-        let me = match &join(&mut state, &mut conn, "alice", None)[..] {
-            [PartyResponse::Joined { member_id, .. }] => *member_id,
-            other => panic!("expected Joined, got {other:?}"),
-        };
+        let me = joined_id(&mut state, &mut conn, "alice");
         let out = handle_request(
             &mut state,
             &mut conn,
             PartyRequest::SendDm {
                 to: me,
-                text: "note to self".to_string(),
+                text: "note to self".into(),
             },
         );
         assert_eq!(out.directed.len(), 1);
@@ -917,7 +810,7 @@ mod tests {
     /// gets it right is not punished.
     #[test]
     fn a_successful_join_is_unaffected_by_an_earlier_mistake() {
-        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut state = PartyState::new("Srv", Some("pw".into()));
         let mut conn = ConnState::default();
         join(&mut state, &mut conn, "alice", Some("nope"));
         let resp = join(&mut state, &mut conn, "alice", Some("pw"));
@@ -927,7 +820,7 @@ mod tests {
 
     #[test]
     fn wrong_password_is_rejected_and_leaves_connection_unjoined() {
-        let mut state = PartyState::new("Srv", Some("pw".to_string()));
+        let mut state = PartyState::new("Srv", Some("pw".into()));
         let mut conn = ConnState::default();
         let resp = join(&mut state, &mut conn, "alice", Some("nope"));
         assert!(matches!(resp[..], [PartyResponse::JoinRejected { .. }]));
@@ -944,30 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn actions_before_join_require_join() {
-        let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::default();
-        for req in [
-            PartyRequest::ListMembers,
-            PartyRequest::ListChannels,
-            PartyRequest::PostMessage {
-                channel: Uuid::new_v4(),
-                text: "hi".to_string(),
-            },
-            PartyRequest::FetchHistory {
-                channel: Uuid::new_v4(),
-                since_seq: 0,
-            },
-        ] {
-            let resp = handle_request(&mut state, &mut conn, req).replies;
-            assert!(
-                matches!(resp[..], [PartyResponse::Error(ref m)] if m == "join required"),
-                "expected join-required error, got {resp:?}"
-            );
-        }
-    }
-
-    #[test]
     fn post_then_fetch_history_round_trips_through_dispatch() {
         let mut state = PartyState::new("Srv", None);
         let channel = state.default_channel();
@@ -979,7 +848,7 @@ mod tests {
             &mut conn,
             PartyRequest::PostMessage {
                 channel,
-                text: "first message".to_string(),
+                text: "first message".into(),
             },
         );
         match &posted.replies[..] {
@@ -1010,7 +879,7 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 assert_eq!(
                     items[0].payload,
-                    MessagePayload::Text("first message".to_string())
+                    MessagePayload::Text("first message".into())
                 );
             }
             other => panic!("expected History, got {other:?}"),
@@ -1040,13 +909,11 @@ mod tests {
             &mut state,
             &mut conn,
             PartyRequest::CreateChannel {
-                name: "random".to_string(),
+                name: "random".into(),
             },
         );
-        // The creator gets their own filtered list. Everyone else is nudged to
-        // re-fetch theirs rather than being handed this one: the list is per
-        // member now, so broadcasting one member's view would either leak
-        // private channels or hide them from the people who are in them.
+        // The creator gets their own filtered list; everyone else is nudged to
+        // re-fetch theirs (see `channel_list_refresh`).
         assert!(matches!(&out.replies[..], [PartyResponse::Channels(c)] if c.len() == 2));
         assert!(matches!(
             &out.broadcast[..],
@@ -1054,28 +921,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn create_channel_before_join_requires_join() {
-        let mut state = PartyState::new("Srv", None);
-        let mut conn = ConnState::default();
-        let out = handle_request(
-            &mut state,
-            &mut conn,
-            PartyRequest::CreateChannel {
-                name: "x".to_string(),
-            },
-        );
-        assert!(matches!(&out.replies[..], [PartyResponse::Error(m)] if m == "join required"));
-    }
-
     /// Drive a dispatch to completion the way `connection.rs` does: perform any
-    /// deferred I/O, then fold the resulting replies back in.
-    ///
-    /// A test that only looked at `handle_request`'s immediate output would
-    /// silently stop checking anything the moment an operation moved to the
-    /// deferred half — which is most of the file operations. This keeps the
-    /// assertions about end-to-end behaviour rather than about which half
-    /// produced them.
+    /// deferred I/O, then fold the resulting replies back in, so assertions
+    /// cover end-to-end behaviour whichever half produced it.
     fn settle(state: &mut PartyState, member: Uuid, mut out: Dispatch) -> Dispatch {
         let Some(work) = out.deferred.take() else {
             return out;
@@ -1094,10 +942,7 @@ mod tests {
                     }
                     Err(reason) => {
                         state.discard_upload(staged);
-                        Dispatch::reply(PartyResponse::ActionFailed {
-                            channel: Uuid::nil(),
-                            reason,
-                        })
+                        Dispatch::action_failed(Uuid::nil(), reason)
                     }
                 }
             }
@@ -1112,17 +957,15 @@ mod tests {
     fn post_file_acks_the_poster_and_broadcasts_a_file_message() {
         let mut state = PartyState::new("Srv", None);
         let mut conn = ConnState::default();
-        join(&mut state, &mut conn, "alice", None);
+        let me = joined_id(&mut state, &mut conn, "alice");
         let channel = state.default_channel();
-
-        let me = conn.member().unwrap();
         let out = handle_request(
             &mut state,
             &mut conn,
             PartyRequest::PostFile {
                 channel,
-                name: "pic.png".to_string(),
-                mime: "image/png".to_string(),
+                name: "pic.png".into(),
+                mime: "image/png".into(),
                 data: b"\x89PNG data".to_vec(),
             },
         );
@@ -1143,17 +986,15 @@ mod tests {
     fn download_returns_bytes_for_known_and_errors_for_unknown() {
         let mut state = PartyState::new("Srv", None);
         let mut conn = ConnState::default();
-        join(&mut state, &mut conn, "alice", None);
+        let me = joined_id(&mut state, &mut conn, "alice");
         let channel = state.default_channel();
-
-        let me = conn.member().unwrap();
         let post = handle_request(
             &mut state,
             &mut conn,
             PartyRequest::PostFile {
                 channel,
-                name: "f.bin".to_string(),
-                mime: "application/octet-stream".to_string(),
+                name: "f.bin".into(),
+                mime: "application/octet-stream".into(),
                 data: b"payload".to_vec(),
             },
         );
@@ -1166,25 +1007,20 @@ mod tests {
             other => panic!("expected broadcast, got {other:?}"),
         };
 
-        // A download is now answered in two halves: `handle_request` decides,
-        // under the lock, whether it may happen and what to read; the runtime
-        // performs the read once the lock is released. Drive both here, which is
-        // what `connection.rs` does.
+        // `handle_request` only authorises; the read is deferred to the runtime.
         let ok = handle_request(&mut state, &mut conn, PartyRequest::DownloadFile { hash });
         assert!(ok.replies.is_empty(), "the bytes must not be read inline");
-        let reply = match ok.deferred {
-            Some(Deferred::Download { hash, offset, plan }) => {
-                let total = plan.total();
-                download_reply(hash, offset, total, plan.perform())
-            }
-            other => panic!("expected a deferred download, got {other:?}"),
-        };
+        assert!(
+            matches!(ok.deferred, Some(Deferred::Download { .. })),
+            "expected a deferred download, got {:?}",
+            ok.deferred
+        );
+        let reply = settle(&mut state, me, ok);
         assert!(
             matches!(&reply.replies[..], [PartyResponse::FileData { data, .. }] if data == b"payload")
         );
 
-        // Denied and unknown are refused before anything is deferred, so the
-        // endpoint still cannot be used to learn that a file exists.
+        // Denied and unknown are refused before anything is deferred.
         let missing = handle_request(
             &mut state,
             &mut conn,
@@ -1199,16 +1035,15 @@ mod tests {
         assert!(matches!(&missing.replies[..], [PartyResponse::Error(_)]));
     }
 
-    /// SRV-06: only channel creation was rate-limited, so one member could
-    /// post 64 KiB messages as fast as their link allowed, each committed under
-    /// the global lock. A refused post answers `ActionFailed` for its channel
-    /// — so the client retracts the row — and costs other members nothing.
+    /// SRV-06: posts are rate-limited per member; a refused post answers
+    /// `ActionFailed` for its channel (so the client retracts the row) and costs
+    /// other members nothing.
     #[test]
     fn writes_past_the_per_member_budget_are_refused_as_failed_sends() {
         let mut state = PartyState::new("Srv", None);
         let mut alice = ConnState::default();
         let mut bob = ConnState::default();
-        joined_id(&mut state, &mut alice, "alice");
+        let me = joined_id(&mut state, &mut alice, "alice");
         let bob_id = joined_id(&mut state, &mut bob, "bob");
         let channel = state.default_channel();
         let post = |text: &str| PartyRequest::PostMessage {
@@ -1236,7 +1071,6 @@ mod tests {
 
         // A refused DM is attributed to its thread, and governance gets an
         // ordinary error.
-        let me = alice.member().unwrap();
         let dm = handle_request(
             &mut state,
             &mut alice,

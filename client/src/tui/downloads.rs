@@ -1,23 +1,16 @@
 //! Saving Party file downloads into the download directory.
 //!
-//! Two properties matter, and the previous version had neither:
-//!
-//! * **Never clobber.** It picked a free name with `exists()` and then wrote
-//!   with `fs::write`, which truncates. Anything that appeared at that path in
-//!   between — a second download of the same name finishing in the same tick,
-//!   or a file the user saved — was silently overwritten. The name is now
-//!   claimed with `create_new`, so the check and the claim are one syscall.
-//! * **Never block the UI.** A community file is up to 100 MiB, and the write
-//!   ran inline in the TUI's frame loop, freezing the whole interface for as
-//!   long as the disk took. It now runs on the blocking pool and reports back
-//!   through a channel the tick drains, like the download itself.
+//! * **Never clobber**: the name is claimed with `create_new`, so the free-name
+//!   check and the claim are one syscall (`exists()` + `fs::write` raced).
+//! * **Never block the UI**: a file is up to 100 MiB, so the write runs on the
+//!   blocking pool and reports back through a channel the tick drains.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
 
-/// Highest `name (n)` suffix tried before giving up. Unbounded used to mean an
-/// endless loop on a directory where every create fails with `AlreadyExists`.
+/// Highest `name (n)` suffix tried before giving up (bounded, so a directory
+/// where every create fails with `AlreadyExists` cannot loop forever).
 const MAX_NAME_SUFFIX: u32 = 10_000;
 
 /// The outcome of one save: the display name, then where it landed.
@@ -58,8 +51,7 @@ pub(crate) fn save_new_file(dir: &Path, name: &str, data: &[u8]) -> std::io::Res
         return match file.write_all(data).and_then(|()| file.sync_all()) {
             Ok(()) => Ok(path),
             Err(e) => {
-                // A partial file under the user's chosen name is worse than
-                // none: it looks like a finished download.
+                // A partial file would look like a finished download.
                 drop(file);
                 let _ = std::fs::remove_file(&path);
                 Err(e)

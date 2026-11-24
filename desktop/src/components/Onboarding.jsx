@@ -20,17 +20,10 @@ function Brand({ sub }) {
   );
 }
 
-/// Shown while the bridge is being reached, and when reaching it failed.
-/// Previously this state rendered `null`, which meant a single slow or failed
-/// `auth_status` left the user staring at a permanently blank window with no
-/// message and no way out short of relaunching.
-///
-/// `fatal` is for a startup failure that retrying cannot fix — today, an
-/// identity file that exists but cannot be read. The app deliberately refuses
-/// to continue there rather than generate a replacement identity, which would
-/// abandon the user's history and their contacts' trust, so this screen has to
-/// say what happened and what to do about it instead of offering a retry that
-/// will fail identically.
+/// Shown while the bridge is being reached, and when that failed (never a blank
+/// window). `fatal` is a failure retrying cannot fix — an identity file that
+/// exists but cannot be read, which the app refuses to replace (that would
+/// abandon history and contacts' trust) — so it explains instead of offering a retry.
 export function BootScreen({ error, retrying, onRetry, fatal }) {
   if (fatal) {
     return (
@@ -136,8 +129,7 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
   async function submit(e) {
     e.preventDefault();
     if (busy) return;
-    // Say why nothing happened. The old handler returned silently here, so a
-    // mistyped confirmation just made the button look broken.
+    // Say why nothing happened, or a mistyped confirmation looks like a broken button.
     if (formError) { setErr(formError); return; }
     setBusy(true);
     try {
@@ -183,10 +175,8 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
   );
 }
 
-/// Shown once, immediately after an identity is created. Losing the identity
-/// file means losing the identity outright, so the moment to offer the backup
-/// is here — not buried in Settings, and not as a "it can't be reset" warning
-/// with no action attached to it.
+/// Shown once, right after an identity is created: losing the file loses the
+/// identity outright, so this is the moment to offer the backup.
 export function BackupPrompt({ onExport, onSkip }) {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState("");

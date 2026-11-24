@@ -1,187 +1,30 @@
 //! End-to-end Communities: a real `messenger-server` on a loopback socket,
-//! joined by the real client-side `PartyManager` — the same object the desktop
-//! bridge and the TUI drive.
+//! joined by the real client-side `PartyManager` (what the desktop bridge and
+//! the TUI drive). The failures that matter only appear when handshake, trust
+//! step, join gate, hub, dispatch, SQLite and blob store run together:
 //!
-//! Communities are the most involved subsystem in the workspace, and until now
-//! the only coverage was unit tests either side of the wire. A join crosses the
-//! v3 handshake, the two-step trust decision, the join gate, the hub, the
-//! dispatch layer, SQLite and the content-addressed blob store, and the failures
-//! that matter are the ones that only appear when those run together:
-//!
-//! - **No credential moves before the trust step.** A first join must stop and
-//!   report the fingerprint + SAS, having sent nothing.
-//! - **A pin that no longer matches must refuse**, before the `Join` frame that
-//!   carries the username and password.
+//! - **No credential moves before the trust step**, and a pin that no longer
+//!   matches refuses before the `Join` frame.
 //! - **History is durable and paged**, and merges rather than replaces.
-//! - **A private channel is never visible to a non-member** — not in the channel
-//!   list, not in history.
-//! - **File access is decided at the download endpoint**, over the `file_refs`
-//!   table, because blobs are stored globally for dedup.
-//! - **A refused send is taken back off the screen** rather than left looking
-//!   delivered.
+//! - **A private channel is never visible to a non-member.**
+//! - **File access is decided at the download endpoint** (blobs are global).
+//! - **A refused send is taken back off the screen.**
 
-use messenger_core::core::generate_rsa_keypair;
+mod common;
+
+use common::*;
 use messenger_core::party::{ChannelKind, MessagePayload, Role};
-use messenger_core::RSA_KEY_BITS;
-use messenger_server::hub::Hub;
-use messenger_server::run_accept_loop;
-use messenger_server::state::PartyState;
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
-use rsa::RsaPrivateKey;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// How long any single "wait for the server to catch up" step may take before
-/// the test fails rather than hangs.
-///
-/// Deliberately generous. It is a hang detector, not a performance assertion:
-/// every one of these tests generates real RSA-2048 keys in a debug build, and
-/// under a parallel runner several do so at once. A tight bound here turns load
-/// into a flake, which is worse than useless — it trains people to re-run.
-const STEP_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// A server listening on an ephemeral loopback port, with durable state in a
-/// temp dir so the SQLite and blob-store paths are the ones under test.
-/// Step one of a first join: connect without credentials and learn the
-/// server's fingerprint, as the user would see it before accepting.
-async fn learn_fingerprint(address: &str, key: &rsa::RsaPrivateKey) -> String {
-    match PartyManager::new()
-        .connect_and_join(address, "probe", None, key, None)
+async fn download(
+    mgr: &mut PartyManager,
+    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
+) -> Result<Vec<u8>, String> {
+    download_result(mgr, rx, STEP_TIMEOUT)
         .await
-        .expect("first contact")
-    {
-        PartyJoinOutcome::NeedsVerification { fingerprint, .. } => fingerprint,
-        other => panic!("a first contact must stop for verification, got {other:?}"),
-    }
-}
-
-struct TestServer {
-    address: String,
-    /// The live server state, for tests that need to set up more than a
-    /// client could do quickly (thousands of messages, say).
-    state: Arc<Mutex<PartyState>>,
-    /// The one-time owner claim token the server printed at startup. The
-    /// operator joins with it in the password field; being first to join no
-    /// longer makes anyone the owner.
-    claim_token: Option<String>,
-    _dir: tempfile::TempDir,
-}
-
-async fn start_server(password: Option<String>) -> TestServer {
-    let dir = tempfile::tempdir().expect("server dir");
-    let state = PartyState::load("Test Community", password, dir.path()).expect("load state");
-    let claim_token = state.owner_claim_token().map(str::to_owned);
-    let state = Arc::new(Mutex::new(state));
-    let privkey = Arc::new(generate_rsa_keypair(RSA_KEY_BITS).expect("server key"));
-    let hub = Arc::new(Hub::new());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let address = listener.local_addr().expect("addr").to_string();
-    let served = state.clone();
-    tokio::spawn(async move {
-        let _ = run_accept_loop(listener, served, privkey, hub).await;
-    });
-
-    TestServer {
-        address,
-        state,
-        claim_token,
-        _dir: dir,
-    }
-}
-
-/// Pump the manager until `done`, or fail rather than hang.
-async fn pump_until<F>(mgr: &mut PartyManager, label: &str, mut done: F)
-where
-    F: FnMut(&mut PartyManager) -> bool,
-{
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        mgr.poll_events();
-        if done(mgr) {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("[{label}] timed out");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Join `server` as `username`, completing the two-step trust decision.
-async fn join(
-    server: &TestServer,
-    username: &str,
-    password: Option<String>,
-    key: &RsaPrivateKey,
-) -> (PartyManager, Uuid) {
-    let mut mgr = PartyManager::new();
-
-    // Step one: no pin, no trust yet. Nothing is sent.
-    let outcome = mgr
-        .connect_and_join(&server.address, username, password.clone(), key, None)
-        .await
-        .expect("first contact");
-    let fingerprint = match outcome {
-        PartyJoinOutcome::NeedsVerification { fingerprint, sas } => {
-            assert!(
-                !sas.is_empty(),
-                "the SAS is what the user actually compares"
-            );
-            assert_eq!(fingerprint.len(), 64, "a full SHA-256 fingerprint");
-            fingerprint
-        }
-        other => panic!("a first join must stop for verification, got {other:?}"),
-    };
-
-    // Step two: the user has compared the code.
-    let server_id = match mgr
-        .connect_and_join(&server.address, username, password, key, Some(&fingerprint))
-        .await
-        .expect("join after verification")
-    {
-        PartyJoinOutcome::Joining { server_id, .. } => server_id,
-        other => panic!("expected Joining, got {other:?}"),
-    };
-
-    pump_until(&mut mgr, "joined", |m| {
-        m.server(server_id)
-            .is_some_and(|s| s.status == PartyStatus::Joined && s.member_id.is_some())
-    })
-    .await;
-
-    assert_eq!(
-        mgr.server(server_id).unwrap().server_fingerprint,
-        fingerprint,
-        "the identity that was verified must be the one that was joined"
-    );
-    (mgr, server_id)
-}
-
-fn channel_named(mgr: &PartyManager, server_id: Uuid, name: &str) -> Option<Uuid> {
-    mgr.server(server_id)?
-        .channels
-        .iter()
-        .find(|c| c.name == name)
-        .map(|c| c.id)
-}
-
-fn texts_in(mgr: &PartyManager, server_id: Uuid, channel: Uuid) -> Vec<String> {
-    mgr.server(server_id)
-        .and_then(|s| s.messages.get(&channel))
-        .map(|msgs| {
-            msgs.iter()
-                .filter_map(|e| match &e.payload {
-                    MessagePayload::Text(t) => Some(t.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        .expect("timed out waiting for a download")
 }
 
 /// The core loop: join, see the default channel, create one, post to it, and
@@ -189,14 +32,9 @@ fn texts_in(mgr: &PartyManager, server_id: Uuid, channel: Uuid) -> Vec<String> {
 #[tokio::test]
 async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
     let server = start_server(None).await;
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
-    let (mut mgr, sid) = join(&server, "alice", None, &key).await;
+    let (mut mgr, sid) = join(&server, "alice", None).await;
 
-    // The directory arrives on join.
-    pump_until(&mut mgr, "channel list", |m| {
-        channel_named(m, sid, "general").is_some()
-    })
-    .await;
+    wait_channel(&mut mgr, sid, "general").await;
     assert_eq!(
         mgr.my_role(sid),
         Some(Role::Member),
@@ -205,12 +43,7 @@ async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
 
     mgr.create_channel(sid, "planning".to_string())
         .expect("create channel");
-    pump_until(&mut mgr, "channel created", |m| {
-        channel_named(m, sid, "planning").is_some()
-    })
-    .await;
-    let planning = channel_named(&mgr, sid, "planning").expect("planning channel");
-
+    let planning = wait_channel(&mut mgr, sid, "planning").await;
     mgr.post(sid, planning, "first post".to_string())
         .expect("post");
     mgr.post(sid, planning, "second post".to_string())
@@ -220,13 +53,17 @@ async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
     })
     .await;
 
-    // Read it back from the server rather than from the optimistic local copy:
-    // durable history is the whole point of a community server.
+    // Read it back from the server, not the optimistic local copy.
     let mut fresh = PartyManager::new();
     let fingerprint = mgr.server(sid).unwrap().server_fingerprint.clone();
-    let key2 = generate_rsa_keypair(RSA_KEY_BITS).expect("second key");
     let sid2 = match fresh
-        .connect_and_join(&server.address, "bob", None, &key2, Some(&fingerprint))
+        .connect_and_join(
+            &server.address,
+            "bob",
+            None,
+            &client_key(),
+            Some(&fingerprint),
+        )
         .await
         .expect("join with a matching pin")
     {
@@ -235,9 +72,7 @@ async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
     };
 
     pump_until(&mut fresh, "bob sees history", |m| {
-        channel_named(m, sid2, "planning")
-            .map(|c| texts_in(m, sid2, c).len() >= 2)
-            .unwrap_or(false)
+        channel_named(m, sid2, "planning").is_some_and(|c| texts_in(m, sid2, c).len() >= 2)
     })
     .await;
     let planning2 = channel_named(&fresh, sid2, "planning").unwrap();
@@ -248,13 +83,11 @@ async fn a_member_joins_creates_a_channel_posts_and_reads_history_back() {
     );
 }
 
-/// A pinned fingerprint that no longer matches must refuse *before* the `Join`
-/// frame — that frame carries the username and password, so checking afterwards
-/// means a server that swapped its key has already been handed them.
+/// A pin that no longer matches must refuse *before* the `Join` frame, which
+/// carries the username and password.
 #[tokio::test]
 async fn a_changed_server_identity_is_refused_before_any_credential_is_sent() {
     let server = start_server(Some("hunter2hunter2".to_string())).await;
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
     let mut mgr = PartyManager::new();
 
     let wrong_pin = "ff".repeat(32);
@@ -263,7 +96,7 @@ async fn a_changed_server_identity_is_refused_before_any_credential_is_sent() {
             &server.address,
             "alice",
             Some("hunter2hunter2".to_string()),
-            &key,
+            &client_key(),
             Some(&wrong_pin),
         )
         .await
@@ -285,36 +118,21 @@ async fn a_changed_server_identity_is_refused_before_any_credential_is_sent() {
 }
 
 /// The join gate: a wrong password is refused, and the refusal is surfaced
-/// rather than leaving the client sitting in "Connecting…" forever.
+/// rather than leaving the client in "Connecting…" forever.
 #[tokio::test]
 async fn a_wrong_server_password_is_refused_and_reported() {
     let server = start_server(Some("correct-horse-battery".to_string())).await;
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
     let mut mgr = PartyManager::new();
-
-    let sid = match mgr
-        .connect_and_join(
-            &server.address,
-            "alice",
-            Some("wrong-password-entirely".to_string()),
-            &key,
-            Some(&learn_fingerprint(&server.address, &key).await),
-        )
-        .await
-        .expect("the connection itself succeeds")
-    {
-        PartyJoinOutcome::Joining { server_id, .. } => server_id,
-        other => panic!("expected Joining, got {other:?}"),
-    };
+    let password = Some("wrong-password-entirely".to_string());
+    let sid = connect_pinned(&mut mgr, &server, "alice", password, &client_key()).await;
 
     pump_until(&mut mgr, "join rejected", |m| {
         m.server(sid)
             .is_some_and(|s| matches!(s.status, PartyStatus::Rejected(_)))
     })
     .await;
-    let reason = match &mgr.server(sid).unwrap().status {
-        PartyStatus::Rejected(reason) => reason.clone(),
-        other => panic!("expected Rejected, got {other:?}"),
+    let PartyStatus::Rejected(reason) = &mgr.server(sid).unwrap().status else {
+        unreachable!()
     };
     assert!(
         reason.to_lowercase().contains("password"),
@@ -322,24 +140,16 @@ async fn a_wrong_server_password_is_refused_and_reported() {
     );
 }
 
-/// A private channel must not appear in a non-member's channel list, and its
-/// history must not be readable by guessing the id. The hub sends one identical
-/// frame to every connection, so the *listing* is what has to be per member.
+/// A private channel must not appear in a non-member's channel list, nor its
+/// history be readable by guessing the id. The hub sends every connection the
+/// same frame, so the *listing* is what has to be per member.
 #[tokio::test]
 async fn a_private_channel_is_invisible_to_a_non_member() {
     let server = start_server(None).await;
-    let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, owner_sid) =
-        join(&server, "owner", server.claim_token.clone(), &owner_key).await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
+    let (mut bob, bob_sid) = join(&server, "bob", None).await;
 
-    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
-    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
-
-    // The owner makes a private channel with nobody else in it.
-    pump_until(&mut owner, "owner sees members", |m| {
-        m.server(owner_sid).is_some_and(|s| s.members.len() >= 2)
-    })
-    .await;
+    wait_members(&mut owner, owner_sid, 2).await;
     owner
         .create_channel_of_kind(
             owner_sid,
@@ -348,11 +158,7 @@ async fn a_private_channel_is_invisible_to_a_non_member() {
             Vec::new(),
         )
         .expect("create private channel");
-    pump_until(&mut owner, "private channel exists", |m| {
-        channel_named(m, owner_sid, "secret").is_some()
-    })
-    .await;
-    let secret = channel_named(&owner, owner_sid, "secret").expect("secret channel");
+    let secret = wait_channel(&mut owner, owner_sid, "secret").await;
     owner
         .post(owner_sid, secret, "for my eyes only".to_string())
         .expect("post");
@@ -361,43 +167,27 @@ async fn a_private_channel_is_invisible_to_a_non_member() {
     })
     .await;
 
-    // Bob's directory refreshes — and must not contain it.
-    for _ in 0..40 {
-        bob.poll_events();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    idle(&mut [&mut bob], 40, 25).await;
     assert!(
         channel_named(&bob, bob_sid, "secret").is_none(),
         "a private channel must never be broadcast to a non-member"
     );
 
-    // Nor may he read it by asking for the id directly.
     bob.fetch_history(bob_sid, secret).ok();
-    for _ in 0..40 {
-        bob.poll_events();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    idle(&mut [&mut bob], 40, 25).await;
     assert!(
         texts_in(&bob, bob_sid, secret).is_empty(),
         "a non-member must not be able to read a private channel by guessing its id"
     );
 }
 
-/// Files: upload, see it in the Drive listing, download it back byte-exact, and
-/// have a member who cannot see it be refused at the download endpoint.
-///
-/// Blobs are content-addressed and stored globally for dedup, so the download
-/// endpoint is the only thing deciding who may read a file.
+/// Upload, see it listed, download it back byte-exact; a later member who can
+/// see it may fetch it; deleting the reference stops the download.
 #[tokio::test]
 async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it() {
     let server = start_server(None).await;
-    let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, sid) = join(&server, "owner", server.claim_token.clone(), &owner_key).await;
-    pump_until(&mut owner, "channels", |m| {
-        channel_named(m, sid, "general").is_some()
-    })
-    .await;
-    let general = channel_named(&owner, sid, "general").expect("general");
+    let (mut owner, sid) = join_owner(&server, "owner").await;
+    let general = wait_channel(&mut owner, sid, "general").await;
 
     let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
     owner
@@ -411,11 +201,7 @@ async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it()
         .expect("upload");
 
     owner.refresh_files(sid).expect("list files");
-    pump_until(&mut owner, "file listed", |m| {
-        m.server(sid)
-            .is_some_and(|s| s.files.iter().any(|f| f.name == "notes.bin"))
-    })
-    .await;
+    pump_until(&mut owner, "file listed", |m| has_file(m, sid, "notes.bin")).await;
     let entry = owner
         .server(sid)
         .unwrap()
@@ -426,32 +212,30 @@ async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it()
         .expect("the uploaded file");
     assert_eq!(entry.size as usize, bytes.len());
 
-    // Download it back. The client re-hashes what arrives, so a mismatch fails
-    // the download rather than saving the wrong bytes.
+    // The client re-hashes what arrives, so a mismatch fails the download.
     let rx = owner
         .request_download(sid, entry.hash.clone())
         .expect("request download");
-    let downloaded = pump_for_download(&mut owner, rx).await;
+    let downloaded = download(&mut owner, rx).await.expect("download succeeds");
     assert_eq!(downloaded, bytes, "the downloaded bytes must be the file");
 
-    // A member who joined later, into a channel they can read, may also fetch
-    // it — access follows the file reference, not who uploaded it.
-    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
-    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
+    // Access follows the file reference, not who uploaded it.
+    let (mut bob, bob_sid) = join(&server, "bob", None).await;
     bob.refresh_files(bob_sid).expect("list files");
     pump_until(&mut bob, "bob sees the file", |m| {
-        m.server(bob_sid)
-            .is_some_and(|s| s.files.iter().any(|f| f.name == "notes.bin"))
+        has_file(m, bob_sid, "notes.bin")
     })
     .await;
     let rx = bob
         .request_download(bob_sid, entry.hash.clone())
         .expect("request download");
-    assert_eq!(pump_for_download(&mut bob, rx).await, bytes);
+    assert_eq!(
+        download(&mut bob, rx).await.expect("download succeeds"),
+        bytes
+    );
 
-    // Deleting the reference stops the download, while the message stays put —
-    // sequence numbers are what clients merge history on, so removing the
-    // envelope would renumber the channel for everyone.
+    // Deleting the reference stops the download; the message stays put (seqs
+    // are what clients merge history on).
     owner
         .delete_file(sid, entry.hash.clone(), general)
         .expect("delete the share");
@@ -459,10 +243,7 @@ async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it()
     let deadline = Instant::now() + STEP_TIMEOUT;
     loop {
         owner.poll_events();
-        if owner
-            .server(sid)
-            .is_some_and(|s| !s.files.iter().any(|f| f.name == "notes.bin"))
-        {
+        if owner.server(sid).is_some() && !has_file(&owner, sid, "notes.bin") {
             break;
         }
         assert!(
@@ -476,7 +257,7 @@ async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it()
     let rx = bob
         .request_download(bob_sid, entry.hash.clone())
         .expect("request download");
-    let after = pump_for_download_result(&mut bob, rx).await;
+    let after = download(&mut bob, rx).await;
     assert!(
         after.is_err(),
         "a released file must stop downloading, got {} bytes",
@@ -484,54 +265,14 @@ async fn a_file_is_shared_listed_and_downloadable_only_by_those_who_may_see_it()
     );
 }
 
-/// Drive the manager until a download resolves, asserting it succeeded.
-async fn pump_for_download(
-    mgr: &mut PartyManager,
-    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-) -> Vec<u8> {
-    pump_for_download_result(mgr, rx)
-        .await
-        .expect("download succeeds")
-}
-
-/// As above, but hands back the result so a refusal can be asserted.
-async fn pump_for_download_result(
-    mgr: &mut PartyManager,
-    mut rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-) -> Result<Vec<u8>, String> {
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        mgr.poll_events();
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                return Err("the connection dropped before the download resolved".to_string())
-            }
-        }
-        if Instant::now() > deadline {
-            panic!("timed out waiting for a download");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// A post the server refuses is taken back off the screen. Outgoing messages are
-/// appended optimistically, so leaving one there tells the user something was
-/// delivered that was never stored.
+/// A post the server refuses is taken back off the screen: it was appended
+/// optimistically, and leaving it would claim a delivery that never happened.
 #[tokio::test]
 async fn a_refused_post_is_removed_rather_than_left_looking_delivered() {
     let server = start_server(None).await;
-    let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, owner_sid) =
-        join(&server, "owner", server.claim_token.clone(), &owner_key).await;
-
-    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
-    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
-    pump_until(&mut owner, "owner sees bob", |m| {
-        m.server(owner_sid).is_some_and(|s| s.members.len() >= 2)
-    })
-    .await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
+    let (mut bob, bob_sid) = join(&server, "bob", None).await;
+    wait_members(&mut owner, owner_sid, 2).await;
 
     // An announce channel is readable by all and writable by admins only.
     owner
@@ -542,15 +283,10 @@ async fn a_refused_post_is_removed_rather_than_left_looking_delivered() {
             Vec::new(),
         )
         .expect("create announce channel");
-    pump_until(&mut bob, "bob sees news", |m| {
-        channel_named(m, bob_sid, "news").is_some()
-    })
-    .await;
-    let news = channel_named(&bob, bob_sid, "news").expect("news channel");
+    let news = wait_channel(&mut bob, bob_sid, "news").await;
 
     bob.post(bob_sid, news, "let me in".to_string())
         .expect("the send itself is queued");
-    // Optimistically on screen for a moment...
     pump_until(&mut bob, "post refused", |m| {
         texts_in(m, bob_sid, news).is_empty() && m.server(bob_sid).unwrap().last_error.is_some()
     })
@@ -566,35 +302,20 @@ async fn a_refused_post_is_removed_rather_than_left_looking_delivered() {
     );
 }
 
-/// Roles are ordered and enforced server-side. The UI hides what the caller
-/// cannot do, but that is politeness — the server refuses regardless.
+/// Roles are enforced server-side; hiding controls in the UI is politeness.
 #[tokio::test]
 async fn a_member_cannot_grant_themselves_a_role() {
     let server = start_server(None).await;
-    let owner_key = generate_rsa_keypair(RSA_KEY_BITS).expect("owner key");
-    let (mut owner, owner_sid) =
-        join(&server, "owner", server.claim_token.clone(), &owner_key).await;
-
-    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
-    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
-    pump_until(&mut owner, "owner sees bob", |m| {
-        m.server(owner_sid).is_some_and(|s| s.members.len() >= 2)
-    })
-    .await;
-    pump_until(&mut bob, "bob sees himself", |m| {
-        m.server(bob_sid).is_some_and(|s| s.member_id.is_some())
-    })
-    .await;
+    let (mut owner, owner_sid) = join_owner(&server, "owner").await;
+    let (mut bob, bob_sid) = join(&server, "bob", None).await;
+    wait_members(&mut owner, owner_sid, 2).await;
 
     let bob_id = bob.server(bob_sid).unwrap().member_id.unwrap();
     assert_eq!(bob.my_role(bob_sid), Some(Role::Member));
 
     bob.set_role(bob_sid, bob_id, Role::Admin)
         .expect("the request is sent");
-    for _ in 0..40 {
-        bob.poll_events();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    idle(&mut [&mut bob], 40, 25).await;
     assert_eq!(
         bob.my_role(bob_sid),
         Some(Role::Member),
@@ -602,22 +323,15 @@ async fn a_member_cannot_grant_themselves_a_role() {
     );
 }
 
-/// The community server's accept loop must survive failed connections too.
-///
-/// Same reasoning as the relay's: `accept()` errors are logged and skipped
-/// rather than propagated, so one transient failure cannot end the listener for
-/// the life of the process. Injected here as connections that hang up without
-/// completing a handshake, which is what a port scanner, a health check or a
-/// peer on a flaky link produces all day long.
+/// The accept loop logs and skips failed connections (hang-ups, garbage) rather
+/// than ending the listener.
 #[tokio::test]
 async fn the_server_keeps_serving_after_failed_connections() {
     let server = start_server(None).await;
 
-    // Deliberately under `ratelimit::MAX_CONNECTIONS` (10 per 30s per address),
-    // leaving room for the join's own two connections. Going over does not test
-    // accept-loop resilience — it tests the rate limiter, which has its own
-    // tests, and it would refuse the very join this is trying to prove still
-    // works. Three of each is enough to run the `continue` repeatedly.
+    // Under `ratelimit::MAX_CONNECTIONS` (10 per 30 s per address), leaving
+    // room for the join's own two connections: this tests the accept loop, not
+    // the rate limiter.
     for _ in 0..3 {
         if let Ok(stream) = tokio::net::TcpStream::connect(&server.address).await {
             drop(stream);
@@ -632,13 +346,8 @@ async fn the_server_keeps_serving_after_failed_connections() {
     }
 
     // A real member can still join and use it.
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
-    let (mut mgr, sid) = join(&server, "alice", None, &key).await;
-    pump_until(&mut mgr, "channels arrive", |m| {
-        channel_named(m, sid, "general").is_some()
-    })
-    .await;
-    let general = channel_named(&mgr, sid, "general").expect("general");
+    let (mut mgr, sid) = join(&server, "alice", None).await;
+    let general = wait_channel(&mut mgr, sid, "general").await;
     mgr.post(sid, general, "still here".to_string())
         .expect("post");
     pump_until(&mut mgr, "post lands", |m| {
@@ -647,28 +356,17 @@ async fn the_server_keeps_serving_after_failed_connections() {
     .await;
 }
 
-/// Regression test for the non-cancel-safe read in the client's connection
-/// task.
-///
-/// The task selected between "send the next request" and "read the next
-/// response", building a fresh read each time. `recv_framed` is not cancel-safe
-/// (length prefix, then body), so whenever a request won the race while a
-/// response was half-read, the consumed bytes were lost, the next read failed
-/// to decrypt, and the connection dropped. Large responses that arrive in
-/// pieces (download chunks) while the user keeps sending (posts) are exactly
-/// that interleaving. The server had and fixed the same bug.
+/// Regression: the client's connection task built a fresh, non-cancel-safe
+/// `recv_framed` each select, so a request winning the race mid-response lost
+/// bytes and dropped the connection. A chunked download interleaved with posts
+/// is exactly that race.
 #[tokio::test]
 async fn sending_while_a_large_download_streams_in_keeps_the_connection() {
     let server = start_server(None).await;
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
-    let (mut mgr, sid) = join(&server, "alice", None, &key).await;
-    pump_until(&mut mgr, "channel list", |m| {
-        channel_named(m, sid, "general").is_some()
-    })
-    .await;
-    let general = channel_named(&mgr, sid, "general").unwrap();
+    let (mut mgr, sid) = join(&server, "alice", None).await;
+    let general = wait_channel(&mut mgr, sid, "general").await;
 
-    // A file past the inline limit, so it is uploaded and downloaded in chunks.
+    // Past the inline limit, so it moves in chunks both ways.
     let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     mgr.send_file(
         sid,
@@ -728,21 +426,14 @@ async fn sending_while_a_large_download_streams_in_keeps_the_connection() {
     assert_eq!(mgr.server(sid).unwrap().status, PartyStatus::Joined);
 }
 
-/// SRV-01, end to end: a channel full of maximum-size messages used to make
-/// the community unjoinable, because the first history page was over the frame
-/// limit and a reply that cannot be sent ends the connection. Pages are now
-/// budgeted by bytes, and the client keeps asking when a page was trimmed for
-/// size rather than only when it held 200 envelopes.
+/// SRV-01: a channel of maximum-size messages made the first history page too
+/// big to send, so the community became unjoinable. Pages are now budgeted by
+/// bytes, and the client keeps asking when a page was trimmed for size.
 #[tokio::test]
 async fn a_channel_of_maximum_size_messages_is_joinable_and_pages_to_the_end() {
     let server = start_server(None).await;
-    let key = generate_rsa_keypair(RSA_KEY_BITS).expect("client key");
-    let (mut alice, sid) = join(&server, "alice", None, &key).await;
-    pump_until(&mut alice, "channel list", |m| {
-        channel_named(m, sid, "general").is_some()
-    })
-    .await;
-    let general = channel_named(&alice, sid, "general").unwrap();
+    let (mut alice, sid) = join(&server, "alice", None).await;
+    let general = wait_channel(&mut alice, sid, "general").await;
     let alice_id = alice.server(sid).unwrap().member_id.unwrap();
 
     // Well past what one count-capped page could have carried in a frame.
@@ -756,12 +447,9 @@ async fn a_channel_of_maximum_size_messages_is_joinable_and_pages_to_the_end() {
         }
     }
 
-    let bob_key = generate_rsa_keypair(RSA_KEY_BITS).expect("bob key");
-    let (mut bob, bob_sid) = join(&server, "bob", None, &bob_key).await;
+    let (mut bob, bob_sid) = join(&server, "bob", None).await;
     pump_until(&mut bob, "every page arrives", |m| {
-        channel_named(m, bob_sid, "general")
-            .map(|c| texts_in(m, bob_sid, c).len() >= POSTS)
-            .unwrap_or(false)
+        channel_named(m, bob_sid, "general").is_some_and(|c| texts_in(m, bob_sid, c).len() >= POSTS)
     })
     .await;
     let texts = texts_in(&bob, bob_sid, general);
@@ -772,9 +460,9 @@ async fn a_channel_of_maximum_size_messages_is_joinable_and_pages_to_the_end() {
     assert_eq!(bob.server(bob_sid).unwrap().status, PartyStatus::Joined);
 }
 
-/// SRV-04, end to end: on a password-protected server, the operator joins
-/// with the one-time claim token in the password field and becomes the Owner;
-/// the token is then spent, and someone who joined first is not promoted.
+/// SRV-04: the operator becomes Owner by presenting the one-time claim token in
+/// the password field; the token is then spent, and the first joiner is not
+/// promoted.
 #[tokio::test]
 async fn the_owner_is_whoever_presents_the_claim_token_not_whoever_is_first() {
     let password = Uuid::new_v4().to_string();
@@ -784,14 +472,11 @@ async fn the_owner_is_whoever_presents_the_claim_token_not_whoever_is_first() {
         .clone()
         .expect("a fresh server has no owner");
 
-    let early_key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
-    let (mut early, early_sid) =
-        join(&server, "early-bird", Some(password.clone()), &early_key).await;
+    let (mut early, early_sid) = join(&server, "early-bird", Some(password.clone())).await;
     pump_until(&mut early, "directory", |m| m.my_role(early_sid).is_some()).await;
     assert_eq!(early.my_role(early_sid), Some(Role::Member));
 
-    let op_key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
-    let (mut op, op_sid) = join(&server, "operator", Some(token), &op_key).await;
+    let (mut op, op_sid) = join(&server, "operator", Some(token)).await;
     pump_until(&mut op, "owner role", |m| {
         m.my_role(op_sid) == Some(Role::Owner)
     })

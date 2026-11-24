@@ -1,5 +1,5 @@
-//! Session-event pump: polling the per-session event channels and reacting
-//! to everything the network layer reports (messages, files, TOFU, lifecycle).
+//! Session-event pump: reacting to everything the network layer reports
+//! (messages, files, TOFU, lifecycle).
 
 use super::*;
 
@@ -13,7 +13,6 @@ impl ChatManager {
         tracing::trace!(tracked_sessions = %chat_ids.len(), "Polling session events");
 
         for chat_id in chat_ids {
-            // Collect all pending events for this session
             let mut events = Vec::new();
             if let Some(rx_mutex) = self.session_events.get(&chat_id) {
                 if let Ok(mut rx) = rx_mutex.try_lock() {
@@ -23,7 +22,6 @@ impl ChatManager {
                 }
             }
 
-            // Process collected events
             tracing::trace!(chat_id = %chat_id, events = %events.len(), "Processing session events for chat");
             for event in events {
                 self.handle_session_event(chat_id, event);
@@ -31,11 +29,8 @@ impl ChatManager {
         }
     }
 
-    /// Register a sent message as waiting for the peer's delivery receipt,
-    /// keeping the map bounded: a peer that predates `Ack` never acknowledges
-    /// anything, so on a long-lived session the entries would otherwise grow
-    /// forever. Hitting the cap means the peer isn't acking at all — dropping
-    /// the backlog only costs ✓ marks that were never going to arrive.
+    /// Register a sent message as awaiting the peer's receipt. Bounded: a peer
+    /// predating `Ack` never acknowledges, so a full backlog is simply dropped.
     pub(super) fn register_awaiting_ack(
         &mut self,
         session_id: Uuid,
@@ -52,8 +47,7 @@ impl ChatManager {
             .insert((session_id, seq), (chat_id, message_id));
     }
 
-    /// Trust-On-First-Use (TOFU): decide whether a peer's verified identity
-    /// may proceed on its own, must be confirmed by the user, or is refused.
+    /// Trust-On-First-Use: let the peer proceed, ask the user, or refuse.
     pub(super) fn handle_tofu_verification(
         &mut self,
         session_id: Uuid,
@@ -61,12 +55,9 @@ impl ChatManager {
         peer_name: &str,
         sas: &str,
     ) {
-        // On the host the session id is the placeholder's; the fingerprint
-        // belongs to the incoming conversation the peer created.
+        // On the host the fingerprint belongs to the incoming conversation.
         let chat_id = self.chat_for_session(session_id);
 
-        // A blocked contact's fingerprint is refused outright: no prompt, no
-        // auto-accept, and the session is told to abort.
         if self.is_fingerprint_blocked(fingerprint) {
             tracing::warn!(peer = %peer_name, "Rejected connection from blocked contact");
             self.answer_fingerprint_check(session_id, false);
@@ -106,8 +97,7 @@ impl ChatManager {
                     "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
                 );
             }
-            // First use, but the user opted into auto-trust, or this is a peer
-            // already verified elsewhere — a returning peer under TOFU.
+            // Auto-trust opted in, or a peer already verified elsewhere.
             None if self.config.auto_trust_on_first_use
                 || self.fingerprint_known_trusted(fingerprint, chat_id) =>
             {
@@ -116,13 +106,10 @@ impl ChatManager {
                     chat.peer_fingerprint = Some(fingerprint.to_string());
                 }
                 self.answer_fingerprint_check(session_id, true);
-                // Reflect it on the matching contact so a returning peer stays
-                // consistent.
                 self.promote_contact_verified(chat_id, fingerprint);
             }
-            // First use: the user compares the safety code out of band. Keyed
-            // by SESSION id, because the answer goes to that session's task;
-            // queued, so two peers dialing a host at once each get a prompt.
+            // First use: the user compares the safety code out of band. Keyed by
+            // session id (the answer goes to that task) and queued.
             None => {
                 tracing::info!(%chat_id, "Trust on first use: requesting user confirmation");
                 self.queue_fingerprint_request(prompt);
@@ -139,16 +126,9 @@ impl ChatManager {
         }
     }
 
-    /// Has this fingerprint already been *confirmed* somewhere other than
-    /// `chat_id` — another conversation with this peer, or a contact whose
-    /// fingerprint was actually verified?
-    ///
-    /// A contact only counts when its trust state says so. Matching *any*
-    /// contact meant that pasting an invite link pre-trusted whatever
-    /// fingerprint it named: the peer then connected with no SAS prompt at all,
-    /// which is the one check the whole product is built around. An imported
-    /// contact starts `Unverified` and becomes `Verified` through
-    /// `promote_contact_verified` once the user accepts.
+    /// Has this fingerprint been *confirmed* outside `chat_id` — in another
+    /// conversation, or on a `Verified`/`Trusted` contact? An imported invite
+    /// alone (`Unverified`) must not pre-trust it.
     fn fingerprint_known_trusted(&self, fingerprint: &str, chat_id: Uuid) -> bool {
         self.chats
             .iter()
@@ -191,9 +171,7 @@ impl ChatManager {
                 }
 
                 if let Some(chat) = self.chats.get_mut(&chat_id) {
-                    // Only re-derive the title from the peer label when the user
-                    // has not named this conversation themselves — otherwise a
-                    // reconnect silently replaced "Mum" with an IP:port.
+                    // Keep a title the user chose.
                     if !chat.title_is_custom {
                         chat.title = peer;
                     }
@@ -201,12 +179,7 @@ impl ChatManager {
                     if hole_punched {
                         chat.transport = Transport::Direct;
                     }
-                    // A fresh session restarts the wire sequence at 1, but this
-                    // chat's high-water mark is left over from the previous
-                    // one — everything at or below it would be rejected as a
-                    // replay, silently swallowing the peer's first messages.
-                    // Transport-layer replay protection is per session and
-                    // still enforced in `run_message_loop`.
+                    // A new session restarts the wire seq; `recv_seq` must too.
                     chat.reset_sequences();
                 }
             }
@@ -264,8 +237,6 @@ impl ChatManager {
                     return;
                 };
                 tracing::info!(file = %filename, seq = %seq, "File send complete (final frame on the wire)");
-                // The stream finished; mark the tracked transfer done and retire
-                // its live handle.
                 self.outgoing_transfers.remove(&transfer_id);
                 if let Some(state) = self.active_transfers.get_mut(&transfer_id) {
                     state.received = state.size;
@@ -277,9 +248,7 @@ impl ChatManager {
             }
 
             SessionEvent::TextSendComplete { seq } => {
-                // The frame carrying the oldest queued text message hit the wire
-                // with this seq (FIFO per session): register it so the peer's
-                // Ack can mark the right message delivered.
+                // The oldest queued text hit the wire with this seq (FIFO).
                 match self
                     .pending_text_sends
                     .get_mut(&chat_id)
@@ -298,20 +267,15 @@ impl ChatManager {
                 tracing::warn!("Session {} disconnected", chat_id);
                 self.add_toast(ToastLevel::Warning, "Connection lost".to_string());
                 self.fail_pending_file_sends(chat_id, "connection lost");
-                // Receives die with the session too. This must run before the
-                // chat_id_mapping entries below are dropped — that mapping is
-                // how a host-side session id resolves to the conversation the
-                // transfer is tracked under.
+                // Fail receives before dropping `chat_id_mapping`, which is how a
+                // host-side session id resolves to the transfer's conversation.
                 self.fail_incoming_transfers(chat_id, "connection lost");
 
                 self.teardown_session(chat_id);
                 self.chat_id_mapping.retain(|_, v| *v != chat_id);
 
-                // A listener that died without ever accepting anyone leaves its
-                // placeholder chat behind, and `check_rehost_needed()` then
-                // reports "a placeholder exists, nothing to do" forever — so the
-                // app shows a Host conversation with no listener under it and
-                // never accepts another peer. Drop it and let auto-rehost rebind.
+                // A dead listener's placeholder would make `check_rehost_needed`
+                // think it is still hosting; drop it so auto-rehost rebinds.
                 if self
                     .chats
                     .get(&chat_id)
@@ -335,7 +299,9 @@ impl ChatManager {
         }
     }
 
-    /// A host listener accepted a peer: route the session into a conversation.
+    /// A host listener accepted a peer: route the session into a conversation —
+    /// an idle existing one with the same (verified) fingerprint, so reconnects
+    /// do not fragment history, else the client's offered chat id.
     fn accept_incoming_connection(
         &mut self,
         session_id: Uuid,
@@ -343,33 +309,9 @@ impl ChatManager {
         fingerprint: &str,
         peer_addr: &str,
     ) {
-        // A returning peer belongs in the conversation it already has.
-        //
-        // The host keys incoming chats by the *client's* chat id, which is fresh
-        // whenever the client hasn't kept its own mapping — so every reconnect
-        // used to open another "Peer ab12cd34" and the history fragmented into a
-        // pile of near-identical threads. The fingerprint arrives verified (the
-        // identity proof was checked before this event), so it is the right key:
-        // prefer an existing conversation with that fingerprint over the id we
-        // were handed.
-        //
-        // Only an idle one, though — a chat with a live session belongs to a
-        // connection that is still running, and merging a second peer into it
-        // would cross two conversations together.
         let chat_id = self
-            .chats
-            .iter()
-            .find(|(id, c)| {
-                c.peer_fingerprint.as_deref() == Some(fingerprint)
-                    && !c.is_host_placeholder
-                    && **id != session_id
-                    && !self.is_connected(id)
-            })
-            .map(|(id, _)| *id)
+            .idle_conversation_with(fingerprint, session_id)
             .unwrap_or(offered_chat_id);
-
-        // Messages sent to the conversation are routed to the session that
-        // accepted it (the placeholder host's).
         self.chat_id_mapping.insert(chat_id, session_id);
         tracing::debug!(
             "Mapped incoming chat {} to session chat {}",
@@ -377,9 +319,8 @@ impl ChatManager {
             session_id
         );
 
-        // Inherit the transport of the host session that accepted this peer: a
-        // relay-hosted listener must produce a Relay chat — unless the
-        // rendezvous hole punched a direct socket.
+        // Inherit the accepting listener's transport (a relay listener makes a
+        // Relay chat) unless the rendezvous hole punched a direct socket.
         let transport = if is_hole_punched(peer_addr) {
             Transport::Direct
         } else {
@@ -389,14 +330,10 @@ impl ChatManager {
                 .unwrap_or(Transport::Direct)
         };
 
-        // Create the conversation, or (on reconnect) bring the existing one in
-        // line with its new session: the peer's wire sequence restarts at 1, so
-        // a leftover high-water mark would reject everything it sends until it
-        // climbs past the old one.
-        //
+        // Create the conversation, or reset an existing one for its new session.
         // A new chat starts with no `peer_fingerprint`, so TOFU actually runs:
-        // pre-filling the peer's own fingerprint made the check trivially
-        // "match" and silently auto-trusted every caller.
+        // pre-filling the peer's own made the check trivially "match" and
+        // auto-trusted every caller.
         let title = format!(
             "Peer {}",
             crate::util::format_fingerprint_short(fingerprint)
@@ -409,8 +346,7 @@ impl ChatManager {
             })
             .or_insert_with(|| Chat::new(chat_id, title, ChatKind::Dm, transport));
 
-        // The listener's placeholder is consumed: the UI shows only the real
-        // conversation, and auto-rehost spawns a new listener.
+        // The listener's placeholder is consumed; auto-rehost spawns a new one.
         if self
             .chats
             .get(&session_id)
@@ -421,43 +357,20 @@ impl ChatManager {
         }
     }
 
-    /// The dialing side of "a returning peer belongs in ONE conversation".
-    ///
-    /// Re-dialing a peer by address (or relay code) starts a fresh chat, because
-    /// nothing at dial time says who will answer. The host already routes a
-    /// returning peer back into its existing conversation by fingerprint; the
-    /// dialing side did not, so every reconnect left the user with a new, empty
-    /// "host:port" conversation beside the one holding their history — the two
-    /// sides of the same session disagreeing about which thread it was.
-    ///
-    /// Now that the peer's identity is verified, a fresh, empty chat whose peer
-    /// already has an idle conversation is folded into it: the session keeps
-    /// its id and is mapped to the existing conversation exactly as a host-side
-    /// session is (`chat_id_mapping`), so messages, sends, transfers and
-    /// teardown all route there. TOFU then runs against the existing
-    /// conversation's stored fingerprint, so the prompt is skipped only for a
-    /// peer the user already verified.
+    /// The dialing side of "a returning peer belongs in ONE conversation": once
+    /// the peer is verified, a fresh empty chat whose peer already has an idle
+    /// conversation is folded into it via `chat_id_mapping`, like a host-side
+    /// session. TOFU then runs against that conversation's stored fingerprint.
     fn rejoin_existing_conversation(&mut self, session_id: Uuid, fingerprint: &str) {
         let Some(fresh) = self.chats.get(&session_id) else {
             return;
         };
-        // A conversation that already belongs to this peer, or already has
-        // history of its own, is not a fresh dial.
+        // A chat that already has a peer or history is not a fresh dial.
         if fresh.peer_fingerprint.is_some() || !fresh.messages.is_empty() {
             return;
         }
         let transport = fresh.transport;
-        let Some(existing) = self
-            .chats
-            .iter()
-            .find(|(id, c)| {
-                **id != session_id
-                    && c.peer_fingerprint.as_deref() == Some(fingerprint)
-                    && !c.is_host_placeholder
-                    && !self.is_connected(id)
-            })
-            .map(|(id, _)| *id)
-        else {
+        let Some(existing) = self.idle_conversation_with(fingerprint, session_id) else {
             return;
         };
         tracing::info!(%session_id, conversation = %existing, "Reconnected peer routed into its existing conversation");
@@ -474,12 +387,8 @@ impl ChatManager {
         }
     }
 
-    /// One application frame from the peer.
-    ///
-    /// The replay check runs here, once, before the frame is looked at: every
-    /// sequenced frame must climb above the last one accepted on this
-    /// conversation, whatever its kind. (The transport enforces the same rule
-    /// per session; this is the app-layer half.)
+    /// One application frame from the peer. The app-layer replay check runs
+    /// first: every sequenced frame must climb above the last one accepted.
     fn handle_peer_frame(&mut self, session_id: Uuid, frame: ProtocolMessage) {
         tracing::debug!("Session {} received message: {:?}", session_id, frame);
         let chat_id = self.chat_for_session(session_id);
@@ -517,8 +426,7 @@ impl ChatManager {
                 text_part,
                 timestamp,
             ) {
-                // Chunks arrive in order on the one stream, so the final
-                // chunk's seq is the one the receipt acknowledges.
+                // Chunks arrive in order, so the last one's seq gets the receipt.
                 Ok(Some((text, assembled_at))) => {
                     tracing::info!(
                         "Reassembled large text message {} for chat {}",
@@ -568,7 +476,7 @@ impl ChatManager {
                     chat.clear_typing();
                 }
             }
-            // Keyed by the SESSION id: that is where the wire seq was stamped.
+            // Keyed by session id: that is where the wire seq was stamped.
             ProtocolMessage::Ack { acked_seq, .. } => self.mark_delivered(session_id, acked_seq),
             other => {
                 tracing::warn!(
@@ -579,8 +487,7 @@ impl ChatManager {
         }
     }
 
-    /// Record a text message from the peer, acknowledge the frame `ack_seq`
-    /// that completed it, and notify (unless the conversation is on screen).
+    /// Record a peer's text, acknowledge `ack_seq`, and notify.
     fn receive_text(
         &mut self,
         chat_id: Uuid,
@@ -603,8 +510,7 @@ impl ChatManager {
     /// The peer offered a file: register the transfer and open its spool.
     fn receive_file_offer(&mut self, chat_id: Uuid, filename: &str, size: u64) {
         tracing::info!("Received file metadata: {} ({} bytes)", filename, size);
-        // A sender streams one file at a time, so a new offer means whatever
-        // was still streaming is over from its side; it will never finish.
+        // One file at a time per sender: a new offer abandons the previous one.
         if let Some(abandoned) = self.streaming_transfer(chat_id) {
             tracing::warn!(%abandoned, "a new file offer arrived before the previous one finished");
             self.pending_file_end.remove(&abandoned);
@@ -622,26 +528,22 @@ impl ChatManager {
                 return;
             }
         };
-        // The directory is ours, the name is the peer's: passing them separately
-        // is what lets the receiver sanitise the name itself rather than trusting
-        // the decoder to have done it.
+        // Directory and peer-supplied name are passed separately so the receiver
+        // sanitises the name itself.
         match IncomingFileSync::new(&self.config.download_dir, filename, size) {
             Ok(incoming) => {
                 self.incoming_files.insert(transfer_id, incoming);
             }
             Err(e) => {
                 tracing::error!("Failed to create incoming file: {}", e);
-                // Fail the transfer, or it stays "active" with no spool behind
-                // it and blocks the conversation's next offer forever.
+                // Fail it, or it blocks the conversation's next offer forever.
                 self.set_transfer_status(transfer_id, TransferStatus::Failed(e.to_string()));
                 self.refuse_file_offer(chat_id, &e.to_string());
             }
         }
     }
 
-    /// We cannot take the file the peer just offered: drop whatever of it is
-    /// still to come, and tell the sender to stop rather than stream it all
-    /// across the wire for nothing.
+    /// Refuse the file the peer just offered and tell the sender to stop.
     fn refuse_file_offer(&mut self, chat_id: Uuid, reason: &str) {
         self.incoming_streams.remove(&chat_id);
         self.send_control(chat_id, ProtocolMessage::FileCancel { seq: 0 });
@@ -657,11 +559,8 @@ impl ChatManager {
         let Some(transfer_id) = self.streaming_transfer(chat_id) else {
             return;
         };
-        // An offer the user has not accepted yet still spools to disk, because
-        // the sender streams without waiting for a decision. Uncapped, that
-        // means a peer can put up to MAX_FILE_SIZE (10 GiB) on the disk while
-        // the accept/decline prompt is still on screen. Past the cap the offer
-        // is declined for them.
+        // An unaccepted offer still spools (the sender does not wait), so it is
+        // capped and auto-declined past `MAX_UNACCEPTED_SPOOL_BYTES`.
         if self.unaccepted_spool_exceeded(transfer_id) {
             self.auto_decline_oversized_offer(transfer_id);
             return;
@@ -689,7 +588,6 @@ impl ChatManager {
 
     /// The peer finished sending: finalize, or hold until the user decides.
     fn receive_file_end(&mut self, chat_id: Uuid, seq: u64) {
-        // The stream is over either way; the next offer starts a new one.
         let Some(transfer_id) = self.incoming_streams.remove(&chat_id) else {
             return;
         };
@@ -704,9 +602,8 @@ impl ChatManager {
             return; // declined or failed while it was still streaming
         }
         if status == TransferStatus::AwaitingAcceptance {
-            // Fully received but not yet accepted: hold the spooled file (and
-            // the FileEnd seq, for the eventual delivery receipt) until the user
-            // decides.
+            // Hold the spool and the FileEnd seq (for the receipt) until the
+            // user decides.
             tracing::info!("File fully received; holding until the user accepts");
             self.pending_file_end.insert(transfer_id, seq);
         } else {
@@ -739,9 +636,8 @@ impl ChatManager {
         }
     }
 
-    /// Resolve a background UPnP mapping attempt started by `start_host`.
-    /// On success the external address is stored (and preferred by invite
-    /// generation); on failure the host keeps working LAN/relay-only.
+    /// Resolve a background UPnP mapping attempt (on failure, hosting stays
+    /// LAN/relay-only).
     fn poll_upnp_result(&mut self) {
         let Some(rx) = self.pending_upnp.as_mut() else {
             return;
@@ -775,10 +671,23 @@ impl ChatManager {
             }
         }
     }
+
+    /// An idle (no live session), non-placeholder conversation other than
+    /// `exclude` that already holds `fingerprint`.
+    fn idle_conversation_with(&self, fingerprint: &str, exclude: Uuid) -> Option<Uuid> {
+        self.chats
+            .iter()
+            .find(|(id, c)| {
+                **id != exclude
+                    && c.peer_fingerprint.as_deref() == Some(fingerprint)
+                    && !c.is_host_placeholder
+                    && !self.is_connected(id)
+            })
+            .map(|(id, _)| *id)
+    }
 }
 
-/// A `p2p:` peer label means the relay rendezvous hole punched a direct
-/// socket, so the conversation is direct even though it began via the relay.
+/// A `p2p:` peer label means the relay rendezvous hole punched a direct socket.
 fn is_hole_punched(peer: &str) -> bool {
     peer.starts_with("p2p:")
 }

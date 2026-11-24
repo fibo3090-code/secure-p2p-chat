@@ -1,16 +1,8 @@
-//! Party application protocol (Phase 1).
+//! Party application protocol: the client/server wire contract, carried inside
+//! the established v3 encrypted tunnel (`network::session`).
 //!
-//! Shared wire contract between the client and the Party server. It rides *on top
-//! of* the established Protocol v3 encrypted tunnel (see `network::session`): the
-//! handshake authenticates and encrypts the channel to the server, and these
-//! messages carry the Party-level application semantics (join, directory, channel
-//! messaging, offline catch-up).
-//!
-//! Two trust tiers share one data model (see `docs/platform_spec.md`):
-//! - **Administered** (default): the server stores plaintext payloads.
-//! - **E2EE** (Phase 4): payloads are ciphertext; the server never sees plaintext.
-//!
-//! The MVP implements the Administered tier.
+//! Two trust tiers share one data model (`docs/platform_spec.md`):
+//! Administered (server stores plaintext; implemented) and E2EE (Phase 4).
 
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
@@ -20,9 +12,8 @@ use uuid::Uuid;
 use crate::core::{recv_packet, send_packet, AesCipher};
 use crate::network::client_handshake;
 
-/// Trust tier of a server / stored message. A property of the server. Only
-/// `Administered` exists today; both shells disclose it as "the operator can
-/// read messages" on every community screen rather than reading this field.
+/// Trust tier of a server. Only `Administered` exists today; the UIs disclose
+/// "the operator can read messages" regardless of this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrustTier {
     /// Server stores plaintext; enables offline buffering, search, admin-read.
@@ -32,33 +23,19 @@ pub enum TrustTier {
     E2EE,
 }
 
-/// Maximum size of a file uploaded inline in a single Party request. Anything
-/// larger goes through the chunked path ([`PartyRequest::StartUpload`]). Kept
-/// well under [`crate::MAX_PACKET_SIZE`] to leave headroom for request framing.
+/// Largest inline upload; larger files use [`PartyRequest::StartUpload`].
 pub const MAX_INLINE_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
-/// The `Error` a server answers a download with when the file is unknown *or*
-/// the member may not see it (deliberately the same answer).
-///
-/// Errors are not correlated with the request that caused them, so the client
-/// recognises a failed download by this text. Anything else — a refused
-/// channel name, a failed role change — must not fail a download in flight.
+/// The `Error` answering a download of a file that is unknown *or* not visible
+/// (deliberately the same). Errors are uncorrelated, so the client recognises
+/// a failed download by this text.
 pub const UNKNOWN_FILE_ERROR: &str = "unknown file";
 
-/// Bytes of file data carried by one [`PartyRequest::UploadChunk`] or
-/// [`PartyResponse::FileChunk`].
-///
-/// Small enough that a chunk plus its framing is nowhere near
-/// [`crate::MAX_PACKET_SIZE`], and small enough that a cancelled transfer wastes
-/// little; large enough that a 100 MiB file is a few hundred round trips rather
-/// than tens of thousands.
+/// File bytes per [`PartyRequest::UploadChunk`] / [`PartyResponse::FileChunk`].
 pub const PARTY_CHUNK_BYTES: usize = 256 * 1024; // 256 KiB
 
-/// Largest file a community server will accept at all, inline or chunked.
-///
-/// Distinct from the per-member quota: the quota bounds what one member may
-/// *hold*, this bounds what a single transfer may cost the server in spool
-/// space and time before it is either committed or thrown away.
+/// Largest file a server accepts at all, inline or chunked (separate from the
+/// per-member quota).
 pub const MAX_PARTY_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
 
 /// Where a chunked upload will be posted once it completes.
@@ -69,10 +46,8 @@ pub enum UploadTarget {
     Dm(Uuid),
 }
 
-/// Metadata describing a file shared in a channel or DM. The file's bytes are
-/// stored content-addressed by `hash` (lowercase hex SHA-256); `name` is the
-/// per-message display name, so two messages may reference one blob under
-/// different names.
+/// A file shared in a channel or DM. Bytes are stored content-addressed by
+/// `hash` (lowercase hex SHA-256); `name` is per message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub hash: String,
@@ -81,43 +56,24 @@ pub struct FileMeta {
     pub mime: String,
 }
 
-/// The application payload carried by an [`Envelope`]. For the Administered tier
-/// this is plaintext; the E2EE tier (Phase 4) will add a ciphertext variant.
+/// An [`Envelope`]'s payload; plaintext in the Administered tier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessagePayload {
     Text(String),
-    /// A reference to a file stored on the server (Phase 2). The bytes are fetched
-    /// separately via [`PartyRequest::DownloadFile`] using `FileMeta::hash`.
+    /// A server-stored file, fetched via [`PartyRequest::DownloadFile`].
     File(FileMeta),
 }
 
-/// Content address (lowercase hex SHA-256) of a blob's bytes. Both sides compute
-/// this identically so uploads can be deduplicated by content.
+/// Content address (lowercase hex SHA-256) of a blob's bytes, for dedup.
 pub fn blob_hash(data: &[u8]) -> String {
     let mut hasher = BlobHasher::new();
     hasher.update(data);
     hasher.finish()
 }
 
-/// The same content address, computed as the bytes arrive.
-///
-/// A chunked upload has its bytes handed to the server 64 KiB at a time, so the
-/// hash can be accumulated across those chunks instead of computed in one pass
-/// at the end. That matters because the one-pass version has to happen
-/// *somewhere*: doing it while holding the server's state lock stalls every
-/// other member for as long as hashing 100 MiB takes, and doing it after the
-/// lock is released means the server does not know, while deciding whether to
-/// accept the upload, whether it already holds this exact content — so it has
-/// to assume it does not and reserve storage it may not need.
-///
-/// Feeding each chunk in as it lands costs microseconds per chunk, on work the
-/// server is doing under the lock anyway, and the answer is ready the moment the
-/// upload completes.
-///
-/// Deliberately the same type [`blob_hash`] is built from, so the incremental
-/// and one-shot forms cannot drift apart — two content-address functions that
-/// disagree would silently split deduplication and, worse, make a file's address
-/// depend on how it happened to be uploaded.
+/// The same content address computed incrementally, so a chunked upload's hash
+/// is known by completion without a 100 MiB pass under the server lock. Shares
+/// its implementation with [`blob_hash`] so the two can never disagree.
 #[derive(Debug, Clone, Default)]
 pub struct BlobHasher {
     inner: sha2::Sha256,
@@ -154,17 +110,10 @@ pub struct Envelope {
     pub payload: MessagePayload,
 }
 
-/// A member's authority on a community server.
-///
-/// Ordered least- to most-privileged, so `>=` is the permission test: `role >=
-/// Role::Admin` reads as "at least an admin". Every check in the server is
-/// written that way.
-///
-/// The server has exactly one [`Role::Owner`]: the operator, who claims it by
-/// joining with the one-time owner claim token the server prints (or whose
-/// fingerprint the server was started with). Being first to join grants
-/// nothing. The owner cannot be demoted — otherwise an admin could strip the operator of their own server —
-/// and a second owner is never created.
+/// A member's authority. Ordered, so `role >= Role::Admin` is the permission
+/// test. There is exactly one [`Role::Owner`], claimed with the one-time
+/// claim token or `--owner` fingerprint (joining first grants nothing); it
+/// cannot be demoted and is never duplicated.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Hash,
 )]
@@ -191,29 +140,23 @@ impl Role {
         }
     }
 
-    /// Whether this role may post messages and upload files at all. A guest is
-    /// read-only everywhere, before any per-channel rule is consulted.
+    /// May post and upload at all (a guest is read-only everywhere).
     pub fn can_write(self) -> bool {
         self >= Role::Member
     }
 
-    /// Whether this role may create channels.
     pub fn can_create_channel(self) -> bool {
         self >= Role::Member
     }
 
-    /// Whether this role administers the server: channel kinds and membership,
-    /// deleting channels, deleting anyone's files, posting to restricted
-    /// channels, and changing roles.
+    /// Administers the server: channel access, deletions, restricted channels,
+    /// roles.
     pub fn is_admin(self) -> bool {
         self >= Role::Admin
     }
 
-    /// Whether `self` may assign `target` role to somebody else.
-    ///
-    /// You can only grant a role strictly below your own, so an admin cannot
-    /// mint another admin (or an owner) and lock the operator out of their own
-    /// community. The owner is the only one who can appoint admins.
+    /// Whether `self` may assign `target`: only roles strictly below your own,
+    /// so an admin cannot mint admins or owners.
     pub fn may_assign(self, target: Role) -> bool {
         self.is_admin() && target < self
     }
@@ -229,11 +172,7 @@ pub struct MemberInfo {
     pub role: Role,
 }
 
-/// Channel kind — the per-channel access rule.
-///
-/// These used to be stored, persisted, and shipped to clients while being
-/// enforced nowhere, then (when that was found) made to fail closed, which left
-/// three of the four kinds unusable. They are now real: see
+/// Channel kind: the per-channel access rule, enforced by
 /// [`ChannelKind::may_read`] / [`ChannelKind::may_post`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
 pub enum ChannelKind {
@@ -242,22 +181,19 @@ pub enum ChannelKind {
     Public,
     /// Only members on the channel's own membership list may read or post.
     Private,
-    /// Everyone may read; nobody may post except an admin. Used to freeze a
-    /// channel without deleting its history.
+    /// Everyone may read; only admins may post (freezes a channel).
     Locked,
     /// Everyone may read; only admins may post. Used for announcements.
     Announce,
 }
 
 impl ChannelKind {
-    /// Whether a member with `role`, who is `is_channel_member` of this channel,
-    /// may read it. `is_channel_member` is only consulted for [`Self::Private`];
-    /// every other kind is server-wide.
+    /// Whether a member with `role` may read this channel; `is_channel_member`
+    /// only matters for [`Self::Private`].
     pub fn may_read(self, role: Role, is_channel_member: bool) -> bool {
         match self {
             ChannelKind::Public | ChannelKind::Locked | ChannelKind::Announce => true,
-            // An admin can always see a private channel — they administer it,
-            // and pretending otherwise only means they cannot moderate it.
+            // Admins always see private channels, so they can moderate them.
             ChannelKind::Private => is_channel_member || role.is_admin(),
         }
     }
@@ -267,29 +203,22 @@ impl ChannelKind {
         if !role.can_write() {
             return Err("your role on this server is read-only");
         }
-        match self {
-            ChannelKind::Public => Ok(()),
-            ChannelKind::Private => {
-                if is_channel_member || role.is_admin() {
-                    Ok(())
-                } else {
-                    Err("you are not a member of this channel")
-                }
-            }
-            ChannelKind::Locked => {
-                if role.is_admin() {
-                    Ok(())
-                } else {
-                    Err("this channel is locked")
-                }
-            }
-            ChannelKind::Announce => {
-                if role.is_admin() {
-                    Ok(())
-                } else {
-                    Err("only admins may post to an announcement channel")
-                }
-            }
+        let (allowed, reason) = match self {
+            ChannelKind::Public => (true, ""),
+            ChannelKind::Private => (
+                is_channel_member || role.is_admin(),
+                "you are not a member of this channel",
+            ),
+            ChannelKind::Locked => (role.is_admin(), "this channel is locked"),
+            ChannelKind::Announce => (
+                role.is_admin(),
+                "only admins may post to an announcement channel",
+            ),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(reason)
         }
     }
 
@@ -309,8 +238,8 @@ pub struct ChannelInfo {
     pub id: Uuid,
     pub name: String,
     pub kind: ChannelKind,
-    /// Members of a [`ChannelKind::Private`] channel. Empty for every other kind,
-    /// where membership is server-wide. Appended field: keep it last.
+    /// Members of a [`ChannelKind::Private`] channel (empty otherwise).
+    /// Appended field: keep it last.
     pub members: Vec<Uuid>,
 }
 
@@ -328,8 +257,7 @@ pub enum PartyRequest {
     ListChannels,
     /// Post a text message to a channel.
     PostMessage { channel: Uuid, text: String },
-    /// Fetch channel history strictly after `since_seq` (offline catch-up).
-    /// `since_seq = 0` returns the whole channel.
+    /// Fetch channel history after `since_seq` (0 = all).
     FetchHistory { channel: Uuid, since_seq: u64 },
     /// Send a direct (1:1) message to another member.
     SendDm { to: Uuid, text: String },
@@ -337,8 +265,7 @@ pub enum PartyRequest {
     FetchDmHistory { with: Uuid, since_seq: u64 },
     /// Create a new public channel.
     CreateChannel { name: String },
-    /// Upload a file inline and post it as a message to a channel. The bytes must
-    /// not exceed [`MAX_INLINE_FILE_BYTES`].
+    /// Upload a file inline (at most [`MAX_INLINE_FILE_BYTES`]) to a channel.
     PostFile {
         channel: Uuid,
         name: String,
@@ -375,8 +302,8 @@ pub enum PartyRequest {
     SetRole { member: Uuid, role: Role },
     /// List every file the caller is allowed to see, for the Drive panel.
     ListFiles,
-    /// Delete a shared file: removes its reference, and the blob once nothing
-    /// holds it. Allowed for the uploader or an admin.
+    /// Remove a file's reference, and the blob once nothing holds it
+    /// (uploader or admin).
     DeleteFile { hash: String, channel: Uuid },
     /// Fetch the server's audit log (admins only), newest first.
     FetchAuditLog { limit: u32 },
@@ -385,8 +312,7 @@ pub enum PartyRequest {
 
     // --- Chunked file transfer (appended; keep the order stable) --------------
     /// Begin a chunked upload. `size` is declared up front so the server can
-    /// refuse — quota, ceiling, unknown channel — before any bytes move rather
-    /// than after spooling a hundred megabytes.
+    /// refuse before any bytes move.
     StartUpload {
         name: String,
         mime: String,
@@ -396,52 +322,40 @@ pub enum PartyRequest {
     /// One chunk of an in-progress upload, in order. At most
     /// [`PARTY_CHUNK_BYTES`].
     UploadChunk { upload: Uuid, data: Vec<u8> },
-    /// All chunks sent: verify the assembled length, store the blob, and post
-    /// the file message.
+    /// Verify the assembled length, store the blob and post the message.
     FinishUpload { upload: Uuid },
     /// Abandon an upload and discard its spool.
     CancelUpload { upload: Uuid },
-    /// Fetch one chunk of a stored file, starting at `offset`. The reply carries
-    /// the total size, so the caller knows when it is done.
+    /// Fetch one chunk of a stored file from `offset`; the reply carries the
+    /// total size.
     DownloadChunk { hash: String, offset: u64 },
 
     // --- Per-file permissions (appended; keep the order stable) --------------
-    /// Post a file you already hold somewhere else, without re-uploading it.
-    /// Requires [`FilePermissions::share`] on the source reference — and the
-    /// content is stored once, so this costs a reference, not a copy.
+    /// Post a file you already hold elsewhere without re-uploading. Requires
+    /// [`FilePermissions::share`] on the source reference.
     ShareFile {
         hash: String,
-        /// The reference being re-shared, which is where the caller's rights
-        /// come from. One blob can sit in several places under different
-        /// grants, so the source has to be named.
+        /// The reference being re-shared, where the caller's rights come from.
         from: Uuid,
         target: UploadTarget,
     },
-    /// Change what a shared file grants. `member: None` sets the default for
-    /// everyone who can reach the location; `Some(id)` sets one member's grant,
-    /// overriding the default for them.
-    ///
-    /// Only ever succeeds for rights the caller holds themselves.
+    /// Change what a shared file grants: `member: None` sets the default for
+    /// the location, `Some(id)` one member's override. Only for rights the
+    /// caller holds.
     SetFilePermissions {
         hash: String,
         location: Uuid,
         member: Option<Uuid>,
         perms: FilePermissions,
     },
-    /// The file listing from `offset` on (newest first). Sent by a client
-    /// only after a [`PartyResponse::Files`] came back holding exactly
-    /// [`MAX_FILE_LISTING`] entries, i.e. possibly truncated — so an older
-    /// server, which never truncates, is not sent a request it cannot decode
-    /// (audit SRV-01).
+    /// The file listing from `offset` on (newest first). Sent only after a
+    /// `Files` reply held exactly [`MAX_FILE_LISTING`] entries, so an older
+    /// server is never sent a request it cannot decode (audit SRV-01).
     ListFilesPage { offset: u32 },
 }
 
-/// What a member may do with one shared file.
-///
-/// The rights are deliberately separate: seeing that a file exists is not the
-/// same as being able to fetch its bytes, and neither implies being allowed to
-/// put it somewhere else. `admin` from the design note is not a flag here —
-/// it is [`Role::is_admin`], which overrides all of these.
+/// What a member may do with one shared file. Admin is not a flag here:
+/// [`Role::is_admin`] overrides all of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct FilePermissions {
     /// See it in the listing and in a message.
@@ -450,15 +364,14 @@ pub struct FilePermissions {
     pub download: bool,
     /// Remove this share (not other shares of the same content).
     pub delete: bool,
-    /// Post it somewhere else without re-uploading — the content-addressed
-    /// store makes that free, which is exactly why it needs its own right.
+    /// Post it elsewhere without re-uploading (free in the content-addressed
+    /// store, hence its own right).
     pub share: bool,
 }
 
 impl Default for FilePermissions {
-    /// What the audience of a channel or DM gets when a file is shared there:
-    /// they can see it and fetch it, and that is all. Deleting somebody else's
-    /// share and re-posting it elsewhere are both grants somebody has to make.
+    /// A share's audience may view and download; delete and share must be
+    /// granted.
     fn default() -> Self {
         Self {
             view: true,
@@ -480,7 +393,6 @@ impl FilePermissions {
         }
     }
 
-    /// Nothing.
     pub fn none() -> Self {
         Self {
             view: false,
@@ -490,10 +402,8 @@ impl FilePermissions {
         }
     }
 
-    /// Whether `self` covers every right in `other`.
-    ///
-    /// This is the "you can only delegate rights you hold" rule: a grant is
-    /// refused unless the granter's own effective rights are a superset of it.
+    /// Whether `self` covers every right in `other` (you can only delegate
+    /// rights you hold).
     pub fn covers(self, other: Self) -> bool {
         (!other.view || self.view)
             && (!other.download || self.download)
@@ -501,9 +411,7 @@ impl FilePermissions {
             && (!other.share || self.share)
     }
 
-    /// Downloading something you cannot see, or sharing something you cannot
-    /// download, is not a coherent grant. Normalising here means the rule is
-    /// enforced once rather than at every call site.
+    /// Viewing is implied by any right, downloading by sharing.
     pub fn normalized(self) -> Self {
         let view = self.view || self.download || self.delete || self.share;
         Self {
@@ -515,8 +423,7 @@ impl FilePermissions {
     }
 }
 
-/// One shared file as shown in the Drive panel: the blob plus the provenance the
-/// server records for it — who shared it, where, and when.
+/// One shared file in the Drive panel, with who shared it, where and when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub hash: String,
@@ -534,8 +441,7 @@ pub struct FileEntry {
     pub is_dm: bool,
     /// Unix milliseconds when it was shared.
     pub shared_at: u64,
-    /// Whether the *requesting* member may delete this reference. Kept as a
-    /// convenience for the UI; it is `perms.delete`.
+    /// Whether the *requesting* member may delete this (`perms.delete`).
     pub can_delete: bool,
     /// What the requesting member may do with it. Appended field: keep it last.
     pub perms: FilePermissions,
@@ -568,10 +474,8 @@ pub struct AuditEntry {
     pub detail: String,
 }
 
-/// Deterministic, order-independent id for the 1:1 DM thread between two members,
-/// so both participants and the server agree on the same `Envelope.channel` for
-/// their direct messages. A DM `Envelope` is just a [`Message`]/[`History`] item
-/// whose `channel` is this thread id rather than a real channel id.
+/// Deterministic, order-independent id of the DM thread between two members,
+/// used as a DM `Envelope.channel`.
 pub fn dm_thread_id(a: Uuid, b: Uuid) -> Uuid {
     use sha2::{Digest, Sha256};
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -616,11 +520,9 @@ pub enum PartyResponse {
     },
     /// A non-fatal application error.
     Error(String),
-    /// A *send* was refused (post, DM, or file upload). Distinct from `Error`
-    /// because the client appends outgoing messages optimistically — it has to
-    /// know that the refusal belongs to the message it is still showing, so it
-    /// can take it back rather than leave the user believing it was delivered.
-    /// Appended variant: bincode encodes the index, so this must stay last.
+    /// A *send* (post, DM, upload) was refused. Distinct from `Error` so the
+    /// client can retract the optimistically shown row. Appended variant:
+    /// bincode encodes the index, so keep the order.
     ActionFailed {
         channel: Uuid,
         reason: String,
@@ -635,13 +537,9 @@ pub enum PartyResponse {
     AuditLog(Vec<AuditEntry>),
     /// A governance action succeeded, with a message worth showing the user.
     Ok(String),
-    /// The channel list changed; re-request it with
-    /// [`PartyRequest::ListChannels`].
-    ///
-    /// A nudge rather than the list itself, because the list is now *per member*:
-    /// a private channel is only visible to those in it, and the hub fans one
-    /// identical frame out to every connection. Broadcasting the channels
-    /// directly would hand everyone the private ones.
+    /// The channel list changed; re-request it. A nudge, not the list: lists
+    /// are per member, and the hub sends one identical frame to everyone, so
+    /// broadcasting the list would leak private channels.
     DirectoryChanged,
     /// A chunked upload was accepted; send [`PartyRequest::UploadChunk`]s of at
     /// most `chunk_size` bytes, then [`PartyRequest::FinishUpload`].
@@ -649,17 +547,16 @@ pub enum PartyResponse {
         upload: Uuid,
         chunk_size: u32,
     },
-    /// One chunk of a requested file. `total` is the whole file's size, so the
-    /// caller knows whether to ask for more; a short final chunk is normal.
+    /// One chunk of a requested file; `total` is the whole size.
     FileChunk {
         hash: String,
         offset: u64,
         total: u64,
         data: Vec<u8>,
     },
-    /// One page of the file listing (reply to [`PartyRequest::ListFilesPage`]
-    /// only, never unsolicited: an older client cannot decode it). `next` is
-    /// the offset to ask for to continue, `None` at the end.
+    /// One page of the file listing, only in reply to
+    /// [`PartyRequest::ListFilesPage`] (older clients cannot decode it). `next`
+    /// is the offset to continue from, `None` at the end.
     FilesPage {
         files: Vec<FileEntry>,
         offset: u32,
@@ -667,55 +564,32 @@ pub enum PartyResponse {
     },
 }
 
-/// Most entries one [`PartyResponse::Files`] or [`PartyResponse::FilesPage`]
-/// carries. A `Files` reply holding exactly this many may be truncated, which
-/// is the client's cue to page on with [`PartyRequest::ListFilesPage`].
+/// Most entries in one `Files`/`FilesPage`. A `Files` reply holding exactly
+/// this many may be truncated: the cue to page on with `ListFilesPage`.
 pub const MAX_FILE_LISTING: usize = 2_000;
 
 /// Byte budget for one file listing page — half a frame.
 pub const FILE_LISTING_BYTES: usize = 4 * 1024 * 1024;
 
-/// Most envelopes the server will put in one `History` response.
-///
-/// A whole channel used to be returned in a single frame, so once its history
-/// passed [`crate::MAX_PACKET_SIZE`] the reply could not be sent at all: the
-/// send failed, the connection dropped, and the community became unjoinable
-/// with no error the user could see. History is paged instead — the client asks
-/// again with `since_seq` set to the last envelope it received.
-///
-/// A count alone does not bound a page, though: 200 envelopes of 64 KiB text
-/// are 12.8 MiB, well past the frame limit, so a page is also capped by its
-/// encoded size ([`HISTORY_PAGE_BYTES`]). See [`take_history_page`].
+/// Most envelopes in one `History` page; the client pages on with `since_seq`.
+/// Pages are also capped by [`HISTORY_PAGE_BYTES`] (see [`take_history_page`]).
 pub const MAX_HISTORY_BATCH: usize = 200;
 
-/// Bytes a Party frame adds around its serialized payload: the frame sequence
-/// carried inside the encryption, the AES-GCM nonce and the tag.
+/// Bytes a Party frame adds around its payload: sequence, nonce and tag.
 pub const PARTY_FRAME_OVERHEAD: usize =
     PARTY_SEQ_BYTES + crate::AES_NONCE_SIZE + crate::AES_GCM_TAG_SIZE;
 
-/// The largest serialized request or response that still fits in one frame
-/// ([`crate::MAX_PACKET_SIZE`] less [`PARTY_FRAME_OVERHEAD`]).
-///
-/// Anything larger cannot be sent at all: `send_packet` refuses it, and on the
-/// server a refused send ends the connection.
+/// The largest serialized request or response that fits in one frame; a
+/// larger one cannot be sent, and on the server that ends the connection.
 pub const MAX_PARTY_PAYLOAD_BYTES: usize = crate::MAX_PACKET_SIZE - PARTY_FRAME_OVERHEAD;
 
-/// Byte budget for the envelopes of one `History` page — half a frame, which
-/// leaves room for the response's own framing with a wide margin.
-///
-/// Pages used to be capped only by count, and one member posting about 130
-/// maximum-size messages was enough to make every page that covered them
-/// unsendable. Every client fetches history on join, and a reply that cannot
-/// be sent ends the connection, so the community became unjoinable for
-/// everyone, durably, until someone edited the database by hand.
+/// Byte budget for one `History` page's envelopes (half a frame). A count cap
+/// alone let ~130 max-size posts make every page unsendable, which ended every
+/// joining connection.
 pub const HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Text that stands in for an envelope too large to fit in any page.
-///
-/// Nothing the server accepts today is that large — text is capped at 64 KiB
-/// and file metadata at a few hundred bytes — but a database written by an
-/// older server may hold one, and the alternative to a placeholder is a page
-/// that can never be sent and a history nobody can page past.
+/// Stands in for an envelope too large for any page (only an older server's
+/// database can hold one), so history can still be paged past it.
 pub const OVERSIZED_ENVELOPE_TEXT: &str = "[this message is too large to deliver]";
 
 /// Encoded size of `value` on the wire (bincode), for byte budgets.
@@ -726,14 +600,10 @@ pub fn encoded_len<T: Serialize + ?Sized>(value: &T) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Build one `History` page from `envelopes` (ascending by seq, all after the
-/// requested `since_seq`): at most [`MAX_HISTORY_BATCH`] of them and at most
-/// [`HISTORY_PAGE_BYTES`] encoded, but always at least one when any remain, so
-/// paging can never stall.
-///
-/// An envelope that alone exceeds the budget is replaced by a placeholder with
-/// the same sequence number (see [`OVERSIZED_ENVELOPE_TEXT`]), so the client's
-/// next request starts after it.
+/// One `History` page from `envelopes` (ascending, after `since_seq`): at most
+/// [`MAX_HISTORY_BATCH`] and [`HISTORY_PAGE_BYTES`] encoded, but always at
+/// least one so paging never stalls. An envelope over the budget alone becomes
+/// an [`OVERSIZED_ENVELOPE_TEXT`] placeholder with the same seq.
 pub fn take_history_page<'a, I>(envelopes: I) -> Vec<Envelope>
 where
     I: IntoIterator<Item = &'a Envelope>,
@@ -761,16 +631,9 @@ where
     page
 }
 
-/// Whether the server may have more history after this page, so the client
-/// should ask again from its last seq.
-///
-/// A page is cut short either by count ([`MAX_HISTORY_BATCH`]) or by size
-/// ([`HISTORY_PAGE_BYTES`]). A page cut for size holds more than the budget
-/// less one envelope, and the largest envelope is tiny next to the budget, so
-/// "more than half the budget" recognises every such page. The cost of a false
-/// positive — a genuinely final page that happens to be large — is one empty
-/// reply; the cost of the old count-only test was that a client stopped
-/// paging at the first page the server had trimmed.
+/// Whether the client should ask again from its last seq. A page cut for size
+/// holds more than half the budget (envelopes are tiny next to it); a false
+/// positive costs one empty reply.
 pub fn history_page_may_continue(page: &[Envelope]) -> bool {
     page.len() >= MAX_HISTORY_BATCH
         || page
@@ -781,45 +644,33 @@ pub fn history_page_may_continue(page: &[Envelope]) -> bool {
 }
 
 impl PartyRequest {
-    /// Serialize to bytes for transport inside the encrypted tunnel.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).expect("PartyRequest serialization is infallible")
     }
 
-    /// Parse from transport bytes; returns `None` on malformed input.
-    ///
-    /// Trailing bytes are malformed input: see [`crate::util::decode_exact`].
+    /// Parse; `None` on malformed input, including trailing bytes
+    /// ([`crate::util::decode_exact`]).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         crate::util::decode_exact(bytes).ok()
     }
 }
 
 impl PartyResponse {
-    /// Serialize to bytes for transport inside the encrypted tunnel.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).expect("PartyResponse serialization is infallible")
     }
 
-    /// Parse from transport bytes; returns `None` on malformed input.
-    ///
-    /// Trailing bytes are malformed input: see [`crate::util::decode_exact`].
+    /// Parse; `None` on malformed input, including trailing bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         crate::util::decode_exact(bytes).ok()
     }
 }
 
-/// Width of the per-frame sequence number prefixed to every Party payload
-/// *inside* the encryption, so it is covered by the AEAD tag.
+/// Width of the per-frame sequence number, carried *inside* the encryption.
 const PARTY_SEQ_BYTES: usize = 8;
 
-/// Monotonic per-direction frame counter. One lives on each end of each
-/// direction of a Party tunnel.
-///
-/// Party frames used to carry nothing but the ciphertext, which meant an
-/// attacker positioned on the TCP stream could replay a captured frame — a
-/// `PostMessage`, or a server's `Message` broadcast — and both ends would
-/// accept it as new. The P2P message loop has enforced a per-session sequence
-/// against exactly this since v3; this brings the Party tunnel in line.
+/// Monotonic per-direction frame counter, so an on-path attacker cannot replay
+/// a captured frame (the P2P loop has enforced this since v3).
 #[derive(Debug, Default, Clone)]
 pub struct FrameSeq(u64);
 
@@ -833,8 +684,7 @@ impl FrameSeq {
         self.0
     }
 
-    /// Accept `seq` only if it advances the counter, rejecting replays and
-    /// reordering.
+    /// Accept `seq` only if it advances the counter.
     fn accept(&mut self, seq: u64) -> bool {
         if seq > self.0 {
             self.0 = seq;
@@ -845,10 +695,8 @@ impl FrameSeq {
     }
 }
 
-/// Send a serialized Party message over an established v3 tunnel: prefix the
-/// next frame sequence, encrypt the result with the session `cipher` (bound to
-/// `transport_aad`), and length-prefix it. Used by both the client and the
-/// server for every Party request/response.
+/// Send a Party message over a v3 tunnel: prefix the next frame sequence,
+/// encrypt with the session `cipher` (bound to `transport_aad`), length-prefix.
 pub async fn send_framed<S>(
     stream: &mut S,
     cipher: &AesCipher,
@@ -867,9 +715,8 @@ where
     Ok(())
 }
 
-/// Receive and decrypt the next Party message from an established v3 tunnel.
-/// Returns an error if the frame fails to authenticate/decrypt, or if its
-/// sequence number does not advance (a replayed or reordered frame).
+/// Receive and decrypt the next Party message, refusing a frame that fails to
+/// authenticate or whose sequence does not advance (replay/reorder).
 pub async fn recv_framed<S>(
     stream: &mut S,
     cipher: &AesCipher,
@@ -895,13 +742,18 @@ where
     Ok(body.to_vec())
 }
 
-/// Client-side handle to a Party server over an established Protocol v3 tunnel.
-///
-/// It completes the client handshake, then exposes `send`/`recv` over the encrypted
-/// channel. Responses are a single stream of [`PartyResponse`] — direct replies and
-/// pushed broadcasts interleaved — that the application correlates by variant. The
-/// future client UI (slice 4) drives this; the server's integration tests exercise
-/// it against the real `serve_connection`.
+async fn recv_response<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    cipher: &AesCipher,
+    transport_aad: &[u8],
+    seq: &mut FrameSeq,
+) -> anyhow::Result<PartyResponse> {
+    let bytes = recv_framed(stream, cipher, transport_aad, seq).await?;
+    PartyResponse::from_bytes(&bytes).ok_or_else(|| anyhow::anyhow!("malformed server response"))
+}
+
+/// Client-side handle to a Party server over an established v3 tunnel. Replies
+/// and pushed broadcasts arrive interleaved as one [`PartyResponse`] stream.
 pub struct PartyClient<S> {
     stream: S,
     server_fingerprint: String,
@@ -934,15 +786,13 @@ where
 {
     /// Receive the next message from the server (reply or pushed broadcast).
     pub async fn recv(&mut self) -> anyhow::Result<PartyResponse> {
-        let bytes = recv_framed(
+        recv_response(
             &mut self.rd,
             &self.cipher,
             &self.transport_aad,
             &mut self.recv_seq,
         )
-        .await?;
-        PartyResponse::from_bytes(&bytes)
-            .ok_or_else(|| anyhow::anyhow!("malformed server response"))
+        .await
     }
 }
 
@@ -950,7 +800,6 @@ impl<W> PartyWriter<W>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    /// Send a request to the server.
     pub async fn send(&mut self, req: &PartyRequest) -> anyhow::Result<()> {
         send_framed(
             &mut self.wr,
@@ -967,8 +816,8 @@ impl<S> PartyClient<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    /// Complete the client side of the v3 handshake against a Party server and
-    /// return a ready client. `chat_id` is this client's advertised session id.
+    /// Complete the client side of the v3 handshake; `chat_id` is this
+    /// client's advertised session id.
     pub async fn connect(
         mut stream: S,
         privkey: &RsaPrivateKey,
@@ -992,16 +841,13 @@ where
         &self.server_fingerprint
     }
 
-    /// The short authentication string for this tunnel (six digits + three
-    /// emoji), derived from the handshake transcript exactly as it is for a
-    /// peer-to-peer session. Shown to the user when a community server's
-    /// identity is being trusted for the first time.
+    /// The tunnel's short authentication string, derived from the transcript
+    /// as for a P2P session.
     pub fn sas(&self) -> &str {
         &self.sas
     }
 
-    /// Split into independent read and write halves so an application can run a
-    /// receive loop concurrently with sending requests.
+    /// Split into read and write halves for a concurrent receive loop.
     pub fn split(self) -> (PartyReader<ReadHalf<S>>, PartyWriter<WriteHalf<S>>) {
         let (rd, wr) = tokio::io::split(self.stream);
         (
@@ -1034,21 +880,17 @@ where
 
     /// Receive the next message from the server (a reply or a pushed broadcast).
     pub async fn recv(&mut self) -> anyhow::Result<PartyResponse> {
-        let bytes = recv_framed(
+        recv_response(
             &mut self.stream,
             &self.cipher,
             &self.transport_aad,
             &mut self.recv_seq,
         )
-        .await?;
-        PartyResponse::from_bytes(&bytes)
-            .ok_or_else(|| anyhow::anyhow!("malformed server response"))
+        .await
     }
 
-    /// Join the server with a username and the optional server password. The
-    /// `Joined`/`JoinRejected` reply arrives before any broadcast can reach this
-    /// connection (the server registers a connection for broadcasts only once it
-    /// has joined), so the next message is the join result.
+    /// Join with a username and optional password. The reply is the next
+    /// message: broadcasts reach a connection only once it has joined.
     pub async fn join(
         &mut self,
         username: &str,
@@ -1068,22 +910,32 @@ mod tests {
     use super::*;
     use crate::core::NonceRole;
 
-    /// A session key for a test: generated, because a test needs *a* key
-    /// shared by both ends, not a particular one.
-    fn test_key() -> [u8; 32] {
+    /// A Host/Client cipher pair over one random session key.
+    fn cipher_pair() -> (AesCipher, AesCipher) {
         let key: [u8; 32] = rand::random();
-        key
+        (
+            AesCipher::new_with_role(&key, NonceRole::Host).unwrap(),
+            AesCipher::new_with_role(&key, NonceRole::Client).unwrap(),
+        )
+    }
+
+    /// The exact bytes of one `ListMembers` frame sent with `cipher`.
+    async fn capture_frame(cipher: &AesCipher, aad: &[u8]) -> Vec<u8> {
+        let mut captured = Vec::new();
+        send_framed(
+            &mut captured,
+            cipher,
+            aad,
+            &mut FrameSeq::new(),
+            &PartyRequest::ListMembers.to_bytes(),
+        )
+        .await
+        .unwrap();
+        captured
     }
 
     fn sample_envelope() -> Envelope {
-        Envelope {
-            tier: TrustTier::Administered,
-            sender: Uuid::new_v4(),
-            channel: Uuid::new_v4(),
-            seq: 7,
-            timestamp: 1_700_000_000_000,
-            payload: MessagePayload::Text("hello channel".to_string()),
-        }
+        text_envelope(7, "hello channel".to_string())
     }
 
     #[test]
@@ -1152,13 +1004,8 @@ mod tests {
         );
     }
 
-    /// The incremental hasher and the one-shot function must agree, for every
-    /// chunking of the same bytes.
-    ///
-    /// If they ever diverged, a file's content address would depend on how it
-    /// happened to be uploaded — inline or chunked, and with which chunk
-    /// boundaries. Deduplication would silently stop working, and the same file
-    /// would be stored under two addresses.
+    /// The incremental and one-shot hashes must agree for every chunking, or a
+    /// file's address (and dedup) would depend on how it was uploaded.
     #[test]
     fn incremental_and_one_shot_hashing_agree() {
         let payload: Vec<u8> = (0..(64 * 1024 + 12345)).map(|i| (i % 251) as u8).collect();
@@ -1176,8 +1023,7 @@ mod tests {
             );
         }
 
-        // Empty input, and the fixed known answer, both hold through the
-        // incremental form too.
+        // Empty input and the known answer hold incrementally too.
         assert_eq!(BlobHasher::new().finish(), blob_hash(b""));
         let mut hasher = BlobHasher::new();
         hasher.update(b"hel");
@@ -1191,17 +1037,13 @@ mod tests {
     #[test]
     fn file_payload_envelope_roundtrips() {
         let env = Envelope {
-            tier: TrustTier::Administered,
-            sender: Uuid::new_v4(),
-            channel: Uuid::new_v4(),
-            seq: 7,
-            timestamp: 1234,
             payload: MessagePayload::File(FileMeta {
                 hash: blob_hash(b"data"),
                 name: "f.bin".to_string(),
                 size: 4,
                 mime: "application/octet-stream".to_string(),
             }),
+            ..text_envelope(7, String::new())
         };
         let bytes = bincode::serialize(&env).unwrap();
         assert_eq!(bincode::deserialize::<Envelope>(&bytes).unwrap(), env);
@@ -1288,9 +1130,7 @@ mod tests {
 
     #[tokio::test]
     async fn framed_message_roundtrips_over_a_tunnel() {
-        let key = test_key();
-        let cipher = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
-        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (cipher, peer) = cipher_pair();
         let aad = b"transport|party-test";
         let (mut a, mut b) = tokio::io::duplex(4096);
         let mut tx_seq = FrameSeq::new();
@@ -1306,43 +1146,22 @@ mod tests {
         let bytes = recv_framed(&mut b, &peer, aad, &mut rx_seq).await.unwrap();
         assert_eq!(PartyRequest::from_bytes(&bytes), Some(req));
 
-        // A frame decrypted under the wrong AAD must fail to authenticate.
-        send_framed(
-            &mut a,
-            &cipher,
-            aad,
-            &mut tx_seq,
-            &PartyRequest::ListMembers.to_bytes(),
-        )
-        .await
-        .unwrap();
+        // The wrong AAD must fail to authenticate.
+        let list = PartyRequest::ListMembers.to_bytes();
+        send_framed(&mut a, &cipher, aad, &mut tx_seq, &list)
+            .await
+            .unwrap();
         assert!(recv_framed(&mut b, &peer, b"wrong-aad", &mut rx_seq)
             .await
             .is_err());
     }
 
-    /// An attacker on the stream must not be able to make a captured frame
-    /// count twice — the P2P loop has enforced this per session since v3, and
-    /// the Party tunnel now does too.
+    /// A captured frame must not count twice.
     #[tokio::test]
     async fn a_replayed_party_frame_is_rejected() {
-        let key = test_key();
-        let cipher = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
-        let peer = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (cipher, peer) = cipher_pair();
         let aad = b"transport|replay-test";
-        let mut tx_seq = FrameSeq::new();
-
-        // Capture the exact bytes of one frame by writing into a buffer.
-        let mut captured: Vec<u8> = Vec::new();
-        send_framed(
-            &mut captured,
-            &cipher,
-            aad,
-            &mut tx_seq,
-            &PartyRequest::ListMembers.to_bytes(),
-        )
-        .await
-        .unwrap();
+        let captured = capture_frame(&cipher, aad).await;
 
         let mut rx_seq = FrameSeq::new();
         let mut once = captured.as_slice();
@@ -1350,7 +1169,7 @@ mod tests {
             .await
             .expect("the first delivery is accepted");
 
-        // Same bytes again: authenticates fine, but the sequence has not moved.
+        // Same bytes again: authenticates, but the sequence has not moved.
         let mut again = captured.as_slice();
         let err = recv_framed(&mut again, &peer, aad, &mut rx_seq)
             .await
@@ -1358,27 +1177,15 @@ mod tests {
         assert!(err.to_string().contains("replayed or out-of-order"));
     }
 
-    /// NET-01: both directions share a key, so a frame we sent, echoed back,
-    /// used to authenticate as the other side's.
+    /// NET-01: both directions share a key, so an echoed frame of ours used to
+    /// authenticate as the other side's.
     #[tokio::test]
     async fn a_reflected_party_frame_is_rejected() {
-        let key = test_key();
-        let ours = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let (ours, _) = cipher_pair();
         let aad = b"transport|reflect-test";
-        let mut tx_seq = FrameSeq::new();
-        let mut captured: Vec<u8> = Vec::new();
-        send_framed(
-            &mut captured,
-            &ours,
-            aad,
-            &mut tx_seq,
-            &PartyRequest::ListMembers.to_bytes(),
-        )
-        .await
-        .unwrap();
-        let mut rx_seq = FrameSeq::new();
+        let captured = capture_frame(&ours, aad).await;
         let mut echoed = captured.as_slice();
-        assert!(recv_framed(&mut echoed, &ours, aad, &mut rx_seq)
+        assert!(recv_framed(&mut echoed, &ours, aad, &mut FrameSeq::new())
             .await
             .is_err());
     }
@@ -1403,7 +1210,6 @@ mod tests {
         let client_priv = generate_rsa_keypair(RSA_KEY_BITS).unwrap();
         let (mut server_stream, client_stream) = tokio::io::duplex(1 << 16);
 
-        // Minimal server: handshake, then answer one ListMembers with an empty list.
         let server = tokio::spawn(async move {
             let tunnel = host_handshake(&mut server_stream, &server_priv, Uuid::new_v4())
                 .await
@@ -1437,8 +1243,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!client.server_fingerprint().is_empty());
-        // Both sides derive the same SAS from the transcript; the join screen
-        // shows it before any credential is sent.
+        // Shown on the join screen before any credential is sent.
         assert!(!client.sas().is_empty());
 
         let (mut reader, mut writer) = client.split();
@@ -1461,8 +1266,8 @@ mod tests {
         }
     }
 
-    /// 200 envelopes of 64 KiB text are 12.8 MiB — far past the frame limit.
-    /// A page must stop at the byte budget, make progress, and fit in a frame.
+    /// 200 × 64 KiB of text is 12.8 MiB: a page must stop at the byte budget,
+    /// make progress, and fit in a frame.
     #[test]
     fn a_history_page_is_bounded_by_bytes_as_well_as_count() {
         let all: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
@@ -1488,8 +1293,7 @@ mod tests {
         assert!(!history_page_may_continue(&small));
     }
 
-    /// An envelope too large for any page (only an old database can hold one)
-    /// becomes a placeholder at the same seq instead of stalling paging.
+    /// An envelope too large for any page becomes a placeholder at its seq.
     #[test]
     fn an_oversized_envelope_becomes_a_placeholder_rather_than_a_stuck_page() {
         let huge = text_envelope(7, "x".repeat(HISTORY_PAGE_BYTES + 1));
