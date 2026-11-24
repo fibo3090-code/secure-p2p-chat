@@ -116,7 +116,7 @@
 }
 .pop-menu button:hover { background: var(--s2); }
 .pop-menu button.is-danger { color: var(--error); }
-.pop-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+.pop-sep { height: 1px; margin: 4px 6px; padding: 0; border: 0; background: var(--border); }
 .pop-menu button.is-danger:hover { background: color-mix(in oklab, var(--error) 14%, transparent); }
 
 /* ---------- Toasts ---------- */
@@ -357,7 +357,7 @@ button.set-row:hover { border-color: var(--border-2); }
 .info-body .verify-advanced { text-align: left; }
 .info-body .verify-advanced summary { text-align: left; }
 .info-body .verify-advanced[open] { align-items: flex-start; }
-.info-actions { display: flex; flex-direction: column; border-radius: 14px; border: 1px solid var(--border); overflow: hidden; }
+.info-actions { display: flex; flex-direction: column; margin: 0; padding: 0; min-width: 0; border-radius: 14px; border: 1px solid var(--border); overflow: hidden; }
 .info-action { display: flex; align-items: center; gap: 11px; padding: 11px 14px; text-align: left; font-size: 13.5px;
   font-weight: 500; color: var(--text); background: var(--s1); transition: background .12s; }
 .info-action + .info-action { border-top: 1px solid var(--border); }

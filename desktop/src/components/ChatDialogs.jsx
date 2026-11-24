@@ -115,7 +115,7 @@ export function InfoDialog({ target, onClose, onRename, onDelete, myFingerprint 
             <p className="verify-hint">On their screen the two are swapped: their “You” must equal your “{target.name}”.</p>
           </details>
         )}
-        <div className="info-actions" role="group" aria-label="Conversation actions">
+        <fieldset className="info-actions" aria-label="Conversation actions">
           {fp && (
             <button className="info-action" onClick={() => navigator.clipboard?.writeText(fp)
               .then(() => toast("Fingerprint copied", "success"))
@@ -133,7 +133,7 @@ export function InfoDialog({ target, onClose, onRename, onDelete, myFingerprint 
               <Icon name="trash" size={16} /> {target.placeholder ? "Stop listening" : "Delete conversation"}
             </button>
           )}
-        </div>
+        </fieldset>
       </div>
     </Modal>
   );

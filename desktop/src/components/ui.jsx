@@ -287,6 +287,19 @@ export function Page({ title, sub, actions, wide, nav, children, bodyClass }) {
 /// instead of a row of look-alike icon buttons, where "block" (an ✕) sat next
 /// to "delete" (a bin) with nothing but a tooltip to tell them apart.
 /// `items`: `{ icon, label, onClick, danger, disabled }`, or `"sep"`.
+// Menu items with each "sep" turned into a separator keyed by the item before
+// it, so React keys stay stable when an item is added or removed (an index key
+// re-keys every separator after the change).
+function menuEntries(items) {
+  const out = [];
+  let prev = "start";
+  for (const it of items.filter(Boolean)) {
+    if (it === "sep") out.push({ sep: true, key: `sep-after-${prev}` });
+    else { out.push(it); prev = it.label; }
+  }
+  return out;
+}
+
 export function OverflowMenu({ label = "More actions", items }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -305,8 +318,8 @@ export function OverflowMenu({ label = "More actions", items }) {
       {open && (
         <div className="pop-menu" role="menu" onKeyDown={arrowNav('[role="menuitem"]')}
           ref={(el) => { if (el && !el.contains(document.activeElement)) el.querySelector('[role="menuitem"]')?.focus(); }}>
-          {items.filter(Boolean).map((it, i) => (it === "sep"
-            ? <div key={`sep${i}`} className="pop-sep" role="separator" />
+          {menuEntries(items).map((it) => (it.sep
+            ? <hr key={it.key} className="pop-sep" />
             : (
               <button key={it.label} role="menuitem" className={cx(it.danger && "is-danger")}
                 disabled={it.disabled}
