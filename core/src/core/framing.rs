@@ -149,18 +149,19 @@ mod tests {
     async fn test_framing_recv_reject_oversized_header() {
         let (mut client, mut server) = tokio::io::duplex(1024);
 
-        // A header claiming an oversized payload, with no body: recv must fail at once.
+        // A header claiming an oversized payload, with no body: recv must
+        // refuse it from the header alone. The writer stays open, so an
+        // implementation that waited for the body would hang (and time out)
+        // instead of passing on an end-of-stream error.
         let oversized_len = (MAX_PACKET_SIZE as u32 + 1).to_be_bytes();
+        client.write_all(&oversized_len).await.unwrap();
 
-        tokio::spawn(async move {
-            client.write_all(&oversized_len).await.ok();
-        });
-
-        let result = recv_packet(&mut server).await;
-        assert!(
-            result.is_err(),
-            "recv_packet should reject oversized header"
-        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), recv_packet(&mut server))
+            .await
+            .expect("recv_packet waited for the body of an oversized frame")
+            .expect_err("recv_packet should reject oversized header");
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+        drop(client);
     }
 
     #[tokio::test]
