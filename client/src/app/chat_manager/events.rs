@@ -4,6 +4,13 @@
 use super::*;
 
 impl ChatManager {
+    /// Feed one session event straight in, as the poll would. Lets the TUI's
+    /// own tests drive a held file offer without standing up a peer.
+    #[cfg(test)]
+    pub(crate) fn inject_session_event(&mut self, chat_id: Uuid, event: SessionEvent) {
+        self.handle_session_event(chat_id, event);
+    }
+
     /// Poll and process all pending session events
     pub fn poll_session_events(&mut self) {
         self.drain_finalized();

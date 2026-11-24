@@ -3029,6 +3029,145 @@ mod tests {
         }
     }
 
+    /// `:history-reset` is the way out of "history could not be read": the
+    /// unreadable file is renamed aside — byte for byte, never deleted — and
+    /// saving, which was refused while the load error stood, works again.
+    #[tokio::test]
+    async fn history_reset_keeps_the_unreadable_file_and_saving_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _data) = app();
+        app.history_path = dir.path().join("history.json.enc");
+        std::fs::write(&app.history_path, b"not a history").unwrap();
+        let key: [u8; 32] = rand::random();
+        app.chat_manager.set_history_key(key);
+        let _ = app.chat_manager.load_history_auto(&app.history_path, &key);
+        assert!(app.chat_manager.history_load_error().is_some());
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "After".into());
+
+        app.execute_command(TuiCommand::HistoryReset).await;
+
+        assert!(
+            last_toast(&app).contains("Old history kept as"),
+            "{}",
+            last_toast(&app)
+        );
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("unreadable"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the unreadable history was not kept");
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"not a history");
+        let mut reader = crate::app::ChatManager::default();
+        assert!(reader.load_history_auto(&app.history_path, &key).unwrap());
+        assert!(reader.chats.contains_key(&chat), "saving did not resume");
+    }
+
+    /// `:contact-connect` names the contact by number or name, refuses an
+    /// unknown or blocked one with the reason, and otherwise dials and opens
+    /// the conversation it lands in.
+    #[tokio::test]
+    async fn contact_connect_dials_the_named_contact() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::ContactConnect("nobody".into()))
+            .await;
+        assert!(last_toast(&app).contains("No contact 'nobody'"));
+
+        let blocked =
+            app.chat_manager
+                .add_contact("Mallory".into(), Some("127.0.0.1:1".into()), None, None);
+        app.chat_manager.block_contact(blocked).unwrap();
+        app.execute_command(TuiCommand::ContactConnect("Mallory".into()))
+            .await;
+        assert!(last_toast(&app).contains("blocked"), "{}", last_toast(&app));
+
+        // Something listening, so the dial is accepted.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        app.chat_manager
+            .add_contact("Bob".into(), Some(format!("127.0.0.1:{port}")), None, None);
+        app.execute_command(TuiCommand::ContactConnect("bob".into()))
+            .await;
+        assert!(
+            last_toast(&app).contains("Connecting to contact"),
+            "{}",
+            last_toast(&app)
+        );
+        let selected = app.selected_chat_id().expect("no conversation opened");
+        assert_eq!(
+            app.chat_manager
+                .contact_to_chat
+                .values()
+                .find(|c| **c == selected),
+            Some(&selected)
+        );
+    }
+
+    /// `:accept` and `:decline` act on a held file offer; with none waiting
+    /// they say so. `:send` needs a selected chat with a live session.
+    #[tokio::test]
+    async fn file_commands_act_on_the_offer_and_the_selected_chat() {
+        use crate::core::ProtocolMessage;
+        use crate::types::{MessageContent, SessionEvent};
+        let downloads = tempfile::tempdir().unwrap();
+        let (mut app, _data) = app();
+        app.chat_manager.config.download_dir = downloads.path().to_path_buf();
+        app.chat_manager.config.auto_accept_files = false;
+        app.execute_command(TuiCommand::AcceptFile).await;
+        assert!(last_toast(&app).contains("No incoming file"));
+
+        let chat = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat, "Peer".into());
+        for msg in [
+            ProtocolMessage::FileMeta {
+                filename: "held.txt".into(),
+                size: 4,
+                seq: 1,
+            },
+            ProtocolMessage::FileChunk {
+                chunk: b"data".to_vec(),
+                seq: 2,
+            },
+            ProtocolMessage::FileEnd { seq: 3 },
+        ] {
+            app.chat_manager
+                .inject_session_event(chat, SessionEvent::MessageReceived(msg));
+        }
+        app.execute_command(TuiCommand::AcceptFile).await;
+        // Finalizing runs off the manager; it lands on a later poll.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let landed = loop {
+            app.chat_manager.poll_session_events();
+            let found =
+                app.chat_manager.chats[&chat]
+                    .messages
+                    .iter()
+                    .find_map(|m| match &m.content {
+                        MessageContent::File { path: Some(p), .. } => Some(p.clone()),
+                        _ => None,
+                    });
+            if let Some(p) = found {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "the accepted file never landed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(std::fs::read(landed).unwrap(), b"data");
+
+        app.chat_manager.toasts.clear();
+        app.select_chat(chat);
+        app.execute_command(TuiCommand::Send("/no/such/file".into()))
+            .await;
+        assert!(
+            last_toast(&app).contains("Send file failed"),
+            "{}",
+            last_toast(&app)
+        );
+    }
+
     /// TUI-25: raw mode swallows SIGINT and no key handled Ctrl+C, so the
     /// universal way out of a terminal program did nothing at all. It asks to
     /// quit from anywhere — the composer included, where it used to be lost —
