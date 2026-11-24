@@ -229,12 +229,17 @@ pub(crate) fn my_identity(state: tauri::State<'_, Bridge>) -> AuthStatus {
 
 /// Change the identity's display name (used in invite links and the UI) and
 /// persist it. The key material and fingerprint are untouched.
+///
+/// Takes `AUTH_OP` like the password commands: `change_password` re-wraps a
+/// copy and swaps it in at the end, so a rename landing in between was put
+/// back, in memory and on disk (TAURI-17).
 #[tauri::command]
-pub(crate) fn set_display_name(
+pub(crate) async fn set_display_name(
     name: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<AuthStatus, String> {
     ensure_ready(&state)?;
+    let _auth = AUTH_OP.lock().await;
     {
         let mut id = crate::lock_identity(&state.identity);
         id.set_name(&name).map_err(|e| e.to_string())?;

@@ -13,7 +13,7 @@ use std::path::Path;
 /// password is never stored) so it survives restarts: the UI offers one-click
 /// rejoin, and the pinned server fingerprint turns the first join's TOFU into a
 /// real trust anchor — a different identity at the same address is refused.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedParty {
     pub address: String,
     pub username: String,
@@ -102,4 +102,95 @@ pub fn upsert_saved_party(path: &Path, entry: SavedParty) {
         None => list.push(entry),
     }
     save_saved_parties(path, &list);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn party(address: &str, username: &str, fingerprint: &str) -> SavedParty {
+        SavedParty {
+            address: address.to_string(),
+            username: username.to_string(),
+            name: String::new(),
+            fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    /// A first run has no file, and an empty one is the same: no communities.
+    #[test]
+    fn a_missing_or_empty_file_is_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parties.json");
+        assert!(load_saved_parties(&path).unwrap().is_empty());
+        std::fs::write(&path, " \n").unwrap();
+        assert!(load_saved_parties(&path).unwrap().is_empty());
+    }
+
+    /// The file holds every community's pin. A damaged or unreadable one
+    /// stops the join — and, above all, is never rewritten from an empty list,
+    /// which would destroy the pins of every other community.
+    #[test]
+    fn a_damaged_file_is_an_error_and_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parties.json");
+        let damaged = br#"[{"address":"a.example:9000","username":"me","fingerprint":"AB"#;
+        std::fs::write(&path, damaged).unwrap();
+        let err = load_saved_parties(&path).unwrap_err();
+        assert!(err.contains("damaged"), "{err}");
+
+        upsert_saved_party(&path, party("b.example:9000", "me", "CD"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "a failed load was followed by a rewrite that dropped the pins"
+        );
+
+        // Unreadable (a directory where the file should be) is refused too.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let err = load_saved_parties(&blocked).unwrap_err();
+        assert!(err.contains("Could not read"), "{err}");
+    }
+
+    /// Rejoining updates the entry for that address — matched without regard
+    /// to case — and an update that carries no fingerprint or name keeps the
+    /// ones on file: a pin is never cleared by a later, emptier write. Other
+    /// communities are untouched.
+    #[test]
+    fn upserting_updates_one_entry_and_never_clears_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parties.json");
+        upsert_saved_party(
+            &path,
+            SavedParty {
+                name: "Club".into(),
+                ..party("Chat.Example:9000", "alice", "PIN-ONE")
+            },
+        );
+        upsert_saved_party(&path, party("other.example:9000", "alice", "PIN-TWO"));
+        upsert_saved_party(&path, party("chat.example:9000", "alice2", ""));
+
+        let list = load_saved_parties(&path).unwrap();
+        assert_eq!(
+            list.len(),
+            2,
+            "the case-insensitive match added a duplicate"
+        );
+        let club = list
+            .iter()
+            .find(|p| p.fingerprint == "PIN-ONE")
+            .expect("pin cleared");
+        assert_eq!(club.username, "alice2");
+        assert_eq!(club.name, "Club");
+        assert!(list.iter().any(|p| p.fingerprint == "PIN-TWO"));
+
+        // Owner-only, like identity.json.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
 }

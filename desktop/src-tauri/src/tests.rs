@@ -535,6 +535,53 @@ fn unlock_tells_a_damaged_identity_from_a_wrong_password() {
     assert!(!err.contains("Wrong password"), "{err}");
 }
 
+/// TAURI-17: `change_password` re-wraps a *copy* of the identity (Argon2,
+/// off the lock) and swaps it in at the end — so a display name changed
+/// while it ran was silently put back, in memory and on disk. Renaming waits
+/// for the password change instead.
+#[test]
+fn a_rename_during_a_password_change_is_kept() {
+    let h = ready_harness();
+    let webview = h.webview.clone();
+    let renamer = std::thread::spawn(move || {
+        // Land inside the password change's Argon2 window.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        tauri::test::get_ipc_response(
+            &webview,
+            InvokeRequest {
+                cmd: "set_display_name".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: LOCAL_ORIGIN.parse().unwrap(),
+                body: InvokeBody::Json(json!({ "name": "Renamed Midway" })),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    });
+    h.ipc(
+        "change_password",
+        json!({ "current": "bridge-test-passphrase", "new": "bridge-test-passphrase-2" }),
+    )
+    .expect("change_password");
+    renamer.join().unwrap().expect("rename");
+
+    assert_eq!(
+        crate::lock_identity(&h.bridge().identity).name,
+        "Renamed Midway",
+        "the password change put the old name back"
+    );
+    let on_disk = Identity::load(&h._dir.path().join("identity.json")).unwrap();
+    assert_eq!(on_disk.name, "Renamed Midway");
+    // And the new password is what opens the file.
+    let mut check = on_disk;
+    check
+        .decrypt("bridge-test-passphrase-2")
+        .expect("new password");
+}
+
 // ── Invoke-key contract with bridge.js ──────────────────────────────────────
 
 /// Every argument-taking command, called with the exact payload keys
