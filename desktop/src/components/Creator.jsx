@@ -219,9 +219,9 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
   return (
     <Modal open={open} onClose={onClose} width={480} title="New connection" icon="plus"
       sub="Start an end-to-end encrypted conversation">
-      <div className="seg" role="tablist" aria-label="How to connect">
+      <div className="seg" role="group" aria-label="What to do">
         {MODES.map((m) => (
-          <button key={m.id} role="tab" aria-selected={mode === m.id} className={cx("seg-btn", mode === m.id && "is-active")}
+          <button key={m.id} aria-pressed={mode === m.id} className={cx("seg-btn", mode === m.id && "is-active")}
             onClick={() => { setMode(m.id); reset(); }}>
             <Icon name={m.icon} size={15} />{m.label}
           </button>
@@ -246,7 +246,7 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
           )}
           <div className="field">
             <label className="field-label" htmlFor="cr-addr">Their address</label>
-            <Input id="cr-addr" mono value={addr} autoFocus placeholder="192.168.1.20:12345"
+            <Input id="cr-addr" value={addr} autoFocus placeholder="192.168.1.20:12345"
               onChange={(e) => setAddr(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && connect()} />
           </div>
@@ -261,10 +261,10 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
 
       {mode === "connect" && viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead">Use the relay and token the other person shared with you.</p>
+          <p className="creator-lead">Use the relay and token the other person shared with you. The relay can't read your messages, but it sees both IP addresses and when you talk.</p>
           <div className="field">
             <label className="field-label" htmlFor="cr-relay">Relay address</label>
-            <Input id="cr-relay" mono value={relay} autoFocus placeholder="relay.example.com:9000"
+            <Input id="cr-relay" value={relay} autoFocus placeholder="relay.example.com:9000"
               onChange={(e) => setRelay(e.target.value)} />
           </div>
           <div className="field">
@@ -282,7 +282,7 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
           <div className="field-grid is-port">
             <div className="field">
               <label className="field-label" htmlFor="cr-port">Port</label>
-              <Input id="cr-port" mono value={port} onChange={(e) => setPort(e.target.value)} inputMode="numeric" />
+              <Input id="cr-port" value={port} onChange={(e) => setPort(e.target.value)} inputMode="numeric" />
             </div>
             <div className="field">
               <label className="field-label" htmlFor="cr-hpass">Require a password <span className="field-opt">optional</span></label>
@@ -307,10 +307,10 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
 
       {mode === "host" && viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead">No port forwarding needed: the relay brokers the connection. You'll get a token to share.</p>
+          <p className="creator-lead">No port forwarding needed: the relay brokers the connection and gives you a token to share. It can't read your messages, but it sees both IP addresses and when you talk.</p>
           <div className="field">
             <label className="field-label" htmlFor="cr-hrelay">Relay address</label>
-            <Input id="cr-hrelay" mono value={relay} autoFocus placeholder="relay.example.com:9000"
+            <Input id="cr-hrelay" value={relay} autoFocus placeholder="relay.example.com:9000"
               onChange={(e) => setRelay(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && relayHost()} />
           </div>

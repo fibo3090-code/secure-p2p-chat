@@ -271,7 +271,14 @@ function makeMock() {
     connected: !!connected[c.id], placeholder: c.is_host_placeholder,
     verified: !!c.peer_fingerprint,
     messages: c.messages.length,
-    unread: c.messages.slice(readMarks[c.id] ?? 0).filter((m) => !m.from_me).length,
+    // Mirrors `Chat::unread_count`: trailing peer messages past the read mark,
+    // so a thread that ends with your own reply never badges.
+    unread: (() => {
+      const after = c.messages.slice(readMarks[c.id] ?? 0);
+      let n = 0;
+      for (let i = after.length - 1; i >= 0 && !after[i].from_me; i--) n++;
+      return n;
+    })(),
     last_at: c.messages.length ? c.messages.at(-1).timestamp : null,
   }));
   const ok = async () => {};

@@ -4,7 +4,7 @@ import { memo, useCallback, useMemo, useRef, useEffect, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { api, fmtDay, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
-import { cx, Avatar, IconButton, Button, Modal } from "./ui.jsx";
+import { cx, Avatar, IconButton, Button, Modal, arrowNav } from "./ui.jsx";
 import { fileKind, splitName } from "../lib/fileKind.js";
 import { Logo } from "./Logo.jsx";
 
@@ -60,7 +60,8 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
         <IconButton name="more" label="More actions" active={open} aria-haspopup="menu" aria-expanded={open}
           onClick={() => setOpen((o) => !o)} />
         {open && (
-          <div className="pop-menu" role="menu">
+          <div className="pop-menu" role="menu" onKeyDown={arrowNav('[role="menuitem"]')}
+            ref={(el) => { if (el && !el.contains(document.activeElement)) el.querySelector('[role="menuitem"]')?.focus(); }}>
             {!isPlaceholder && (
               <button role="menuitem" onClick={item(onVerify)}><Icon name="fingerprint" size={15} /> Verify safety code</button>
             )}
@@ -169,7 +170,7 @@ export function rowStatusLabel(c) {
 // and the default shallow compare would never hit. Comparing the fields the row
 // actually renders is what stops an idle poll from re-rendering the whole list.
 function convRowsEqual(a, b) {
-  if (a.onSelect !== b.onSelect || a.active !== b.active || a.paused !== b.paused) return false;
+  if (a.onSelect !== b.onSelect || a.active !== b.active || a.paused !== b.paused || a.tabStop !== b.tabStop) return false;
   const x = a.c;
   const y = b.c;
   return (
@@ -180,7 +181,7 @@ function convRowsEqual(a, b) {
   );
 }
 
-const ConvRow = memo(function ConvRow({ c, active, onSelect, paused }) {
+const ConvRow = memo(function ConvRow({ c, active, onSelect, paused, tabStop = true }) {
   const status = rowStatusLabel(c);
   const hosting = c.state === "hosting";
   return (
@@ -188,6 +189,7 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect, paused }) {
       className={cx("conv-row", active && "is-active", c.unread > 0 && "has-unread")}
       role="option"
       aria-selected={active}
+      tabIndex={tabStop ? 0 : -1}
       aria-label={`${c.name}. ${status}`}
       onClick={() => onSelect(c.id)}
     >
@@ -199,9 +201,6 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect, paused }) {
           {/* aria-hidden: every marker here is repeated in the row's aria-label
               above, in words. Leaving them exposed makes a reader announce a
               bare glyph after the name. */}
-          {c.trust === "verified" && !hosting && (
-            <span className="conv-verified" aria-hidden="true" title="Verified"><Icon name="shieldCheck" size={13} /></span>
-          )}
           <span className="conv-time">{c.lastT}</span>
         </div>
         <div className="conv-line2">
@@ -220,9 +219,6 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect, paused }) {
             {/* Only a real peer can be unverified. A listener with nobody on
                 the other end used to wear the same warning, and a warning that
                 shows up where nothing is wrong is one people learn to skip. */}
-            {c.trust === "unverified" && !hosting && (
-              <span className="marker-warn" title="Not verified"><Icon name="shieldAlert" size={13} /></span>
-            )}
             {c.unread > 0 && <span className="conv-unread">{c.unread > 99 ? "99+" : c.unread}</span>}
           </span>
         </div>
@@ -231,7 +227,7 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect, paused }) {
   );
 }, convRowsEqual);
 
-export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery, connectedCount = 0, gateClosed = false }) {
+export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery, connectedCount = 0, gateClosed = false, status }) {
   const filtered = useMemo(
     () => contacts.filter((c) => c.name.toLowerCase().includes(query.toLowerCase())),
     [contacts, query],
@@ -247,11 +243,13 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery,
       <div className="conv-head">
         <div className="conv-head-txt">
           <h1 className="conv-title">Chats</h1>
-          <span className="conv-sub">
-            {connectedCount > 0
-              ? <><span className="conv-sub-dot" aria-hidden="true" />{connectedCount} connected</>
-              : "Nobody connected"}
-          </span>
+          {status || (
+            <span className="conv-sub">
+              {connectedCount > 0
+                ? <><span className="conv-sub-dot" aria-hidden="true" />{connectedCount} connected</>
+                : "Nobody connected"}
+            </span>
+          )}
         </div>
         <button className="conv-add" onClick={onAdd} title="New connection" aria-label="New connection">
           <Icon name="compose" size={17} />
@@ -268,9 +266,10 @@ export function ConvList({ contacts, activeId, onSelect, onAdd, query, setQuery,
       {/* listbox/option: the rows are a single-select list of conversations,
           not a run of unrelated buttons, so a reader announces "3 of 12"
           instead of leaving the user to count. */}
-      <div className="conv-scroll" role="listbox" aria-label="Conversations">
-        {filtered.map((c) => (
-          <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} paused={gateClosed} />
+      <div className="conv-scroll" role="listbox" aria-label="Conversations" onKeyDown={arrowNav('[role="option"]')}>
+        {filtered.map((c, i) => (
+          <ConvRow key={c.id} c={c} active={activeId === c.id} onSelect={onSelect} paused={gateClosed}
+            tabStop={activeId ? activeId === c.id : i === 0} />
         ))}
         {filtered.length === 0 && (
           <div className="conv-empty">
@@ -299,7 +298,7 @@ function Receipt({ delivered }) {
     : <span className="msg-receipt" title="Sent"><Icon name="check" size={14} /><span className="sr-only">Sent</span></span>;
 }
 
-function MessageItemInner({ m, preview, onOpen, onReveal, pos = "single" }) {
+function MessageItemInner({ m, preview, onOpen, onReveal, pos = "single", peerName }) {
   if (m.kind === "system") {
     return (
       <div className={cx("sys-msg", m.warn && "is-warn", m.ok && "is-ok")}>
@@ -334,6 +333,7 @@ function MessageItemInner({ m, preview, onOpen, onReveal, pos = "single" }) {
               <img src={preview} alt={m.name} loading="lazy" />
             </button>
           )}
+          <span className="sr-only">{mine ? "You sent a file: " : `${peerName || "They"} sent a file: `}</span>
           <div className="file-card-row">
             <button className="file-ic" onClick={open} disabled={!canOpen}
               aria-label={canOpen ? `Open ${m.name}` : m.name}
@@ -375,6 +375,8 @@ function MessageItemInner({ m, preview, onOpen, onReveal, pos = "single" }) {
     <div className={cx("msg-row", mine ? "is-mine" : "is-them", "pos-" + pos)}>
       <div className="msg-bubble">
         {m.author && !mine && <span className="msg-author">{m.author}</span>}
+        {/* Left/right is a visual cue only; say who wrote it. */}
+        <span className="sr-only">{mine ? "You: " : `${m.author || peerName || "Them"}: `}</span>
         <span className="msg-text"><LinkifiedText text={m.text} /></span>
         {/* The spacer reserves room for the timestamp on the last line, so
             short messages keep it inline and long ones never run under it. */}
@@ -394,7 +396,8 @@ function MessageItemInner({ m, preview, onOpen, onReveal, pos = "single" }) {
 // row, several times a second, for the entire time the app was open. Comparing
 // the fields a row actually renders makes an idle tick cost nothing.
 function messagesEqual(a, b) {
-  if (a.preview !== b.preview || a.onOpen !== b.onOpen || a.onReveal !== b.onReveal || a.pos !== b.pos) return false;
+  if (a.preview !== b.preview || a.onOpen !== b.onOpen || a.onReveal !== b.onReveal || a.pos !== b.pos ||
+      a.peerName !== b.peerName) return false;
   const x = a.m;
   const y = b.m;
   return (
@@ -446,6 +449,7 @@ function TransferBar({ transfers, onAccept, onDecline, onCancel }) {
             <button
               className="transfer-cancel"
               title="Cancel transfer"
+              aria-label={`Cancel transfer of ${t.filename}`}
               onClick={() => onCancel && onCancel(t.id)}
             >
               <Icon name="x" size={12} />
@@ -573,9 +577,26 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
     setPreviews({});
     requested.current = new Set();
   }, [contactId]);
+  // Follow the thread only when the reader is already at the bottom. Yanking
+  // someone reading history down to every new arrival loses their place; a
+  // pill says something arrived instead.
+  const atBottom = useRef(true);
+  const [newBelow, setNewBelow] = useState(false);
+  const toBottom = () => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    setNewBelow(false);
+  };
+  useEffect(() => { atBottom.current = true; toBottom(); }, [contactId]);
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [contactId, messageCount]);
+    if (atBottom.current) toBottom(); else setNewBelow(true);
+  }, [messageCount]);
+  const onThreadScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (atBottom.current) setNewBelow(false);
+  };
   // Which file cards are currently previewable. Keying the effect on this —
   // rather than on the message count — means a card that becomes eligible
   // without the thread growing (it gains a path, or finishes) still gets its
@@ -643,6 +664,13 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   const online = contact ? contact.state === "connected" : false;
   const hosting = contact ? contact.state === "hosting" : false;
   const canRedial = !!(reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked");
+  const [redial, setRedial] = useState({ busy: false, failed: "" });
+  useEffect(() => { setRedial({ busy: false, failed: "" }); }, [contactId]);
+  const doReconnect = async () => {
+    setRedial({ busy: true, failed: "" });
+    try { await onReconnect(contact); setRedial({ busy: false, failed: "" }); }
+    catch (e) { setRedial({ busy: false, failed: friendlyError(e) }); }
+  };
   const copyInvite = () => api.myInviteLink()
     .then((l) => navigator.clipboard?.writeText(l))
     .then(() => toast("Invite link copied", "success"))
@@ -739,12 +767,16 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               <span className={"chat-state state-txt-" + contact.state}>{STATE_LABEL[contact.state]}</span>
               {!hosting && (
                 <>
-                  <span className="chat-dot" aria-hidden="true">·</span>
-                  <span>{TRANSPORT_WORD[contact.transport] || TRANSPORT_WORD.direct}</span>
+                  {contact.transport && contact.transport !== "direct" && (
+                    <>
+                      <span className="chat-dot" aria-hidden="true">·</span>
+                      <span>{TRANSPORT_WORD[contact.transport]}</span>
+                    </>
+                  )}
                   <span className="chat-dot" aria-hidden="true">·</span>
                   <button className={cx("chat-trust", contact.trust === "verified" ? "is-ok" : "is-pending")}
                     onClick={() => onVerify && onVerify(contact)}
-                    title={contact.trust === "verified" ? "Show the safety code" : "Compare safety codes to verify this contact"}>
+                    title={contact.trust === "verified" ? "Show fingerprints" : "How to verify this contact"}>
                     <Icon name={contact.trust === "verified" ? "shieldCheck" : "shieldAlert"} size={13} />
                     {contact.trust === "verified" ? "Verified" : "Not verified"}
                   </button>
@@ -756,7 +788,10 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         <ChatMenu contact={contact} onVerify={onVerify} onRename={onRename} onDelete={onDelete} onInfo={onInfo} />
       </header>
 
-      <div className="chat-scroll" ref={scrollRef}>
+      {/* A log: a screen reader announces arrivals in the open conversation,
+          and the region is focusable so the keyboard can scroll history. */}
+      <div className="chat-scroll" ref={scrollRef} role="log" aria-live="polite"
+        aria-label={`Messages with ${contact.name}`} tabIndex={0} onScroll={onThreadScroll}>
         {hosting && <HostingCard paused={gateClosed} onStop={onDelete ? () => onDelete(contact) : null} />}
         <div className="chat-thread" hidden={hosting && contact.messages.length === 0}>
           {!hosting && (
@@ -767,7 +802,7 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               onClick={() => onVerify && onVerify(contact)}>
               <Icon name="lock" size={13} />
               <span>
-                End-to-end encrypted{contact.transport === "relay" ? " — the relay only sees encrypted bytes" : ""}.{" "}
+                End-to-end encrypted{contact.transport === "relay" ? " — the relay can't read messages, but sees both IP addresses" : ""}.{" "}
                 {contact.trust === "verified"
                   ? <span className="e2e-ok">Safety code verified.</span>
                   : online
@@ -792,12 +827,18 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
                   <span>{sep}</span>
                 </div>
               )}
-              <MessageItem m={m} preview={m.id ? previews[m.id] : null} pos={pos}
+              <MessageItem m={m} preview={m.id ? previews[m.id] : null} pos={pos} peerName={contact.name}
                 onOpen={openFile} onReveal={revealFile} />
             </div>
           ))}
         </div>
       </div>
+
+      {newBelow && (
+        <button className="new-below" onClick={toBottom}>
+          <Icon name="arrowDown" size={14} /> New messages
+        </button>
+      )}
 
       <TransferBar transfers={transfers} onAccept={onAcceptTransfer} onDecline={onDeclineTransfer} onCancel={onCancelTransfer} />
 
@@ -806,17 +847,28 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         // ending in the one thing that helps: dial them back, or (with no saved
         // address) hand them a way to dial you.
         <div className="composer">
-          <div className="composer-notice" role="status">
+          <div className={cx("composer-notice", redial.failed && "is-failed")} role="status">
             <span className="composer-notice-txt">
               {contact.state === "connecting"
                 ? OFFLINE_NOTICE.connecting
-                : canRedial
-                  ? `${contact.name} is offline. You can write again once you're connected.`
-                  : `${contact.name} is offline and there's no saved address to reach them. Send them your invite link so they can connect to you.`}
+                : redial.failed
+                  ? <>Couldn't reach {contact.name}{reconnectContact?.address ? ` at ${reconnectContact.address}` : ""}. They need P2PEM open and accepting new peers — or send them your invite link. <span className="composer-notice-why">({redial.failed})</span></>
+                  : canRedial
+                    ? `${contact.name} is offline. You can write again once you're connected.`
+                    : `${contact.name} is offline and there's no saved address to reach them. Send them your invite link so they can connect to you.`}
             </span>
-            {contact.state !== "connecting" && (canRedial
-              ? <Button size="sm" icon="refresh" onClick={() => onReconnect && onReconnect(contact)}>Reconnect</Button>
-              : <Button size="sm" variant="ghost" icon="link" onClick={copyInvite}>Copy invite link</Button>)}
+            {contact.state !== "connecting" && (
+              <span className="composer-notice-actions">
+                {canRedial && (
+                  <Button size="sm" icon="refresh" disabled={redial.busy} onClick={doReconnect}>
+                    {redial.busy ? "Connecting…" : redial.failed ? "Try again" : "Reconnect"}
+                  </Button>
+                )}
+                {(!canRedial || redial.failed) && (
+                  <Button size="sm" variant="ghost" icon="link" onClick={copyInvite}>Copy invite link</Button>
+                )}
+              </span>
+            )}
           </div>
         </div>
       )}

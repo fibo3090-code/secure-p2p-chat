@@ -75,6 +75,19 @@ describe("ConvList", () => {
     expect(options[0].getAttribute("aria-selected")).toBe("false");
   });
 
+  it("moves between rows with the arrow keys, as a listbox promises", async () => {
+    render(<ConvList contacts={rows} activeId="a" onSelect={() => {}} onAdd={() => {}} query="" setQuery={() => {}} />);
+    const [alice, bob] = screen.getAllByRole("option");
+    // One tab stop for the whole list: the selected row.
+    expect(alice.tabIndex).toBe(0);
+    expect(bob.tabIndex).toBe(-1);
+    alice.focus();
+    await userEvent.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(bob);
+    await userEvent.keyboard("{Home}");
+    expect(document.activeElement).toBe(alice);
+  });
+
   it("announces the unread total in a live region", () => {
     render(<ConvList contacts={rows} activeId={null} onSelect={() => {}} onAdd={() => {}} query="" setQuery={() => {}} />);
     expect(screen.getByRole("status").textContent).toBe("2 unread messages");
@@ -121,6 +134,16 @@ describe("ChatPane composer", () => {
     // With no saved contact behind it, there is nothing to redial — so no
     // Reconnect button that could only fail; the way out is the invite link.
     expect(screen.queryByRole("button", { name: /Reconnect/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Copy invite link/ })).toBeTruthy();
+  });
+
+  it("says why a reconnect failed and offers the invite link as the way out", async () => {
+    const onReconnect = vi.fn(async () => { throw new Error("connection refused"); });
+    render(<ChatPane {...base} contact={contactFixture({ state: "offline", messages: [] })}
+      reconnectContact={{ id: "k1", reachable: true, trust: "verified", address: "10.0.0.5:12345" }} onReconnect={onReconnect} />);
+    await userEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+    expect(await screen.findByText(/Couldn't reach .* at 10\.0\.0\.5:12345/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Try again/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Copy invite link/ })).toBeTruthy();
   });
 
@@ -197,7 +220,7 @@ describe("ChatPane transfers", () => {
       <ChatPane {...base} contact={contactFixture()} onCancelTransfer={onCancel}
         transfers={[{ id: "t1", direction: "outgoing", status: "active", filename: "x", size: 10, received: 2, cancellable: true }]} />,
     );
-    await userEvent.click(screen.getByRole("button", { name: "Cancel transfer" }));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel transfer of x" }));
     expect(onCancel).toHaveBeenCalledWith("t1");
   });
 });

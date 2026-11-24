@@ -5,6 +5,7 @@ import { Icon } from "./lib/Icon.jsx";
 import { Logo } from "./components/Logo.jsx";
 import { cx, Avatar } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
+import { Reachability } from "./components/Reachability.jsx";
 import { BootScreen, LockScreen, SetPasswordScreen, BackupPrompt } from "./components/Onboarding.jsx";
 import { Creator } from "./components/Creator.jsx";
 import { Verify } from "./components/Verify.jsx";
@@ -17,6 +18,7 @@ import { HistoryBanner } from "./components/HistoryBanner.jsx";
 import { RenameDialog, ConfirmDelete, InfoDialog } from "./components/ChatDialogs.jsx";
 import { toast } from "./lib/toast.js";
 import { loadTheme, saveTheme } from "./lib/themes.js";
+import { loadTextSize, saveTextSize, applyTextSize } from "./lib/textSize.js";
 
 function RailBtn({ icon, label, active, onClick, badge }) {
   // The badge is a bare number next to an icon, so a reader announced "Chats"
@@ -84,6 +86,9 @@ export default function App() {
   const [visible, setVisible] = useState(true);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
+  const [textSize, setTextSizeState] = useState(loadTextSize());
+  const setTextSize = useCallback((id) => { setTextSizeState(id); saveTextSize(id); }, []);
+  useEffect(() => { applyTextSize(textSize); }, [textSize]);
   const openCreator = useCallback((mode = "connect", relay = false) => {
     setCreatorMode(mode);
     setCreatorRelay(relay);
@@ -256,7 +261,7 @@ export default function App() {
     }} />;
   }
   if (auth.state === "set_password") {
-    return <SetPasswordScreen fingerprint={auth.fingerprint} minLength={auth.min_password_len}
+    return <SetPasswordScreen minLength={auth.min_password_len}
       onSet={async (pw) => {
         try {
           await api.setPassword(pw);
@@ -275,6 +280,10 @@ export default function App() {
   }
 
   const contacts = convs.map(summaryToConv);
+  // Listeners are a state of the app, not people: they live in the
+  // reachability status, not among the conversations.
+  const listRows = contacts.filter((c) => !c.placeholder);
+  const listeners = contacts.filter((c) => c.placeholder);
   const connCount = convs.filter((c) => c.connected).length;
 
   async function openConv(id) {
@@ -325,14 +334,13 @@ export default function App() {
       || null;
   }
 
+  // Throws on failure: the offline strip shows what went wrong and what the
+  // other person needs to do, instead of a toast that disappears.
   async function reconnect(c) {
     const k = contactFor(c);
     if (!k) return;
-    try {
-      await api.connectContact(k.id);
-      toast(`Connecting to ${c.name}…`, "info");
-      refresh();
-    } catch (e) { toast(friendlyError(e), "error"); }
+    await api.connectContact(k.id);
+    refresh();
   }
 
   async function sendFile(c) {
@@ -367,7 +375,6 @@ export default function App() {
       {nav === "chats" && activeId && (
         <a className="skip-link" href="#composer-input">Skip to message box</a>
       )}
-      <div className="hex-bg" />
       {historyIssue && (
         <HistoryBanner issue={historyIssue} onSetAside={async () => {
           const moved = await api.setAsideHistory();
@@ -398,22 +405,6 @@ export default function App() {
             <RailBtn icon="settings" label="Settings" active={nav === "settings"} onClick={() => setNav("settings")} />
           </div>
           <div className="rail-foot">
-            {/* The peer gate. It used to be a bare padlock in the title bar,
-                which read as "the app is unlocked" or "not encrypted" — the
-                opposite of what it does. It says what it does, in words. */}
-            <button className={cx("rail-btn", "rail-gate", locked && "is-closed")}
-              role="switch" aria-checked={!locked}
-              aria-label={locked ? "New peers: closed. Activate to accept new peers again." : "New peers: open. Activate to refuse new peers."}
-              title={locked
-                ? "Closed to new peers — nobody new can connect. Existing conversations keep working."
-                : "Open to new peers — anyone with your address or invite can ask to connect."}
-              onClick={async () => {
-                try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Closed to new peers" : "Open to new peers", "info"); }
-                catch (e) { toast(friendlyError(e), "error"); }
-              }}>
-              <Icon name={locked ? "ban" : "radio"} size={19} />
-              <span className="rail-label">{locked ? "Closed" : "Accepting"}</span>
-            </button>
             <button className="rail-id"
               title={`${auth.name} — open your identity settings`}
               aria-label={`${auth.name} — open your identity settings`}
@@ -426,9 +417,25 @@ export default function App() {
         {nav === "chats" && (
           <>
             <aside className="col-list">
-              <ConvList contacts={contacts} activeId={activeId} onSelect={openConv}
+              <ConvList contacts={listRows} activeId={activeId} onSelect={openConv}
                 onAdd={() => openCreator()} query={query} setQuery={setQuery}
-                connectedCount={connCount} gateClosed={locked} />
+                connectedCount={connCount} gateClosed={locked}
+                status={
+                  <Reachability listeners={listeners} locked={locked} connected={connCount}
+                    onChanged={refresh}
+                    onToggleLock={async () => {
+                      try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Closed to new peers" : "Accepting new peers", "info"); }
+                      catch (e) { toast(friendlyError(e), "error"); }
+                    }}
+                    onStopListening={async (l) => {
+                      try {
+                        await api.deleteChat(l.id);
+                        if (activeId === l.id) { setActiveId(null); activeIdRef.current = null; setActive(null); }
+                        toast("Stopped listening", "info");
+                        refresh();
+                      } catch (e) { toast(friendlyError(e), "error"); }
+                    }} />
+                } />
             </aside>
             <main className="col-main" id="main-content" tabIndex={-1}>
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
@@ -437,7 +444,7 @@ export default function App() {
                 onReconnect={reconnect}
                 // A user with no conversations at all gets the get-started
                 // panel rather than "select a conversation" with nothing to select.
-                isFirstRun={convs.length === 0}
+                isFirstRun={listRows.length === 0}
                 gateClosed={locked}
                 waiting={(() => {
                   const unread = convs.filter((c) => (c.unread || 0) > 0);
@@ -485,7 +492,8 @@ export default function App() {
             connectedChats={new Set(convs.filter((c) => c.connected).map((c) => c.id))} /></main>
         )}
         {nav === "settings" && (
-          <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth}
+            textSize={textSize} setTextSize={setTextSize} /></main>
         )}
         {nav === "parties" && <main className="col-full" id="main-content" tabIndex={-1}><Parties /></main>}
         {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onPair={(mode) => openCreator(mode, true)} /></main>}
@@ -495,7 +503,7 @@ export default function App() {
       <Verify req={fpReq} onClose={() => setFpReq(null)} />
       <RenameDialog target={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={doRename} />
       <ConfirmDelete target={deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete} />
-      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)}
+      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)} myFingerprint={auth.fingerprint}
         onRename={(c) => setRenameTarget(c)} onDelete={(c) => setDeleteTarget(c)} />
       <Toasts />
     </div>

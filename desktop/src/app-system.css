@@ -7,7 +7,6 @@
      as small text on a dark surface — so text gets its own lighter step. */
   --accent-text:var(--accent);
   --radius:9px;
-  --hex-op:0.04;
   --r-sm:calc(var(--radius) * .62);
   --r-lg:calc(var(--radius) * 1.5);
   --font:'IBM Plex Sans',system-ui,sans-serif;
@@ -93,10 +92,6 @@ input,textarea{font-family:inherit;color:inherit}
 ::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:9px;border:2px solid transparent;background-clip:padding-box}
 ::-webkit-scrollbar-thumb:hover{background:var(--dim)}
 
-/* hex pattern overlay */
-.hex-bg,.onb-hex{position:fixed;inset:0;pointer-events:none;z-index:0;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='96' viewBox='0 0 56 96'%3E%3Cpath d='M28 0L56 16v32L28 64 0 48V16z' fill='none' stroke='%2393a3b8' stroke-width='1'/%3E%3Cpath d='M28 64l28 16v16M28 64L0 80v16' fill='none' stroke='%2393a3b8' stroke-width='1'/%3E%3C/svg%3E");
-  background-size:56px 96px;opacity:var(--hex-op)}
 
 /* ============ BUTTONS ============ */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:600;
@@ -238,11 +233,6 @@ input,textarea{font-family:inherit;color:inherit}
   background:var(--accent);color:var(--accent-ink);font-size:11px;font-weight:700;display:grid;place-items:center;
   box-shadow:0 0 0 2px var(--s1);font-variant-numeric:tabular-nums}
 .rail-foot{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%}
-.rail-gate{position:relative}
-.rail-gate::after{content:"";position:absolute;top:8px;right:20px;width:8px;height:8px;border-radius:50%;
-  background:var(--success);box-shadow:0 0 0 2px var(--s1)}
-.rail-gate.is-closed::after{background:var(--warning)}
-.rail-gate.is-closed{color:var(--warning);background:color-mix(in oklab,var(--warning) 10%,transparent)}
 .rail-id{border-radius:50%;transition:transform .13s;padding:2px}
 .rail-id:hover{transform:scale(1.05)}
 .rail-id.is-active{box-shadow:0 0 0 2px var(--accent)}
@@ -388,19 +378,22 @@ input,textarea{font-family:inherit;color:inherit}
 .sys-msg.is-warn svg{color:var(--warning)}
 /* Day separator: a small centred label, nothing more. */
 .day-sep{display:flex;justify-content:center;margin:16px 0 10px;position:sticky;top:-10px;z-index:2}
-.day-sep span{font-size:11.5px;font-weight:600;color:var(--dim);padding:3px 11px;border-radius:20px;
-  background:color-mix(in oklab,var(--canvas) 70%,var(--s3));backdrop-filter:blur(6px)}
+.day-sep span{font-size:12px;font-weight:600;color:var(--dim);padding:2px 8px;border-radius:8px;
+  background:color-mix(in oklab,var(--canvas) 85%,transparent)}
 
 /* Bubbles. Spacing comes from the run position: a new turn gets air, a
    continuation sits close; only the last bubble of a run has the tail corner. */
-.msg-row{display:flex;margin-top:10px;animation:msg-in .2s cubic-bezier(.2,.7,.3,1)}
+.msg-row{display:flex;margin-top:14px;animation:msg-in .2s cubic-bezier(.2,.7,.3,1)}
 @keyframes msg-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .msg-row.pos-mid,.msg-row.pos-last{margin-top:2px}
 .msg-row.is-mine{justify-content:flex-end}
 .msg-bubble{--r:18px;--rt:6px;position:relative;max-width:min(560px,72%);padding:7px 12px 7px 13px;
   border-radius:var(--r);background:var(--theirs);color:var(--text);
   font-size:14.5px;line-height:1.42;box-shadow:0 1px 1px rgba(0,0,0,.08)}
-.is-mine .msg-bubble{background:var(--mine);color:var(--mine-ink)}
+.is-mine .msg-bubble{background:var(--mine);color:var(--mine-ink);
+  /* A breath of the logo's teal end, deep enough that white ink holds ≥4.8:1
+     across all five themes. */
+  background-image:linear-gradient(135deg,var(--mine),color-mix(in oklab,var(--mine) 78%,#0f766e))}
 .is-them.pos-single .msg-bubble,.is-them.pos-last .msg-bubble{border-bottom-left-radius:var(--rt)}
 .is-them.pos-first .msg-bubble{border-bottom-left-radius:var(--rt)}
 .is-them.pos-mid .msg-bubble,.is-them.pos-last .msg-bubble{border-top-left-radius:var(--rt)}
@@ -438,7 +431,8 @@ input,textarea{font-family:inherit;color:inherit}
 .is-them.pos-mid .file-card,.is-them.pos-last .file-card{border-top-left-radius:6px}
 .is-mine.pos-single .file-card,.is-mine.pos-last .file-card,.is-mine.pos-first .file-card{border-bottom-right-radius:6px}
 .is-mine.pos-mid .file-card,.is-mine.pos-last .file-card{border-top-right-radius:6px}
-.file-card.is-mine{background:var(--mine);color:var(--mine-ink)}
+.file-card.is-mine{background:var(--mine);color:var(--mine-ink);
+  background-image:linear-gradient(135deg,var(--mine),color-mix(in oklab,var(--mine) 78%,#0f766e))}
 .file-card.is-risky{box-shadow:inset 0 0 0 1px color-mix(in oklab,var(--warning) 45%,transparent)}
 .file-card-row{display:flex;align-items:center;gap:11px;width:100%}
 .file-thumb{display:block;width:100%;padding:0;border-radius:12px;overflow:hidden;line-height:0}
@@ -919,8 +913,9 @@ input,textarea{font-family:inherit;color:inherit}
 .party-saved-hint{font-size:11.5px;color:var(--faint)}
 @media (max-width:760px){ .party-layout{grid-template-columns:170px 1fr} }
 
+/* Rail labels stay down to 760px: an icon-only rail drops the words the
+   navigation relies on, so the list gives up width first. */
 @media (max-width:900px){
-  .rail-label{display:none}.rail{width:60px}
   .col-list{width:268px}
   .vf-grids{flex-direction:column}
 }
@@ -984,7 +979,7 @@ input,textarea{font-family:inherit;color:inherit}
 .audit-when{flex:none;color:var(--faint);font-size:11px}
 .audit-who{flex:none;font-weight:600}
 .audit-what{flex:1;min-width:0;color:var(--dim)}
-.audit-tag{flex:none;font-size:11px;color:var(--faint);background:var(--s4);border-radius:5px;padding:1px 6px}
+.audit-tag{flex:none;font-size:11px;color:var(--dim);background:var(--s3);border-radius:5px;padding:1px 6px}
 
 /* Channel-access dialog. */
 .fld{display:block;margin-bottom:15px}
@@ -1025,7 +1020,8 @@ input,textarea{font-family:inherit;color:inherit}
 .page-title{font-family:var(--display);font-size:26px;font-weight:600;letter-spacing:-.4px;line-height:1.2}
 .page-sub{font-size:13px;color:var(--dim);margin-top:2px}
 .page-actions{display:flex;gap:8px;flex:none}
-.page-scroll{flex:1;overflow-y:auto;scroll-behavior:smooth}
+.page-scroll{flex:1;overflow-y:auto}
+@media (prefers-reduced-motion: no-preference){.page-scroll{scroll-behavior:smooth}}
 .page-body{max-width:720px;margin:0 auto;padding:22px 32px 48px;display:flex;flex-direction:column;gap:20px}
 .page-body.is-wide{max-width:960px}
 .section-h{font-size:14px;font-weight:600;color:var(--text);margin:0 0 10px 2px}
@@ -1098,7 +1094,7 @@ button.contact-row-main:disabled{cursor:default}
   background:var(--s1);border-right:1px solid var(--border);overflow-y:auto}
 .set-nav-title{font-family:var(--display);font-size:26px;font-weight:600;letter-spacing:-.4px;padding:2px 11px 16px}
 .page.is-settings .page-main{flex:1;min-width:0;display:flex;flex-direction:column}
-.page.is-settings .page-head,.page.is-settings .page-body{max-width:760px;margin:0;padding-left:44px;padding-right:44px}
+.page.is-settings .page-head,.page.is-settings .page-body{max-width:760px;margin:0 auto;padding-left:44px;padding-right:44px}
 .set-nav-item{display:flex;align-items:center;gap:10px;padding:8px 11px;border-radius:9px;
   color:var(--dim);font-size:13.5px;font-weight:500;text-decoration:none;transition:background .12s,color .12s}
 .set-nav-item:hover{background:var(--s2);color:var(--text)}
@@ -1111,8 +1107,7 @@ button.contact-row-main:disabled{cursor:default}
 .set-layout :not(.set-row)+.set-row{border-top-left-radius:14px;border-top-right-radius:14px}
 .set-layout .set-row:not(:has(+ .set-row)){border-bottom-width:1px;border-bottom-left-radius:14px;
   border-bottom-right-radius:14px;margin-bottom:10px}
-.set-layout .set-row.is-warn{border-color:var(--border);box-shadow:inset 3px 0 0 var(--warning);
-  background:color-mix(in oklab,var(--warning) 5%,var(--s1))}
+.set-layout .set-row.is-warn{border-color:var(--border);background:color-mix(in oklab,var(--warning) 7%,var(--s1))}
 
 @media (max-width: 980px){
   .set-nav{width:184px}
@@ -1134,3 +1129,69 @@ button.contact-row-main:disabled{cursor:default}
   text-decoration-color:color-mix(in oklab,currentColor 45%,transparent)}
 .e2e-later{color:var(--dim)}
 .modal-icon.is-warn{color:var(--warning);background:color-mix(in oklab,var(--warning) 14%,var(--s2))}
+
+/* ============ REACHABILITY ============
+   One status under the Chats title instead of a listener row + a rail gate. */
+.reach{position:relative;margin-top:2px}
+.reach-btn{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);padding:2px 6px 2px 4px;
+  margin-left:-4px;border-radius:7px;transition:background .12s,color .12s}
+.reach-btn:hover,.reach-btn[aria-expanded="true"]{background:var(--s2);color:var(--text)}
+.reach-btn.is-closed{color:var(--warning)}
+.reach-dot{width:7px;height:7px;border-radius:50%;background:var(--success)}
+.reach-sep{color:var(--faint)}
+.reach-pop{position:absolute;left:-4px;top:calc(100% + 6px);z-index:60;width:340px;display:flex;flex-direction:column;
+  gap:10px;padding:14px;border-radius:14px;background:var(--s1);border:1px solid var(--border-2);box-shadow:var(--shadow)}
+.reach-pop-h{font-size:13px;font-weight:600}
+.reach-p{font-size:12.5px;color:var(--dim);line-height:1.5}
+.reach-addr{display:flex;align-items:center;gap:8px;padding:7px 6px 7px 10px;border-radius:10px;background:var(--s2)}
+.reach-addr-l{flex:none;font-size:11.5px;color:var(--dim);width:88px}
+.reach-addr-v{flex:1;min-width:0;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis}
+.reach-copy{flex:none;display:grid;place-items:center;width:28px;height:28px;border-radius:8px;color:var(--dim)}
+.reach-copy:hover{background:var(--s3);color:var(--text)}
+.reach-toggle{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;cursor:pointer;
+  padding-top:10px;border-top:1px solid var(--border)}
+.reach-toggle input{position:absolute;opacity:0;width:1px;height:1px}
+.reach-toggle-l{display:block;font-size:13px;font-weight:600}
+.reach-toggle-h{display:block;font-size:12px;color:var(--dim);line-height:1.4;margin-top:1px}
+.reach-switch{flex:none;position:relative;width:36px;height:20px;margin-top:2px;border-radius:10px;background:var(--s4);
+  box-shadow:inset 0 0 0 1px var(--border-2);transition:background .15s}
+.reach-switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+  background:var(--dim);transition:left .15s,background .15s}
+.reach-toggle input:checked+.reach-switch{background:var(--accent)}
+.reach-toggle input:checked+.reach-switch::after{left:18px;background:#fff}
+.reach-toggle input:focus-visible+.reach-switch{outline:2px solid var(--accent);outline-offset:2px}
+.reach-actions{display:flex;justify-content:flex-end}
+
+.chat-pane{position:relative}
+.chat-scroll:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.new-below{position:absolute;left:50%;bottom:96px;transform:translateX(-50%);z-index:5;display:inline-flex;align-items:center;
+  gap:6px;padding:7px 14px;border-radius:20px;background:var(--accent);color:var(--accent-ink);font-size:12.5px;font-weight:600;
+  box-shadow:var(--shadow)}
+
+/* Focus inside a sent bubble: the accent ring vanishes on the accent fill. */
+.is-mine :focus-visible,.file-card.is-mine :focus-visible{outline-color:var(--mine-ink)}
+/* Daylight: control edges at ≥3:1 (WCAG 1.4.11) — inputs, the active segment,
+   switches when off. The hairline border stays for passive surfaces. */
+:root[data-theme="light"] .input,:root[data-theme="light"] .composer-box,
+:root[data-theme="light"] .conv-search{border-color:#7b879b}
+:root[data-theme="light"] .seg-btn.is-active{box-shadow:inset 0 0 0 1px #7b879b}
+:root[data-theme="light"] .set-switch:not(.is-on),:root[data-theme="light"] .reach-switch{box-shadow:inset 0 0 0 1px #7b879b}
+
+/* Disclosure: one chevron for every <details>, instead of the browser's ▶. */
+summary{list-style:none;cursor:pointer}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"";display:inline-block;width:6px;height:6px;margin-right:9px;vertical-align:2px;
+  border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform .15s}
+details[open]>summary::before{transform:rotate(45deg);vertical-align:3px}
+/* Row actions share one width so the action column lines up. */
+.contact-row-actions .btn{min-width:104px}
+/* Relays: the command block follows the theme. */
+.rl-cmd{background:var(--s2);color:var(--text);border:1px solid var(--border)}
+.rl-cmd code{color:var(--text)}
+
+.input{font-variant-numeric:tabular-nums}
+.composer-notice-actions{flex:none;display:flex;gap:6px}
+.composer-notice.is-failed{background:color-mix(in oklab,var(--warning) 9%,var(--s2))}
+.composer-notice-why{color:var(--faint)}
+.card-details>summary{display:flex;align-items:center}
+.card-details[open]{gap:12px}

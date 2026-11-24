@@ -113,7 +113,8 @@ test.describe("the app loads", () => {
     await expect(
       page.getByRole("button", { name: "Create identity" }),
     ).toBeVisible();
-    await expect(page.getByPlaceholder(/New password/)).toBeVisible();
+    // A real label, not a placeholder that vanishes as you type.
+    await expect(page.getByLabel("New password")).toBeVisible();
 
     expectNoProblems(problems);
   });

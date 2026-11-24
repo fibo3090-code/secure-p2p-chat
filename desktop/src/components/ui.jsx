@@ -139,7 +139,8 @@ export function PasswordInput({ autoComplete = "off", ...props }) {
     <span className="pw-wrap">
       <input className="input" type={show ? "text" : "password"}
         autoComplete={autoComplete} {...props} />
-      <button type="button" className="pw-toggle" onClick={() => setShow((s) => !s)} aria-label="Toggle visibility">
+      <button type="button" className="pw-toggle" onClick={() => setShow((s) => !s)}
+        aria-label="Show password" aria-pressed={show}>
         <Icon name={show ? "eyeOff" : "eye"} size={16} />
       </button>
     </span>
@@ -315,7 +316,8 @@ export function OverflowMenu({ label = "More actions", items }) {
       <IconButton name="more" label={label} active={open} aria-haspopup="menu" aria-expanded={open}
         onClick={() => setOpen((o) => !o)} />
       {open && (
-        <div className="pop-menu" role="menu">
+        <div className="pop-menu" role="menu" onKeyDown={arrowNav('[role="menuitem"]')}
+          ref={(el) => { if (el && !el.contains(document.activeElement)) el.querySelector('[role="menuitem"]')?.focus(); }}>
           {menuEntries(items).map((it) => (it.sep
             ? <hr key={it.key} className="pop-sep" />
             : (
@@ -329,4 +331,25 @@ export function OverflowMenu({ label = "More actions", items }) {
       )}
     </div>
   );
+}
+
+/// Arrow-key movement for a composite widget whose role promises it (a
+/// listbox, a menu). Declaring `role="listbox"` or `role="menu"` puts a screen
+/// reader into focus mode, where arrow keys are expected to move — with no
+/// handler they did nothing at all. Up/Down/Home/End move focus between the
+/// items that match `selector`; Tab still leaves the widget.
+export function arrowNav(selector) {
+  return (e) => {
+    const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (!keys.includes(e.key)) return;
+    const items = [...e.currentTarget.querySelectorAll(selector)].filter((el) => !el.disabled);
+    if (!items.length) return;
+    const i = items.indexOf(document.activeElement);
+    let next = 0;
+    if (e.key === "ArrowDown") next = i < 0 ? 0 : Math.min(items.length - 1, i + 1);
+    else if (e.key === "ArrowUp") next = i < 0 ? 0 : Math.max(0, i - 1);
+    else if (e.key === "End") next = items.length - 1;
+    e.preventDefault();
+    items[next].focus();
+  };
 }
