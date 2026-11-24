@@ -90,9 +90,11 @@ describe("SetPasswordScreen", () => {
     expect(await screen.findByText("keystore is read-only")).toBeTruthy();
   });
 
-  it("shows the new identity's fingerprint", () => {
-    render(<SetPasswordScreen minLength={12} fingerprint={"ab".repeat(32)} onSet={async () => ""} />);
-    expect(screen.getByText(/^abababab/)).toBeTruthy();
+  it("leads with the no-recovery warning, not a fingerprint nobody can use yet", () => {
+    render(<SetPasswordScreen minLength={12} onSet={async () => ""} />);
+    expect(screen.getByText("There is no recovery.")).toBeTruthy();
+    expect(screen.getByLabelText("New password")).toBeTruthy();
+    expect(screen.getByLabelText("Confirm password")).toBeTruthy();
   });
 });
 

@@ -188,6 +188,15 @@ impl TuiApp {
     /// developer's real `identity.json` and, on a machine with none, wrote a
     /// `history.json.enc` under a throwaway key that the real client could
     /// then never decrypt.
+    /// A throwaway app for tests: a fresh, unencrypted identity over a new
+    /// temp directory of its own. `new` read the real profile, so on a machine
+    /// with a password-protected terminal identity the tests saw that identity
+    /// and loaded the user's real history.
+    pub fn ephemeral(logs: LogBuffer) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("p2pem-tui-ephemeral-{}", Uuid::new_v4()));
+        Self::new_in(Some(dir), logs)
+    }
+
     pub fn new_in(data_dir: Option<PathBuf>, logs: LogBuffer) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
 
@@ -464,6 +473,7 @@ impl TuiApp {
                     peer_name: pending.peer_name,
                     sas: pending.sas,
                     chat_id: pending.session_id,
+                    warning: pending.warning,
                 };
             }
         }
@@ -801,8 +811,8 @@ impl TuiApp {
         };
     }
 
-    fn toast(&mut self, level: ToastLevel, msg: String) {
-        self.chat_manager.add_toast(level, msg);
+    fn toast(&mut self, level: ToastLevel, msg: impl Into<String>) {
+        self.chat_manager.add_toast(level, msg.into());
     }
 
     // ---------------------------------------------------------------- keys
@@ -1242,14 +1252,14 @@ impl TuiApp {
     /// The private key, if the identity is unlocked. Prompts for the password
     /// (or toasts why the key is unreadable) otherwise, so a command can just
     /// `let Some(key) = self.unlocked_private_key() else { return };`.
-    fn unlocked_private_key(&mut self) -> Option<rsa::RsaPrivateKey> {
+    fn unlocked_private_key(&mut self) -> Option<rsa::PrivateKey> {
         if !self.require_unlocked() {
             return None;
         }
         self.private_key()
     }
 
-    fn private_key(&mut self) -> Option<rsa::RsaPrivateKey> {
+    fn private_key(&mut self) -> Option<rsa::PrivateKey> {
         match self.identity.private_key() {
             Ok(k) => Some(k),
             Err(e) => {
@@ -1865,7 +1875,40 @@ mod tests {
             peer_name: "Peer".into(),
             sas: String::new(),
             session_id,
+            warning: None,
         }
+    }
+
+    /// CRYPTO-04: the overlay must carry the prompt's warning, or a key that
+    /// is not the invite's looks exactly like a first contact.
+    #[test]
+    fn the_fingerprint_overlay_carries_an_invite_mismatch_warning() {
+        let (mut app, _data) = app();
+        let chat_id = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat_id, "Peer".into());
+        let warning = crate::app::FingerprintWarning::InviteMismatch {
+            contact_id: Uuid::new_v4(),
+            contact_name: "Alice".into(),
+            expected: "cd".repeat(32),
+        };
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(crate::app::PendingFingerprint {
+                warning: Some(warning.clone()),
+                ..queued_prompt(chat_id)
+            });
+
+        app.tick();
+
+        match &app.overlay {
+            TuiOverlay::FingerprintVerify { warning: shown, .. } => {
+                assert_eq!(shown.as_ref(), Some(&warning));
+            }
+            other => panic!("expected the fingerprint overlay, got {other:?}"),
+        }
+        let text = crate::tui::overlays::fingerprint_warning_text(&warning);
+        assert!(text.contains("NOT the key in Alice's invite"), "{text}");
+        assert!(text.contains(&"cd".repeat(8)), "{text}");
     }
 
     #[test]
@@ -1885,6 +1928,7 @@ mod tests {
             peer_name: "Peer".into(),
             sas: String::new(),
             chat_id,
+            warning: None,
         };
 
         // Ctrl+Y accepts.
@@ -1912,6 +1956,7 @@ mod tests {
             peer_name: "Peer".into(),
             sas: String::new(),
             chat_id,
+            warning: None,
         };
 
         app.handle_key_event(ctrl('n'));
@@ -1939,6 +1984,7 @@ mod tests {
             peer_name: "Peer".into(),
             sas: String::new(),
             chat_id,
+            warning: None,
         };
 
         for c in ['h', 'e', 'y', 'n'] {

@@ -40,6 +40,15 @@ predate tagged releases.
   with a message to update it; older clients can still connect to an updated
   host.
 
+- Dialling a contact imported from an invite now checks the key that answers
+  against the one the invite named (audit CRYPTO-04). A different key gets a
+  warning in the verification prompt itself — "this is not the key in Alice's
+  invite" — in both the desktop app and the terminal client, and the
+  auto-trust setting no longer applies to it. The invite's key answering is
+  still not trusted on its own: it gets the ordinary safety-code prompt. A
+  conversation whose key changed now says so in the prompt too, not only in a
+  toast.
+
 ### Fixed
 
 - A community server that cannot write a message to its database (a full
@@ -119,6 +128,63 @@ predate tagged releases.
 
 ### Changed
 
+- **Desktop app redesign.** The shell, conversation list and thread, every
+  full-width page and the main dialogs were reworked against today's best chat
+  apps:
+  - The app carries its real logo (the bubble from the app icon), and its accent
+    is taken from it: a blue-indigo with white ink.
+  - The design-system typefaces (IBM Plex Sans, Space Grotesk, IBM Plex Mono)
+    are bundled locally. Nothing is fetched from a third party.
+  - Sent messages are filled bubbles, grouped by turn, with the time and
+    delivery ticks inside.
+  - File cards are one line, and a received program (`.exe`, `.lnk`, …) is
+    labelled as one before anyone clicks it.
+  - The app-wide title bar is gone. Accepting new peers is a labelled switch in
+    the sidebar, and the theme lives in Settings.
+  - Trust is said in words ("Verified" / "Not verified"), with an encryption note
+    at the top of every direct conversation and a verdict in Conversation info.
+  - The verification dialog shows the safety code laid out for reading aloud and
+    the route (direct or relay). It warns, with trusting made deliberate, when a
+    contact you verified presents a different key.
+  - Offline conversations end in one action: Reconnect, or Copy invite link when
+    there is no saved address. A listening conversation shows the addresses to
+    share, an invite link and Stop listening.
+  - Contacts, Relays, Communities and Settings share one page template (Settings
+    has a section index). New connection keeps its Direct / Via relay choice
+    under Dial and Host, with the action in a footer.
+  - Daylight was redesigned, and every text colour holds at least 4.5:1 in all
+    five themes.
+- **Desktop app, second pass after an independent review.**
+  - **Reachability:** listening is no longer shown as a conversation. A single
+    status under the Chats title shows whether you are listening and whether new
+    peers are accepted. It opens a panel with the addresses to share, your invite
+    link, an "Accept new peers" switch and Start/Stop listening.
+  - **Trust:**
+    - Conversation info puts your fingerprint beside theirs, so a later check is
+      a real comparison.
+    - Accepting a changed key reads "trust new key".
+    - Relay copy now says what a relay *can* see (both IP addresses and when you
+      talk), as well as what it can't.
+    - A community's server key has a colour grid, a Copy button and a "pinned"
+      marker.
+  - **Accessibility:**
+    - The conversation is announced as it arrives, with who wrote each message.
+      Reading history is no longer interrupted: a "New messages" pill appears
+      instead.
+    - Arrow keys work in the conversation list and in menus.
+    - Ctrl +/− zoom works, and there is a Text size setting.
+    - Focus is visible inside sent bubbles, and controls in Daylight have
+      clearer edges.
+    - Password fields have real labels.
+  - **Look:**
+    - Sent bubbles carry a hint of the logo's teal.
+    - The list rows and the header show fewer badges.
+    - The date separator is quieter.
+    - Settings is centred like the other pages.
+  - **Offline:** a failed Reconnect says why and what the other person needs to
+    do.
+
+
 - The test suite was audited and restructured: the client's 21 integration
   test binaries are one, with one shared harness; tests that could not fail
   (Mutex and `HashMap` round-trips, assertion-free checks, negative checks
@@ -127,11 +193,22 @@ predate tagged releases.
   data directory; a flaky test now fails CI. The Rust suite runs in about 30 s
   instead of 44 s with the desktop bridge included.
 
+
 ### Dependencies
 
+- `rsa` 0.9 → 0.10. Its private-key arithmetic is now constant-time
+  (`crypto-bigint`), which fixes the Marvin timing advisory RUSTSEC-2023-0071
+  that `deny.toml` had accepted (the app only ever signed with RSA, never
+  decrypted). Keys, fingerprints, the derived Ed25519 subkey, the history key
+  and RSA-PSS signatures are byte-for-byte what 0.9 produced, pinned by a new
+  known-answer test, so existing identities, histories, pins and peers on older
+  versions are unaffected in both directions.
 - UPnP port mapping (`igd-next`) 0.17 → 0.18. `mdns-sd`, `uuid`, `serde_json`,
   `arboard`, `open`, `log`, `unicode-width`, `tauri-build`, `tauri-plugin-log`
   and `proptest` move to their latest compatible releases.
+- Native file dialogs: `rfd` 0.17 → 0.18 (GTK3 memory-leak fixes among
+  others). It needs Rust 1.92, so the minimum supported Rust version for
+  building from source rises from 1.90 to 1.92.
 - Desktop front-end: lucide-react 1.70, and the Tauri CLI moves to 2.12 to
   match the Tauri crate and `@tauri-apps/api`.
 - Development tooling only, nothing that ships: jsdom 30, Playwright 1.64,
@@ -139,6 +216,14 @@ predate tagged releases.
   `brace-expansion` and `zod` updates clear five advisories in the test and
   build tooling; `npm audit` now reports none, with or without dev
   dependencies.
+- Desktop notifications on Linux (`notify-rust` 4.19) now talk to D-Bus through
+  `zbus` 6, which retires three unmaintained-crate advisory acceptances.
+  `uuid`, `zeroize` and `tauri-plugin-log` move to their latest patch releases.
+- `url` 2.5.9 and `cookie` 0.18.3 fix RUSTSEC-2026-0592 (stack overflow on
+  nested `blob:` URLs) and RUSTSEC-2026-0594 (private-cookie nonce reuse after
+  `fork`), reached through Tauri (and, for `url`, the UPnP client). `chrono` is now flagged unmaintained
+  upstream (RUSTSEC-2026-0543) with no release to move to; it is accepted, with
+  the reason, in `deny.toml` and `SECURITY.md`.
 
 ## [1.17.0] - 2026-11-09
 

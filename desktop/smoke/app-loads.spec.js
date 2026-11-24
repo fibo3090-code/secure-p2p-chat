@@ -1,34 +1,22 @@
-// The app comes up, paints, and reports nothing broken while doing it.
-//
-// This is deliberately shallow. It is not here to test behaviour — the rest of
-// the suite does that — it is here to notice that the application is *on*. The
-// bug it was written for made every screen blank in `tauri dev` while every
-// other gate stayed green, because nothing anywhere had ever loaded the page.
-//
-// Each test asserts a ladder rather than one thing, so a failure says which
-// stage broke:
+// The app comes up, paints, and reports nothing broken. Deliberately shallow: it
+// notices that the app is *on* (the bug it was written for blanked every screen
+// while every other gate stayed green). Each test asserts a ladder, so a failure
+// says which stage broke:
 //
 //   1. the document loaded and carries its CSP
 //   2. React mounted (`#root` has children)
 //   3. the app shell rendered (a known landmark is visible)
 //   4. nothing was refused, thrown, or logged as an error on the way
 //
-// Rung 4 is what catches the CSP class of bug directly, but rung 2 is what
-// actually trips first when a script is blocked — so the collected violations
-// are attached to *every* failure by the `problems` fixture below. Without
-// that, the report says "React did not mount" and leaves you to guess why,
-// which is the same dead end the original bug presented.
+// A blocked script trips rung 2 first, which alone says nothing about why — so
+// the `problems` fixture attaches everything the page reported to *every* failure.
 
 import { test as base, expect } from "@playwright/test";
 
-/// A page under observation, plus the record of everything it complained about.
-///
-/// `securitypolicyviolation` is worth listening for on top of the console
-/// because it names the directive and the blocked URI. "Refused to execute
-/// inline script" in a console dump is easy to skim past; a violation record
-/// pointing at `script-src` is not. The listener goes in via an init script, so
-/// it is installed before the document's own scripts and sees violations from
-/// the very first inline block in `<head>`.
+/// A page under observation, plus everything it complained about.
+/// `securitypolicyviolation` names the directive and blocked URI (easier to spot
+/// than a console line); it is installed by an init script, so it sees violations
+/// from the first inline block in `<head>`.
 const test = base.extend({
   problems: async ({ page }, use, testInfo) => {
     const problems = {
@@ -65,9 +53,8 @@ const test = base.extend({
 
     await use(problems);
 
-    // Whatever the test failed on, say what the page reported. Attached for the
-    // HTML report and printed for the CI log, which is the only one anybody
-    // reads when a job goes red.
+    // On any failure, report what the page said: attached for the HTML report
+    // and printed for the CI log.
     if (testInfo.status !== testInfo.expectedStatus) {
       const record = JSON.stringify(problems, null, 2);
       await testInfo.attach("page-problems", {
@@ -79,10 +66,8 @@ const test = base.extend({
   },
 });
 
-/// Assert the page reported nothing wrong.
-///
-/// One assertion per channel so the failure message names the channel, and
-/// Playwright prints the offending array inline rather than needing a rerun.
+/// Assert the page reported nothing wrong, one assertion per channel so the
+/// failure names it.
 function expectNoProblems(problems) {
   expect(problems.csp, "content-security-policy violations").toEqual([]);
   expect(problems.pageErrors, "uncaught exceptions").toEqual([]);
@@ -90,13 +75,8 @@ function expectNoProblems(problems) {
   expect(problems.failedRequests, "failed requests").toEqual([]);
 }
 
-/// The policy the document actually carries, read off the served HTML rather
-/// than out of `csp.js`.
-///
-/// `csp.test.js` already checks that the module produces the right string and
-/// that it matches `tauri.conf.json`. That is a different claim from "the page
-/// a browser receives has the tag on it", which is what a change to the Vite
-/// plugin, the build, or `index.html` can quietly drop.
+/// The policy read off the served HTML, not `csp.js` (which `csp.test.js`
+/// checks): a change to the Vite plugin, the build or `index.html` could drop the tag.
 async function servedPolicy(page) {
   return page.getAttribute(
     'meta[http-equiv="Content-Security-Policy"]',
@@ -111,8 +91,7 @@ test.describe("the app loads", () => {
     // (1) the document arrived with a policy on it
     expect(await servedPolicy(page)).toContain("default-src 'self'");
 
-    // (2) React mounted. Checked apart from the landmark below so a failure
-    // distinguishes "the bundle never ran" from "it ran and rendered nothing".
+    // (2) React mounted: "the bundle never ran", apart from "rendered nothing"
     await expect(page.locator("#root > *")).toHaveCount(1);
 
     // (3) the shell is on screen, not an empty div or an error boundary
@@ -125,10 +104,8 @@ test.describe("the app loads", () => {
     expectNoProblems(problems);
   });
 
-  // The first screen a new user ever sees, and a different component tree from
-  // the one above — the app blocks all UI until the keystore password is set,
-  // so this path renders without the shell at all. `bridge.js`'s mock takes its
-  // auth state from `?mock=`.
+  // A new user's first screen: a different tree, rendered without the shell
+  // until a password is set. The `bridge.js` mock reads its auth state from `?mock=`.
   test("the first-run password screen paints", async ({ page, problems }) => {
     await page.goto("/?mock=set_password");
 
@@ -136,7 +113,8 @@ test.describe("the app loads", () => {
     await expect(
       page.getByRole("button", { name: "Create identity" }),
     ).toBeVisible();
-    await expect(page.getByPlaceholder(/New password/)).toBeVisible();
+    // A real label, not a placeholder that vanishes as you type.
+    await expect(page.getByLabel("New password")).toBeVisible();
 
     expectNoProblems(problems);
   });

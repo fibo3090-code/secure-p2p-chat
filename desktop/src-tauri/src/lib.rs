@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
-use p2pem_classic::app::{ChatManager, PendingFingerprint};
+use p2pem_classic::app::{ChatManager, FingerprintWarning, PendingFingerprint};
 
 /// The TOFU prompt currently published to the frontend, held for it to poll.
 type PendingFp = Arc<StdMutex<Option<PendingFingerprint>>>;
@@ -491,32 +491,41 @@ fn init_bridge() -> Bridge {
         )
     };
 
-    let identity_path = history_path.with_file_name("identity.json");
-    let parties_path = history_path.with_file_name("parties.json");
-    // A new identity, or a plaintext key in hand (no password), must get a
-    // password before anything else.
-    let needs_password_setup = is_new || !identity.is_locked();
-
-    let mut chat_manager = ChatManager::new(Config::default());
-    // So the manager can recognise the user's own invite link and refuse to add
-    // them to their own contacts.
-    chat_manager.set_my_fingerprint(identity.fingerprint.clone());
-    let manager = Arc::new(Mutex::new(chat_manager));
-
     Bridge {
-        manager,
-        party: Arc::new(Mutex::new(PartyManager::new())),
-        identity: Arc::new(StdMutex::new(identity)),
-        discovery: Arc::new(StdMutex::new(None)),
-        discovered: Arc::new(StdMutex::new(Vec::new())),
-        history_path,
-        identity_path,
-        parties_path,
-        needs_password_setup: AtomicBool::new(needs_password_setup),
-        pending_fp: Arc::new(StdMutex::new(None)),
-        init_error,
-        saved_sig: Arc::new(StdMutex::new(None)),
         _instance_lock: instance_lock,
+        ..Bridge::new(identity, history_path, is_new, init_error)
+    }
+}
+
+impl Bridge {
+    /// The bridge over `identity`, with its files beside `history_path`. No
+    /// instance lock: `init_bridge` adds the one it took, tests need none.
+    fn new(
+        identity: Identity,
+        history_path: PathBuf,
+        is_new: bool,
+        init_error: Option<String>,
+    ) -> Self {
+        let mut chat_manager = ChatManager::new(Config::default());
+        // Lets the manager refuse the user's own invite link.
+        chat_manager.set_my_fingerprint(identity.fingerprint.clone());
+        Bridge {
+            manager: Arc::new(Mutex::new(chat_manager)),
+            party: Arc::new(Mutex::new(PartyManager::new())),
+            // A new identity, or a plaintext key in hand (no password), must
+            // get a password before anything else.
+            needs_password_setup: AtomicBool::new(is_new || !identity.is_locked()),
+            identity: Arc::new(StdMutex::new(identity)),
+            discovery: Arc::new(StdMutex::new(None)),
+            discovered: Arc::new(StdMutex::new(Vec::new())),
+            identity_path: history_path.with_file_name("identity.json"),
+            parties_path: history_path.with_file_name("parties.json"),
+            history_path,
+            pending_fp: Arc::new(StdMutex::new(None)),
+            init_error,
+            saved_sig: Arc::new(StdMutex::new(None)),
+            _instance_lock: None,
+        }
     }
 }
 
@@ -932,11 +941,34 @@ impl PollContext {
 }
 
 /// The shape the frontend expects for a TOFU prompt (event and poll alike).
+///
+/// `warning` is `null` for an ordinary first use, otherwise
+/// `{ kind: "key_changed", previous }` or
+/// `{ kind: "invite_mismatch", contact, expected }` (CRYPTO-04). `Verify`
+/// leads with it, so a key that is not the invite's never reads as a first
+/// contact.
 fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
+    let warning = match &prompt.warning {
+        None => serde_json::Value::Null,
+        Some(FingerprintWarning::KeyChanged { previous }) => serde_json::json!({
+            "kind": "key_changed",
+            "previous": previous,
+        }),
+        Some(FingerprintWarning::InviteMismatch {
+            contact_name,
+            expected,
+            ..
+        }) => serde_json::json!({
+            "kind": "invite_mismatch",
+            "contact": contact_name,
+            "expected": expected,
+        }),
+    };
     serde_json::json!({
         "fingerprint": prompt.fingerprint,
         "peer_name": prompt.peer_name,
         "sas": prompt.sas,
         "chat_id": prompt.session_id.to_string(),
+        "warning": warning,
     })
 }

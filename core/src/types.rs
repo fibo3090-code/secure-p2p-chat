@@ -3,13 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// A chat session with a peer
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Chat {
     pub id: Uuid,
     pub title: String,
     pub peer_fingerprint: Option<String>,
-    /// Participants (references to Contact IDs). Empty for one-to-one until contact added.
+    /// Contact IDs; empty for one-to-one until a contact is added.
     pub participants: Vec<Uuid>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
@@ -30,34 +29,21 @@ pub struct Chat {
     /// How bytes reach the peer(s) for this conversation (orthogonal to `kind`).
     #[serde(default)]
     pub transport: Transport,
-    /// How many entries of `messages` the user has already seen. Persisted with
-    /// the (encrypted) history so unread badges survive a restart — seeding this
-    /// from the live message count at startup instead would mark everything that
-    /// arrived while the app was closed as read, which is the one thing a
-    /// messenger must never do. Older history files load with `0`, which is
-    /// conservative: the first launch after upgrading shows real history as
-    /// unread rather than hiding a message the user never saw.
+    /// How many `messages` the user has seen. Persisted so unread survives a
+    /// restart; never seed it from the live count. Old history loads as `0`
+    /// (everything unread), which is the conservative side.
     #[serde(default)]
     pub read_count: usize,
-    /// True once the user has renamed this conversation. Session lifecycle
-    /// events (`Connected`) relabel a chat with the peer address they just
-    /// reached, which would otherwise silently overwrite "Mum" with
-    /// `192.168.1.20:12345` on every reconnect. Older history files load as
-    /// `false`, which only means the next connect may re-derive the title —
-    /// never that a name is lost.
+    /// Set once the user renames the chat, so `Connected` stops relabelling
+    /// it with the peer address.
     #[serde(default)]
     pub title_is_custom: bool,
 }
 
 impl Chat {
-    /// A new, empty conversation.
-    ///
-    /// `kind` and `transport` are required rather than defaulted: they drive
-    /// the badges the UI shows, and a constructor that guessed them is how a
-    /// relay conversation once came to be persisted as a direct one. Everything
-    /// else starts at its zero value — no fingerprint (so TOFU runs), no
-    /// messages, fresh sequence counters — and a placeholder host flips
-    /// `is_host_placeholder` itself.
+    /// A new, empty conversation (no fingerprint, so TOFU runs). `kind` and
+    /// `transport` are required because they drive the UI badges; guessing
+    /// them once persisted a relay chat as direct.
     pub fn new(id: Uuid, title: impl Into<String>, kind: ChatKind, transport: Transport) -> Self {
         Self {
             id,
@@ -78,12 +64,8 @@ impl Chat {
         }
     }
 
-    /// Accept `seq` as the next frame from the peer, or refuse it as a replay.
-    ///
-    /// Every sequenced frame must climb strictly above the last one accepted
-    /// on this conversation. This is the app-layer half of replay protection —
-    /// the transport enforces the same rule per session — and it is the one
-    /// place it is spelled out, rather than once per message kind.
+    /// Accept `seq` if it climbs strictly above the last accepted one on this
+    /// chat (the app-layer half of replay protection), else refuse a replay.
     pub fn accept_seq(&mut self, seq: u64) -> bool {
         if seq <= self.recv_seq {
             return false;
@@ -92,25 +74,15 @@ impl Chat {
         true
     }
 
-    /// Reset both sequence counters because a **new** session is about to
-    /// serve this conversation.
-    ///
-    /// The wire sequence is per session and restarts at 1, but `recv_seq`
-    /// lives here and survives reconnects. Left alone, every frame the peer
-    /// sends after a reconnect is at or below the previous session's
-    /// high-water mark and is discarded as a replay — the peer's first N
-    /// messages vanish with only a log line, and they see them as sent.
-    ///
-    /// This does not weaken replay protection: it is enforced per session at
-    /// the transport layer (`last_valid_seq` in `run_message_loop`), on a key
-    /// that is itself unique per session. This counter is a second layer that
-    /// must be aligned with the session it is checking.
+    /// Reset both counters when a **new** session attaches to this chat: the
+    /// wire seq restarts at 1, so a stale `recv_seq` would discard the peer's
+    /// first messages as replays. Replay protection still holds per session
+    /// in `run_message_loop`.
     pub fn reset_sequences(&mut self) {
         self.recv_seq = 0;
         self.send_seq = 0;
     }
 
-    /// The peer stopped typing (they sent a message, or said so).
     pub fn clear_typing(&mut self) {
         self.peer_typing = false;
         self.typing_since = None;
@@ -143,8 +115,7 @@ pub enum ChatKind {
     Channel,
 }
 
-/// How a conversation's bytes reach the other participant(s). Orthogonal to
-/// [`ChatKind`]: a DM or a group can each be carried over any transport.
+/// How a conversation's bytes reach the peer(s); orthogonal to [`ChatKind`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Transport {
     /// Direct peer-to-peer TCP (one peer exposes a port).
@@ -156,24 +127,20 @@ pub enum Transport {
     Server,
 }
 
-/// A single message in a chat
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
     pub id: Uuid,
     pub from_me: bool,
     pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
-    /// True once the peer acknowledged receipt (delivery receipt, sent
-    /// messages only). Messages from before this field — or sent to peers
-    /// that predate receipts — simply stay `false`; the UI shows nothing
-    /// rather than an error state.
+    /// Set once the peer acknowledged receipt (sent messages only; stays
+    /// `false` for old peers and old history).
     #[serde(default)]
     pub delivered: bool,
 }
 
 impl Message {
-    /// A message this device sent. `id` is what the peer's delivery receipt
-    /// will be matched against, so the caller keeps it.
+    /// A message this device sent; `id` is what the delivery receipt matches.
     pub fn sent(id: Uuid, content: MessageContent) -> Self {
         Self {
             id,
@@ -196,15 +163,13 @@ impl Message {
     }
 }
 
-/// A contact (a known peer)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Contact {
     pub id: Uuid,
     pub name: String,
     pub address: Option<String>,
-    /// Additional direct-connect candidate addresses in priority order
-    /// (e.g. an internet-reachable address plus a LAN one). `address` stays the
-    /// primary/first for back-compat; connecting tries these in order.
+    /// Extra direct-connect candidates in priority order; `address` stays the
+    /// primary for back-compat.
     #[serde(default)]
     pub addresses: Vec<String>,
     #[serde(default)]
@@ -215,7 +180,6 @@ pub struct Contact {
     pub public_key: Option<String>,
     pub created_at: DateTime<Utc>,
 
-    // Contacts 2.0 Fields
     #[serde(default)]
     pub trust_state: TrustState,
     #[serde(default)]
@@ -226,9 +190,8 @@ pub struct Contact {
 }
 
 impl Contact {
-    /// Direct-connect candidate addresses in priority order. Falls back to the
-    /// single legacy `address` when the multi-address list is empty (contacts
-    /// imported from older invites or loaded from old history files).
+    /// Direct-connect candidates in priority order, falling back to the
+    /// legacy single `address`.
     pub fn candidate_addresses(&self) -> Vec<String> {
         if self.addresses.is_empty() {
             self.address.iter().cloned().collect()
@@ -238,7 +201,6 @@ impl Contact {
     }
 }
 
-/// Trust level for a contact
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrustState {
     #[default]
@@ -248,7 +210,6 @@ pub enum TrustState {
     Blocked,
 }
 
-/// Message content types
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum MessageContent {
@@ -263,7 +224,6 @@ pub enum MessageContent {
     },
 }
 
-/// Toast notification for UI
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub id: Uuid,
@@ -273,7 +233,6 @@ pub struct Toast {
     pub duration: std::time::Duration,
 }
 
-/// Toast severity level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastLevel {
     Info,
@@ -282,14 +241,12 @@ pub enum ToastLevel {
     Error,
 }
 
-/// Whether a tracked transfer is being received from or sent to the peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
     Incoming,
     Outgoing,
 }
 
-/// File transfer state
 #[derive(Debug, Clone)]
 pub struct FileTransferState {
     pub id: Uuid,
@@ -303,13 +260,11 @@ pub struct FileTransferState {
     pub direction: TransferDirection,
 }
 
-/// File transfer status
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransferStatus {
     Pending,
-    /// Incoming transfer held until the user accepts it (when
-    /// `Config::auto_accept_files` is off). Chunks are spooled to the temp
-    /// file meanwhile; declining deletes the spool and discards the rest.
+    /// Incoming transfer held until the user accepts (`auto_accept_files`
+    /// off); chunks spool meanwhile, declining deletes the spool.
     AwaitingAcceptance,
     InProgress,
     Completed,
@@ -318,8 +273,7 @@ pub enum TransferStatus {
 }
 
 impl TransferStatus {
-    /// Still running — including an incoming offer held for the user's
-    /// decision, which owns its conversation's incoming slot just the same.
+    /// Still running, including an offer awaiting the user's decision.
     pub fn is_active(&self) -> bool {
         matches!(
             self,
@@ -328,14 +282,12 @@ impl TransferStatus {
     }
 }
 
-/// Session role
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRole {
     Host,
     Client,
 }
 
-/// Session status
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     Connecting,
@@ -346,7 +298,7 @@ pub enum SessionStatus {
     Error(String),
 }
 
-/// Events sent from network session to app
+/// Events sent from a network session to the app.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Listening {
@@ -358,8 +310,7 @@ pub enum SessionEvent {
     NewConnection {
         peer_addr: String,
         fingerprint: String,
-        /// Short authentication string for this session (identical on both
-        /// ends; an interposed MITM produces two different codes).
+        /// Short authentication string (same on both ends unless MITM'd).
         sas: String,
         chat_id: Uuid,
     },
@@ -372,14 +323,13 @@ pub enum SessionEvent {
     },
     Ready,
     MessageReceived(crate::core::ProtocolMessage),
-    /// The final frame of an outgoing file transfer (`FileEnd` with this seq)
-    /// was written to the wire — only now is the transfer actually complete.
+    /// The outgoing transfer's final `FileEnd` (this seq) hit the wire; only
+    /// now is it complete.
     FileSendComplete {
         seq: u64,
     },
-    /// An outgoing text message's frame (or the last chunk of a large one)
-    /// was written to the wire with this transport seq. The app records it to
-    /// match the peer's later `Ack { acked_seq }` back to the message.
+    /// An outgoing text frame (or a large one's last chunk) was written with
+    /// this seq, used to match the peer's later `Ack { acked_seq }`.
     TextSendComplete {
         seq: u64,
     },
@@ -388,7 +338,6 @@ pub enum SessionEvent {
     Warning(String),
 }
 
-/// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub download_dir: PathBuf,
@@ -400,33 +349,27 @@ pub struct Config {
     pub theme: Theme,
     pub font_size: u8,
     pub auto_connect: bool,
-    // Auto-host settings
     #[serde(default)]
     pub auto_host_on_startup: bool,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     #[serde(default)]
     pub auto_trust_on_first_use: bool,
-    /// Enable broadcasting and discovery via mDNS (Bonjour).
-    /// Disabled by default for privacy; enabling will advertise a hostname
-    /// and a fingerprint on the local network.
+    /// Advertise and discover via mDNS. Off by default: it reveals a hostname
+    /// and fingerprint on the LAN.
     #[serde(default)]
     pub enable_mdns: bool,
     /// What a notification shows; see [`NotificationContent`].
     #[serde(default)]
     pub notification_content: NotificationContent,
-    /// Ask the router (UPnP/IGD) to forward the listening port when hosting,
-    /// and embed the discovered external address in invites. Disabled by
-    /// default: it opens a port on the router and reveals the external IP to
-    /// invite recipients.
+    /// Map the listening port via UPnP/IGD and embed the external address in
+    /// invites. Off by default: it opens a router port and reveals the IP.
     #[serde(default)]
     pub enable_upnp: bool,
     #[serde(default)]
     pub relay_server: Option<String>,
-    /// RFC 3339 timestamp of the last successful identity backup, or `None` if
-    /// the user has never made one. Recorded so the app can say "never backed
-    /// up" instead of leaving the single unrecoverable failure mode — a lost
-    /// identity file — as a line of small print the user reads once.
+    /// RFC 3339 time of the last identity backup, so the app can say "never
+    /// backed up".
     #[serde(default)]
     pub identity_backed_up_at: Option<String>,
 }
@@ -457,10 +400,8 @@ pub enum Theme {
     Rose,
 }
 
-/// The user's real Downloads directory. The old default was the **relative**
-/// path `Downloads`, which resolved against the process working directory —
-/// received files landed next to wherever the app happened to be launched from
-/// (or failed outright when that location wasn't writable).
+/// The user's real Downloads directory (absolute; the old relative default
+/// resolved against the working directory).
 pub fn default_download_dir() -> PathBuf {
     if let Some(dirs) = directories::UserDirs::new() {
         if let Some(dl) = dirs.download_dir() {
@@ -471,8 +412,7 @@ pub fn default_download_dir() -> PathBuf {
     PathBuf::from("Downloads")
 }
 
-/// A per-app scratch directory under the OS temp dir (absolute, always
-/// writable), replacing the old relative `temp` default.
+/// A per-app scratch directory under the OS temp dir.
 pub fn default_temp_dir() -> PathBuf {
     std::env::temp_dir().join("chat-p2p")
 }
@@ -509,10 +449,21 @@ fn default_listen_port() -> u16 {
 mod tests {
     use super::*;
 
+    /// A Chat as persisted before kind/transport/read_count/title_is_custom.
+    fn old_chat() -> Chat {
+        serde_json::from_str(
+            r#"{
+                "id":"00000000-0000-0000-0000-000000000000",
+                "title":"old","peer_fingerprint":null,"participants":[],
+                "messages":[],"created_at":"2020-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn config_default_is_privacy_conservative() {
         let c = Config::default();
-        // Security/privacy-sensitive defaults must stay off.
         assert!(
             !c.auto_accept_files,
             "files must not auto-accept by default"
@@ -551,10 +502,8 @@ mod tests {
 
     #[test]
     fn config_deserializes_with_optional_fields_missing() {
-        // A minimal config that predates the newer #[serde(default)] fields must
-        // still load, filling defaults for auto_host_on_startup, listen_port, etc.
-        // The retired `notification_sound` key stays in this fixture on purpose:
-        // configs saved by old versions contain it and must be tolerated.
+        // Predates the #[serde(default)] fields; the retired
+        // `notification_sound` key must still be tolerated.
         let json = r#"{
             "download_dir": "Downloads",
             "temp_dir": "temp",
@@ -588,18 +537,11 @@ mod tests {
     fn chat_kind_transport_defaults_and_back_compat() {
         assert_eq!(ChatKind::default(), ChatKind::Dm);
         assert_eq!(Transport::default(), Transport::Direct);
-        // A Chat persisted before these fields existed must still load, filling
-        // kind=Dm / transport=Direct via #[serde(default)].
-        let json = r#"{
-            "id":"00000000-0000-0000-0000-000000000000",
-            "title":"old","peer_fingerprint":null,"participants":[],
-            "messages":[],"created_at":"2020-01-01T00:00:00Z"
-        }"#;
-        let c: Chat = serde_json::from_str(json).unwrap();
+        // A Chat persisted before these fields existed loads with the defaults.
+        let c = old_chat();
         assert_eq!(c.kind, ChatKind::Dm);
         assert_eq!(c.transport, Transport::Direct);
         assert!(!c.is_host_placeholder);
-        // Round-trip preserves explicit values.
         let mut c2 = c.clone();
         c2.kind = ChatKind::Group;
         c2.transport = Transport::Relay;
@@ -608,17 +550,11 @@ mod tests {
         assert_eq!(back.transport, Transport::Relay);
     }
 
-    /// The read mark must survive a save/load cycle, or unread badges reset on
-    /// every restart and messages that arrived while the app was closed are
-    /// silently marked as seen.
+    /// The read mark survives save/load, or messages that arrived while the
+    /// app was closed are silently marked as seen.
     #[test]
     fn read_count_persists_and_defaults_for_old_history() {
-        let json = r#"{
-            "id":"00000000-0000-0000-0000-000000000000",
-            "title":"old","peer_fingerprint":null,"participants":[],
-            "messages":[],"created_at":"2020-01-01T00:00:00Z"
-        }"#;
-        let old: Chat = serde_json::from_str(json).unwrap();
+        let old = old_chat();
         assert_eq!(old.read_count, 0, "old history loads as fully unread");
 
         let mut c = old.clone();
@@ -627,21 +563,11 @@ mod tests {
         assert_eq!(back.read_count, 7);
     }
 
-    /// A user's rename must survive a save/load cycle, and old history (which
-    /// predates the flag) must load without it rather than failing to parse.
+    /// A rename survives save/load; old history loads without one.
     #[test]
     fn title_is_custom_persists_and_defaults_for_old_history() {
-        let json = r#"{
-            "id":"00000000-0000-0000-0000-000000000000",
-            "title":"old","peer_fingerprint":null,"participants":[],
-            "messages":[],"created_at":"2020-01-01T00:00:00Z"
-        }"#;
-        let old: Chat = serde_json::from_str(json).unwrap();
-        assert!(
-            !old.title_is_custom,
-            "old history has no rename recorded, so the title is still derived"
-        );
-
+        let old = old_chat();
+        assert!(!old.title_is_custom);
         let mut c = old.clone();
         c.title = "Mum".to_string();
         c.title_is_custom = true;
@@ -653,23 +579,16 @@ mod tests {
     #[test]
     fn unread_counts_only_unseen_peer_messages() {
         fn msg(from_me: bool) -> Message {
-            Message {
-                id: Uuid::new_v4(),
-                from_me,
-                content: MessageContent::Text {
-                    text: "hi".to_string(),
-                },
-                timestamp: Utc::now(),
-                delivered: false,
+            let text = MessageContent::Text {
+                text: "hi".to_string(),
+            };
+            if from_me {
+                Message::sent(Uuid::new_v4(), text)
+            } else {
+                Message::received(text, Utc::now())
             }
         }
-        let mut chat: Chat = serde_json::from_str(
-            r#"{"id":"00000000-0000-0000-0000-000000000000","title":"c",
-                "peer_fingerprint":null,"participants":[],"messages":[],
-                "created_at":"2020-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-
+        let mut chat = old_chat();
         chat.messages.push(msg(false));
         chat.messages.push(msg(false));
         assert_eq!(chat.unread_count(), 2);
@@ -684,8 +603,7 @@ mod tests {
         chat.messages.push(msg(false));
         assert_eq!(chat.unread_count(), 1);
 
-        // A read mark ahead of the message list (history trimmed/reloaded) must
-        // saturate instead of panicking on an out-of-range slice.
+        // A read mark past the end must saturate, not panic.
         chat.read_count = 99;
         assert_eq!(chat.unread_count(), 0);
     }
@@ -723,7 +641,6 @@ mod tests {
 
     #[test]
     fn contact_deserializes_without_contacts_2_0_fields() {
-        // Older persisted contacts lack trust_state/notes/tags/relay fields.
         let json = format!(
             r#"{{"id":"{}","name":"Bob","address":null,"fingerprint":null,
                  "public_key":null,"created_at":"2020-01-01T00:00:00Z","last_seen":null}}"#,

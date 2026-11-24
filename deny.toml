@@ -15,13 +15,21 @@ version = 2
 # the `image` AVIF chain, and those entries went with it.
 # Verify a claim before adding one: `cargo tree --workspace --target all -i <crate>`.
 ignore = [
-    "RUSTSEC-2023-0071", # rsa Marvin timing issue. No upstream fix. Used for
-                         # RSA-PSS *signatures* only; this app performs no RSA
-                         # decryption, which is what the attack targets.
+    # RUSTSEC-2023-0071 (rsa Marvin timing issue) was accepted here while no
+    # fix existed. rsa 0.10 does its private-key arithmetic in constant-time
+    # crypto-bigint and is listed as patched, so the entry was removed.
     "RUSTSEC-2024-0436", # paste unmaintained (proc-macro, build-time). Reached
                          # via natpmp -> netdev -> netlink-packet-utils (Linux).
                          # `image` no longer pulls it: it is built PNG-only.
     "RUSTSEC-2025-0141", # bincode unmaintained (direct in core, migration pending)
+    # chrono unmaintained (announced upstream, chronotope/chrono#1768; no
+    # release is affected by a known vulnerability). A direct dependency of
+    # core, client and desktop only -- nothing else in the tree pulls it. Its
+    # serde form (RFC 3339 strings) is inside every saved history file,
+    # identity.json and the Party server's rows and frames, so swapping it for
+    # `time`/`jiff` is a format-compatibility migration, not a bump.
+    # Unmaintained, not vulnerable (accepted 2026-11-23).
+    "RUSTSEC-2026-0543",
     # RUSTSEC-2024-0411 through -0420 (the gtk-rs GTK3 binding family: gtk,
     # gdk, atk, gtk-sys, gdk-sys, atk-sys, gdkx11, gdkx11-sys, gdkwayland-sys,
     # gtk3-macros) were accepted here as unmaintained. All ten were **withdrawn
@@ -48,15 +56,10 @@ ignore = [
     # resolves the fixed 0.41.0.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # zvariant / zbus_names / zvariant_derive unmaintained as standalone crates
-    # (folded into zbus 6). Reached only via notify-rust 4.18.2 -> zbus 5, the
-    # Linux D-Bus desktop-notification path; notify-rust has no zbus-6 release
-    # yet, so there is no upgrade to take. Unmaintained, not vulnerable: the
-    # D-Bus peer is the local session bus, never a network party. Remove when
-    # notify-rust moves to zbus 6 (accepted 2026-11-03).
-    "RUSTSEC-2026-0370",
-    "RUSTSEC-2026-0371",
-    "RUSTSEC-2026-0372",
+    # RUSTSEC-2026-0370/-0371/-0372 (zvariant / zbus_names / zvariant_derive,
+    # unmaintained as standalone crates) were accepted here for the
+    # notify-rust 4.18 -> zbus 5 path. notify-rust 4.19 moved to zbus 6, which
+    # folds them in, so they stopped firing and the entries were removed.
 ]
 
 [licenses]

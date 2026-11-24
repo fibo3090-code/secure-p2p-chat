@@ -3,17 +3,14 @@
 
 use super::*;
 
-/// Fingerprint equality for the trust paths in this file (remove, block,
-/// unblock). Stored contact fingerprints are canonical, but a block or a trust
-/// revocation that silently misses because one side was spelled in capitals
-/// is the failure that matters, so these compare without regard to case.
+/// Case-insensitive fingerprint equality for trust decisions: storage is
+/// canonical, but a block that misses on case is the failure that matters.
 fn same_fingerprint(stored: Option<&str>, fingerprint: &str) -> bool {
     stored.is_some_and(|fp| fp.eq_ignore_ascii_case(fingerprint))
 }
 
 impl ChatManager {
-    /// Parse an address of the form host:port
-    /// Returns (host, port) or an error if the format is invalid.
+    /// Parse a `host:port` address.
     pub fn parse_address(address: &str) -> Result<(String, u16)> {
         crate::util::parse_host_port(address, None).map_err(|e| {
             tracing::error!("Invalid address format for contact '{}': {}", address, e);
@@ -50,7 +47,6 @@ impl ChatManager {
             last_seen: None,
         };
         self.contacts.insert(id, contact);
-        // no chat association by default
         tracing::debug!(id = %id, total_contacts = %self.contacts.len(), "Contact added");
         id
     }
@@ -90,15 +86,7 @@ impl ChatManager {
             if let Some(existing) = self
                 .contacts
                 .values()
-                // Case-insensitively, like the self-check above. A fingerprint
-                // is hex, so the same peer spelled in a different case is the
-                // same peer — comparing exactly made them a second contact card
-                // for one person, each with its own trust state.
-                .find(|c| {
-                    c.fingerprint
-                        .as_deref()
-                        .is_some_and(|known| known.eq_ignore_ascii_case(fp))
-                })
+                .find(|c| same_fingerprint(c.fingerprint.as_deref(), fp))
                 .map(|c| c.id)
             {
                 if !signed {
@@ -127,28 +115,10 @@ impl ChatManager {
         let id = Uuid::new_v4();
         contact.id = id;
         contact.created_at = chrono::Utc::now();
-        // An invite link is not verification, and this is the layer that owns
-        // that rule. `parse_invite_link` already sets `Unverified` on both the v1
-        // and v2 paths, so nothing reaching here today is wrong — but the
-        // invariant was being *relied on* here while being *enforced* somewhere
-        // else, which is the arrangement that eventually breaks. A future invite
-        // version, or any other caller building a `Contact`, would have been
-        // taken at its word, and a pre-trusted fingerprint connects with no
-        // safety-code prompt at all.
-        //
-        // Same reasoning as `MIN_PASSWORD_LEN` living in `Identity::encrypt`
-        // rather than in the UIs: a caller that forgets must still be unable to
-        // do the unsafe thing.
-        //
-        // Only on the new-contact path. The refresh above deliberately leaves
-        // everything trust-related alone, so re-pasting someone's link cannot
-        // un-verify them.
-        //
-        // `Blocked` is preserved, and that distinction matters: this clamp exists
-        // to stop an *unearned elevation* of trust, and a block is the opposite
-        // of trust. Flattening it to `Unverified` would silently lift a block —
-        // a worse bug than the one being fixed, and precisely what
-        // `remove_contact` documents as the thing only deletion may do.
+        // An invite link is not verification, and this layer enforces it for
+        // every caller (like `MIN_PASSWORD_LEN` in `Identity::encrypt`). New
+        // contacts only, so re-pasting a link cannot un-verify anyone; `Blocked`
+        // is kept, since only deletion may lift a block.
         contact.trust_state = match contact.trust_state {
             TrustState::Blocked => TrustState::Blocked,
             TrustState::Unverified | TrustState::Verified | TrustState::Trusted => {
@@ -159,15 +129,9 @@ impl ChatManager {
         Ok(id)
     }
 
-    /// Remove a contact **and the trust that came with it**.
-    ///
-    /// Deleting used to drop the contact record only, leaving the fingerprint on
-    /// any chat that had verified it — so the peer still connected with no
-    /// prompt, and a *blocked* contact silently became unblocked because the
-    /// block lived nowhere else. Both of those made the confirmation dialog's
-    /// promise ("you would have to compare the safety code again") untrue.
-    /// Clearing the stored fingerprint restores it: the next connection from
-    /// that peer is a first contact again.
+    /// Remove a contact **and the trust that came with it**: its fingerprint is
+    /// cleared from every chat (unless another contact vouches for it), so the
+    /// peer must be verified again, and its block is lifted.
     pub fn remove_contact(&mut self, contact_id: Uuid) {
         tracing::info!(contact_id = %contact_id, "Removing contact");
         let removed = self.contacts.remove(&contact_id);
@@ -194,8 +158,7 @@ impl ChatManager {
         tracing::debug!(remaining_contacts = %self.contacts.len(), "Contact removed");
     }
 
-    /// Whether deleting this contact would also lift a block on that peer, so
-    /// the UI can say so before the user commits to it.
+    /// Whether deleting this contact would also lift a block (for the dialog).
     pub fn deleting_contact_would_unblock(&self, contact_id: Uuid) -> bool {
         self.contacts
             .get(&contact_id)
@@ -219,12 +182,8 @@ impl ChatManager {
         let fingerprint = contact.fingerprint.clone();
         tracing::info!(%contact_id, name = %name, "Contact blocked");
 
-        // Disconnect every live session with that fingerprint right away.
-        // Tearing down ONLY the SessionHandle is not enough: the network task
-        // would keep running and its events would keep being polled, so the
-        // blocked peer could still deliver messages on an established session.
-        // Dropping the event receiver too makes the task's next send fail,
-        // which ends its loop and closes the socket.
+        // Tear down every live session with that fingerprint, events receiver
+        // included, so the blocked peer cannot keep delivering.
         if let Some(fp) = fingerprint {
             let session_ids: Vec<Uuid> = self
                 .chats
@@ -233,16 +192,10 @@ impl ChatManager {
                 .map(|c| self.session_for_chat(c.id))
                 .collect();
             for sid in session_ids {
-                // An in-flight receive from this peer must be failed *before*
-                // the mapping is dropped — that mapping is how a session id
-                // resolves back to its conversation. Otherwise blocking someone
-                // mid-transfer leaves a progress row that never finishes and an
-                // orphaned temp spool, exactly as a mid-receive disconnect used
-                // to.
+                // Fail receives before dropping the mapping that resolves them.
                 self.fail_incoming_transfers(sid, "blocked this contact");
                 let had_session = self.sessions.contains_key(&sid);
-                // Aborts the task too: a task parked on a socket read has
-                // nothing to send, so dropping its handles alone never stops it.
+                // Aborts the task too (a task parked on a read never notices).
                 self.teardown_session(sid);
                 self.chat_id_mapping.retain(|_, v| *v != sid);
                 if had_session {
@@ -285,18 +238,15 @@ impl ChatManager {
 
     /// Whether a peer fingerprint belongs to a blocked contact.
     pub(super) fn is_fingerprint_blocked(&self, fingerprint: &str) -> bool {
-        // Case-insensitive on top of canonical storage: a block is the one
-        // comparison where a false negative lets someone in.
         self.contacts.values().any(|c| {
             c.trust_state == TrustState::Blocked
                 && same_fingerprint(c.fingerprint.as_deref(), fingerprint)
         })
     }
 
-    /// Record a successful TOFU confirmation on the matching contact: the
-    /// contact bound to this chat (or one sharing the fingerprint) becomes
-    /// Verified, filling in its fingerprint when it had none. Blocked contacts
-    /// are never promoted.
+    /// Record a TOFU confirmation on the matching contact (bound to this chat,
+    /// or sharing the fingerprint): it becomes Verified, gaining the fingerprint
+    /// if it had none. Blocked contacts are never promoted.
     pub(super) fn promote_contact_verified(&mut self, chat_id: Uuid, fingerprint: &str) {
         let contact_id = self
             .contact_to_chat
@@ -327,7 +277,30 @@ impl ChatManager {
         }
     }
 
-    /// Associate a contact with a one-to-one chat (useful when a session is created for that contact)
+    /// Replace a contact's fingerprint with one the user accepted over an
+    /// invite-mismatch warning (CRYPTO-04), and reset it to `Unverified` so
+    /// `promote_contact_verified` records the acceptance. Blocked contacts are
+    /// left alone: a block is never lifted or moved by a connection attempt.
+    pub(super) fn rebind_contact_fingerprint(&mut self, contact_id: Uuid, fingerprint: &str) {
+        let Some(contact) = self.contacts.get_mut(&contact_id) else {
+            return;
+        };
+        if contact.trust_state == TrustState::Blocked {
+            return;
+        }
+        tracing::warn!(
+            contact = %contact.name,
+            old = ?contact.fingerprint,
+            new = %fingerprint,
+            "Contact rebound to a key the user accepted over its invite"
+        );
+        contact.fingerprint = Some(fingerprint.to_string());
+        // The public key the invite carried belongs to the old fingerprint.
+        contact.public_key = None;
+        contact.trust_state = TrustState::Unverified;
+    }
+
+    /// Associate a contact with a one-to-one chat.
     pub fn associate_contact_with_chat(&mut self, contact_id: Uuid, chat_id: Uuid) {
         tracing::debug!(
             "associate_contact_with_chat: contact_id={}, chat_id={}",
@@ -343,8 +316,7 @@ impl ChatManager {
         tracing::info!("Associated contact {} -> chat {}", contact_id, chat_id);
     }
 
-    /// Attempt to reconnect to previously mapped contacts based on persisted history.
-    /// Best-effort: skips missing contacts and logs warnings instead of failing fast.
+    /// Best-effort reconnect to previously mapped contacts.
     pub async fn auto_reconnect_contacts(&mut self, privkey: &RsaPrivateKey) {
         if !self.config.auto_connect {
             tracing::info!("auto_connect disabled; skipping auto reconnect");

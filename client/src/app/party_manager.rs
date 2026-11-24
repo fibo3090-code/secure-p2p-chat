@@ -1,26 +1,15 @@
-//! Client-side Party manager (Phase 1, slice 4).
+//! Client-side Party manager: owns the connections to community servers (one
+//! background task each), and the per-server state the UIs render, updated by
+//! `poll_events` from the UI loop.
 //!
-//! The business-logic half of the Party tab: it owns the client's connections to
-//! Party servers, runs a background read/write task per connection (mirroring the
-//! P2P session model), and tracks per-server state — directory, channels, and
-//! per-channel message history — that the GUI/TUI render. State updates are driven
-//! by `poll_events`, polled from the UI loop just like `poll_session_events`.
+//! The server does not echo a sender's own broadcast, so outgoing posts are
+//! shown optimistically and tracked in `awaiting` until the server's ordered
+//! `MessagePosted` / `ActionFailed` reply confirms or retracts them.
 //!
-//! Message handling: the server broadcasts a post to every member *except* the
-//! sender, so the manager appends the sender's own message optimistically when
-//! `post` is called, and appends others' messages as `Message` broadcasts arrive.
-//! Every optimistic append is tracked in `awaiting` so the server's ordered
-//! `MessagePosted` / `ActionFailed` reply can confirm or retract exactly that
-//! message.
-//!
-//! History: durable channel history is requested once per channel, when the
-//! channel list arrives — **not** when `Joined` arrives. The client pipelines
-//! `Join`, `ListChannels`, `ListMembers`, so the server answers `Joined` first,
-//! while the channel list is still empty; seeding there meant the loop had
-//! nothing to iterate and no channel history was ever fetched at all. Responses
-//! are paged (`MAX_HISTORY_BATCH` envelopes or `HISTORY_PAGE_BYTES`, whichever
-//! comes first), so a page the server cut short triggers a request for the next
-//! one (see [`history_page_may_continue`]).
+//! Durable history is requested once per thread when the *channel list*
+//! arrives, not on `Joined` (the pipelined `Join` → `ListChannels` →
+//! `ListMembers` answers `Joined` first, while the list is still empty). Pages
+//! the server cut short are continued (see [`history_page_may_continue`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -32,7 +21,7 @@ use messenger_core::party::{
     MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -42,38 +31,33 @@ const MIN_UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
 /// Ceiling on reaching a community server: TCP connect plus the handshake.
 pub const PARTY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+const HASH_MISMATCH: &str =
+    "The server sent a file that does not match the one that was requested. It was not saved.";
+
 /// What happened when the client tried to join a community server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartyJoinOutcome {
-    /// The server's identity was already pinned (or has just been confirmed by
-    /// the user), the credentials have been sent, and the join is in flight.
-    /// Watch `PartyServerConn::status` for the result.
+    /// The server's identity matched the pinned/confirmed one, the credentials
+    /// were sent, and the join is in flight (watch `PartyServerConn::status`).
     Joining {
         server_id: Uuid,
         fingerprint: String,
     },
-    /// This address has never been joined before. Nothing was sent — not the
-    /// username, not the password. Show the fingerprint for an out-of-band
-    /// comparison with the one the server prints at startup, then call again
-    /// with that fingerprint as `expected_fingerprint`.
-    ///
-    /// `sas` is this connection's short code. It is kept for diagnostics only:
-    /// the operator never sees it (the server does not display one), and it
-    /// belongs to a connection that is closed before the credentials are sent,
-    /// so it cannot be what the user compares.
+    /// First contact with this address: nothing was sent. Show the fingerprint
+    /// for an out-of-band check against the one the server prints at startup,
+    /// then call again with it as `expected_fingerprint`. `sas` is diagnostic
+    /// only — the operator never sees it.
     NeedsVerification { fingerprint: String, sas: String },
 }
 
-/// The result of [`PartyManager::dial`]: either a connection whose identity
-/// matched the expected fingerprint, or a first contact to show the user.
+/// The result of [`PartyManager::dial`].
 pub enum PartyDial {
     Verified(Box<VerifiedParty>),
     NeedsVerification { fingerprint: String, sas: String },
 }
 
-/// A handshaken connection whose server fingerprint matched the one the user
-/// verified. Only [`PartyManager::dial`] makes one, so holding it is proof the
-/// check ran; [`PartyManager::attach`] is the only thing that consumes it.
+/// A handshaken connection whose fingerprint matched the verified one. Only
+/// [`PartyManager::dial`] makes one and only [`PartyManager::attach`] consumes it.
 pub struct VerifiedParty {
     client: messenger_core::party::PartyClient<tokio::net::TcpStream>,
     fingerprint: String,
@@ -102,22 +86,17 @@ enum Incoming {
     Disconnected,
 }
 
-/// A request whose reply the client is still waiting for.
-///
-/// The server answers one request at a time down one connection, so replies
-/// arrive in exactly the order these are queued — and that order is the only
-/// correlation available: `MessagePosted`, `ActionFailed` and `UploadReady`
-/// name nothing the client chose.
+/// A request whose reply is still awaited. Replies arrive in request order on
+/// one connection, and that order is the only correlation available.
 enum AwaitingReply {
-    /// A send answered by `MessagePosted` or `ActionFailed`. `shown` is the
-    /// optimistic copy already on screen (`None` for a share, which shows
-    /// nothing until the server stores it).
+    /// Answered by `MessagePosted`/`ActionFailed`. `shown` is the optimistic
+    /// copy on screen (`None` for a share, which shows nothing).
     Send {
         thread: Uuid,
         shown: Option<Envelope>,
     },
-    /// A chunked-upload offer, answered by `UploadReady` or `ActionFailed`.
-    /// Holds the bytes to stream once the server accepts.
+    /// A chunked-upload offer (answered by `UploadReady`/`ActionFailed`),
+    /// holding the bytes to stream once accepted.
     UploadOffer {
         thread: Uuid,
         shown: Envelope,
@@ -125,8 +104,7 @@ enum AwaitingReply {
     },
 }
 
-/// A chunked download in progress: the bytes received so far and the caller
-/// waiting for the whole file.
+/// A chunked download in progress.
 struct ChunkedDownload {
     data: Vec<u8>,
     tx: oneshot::Sender<Result<Vec<u8>, String>>,
@@ -135,8 +113,7 @@ struct ChunkedDownload {
 /// Per-server connection state shown in the Party tab.
 pub struct PartyServerConn {
     pub address: String,
-    /// The username this client joined (or is joining) with; kept so the UI can
-    /// offer one-click rejoin after a disconnect or restart.
+    /// Kept so the UI can offer one-click rejoin.
     pub username: String,
     pub server_name: String,
     pub server_fingerprint: String,
@@ -144,64 +121,77 @@ pub struct PartyServerConn {
     pub status: PartyStatus,
     pub channels: Vec<ChannelInfo>,
     pub members: Vec<MemberInfo>,
-    /// Per-channel message history (delivery order).
+    /// Per-thread message history (delivery order).
     pub messages: HashMap<Uuid, Vec<Envelope>>,
-    /// The most recent error this server replied with (e.g. a rejected post),
-    /// surfaced in the UI until superseded. Without this, server errors were
-    /// silently dropped and a failed action looked like it simply did nothing.
+    /// The most recent server error, shown until superseded.
     pub last_error: Option<String>,
     /// The most recent successful governance action, for a confirmation toast.
     pub last_notice: Option<String>,
-    /// Files shared here that this member may see (the Drive panel), refreshed
-    /// by `ListFiles`.
+    /// Files this member may see (Drive panel), refreshed by `ListFiles`.
     pub files: Vec<FileEntry>,
     /// This member's storage usage, refreshed by `FetchQuota`.
     pub quota: Option<QuotaInfo>,
-    /// The server's audit log, newest first. Only ever populated for admins.
+    /// The server's audit log, newest first (admins only).
     pub audit: Vec<AuditEntry>,
-    /// Channels (and DM threads) whose durable history has been requested since
-    /// this connection joined, so a refreshed channel list does not re-fetch
-    /// everything on every broadcast.
+    /// Threads whose history was already requested on this connection.
     history_requested: HashSet<Uuid>,
-    /// Sends and upload offers awaiting the server's reply, oldest first (see
-    /// [`AwaitingReply`]).
-    ///
-    /// Without this correlation a refused post simply stayed on screen looking
-    /// delivered. Every request that the server answers with `MessagePosted`,
-    /// `ActionFailed` or `UploadReady` must be queued here, in the order it was
-    /// sent — including a share, which shows nothing locally: leaving it out
-    /// let its reply confirm or retract whichever message was next in line.
-    ///
-    /// The on-screen message is found by value (an unconfirmed `seq == 0`
-    /// envelope equal to `shown`), never by a stored index: an index went stale
-    /// as soon as a history page re-sorted the thread, after which a
-    /// confirmation stamped its sequence onto someone else's message and a
-    /// refusal deleted someone else's message instead of the refused one.
+    /// Requests answered by `MessagePosted`/`ActionFailed`/`UploadReady`, in
+    /// send order — shares included, or their reply would hit the next send.
+    /// The on-screen row is found by value (an unconfirmed seq-0 envelope equal
+    /// to `shown`), never by index: a history page re-sorts the thread.
     awaiting: VecDeque<AwaitingReply>,
     outgoing_tx: mpsc::UnboundedSender<PartyRequest>,
     incoming_rx: mpsc::UnboundedReceiver<Incoming>,
-    /// Chunked downloads in progress, keyed by content hash: the bytes so far,
-    /// plus the one-shot waiting for the whole file.
+    /// Chunked downloads in progress, keyed by content hash.
     chunked_downloads: HashMap<String, ChunkedDownload>,
-    /// In-flight file downloads, keyed by content hash. A `DownloadFile` request
-    /// registers a one-shot here; the matching `FileData` response (drained by
-    /// `poll_events`) completes it with the bytes. A server `Error` (e.g. the file
-    /// is gone or access is denied — the error is not hash-correlated on the wire)
-    /// or a disconnect fails every in-flight download instead, so a caller awaiting
-    /// the receiver never hangs forever.
+    /// Single-frame downloads awaiting `FileData`, keyed by content hash.
+    /// `UNKNOWN_FILE_ERROR` (not hash-correlated) or a disconnect fails them all.
     pending_downloads: HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>,
 }
 
 impl PartyServerConn {
+    fn new(
+        address: &str,
+        username: &str,
+        fingerprint: String,
+        outgoing_tx: mpsc::UnboundedSender<PartyRequest>,
+        incoming_rx: mpsc::UnboundedReceiver<Incoming>,
+    ) -> Self {
+        Self {
+            address: address.to_string(),
+            username: username.to_string(),
+            server_name: String::new(),
+            server_fingerprint: fingerprint,
+            member_id: None,
+            status: PartyStatus::Connecting,
+            channels: Vec::new(),
+            members: Vec::new(),
+            messages: HashMap::new(),
+            last_error: None,
+            last_notice: None,
+            files: Vec::new(),
+            quota: None,
+            audit: Vec::new(),
+            history_requested: HashSet::new(),
+            awaiting: VecDeque::new(),
+            outgoing_tx,
+            incoming_rx,
+            pending_downloads: HashMap::new(),
+            chunked_downloads: HashMap::new(),
+        }
+    }
+
     fn send(&self, req: PartyRequest) -> Result<()> {
         self.outgoing_tx
             .send(req)
             .map_err(|_| anyhow!("connection to server is closed"))
     }
 
-    /// Show an outgoing message right away and send the request that stores
-    /// it, remembering it so the server's ordered reply can either stamp it
-    /// with its real sequence or take it back off the screen.
+    fn me(&self) -> Result<Uuid> {
+        self.member_id.ok_or_else(|| anyhow!("not joined yet"))
+    }
+
+    /// Show an outgoing message and send the request that stores it.
     fn send_shown(&mut self, thread: Uuid, shown: Envelope, req: PartyRequest) -> Result<()> {
         self.show(thread, shown.clone());
         self.awaiting.push_back(AwaitingReply::Send {
@@ -211,12 +201,8 @@ impl PartyServerConn {
         self.send_or_take_back(req, thread, &shown)
     }
 
-    /// Offer a chunked upload, showing its message right away and holding its
-    /// bytes until the server accepts.
-    ///
-    /// Nothing is streamed yet: the server checks the declared size against the
-    /// hard ceiling and the uploader's allowance first, so a file that will be
-    /// refused costs one round trip instead of a full transfer.
+    /// Offer a chunked upload, holding its bytes until the server accepts (so a
+    /// refused file costs one round trip, not a full transfer).
     fn offer_upload(
         &mut self,
         thread: Uuid,
@@ -238,9 +224,8 @@ impl PartyServerConn {
         self.messages.entry(thread).or_default().push(shown);
     }
 
-    /// Send a request whose message is already on screen. If the connection is
-    /// gone, nothing will ever answer it: take the message back and forget it,
-    /// so the caller's error is the only outcome.
+    /// If the connection is gone nothing will answer: take the message back so
+    /// the caller's error is the only outcome.
     fn send_or_take_back(
         &mut self,
         req: PartyRequest,
@@ -255,7 +240,6 @@ impl PartyServerConn {
         sent
     }
 
-    /// Where an unconfirmed message sits in its thread right now.
     fn find_unconfirmed(&self, thread: Uuid, shown: &Envelope) -> Option<usize> {
         self.messages
             .get(&thread)?
@@ -275,9 +259,7 @@ impl PartyServerConn {
         true
     }
 
-    /// The server stored the oldest awaited send as `seq`: stamp the real
-    /// sequence onto the message on screen so a later history page merges
-    /// cleanly instead of duplicating it.
+    /// The server stored the oldest awaited send as `seq`: stamp it on screen.
     fn confirm_oldest(&mut self, seq: u64) {
         let Some(AwaitingReply::Send { thread, shown }) = self.awaiting.pop_front() else {
             tracing::warn!(seq, "MessagePosted with no send awaiting it");
@@ -289,20 +271,15 @@ impl PartyServerConn {
         };
         let list = self.messages.get_mut(&thread).expect("found above");
         if list.iter().any(|e| e.seq == seq) {
-            // A history page already delivered the stored copy of this very
-            // message; keeping ours too would show it twice.
+            // A history page already delivered the stored copy.
             list.remove(index);
         } else {
             list[index].seq = seq;
         }
     }
 
-    /// The server refused the oldest awaited send or upload offer: take its
-    /// message back off the screen. Leaving it there is the failure this exists
-    /// to prevent — the user believes a message was delivered that the server
-    /// never stored, and nothing later corrects them. A refused offer also drops
-    /// its bytes, so they can never be streamed under another upload's id.
-    /// Returns whether a message was retracted.
+    /// The server refused the oldest awaited send or offer: take its message
+    /// back (and drop an offer's bytes). Returns whether one was retracted.
     fn retract_oldest(&mut self) -> bool {
         match self.awaiting.pop_front() {
             Some(AwaitingReply::Send {
@@ -316,8 +293,7 @@ impl PartyServerConn {
         }
     }
 
-    /// The server accepted the oldest upload offer as `upload`: stream the
-    /// bytes, finish it, and wait for the post that the finished upload becomes.
+    /// The server accepted the oldest offer as `upload`: stream and finish it.
     fn stream_accepted_upload(&mut self, upload: Uuid, chunk_size: u32) {
         let Some(AwaitingReply::UploadOffer {
             thread,
@@ -325,14 +301,11 @@ impl PartyServerConn {
             data,
         }) = self.awaiting.pop_front()
         else {
-            // Out of step with the server: nothing here asked for this upload.
             tracing::warn!(%upload, "UploadReady with no upload offer awaiting it");
             let _ = self.send(PartyRequest::CancelUpload { upload });
             return;
         };
-        // The server picks the chunk size, but not without limit: honouring a
-        // 1-byte (or 0-byte) answer turned one file into millions of queued
-        // requests on this side.
+        // Bounded: a 0/1-byte chunk size would queue millions of requests.
         let chunk = (chunk_size as usize).clamp(MIN_UPLOAD_CHUNK_BYTES, PARTY_CHUNK_BYTES);
         for part in data.chunks(chunk) {
             let req = PartyRequest::UploadChunk {
@@ -340,11 +313,11 @@ impl PartyServerConn {
                 data: part.to_vec(),
             };
             if self.send(req).is_err() {
-                return; // the connection went away; nothing to clean up here
+                return;
             }
         }
-        // `FinishUpload` is answered like any other send. Queued now, not when
-        // the offer was made: requests sent in between are answered first.
+        // `FinishUpload` is answered like a send; queued now, after anything
+        // sent since the offer.
         self.awaiting.push_back(AwaitingReply::Send {
             thread,
             shown: Some(shown),
@@ -352,21 +325,21 @@ impl PartyServerConn {
         let _ = self.send(PartyRequest::FinishUpload { upload });
     }
 
-    /// Ask for a thread's durable history once. Returns false if it was already
-    /// requested on this connection.
-    fn request_history_once(&mut self, thread: Uuid, is_dm_peer: Option<Uuid>) -> bool {
-        if !self.history_requested.insert(thread) {
-            return false;
+    /// Ask for a thread's durable history once per connection.
+    fn request_history_once(&mut self, thread: Uuid, dm_peer: Option<Uuid>) {
+        if self.history_requested.insert(thread) {
+            let _ = self.send(history_request(thread, dm_peer, 0));
         }
-        let req = match is_dm_peer {
-            Some(with) => PartyRequest::FetchDmHistory { with, since_seq: 0 },
-            None => PartyRequest::FetchHistory {
-                channel: thread,
-                since_seq: 0,
-            },
-        };
-        let _ = self.send(req);
-        true
+    }
+}
+
+fn history_request(thread: Uuid, dm_peer: Option<Uuid>, since_seq: u64) -> PartyRequest {
+    match dm_peer {
+        Some(with) => PartyRequest::FetchDmHistory { with, since_seq },
+        None => PartyRequest::FetchHistory {
+            channel: thread,
+            since_seq,
+        },
     }
 }
 
@@ -374,7 +347,7 @@ impl PartyServerConn {
 #[derive(Default)]
 pub struct PartyManager {
     servers: HashMap<Uuid, PartyServerConn>,
-    /// Last connection error, surfaced in the UI until dismissed or superseded.
+    /// Last connection error, shown until dismissed or superseded.
     last_error: Option<String>,
 }
 
@@ -383,47 +356,25 @@ impl PartyManager {
         Self::default()
     }
 
-    /// Record a connection error (e.g. a failed handshake) for the UI to show.
     pub fn set_last_error(&mut self, message: String) {
         self.last_error = Some(message);
     }
 
-    /// The last connection error, if any.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
 
-    /// Clear the last connection error (e.g. when the user dismisses it).
     pub fn clear_last_error(&mut self) {
         self.last_error = None;
     }
 
-    /// Connect to a Party server, complete the v3 handshake, and queue a join plus
-    /// an initial directory + history fetch. Returns the local server id. The
-    /// server fingerprint is captured for TOFU display; the caller is responsible
-    /// for surfacing it for verification.
-    ///
-    /// `expected_fingerprint` is the identity this address was pinned to on a
-    /// previous join. It is checked **before the `Join` frame is written**,
-    /// because that frame carries the user's community username and password:
-    /// verifying afterwards means a server that swapped its key — a redeploy, or
-    /// someone who took over the address — has already been handed the
-    /// credentials it was supposed to prove it deserved. The handshake is
-    /// authenticated, so a mismatch here is the whole point of pinning.
-    ///
-    /// When there is **no** expected fingerprint — the first time this address
-    /// is used — it connects only far enough to learn the server's fingerprint,
-    /// hangs up without sending anything and returns
-    /// [`PartyJoinOutcome::NeedsVerification`]. The shell shows that fingerprint
-    /// for an out-of-band check against the one the operator's server prints at
-    /// startup, then calls again **passing the fingerprint the user accepted**.
-    ///
-    /// There is deliberately no "trust whatever answers" mode. The second call
-    /// opens a new connection, and the old `trust_new_identity: true` flag let
-    /// it send the credentials to whatever key answered *that* connection — the
-    /// verified fingerprint was never compared with it, so a man in the middle
-    /// could let the first connection through and intercept the second (audit
-    /// SRV-05 / TAURI-01 / TUI-02 / UI-01).
+    /// Connect, handshake and (once verified) join, queueing the directory
+    /// fetch. `expected_fingerprint` is checked **before** the `Join` frame —
+    /// which carries the username and password — is written. With `None` (first
+    /// contact) it hangs up after the handshake and returns
+    /// [`PartyJoinOutcome::NeedsVerification`]; the shell calls again with the
+    /// fingerprint the user accepted. There is deliberately no "trust whatever
+    /// answers" mode (audit SRV-05 / TAURI-01 / TUI-02 / UI-01).
     pub async fn connect_and_join(
         &mut self,
         address: &str,
@@ -441,11 +392,9 @@ impl PartyManager {
         }
     }
 
-    /// The network half of [`connect_and_join`](Self::connect_and_join):
-    /// reach the server, complete the handshake and check its fingerprint.
-    /// It touches no manager state, so a shell can run it **without holding
-    /// its UI loop or the manager** and hand the result to
-    /// [`attach`](Self::attach) afterwards. Nothing is sent to the server.
+    /// The network half of [`connect_and_join`](Self::connect_and_join): reach
+    /// the server, handshake, check the fingerprint. Touches no manager state
+    /// (so a shell can run it without holding its lock) and sends nothing.
     pub async fn dial(
         address: &str,
         privkey: &RsaPrivateKey,
@@ -454,9 +403,7 @@ impl PartyManager {
         use messenger_core::party::PartyClient;
 
         let (host, port) = parse_host_port(address, Some(messenger_core::PORT_DEFAULT))?;
-        // Bounded: an address that silently drops packets used to hold the
-        // caller for the OS connect timeout (75 s or more), and both shells call
-        // this while holding their UI loop or the party lock (TUI-08, APP-10).
+        // Bounded: callers hold their UI loop or the party lock (TUI-08, APP-10).
         let client = tokio::time::timeout(PARTY_CONNECT_TIMEOUT, async {
             let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
             // Frames are small and latency-bound: no Nagle (audit NET-04).
@@ -475,9 +422,8 @@ impl PartyManager {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
+            // Returning drops `client`, closing the stream with nothing sent.
             Some(expected) if !expected.eq_ignore_ascii_case(&fingerprint) => {
-                // Drop the connection without sending anything. `client` owns the
-                // stream, so returning here closes it.
                 bail!(
                     "SECURITY: this server's identity is not the one you verified \
                      (expected {}…, got {}…). Your username and password were NOT sent. \
@@ -493,18 +439,14 @@ impl PartyManager {
                 fingerprint,
             }))),
             None => {
-                // First contact with this address. Hang up before the `Join`
-                // frame — it carries the credentials — and let the shell show
-                // the fingerprint for an out-of-band check.
                 let sas = client.sas().to_string();
                 Ok(PartyDial::NeedsVerification { fingerprint, sas })
             }
         }
     }
 
-    /// The state half of [`connect_and_join`](Self::connect_and_join): take a
-    /// connection whose fingerprint [`dial`](Self::dial) has already checked,
-    /// send the `Join` (this is where the credentials go out) and register it.
+    /// The state half of [`connect_and_join`](Self::connect_and_join): send the
+    /// `Join` (the credentials) on a verified connection and register it.
     pub fn attach(
         &mut self,
         address: &str,
@@ -522,20 +464,10 @@ impl PartyManager {
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<PartyRequest>();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Incoming>();
 
-        // Connection task: two independent pumps, one per direction.
-        //
-        // It used to be one loop that selected between "send the next request"
-        // and "read the next response", building a fresh read each iteration.
-        // `recv_framed` is not cancel-safe (a length prefix, then the body), so
-        // whenever a request won the race while a response was half-read, the
-        // bytes already consumed were thrown away, the next read failed to
-        // decrypt, and the connection dropped — reliably, while a large
-        // download streamed in and the user kept posting. The server hit and
-        // fixed the same bug (`server/src/connection.rs`). Separate pumps never
-        // abandon a read, and a slow write never stops the reading either.
+        // Two independent pumps, one per direction: `recv_framed` is not
+        // cancel-safe, so a read must never lose a `select!` race mid-frame.
         tokio::spawn(async move {
             let send_requests = async {
-                // Ends when the manager drops this connection, or the write fails.
                 while let Some(req) = outgoing_rx.recv().await {
                     if writer.send(&req).await.is_err() {
                         break;
@@ -543,16 +475,13 @@ impl PartyManager {
                 }
             };
             let forward_responses = async {
-                // Ends when the server closes, a frame fails to authenticate, or
-                // the manager stops listening.
                 while let Ok(resp) = reader.recv().await {
                     if incoming_tx.send(Incoming::Response(resp)).is_err() {
                         break;
                     }
                 }
             };
-            // Either direction ending ends the connection; dropping the other
-            // pump mid-frame is fine, because nothing reads after it.
+            // Either ending ends the connection; nothing reads after it.
             tokio::select! {
                 _ = send_requests => {}
                 _ = forward_responses => {}
@@ -560,30 +489,13 @@ impl PartyManager {
             let _ = incoming_tx.send(Incoming::Disconnected);
         });
 
-        let conn = PartyServerConn {
-            address: address.to_string(),
-            username: username.to_string(),
-            server_name: String::new(),
-            server_fingerprint: fingerprint.clone(),
-            member_id: None,
-            status: PartyStatus::Connecting,
-            channels: Vec::new(),
-            members: Vec::new(),
-            messages: HashMap::new(),
-            last_error: None,
-            last_notice: None,
-            files: Vec::new(),
-            quota: None,
-            audit: Vec::new(),
-            history_requested: HashSet::new(),
-            awaiting: VecDeque::new(),
+        let conn = PartyServerConn::new(
+            address,
+            username,
+            fingerprint.clone(),
             outgoing_tx,
             incoming_rx,
-            pending_downloads: HashMap::new(),
-            chunked_downloads: HashMap::new(),
-        };
-
-        // Join, then load the directory.
+        );
         conn.send(PartyRequest::Join {
             username: username.to_string(),
             password,
@@ -599,40 +511,27 @@ impl PartyManager {
         })
     }
 
-    /// Post a message to a channel. The message is appended locally right away
-    /// (the server won't echo the sender's own broadcast).
+    /// Post a message to a channel (shown locally right away).
     pub fn post(&mut self, server_id: Uuid, channel: Uuid, text: String) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        let sender = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
-        let shown = outgoing(sender, channel, MessagePayload::Text(text.clone()));
+        let conn = self.conn_mut(server_id)?;
+        let shown = outgoing(conn.me()?, channel, MessagePayload::Text(text.clone()));
         conn.send_shown(channel, shown, PartyRequest::PostMessage { channel, text })
     }
 
-    /// Send a direct message to another member. Stored locally under the (shared)
-    /// DM thread id immediately; the server delivers it to the recipient.
+    /// Send a direct message (shown locally under the shared DM thread id).
     pub fn send_dm(&mut self, server_id: Uuid, to: Uuid, text: String) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
+        let conn = self.conn_mut(server_id)?;
+        let me = conn.me()?;
         let thread = dm_thread_id(me, to);
         let shown = outgoing(me, thread, MessagePayload::Text(text.clone()));
         conn.send_shown(thread, shown, PartyRequest::SendDm { to, text })
     }
 
-    /// Request DM history with another member (offline catch-up). Idempotent
-    /// per connection: opening the thread repeatedly does not re-fetch it.
+    /// Request DM history with another member (once per connection).
     pub fn fetch_dm_history(&mut self, server_id: Uuid, with: Uuid) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
-        conn.request_history_once(dm_thread_id(me, with), Some(with));
+        let conn = self.conn_mut(server_id)?;
+        let thread = dm_thread_id(conn.me()?, with);
+        conn.request_history_once(thread, Some(with));
         Ok(())
     }
 
@@ -640,29 +539,18 @@ impl PartyManager {
     pub fn dm_messages(&self, server_id: Uuid, peer: Uuid) -> Vec<Envelope> {
         self.servers
             .get(&server_id)
-            .and_then(|conn| {
-                conn.member_id.map(|me| {
-                    conn.messages
-                        .get(&dm_thread_id(me, peer))
-                        .cloned()
-                        .unwrap_or_default()
-                })
-            })
+            .and_then(|conn| conn.messages.get(&dm_thread_id(conn.member_id?, peer)))
+            .cloned()
             .unwrap_or_default()
     }
 
-    /// Create a new channel on the server. The server replies with the refreshed
-    /// channel list, applied on the next poll.
+    /// Create a channel; the refreshed list arrives on a later poll.
     pub fn create_channel(&self, server_id: Uuid, name: String) -> Result<()> {
-        let conn = self
-            .servers
-            .get(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        conn.send(PartyRequest::CreateChannel { name })
+        self.conn(server_id)?
+            .send(PartyRequest::CreateChannel { name })
     }
 
-    /// Create a channel of a specific kind. `members` seeds a private channel's
-    /// membership and is ignored for every other kind.
+    /// Create a channel of a specific kind (`members` seeds a private channel).
     pub fn create_channel_of_kind(
         &self,
         server_id: Uuid,
@@ -705,8 +593,7 @@ impl PartyManager {
             .send(PartyRequest::SetRole { member, role })
     }
 
-    /// Ask for the files this member may see; the answer lands in
-    /// `PartyServerConn::files`.
+    /// Refresh `PartyServerConn::files` and `quota`.
     pub fn refresh_files(&self, server_id: Uuid) -> Result<()> {
         let conn = self.conn(server_id)?;
         conn.send(PartyRequest::ListFiles)?;
@@ -721,9 +608,8 @@ impl PartyManager {
         })
     }
 
-    /// Post a file you already hold into another channel or DM, without
-    /// re-uploading it. `from` is the location you are sharing it *from*, which
-    /// is where your right to do so comes from.
+    /// Post a file you already hold into another location without re-uploading.
+    /// `from` is where you are sharing it from (the source of your right to).
     pub fn share_file(
         &mut self,
         server_id: Uuid,
@@ -731,16 +617,12 @@ impl PartyManager {
         from: Uuid,
         target: UploadTarget,
     ) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
+        let conn = self.conn_mut(server_id)?;
         let thread = match target {
             UploadTarget::Channel(id) => id,
             UploadTarget::Dm(to) => dm_thread_id(conn.member_id.unwrap_or_default(), to),
         };
-        // Answered like a post, so it takes its place in the reply order even
-        // though nothing is shown until the server stores it.
+        // Answered like a post, so it takes its place in the reply order.
         conn.awaiting.push_back(AwaitingReply::Send {
             thread,
             shown: None,
@@ -752,8 +634,8 @@ impl PartyManager {
         sent
     }
 
-    /// Change what a shared file grants — by default (`member: None`) or for one
-    /// member. The server refuses anything the caller does not hold themselves.
+    /// Change what a shared file grants, by default (`member: None`) or for one
+    /// member. The server refuses anything the caller does not hold.
     pub fn set_file_permissions(
         &self,
         server_id: Uuid,
@@ -771,7 +653,7 @@ impl PartyManager {
             })
     }
 
-    /// Ask for the audit log; the answer lands in `PartyServerConn::audit`.
+    /// Refresh `PartyServerConn::audit`.
     pub fn refresh_audit(&self, server_id: Uuid, limit: u32) -> Result<()> {
         self.conn(server_id)?
             .send(PartyRequest::FetchAuditLog { limit })
@@ -797,10 +679,13 @@ impl PartyManager {
             .ok_or_else(|| anyhow!("unknown server"))
     }
 
-    /// Upload a file to a channel: append it optimistically (so the sender sees it
-    /// immediately, since the server won't echo their own broadcast) and send a
-    /// `PostFile`. `name`/`mime` describe the file; `data` is its bytes. Errors if
-    /// the payload exceeds [`MAX_INLINE_FILE_BYTES`] (the server would reject it).
+    fn conn_mut(&mut self, server_id: Uuid) -> Result<&mut PartyServerConn> {
+        self.servers
+            .get_mut(&server_id)
+            .ok_or_else(|| anyhow!("unknown server"))
+    }
+
+    /// Upload a file to a channel (shown locally right away).
     pub fn send_file(
         &mut self,
         server_id: Uuid,
@@ -809,38 +694,10 @@ impl PartyManager {
         mime: String,
         data: Vec<u8>,
     ) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        let sender = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
-        let shown = outgoing(
-            sender,
-            channel,
-            MessagePayload::File(file_meta(&name, &mime, &data)?),
-        );
-        // Small files go inline in one request; anything larger is streamed,
-        // because a single frame is bounded by MAX_PACKET_SIZE.
-        if data.len() <= MAX_INLINE_FILE_BYTES {
-            let req = PartyRequest::PostFile {
-                channel,
-                name,
-                mime,
-                data,
-            };
-            return conn.send_shown(channel, shown, req);
-        }
-        let req = PartyRequest::StartUpload {
-            name,
-            mime,
-            size: data.len() as u64,
-            target: UploadTarget::Channel(channel),
-        };
-        conn.offer_upload(channel, shown, req, data)
+        self.upload(server_id, UploadTarget::Channel(channel), name, mime, data)
     }
 
-    /// Upload a file as a direct message to another member. Mirrors [`send_file`]
-    /// but stores under the shared DM thread id and sends `SendFileDm`.
+    /// Upload a file as a direct message, like [`send_file`](Self::send_file).
     pub fn send_file_dm(
         &mut self,
         server_id: Uuid,
@@ -849,23 +706,44 @@ impl PartyManager {
         mime: String,
         data: Vec<u8>,
     ) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        let me = conn.member_id.ok_or_else(|| anyhow!("not joined yet"))?;
-        let thread = dm_thread_id(me, to);
+        self.upload(server_id, UploadTarget::Dm(to), name, mime, data)
+    }
+
+    /// Small files go inline in one request; larger ones (one frame is bounded
+    /// by `MAX_PACKET_SIZE`) are offered and streamed.
+    fn upload(
+        &mut self,
+        server_id: Uuid,
+        target: UploadTarget,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let conn = self.conn_mut(server_id)?;
+        let me = conn.me()?;
+        let thread = match target {
+            UploadTarget::Channel(channel) => channel,
+            UploadTarget::Dm(to) => dm_thread_id(me, to),
+        };
         let shown = outgoing(
             me,
             thread,
             MessagePayload::File(file_meta(&name, &mime, &data)?),
         );
         if data.len() <= MAX_INLINE_FILE_BYTES {
-            let req = PartyRequest::SendFileDm {
-                to,
-                name,
-                mime,
-                data,
+            let req = match target {
+                UploadTarget::Channel(channel) => PartyRequest::PostFile {
+                    channel,
+                    name,
+                    mime,
+                    data,
+                },
+                UploadTarget::Dm(to) => PartyRequest::SendFileDm {
+                    to,
+                    name,
+                    mime,
+                    data,
+                },
             };
             return conn.send_shown(thread, shown, req);
         }
@@ -873,29 +751,23 @@ impl PartyManager {
             name,
             mime,
             size: data.len() as u64,
-            target: UploadTarget::Dm(to),
+            target,
         };
         conn.offer_upload(thread, shown, req, data)
     }
 
-    /// Request a stored file's bytes by content hash. Returns a receiver that
-    /// resolves once the matching `FileData` response is drained by `poll_events`
-    /// (or errors if the connection drops first, dropping the sender). The server
-    /// only returns bytes the requester is allowed to see (access-checked there).
+    /// Request a stored file's bytes by content hash (the server access-checks
+    /// it). The receiver resolves when `poll_events` drains the reply, or errors
+    /// if the connection drops first.
     pub fn request_download(
         &mut self,
         server_id: Uuid,
         hash: String,
     ) -> Result<oneshot::Receiver<Result<Vec<u8>, String>>> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
+        let conn = self.conn_mut(server_id)?;
         let (tx, rx) = oneshot::channel();
-        // Ask for the size the listing reports, when it knows it: a file past
-        // the inline limit cannot come back in one frame, so it has to be
-        // streamed. Anything unknown takes the single-frame path, which the
-        // server answers for everything it can fit.
+        // A file known to be past the inline limit must be streamed; unknown
+        // sizes take the single-frame path.
         let size = conn
             .files
             .iter()
@@ -927,20 +799,14 @@ impl PartyManager {
         Ok(rx)
     }
 
-    /// Request a channel's durable history (offline catch-up). Idempotent per
-    /// connection — `seed_history` already asks for every visible channel when
-    /// the directory arrives, so this is the explicit "open this channel" path.
+    /// Request a channel's durable history (once per connection).
     pub fn fetch_history(&mut self, server_id: Uuid, channel: Uuid) -> Result<()> {
-        let conn = self
-            .servers
-            .get_mut(&server_id)
-            .ok_or_else(|| anyhow!("unknown server"))?;
-        conn.request_history_once(channel, None);
+        self.conn_mut(server_id)?
+            .request_history_once(channel, None);
         Ok(())
     }
 
-    /// Drain incoming events from every connection and update state. Call this from
-    /// the UI loop, like `poll_session_events`.
+    /// Drain incoming events from every connection. Call from the UI loop.
     pub fn poll_events(&mut self) {
         for conn in self.servers.values_mut() {
             loop {
@@ -965,19 +831,16 @@ impl PartyManager {
         self.servers.get(&server_id)
     }
 
-    /// Clear a server's last surfaced error (e.g. after the UI shows and the user
-    /// dismisses a rejected-post banner). No-op for an unknown server.
+    /// Clear a server's last error (no-op for an unknown server).
     pub fn clear_server_error(&mut self, server_id: Uuid) {
         if let Some(conn) = self.servers.get_mut(&server_id) {
             conn.last_error = None;
         }
     }
 
-    /// Leave a community: drop the connection and forget its local state. Dropping
-    /// the connection's channels makes its background task exit (and any in-flight
-    /// download receivers error) — the server keeps the membership server-side, so
-    /// rejoining later with the same identity resumes it. Returns whether a server
-    /// was actually removed.
+    /// Leave a community: drop the connection (its task exits, pending downloads
+    /// error) and its local state. The membership stays server-side. Returns
+    /// whether a server was removed.
     pub fn remove_server(&mut self, server_id: Uuid) -> bool {
         self.servers.remove(&server_id).is_some()
     }
@@ -1040,8 +903,7 @@ impl PartyManager {
     }
 }
 
-/// The optimistic copy of something this member is sending: shown at once,
-/// with the provisional sequence 0 until the server confirms it.
+/// The optimistic copy of an outgoing message (seq 0 until confirmed).
 fn outgoing(sender: Uuid, thread: Uuid, payload: MessagePayload) -> Envelope {
     Envelope {
         tier: TrustTier::Administered,
@@ -1053,12 +915,9 @@ fn outgoing(sender: Uuid, thread: Uuid, payload: MessagePayload) -> Envelope {
     }
 }
 
-/// Build the [`FileMeta`] for an outgoing upload, computing its content hash and
-/// rejecting payloads the server would refuse (`> MAX_INLINE_FILE_BYTES`) so the
-/// user gets a clear error instead of a silent server-side rejection.
+/// The [`FileMeta`] for an upload. Only the server's hard ceiling is refused;
+/// anything past the inline limit is streamed.
 fn file_meta(name: &str, mime: &str, data: &[u8]) -> Result<FileMeta> {
-    // Files past the inline limit are streamed rather than refused; only the
-    // server's hard ceiling is a real "no".
     if data.len() as u64 > MAX_PARTY_FILE_BYTES {
         return Err(anyhow!(
             "file is too large to share here (max {})",
@@ -1073,35 +932,43 @@ fn file_meta(name: &str, mime: &str, data: &[u8]) -> Result<FileMeta> {
     })
 }
 
-/// Fail every in-flight download on a connection with `reason`, so callers awaiting
-/// a download don't hang when the server reports an error or the connection drops.
+/// Fail every in-flight download so no caller hangs.
 fn fail_pending_downloads(conn: &mut PartyServerConn, reason: &str) {
     for (_, tx) in conn.pending_downloads.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
-    // Chunked downloads wait across many round trips, so they are the ones most
-    // likely to be in flight when something goes wrong.
     for (_, state) in conn.chunked_downloads.drain() {
         let _ = state.tx.send(Err(reason.to_string()));
     }
 }
 
-/// Request durable history for every thread this connection can see and has not
-/// asked about yet.
-///
-/// Called after `Joined`, `Channels` and `Members` because any of the three can
-/// be the one that completes the picture: the channel list decides which
-/// channels exist, the member list decides which DM threads do, and neither is
-/// known when `Joined` arrives.
+/// Hand downloaded bytes to their waiter, verified against the requested hash:
+/// the hash the server echoed proves nothing about the bytes attached to it.
+fn deliver_verified(tx: oneshot::Sender<Result<Vec<u8>, String>>, hash: &str, data: Vec<u8>) {
+    let actual = blob_hash(&data);
+    let _ = if actual == hash {
+        tx.send(Ok(data))
+    } else {
+        tracing::error!(
+            expected = %hash,
+            actual = %actual,
+            "community server returned bytes that do not match the requested content hash"
+        );
+        tx.send(Err(HASH_MISMATCH.to_string()))
+    };
+}
+
+/// Request history for every visible thread not yet asked about. Runs after
+/// `Joined`, `Channels` and `Members`: channels decide which channels exist,
+/// members which DM threads do, and any of the three can complete the picture.
 fn seed_history(conn: &mut PartyServerConn) {
-    if conn.member_id.is_none() {
+    let Some(me) = conn.member_id else {
         return; // the server refuses history until we have joined
-    }
+    };
     let channels: Vec<Uuid> = conn.channels.iter().map(|c| c.id).collect();
     for ch in channels {
         conn.request_history_once(ch, None);
     }
-    let Some(me) = conn.member_id else { return };
     let peers: Vec<Uuid> = conn
         .members
         .iter()
@@ -1124,10 +991,6 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             conn.member_id = Some(member_id);
             conn.server_name = server_name;
             conn.status = PartyStatus::Joined;
-            // History is *not* seeded here. `Joined` arrives before `Channels`
-            // (the requests are pipelined in that order), so `conn.channels` is
-            // still empty — which is exactly why channel history was never
-            // fetched at all. It is requested when the channel list lands.
             seed_history(conn);
         }
         PartyResponse::JoinRejected { reason } => conn.status = PartyStatus::Rejected(reason),
@@ -1140,15 +1003,9 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             seed_history(conn);
         }
         PartyResponse::Message(env) => {
-            // Sequence 0 is *our* sentinel for "sent, not yet acknowledged", and
-            // the server has no business using it: an honest one assigns
-            // `len() + 1`, so 0 never appears on the wire. Accepting it let a
-            // non-conforming or hostile server plant an envelope that the sort
-            // at `History` files in among the user's own unconfirmed sends —
-            // and once it sits at a lower index than a real pending message,
-            // `ActionFailed` retracts *their* row while the user's stays on
-            // screen looking delivered, which is the exact failure the pending
-            // queue exists to prevent.
+            // Seq 0 is our "unconfirmed send" sentinel; an honest server never
+            // sends it, and a planted one would make `ActionFailed` retract the
+            // wrong row.
             if env.seq == 0 {
                 tracing::warn!(
                     channel = %env.channel,
@@ -1157,26 +1014,20 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 return;
             }
             let thread = conn.messages.entry(env.channel).or_default();
-            // A live broadcast can race a history page carrying the same
-            // envelope; both are keyed by the server-assigned sequence.
-            // Confirmed envelopes sit in ascending seq order by position
-            // (pages are sorted on merge, broadcasts arrive in order), so a
-            // seq above the last confirmed one is new without a scan — the
-            // common case, which used to cost O(thread) per arrival (PERF-05).
+            // Deduplicate against a racing history page by seq. Confirmed
+            // envelopes are in ascending order, so a seq above the newest is new
+            // without a scan (PERF-05).
             let newest = thread.iter().rev().find(|e| e.seq != 0).map(|e| e.seq);
             if newest.is_none_or(|n| env.seq > n) || !thread.iter().any(|e| e.seq == env.seq) {
                 thread.push(env);
             }
         }
         PartyResponse::History(items) => {
-            // A page is cut short by count *or* by size; asking again only
-            // after a full count stalled at the first page the server trimmed
-            // for size, so a channel of long messages never loaded past it.
+            // A page is cut short by count *or* size.
             let page_was_full = history_page_may_continue(&items);
             let threads: HashSet<Uuid> = items.iter().map(|e| e.channel).collect();
-            // Which threads are DMs, and with whom: one hash per member per
-            // page, not one per member per thread (PERF-05). Only needed to
-            // ask for the next page.
+            // DM thread -> peer, built once per page and only when continuing
+            // (PERF-05).
             let dm_peers: HashMap<Uuid, Uuid> = match conn.member_id {
                 Some(me) if page_was_full => conn
                     .members
@@ -1186,24 +1037,16 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 _ => HashMap::new(),
             };
             for th in threads {
-                // Same sentinel, same reasoning as `Message` above: a history
-                // page is no more trustworthy than a broadcast.
+                // Same seq-0 rule as `Message`.
                 let page = items.iter().filter(|e| e.channel == th && e.seq != 0);
                 // Where *this page* ends — not the newest seq in the thread,
                 // which a live broadcast may have pushed far ahead: asking
                 // after that skipped everything in between (APP-08).
                 let page_end = page.clone().map(|e| e.seq).max();
                 let existing = conn.messages.entry(th).or_default();
-                // Merge rather than replace: history is paged now, so a later
-                // page must not throw away the earlier one. Server-assigned
-                // sequences are the identity; unconfirmed local sends (seq 0)
-                // are kept so a message in flight does not blink out.
-                //
-                // One set of known sequences per page, not a scan of the whole
-                // thread per envelope: that made joining a long channel
-                // quadratic, under the lock every party command needs
-                // (PERF-05). The sort only runs when something was added, and
-                // a stable sort of presorted runs is close to linear.
+                // Merge by seq (pages must not replace each other), keeping
+                // unconfirmed sends; one known-seq set per page keeps it linear
+                // (PERF-05), and the sort runs only when something was added.
                 let mut known: HashSet<u64> =
                     existing.iter().map(|e| e.seq).filter(|&s| s != 0).collect();
                 let before = existing.len();
@@ -1215,26 +1058,15 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 if existing.len() != before {
                     existing.sort_by_key(|e| if e.seq == 0 { u64::MAX } else { e.seq });
                 }
-
-                // A full page means there is probably more behind it.
                 if page_was_full {
                     if let Some(since_seq) = page_end {
-                        let _ = conn.send(match dm_peers.get(&th) {
-                            Some(&with) => PartyRequest::FetchDmHistory { with, since_seq },
-                            None => PartyRequest::FetchHistory {
-                                channel: th,
-                                since_seq,
-                            },
-                        });
+                        let req = history_request(th, dm_peers.get(&th).copied(), since_seq);
+                        let _ = conn.send(req);
                     }
                 }
             }
         }
-        // The server stored it: stamp the real sequence onto the message we
-        // already put on screen.
         PartyResponse::MessagePosted { seq, .. } => conn.confirm_oldest(seq),
-        // The server refused a send. Take the message back off the screen —
-        // leaving it there tells the user it was delivered when it never was.
         PartyResponse::ActionFailed { reason, .. } => {
             let retracted = conn.retract_oldest();
             conn.last_error = Some(if retracted {
@@ -1243,56 +1075,29 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 reason
             });
         }
-        // Downloaded file bytes: hand them to the awaiting `request_download` caller
-        // (keyed by content hash). Unsolicited/duplicate data has no waiter and is
-        // dropped.
+        // Unsolicited/duplicate data has no waiter and is dropped.
         PartyResponse::FileData { hash, data } => {
             if let Some(tx) = conn.pending_downloads.remove(&hash) {
-                // The hash *is* the integrity check — that is the whole point of
-                // content addressing, and it costs one SHA-256 to use. Matching
-                // on the hash the server echoed back proves nothing about the
-                // bytes it attached to it.
-                let actual = blob_hash(&data);
-                let _ = if actual == hash {
-                    tx.send(Ok(data))
-                } else {
-                    tracing::error!(
-                        expected = %hash,
-                        actual = %actual,
-                        "community server returned bytes that do not match the requested content hash"
-                    );
-                    tx.send(Err(
-                        "The server sent a file that does not match the one that was requested. It was not saved.".to_string(),
-                    ))
-                };
+                deliver_verified(tx, &hash, data);
             }
         }
-        // Surface server-side failures (rejected post, unknown channel, …) so a
-        // failed action is visible instead of silently doing nothing. A download
-        // failure arrives as an `Error` too, and the wire error is not
-        // hash-correlated, so that one fails the in-flight downloads rather than
-        // let their callers hang — but only that one: failing them on *any*
-        // error meant a refused channel name cancelled an unrelated download.
+        // Only the not-hash-correlated download error fails in-flight downloads;
+        // any other error (a refused channel name) must not cancel them.
         PartyResponse::Error(message) => {
             if message == UNKNOWN_FILE_ERROR {
                 fail_pending_downloads(conn, &message);
             }
             conn.last_error = Some(message);
         }
-        // The channel list is per member now (private channels are filtered), so
-        // the server nudges instead of broadcasting a list that would be wrong
-        // for somebody. Ask for our own.
+        // The channel list is per member, so the server nudges and each client
+        // fetches its own view.
         PartyResponse::DirectoryChanged => {
             let _ = conn.send(PartyRequest::ListChannels);
             let _ = conn.send(PartyRequest::ListMembers);
         }
-        // The server accepted a chunked upload: stream the bytes it is now
-        // waiting for.
         PartyResponse::UploadReady { upload, chunk_size } => {
             conn.stream_accepted_upload(upload, chunk_size)
         }
-        // One chunk of a chunked download. Ask for the next until the file is
-        // whole, then hand it over — verified against the hash we asked for.
         PartyResponse::FileChunk {
             hash,
             offset,
@@ -1302,11 +1107,8 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             let Some(state) = conn.chunked_downloads.get_mut(&hash) else {
                 return; // unsolicited, or already completed/failed
             };
-            // Out-of-order or duplicated chunk: the stream is no longer
-            // reconstructible, so fail rather than assemble something wrong.
-            // Likewise a total no server could be storing, or more bytes than
-            // the total it announced — buffering toward either is the client
-            // filling its own memory on the server's say-so.
+            // Out of order, or more than any server may store / than announced:
+            // fail rather than assemble something wrong or buffer on its say-so.
             let grown = state.data.len() as u64 + data.len() as u64;
             let refusal = if offset != state.data.len() as u64 {
                 Some("the server sent file data out of order")
@@ -1330,24 +1132,13 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
                 });
                 return;
             }
-            let Some(state) = conn.chunked_downloads.remove(&hash) else {
-                return;
-            };
-            // The hash is the integrity check, and it costs one SHA-256 to use.
-            let actual = blob_hash(&state.data);
-            let _ = if actual == hash {
-                state.tx.send(Ok(state.data))
-            } else {
-                tracing::error!(expected = %hash, actual = %actual, "community server returned chunks that do not match the requested content hash");
-                state.tx.send(Err(
-                    "The server sent a file that does not match the one that was requested. It was not saved.".to_string(),
-                ))
-            };
+            if let Some(state) = conn.chunked_downloads.remove(&hash) {
+                deliver_verified(state.tx, &hash, state.data);
+            }
         }
         PartyResponse::Files(files) => {
-            // A full listing may have been truncated by the server: ask for
-            // the rest. Only then — an older server never truncates and could
-            // not decode the paged request (audit SRV-01).
+            // Only a full listing may be truncated; page on only then, since an
+            // older server cannot decode the paged request (audit SRV-01).
             let full = files.len() >= messenger_core::party::MAX_FILE_LISTING;
             conn.files = files;
             if full {
@@ -1360,8 +1151,7 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
             offset,
             next,
         } => {
-            // Only a page that continues what we hold; a stale one (the list
-            // was refreshed meanwhile) is dropped rather than spliced in.
+            // A stale page (the list was refreshed meanwhile) is dropped.
             if offset as usize == conn.files.len() {
                 conn.files.extend(files);
                 if let Some(next) = next {
@@ -1378,46 +1168,102 @@ fn apply(conn: &mut PartyServerConn, resp: PartyResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use messenger_core::party::ChannelKind;
     use messenger_core::party::{HISTORY_PAGE_BYTES, MAX_HISTORY_BATCH};
 
-    /// Build a manager with one server connection wired to test channels, returning
-    /// the server id, a sender to push server responses, and a receiver to observe
-    /// the requests the manager emits.
-    fn manager_with_server() -> (
-        PartyManager,
-        Uuid,
-        mpsc::UnboundedSender<Incoming>,
-        mpsc::UnboundedReceiver<PartyRequest>,
-    ) {
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let conn = PartyServerConn {
-            address: "127.0.0.1:12345".to_string(),
-            username: "alice".to_string(),
-            server_name: String::new(),
-            server_fingerprint: "FP".to_string(),
-            member_id: None,
-            status: PartyStatus::Connecting,
-            channels: Vec::new(),
-            members: Vec::new(),
-            messages: HashMap::new(),
-            last_error: None,
-            last_notice: None,
-            files: Vec::new(),
-            quota: None,
-            audit: Vec::new(),
-            history_requested: HashSet::new(),
-            awaiting: VecDeque::new(),
-            outgoing_tx,
-            incoming_rx,
-            pending_downloads: HashMap::new(),
-            chunked_downloads: HashMap::new(),
-        };
-        let mut mgr = PartyManager::new();
-        let id = Uuid::new_v4();
-        mgr.servers.insert(id, conn);
-        (mgr, id, incoming_tx, outgoing_rx)
+    /// A manager with one server connection wired to test channels.
+    struct Fx {
+        mgr: PartyManager,
+        id: Uuid,
+        tx: mpsc::UnboundedSender<Incoming>,
+        out: mpsc::UnboundedReceiver<PartyRequest>,
+    }
+
+    impl Fx {
+        fn new() -> Self {
+            let (outgoing_tx, out) = mpsc::unbounded_channel();
+            let (tx, incoming_rx) = mpsc::unbounded_channel();
+            let conn = PartyServerConn::new(
+                "127.0.0.1:12345",
+                "alice",
+                "FP".to_string(),
+                outgoing_tx,
+                incoming_rx,
+            );
+            let mut mgr = PartyManager::new();
+            let id = Uuid::new_v4();
+            mgr.servers.insert(id, conn);
+            Self { mgr, id, tx, out }
+        }
+
+        /// A connection that has joined as a fresh member id.
+        fn joined() -> (Self, Uuid) {
+            let mut fx = Self::new();
+            let me = Uuid::new_v4();
+            fx.mgr.servers.get_mut(&fx.id).unwrap().member_id = Some(me);
+            (fx, me)
+        }
+
+        /// Deliver a server response and poll it in.
+        fn respond(&mut self, resp: PartyResponse) {
+            self.tx.send(Incoming::Response(resp)).unwrap();
+            self.mgr.poll_events();
+        }
+
+        fn conn(&self) -> &PartyServerConn {
+            self.mgr.server(self.id).unwrap()
+        }
+
+        fn conn_mut(&mut self) -> &mut PartyServerConn {
+            self.mgr.servers.get_mut(&self.id).unwrap()
+        }
+
+        fn thread(&self, channel: Uuid) -> &Vec<Envelope> {
+            &self.conn().messages[&channel]
+        }
+
+        fn thread_is_empty(&self, channel: Uuid) -> bool {
+            self.conn()
+                .messages
+                .get(&channel)
+                .is_none_or(|t| t.is_empty())
+        }
+
+        /// Every request emitted so far.
+        fn sent(&mut self) -> Vec<PartyRequest> {
+            std::iter::from_fn(|| self.out.try_recv().ok()).collect()
+        }
+
+        fn download(&mut self, hash: &str) -> oneshot::Receiver<Result<Vec<u8>, String>> {
+            self.mgr
+                .request_download(self.id, hash.to_string())
+                .unwrap()
+        }
+
+        fn send_file(&mut self, channel: Uuid, name: &str, data: Vec<u8>) -> Result<()> {
+            self.mgr
+                .send_file(self.id, channel, name.into(), "x".into(), data)
+        }
+
+        /// Put a file message of `size` into history so a download knows its size.
+        fn known_file(&mut self, channel: Uuid, hash: &str, size: u64) {
+            self.conn_mut()
+                .messages
+                .entry(channel)
+                .or_default()
+                .push(Envelope {
+                    tier: TrustTier::Administered,
+                    sender: Uuid::new_v4(),
+                    channel,
+                    seq: 1,
+                    timestamp: 1,
+                    payload: MessagePayload::File(FileMeta {
+                        hash: hash.to_string(),
+                        name: "big.bin".into(),
+                        size,
+                        mime: "application/octet-stream".into(),
+                    }),
+                });
+        }
     }
 
     fn envelope(channel: Uuid, sender: Uuid, seq: u64, text: &str) -> Envelope {
@@ -1431,44 +1277,59 @@ mod tests {
         }
     }
 
+    fn general(id: Uuid) -> PartyResponse {
+        PartyResponse::Channels(vec![ChannelInfo {
+            id,
+            name: "general".to_string(),
+            kind: ChannelKind::Public,
+            members: Vec::new(),
+        }])
+    }
+
+    fn joined_as(member_id: Uuid) -> PartyResponse {
+        PartyResponse::Joined {
+            member_id,
+            server_name: "Srv".to_string(),
+            tier: TrustTier::Administered,
+        }
+    }
+
+    fn member(id: Uuid, username: &str) -> MemberInfo {
+        MemberInfo {
+            id,
+            username: username.to_string(),
+            online: true,
+            role: Role::Member,
+        }
+    }
+
+    fn failed(channel: Uuid, reason: &str) -> PartyResponse {
+        PartyResponse::ActionFailed {
+            channel,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn posted(channel: Uuid, seq: u64) -> PartyResponse {
+        PartyResponse::MessagePosted { channel, seq }
+    }
+
+    fn ready(upload: Uuid, chunk_size: u32) -> PartyResponse {
+        PartyResponse::UploadReady { upload, chunk_size }
+    }
+
     #[test]
     fn poll_applies_join_directory_and_messages() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
+        let mut fx = Fx::new();
         let me = Uuid::new_v4();
         let channel = Uuid::new_v4();
 
-        tx.send(Incoming::Response(PartyResponse::Channels(vec![
-            ChannelInfo {
-                id: channel,
-                name: "general".to_string(),
-                kind: ChannelKind::Public,
-                members: Vec::new(),
-            },
-        ])))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::Joined {
-            member_id: me,
-            server_name: "Srv".to_string(),
-            tier: TrustTier::Administered,
-        }))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::Members(vec![
-            MemberInfo {
-                id: me,
-                username: "alice".to_string(),
-                online: true,
-                role: Role::Member,
-            },
-        ])))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::Message(envelope(
-            channel, me, 1, "hi",
-        ))))
-        .unwrap();
+        fx.respond(general(channel));
+        fx.respond(joined_as(me));
+        fx.respond(PartyResponse::Members(vec![member(me, "alice")]));
+        fx.respond(PartyResponse::Message(envelope(channel, me, 1, "hi")));
 
-        mgr.poll_events();
-
-        let conn = mgr.server(id).unwrap();
+        let conn = fx.conn();
         assert_eq!(conn.status, PartyStatus::Joined);
         assert_eq!(conn.member_id, Some(me));
         assert_eq!(conn.server_name, "Srv");
@@ -1479,63 +1340,87 @@ mod tests {
 
     #[test]
     fn join_rejection_is_surfaced() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        tx.send(Incoming::Response(PartyResponse::JoinRejected {
+        let mut fx = Fx::new();
+        fx.respond(PartyResponse::JoinRejected {
             reason: "wrong password".to_string(),
-        }))
-        .unwrap();
-        mgr.poll_events();
+        });
         assert_eq!(
-            mgr.server(id).unwrap().status,
+            fx.conn().status,
             PartyStatus::Rejected("wrong password".to_string())
         );
     }
 
     #[test]
     fn post_appends_locally_and_emits_request() {
-        let (mut mgr, id, _tx, mut out) = manager_with_server();
-        // Pretend we've joined.
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let (mut fx, _) = Fx::joined();
         let channel = Uuid::new_v4();
+        fx.mgr.post(fx.id, channel, "hello".to_string()).unwrap();
 
-        mgr.post(id, channel, "hello".to_string()).unwrap();
-
-        // Local optimistic append.
-        let conn = mgr.server(id).unwrap();
-        let msgs = conn.messages.get(&channel).unwrap();
+        let msgs = fx.thread(channel);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].payload, MessagePayload::Text("hello".to_string()));
-
-        // The PostMessage request was emitted to the connection.
-        match out.try_recv().unwrap() {
-            PartyRequest::PostMessage { channel: c, text } => {
-                assert_eq!(c, channel);
-                assert_eq!(text, "hello");
+        assert_eq!(
+            fx.out.try_recv().unwrap(),
+            PartyRequest::PostMessage {
+                channel,
+                text: "hello".into()
             }
-            other => panic!("expected PostMessage, got {other:?}"),
-        }
+        );
+    }
+
+    #[test]
+    fn post_before_join_fails() {
+        let mut fx = Fx::new();
+        assert!(fx.mgr.post(fx.id, Uuid::new_v4(), "x".to_string()).is_err());
+    }
+
+    #[test]
+    fn send_dm_appends_locally_and_emits_request() {
+        let (mut fx, _) = Fx::joined();
+        let peer = Uuid::new_v4();
+        fx.mgr.send_dm(fx.id, peer, "hi".to_string()).unwrap();
+
+        let dm = fx.mgr.dm_messages(fx.id, peer);
+        assert_eq!(dm.len(), 1);
+        assert_eq!(dm[0].payload, MessagePayload::Text("hi".to_string()));
+        assert_eq!(
+            fx.out.try_recv().unwrap(),
+            PartyRequest::SendDm {
+                to: peer,
+                text: "hi".into()
+            }
+        );
+    }
+
+    #[test]
+    fn create_channel_emits_request() {
+        let mut fx = Fx::new();
+        fx.mgr.create_channel(fx.id, "random".to_string()).unwrap();
+        assert_eq!(
+            fx.out.try_recv().unwrap(),
+            PartyRequest::CreateChannel {
+                name: "random".into()
+            }
+        );
     }
 
     #[test]
     fn send_file_appends_optimistically_and_emits_postfile() {
-        let (mut mgr, id, _tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let (mut fx, _) = Fx::joined();
         let channel = Uuid::new_v4();
         let data = b"\x89PNG fake image bytes".to_vec();
-
-        mgr.send_file(
-            id,
-            channel,
-            "photo.png".to_string(),
-            "image/png".to_string(),
-            data.clone(),
-        )
-        .unwrap();
+        fx.mgr
+            .send_file(
+                fx.id,
+                channel,
+                "photo.png".to_string(),
+                "image/png".to_string(),
+                data.clone(),
+            )
+            .unwrap();
 
         // Optimistic local append is a File message with the content hash/size.
-        let msgs = mgr.server(id).unwrap().messages.get(&channel).unwrap();
+        let msgs = fx.thread(channel);
         assert_eq!(msgs.len(), 1);
         match &msgs[0].payload {
             MessagePayload::File(f) => {
@@ -1545,9 +1430,7 @@ mod tests {
             }
             other => panic!("expected a File payload, got {other:?}"),
         }
-
-        // The PostFile request carrying the bytes was emitted.
-        match out.try_recv().unwrap() {
+        match fx.out.try_recv().unwrap() {
             PartyRequest::PostFile {
                 channel: c,
                 name,
@@ -1563,78 +1446,49 @@ mod tests {
     }
 
     #[test]
-    fn request_download_resolves_when_filedata_arrives() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
-        let data = b"downloaded file contents".to_vec();
-        let hash = blob_hash(&data);
-
-        let mut rx = mgr.request_download(id, hash.clone()).unwrap();
-        // The DownloadFile request was emitted for the right hash.
-        match out.try_recv().unwrap() {
-            PartyRequest::DownloadFile { hash: h } => assert_eq!(h, hash),
-            other => panic!("expected DownloadFile, got {other:?}"),
-        }
-        // Before the response, the receiver is still pending.
-        assert!(rx.try_recv().is_err());
-
-        // The server replies with the bytes; poll_events routes them to the waiter.
-        tx.send(Incoming::Response(PartyResponse::FileData {
-            hash: hash.clone(),
-            data: data.clone(),
-        }))
-        .unwrap();
-        mgr.poll_events();
-
-        assert_eq!(rx.try_recv().unwrap(), Ok(data));
+    fn oversized_file_upload_is_rejected_without_side_effects() {
+        let (mut fx, _) = Fx::joined();
+        let channel = Uuid::new_v4();
+        // Past the server's ceiling, not merely the inline limit.
+        let too_big = vec![0u8; MAX_PARTY_FILE_BYTES as usize + 1];
+        assert!(
+            fx.send_file(channel, "big.bin", too_big).is_err(),
+            "a file past the server ceiling must be rejected"
+        );
+        assert!(!fx.conn().messages.contains_key(&channel));
+        assert!(fx.out.try_recv().is_err());
     }
 
     /// A file too large for one frame is offered first and streamed only once
-    /// the server accepts it, so a refusal costs a round trip instead of the
-    /// whole transfer.
+    /// the server accepts it.
     #[test]
     fn a_large_file_is_offered_first_then_streamed_in_chunks() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let (mut fx, _) = Fx::joined();
         let channel = Uuid::new_v4();
         let payload: Vec<u8> = (0..(MAX_INLINE_FILE_BYTES + 1234))
             .map(|i| (i % 253) as u8)
             .collect();
+        fx.send_file(channel, "big.bin", payload.clone()).unwrap();
 
-        mgr.send_file(
-            id,
-            channel,
-            "big.bin".into(),
-            "application/octet-stream".into(),
-            payload.clone(),
-        )
-        .unwrap();
-
-        // Offered, not sent: the bytes are still held client-side.
-        match out.try_recv().unwrap() {
+        match fx.out.try_recv().unwrap() {
             PartyRequest::StartUpload { size, target, .. } => {
                 assert_eq!(size, payload.len() as u64);
                 assert_eq!(target, UploadTarget::Channel(channel));
             }
             other => panic!("expected StartUpload, got {other:?}"),
         }
-        assert!(out.try_recv().is_err(), "nothing streams before acceptance");
-        // …and it is already on screen, so the user sees it immediately.
-        assert_eq!(mgr.servers[&id].messages[&channel].len(), 1);
+        assert!(
+            fx.out.try_recv().is_err(),
+            "nothing streams before acceptance"
+        );
+        assert_eq!(fx.thread(channel).len(), 1, "already on screen");
 
-        // The server accepts; the client streams and finishes.
         let upload = Uuid::new_v4();
-        tx.send(Incoming::Response(PartyResponse::UploadReady {
-            upload,
-            chunk_size: PARTY_CHUNK_BYTES as u32,
-        }))
-        .unwrap();
-        mgr.poll_events();
+        fx.respond(ready(upload, PARTY_CHUNK_BYTES as u32));
 
         let mut streamed = Vec::new();
         let mut finished = false;
-        while let Ok(req) = out.try_recv() {
+        for req in fx.sent() {
             match req {
                 PartyRequest::UploadChunk { upload: u, data } => {
                     assert_eq!(u, upload);
@@ -1652,67 +1506,132 @@ mod tests {
         assert!(finished, "the upload is finished, not left open");
     }
 
-    /// A large download is reassembled across chunks and checked against the
-    /// hash that was asked for.
+    /// A refused offer must drop its bytes, not stream them under the next id.
+    #[test]
+    fn a_refused_upload_offer_does_not_stream_into_the_next_upload() {
+        let (mut fx, _) = Fx::joined();
+        let channel = Uuid::new_v4();
+        let big = MAX_INLINE_FILE_BYTES + 1;
+
+        fx.send_file(channel, "refused.bin", vec![1u8; big])
+            .unwrap();
+        fx.respond(failed(channel, "over quota"));
+        fx.send_file(channel, "wanted.bin", vec![2u8; big]).unwrap();
+        let upload = Uuid::new_v4();
+        fx.respond(ready(upload, PARTY_CHUNK_BYTES as u32));
+
+        let mut streamed = Vec::new();
+        for req in fx.sent() {
+            if let PartyRequest::UploadChunk { upload: u, data } = req {
+                assert_eq!(u, upload);
+                streamed.extend(data);
+            }
+        }
+        assert_eq!(streamed.len(), big);
+        assert!(
+            streamed.iter().all(|b| *b == 2),
+            "the refused file's bytes were streamed under the accepted upload"
+        );
+        assert_eq!(
+            fx.thread(channel).len(),
+            1,
+            "only the accepted upload stays on screen"
+        );
+    }
+
+    #[test]
+    fn a_tiny_upload_chunk_size_from_the_server_is_bounded() {
+        let (mut fx, _) = Fx::joined();
+        let size = MAX_INLINE_FILE_BYTES + 1;
+        fx.send_file(Uuid::new_v4(), "f.bin", vec![9u8; size])
+            .unwrap();
+        fx.respond(ready(Uuid::new_v4(), 0));
+        let mut chunks = 0usize;
+        let mut bytes = 0usize;
+        for req in fx.sent() {
+            if let PartyRequest::UploadChunk { data, .. } = req {
+                chunks += 1;
+                bytes += data.len();
+            }
+        }
+        assert_eq!(bytes, size, "every byte is still sent");
+        assert!(
+            chunks <= size / (16 * 1024) + 1,
+            "{chunks} requests queued for one {size}-byte file"
+        );
+    }
+
+    #[test]
+    fn request_download_resolves_when_filedata_arrives() {
+        let (mut fx, _) = Fx::joined();
+        let data = b"downloaded file contents".to_vec();
+        let hash = blob_hash(&data);
+
+        let mut rx = fx.download(&hash);
+        assert_eq!(
+            fx.out.try_recv().unwrap(),
+            PartyRequest::DownloadFile { hash: hash.clone() }
+        );
+        assert!(rx.try_recv().is_err(), "pending before the response");
+
+        fx.respond(PartyResponse::FileData {
+            hash,
+            data: data.clone(),
+        });
+        assert_eq!(rx.try_recv().unwrap(), Ok(data));
+    }
+
+    /// Content addressing is the integrity check: mismatched bytes are refused.
+    #[tokio::test]
+    async fn a_download_whose_bytes_do_not_match_its_hash_is_refused() {
+        let mut fx = Fx::new();
+        let hash = blob_hash(b"the real file");
+        let rx = fx.download(&hash);
+        fx.respond(PartyResponse::FileData {
+            hash,
+            data: b"something else entirely".to_vec(),
+        });
+        let err = rx
+            .await
+            .expect("the waiter is completed")
+            .expect_err("mismatched bytes must not be handed to the caller");
+        assert!(err.contains("does not match"), "{err}");
+    }
+
     #[test]
     fn a_large_download_is_reassembled_from_chunks() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let (mut fx, _) = Fx::joined();
         let channel = Uuid::new_v4();
         // Past the inline limit, which is what makes this a chunked download.
         let payload: Vec<u8> = (0..(MAX_INLINE_FILE_BYTES + 500))
             .map(|i| (i % 199) as u8)
             .collect();
         let hash = blob_hash(&payload);
+        fx.known_file(channel, &hash, payload.len() as u64);
 
-        // The client learns the size from a file message in history, which is
-        // what tells it this cannot arrive in a single frame.
-        mgr.servers
-            .get_mut(&id)
-            .unwrap()
-            .messages
-            .entry(channel)
-            .or_default()
-            .push(Envelope {
-                tier: TrustTier::Administered,
-                sender: me,
-                channel,
-                seq: 1,
-                timestamp: 0,
-                payload: MessagePayload::File(FileMeta {
-                    hash: hash.clone(),
-                    name: "big.bin".into(),
-                    size: payload.len() as u64,
-                    mime: "application/octet-stream".into(),
-                }),
-            });
-
-        let mut rx = mgr.request_download(id, hash.clone()).unwrap();
-        match out.try_recv().unwrap() {
-            PartyRequest::DownloadChunk { hash: h, offset } => {
-                assert_eq!(h, hash);
-                assert_eq!(offset, 0);
+        let mut rx = fx.download(&hash);
+        assert_eq!(
+            fx.out.try_recv().unwrap(),
+            PartyRequest::DownloadChunk {
+                hash: hash.clone(),
+                offset: 0
             }
-            other => panic!("expected DownloadChunk, got {other:?}"),
-        }
+        );
 
         // Feed it back one chunk at a time, following the offsets it asks for.
         let total = payload.len() as u64;
         let mut offset = 0usize;
         while offset < payload.len() {
             let end = (offset + PARTY_CHUNK_BYTES).min(payload.len());
-            tx.send(Incoming::Response(PartyResponse::FileChunk {
+            fx.respond(PartyResponse::FileChunk {
                 hash: hash.clone(),
                 offset: offset as u64,
                 total,
                 data: payload[offset..end].to_vec(),
-            }))
-            .unwrap();
-            mgr.poll_events();
+            });
             offset = end;
             if offset < payload.len() {
-                match out.try_recv().unwrap() {
+                match fx.out.try_recv().unwrap() {
                     PartyRequest::DownloadChunk { offset: next, .. } => {
                         assert_eq!(next, offset as u64, "asks for exactly what it is missing");
                     }
@@ -1723,33 +1642,24 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Ok(payload));
     }
 
-    /// A chunk that does not continue where the last one stopped means the
-    /// stream is no longer reconstructible — fail rather than assemble
-    /// something that is not the file.
     #[test]
     fn an_out_of_order_chunk_fails_the_download() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let (mut fx, _) = Fx::joined();
         let hash = "abc123".to_string();
         let (otx, mut rx) = oneshot::channel();
-        mgr.servers.get_mut(&id).unwrap().chunked_downloads.insert(
+        fx.conn_mut().chunked_downloads.insert(
             hash.clone(),
             ChunkedDownload {
                 data: Vec::new(),
                 tx: otx,
             },
         );
-
-        tx.send(Incoming::Response(PartyResponse::FileChunk {
-            hash: hash.clone(),
+        fx.respond(PartyResponse::FileChunk {
+            hash,
             offset: 999, // not where we are
             total: 4096,
             data: vec![1, 2, 3],
-        }))
-        .unwrap();
-        mgr.poll_events();
-
+        });
         assert_eq!(
             rx.try_recv().unwrap(),
             Err("the server sent file data out of order".to_string())
@@ -1757,21 +1667,28 @@ mod tests {
     }
 
     #[test]
+    fn a_download_claiming_more_than_the_server_ceiling_is_refused() {
+        let (mut fx, _) = Fx::joined();
+        let hash = "ab".repeat(32);
+        fx.known_file(Uuid::new_v4(), &hash, MAX_PARTY_FILE_BYTES);
+        let mut rx = fx.download(&hash);
+        fx.respond(PartyResponse::FileChunk {
+            hash,
+            offset: 0,
+            total: MAX_PARTY_FILE_BYTES * 1000,
+            data: vec![0u8; 1024],
+        });
+        assert!(
+            matches!(rx.try_recv(), Ok(Err(_))),
+            "the client kept downloading toward an impossible size"
+        );
+    }
+
+    #[test]
     fn request_download_fails_when_the_server_reports_an_error() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
-
-        let mut rx = mgr.request_download(id, "deadbeef".to_string()).unwrap();
-
-        // The server can't serve it (gone / not permitted); a download error is not
-        // hash-correlated on the wire, so any in-flight download is failed.
-        tx.send(Incoming::Response(PartyResponse::Error(
-            "unknown file".to_string(),
-        )))
-        .unwrap();
-        mgr.poll_events();
-
-        // The caller gets an error instead of hanging forever.
+        let (mut fx, _) = Fx::joined();
+        let mut rx = fx.download("deadbeef");
+        fx.respond(PartyResponse::Error("unknown file".to_string()));
         assert_eq!(rx.try_recv().unwrap(), Err("unknown file".to_string()));
     }
 
@@ -1802,140 +1719,51 @@ mod tests {
         assert!(started.elapsed() <= PARTY_CONNECT_TIMEOUT + std::time::Duration::from_secs(1));
     }
 
-    /// Errors carry no request id, so any `Error` used to fail every download
-    /// in flight — a refused channel name cancelled an unrelated download.
+    /// Errors carry no request id; an unrelated one must not fail a download.
     #[test]
     fn an_unrelated_server_error_does_not_fail_a_download() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
-        let mut rx = mgr.request_download(id, "deadbeef".to_string()).unwrap();
-
-        tx.send(Incoming::Response(PartyResponse::Error(
-            "channel name is taken".to_string(),
-        )))
-        .unwrap();
-        mgr.poll_events();
-
+        let (mut fx, _) = Fx::joined();
+        let mut rx = fx.download("deadbeef");
+        fx.respond(PartyResponse::Error("channel name is taken".to_string()));
         assert!(rx.try_recv().is_err(), "the download is still in flight");
         assert_eq!(
-            mgr.server(id).unwrap().last_error.as_deref(),
+            fx.conn().last_error.as_deref(),
             Some("channel name is taken")
         );
     }
 
     #[test]
     fn remove_server_forgets_it_and_fails_inflight_downloads() {
-        let (mut mgr, id, _tx, _out) = manager_with_server();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
+        let (mut fx, _) = Fx::joined();
+        let mut rx = fx.download("abc123");
 
-        // An in-flight download's receiver must error (sender dropped), not hang.
-        let mut rx = mgr.request_download(id, "abc123".to_string()).unwrap();
-
-        assert!(mgr.remove_server(id), "the server is removed");
-        assert!(mgr.server(id).is_none());
-        assert!(mgr.server_ids().is_empty());
+        assert!(fx.mgr.remove_server(fx.id), "the server is removed");
+        assert!(fx.mgr.server(fx.id).is_none());
+        assert!(fx.mgr.server_ids().is_empty());
         assert!(
             rx.try_recv().is_err(),
             "pending download receivers error out on leave"
         );
-
-        // Removing again is a no-op.
-        assert!(!mgr.remove_server(id));
+        assert!(!fx.mgr.remove_server(fx.id), "removing again is a no-op");
     }
 
     #[test]
-    fn oversized_file_upload_is_rejected_without_side_effects() {
-        let (mut mgr, id, _tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
-        let channel = Uuid::new_v4();
-        // Past the *server's ceiling*, not merely past the inline limit —
-        // anything between the two is streamed rather than refused.
-        let too_big = vec![0u8; MAX_PARTY_FILE_BYTES as usize + 1];
-
-        assert!(
-            mgr.send_file(
-                id,
-                channel,
-                "big.bin".to_string(),
-                "application/octet-stream".to_string(),
-                too_big
-            )
-            .is_err(),
-            "a file past the server ceiling must be rejected"
-        );
-        // Nothing was appended locally and no request was emitted.
-        assert!(!mgr.server(id).unwrap().messages.contains_key(&channel));
-        assert!(out.try_recv().is_err());
-    }
-
-    #[test]
-    fn post_before_join_fails() {
-        let (mut mgr, id, _tx, _out) = manager_with_server();
-        assert!(mgr.post(id, Uuid::new_v4(), "x".to_string()).is_err());
-    }
-
-    #[test]
-    fn create_channel_emits_request() {
-        let (mgr, id, _tx, mut out) = manager_with_server();
-        mgr.create_channel(id, "random".to_string()).unwrap();
-        match out.try_recv().unwrap() {
-            PartyRequest::CreateChannel { name } => assert_eq!(name, "random"),
-            other => panic!("expected CreateChannel, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn send_dm_appends_locally_and_emits_request() {
-        let (mut mgr, id, _tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
-        let peer = Uuid::new_v4();
-
-        mgr.send_dm(id, peer, "hi".to_string()).unwrap();
-
-        let dm = mgr.dm_messages(id, peer);
-        assert_eq!(dm.len(), 1);
-        assert_eq!(dm[0].payload, MessagePayload::Text("hi".to_string()));
-
-        match out.try_recv().unwrap() {
-            PartyRequest::SendDm { to, text } => {
-                assert_eq!(to, peer);
-                assert_eq!(text, "hi");
-            }
-            other => panic!("expected SendDm, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn history_replaces_channel_messages() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
+    fn history_merges_into_channel_messages() {
+        let mut fx = Fx::new();
         let me = Uuid::new_v4();
         let channel = Uuid::new_v4();
-        tx.send(Incoming::Response(PartyResponse::History(vec![
+        fx.respond(PartyResponse::History(vec![
             envelope(channel, me, 1, "one"),
             envelope(channel, me, 2, "two"),
-        ])))
-        .unwrap();
-        mgr.poll_events();
-        assert_eq!(
-            mgr.server(id)
-                .unwrap()
-                .messages
-                .get(&channel)
-                .unwrap()
-                .len(),
-            2
-        );
+        ]));
+        assert_eq!(fx.thread(channel).len(), 2);
     }
 
-    /// PERF-05: paging through a long channel used to scan the whole thread
-    /// for every envelope of every page. The merge must stay correct (no
-    /// duplicates, ascending order, a live broadcast racing a page) and must
-    /// finish a 50k-message channel quickly even in a debug build.
+    /// PERF-05: the merge stays correct (no duplicates, ascending, a broadcast
+    /// racing a page) and linear for a 50k-message channel.
     #[test]
     fn paging_a_long_channel_is_linear_and_deduplicated() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
+        let mut fx = Fx::new();
         let me = Uuid::new_v4();
         let channel = Uuid::new_v4();
         let started = std::time::Instant::now();
@@ -1943,18 +1771,13 @@ mod tests {
         for start in (1..=total).step_by(MAX_HISTORY_BATCH) {
             let end = (start + MAX_HISTORY_BATCH as u64 - 1).min(total);
             // A live broadcast of the page's last envelope arrives first.
-            tx.send(Incoming::Response(PartyResponse::Message(envelope(
-                channel, me, end, "live",
-            ))))
-            .unwrap();
+            fx.respond(PartyResponse::Message(envelope(channel, me, end, "live")));
             let page = (start..=end)
                 .map(|s| envelope(channel, me, s, "x"))
                 .collect();
-            tx.send(Incoming::Response(PartyResponse::History(page)))
-                .unwrap();
-            mgr.poll_events();
+            fx.respond(PartyResponse::History(page));
         }
-        let thread = mgr.server(id).unwrap().messages.get(&channel).unwrap();
+        let thread = fx.thread(channel);
         assert_eq!(thread.len() as u64, total);
         assert!(thread.windows(2).all(|w| w[0].seq < w[1].seq));
         assert!(
@@ -1964,11 +1787,10 @@ mod tests {
         );
     }
 
-    /// SRV-01: a full `Files` reply may be truncated; the client pages on, and
-    /// only then (an older server never truncates and cannot decode it).
+    /// SRV-01: a full `Files` reply may be truncated; only then page on.
     #[test]
     fn a_full_file_listing_is_continued_page_by_page() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
+        let mut fx = Fx::new();
         let entry = |i: usize| FileEntry {
             hash: format!("{i:064x}"),
             name: format!("f{i}"),
@@ -1984,68 +1806,53 @@ mod tests {
             perms: Default::default(),
         };
         let max = messenger_core::party::MAX_FILE_LISTING;
-        while out.try_recv().is_ok() {}
+        fx.sent();
 
-        // A short listing is complete: nothing more is asked for.
-        tx.send(Incoming::Response(PartyResponse::Files(vec![entry(0)])))
-            .unwrap();
-        mgr.poll_events();
-        assert!(out.try_recv().is_err());
+        fx.respond(PartyResponse::Files(vec![entry(0)]));
+        assert!(fx.out.try_recv().is_err(), "a short listing is complete");
 
-        tx.send(Incoming::Response(PartyResponse::Files(
-            (0..max).map(entry).collect(),
-        )))
-        .unwrap();
-        mgr.poll_events();
+        fx.respond(PartyResponse::Files((0..max).map(entry).collect()));
         assert_eq!(
-            out.try_recv().unwrap(),
+            fx.out.try_recv().unwrap(),
             PartyRequest::ListFilesPage { offset: max as u32 }
         );
 
-        tx.send(Incoming::Response(PartyResponse::FilesPage {
+        fx.respond(PartyResponse::FilesPage {
             files: (max..max + 3).map(entry).collect(),
             offset: max as u32,
             next: None,
-        }))
-        .unwrap();
-        mgr.poll_events();
-        assert_eq!(mgr.server(id).unwrap().files.len(), max + 3);
+        });
+        assert_eq!(fx.conn().files.len(), max + 3);
         assert!(
-            out.try_recv().is_err(),
+            fx.out.try_recv().is_err(),
             "the last page asks for nothing more"
         );
     }
 
     #[test]
     fn disconnect_marks_status() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        tx.send(Incoming::Disconnected).unwrap();
-        mgr.poll_events();
-        assert_eq!(mgr.server(id).unwrap().status, PartyStatus::Disconnected);
+        let mut fx = Fx::new();
+        fx.tx.send(Incoming::Disconnected).unwrap();
+        fx.mgr.poll_events();
+        assert_eq!(fx.conn().status, PartyStatus::Disconnected);
     }
 
     #[test]
     fn server_error_response_is_surfaced_not_dropped() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        tx.send(Incoming::Response(PartyResponse::Error(
-            "channel is locked".to_string(),
-        )))
-        .unwrap();
-        mgr.poll_events();
+        let mut fx = Fx::new();
+        fx.respond(PartyResponse::Error("channel is locked".to_string()));
         assert_eq!(
-            mgr.server(id).unwrap().last_error.as_deref(),
+            fx.conn().last_error.as_deref(),
             Some("channel is locked"),
             "a server Error reply must surface, not be silently dropped"
         );
-
-        // The UI can dismiss it once shown.
-        mgr.clear_server_error(id);
+        fx.mgr.clear_server_error(fx.id);
         assert!(
-            mgr.server(id).unwrap().last_error.is_none(),
+            fx.conn().last_error.is_none(),
             "a dismissed server error must be cleared"
         );
         // Clearing an unknown server is a harmless no-op.
-        mgr.clear_server_error(Uuid::new_v4());
+        fx.mgr.clear_server_error(Uuid::new_v4());
     }
 
     #[test]
@@ -2058,120 +1865,72 @@ mod tests {
         assert!(mgr.last_error().is_none());
     }
 
-    /// The client pipelines Join → ListChannels → ListMembers, so `Joined`
-    /// arrives while the channel list is still empty. Seeding history there
-    /// iterated nothing, and durable channel history was never fetched at all —
-    /// every channel came up empty after a restart even though the server had
-    /// it all in SQLite.
+    /// `Joined` arrives before the channel list, so history must be seeded when
+    /// the list (and members) arrive — and only once.
     #[test]
     fn history_is_requested_once_the_channel_list_arrives() {
-        let (mut mgr, _id, tx, mut out) = manager_with_server();
+        let mut fx = Fx::new();
         let me = Uuid::new_v4();
         let channel = Uuid::new_v4();
         let peer = Uuid::new_v4();
 
         // Exactly the order the server answers in.
-        tx.send(Incoming::Response(PartyResponse::Joined {
-            member_id: me,
-            server_name: "Srv".to_string(),
-            tier: TrustTier::Administered,
-        }))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::Channels(vec![
-            ChannelInfo {
-                id: channel,
-                name: "general".to_string(),
-                kind: ChannelKind::Public,
-                members: Vec::new(),
-            },
-        ])))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::Members(vec![
-            MemberInfo {
-                id: me,
-                username: "alice".to_string(),
-                online: true,
-                role: Role::Member,
-            },
-            MemberInfo {
-                id: peer,
-                username: "bob".to_string(),
-                online: true,
-                role: Role::Member,
-            },
-        ])))
-        .unwrap();
-        mgr.poll_events();
+        fx.respond(joined_as(me));
+        fx.respond(general(channel));
+        fx.respond(PartyResponse::Members(vec![
+            member(me, "alice"),
+            member(peer, "bob"),
+        ]));
 
-        let mut requested_channel = false;
-        let mut requested_dm = false;
-        while let Ok(req) = out.try_recv() {
-            match req {
-                PartyRequest::FetchHistory { channel: c, .. } if c == channel => {
-                    requested_channel = true
-                }
-                PartyRequest::FetchDmHistory { with, .. } if with == peer => requested_dm = true,
-                _ => {}
-            }
-        }
-        assert!(requested_channel, "channel history must be fetched on join");
-        assert!(requested_dm, "DM history must be fetched on join");
-
-        // Idempotent: a re-broadcast channel list (someone created a channel)
-        // must not refetch everything.
-        tx.send(Incoming::Response(PartyResponse::Channels(vec![
-            ChannelInfo {
-                id: channel,
-                name: "general".to_string(),
-                kind: ChannelKind::Public,
-                members: Vec::new(),
-            },
-        ])))
-        .unwrap();
-        mgr.poll_events();
+        let sent = fx.sent();
         assert!(
-            out.try_recv().is_err(),
+            sent.iter().any(
+                |r| matches!(r, PartyRequest::FetchHistory { channel: c, .. } if *c == channel)
+            ),
+            "channel history must be fetched on join"
+        );
+        assert!(
+            sent.iter()
+                .any(|r| matches!(r, PartyRequest::FetchDmHistory { with, .. } if *with == peer)),
+            "DM history must be fetched on join"
+        );
+
+        // A re-broadcast channel list must not refetch everything.
+        fx.respond(general(channel));
+        assert!(
+            fx.out.try_recv().is_err(),
             "already-seeded threads must not be re-requested"
         );
     }
 
-    /// History is paged now, so a later page must merge into the earlier one
-    /// rather than replace it — and a full page asks for the next.
+    fn asked_for_history_since(fx: &mut Fx, channel: Uuid, since: u64) -> bool {
+        fx.sent().into_iter().any(|r| {
+            matches!(r, PartyRequest::FetchHistory { channel: c, since_seq }
+                if c == channel && since_seq == since)
+        })
+    }
+
+    /// A later page merges into the earlier one, and a full page asks for more.
     #[test]
     fn history_pages_are_merged_and_continued() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, me) = Fx::joined();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
+        let batch = MAX_HISTORY_BATCH as u64;
 
-        let page: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
+        let page = (1..=batch)
             .map(|seq| envelope(channel, me, seq, &format!("m{seq}")))
             .collect();
-        tx.send(Incoming::Response(PartyResponse::History(page)))
-            .unwrap();
-        mgr.poll_events();
-
-        assert_eq!(
-            mgr.server(id).unwrap().messages[&channel].len(),
-            MAX_HISTORY_BATCH
+        fx.respond(PartyResponse::History(page));
+        assert_eq!(fx.thread(channel).len(), MAX_HISTORY_BATCH);
+        assert!(
+            asked_for_history_since(&mut fx, channel, batch),
+            "a full page must be followed by the next one"
         );
-        let asked_again = std::iter::from_fn(|| out.try_recv().ok()).any(|r| {
-            matches!(r, PartyRequest::FetchHistory { channel: c, since_seq }
-                if c == channel && since_seq == MAX_HISTORY_BATCH as u64)
-        });
-        assert!(asked_again, "a full page must be followed by the next one");
 
-        // The next page appends rather than replacing.
-        tx.send(Incoming::Response(PartyResponse::History(vec![envelope(
-            channel,
-            me,
-            MAX_HISTORY_BATCH as u64 + 1,
-            "tail",
-        )])))
-        .unwrap();
-        mgr.poll_events();
+        let tail = envelope(channel, me, batch + 1, "tail");
+        fx.respond(PartyResponse::History(vec![tail]));
         assert_eq!(
-            mgr.server(id).unwrap().messages[&channel].len(),
+            fx.thread(channel).len(),
             MAX_HISTORY_BATCH + 1,
             "a later page must not throw away the earlier one"
         );
@@ -2184,24 +1943,24 @@ mod tests {
     /// silently, on any busy community.
     #[test]
     fn a_live_message_arriving_first_does_not_skip_history() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, me) = Fx::joined();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
 
         let live = MAX_HISTORY_BATCH as u64 * 2 + 101;
-        tx.send(Incoming::Response(PartyResponse::Message(envelope(
-            channel, me, live, "live",
-        ))))
-        .unwrap();
+        fx.tx
+            .send(Incoming::Response(PartyResponse::Message(envelope(
+                channel, me, live, "live",
+            ))))
+            .unwrap();
         let page: Vec<Envelope> = (1..=MAX_HISTORY_BATCH as u64)
             .map(|seq| envelope(channel, me, seq, &format!("m{seq}")))
             .collect();
-        tx.send(Incoming::Response(PartyResponse::History(page)))
+        fx.tx
+            .send(Incoming::Response(PartyResponse::History(page)))
             .unwrap();
-        mgr.poll_events();
+        fx.mgr.poll_events();
 
-        let asked: Vec<u64> = std::iter::from_fn(|| out.try_recv().ok())
+        let asked: Vec<u64> = std::iter::from_fn(|| fx.out.try_recv().ok())
             .filter_map(|r| match r {
                 PartyRequest::FetchHistory {
                     channel: c,
@@ -2217,139 +1976,80 @@ mod tests {
         );
     }
 
-    /// A page the server cut short for *size* has fewer than
-    /// `MAX_HISTORY_BATCH` envelopes, and the client used to treat that as the
-    /// end of history — so a channel of long messages never loaded past its
-    /// first few dozen. A page that is large asks for the next one too, and a
-    /// small short page still does not.
+    /// A page cut short for *size* is continued; a small short page is the end.
     #[test]
     fn a_page_trimmed_for_size_is_continued() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, me) = Fx::joined();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
 
         let long = "x".repeat(60 * 1024);
         let count = (HISTORY_PAGE_BYTES / long.len()) as u64; // ~68: well under 200
         assert!((count as usize) < MAX_HISTORY_BATCH);
-        let page: Vec<Envelope> = (1..=count)
+        let page = (1..=count)
             .map(|seq| envelope(channel, me, seq, &long))
             .collect();
-        tx.send(Incoming::Response(PartyResponse::History(page)))
-            .unwrap();
-        mgr.poll_events();
-        let asked_again = std::iter::from_fn(|| out.try_recv().ok()).any(|r| {
-            matches!(r, PartyRequest::FetchHistory { channel: c, since_seq }
-                if c == channel && since_seq == count)
-        });
-        assert!(asked_again, "a page trimmed for size must be continued");
-
-        // A short, small page really is the end.
-        tx.send(Incoming::Response(PartyResponse::History(vec![envelope(
-            channel,
-            me,
-            count + 1,
-            "tail",
-        )])))
-        .unwrap();
-        mgr.poll_events();
+        fx.respond(PartyResponse::History(page));
         assert!(
-            out.try_recv().is_err(),
+            asked_for_history_since(&mut fx, channel, count),
+            "a page trimmed for size must be continued"
+        );
+
+        let tail = envelope(channel, me, count + 1, "tail");
+        fx.respond(PartyResponse::History(vec![tail]));
+        assert!(
+            fx.out.try_recv().is_err(),
             "a small final page must not be followed by another request"
         );
     }
 
-    /// Sequence 0 is the client's own sentinel for "sent, not yet
-    /// acknowledged", and the server must never be able to occupy it.
-    ///
-    /// An honest server assigns `len() + 1` and so never sends 0. A hostile one
-    /// that does gets its envelope sorted in among the user's unconfirmed sends
-    /// — and from there the ordered `ActionFailed` reply retracts the planted
-    /// row instead of the user's, leaving a message on screen that the server
-    /// refused and never stored. That is precisely the failure the pending
-    /// queue exists to prevent, reached by handing the server the one value the
-    /// queue reserves for itself.
+    /// Seq 0 is the client's "unconfirmed" sentinel; a server must not be able
+    /// to plant one and make a refusal retract the wrong row.
     #[test]
     fn a_planted_zero_sequence_envelope_is_ignored() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, me) = Fx::joined();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
 
-        // The server pushes a seq-0 envelope into the channel before we post.
-        tx.send(Incoming::Response(PartyResponse::Message(envelope(
-            channel, me, 0, "planted",
-        ))))
-        .unwrap();
-        mgr.poll_events();
+        fx.respond(PartyResponse::Message(envelope(channel, me, 0, "planted")));
         assert!(
-            mgr.server(id)
-                .unwrap()
-                .messages
-                .get(&channel)
-                .is_none_or(|t| t.is_empty()),
+            fx.thread_is_empty(channel),
             "a seq-0 envelope from the server was accepted"
         );
 
-        // A history page carrying one is refused on the same grounds.
-        tx.send(Incoming::Response(PartyResponse::History(vec![
+        fx.respond(PartyResponse::History(vec![
             envelope(channel, me, 0, "planted in history"),
             envelope(channel, me, 4, "real"),
-        ])))
-        .unwrap();
-        mgr.poll_events();
-        let thread = &mgr.server(id).unwrap().messages[&channel];
+        ]));
+        let thread = fx.thread(channel);
         assert_eq!(thread.len(), 1, "the planted envelope survived history");
         assert_eq!(thread[0].seq, 4);
 
         // With nothing planted, our own send is the one the refusal retracts.
-        mgr.post(id, channel, "mine".to_string()).unwrap();
-        assert_eq!(mgr.server(id).unwrap().messages[&channel].len(), 2);
-        tx.send(Incoming::Response(PartyResponse::ActionFailed {
-            channel,
-            reason: "nope".to_string(),
-        }))
-        .unwrap();
-        mgr.poll_events();
-        let thread = &mgr.server(id).unwrap().messages[&channel];
+        fx.mgr.post(fx.id, channel, "mine".to_string()).unwrap();
+        assert_eq!(fx.thread(channel).len(), 2);
+        fx.respond(failed(channel, "nope"));
+        let thread = fx.thread(channel);
         assert_eq!(thread.len(), 1, "the refusal retracted the wrong message");
         assert_eq!(thread[0].seq, 4, "the server's real message was removed");
     }
 
-    /// A history page re-sorts the thread, which moves unconfirmed sends to the
-    /// end. The reply correlation used to remember a list *index*, so after a
-    /// page landed a refusal deleted the server's message instead of ours, and
-    /// a confirmation stamped our sequence onto someone else's.
+    /// A history page re-sorts the thread; replies must still find their rows.
     #[test]
     fn a_history_page_does_not_misdirect_replies_to_pending_sends() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, _) = Fx::joined();
         let other = Uuid::new_v4();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
 
-        mgr.post(id, channel, "refused".to_string()).unwrap();
-        mgr.post(id, channel, "stored".to_string()).unwrap();
-        // History lands while both are in flight and sorts them to the end.
-        tx.send(Incoming::Response(PartyResponse::History(vec![
+        fx.mgr.post(fx.id, channel, "refused".to_string()).unwrap();
+        fx.mgr.post(fx.id, channel, "stored".to_string()).unwrap();
+        fx.respond(PartyResponse::History(vec![
             envelope(channel, other, 1, "a"),
             envelope(channel, other, 2, "b"),
-        ])))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::ActionFailed {
-            channel,
-            reason: "nope".to_string(),
-        }))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::MessagePosted {
-            channel,
-            seq: 3,
-        }))
-        .unwrap();
-        mgr.poll_events();
+        ]));
+        fx.respond(failed(channel, "nope"));
+        fx.respond(posted(channel, 3));
 
-        let thread = &mgr.server(id).unwrap().messages[&channel];
-        let texts: Vec<(u64, String)> = thread
+        let texts: Vec<(u64, String)> = fx
+            .thread(channel)
             .iter()
             .map(|e| match &e.payload {
                 MessagePayload::Text(t) => (e.seq, t.clone()),
@@ -2367,169 +2067,38 @@ mod tests {
         );
     }
 
-    /// A refused upload offer used to leave its bytes queued, so the *next*
-    /// accepted upload streamed the refused file's contents under its own id.
-    #[test]
-    fn a_refused_upload_offer_does_not_stream_into_the_next_upload() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let me = Uuid::new_v4();
-        let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
-        let big = MAX_INLINE_FILE_BYTES + 1;
-
-        mgr.send_file(
-            id,
-            channel,
-            "refused.bin".into(),
-            "x".into(),
-            vec![1u8; big],
-        )
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::ActionFailed {
-            channel,
-            reason: "over quota".to_string(),
-        }))
-        .unwrap();
-        mgr.poll_events();
-        mgr.send_file(id, channel, "wanted.bin".into(), "x".into(), vec![2u8; big])
-            .unwrap();
-        let upload = Uuid::new_v4();
-        tx.send(Incoming::Response(PartyResponse::UploadReady {
-            upload,
-            chunk_size: PARTY_CHUNK_BYTES as u32,
-        }))
-        .unwrap();
-        mgr.poll_events();
-
-        let mut streamed = Vec::new();
-        while let Ok(req) = out.try_recv() {
-            if let PartyRequest::UploadChunk { upload: u, data } = req {
-                assert_eq!(u, upload);
-                streamed.extend(data);
-            }
-        }
-        assert_eq!(streamed.len(), big);
-        assert!(
-            streamed.iter().all(|b| *b == 2),
-            "the refused file's bytes were streamed under the accepted upload"
-        );
-        let thread = &mgr.server(id).unwrap().messages[&channel];
-        assert_eq!(thread.len(), 1, "only the accepted upload stays on screen");
-    }
-
-    /// A share shows nothing locally, so it used to be missing from the reply
-    /// queue: its `MessagePosted` then confirmed the next post in line with the
-    /// share's sequence.
+    /// A share shows nothing but must still hold its place in the reply queue.
     #[test]
     fn a_share_reply_is_not_matched_to_a_pending_post() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, _) = Fx::joined();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
-
-        mgr.share_file(
-            id,
-            "h".into(),
-            Uuid::new_v4(),
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-        mgr.post(id, channel, "after the share".to_string())
+        fx.mgr
+            .share_file(
+                fx.id,
+                "h".into(),
+                Uuid::new_v4(),
+                UploadTarget::Channel(channel),
+            )
             .unwrap();
-        tx.send(Incoming::Response(PartyResponse::MessagePosted {
-            channel,
-            seq: 7,
-        }))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::MessagePosted {
-            channel,
-            seq: 8,
-        }))
-        .unwrap();
-        mgr.poll_events();
+        fx.mgr
+            .post(fx.id, channel, "after the share".to_string())
+            .unwrap();
+        fx.respond(posted(channel, 7));
+        fx.respond(posted(channel, 8));
 
-        let thread = &mgr.server(id).unwrap().messages[&channel];
+        let thread = fx.thread(channel);
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].seq, 8, "the share's reply confirmed the post");
     }
 
-    /// A server that asks for 1-byte (or 0-byte) upload chunks must not turn
-    /// one file into millions of queued requests on the client.
-    #[test]
-    fn a_tiny_upload_chunk_size_from_the_server_is_bounded() {
-        let (mut mgr, id, tx, mut out) = manager_with_server();
-        let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
-        let size = MAX_INLINE_FILE_BYTES + 1;
-        mgr.send_file(id, channel, "f.bin".into(), "x".into(), vec![9u8; size])
-            .unwrap();
-        tx.send(Incoming::Response(PartyResponse::UploadReady {
-            upload: Uuid::new_v4(),
-            chunk_size: 0,
-        }))
-        .unwrap();
-        mgr.poll_events();
-        let mut chunks = 0usize;
-        let mut bytes = 0usize;
-        while let Ok(req) = out.try_recv() {
-            if let PartyRequest::UploadChunk { data, .. } = req {
-                chunks += 1;
-                bytes += data.len();
-            }
-        }
-        assert_eq!(bytes, size, "every byte is still sent");
-        assert!(
-            chunks <= size / (16 * 1024) + 1,
-            "{chunks} requests queued for one {size}-byte file"
-        );
-    }
-
-    /// A download the server claims is bigger than anything it may store is a
-    /// server lying about it; the client must not keep buffering toward it.
-    #[test]
-    fn a_download_claiming_more_than_the_server_ceiling_is_refused() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
-        let hash = "ab".repeat(32);
-        let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().messages.insert(
-            channel,
-            vec![Envelope {
-                tier: TrustTier::Administered,
-                sender: Uuid::new_v4(),
-                channel,
-                seq: 1,
-                timestamp: 1,
-                payload: MessagePayload::File(FileMeta {
-                    hash: hash.clone(),
-                    name: "big".into(),
-                    size: MAX_PARTY_FILE_BYTES,
-                    mime: "x".into(),
-                }),
-            }],
-        );
-        let mut rx = mgr.request_download(id, hash.clone()).unwrap();
-        tx.send(Incoming::Response(PartyResponse::FileChunk {
-            hash,
-            offset: 0,
-            total: MAX_PARTY_FILE_BYTES * 1000,
-            data: vec![0u8; 1024],
-        }))
-        .unwrap();
-        mgr.poll_events();
-        assert!(
-            matches!(rx.try_recv(), Ok(Err(_))),
-            "the client kept downloading toward an impossible size"
-        );
-    }
-
-    /// Once the connection is gone, a post must fail and leave nothing on
-    /// screen — not sit there forever looking like it is being delivered.
+    /// A post on a closed connection fails and leaves nothing on screen.
     #[test]
     fn posting_after_the_connection_closed_shows_nothing() {
-        let (mut mgr, id, _tx, out) = manager_with_server();
+        let (fx, _) = Fx::joined();
+        let Fx {
+            mut mgr, id, out, ..
+        } = fx;
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(Uuid::new_v4());
         drop(out);
         assert!(mgr.post(id, channel, "into the void".into()).is_err());
         assert!(
@@ -2542,78 +2111,38 @@ mod tests {
         );
     }
 
-    /// A post the server refuses used to stay on screen looking delivered: the
-    /// error arrived uncorrelated and nothing ever took the message back.
     #[test]
     fn a_refused_send_is_taken_back_off_the_screen() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        let me = Uuid::new_v4();
+        let (mut fx, _) = Fx::joined();
         let channel = Uuid::new_v4();
-        mgr.servers.get_mut(&id).unwrap().member_id = Some(me);
-
-        mgr.post(id, channel, "first".to_string()).unwrap();
-        mgr.post(id, channel, "second".to_string()).unwrap();
-        assert_eq!(mgr.server(id).unwrap().messages[&channel].len(), 2);
+        fx.mgr.post(fx.id, channel, "first".to_string()).unwrap();
+        fx.mgr.post(fx.id, channel, "second".to_string()).unwrap();
+        assert_eq!(fx.thread(channel).len(), 2);
 
         // The server accepts the first and refuses the second, in order.
-        tx.send(Incoming::Response(PartyResponse::MessagePosted {
-            channel,
-            seq: 7,
-        }))
-        .unwrap();
-        tx.send(Incoming::Response(PartyResponse::ActionFailed {
-            channel,
-            reason: "this channel is locked".to_string(),
-        }))
-        .unwrap();
-        mgr.poll_events();
+        fx.respond(posted(channel, 7));
+        fx.respond(failed(channel, "this channel is locked"));
 
-        let conn = mgr.server(id).unwrap();
-        let msgs = &conn.messages[&channel];
+        let msgs = fx.thread(channel);
         assert_eq!(msgs.len(), 1, "the refused message must be removed");
         assert_eq!(msgs[0].seq, 7, "the accepted one keeps its real sequence");
-        assert!(conn
+        assert!(fx
+            .conn()
             .last_error
             .as_deref()
             .is_some_and(|e| e.contains("locked")));
     }
 
-    /// Content addressing is the integrity check. Matching on the hash the
-    /// server echoed back proves nothing about the bytes attached to it.
-    #[tokio::test]
-    async fn a_download_whose_bytes_do_not_match_its_hash_is_refused() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
-        let hash = blob_hash(b"the real file");
-        let rx = mgr.request_download(id, hash.clone()).unwrap();
-
-        tx.send(Incoming::Response(PartyResponse::FileData {
-            hash,
-            data: b"something else entirely".to_vec(),
-        }))
-        .unwrap();
-        mgr.poll_events();
-
-        let err = rx
-            .await
-            .expect("the waiter is completed")
-            .expect_err("mismatched bytes must not be handed to the caller");
-        assert!(err.contains("does not match"), "{err}");
-    }
-
     #[tokio::test]
     async fn a_download_whose_bytes_match_is_delivered() {
-        let (mut mgr, id, tx, _out) = manager_with_server();
+        let mut fx = Fx::new();
         let data = b"the real file".to_vec();
         let hash = blob_hash(&data);
-        let rx = mgr.request_download(id, hash.clone()).unwrap();
-
-        tx.send(Incoming::Response(PartyResponse::FileData {
+        let rx = fx.download(&hash);
+        fx.respond(PartyResponse::FileData {
             hash,
             data: data.clone(),
-        }))
-        .unwrap();
-        mgr.poll_events();
-
+        });
         assert_eq!(rx.await.unwrap().unwrap(), data);
     }
 }

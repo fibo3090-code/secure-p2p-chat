@@ -1,12 +1,9 @@
-//! TUI rendering.
-//!
-//! Composes the frame: chat list (with status markers + unread dots), the
-//! message view (auto-scroll with clamping), the input / command box, a toast
-//! stack, and the status bar — then draws any active overlay on top.
+//! TUI rendering: chat list, message view (auto-scroll with clamping), input /
+//! command box, toast stack and status bar, then any active overlay on top.
 
 use crate::tui::app::{TuiApp, TuiFocus, TuiMode};
 use crate::tui::command::COMMANDS;
-use crate::tui::overlays::{self, toast_color, BRAND_ACCENT};
+use crate::tui::overlays::{self, block, focus_color, toast_color, truncate, BRAND_ACCENT};
 use crate::types::MessageContent;
 use ratatui::{prelude::*, widgets::*};
 use unicode_width::UnicodeWidthStr;
@@ -19,24 +16,13 @@ pub struct Regions {
     pub status: Rect,
 }
 
-/// Compute the standard layout for a given full area. Single source of truth so
-/// the cursor placement in `mod.rs` never drifts from the renderer.
+/// The standard layout: one source of truth so the cursor placement in
+/// `mod.rs` never drifts from the renderer.
 pub fn regions(area: Rect) -> Regions {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+    let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let columns = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(vertical[0]);
-
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(5)])
-        .split(columns[1]);
-
+    let right = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(columns[1]);
     Regions {
         chat_list: columns[0],
         messages: right[0],
@@ -112,12 +98,7 @@ fn render_command_suggestions(f: &mut Frame, app: &TuiApp, input_area: Rect) {
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" commands · Tab to complete "),
-        )
+        .block(block(" commands · Tab to complete ", Color::Yellow))
         .highlight_style(
             Style::default()
                 .bg(Color::Yellow)
@@ -167,23 +148,14 @@ fn render_chat_list(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         })
         .collect();
 
-    let title = match app.focus {
-        TuiFocus::ChatList => " Chats [focus] ",
-        _ => " Chats ",
-    };
-    let border = if app.focus == TuiFocus::ChatList {
-        BRAND_ACCENT
+    let focused = app.focus == TuiFocus::ChatList;
+    let title = if focused {
+        " Chats [focus] "
     } else {
-        Color::DarkGray
+        " Chats "
     };
-
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border))
-                .title(title),
-        )
+        .block(block(title, focus_color(focused)))
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -194,10 +166,8 @@ fn render_chat_list(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.chat_list_state);
 }
 
-/// Bytes of one message's text drawn in the messages pane. A peer can send a
-/// text of about 24 MiB; drawn whole it was copied twice and word-wrapped on
-/// every 100 ms frame, which froze the terminal while that chat was selected
-/// (PERF-02). The full text stays in the history.
+/// Bytes of one message's text drawn in the messages pane: a ~24 MiB text
+/// re-wrapped every frame froze the terminal (PERF-02). History keeps it all.
 const MAX_RENDER_TEXT_BYTES: usize = 8 * 1024;
 
 /// `text`, cut to [`MAX_RENDER_TEXT_BYTES`] on a character boundary with a
@@ -300,24 +270,15 @@ fn render_messages(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             title.push_str(&format!("· 📎 {} {}% ", t.filename, pct));
         }
     }
-    let border = if app.focus == TuiFocus::MessageView {
-        BRAND_ACCENT
-    } else {
-        Color::DarkGray
-    };
-
-    // Auto-scroll: compute wrapped height and clamp / stick to bottom.
     let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border))
-                .title(title),
-        )
+        .block(block(
+            title,
+            focus_color(app.focus == TuiFocus::MessageView),
+        ))
         .wrap(Wrap { trim: false });
 
-    // ratatui 0.30 keeps `Paragraph::line_count` private, so compute the wrapped
-    // height ourselves (greedy word-wrap, unicode-width aware) to clamp scroll.
+    // Auto-scroll: ratatui 0.30 keeps `Paragraph::line_count` private, so
+    // compute the wrapped height ourselves to clamp / stick to the bottom.
     let total: u16 = plain_texts
         .iter()
         .map(|t| wrapped_rows(t, inner_w))
@@ -458,11 +419,9 @@ fn render_toasts(f: &mut Frame, app: &TuiApp, area: Rect) {
     if area.height <= height + 1 || area.width <= width + 2 {
         return;
     }
-    let x = area.x + area.width.saturating_sub(width + 1);
-    let y = area.y + area.height.saturating_sub(height + 1);
     let rect = Rect {
-        x,
-        y,
+        x: area.x + area.width.saturating_sub(width + 1),
+        y: area.y + area.height.saturating_sub(height + 1),
         width,
         height,
     };
@@ -480,26 +439,20 @@ fn render_toasts(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" notices "),
-        ),
+        Paragraph::new(lines).block(block(" notices ", Color::DarkGray)),
         rect,
     );
 }
 
-/// Greedy word-wrap row count for a single logical line, matching ratatui's
-/// `Wrap { trim: false }` closely enough to clamp/auto-scroll the message view.
-/// Honors embedded newlines and hard-splits words longer than the width.
+/// Greedy word-wrap row count, close enough to ratatui's `Wrap { trim: false }`
+/// to clamp the message view. Honors newlines; hard-splits overlong words.
 fn wrapped_rows(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
-    let mut rows: u16 = 0;
-    for segment in text.split('\n') {
-        rows = rows.saturating_add(segment_rows(segment, width));
-    }
-    rows.max(1)
+    text.split('\n')
+        .fold(0u16, |rows, seg| {
+            rows.saturating_add(segment_rows(seg, width))
+        })
+        .max(1)
 }
 
 fn segment_rows(seg: &str, width: usize) -> u16 {
@@ -512,10 +465,9 @@ fn segment_rows(seg: &str, width: usize) -> u16 {
         if !first && col + advance > width {
             rows = rows.saturating_add(1);
             col = 0;
-            // fall through to place the word at line start
         }
         if col == 0 {
-            // place word at line start; hard-split if longer than width
+            // The word starts a line; hard-split it if longer than the width.
             if w > width {
                 let extra = ((w - 1) / width) as u16;
                 rows = rows.saturating_add(extra);
@@ -529,22 +481,6 @@ fn segment_rows(seg: &str, width: usize) -> u16 {
         first = false;
     }
     rows
-}
-
-fn block<'a>(title: &str, color: Color) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
-        .title(title.to_string())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{}…", t)
-    }
 }
 
 #[cfg(test)]
@@ -589,16 +525,12 @@ mod tests {
     use ratatui::Terminal;
     use uuid::Uuid;
 
-    /// An app over a throwaway data directory, never the developer's own.
-    fn test_app() -> (TuiApp, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("data dir");
-        let app = TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app");
-        (app, dir)
+    fn app() -> TuiApp {
+        TuiApp::ephemeral(LogBuffer::new()).expect("app")
     }
 
-    fn draw_once(app: &mut TuiApp) {
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+    fn draw(app: &mut TuiApp, width: u16, height: u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal.draw(|f| ui(f, app)).expect("draw");
     }
 
@@ -608,7 +540,7 @@ mod tests {
     /// line on screen.
     #[test]
     fn a_multi_line_message_keeps_its_lines() {
-        let (mut app, _data) = test_app();
+        let mut app = app();
         let chat = Uuid::new_v4();
         app.chat_manager
             .create_local_chat_for_test(chat, "Peer".into());
@@ -665,6 +597,18 @@ mod tests {
                 peer_name: "Peer".into(),
                 sas: "12-34-56 🐶 🐱 🦊".into(),
                 chat_id: Uuid::new_v4(),
+                warning: None,
+            },
+            TuiOverlay::FingerprintVerify {
+                fingerprint: "ab".repeat(32),
+                peer_name: "Peer".into(),
+                sas: "12-34-56 🐶 🐱 🦊".into(),
+                chat_id: Uuid::new_v4(),
+                warning: Some(crate::app::FingerprintWarning::InviteMismatch {
+                    contact_id: Uuid::new_v4(),
+                    contact_name: "Alice".into(),
+                    expected: "cd".repeat(32),
+                }),
             },
             TuiOverlay::Contacts,
             TuiOverlay::Settings,
@@ -680,20 +624,19 @@ mod tests {
             TuiOverlay::ConfirmClearHistory,
             TuiOverlay::ConfirmWipe,
         ];
-        let (mut app, _data) = test_app();
         for ov in overlays {
+            let mut app = app();
             app.overlay = ov;
-            draw_once(&mut app);
+            draw(&mut app, 100, 30);
         }
     }
 
     #[test]
     fn render_does_not_panic_with_stale_chat_ids() {
-        let (mut app, _data) = test_app();
-        let stale_id = Uuid::new_v4();
-        app.chat_ids = vec![stale_id];
+        let mut app = app();
+        app.chat_ids = vec![Uuid::new_v4()];
         app.chat_list_state.select(Some(0));
-        draw_once(&mut app);
+        draw(&mut app, 100, 30);
     }
 
     #[test]
@@ -707,10 +650,8 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_on_small_terminal_size() {
-        let (mut app, _data) = test_app();
+        let mut app = app();
         app.focus = TuiFocus::Input;
-        let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| ui(f, &mut app)).expect("draw");
+        draw(&mut app, 40, 10);
     }
 }

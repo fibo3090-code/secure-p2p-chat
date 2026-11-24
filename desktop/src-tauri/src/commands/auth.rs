@@ -6,20 +6,17 @@ pub(crate) struct AuthStatus {
     state: &'static str,
     name: String,
     fingerprint: String,
-    /// The password floor the core enforces, surfaced so the set-password
-    /// screen validates against the real rule instead of a hardcoded number
-    /// that can silently drift from it.
+    /// The core's password floor, so the set-password screen validates
+    /// against the real rule.
     min_password_len: usize,
-    /// Populated only when `state == "error"`: what went wrong at startup, in
-    /// words meant for the user.
+    /// Only when `state == "error"`: the startup failure, for the user.
     error: Option<String>,
 }
 
 #[tauri::command]
 pub(crate) fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
-    // A startup failure outranks every other state. In particular it must NOT
-    // present as "set_password", which would invite the user to create a new
-    // identity over the one that failed to load.
+    // A startup failure must never present as "set_password", which would
+    // invite creating a new identity over the unreadable one.
     if let Some(err) = &state.init_error {
         return AuthStatus {
             state: "error",
@@ -29,7 +26,7 @@ pub(crate) fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
             error: Some(err.clone()),
         };
     }
-    let id = crate::lock_identity(&state.identity);
+    let id = lock_or_recover(&state.identity);
     let st = if id.is_locked() {
         "unlock"
     } else if state.needs_password_setup() {
@@ -46,14 +43,8 @@ pub(crate) fn auth_status(state: tauri::State<'_, Bridge>) -> AuthStatus {
     }
 }
 
-/// Refuse the auth commands when startup could not read the identity file.
-///
-/// These two are deliberately *not* behind `ensure_ready` (they are what makes
-/// the app ready), so they need their own guard. `set_password` in particular
-/// must never run here: it would encrypt and save the throwaway identity created
-/// only to display the error, overwriting the unreadable-but-recoverable file
-/// with a brand new one — the exact destruction this whole path exists to
-/// prevent.
+/// Guard for the auth commands, which are not behind `ensure_ready`.
+/// `set_password` here would overwrite the unreadable identity file.
 fn ensure_identity_loaded(state: &Bridge) -> Result<(), String> {
     match &state.init_error {
         Some(err) => Err(err.clone()),
@@ -117,12 +108,10 @@ pub(crate) async fn unlock(
     Ok(())
 }
 
-/// Honor `auto_host_on_startup` and `auto_connect` once the identity is
-/// unlocked and history (with its persisted config) is loaded — "open the app
-/// and be reachable / reconnected", matching the terminal client. Failures are
-/// logged, never fatal to the unlock.
+/// Honor `auto_host_on_startup` and `auto_connect` after unlock; failures are
+/// logged, never fatal.
 async fn auto_host_if_configured(state: &tauri::State<'_, Bridge>, mgr: &mut ChatManager) {
-    let pk_result = crate::lock_identity(&state.identity).private_key();
+    let pk_result = lock_or_recover(&state.identity).private_key();
     let pk = match pk_result {
         Ok(pk) => pk,
         Err(e) => {
@@ -185,18 +174,10 @@ pub(crate) async fn set_password(
     Ok(())
 }
 
-/// Change the password protecting the identity file.
-///
-/// The private key — and therefore the history key derived from it — is
-/// unchanged, so every stored message stays readable and the fingerprint every
-/// contact verified stays the same. Only the Argon2/ChaCha20 wrapper around the
-/// key is replaced.
-///
-/// The re-wrap is done on a **copy** and only swapped into the shared identity
-/// once the new file is safely on disk. Mutating in place first would, on a
-/// failed write, leave the running app wanting the new password while the file
-/// on disk still wanted the old one — and the next attempt would then report
-/// "current password is incorrect" for the password the user just set.
+/// Change the password protecting the identity file. The private key (and so
+/// the history key and fingerprint) is unchanged. The re-wrap runs on a copy
+/// swapped in only once the new file is on disk, so a failed write cannot
+/// leave memory and disk wanting different passwords.
 #[tauri::command]
 pub(crate) async fn change_password(
     current: String,
@@ -206,9 +187,8 @@ pub(crate) async fn change_password(
     ensure_ready(&state)?;
     let _auth = AUTH_OP.lock().await;
     let path = state.identity_path.clone();
-    // Argon2 at 64 MiB × 3 passes runs twice here (verify + re-wrap), which is
-    // ~1s of CPU — off the async runtime so the UI keeps painting.
-    let mut candidate = crate::lock_identity(&state.identity).clone();
+    // Argon2 runs twice (~1s of CPU): keep it off the async runtime.
+    let mut candidate = lock_or_recover(&state.identity).clone();
     let candidate = tokio::task::spawn_blocking(move || -> Result<Identity, String> {
         candidate
             .change_password(&current, &new)
@@ -218,7 +198,7 @@ pub(crate) async fn change_password(
     })
     .await
     .map_err(|e| e.to_string())??;
-    *crate::lock_identity(&state.identity) = candidate;
+    *lock_or_recover(&state.identity) = candidate;
     Ok(())
 }
 
@@ -241,21 +221,18 @@ pub(crate) async fn set_display_name(
     ensure_ready(&state)?;
     let _auth = AUTH_OP.lock().await;
     {
-        let mut id = crate::lock_identity(&state.identity);
+        let mut id = lock_or_recover(&state.identity);
         id.set_name(&name).map_err(|e| e.to_string())?;
         id.save(&state.identity_path).map_err(|e| e.to_string())?;
     }
     Ok(auth_status(state))
 }
 
-/// Whether the history on disk failed to load this session.
 #[derive(serde::Serialize)]
 pub(crate) struct HistoryStatus {
-    /// `Some(reason)` when the file exists but could not be read. Saving is
-    /// blocked while this is set (see `ChatManager::history_load_error`), so
-    /// the UI must say so and offer [`set_aside_history`].
+    /// `Some(reason)` when the file exists but could not be read; saving is
+    /// blocked until [`set_aside_history`].
     error: Option<String>,
-    /// Where the history lives, so the message can name the file.
     path: String,
 }
 
@@ -291,16 +268,10 @@ pub(crate) async fn set_aside_history(
 /// What the user types to confirm deleting everything.
 pub(crate) const DELETE_CONFIRMATION: &str = "DELETE";
 
-/// Delete everything this app stores on this device — identity, encrypted
-/// history, saved communities, diagnostics — then quit (audit JOURNEY-03 /
-/// DOC-02: the guide promised this and nothing implemented it).
-///
-/// Guarded twice, because it cannot be undone and is the one action that
-/// destroys the identity itself: the password, checked against the file on
-/// disk, and the typed word `DELETE`. Communities and discovery are dropped
-/// first, then `ChatManager::delete_all_data` stops hosting and sessions,
-/// removes the files and refuses every later save, so the window-close flush
-/// cannot write a history file back.
+/// Delete everything this app stores on this device, then quit (audit
+/// JOURNEY-03 / DOC-02). Guarded by the password (checked against the file on
+/// disk) and the typed word `DELETE`. `ChatManager::delete_all_data` refuses
+/// every later save, so the close flush cannot write history back.
 #[tauri::command]
 pub(crate) async fn delete_all_data<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -328,7 +299,7 @@ pub(crate) async fn delete_all_data<R: tauri::Runtime>(
             party.remove_server(id);
         }
     }
-    *crate::lock_or_recover(&state.discovery) = None;
+    *lock_or_recover(&state.discovery) = None;
     let data_dir = state
         .history_path
         .parent()
@@ -348,11 +319,8 @@ pub(crate) async fn delete_all_data<R: tauri::Runtime>(
     Ok(())
 }
 
-/// Export a backup copy of the encrypted identity file (identity.json) to a
-/// user-chosen location. The file is already encrypted at rest (Argon2 +
-/// ChaCha20-Poly1305), so the copy is as safe as the original — but it IS the
-/// identity: losing it (and the password) means losing the account.
-/// Returns the destination path, or None if the dialog was cancelled.
+/// Copy the (already encrypted) identity file to a user-chosen location.
+/// Returns the destination, or None if cancelled.
 #[tauri::command]
 pub(crate) async fn export_identity<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
@@ -419,14 +387,13 @@ pub(crate) async fn backup_identity_to(
     Ok(())
 }
 
-/// Export a support bundle (state metadata + config, never key material) to
-/// `<data dir>/diagnostics/bundle-<stamp>/`, the same bundle the terminal client exports.
-/// Returns the bundle directory path.
+/// Export a support bundle (metadata + config, never key material) to
+/// `<data dir>/diagnostics/bundle-<stamp>/`. Returns the bundle directory.
 #[tauri::command]
 pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
     let (identity_locked, identity_name, fp_prefix) = {
-        let id = crate::lock_identity(&state.identity);
+        let id = lock_or_recover(&state.identity);
         (
             id.is_locked(),
             id.name.clone(),
@@ -451,7 +418,7 @@ pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Resul
             contacts: mgr.contacts.len(),
             sessions: mgr.sessions_len(),
             active_toasts: mgr.toasts.len(),
-            discovered_peers: crate::lock_or_recover(&state.discovered).len(),
+            discovered_peers: lock_or_recover(&state.discovered).len(),
             config: p2pem_classic::support::DiagnosticsConfig::from(&mgr.config),
         }
     };
@@ -472,8 +439,7 @@ pub(crate) async fn export_diagnostics(state: tauri::State<'_, Bridge>) -> Resul
     Ok(bundle.display().to_string())
 }
 
-/// Open the app's data directory (identity, encrypted history, diagnostics)
-/// in the system file manager.
+/// Open the app's data directory in the system file manager.
 #[tauri::command]
 pub(crate) fn open_data_dir(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
@@ -486,10 +452,7 @@ pub(crate) fn open_data_dir(state: tauri::State<'_, Bridge>) -> Result<String, S
     Ok(dir.display().to_string())
 }
 
-/// The user-facing settings the desktop app exposes. Only fields the core
-/// actually honors are surfaced (a toggle the runtime ignores is a lying UI):
-/// `download_dir` and typing/notification switches are read by `ChatManager`,
-/// and auto-host is implemented by this bridge on unlock.
+/// The settings the desktop app exposes; only fields the core actually honors.
 #[derive(Serialize)]
 pub(crate) struct SettingsDto {
     download_dir: String,
@@ -502,9 +465,7 @@ pub(crate) struct SettingsDto {
     auto_connect: bool,
     enable_mdns: bool,
     notification_content: messenger_core::types::NotificationContent,
-    /// RFC 3339 timestamp of the last identity backup, or `null` if there has
-    /// never been one. Read-only — it is set by `export_identity`, not by the
-    /// settings form.
+    /// RFC 3339 time of the last identity backup; read-only (set by `export_identity`).
     identity_backed_up_at: Option<String>,
 }
 
@@ -542,8 +503,8 @@ pub(crate) async fn get_settings(state: tauri::State<'_, Bridge>) -> Result<Sett
     })
 }
 
-/// Apply the toggle/number settings and persist them (config is part of the
-/// encrypted history file). The download directory has its own picker command.
+/// Apply the toggle/number settings and persist them (config lives in the
+/// encrypted history). The download directory has its own picker.
 #[tauri::command]
 pub(crate) async fn update_settings(
     settings: SettingsUpdate,
@@ -578,8 +539,7 @@ pub(crate) async fn update_settings(
     Ok(())
 }
 
-/// Pick a new download directory with the native folder dialog (on a blocking
-/// thread) and persist it. Returns the new path, or `None` if cancelled.
+/// Pick and persist a new download directory. `None` if cancelled.
 #[tauri::command]
 pub(crate) async fn pick_download_dir<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,

@@ -1,25 +1,21 @@
-//! Modal overlays for the TUI.
-//!
-//! Overlays sit on top of the normal chat layout. While one is open, key events
-//! route to it first (see `TuiApp::handle_key_event`). Every overlay has an
-//! equivalent `:`-command so the app stays fully keyboard/command driven.
+//! Modal overlays drawn over the chat layout. While one is open, keys route to
+//! it first (`TuiApp::handle_key_event`); each has an equivalent `:`-command.
 
+use crate::app::FingerprintWarning;
 use crate::tui::app::TuiApp;
-use crate::tui::command::{command_help, settings_keys, COMMANDS};
+use crate::tui::command::{command_help, COMMANDS};
 use crate::types::{ToastLevel, TransferStatus};
 use ratatui::{prelude::*, widgets::*};
 use uuid::Uuid;
 
-/// What a password overlay is for.
+/// What a password overlay is for: unlocking an encrypted identity, or
+/// setting a password on an unencrypted one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordMode {
-    /// Unlock an existing encrypted identity.
     Unlock,
-    /// Set a password on a new/unencrypted identity.
     Set,
 }
 
-/// The currently active overlay (if any).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TuiOverlay {
     #[default]
@@ -30,6 +26,9 @@ pub enum TuiOverlay {
         peer_name: String,
         sas: String,
         chat_id: Uuid,
+        /// Set when this is not an ordinary first use: the key changed, or it
+        /// is not the one in the dialled contact's invite (CRYPTO-04).
+        warning: Option<FingerprintWarning>,
     },
     Contacts,
     Settings,
@@ -38,8 +37,7 @@ pub enum TuiOverlay {
     },
     Identity,
     Transfers,
-    /// The Communities pane: servers, channels, members with their roles, and
-    /// the files shared where you can see them.
+    /// The Communities pane.
     Party,
     Password {
         mode: PasswordMode,
@@ -50,8 +48,7 @@ pub enum TuiOverlay {
     ConfirmDeleteChat {
         chat_id: uuid::Uuid,
     },
-    /// `:wipe` after the password checked out: the last step before deleting
-    /// everything. Only Ctrl+Y proceeds.
+    /// `:wipe` after the password checked out; only Ctrl+Y proceeds.
     ConfirmWipe,
 }
 
@@ -63,33 +60,106 @@ impl TuiOverlay {
 
 /// Compute a centered rectangle `pct_x` × `pct_y` percent of `area`.
 pub fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - pct_y) / 2),
-            Constraint::Percentage(pct_y),
-            Constraint::Percentage((100 - pct_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - pct_x) / 2),
-            Constraint::Percentage(pct_x),
-            Constraint::Percentage((100 - pct_x) / 2),
-        ])
-        .split(vertical[1])[1]
+    let split = |pct: u16| {
+        let margin = Constraint::Percentage((100 - pct) / 2);
+        [margin, Constraint::Percentage(pct), margin]
+    };
+    let vertical = Layout::vertical(split(pct_y)).split(area);
+    Layout::horizontal(split(pct_x)).split(vertical[1])[1]
 }
 
-fn ratatui_color(c: crate::colorgrid::Rgb) -> Color {
-    Color::Rgb(c.0, c.1, c.2)
+/// Chrome accent (borders, key hints) from design/tokens.json. Semantic colors
+/// (success/warning/error/info) stay separate: they carry meaning, not brand.
+pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x4a, 0x68, 0xec);
+
+/// A bordered block in `color`.
+pub(crate) fn block<'a>(title: impl Into<Line<'a>>, color: Color) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(title)
 }
 
-/// Brand-neutral chrome accent ("control teal-indigo", see design/tokens.json).
-/// Used only for UI chrome (borders, key-hint labels) that previously used an
-/// arbitrary `Color::Cyan` — semantic colors (success/warning/error/info) are
-/// untouched, since they carry meaning rather than brand.
-pub(crate) const BRAND_ACCENT: Color = Color::Rgb(0x3e, 0x8d, 0xd2);
+/// The accent for the focused pane, gray otherwise.
+pub(crate) fn focus_color(focused: bool) -> Color {
+    if focused {
+        BRAND_ACCENT
+    } else {
+        Color::DarkGray
+    }
+}
+
+fn selected_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(BRAND_ACCENT).bold()
+    } else {
+        Style::default()
+    }
+}
+
+fn dim<'a>(text: impl Into<std::borrow::Cow<'a, str>>) -> Span<'a> {
+    Span::styled(text, Style::default().fg(Color::DarkGray))
+}
+
+fn heading(text: &str) -> Line<'_> {
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::Yellow).bold(),
+    ))
+}
+
+/// A gray, wrapped explanatory paragraph.
+fn note(f: &mut Frame, text: &str, area: Rect) {
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray)),
+        area,
+    );
+}
+
+/// A one-line key hint.
+fn hint(f: &mut Frame, text: &str, area: Rect) {
+    f.render_widget(Paragraph::new(dim(text)), area);
+}
+
+fn highlight_list<'a>(items: impl IntoIterator<Item = ListItem<'a>>) -> List<'a> {
+    List::new(items)
+        .highlight_style(Style::default().bg(Color::DarkGray).bold())
+        .highlight_symbol("> ")
+}
+
+/// The safety grid (the frozen palette every front-end renders, so users
+/// compare the same shape everywhere) and the fingerprint hex.
+fn render_grid_and_hex(f: &mut Frame, fingerprint: &str, grid: Rect, hex: Rect) {
+    let lines: Vec<Line> = crate::colorgrid::generate_color_grid(fingerprint)
+        .iter()
+        .map(|row| {
+            Line::from(
+                row.iter()
+                    .map(|c| Span::styled("███ ", Style::default().fg(Color::Rgb(c.0, c.1, c.2))))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), grid);
+    f.render_widget(
+        // The terminal's own foreground: white was white-on-white on a light
+        // theme, and this is the backstop for the safety code (TUI-21).
+        Paragraph::new(fingerprint.to_string()).wrap(Wrap { trim: true }),
+        hex,
+    );
+}
+
+/// Trim to `max` display columns, marking the cut so a truncated name does not
+/// read as the whole name.
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
 
 /// Render the active overlay over `area`. No-op when none is open.
 pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
@@ -100,8 +170,9 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             fingerprint,
             peer_name,
             sas,
+            warning,
             ..
-        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, area),
+        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, warning.as_ref(), area),
         TuiOverlay::Contacts => render_contacts(f, app, area),
         TuiOverlay::Settings => render_settings(f, app, area),
         TuiOverlay::Invite { link } => render_invite(f, &link, area),
@@ -141,13 +212,8 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
 fn clear_and_block(f: &mut Frame, area: Rect, title: &str) -> Rect {
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BRAND_ACCENT))
-        .title(Span::styled(
-            format!(" {} ", title),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    let title = Span::styled(format!(" {} ", title), Style::default().bold());
+    let block = block(title, BRAND_ACCENT);
     let inner = block.inner(area);
     f.render_widget(block, area);
     inner
@@ -167,27 +233,19 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
         if let Some((name, usage, desc)) = command_help(topic) {
             lines.push(Line::from(Span::styled(
                 usage,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Green).bold(),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(desc));
             lines.push(Line::from(""));
             lines.push(Line::from(format!("Command name: {}", name)));
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
+            lines.push(Line::from(dim(
                 "Use :help for the full command list · Esc to close",
-                Style::default().fg(Color::DarkGray),
             )));
         }
     } else {
-        lines.push(Line::from(Span::styled(
-            "Keys",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(heading("Keys"));
         for (k, v) in [
             ("Tab", "cycle focus (chats / messages / input)"),
             (":", "enter command mode"),
@@ -210,22 +268,12 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
             ]));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Chat markers",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(heading("Chat markers"));
         lines.push(Line::from(
             "  H hosting   ● connected   ○ offline   * unread",
         ));
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Commands",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(heading("Commands"));
         for (_, usage, desc) in COMMANDS {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -236,10 +284,7 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
             ]));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Esc or :help to close · ↑/↓ to scroll",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(dim("Esc or :help to close · ↑/↓ to scroll")));
     }
 
     let para = Paragraph::new(lines)
@@ -248,81 +293,95 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
     f.render_widget(para, inner);
 }
 
-fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &str, full: Rect) {
+/// The text the fingerprint prompt leads with when it is not a first use.
+pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
+    match warning {
+        FingerprintWarning::KeyChanged { previous } => format!(
+            "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
+            short_fingerprint(previous)
+        ),
+        FingerprintWarning::InviteMismatch {
+            contact_name,
+            expected,
+            ..
+        } => format!(
+            "⚠ WARNING: this is NOT the key in {}'s invite (expected {}…). Someone may be intercepting the connection. Reject unless the codes match.",
+            contact_name,
+            short_fingerprint(expected)
+        ),
+    }
+}
+
+fn short_fingerprint(fp: &str) -> String {
+    fp.chars().take(16).collect()
+}
+
+fn render_fingerprint(
+    f: &mut Frame,
+    fingerprint: &str,
+    peer_name: &str,
+    sas: &str,
+    warning: Option<&FingerprintWarning>,
+    full: Rect,
+) {
     let area = centered_rect(70, 70, full);
     let inner = clear_and_block(f, area, "🛡 Verify peer identity");
 
     let has_sas = !sas.is_empty();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),                           // heading
-            Constraint::Length(2),                           // instruction
-            Constraint::Length(if has_sas { 3 } else { 0 }), // SAS
-            Constraint::Min(6),                              // color grid
-            Constraint::Length(2),                           // fingerprint hex
-            Constraint::Length(1),                           // actions
-        ])
-        .split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(if warning.is_some() { 3 } else { 0 }), // warning
+        Constraint::Length(2),                                     // heading
+        Constraint::Length(2),                                     // instruction
+        Constraint::Length(if has_sas { 3 } else { 0 }),           // SAS
+        Constraint::Min(6),                                        // color grid
+        Constraint::Length(2),                                     // fingerprint hex
+        Constraint::Length(1),                                     // actions
+    ])
+    .split(inner);
+
+    // A warning leads: the SAS still decides, but the user must know this
+    // is not an ordinary first contact before reading the code.
+    if let Some(warning) = warning {
+        f.render_widget(
+            Paragraph::new(fingerprint_warning_text(warning))
+                .wrap(Wrap { trim: true })
+                .style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            rows[0],
+        );
+    }
 
     f.render_widget(
-        Paragraph::new(format!("Connecting to {}", peer_name))
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-        rows[0],
+        Paragraph::new(format!("Connecting to {}", peer_name)).style(Style::default().bold()),
+        rows[1],
     );
 
-    // The short authentication string leads: both peers see the same code,
-    // and an interposed MITM makes the two ends differ. Reading it aloud is
-    // the low-friction check; the safety grid / hex stays as the backstop.
+    // The SAS leads: both peers see the same code and a MITM makes them
+    // differ. The safety grid / hex stays as the backstop.
     if has_sas {
-        f.render_widget(
-            Paragraph::new("Read this code aloud with your peer — it must match on both ends:")
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::Gray)),
-            rows[1],
+        note(
+            f,
+            "Read this code aloud with your peer — it must match on both ends:",
+            rows[2],
         );
         f.render_widget(
             Paragraph::new(sas.to_string())
                 .alignment(ratatui::layout::Alignment::Center)
-                .style(
-                    Style::default()
-                        .fg(BRAND_ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            rows[2],
+                .style(Style::default().fg(BRAND_ACCENT).bold()),
+            rows[3],
         );
     } else {
-        f.render_widget(
-            Paragraph::new(
-                "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
-            )
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Gray)),
-            rows[1],
+        note(
+            f,
+            "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
+            rows[2],
         );
     }
-
-    // Safety grid — the same frozen palette every front-end renders, so the
-    // shape a user compares is identical in the terminal and the desktop app.
-    let grid = crate::colorgrid::generate_color_grid(fingerprint);
-    let grid_lines: Vec<Line> = grid
-        .iter()
-        .map(|row| {
-            Line::from(
-                row.iter()
-                    .map(|c| Span::styled("███ ", Style::default().fg(ratatui_color(*c))))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
-    f.render_widget(Paragraph::new(grid_lines), rows[3]);
-
-    f.render_widget(
-        // The terminal's own foreground: white was white-on-white on a
-        // light theme, and this is the backstop for the safety code (TUI-21).
-        Paragraph::new(fingerprint.to_string()).wrap(Wrap { trim: true }),
-        rows[4],
-    );
+    render_grid_and_hex(f, fingerprint, rows[4], rows[5]);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -338,7 +397,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
             ),
             Span::raw(" later (:verify accept|reject)"),
         ])),
-        rows[5],
+        rows[6],
     );
 }
 
@@ -347,12 +406,9 @@ fn render_contacts(f: &mut Frame, app: &mut TuiApp, full: Rect) {
     let inner = clear_and_block(f, area, "Contacts");
 
     if app.contact_ids.is_empty() {
-        f.render_widget(
-            Paragraph::new(
-                "No contacts yet.\n\nAdd one with :contact-add <name> <host:port> [fingerprint]\nor import an invite with :import <link>.",
-            )
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Gray)),
+        note(
+            f,
+            "No contacts yet.\n\nAdd one with :contact-add <name> <host:port> [fingerprint]\nor import an invite with :import <link>.",
             inner,
         );
         return;
@@ -378,14 +434,7 @@ fn render_contacts(f: &mut Frame, app: &mut TuiApp, full: Rect) {
         })
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, inner, &mut app.contacts_list_state);
+    f.render_stateful_widget(highlight_list(items), inner, &mut app.contacts_list_state);
 }
 
 fn render_settings(f: &mut Frame, app: &mut TuiApp, full: Rect) {
@@ -402,17 +451,8 @@ fn render_settings(f: &mut Frame, app: &mut TuiApp, full: Rect) {
         format!("auto-host      {}", on_off(cfg.auto_host_on_startup)),
         format!("upnp           {}", on_off(cfg.enable_upnp)),
     ];
-    let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.clone())).collect();
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
+    let list = highlight_list(rows.map(ListItem::new));
     f.render_stateful_widget(list, inner, &mut app.settings_list_state);
-
-    let _ = settings_keys();
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -438,10 +478,7 @@ fn render_invite(f: &mut Frame, link: &str, full: Rect) {
                 Style::default().fg(Color::Green),
             )),
             Line::from(""),
-            Line::from(Span::styled(
-                "Esc to close",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(dim("Esc to close")),
         ])
         .wrap(Wrap { trim: false }),
         inner,
@@ -452,44 +489,20 @@ fn render_identity(f: &mut Frame, app: &TuiApp, full: Rect) {
     let area = centered_rect(70, 70, full);
     let inner = clear_and_block(f, area, "Your identity (fingerprint copied)");
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(6),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(6),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
     f.render_widget(
-        Paragraph::new(format!("Name: {}", app.identity_name))
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(format!("Name: {}", app.identity_name)).style(Style::default().bold()),
         rows[0],
     );
-    let grid = crate::colorgrid::generate_color_grid(&app.identity_fingerprint());
-    let grid_lines: Vec<Line> = grid
-        .iter()
-        .map(|row| {
-            Line::from(
-                row.iter()
-                    .map(|c| Span::styled("███ ", Style::default().fg(ratatui_color(*c))))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
-    f.render_widget(Paragraph::new(grid_lines), rows[1]);
-    f.render_widget(
-        Paragraph::new(app.identity_fingerprint()).wrap(Wrap { trim: true }),
-        rows[2],
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "Esc to close",
-            Style::default().fg(Color::DarkGray),
-        )),
-        rows[3],
-    );
+    render_grid_and_hex(f, &app.identity_fingerprint(), rows[1], rows[2]);
+    hint(f, "Esc to close", rows[3]);
 }
 
 fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
@@ -498,18 +511,14 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
 
     let transfers = app.chat_manager.active_transfers_sorted();
     if transfers.is_empty() {
-        f.render_widget(
-            Paragraph::new("No active transfers.\n\nSend a file with :send <path>.")
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::Gray)),
+        note(
+            f,
+            "No active transfers.\n\nSend a file with :send <path>.",
             inner,
         );
         return;
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
     let sel = app.transfer_sel.min(transfers.len().saturating_sub(1));
     let lines: Vec<Line> = transfers
@@ -545,41 +554,25 @@ fn render_transfers(f: &mut Frame, app: &TuiApp, full: Rect) {
                 crate::util::format_size(t.size),
                 status
             );
-            let style = if i == sel {
-                Style::default()
-                    .fg(BRAND_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            Line::styled(text, style)
+            Line::styled(text, selected_style(i == sel))
         })
         .collect();
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "↑/↓ select · c cancel · Esc close",
-            Style::default().fg(Color::DarkGray),
-        )),
-        rows[1],
-    );
+    hint(f, "↑/↓ select · c cancel · Esc close", rows[1]);
 }
 
-/// The Communities pane: the servers you have joined, and for the selected one
-/// its channels (with their access rule), members (with role and presence), and
-/// the files shared where you can see them.
-///
-/// The commands remain the way to *act*; this is the surface that shows the
-/// state they act on, which command output could only ever print one slice of.
+/// The Communities pane: joined servers and, for the selected one, its threads
+/// (channels with their access rule, DMs with role and presence), the selected
+/// thread's messages, and the files you can see. Commands remain the way to act.
 fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
     let area = centered_rect(84, 76, full);
     let inner = clear_and_block(f, area, "Communities");
 
     let servers = app.party_manager.server_ids();
     if servers.is_empty() {
-        f.render_widget(
-            Paragraph::new(
-                "You have not joined any communities.\n\n\
+        note(
+            f,
+            "You have not joined any communities.\n\n\
                  Join one with:\n  \
                  :party-connect <host[:port]> <username> [password]\n\n\
                  The first time you connect to an address you will be shown the \
@@ -588,50 +581,39 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
                  sent before you do.\n\n\
                  Communities are not end-to-end encrypted: the server's operator \
                  can read every message, DM and file posted there.",
-            )
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Gray)),
             inner,
         );
         return;
     }
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
     let sel = app.party_sel.min(servers.len().saturating_sub(1));
     // Server tabs across the top, so it is obvious which one the rest describes.
-    let tabs: Vec<Span> = servers
+    let mut tabs: Vec<Span> = servers
         .iter()
         .enumerate()
         .map(|(i, id)| {
-            let conn = app.party_manager.server(*id);
-            let name = conn
-                .map(|c| {
-                    if c.server_name.is_empty() {
-                        c.address.clone()
-                    } else {
-                        c.server_name.clone()
-                    }
-                })
-                .unwrap_or_else(|| "?".to_string());
-            let style = if i == sel {
-                Style::default()
-                    .fg(BRAND_ACCENT)
-                    .add_modifier(Modifier::BOLD)
+            let name = app.party_manager.server(*id).map_or("?", |c| {
+                if c.server_name.is_empty() {
+                    &c.address
+                } else {
+                    &c.server_name
+                }
+            });
+            let text = format!(" {} ", name);
+            if i == sel {
+                Span::styled(text, selected_style(true))
             } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            Span::styled(format!(" {} ", name), style)
+                dim(text)
+            }
         })
         .collect();
-    let mut tabs = tabs;
     // Always visible: community traffic is stored readable by the operator
     // (audit JOURNEY-04 / PRIV-01), and a DM here looks like any other.
     tabs.push(Span::styled(
@@ -647,40 +629,27 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
         return;
     };
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(rows[1]);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).split(rows[1]);
 
-    // Left: the threads — channels, then a DM with each member. ↑/↓ selects
-    // the one shown on the right (and that :party-post writes to).
+    // Left: channels, then a DM with each member; ↑/↓ picks the one shown on
+    // the right (and that :party-post writes to).
     let threads = app.party_threads();
     let thread_sel = app.party_thread_sel.min(threads.len().saturating_sub(1));
-    let section = |label: &'static str| {
-        Line::styled(
-            label,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
+    let section =
+        |label: &'static str| Line::styled(label, Style::default().fg(Color::DarkGray).bold());
     let mut left: Vec<Line> = Vec::new();
-    left.push(Line::styled(
-        format!("{}  ({})", conn.address, party_status_label(&conn.status)),
-        Style::default().fg(Color::DarkGray),
-    ));
+    left.push(Line::from(dim(format!(
+        "{}  ({})",
+        conn.address,
+        party_status_label(&conn.status)
+    ))));
     left.push(Line::raw(""));
     left.push(section("CHANNELS"));
     let mut dm_header_shown = false;
     for (i, thread) in threads.iter().enumerate() {
         let marker = if i == thread_sel { "▶ " } else { "  " };
-        let style = if i == thread_sel {
-            Style::default()
-                .fg(BRAND_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
+        let style = selected_style(i == thread_sel);
         match thread {
             crate::tui::app::PartyThread::Channel { id, name } => {
                 // The kind is the access rule, so it belongs next to the name.
@@ -717,12 +686,8 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
     }
     f.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), cols[0]);
 
-    // Right: the selected thread's messages, newest at the bottom, then a
-    // short files/quota summary.
-    let right_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(7)])
-        .split(cols[1]);
+    // Right: the thread's messages, newest at the bottom, then files/quota.
+    let right_rows = Layout::vertical([Constraint::Min(3), Constraint::Length(7)]).split(cols[1]);
     let name_of = |id: uuid::Uuid| {
         if Some(id) == conn.member_id {
             "you".to_string()
@@ -738,10 +703,9 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
     let capacity = right_rows[0].height as usize;
     let mut msg_lines: Vec<Line> = Vec::new();
     if messages.is_empty() {
-        msg_lines.push(Line::styled(
+        msg_lines.push(Line::from(dim(
             "  no messages yet — :party-post <text> writes here",
-            Style::default().fg(Color::DarkGray),
-        ));
+        )));
     }
     for env in messages
         .iter()
@@ -773,10 +737,9 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
     let mut right: Vec<Line> = Vec::new();
     right.push(section("SHARED FILES"));
     if conn.files.is_empty() {
-        right.push(Line::styled(
+        right.push(Line::from(dim(
             "  none visible — :party-files refreshes this",
-            Style::default().fg(Color::DarkGray),
-        ));
+        )));
     } else {
         for file in conn.files.iter().take(3) {
             right.push(Line::raw(format!(
@@ -788,30 +751,23 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
             )));
         }
         if conn.files.len() > 3 {
-            right.push(Line::styled(
-                format!("  … and {} more", conn.files.len() - 3),
-                Style::default().fg(Color::DarkGray),
-            ));
+            right.push(Line::from(dim(format!(
+                "  … and {} more",
+                conn.files.len() - 3
+            ))));
         }
     }
     if let Some(q) = conn.quota {
-        let used = crate::util::format_size(q.used);
-        let line = match q.limit {
-            Some(limit) => format!(
-                "  You: {} of {}   Server: {} of {}",
-                used,
-                crate::util::format_size(limit),
-                crate::util::format_size(q.server_used),
-                crate::util::format_size(q.server_limit)
-            ),
-            None => format!(
-                "  You: {} (no personal limit)   Server: {} of {}",
-                used,
-                crate::util::format_size(q.server_used),
-                crate::util::format_size(q.server_limit)
-            ),
+        let size = crate::util::format_size;
+        let mine = match q.limit {
+            Some(limit) => format!("{} of {}", size(q.used), size(limit)),
+            None => format!("{} (no personal limit)", size(q.used)),
         };
-        right.push(Line::styled(line, Style::default().fg(Color::DarkGray)));
+        right.push(Line::from(dim(format!(
+            "  You: {mine}   Server: {} of {}",
+            size(q.server_used),
+            size(q.server_limit)
+        ))));
     }
     if let Some(err) = &conn.last_error {
         right.push(Line::styled(
@@ -824,11 +780,9 @@ fn render_party(f: &mut Frame, app: &TuiApp, full: Rect) {
         right_rows[1],
     );
 
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "←/→ community · ↑/↓ thread · :party-post writes here · :party-files · Esc close",
-            Style::default().fg(Color::DarkGray),
-        )),
+    hint(
+        f,
+        "←/→ community · ↑/↓ thread · :party-post writes here · :party-files · Esc close",
         rows[2],
     );
 }
@@ -841,16 +795,6 @@ fn party_status_label(status: &crate::app::party_manager::PartyStatus) -> String
         PartyStatus::Rejected(r) => format!("rejected: {r}"),
         PartyStatus::Disconnected => "disconnected".to_string(),
     }
-}
-
-/// Trim to `max` display columns, marking the cut so a truncated name does not
-/// read as the whole name.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
 }
 
 fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) {
@@ -873,34 +817,21 @@ fn render_password(f: &mut Frame, app: &TuiApp, mode: PasswordMode, full: Rect) 
              You'll need it on next launch, and it cannot be recovered."
         }
     };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(2),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = Layout::vertical([
+        Constraint::Min(2),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
-    f.render_widget(
-        Paragraph::new(prompt)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Gray)),
-        rows[0],
-    );
+    note(f, prompt, rows[0]);
     f.render_widget(
         Paragraph::new(app.password_field.display_text())
             .block(Block::default().borders(Borders::ALL).title("password"))
             .style(Style::default().fg(Color::Yellow)),
         rows[1],
     );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "Enter to confirm · Esc to cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-        rows[2],
-    );
+    hint(f, "Enter to confirm · Esc to cancel", rows[2]);
 }
 
 fn render_confirm(f: &mut Frame, title: &str, message: &str, full: Rect) {
@@ -914,7 +845,6 @@ fn render_confirm(f: &mut Frame, title: &str, message: &str, full: Rect) {
     );
 }
 
-/// Severity → ratatui color for toasts.
 pub fn toast_color(level: ToastLevel) -> Color {
     match level {
         ToastLevel::Info => Color::Cyan,
@@ -926,11 +856,9 @@ pub fn toast_color(level: ToastLevel) -> Color {
 
 #[cfg(test)]
 mod token_drift_tests {
-    //! `design/tokens.json` is the source of record for brand colour, but
-    //! nothing generates code from it. This is the Rust half of the drift
-    //! guard (the desktop CSS half is `desktop/src/lib/tokens.test.js`); it
-    //! replaces the equivalent check that lived in the egui theming module
-    //! before that was retired.
+    //! `design/tokens.json` is the source of record for brand colour but
+    //! generates nothing; this is the Rust half of the drift guard (the CSS
+    //! half is `desktop/src/lib/tokens.test.js`).
     use super::BRAND_ACCENT;
     use ratatui::style::Color;
     use std::path::Path;

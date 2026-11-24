@@ -184,7 +184,7 @@ describe("App — navigation", () => {
   it("switches panes without losing the shell", async () => {
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
-    expect(await screen.findByText(/identity · privacy · hosting/)).toBeTruthy();
+    expect(await screen.findByRole("navigation", { name: "Settings sections" })).toBeTruthy();
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeTruthy();
 
     await userEvent.click(screen.getByRole("button", { name: "Relays" }));
@@ -249,8 +249,8 @@ describe("App — conversation switching", () => {
     render(<App />);
     await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
     await screen.findByText("hi from Alice");
-    await userEvent.click(screen.getByRole("button", { name: "More" }));
-    await userEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /Delete conversation/ }));
     const dialog = await screen.findByRole("dialog", { name: "Delete conversation" });
     await userEvent.click(within(dialog).getByRole("button", { name: /Delete/ }));
     await waitFor(() => expect(api.deleteChat).toHaveBeenCalledWith("chat-1"));
@@ -280,7 +280,7 @@ describe("App — getting in", () => {
       listConversations: [], listTransfers: [], lockState: false, partyList: [],
     });
     render(<App />);
-    const field = await screen.findByPlaceholderText("Password");
+    const field = await screen.findByLabelText("Password");
     await userEvent.type(field, "guess{Enter}");
     expect(await screen.findByText(/Wrong password/)).toBeTruthy();
     expect(screen.queryByRole("navigation")).toBeNull();
@@ -299,8 +299,8 @@ describe("App — getting in", () => {
     });
     render(<App />);
     const pw = "a perfectly long passphrase";
-    await userEvent.type(await screen.findByPlaceholderText(/New password/), pw);
-    await userEvent.type(screen.getByPlaceholderText("Confirm password"), pw);
+    await userEvent.type(await screen.findByLabelText("New password"), pw);
+    await userEvent.type(screen.getByLabelText("Confirm password"), pw);
     await userEvent.click(screen.getByRole("button", { name: /Create identity/ }));
     await waitFor(() => expect(api.setPassword).toHaveBeenCalledWith(pw));
     // Not straight into the app: this is the one moment a backup is cheap.
@@ -312,21 +312,24 @@ describe("App — getting in", () => {
 });
 
 describe("App — shell controls", () => {
-  it("the lock button stops new peers, and a refused lock does not claim to be locked", async () => {
+  it("the new-peers switch closes the door, and a refused change does not claim to have happened", async () => {
     let fail = false;
     const api = readyApi({
       setLocked: vi.fn(async () => { if (fail) throw "listener could not be stopped"; }),
     });
     render(<App />);
-    const lock = await screen.findByTitle(/Lock the conversation/);
-    await userEvent.click(lock);
+    await userEvent.click(await screen.findByRole("button", { name: /Show how others can reach you/ }));
+    const accept = screen.getByRole("switch", { name: /Accept new peers/ });
+    expect(accept.checked).toBe(true);
+    await userEvent.click(accept);
     await waitFor(() => expect(api.setLocked).toHaveBeenCalledWith(true));
-    const unlock = await screen.findByTitle(/Conversation locked/);
-    // A failure must leave the control showing what is true — still locked.
+    await waitFor(() => expect(screen.getByRole("switch", { name: /Accept new peers/ }).checked).toBe(false));
+    // A failure must leave the control showing what is true — still closed.
     fail = true;
-    await userEvent.click(unlock);
+    await userEvent.click(screen.getByRole("switch", { name: /Accept new peers/ }));
     await waitFor(() => expect(api.setLocked).toHaveBeenLastCalledWith(false));
-    expect(screen.getByTitle(/Conversation locked/)).toBeTruthy();
+    expect(screen.getByRole("switch", { name: /Accept new peers/ }).checked).toBe(false);
+    expect(screen.getByRole("button", { name: /Closed to new peers. Show how/ })).toBeTruthy();
     expect((await toasts()).some((t) => t.level === "error" && /could not be stopped/.test(t.message))).toBe(true);
   });
 
@@ -380,32 +383,36 @@ describe("App — conversation actions", () => {
   }
 
   it("Verify opens the trust prompt only when one is pending for this conversation", async () => {
+    const verify = async () => {
+      await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: /Verify safety code/ }));
+    };
     let pending = null;
     await openAlice({ pendingFingerprint: async () => pending });
     // Nothing pending: the read-only details, never an accept button.
-    await userEvent.click(screen.getByRole("button", { name: "Verify fingerprint" }));
-    const info = await screen.findByRole("dialog", { name: "Alice" });
+    await verify();
+    const info = await screen.findByRole("dialog", { name: "Conversation info" });
     expect(within(info).queryByRole("button", { name: /trust|accept|match/i })).toBeNull();
     await userEvent.click(within(info).getAllByRole("button", { name: /close/i })[0]);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
     // A prompt for another conversation must not be offered here either.
     pending = { chat_id: "chat-9", peer_name: "Mallory", fingerprint: "cd".repeat(32), sas: null };
-    await userEvent.click(screen.getByRole("button", { name: "Verify fingerprint" }));
-    expect(await screen.findByRole("dialog", { name: "Alice" })).toBeTruthy();
+    await verify();
+    expect(await screen.findByRole("dialog", { name: "Conversation info" })).toBeTruthy();
     expect(screen.queryByRole("dialog", { name: /Mallory/ })).toBeNull();
     await userEvent.click(within(screen.getByRole("dialog")).getAllByRole("button", { name: /close/i })[0]);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
     pending = { chat_id: "chat-1", peer_name: "Alice", fingerprint: "ab".repeat(32), sas: null };
-    await userEvent.click(screen.getByRole("button", { name: "Verify fingerprint" }));
+    await verify();
     expect(await screen.findByRole("dialog", { name: "Verify Alice" })).toBeTruthy();
   });
 
   it("rename starts from the current name and saves the trimmed one", async () => {
     const api = await openAlice({ renameChat: vi.fn(async () => {}) });
-    await userEvent.click(screen.getByRole("button", { name: "More" }));
-    await userEvent.click(screen.getByRole("button", { name: /Rename/ }));
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /Rename/ }));
     const dialog = await screen.findByRole("dialog", { name: "Rename conversation" });
     const field = within(dialog).getByRole("textbox");
     expect(field.value).toBe("Alice");
@@ -478,25 +485,22 @@ describe("App — backend events", () => {
   });
 });
 
-describe("App — theme menu", () => {
-  it("applies the chosen theme, remembers it, and closes on a click outside", async () => {
+describe("App — theme", () => {
+  it("applies the theme chosen in Settings, and remembers it across a restart", async () => {
     const { THEMES, loadTheme } = await import("./lib/themes.js");
     readyApi();
-    render(<App />);
-    await screen.findByRole("navigation", { name: "Primary" });
+    const { unmount } = render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     const other = THEMES.find((t) => t.id !== document.documentElement.getAttribute("data-theme"));
-
-    await userEvent.click(screen.getByTitle("Theme"));
-    await userEvent.click(screen.getByRole("button", { name: other.label }));
+    await userEvent.click(await screen.findByRole("button", { name: new RegExp(`^${other.label}`) }));
     expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
     expect(loadTheme()).toBe(other.id);
-    expect(screen.queryByRole("button", { name: other.label })).toBeNull();
 
-    // Open again, then click elsewhere: it closes without changing anything.
-    await userEvent.click(screen.getByTitle("Theme"));
-    expect(screen.getByRole("button", { name: other.label })).toBeTruthy();
-    await userEvent.click(screen.getByRole("navigation", { name: "Primary" }));
-    expect(screen.queryByRole("button", { name: other.label })).toBeNull();
+    // A fresh shell starts on the remembered theme, not the default.
+    unmount();
+    document.documentElement.removeAttribute("data-theme");
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Primary" });
     expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
   });
 });

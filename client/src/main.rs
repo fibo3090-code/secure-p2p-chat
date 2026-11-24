@@ -1,9 +1,5 @@
-//! P2PEM terminal client.
-//!
-//! This binary is the ratatui terminal UI plus the relay-server mode. The
-//! desktop app is a separate product (`p2pem-desktop`, Tauri + React) built
-//! from `desktop/`; the egui GUI that used to live behind `--gui` was retired
-//! once that reached parity, so there is exactly one desktop app to install.
+//! P2PEM terminal client: the ratatui UI plus the relay-server mode. The
+//! desktop app is the separate `p2pem-desktop` (`desktop/`).
 use clap::Parser;
 
 use p2pem_classic::logbuf::LogBuffer;
@@ -55,9 +51,8 @@ struct Args {
     tui: bool,
 }
 
-/// Printed when someone passes the retired `--gui` flag, or launches a shortcut
-/// that still carries it. Failing with directions beats silently starting a
-/// different interface than the one that was asked for.
+/// Printed for the retired `--gui` flag: directions beat silently starting a
+/// different interface than the one asked for.
 const GUI_RETIRED_NOTICE: &str = "\
 `--gui` has been retired: this binary is the terminal client.
 
@@ -113,11 +108,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // No console juggling on Windows any more: this is a console-subsystem
-    // binary now that the GUI is gone, so Windows attaches (or creates) a
-    // console for it. The old build declared `windows_subsystem = "windows"`
-    // for the egui window and had to `AttachConsole`/`AllocConsole` by hand
-    // whenever the terminal UI was requested.
     tracing::info!("Starting TUI mode");
     let launch = tui::TuiLaunchConfig {
         host: args.host,

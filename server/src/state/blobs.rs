@@ -5,36 +5,10 @@ use super::*;
 
 /// Run a blocking filesystem operation without stalling the async runtime.
 ///
-/// `PartyState` is deliberately synchronous — it is a state machine, and making
-/// every accessor `async` to accommodate two I/O paths would be the tail wagging
-/// the dog. But two of those paths move real bytes: a blob write and a blob read
-/// are each up to `MAX_PARTY_FILE_BYTES` (100 MiB), and they run inside
-/// `serve_connection`'s task.
-///
-/// `block_in_place` tells tokio the current thread is about to block so it can
-/// move the other tasks off it. It panics on a current-thread runtime, which is
-/// what `#[tokio::test]` gives you by default, hence the flavor check: outside a
-/// multi-threaded runtime the call is a plain function call, which is correct
-/// because there are no sibling tasks to rescue.
-///
-/// ## What this does *not* fix
-///
-/// It frees the runtime **worker**; it does not free the **lock**. Every call
-/// site here runs under `state.lock().await` (see `connection.rs`), so for the
-/// duration of the I/O every other connection's request is still queued behind
-/// the mutex. Moving the tasks off this thread does not help them, because they
-/// are not waiting on the thread.
-///
-/// That is worth being precise about, because the comment this replaces claimed
-/// otherwise — and a comment saying a problem is solved is what stops the next
-/// person from solving it. Genuinely removing the stall means moving the bytes
-/// outside the lock: authorise under it, read or write after releasing it. That
-/// is a restructuring of the request path, not a change of thread label.
-///
-/// Two things narrow the exposure in the meantime. `blob_chunk_for` reads one
-/// `PARTY_CHUNK_BYTES` chunk rather than the whole file, so the chunked download
-/// path — the one large files take — holds the lock for 64 KiB of I/O and not
-/// 100 MiB of it. The whole-blob `blob_bytes` path remains as described above.
+/// `block_in_place` panics on a current-thread runtime (the `#[tokio::test]`
+/// default), so outside a multi-threaded runtime this is a plain call. It frees
+/// the runtime worker, not the state lock: bulk blob I/O is deferred until the
+/// lock is released (see [`BlobReadPlan`] and [`StagedUpload`]).
 pub(super) fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {
@@ -52,49 +26,35 @@ pub(super) struct Reservation {
     pub(super) bytes: u64,
 }
 
-/// The prefix every in-progress upload's file carries in the blob directory.
-///
-/// Distinct from a blob's name, which is its content hash, so a sweep can tell
-/// the two apart with certainty: no hash starts with this.
+/// Prefix of in-progress upload files in the blob directory; no content hash
+/// starts with it, so a sweep can tell staging files from blobs.
 pub(super) const STAGING_PREFIX: &str = "staging_";
 
-/// Everything [`PartyState::stage`] needs to build a [`StagedUpload`].
-///
-/// A struct rather than seven positional arguments: they are mostly `Uuid` and
-/// `String`, so a transposed pair would type-check and silently attribute an
-/// upload to the wrong member or file it under the wrong name.
+/// Everything [`PartyState::stage`] needs to build a [`StagedUpload`] (a struct,
+/// because transposed `Uuid`/`String` arguments would still type-check).
 pub(super) struct StageRequest {
-    /// Keys both the reservation and the staging file. For a chunked upload
-    /// this is the client's own upload id, so the connection's list of open
-    /// uploads doubles as its list of reservations to release.
+    /// Keys both the reservation and the staging file (a chunked upload's own
+    /// id, so the connection's open uploads are also its reservations).
     pub(super) id: Uuid,
     pub(super) uploader: Uuid,
     pub(super) target: UploadTarget,
     pub(super) name: String,
     pub(super) mime: String,
     pub(super) data: Vec<u8>,
-    /// `None` means "not known here", which forces a pessimistic reservation.
-    /// Every current caller knows it — see [`PartyState::stage`].
+    /// `None` forces a pessimistic reservation; every current caller knows it.
     pub(super) known_hash: Option<String>,
 }
 
-/// An upload that has passed its checks and had its bytes taken out of the
-/// spool, on its way to disk.
-///
-/// This is the value that carries an upload across the gap where the state lock
-/// is *not* held. It exists in three states, in order:
+/// An upload that has passed its checks, carried across the gap where the state
+/// lock is *not* held:
 ///
 /// 1. Created by [`PartyState::begin_upload`] under the lock, holding the bytes.
-/// 2. Written by [`Self::write_staging`] with no lock held — the expensive part,
-///    and the whole reason for the split.
+/// 2. Written by [`Self::write_staging`] with no lock held.
 /// 3. Consumed by [`PartyState::commit_upload`] or [`PartyState::discard_upload`]
 ///    under the lock again.
 ///
-/// It must reach step 3. If it is dropped instead — a task cancelled, a
-/// connection torn down between steps — `Drop` removes its own staging file so
-/// the bytes are not orphaned; the reservation is released by whichever of
-/// `commit_upload` / `discard_upload` runs, and by `cancel_uploads_for` when the
-/// connection goes away without either.
+/// If dropped before step 3, `Drop` removes its staging file; the reservation
+/// is released by `commit_upload`/`discard_upload`/`cancel_connection_uploads`.
 #[derive(Debug)]
 pub struct StagedUpload {
     /// Identifies both the reservation and the staging file.
@@ -107,43 +67,27 @@ pub struct StagedUpload {
     pub(super) data: Option<Vec<u8>>,
     /// Where blobs live, copied in so step 2 needs nothing from the state.
     pub(super) blob_dir: Option<PathBuf>,
-    /// Set by step 2.
+    /// Set by step 2 (or known up front).
     pub(super) hash: Option<String>,
     pub(super) size: u64,
-    /// Set once the file is on disk, cleared once it has been renamed into
-    /// place or deliberately removed. `Drop` acts on whatever is left.
+    /// Set once on disk, cleared once renamed into place. `Drop` removes it.
     pub(super) staging_path: Option<PathBuf>,
 }
 
 impl StagedUpload {
-    /// The id this upload's reservation and staging file are keyed by.
-    ///
-    /// The runtime records it so a connection torn down mid-upload can release
-    /// the reservation, which `Drop` cannot reach — it can remove the file, but
-    /// not touch the state that is counting the bytes.
+    /// The id this upload's reservation and staging file are keyed by, recorded
+    /// so a torn-down connection can release the reservation `Drop` cannot reach.
     pub fn id(&self) -> Uuid {
         self.id
     }
 
     /// Hash the bytes and write them to this upload's own staging file.
     ///
-    /// **Call this with no lock held.** It is up to `MAX_PARTY_FILE_BYTES` of
-    /// hashing and I/O, and moving it off the lock is the point of the whole
-    /// three-phase shape.
-    ///
-    /// The staging name is per-upload, never the content hash. Two members
-    /// uploading identical content therefore write to different files and
-    /// neither can remove the other's: a shared name meant one member's failed
-    /// commit could unlink bytes the other's commit was about to record, leaving
-    /// a file message that answers "unknown file" forever.
-    ///
-    /// A failed write **propagates**, unlike the persistence mirrors elsewhere
-    /// in this file. Those mirror state that is already correct in memory, so a
-    /// failure costs durability and nothing else. These bytes are the file: a
-    /// disk-backed store keeps nothing resident, so a write that failed quietly
-    /// would leave the upload acknowledged, the file message broadcast to the
-    /// whole channel, and every download of it answering "unknown file" for
-    /// good. Refusing the upload is the only honest outcome.
+    /// **Call this with no lock held** (up to `MAX_PARTY_FILE_BYTES` of I/O).
+    /// The staging name is per-upload, never the content hash, so one member's
+    /// failed commit cannot unlink bytes another's commit is about to record.
+    /// Unlike the persistence mirrors, a failed write propagates: these bytes
+    /// *are* the file, so acknowledging the upload would publish a dead link.
     pub fn write_staging(&mut self) -> Result<(), String> {
         let Some(data) = self.data.take() else {
             return Err("upload has already been written".to_string());
@@ -175,9 +119,8 @@ impl StagedUpload {
                 Ok(())
             }
             Err(e) => {
-                // Unlink the partial. A disk-full server that leaves one behind
-                // on every retry makes itself progressively worse, which is the
-                // opposite of what an out-of-space path should do.
+                // Unlink the partial so a disk-full server does not get worse
+                // with every retry.
                 let _ = std::fs::remove_file(&path);
                 tracing::error!(error = %e, path = %path.display(), "failed to stage upload");
                 Err("the server could not store this file".to_string())
@@ -203,19 +146,14 @@ impl Drop for StagedUpload {
     }
 }
 
-/// A download that has been authorised but not yet performed.
-///
-/// The point of the split is that deciding *whether* a member may read a blob is
-/// a question about state and needs the lock; actually moving up to
-/// `MAX_PARTY_FILE_BYTES` of it does not, and doing it under the lock made every
-/// other member's traffic queue behind one download.
+/// A download that has been authorised (under the lock) but not yet performed
+/// (after releasing it), so one download does not stall every other member.
 #[derive(Debug, Clone)]
 pub enum BlobReadPlan {
     /// The memory-only store already holds the bytes; nothing to defer.
     Resident { bytes: Vec<u8>, total: u64 },
-    /// Read `len` bytes at `offset` from `path`. `total` is the blob's full size
-    /// as recorded, which is what the client is told regardless of how much of
-    /// it this particular read returns.
+    /// Read `len` bytes at `offset` from `path`. `total` is the blob's full
+    /// recorded size, which the client is told regardless of `len`.
     OnDisk {
         path: PathBuf,
         offset: u64,
@@ -228,18 +166,12 @@ impl BlobReadPlan {
     /// The blob's full size, whichever shape the plan took.
     pub fn total(&self) -> u64 {
         match self {
-            Self::Resident { total, .. } => *total,
-            Self::OnDisk { total, .. } => *total,
+            Self::Resident { total, .. } | Self::OnDisk { total, .. } => *total,
         }
     }
 
-    /// Perform the read. **Call this with no lock held** — that is the entire
-    /// reason the plan exists as a separate value.
-    ///
-    /// A blob whose file has gone (the last reference was deleted while this was
-    /// in flight) reads as `None`, which the caller reports the same way as an
-    /// unknown hash. That is a race the previous shape could not have, and the
-    /// honest answer to it: the file genuinely is not there any more.
+    /// Perform the read. **Call this with no lock held.** A blob deleted while
+    /// in flight reads as `None`, reported like an unknown hash.
     pub fn perform(self) -> Option<Vec<u8>> {
         match self {
             Self::Resident { bytes, .. } => Some(bytes),
@@ -282,25 +214,19 @@ impl PartyState {
         }
     }
 
-    /// Distinct bytes this member currently holds.
-    ///
-    /// Counted over *distinct* blobs, so sharing one file into three channels
-    /// costs its size once — the same rule the server-wide ceiling uses. Freeing
-    /// it therefore requires deleting every reference, which is what makes the
-    /// number match what the store actually holds on their behalf.
+    /// Distinct bytes this member currently holds, plus their reservations.
+    /// Counted over *distinct* blobs, like the server-wide ceiling, so one file
+    /// shared into three channels costs its size once.
     pub(super) fn member_blob_bytes(&self, member: Uuid) -> u64 {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut total = 0u64;
         for r in self.file_refs.iter().filter(|r| r.uploader == member) {
             if seen.insert(r.hash.as_str()) {
-                total = total
-                    .saturating_add(self.blobs.get(&r.hash).map(|b| b.size).unwrap_or_default());
+                total = total.saturating_add(self.blobs.get(&r.hash).map_or(0, |b| b.size));
             }
         }
-        // Plus anything of theirs currently being staged. Without this a member
-        // can start several uploads that each fit under the allowance and only
-        // discover at commit that together they do not — after every byte has
-        // already been written.
+        // Reservations count too, or several uploads that each fit could
+        // together overshoot the allowance after every byte was written.
         for r in self.reservations.values().filter(|r| r.member == member) {
             total = total.saturating_add(r.bytes);
         }
@@ -340,30 +266,23 @@ impl PartyState {
         self.file_refs.push(entry);
     }
 
-    /// What `member` may do with the share `r`.
-    ///
-    /// Resolution order: an admin holds everything; anyone who cannot reach the
-    /// location holds nothing; within a location they can reach, the uploader
-    /// holds everything, an explicit grant overrides the location default, and
-    /// otherwise the default applies. A guest never holds a write right,
-    /// whatever they were granted.
+    /// What `member` may do with the share `r`: an admin holds everything;
+    /// anyone who cannot reach the location holds nothing; otherwise the
+    /// uploader holds everything, an explicit grant overrides the default, and
+    /// a guest never holds a write right whatever they were granted.
     pub(super) fn effective_perms(&self, member: Uuid, r: &FileRef) -> FilePermissions {
         if self.role_of(member).is_admin() {
             return FilePermissions::all();
         }
-        // Reachability gates everything below it, uploaders included. Having
-        // once shared a file into a channel does not survive being shut out of
-        // that channel — otherwise making a channel private would leave its
-        // files reachable by exactly the people just excluded from it.
+        // Reachability gates uploaders too: making a channel private must not
+        // leave its files reachable by the people just excluded from it.
         if !self.can_reach_location(member, r) {
             return FilePermissions::none();
         }
         if r.uploader == member {
             return FilePermissions::all();
         }
-        // A guest is read-only everywhere, and that outranks any grant: the
-        // rest of the server refuses their writes, so a `delete` grant here
-        // would be the one place it did not.
+        // A guest's read-only role outranks any grant.
         let granted = r
             .grants
             .get(&member)
@@ -396,11 +315,9 @@ impl PartyState {
     /// Re-share a file the caller already holds into another channel or DM,
     /// without moving the bytes again.
     ///
-    /// `from` names the reference the caller's rights come from: one blob can
-    /// sit in several places under different grants, so "may I share this?" is
-    /// only answerable against a specific share. The new reference starts at the
-    /// default grant, not at the source's — re-sharing passes on the file, not
-    /// the sharer's authority over it.
+    /// `from` names the share the caller's rights come from (one blob can sit in
+    /// several places under different grants). The new reference starts at the
+    /// default grant: re-sharing passes on the file, not the sharer's authority.
     pub fn share_file(
         &mut self,
         actor: Uuid,
@@ -452,9 +369,8 @@ impl PartyState {
             return Err("that file is already shared there".to_string());
         }
 
-        // The bytes exist already, so this is a reference and a message — it
-        // costs the sharer a refcount, and it counts against *their* quota,
-        // because they are now one of the people holding it here.
+        // A new reference to existing bytes: a refcount, counted against the
+        // sharer's quota as one more holder.
         let meta = {
             let Some(rec) = self.blobs.get_mut(hash) else {
                 return Err("that file is no longer stored here".to_string());
@@ -482,12 +398,9 @@ impl PartyState {
         Ok(envelope)
     }
 
-    /// Change what a share grants, either by default or for one member.
-    ///
-    /// Refused unless the caller's own effective rights cover what they are
-    /// handing out — the "you can only delegate rights you hold" rule. Only the
-    /// uploader or an admin may change a share's permissions at all; holding
-    /// `share` lets you spread a file, not re-write who else may do what.
+    /// Change what a share grants, by default or for one member. Only the
+    /// uploader or an admin may, and only within their own effective rights
+    /// ("you can only delegate rights you hold").
     pub fn set_file_permissions(
         &mut self,
         actor: Uuid,
@@ -538,7 +451,7 @@ impl PartyState {
             match member {
                 Some(target) => {
                     r.grants.insert(target, perms);
-                    format!("changed what {name} grants {}", self.member_label(target))
+                    format!("changed what {name} grants {}", self.username_of(target))
                 }
                 None => {
                     r.default_perms = perms;
@@ -546,15 +459,9 @@ impl PartyState {
                 }
             }
         };
-        let updated = self.file_refs[index].clone();
-        self.persist_file_ref(&updated);
+        self.persist_file_ref(&self.file_refs[index]);
         self.record_audit(actor, "file.permissions", &detail);
         Ok(detail)
-    }
-
-    /// A member's display name, for audit detail.
-    pub(super) fn member_label(&self, id: Uuid) -> String {
-        self.username_of(id)
     }
 
     /// Drop one reference to a blob, deleting the bytes when the last one goes.
@@ -587,11 +494,9 @@ impl PartyState {
     /// Delete one share of a file. The uploader may remove their own; an admin
     /// may remove anyone's.
     ///
-    /// The *message* referencing the file stays in history: sequence numbers are
-    /// what clients merge on, so removing an envelope would renumber the channel
-    /// and desynchronise everyone who had already fetched it. What goes away is
-    /// the reference and — once nothing else holds it — the bytes, after which
-    /// the file card reports that the file was deleted.
+    /// The *message* stays in history (removing it would renumber the channel
+    /// for everyone who fetched it); the reference goes, and the bytes with it
+    /// once nothing else holds them.
     pub fn delete_file(
         &mut self,
         actor: Uuid,
@@ -615,9 +520,8 @@ impl PartyState {
             return Err("that file is not shared here".to_string());
         };
         let entry = self.file_refs[index].clone();
-        // One check now covers who may delete *and* whether they can see where
-        // it was shared: `effective_perms` returns nothing at all for a
-        // location the member cannot reach.
+        // `effective_perms` grants nothing for an unreachable location, so this
+        // one check also covers visibility.
         if !self.effective_perms(actor, &entry).delete {
             return Err("you do not have permission to delete this file".to_string());
         }
@@ -629,26 +533,20 @@ impl PartyState {
         Ok(detail)
     }
 
-    /// Every file `member` may see, newest first — the Drive panel's contents.
-    ///
-    /// Access follows the same rule as downloading: files shared in channels they
-    /// can read, and in their own DM threads.
+    /// Every file `member` may see (same rule as downloading), newest first.
     pub fn files_for(&self, member: Uuid) -> Vec<FileEntry> {
         self.files_page(member, 0).0
     }
 
     /// One page of [`Self::files_for`] from `offset` on, and the offset of the
-    /// next page (`None` at the end). Pages are bounded by
-    /// [`MAX_FILE_LISTING`] entries and [`FILE_LISTING_BYTES`], so every page
-    /// fits in a frame however many files are shared (audit SRV-01).
+    /// next page (`None` at the end), bounded by [`MAX_FILE_LISTING`] entries and
+    /// [`FILE_LISTING_BYTES`] so every page fits in a frame (audit SRV-01).
     pub fn files_page(&self, member: Uuid, offset: usize) -> (Vec<FileEntry>, Option<usize>) {
         let mut all = self.visible_files(member);
         let total = all.len();
         let mut page: Vec<FileEntry> = all.drain(offset.min(total)..).collect();
         truncate_listing(&mut page, MAX_FILE_LISTING, FILE_LISTING_BYTES);
-        // Always make progress: a single entry larger than the budget (not
-        // possible with bounded names and MIME types, but cheap to rule out)
-        // must not make the client ask for the same page forever.
+        // Always make progress, even past an entry larger than the budget.
         let end = offset.min(total) + page.len().max(usize::from(offset < total));
         (page, (end < total).then_some(end))
     }
@@ -658,41 +556,35 @@ impl PartyState {
         let mut out: Vec<FileEntry> = self
             .file_refs
             .iter()
-            .filter(|r| self.effective_perms(member, r).view)
-            .map(|r| {
-                let (location_name, is_dm) = if r.is_dm {
-                    (self.dm_location_name(member, r.location), true)
+            .filter_map(|r| {
+                let perms = self.effective_perms(member, r);
+                if !perms.view {
+                    return None;
+                }
+                let location_name = if r.is_dm {
+                    self.dm_location_name(member, r.location)
                 } else {
-                    (
-                        self.channel(r.location)
-                            .map(|c| format!("#{}", c.name))
-                            .unwrap_or_else(|| "#unknown".to_string()),
-                        false,
-                    )
+                    self.channel(r.location)
+                        .map_or_else(|| "#unknown".to_string(), |c| format!("#{}", c.name))
                 };
-                FileEntry {
+                let blob = self.blobs.get(&r.hash);
+                Some(FileEntry {
                     hash: r.hash.clone(),
                     name: r.name.clone(),
-                    size: self.blobs.get(&r.hash).map(|b| b.size).unwrap_or_default(),
-                    mime: self
-                        .blobs
-                        .get(&r.hash)
-                        .map(|b| b.mime.clone())
-                        .unwrap_or_default(),
+                    size: blob.map_or(0, |b| b.size),
+                    mime: blob.map(|b| b.mime.clone()).unwrap_or_default(),
                     uploader: r.uploader,
                     uploader_name: self.username_of(r.uploader),
                     location: r.location,
                     location_name,
-                    is_dm,
+                    is_dm: r.is_dm,
                     shared_at: r.shared_at,
-                    can_delete: self.effective_perms(member, r).delete,
-                    perms: self.effective_perms(member, r),
-                }
+                    can_delete: perms.delete,
+                    perms,
+                })
             })
             .collect();
-        // Newest first; hash then location break ties, so the order — and
-        // with it every page boundary — is the same from one request to the
-        // next.
+        // Total order, so page boundaries are stable between requests.
         out.sort_by(|a, b| {
             b.shared_at
                 .cmp(&a.shared_at)
@@ -712,26 +604,14 @@ impl PartyState {
         "Direct message".to_string()
     }
 
-    // --- Chunked upload (Phase 2, slice 2) --------------------------------------
+    // --- Chunked upload ----------------------------------------------------------
 
-    /// Accept a chunked upload, or refuse it before a single byte moves.
+    /// Begin a chunked upload, refusing it before a byte moves if the size,
+    /// target or allowance rule it out.
     ///
-    /// Everything checkable up front is checked here — the declared size against
-    /// the hard ceiling and the uploader's remaining allowance, and the target
-    /// against the permission rules — because the alternative is spooling a
-    /// hundred megabytes and then saying no.
-    /// Begin a chunked upload, if this member is allowed one.
-    ///
-    /// The concurrency cap counts the uploads *this state* is holding for the
-    /// member, not the ones the connection believes it has open. Those two
-    /// numbers used to be allowed to disagree: `FinishUpload` cleared the
-    /// connection's list before calling `finish_upload`, which then returned
-    /// `Err` on the incomplete path without dropping the spool. The connection
-    /// then reported zero in flight while the server still held up to
-    /// `MAX_PARTY_FILE_BYTES` per abandoned upload, so the cap could be walked
-    /// past indefinitely — declare 100 MiB, send 99, finish, repeat. Deriving
-    /// the count from the spools themselves makes the cap true regardless of
-    /// what any caller remembers.
+    /// The concurrency cap counts the spools *this state* holds for the member,
+    /// not what the connection believes it has open: trusting the connection's
+    /// list let an abandoned upload be repeated past the cap indefinitely.
     pub fn start_upload(
         &mut self,
         uploader: Uuid,
@@ -757,23 +637,11 @@ impl PartyState {
                 messenger_core::util::format_size(MAX_PARTY_FILE_BYTES)
             ));
         }
-        match target {
-            UploadTarget::Channel(channel) => self.member_can_post_to_channel(uploader, channel)?,
-            UploadTarget::Dm(to) => {
-                if !self.role_of(uploader).can_write() {
-                    return Err("your role on this server is read-only".to_string());
-                }
-                if !self.is_member(to) {
-                    return Err("recipient is not a member of this server".to_string());
-                }
-            }
-        }
-        // The quota check is provisional: content the server already holds costs
-        // nothing, but that is only knowable once the bytes have arrived, so the
-        // pessimistic answer is the one to give before accepting them.
-        // Spools are held in memory until they finish, so what is already in
-        // flight counts: checked one at a time, four 100 MiB uploads each
-        // passed a 128 MiB allowance (SRV-07).
+        self.check_may_post_file(uploader, target)?;
+        // Provisional: deduplicated content costs nothing, but that is only
+        // knowable once the bytes have arrived. Spools are held in memory until
+        // they finish, so what is already in flight counts too: checked one at
+        // a time, four 100 MiB uploads each passed a 128 MiB allowance (SRV-07).
         let in_flight = |only: Option<Uuid>| -> u64 {
             self.uploads
                 .values()
@@ -803,10 +671,8 @@ impl PartyState {
             id,
             PendingUpload {
                 uploader,
-                // Bounded on arrival rather than at publish: both strings are
-                // copied into every message, page and listing that mentions the
-                // file, and until then they sit in memory on the uploader's
-                // behalf.
+                // Bounded on arrival: both strings are copied into every
+                // message, page and listing that mentions the file.
                 name: sanitize_filename(&name),
                 mime: normalize_mime(&mime),
                 declared: size,
@@ -818,9 +684,8 @@ impl PartyState {
         Ok(id)
     }
 
-    /// Append one chunk. Refuses anything that would take the upload past the
-    /// size it declared — checking after the write would still have put the
-    /// excess in memory, which is the whole thing being bounded.
+    /// Append one chunk, refusing anything past the declared size *before*
+    /// buffering it.
     pub fn upload_chunk(
         &mut self,
         uploader: Uuid,
@@ -847,16 +712,10 @@ impl PartyState {
         Ok(())
     }
 
-    /// Complete an upload: store the assembled bytes and post the file message.
-    /// Returns the envelope to deliver, and whether it was a DM.
-    /// Complete an upload.
+    /// Complete an upload, running all three phases back to back.
     ///
-    /// The spool is dropped on **every** path out of here, success or failure.
-    /// It used to survive the incomplete case, which was the leak: a member
-    /// declaring 100 MiB, sending 99 and finishing got an error back and left
-    /// the 99 MiB behind, with nothing that would ever reclaim it short of a
-    /// restart. Finishing short is a client that broke its own protocol; the
-    /// bytes are not worth keeping on the chance it comes back for them.
+    /// The spool is dropped on **every** path out of here: an incomplete
+    /// finish used to leave its bytes behind until restart.
     pub fn finish_upload(
         &mut self,
         uploader: Uuid,
@@ -871,20 +730,15 @@ impl PartyState {
     }
 
     /// Phase 1 of an upload, under the lock: check it, claim the storage, and
-    /// take the bytes.
-    ///
-    /// Everything that needs to consult state happens here — the upload exists,
-    /// it is this member's, it is complete, they may still post where it is
-    /// going, and there is room for it. What does *not* happen here is any I/O:
-    /// the returned [`StagedUpload`] is written by the caller once it has let go
-    /// of the lock, and handed back to [`Self::commit_upload`].
+    /// take the bytes. No I/O happens here; the caller writes the returned
+    /// [`StagedUpload`] once the lock is released, then hands it to
+    /// [`Self::commit_upload`].
     pub fn begin_upload(&mut self, uploader: Uuid, upload: Uuid) -> Result<StagedUpload, String> {
         let Some(pending) = self.uploads.get(&upload) else {
             return Err("no such upload".to_string());
         };
         if pending.uploader != uploader {
-            // Not this member's upload: say nothing about it and, crucially,
-            // do not remove it — it belongs to someone else.
+            // Someone else's upload: reveal nothing and leave it alone.
             return Err("no such upload".to_string());
         }
         if (pending.data.len() as u64) != pending.declared {
@@ -896,28 +750,17 @@ impl PartyState {
             ));
         }
 
-        // Check where it is going *before* taking the bytes, so a refusal leaves
-        // the spool exactly as it was.
+        // Check the target *before* taking the bytes, so a refusal leaves the
+        // spool as it was.
         let target = pending.target;
         self.check_may_post_file(uploader, target)?;
-        // The ceiling is checked inside `stage`, which knows the content hash
-        // and can therefore skip the check entirely for content the store
-        // already holds. Checking here as well would defeat that: it runs before
-        // the hash is consulted, so it refuses a deduplicated re-upload that
-        // costs no new storage.
-        //
-        // The spool is taken before that check can fail, so a refused finish
-        // consumes it. That is deliberate: the client has to start over either
-        // way, and holding its bytes until the connection drops is the shape of
-        // the leak that `an_upload_finished_short_does_not_leak_its_spool`
-        // exists to prevent.
+        // The ceiling is checked in `stage`, which knows the hash and so lets a
+        // deduplicated re-upload through. A refusal there consumes the spool on
+        // purpose: the client must start over either way, and keeping the bytes
+        // is the leak `an_upload_finished_short_does_not_leak_its_spool` pins.
         let pending = self.uploads.remove(&upload).expect("checked above");
-        // The hash was accumulated chunk by chunk as the upload arrived, so it
-        // is free here — no 100 MiB pass under the lock, and no pessimism in the
-        // reservation. See `PendingUpload::hasher`.
+        // Accumulated chunk by chunk (`PendingUpload::hasher`): free here.
         let hash = pending.hasher.finish();
-        // Keyed by the upload's own id, so the connection's existing list of
-        // open uploads is also the list of reservations to release if it dies.
         self.stage(StageRequest {
             id: upload,
             uploader,
@@ -929,16 +772,9 @@ impl PartyState {
         })
     }
 
-    /// Phase 1 for an **inline** upload — one that arrived whole in a single
-    /// request rather than in chunks.
-    ///
-    /// Inline uploads are capped at `MAX_INLINE_FILE_BYTES` (4 MiB), so writing
-    /// one under the lock is 25x cheaper than a chunked upload's 100 MiB. It is
-    /// still not free, and more to the point a rule with an exception in it is a
-    /// rule that gets forgotten: "no blob write happens under the state lock" is
-    /// worth being true without qualification. Both paths therefore stage,
-    /// commit and reclaim identically — one fewer shape to reason about, and one
-    /// fewer place for the ceiling checks and the re-check to drift apart.
+    /// Phase 1 for an **inline** upload (one that arrived whole). Staged,
+    /// committed and reclaimed exactly like a chunked one, so "no blob write
+    /// happens under the state lock" holds without exception.
     pub fn begin_inline_upload(
         &mut self,
         uploader: Uuid,
@@ -949,17 +785,13 @@ impl PartyState {
     ) -> Result<StagedUpload, String> {
         let data = Self::check_inline_size(data)?;
         self.check_may_post_file(uploader, target)?;
-        // See `start_upload`: bounded before anything else copies them.
+        // Bounded before anything else copies them (see `start_upload`).
         let (name, mime) = (sanitize_filename(&name), normalize_mime(&mime));
-        // Capped at 4 MiB and already in hand, so hashing here costs
-        // single-digit milliseconds — cheap enough to buy an exact answer to "do
-        // we already hold this?", which is what keeps a re-upload of stored
-        // content free at a full ceiling. A chunked upload reaches the same
-        // answer differently, by hashing each chunk as it arrives.
+        // At most 4 MiB in hand: hashing it now gives an exact "already held?"
+        // answer, which keeps a re-upload free at a full ceiling.
         let hash = blob_hash(&data);
         self.stage(StageRequest {
-            // No client-supplied id for an inline upload, so one is minted here
-            // and recorded on the connection by the dispatcher.
+            // Minted here; the dispatcher records it on the connection.
             id: Uuid::new_v4(),
             uploader,
             target,
@@ -970,20 +802,12 @@ impl PartyState {
         })
     }
 
-    /// Build a [`StagedUpload`], reserving storage for it unless the content is
-    /// one the store already holds.
+    /// Build a [`StagedUpload`], reserving storage for it unless the store
+    /// already holds the content (so a deduplicated re-upload succeeds at a full
+    /// ceiling — see `a_new_blob_past_the_storage_ceiling_is_rejected`).
     ///
-    /// `known_hash` is `Some` for every path that reaches here today: an inline
-    /// upload hashes its 4 MiB in hand, and a chunked one accumulates the hash
-    /// as its chunks arrive. So no reservation is made for content the store
-    /// already holds, and a deduplicated re-upload still succeeds at a full
-    /// ceiling — the property `a_new_blob_past_the_storage_ceiling_is_rejected`
-    /// pins.
-    ///
-    /// `None` is still handled, and handled pessimistically — a duplicate would
-    /// reserve its size and give it back at commit — so a future caller that
-    /// genuinely cannot know the hash up front is safe rather than wrong. It
-    /// would just be needlessly strict at a full ceiling.
+    /// An unknown hash (no current caller) is handled pessimistically: the
+    /// reservation is taken and given back at commit.
     pub(super) fn stage(&mut self, req: StageRequest) -> Result<StagedUpload, String> {
         let StageRequest {
             id,
@@ -995,9 +819,7 @@ impl PartyState {
             known_hash,
         } = req;
         let size = data.len() as u64;
-        // Content already held costs no new storage, so it needs no reservation
-        // and no ceiling check — the same rule commit applies once the hash is
-        // known for certain.
+        // Content already held needs no reservation and no ceiling check.
         let already_held = known_hash
             .as_deref()
             .is_some_and(|h| self.blobs.contains_key(h));
@@ -1027,18 +849,13 @@ impl PartyState {
 
     /// Phase 3, under the lock: re-check, publish the bytes, post the message.
     ///
-    /// The re-check is the point. Between phase 1 and here the lock was released
-    /// for as long as a 100 MiB write takes, and in that window the uploader can
-    /// have been demoted or removed, the channel deleted, or a DM recipient
-    /// removed from the server. Checking only on the way in would append a
-    /// message that the current state forbids.
+    /// The re-check matters: during the unlocked write the uploader may have
+    /// been demoted or removed, the channel deleted, or a DM recipient removed.
     pub fn commit_upload(
         &mut self,
         staged: StagedUpload,
     ) -> Result<(Envelope, UploadTarget), String> {
-        // The blob row (or its refcount), the file reference and the message
-        // are one commit: a crash between them used to leave a refcount with
-        // no reference to release it, or a blob on disk with no row.
+        // Blob row/refcount, file reference and message commit together.
         self.with_tx(|s| s.commit_upload_in_tx(staged))
     }
 
@@ -1046,22 +863,18 @@ impl PartyState {
         &mut self,
         mut staged: StagedUpload,
     ) -> Result<(Envelope, UploadTarget), String> {
-        // Release the claim first, whatever happens next: from here on the bytes
-        // are either recorded (and counted as stored) or discarded.
+        // Release the claim first: the bytes are now recorded or discarded.
         self.reservations.remove(&staged.id);
 
-        let hash = match staged.hash.clone() {
-            Some(hash) => hash,
-            None => return Err("upload was never written".to_string()),
+        let Some(hash) = staged.hash.clone() else {
+            return Err("upload was never written".to_string());
         };
         let uploader = staged.uploader;
         let target = staged.target;
 
         self.check_may_post_file(uploader, target)?;
 
-        // Content the server already holds costs nothing more, so the ceiling is
-        // only re-checked for genuinely new content — and now against the real
-        // hash rather than the pessimistic reservation.
+        // Only new content is re-checked against the ceiling, now by real hash.
         if !self.blobs.contains_key(&hash) {
             self.check_storage_room(uploader, staged.size)?;
         }
@@ -1074,22 +887,15 @@ impl PartyState {
         Ok((envelope, target))
     }
 
-    /// Give up on a staged upload: release its claim and remove its file.
-    ///
-    /// `Drop` removes the file on its own, so this is about the reservation —
-    /// but calling it explicitly is what keeps the two in step on the paths that
-    /// know they are giving up.
+    /// Give up on a staged upload: release its reservation (its `Drop` removes
+    /// the file).
     pub fn discard_upload(&mut self, staged: StagedUpload) {
         self.reservations.remove(&staged.id);
         drop(staged); // its `Drop` unlinks the staging file
     }
 
     /// Move a staged upload's bytes into the blob store under their content hash.
-    ///
-    /// A rename, not a copy: the bytes were already written and fsynced in phase
-    /// 2, and renaming within one directory is atomic, so a blob is either
-    /// absent or complete — never a half-written file that a download would
-    /// serve as truncated.
+    /// A rename of the fsynced staging file, so a blob is absent or complete.
     pub(super) fn publish_staged_blob(
         &mut self,
         staged: &mut StagedUpload,
@@ -1099,8 +905,7 @@ impl PartyState {
         let mime = staged.mime.clone();
 
         if let Some(rec) = self.blobs.get_mut(hash) {
-            // Already held: this upload's copy is redundant. Take the staging
-            // file back out (via `Drop`) and just count the new reference.
+            // Already held: count the reference; `Drop` removes the duplicate.
             rec.refcount += 1;
             let refcount = rec.refcount;
             self.persist_blob_refcount(hash, refcount);
@@ -1145,21 +950,15 @@ impl PartyState {
 
         Ok(FileMeta {
             hash: hash.to_string(),
-            // The display name is member-supplied: reduce it to a safe filename
-            // so no client ever receives a name that could escape its download
-            // directory.
+            // Member-supplied: reduce it to a safe filename.
             name: sanitize_filename(&staged.name),
             size,
             mime,
         })
     }
 
-    /// May this member put a file in this place, right now?
-    ///
-    /// One function so the check on the way in and the re-check on the way out
-    /// cannot drift apart — which is how the DM recipient came to be checked
-    /// only on the way in, letting a member removed from the server during a
-    /// 100 MiB upload still receive the message at the end of it.
+    /// May this member put a file in this place, right now? Shared by every
+    /// entry check and the commit re-check, so they cannot drift apart.
     pub(super) fn check_may_post_file(
         &self,
         uploader: Uuid,
@@ -1183,14 +982,17 @@ impl PartyState {
     }
 
     /// Is there room for `size` more bytes, server-wide and for this member?
-    ///
-    /// Counts reservations alongside stored blobs, so uploads still being
-    /// written are budgeted for rather than discovered afterwards.
+    /// Reservations count, so uploads still being written are budgeted for.
     pub(super) fn check_storage_room(&self, uploader: Uuid, size: u64) -> Result<(), String> {
         let stored = self.total_committed_and_reserved_bytes();
         if stored.saturating_add(size) > self.max_blob_bytes {
             return Err("server file storage is full".to_string());
         }
+        self.check_member_allowance(uploader, size)
+    }
+
+    /// Refuse `size` more bytes past this member's allowance (admins exempt).
+    pub(super) fn check_member_allowance(&self, uploader: Uuid, size: u64) -> Result<(), String> {
         if let Some(limit) = self.member_blob_limit(uploader) {
             let used = self.member_blob_bytes(uploader);
             if used.saturating_add(size) > limit {
@@ -1211,9 +1013,7 @@ impl PartyState {
         stored.saturating_add(reserved)
     }
 
-    /// Discard an in-flight upload. Called on an explicit cancel and on
-    /// disconnect, so a client that vanishes mid-transfer does not pin its spool
-    /// for the lifetime of the process.
+    /// Discard an in-flight upload (explicit cancel or disconnect).
     pub fn cancel_upload(&mut self, uploader: Uuid, upload: Uuid) {
         if self
             .uploads
@@ -1226,20 +1026,13 @@ impl PartyState {
 
     /// Drop the uploads and reservations belonging to **one connection**.
     ///
-    /// Per connection, not per member: one person can be signed in from two
-    /// devices, each with uploads in flight. Sweeping by member would make
-    /// closing a laptop cancel the phone's transfer — the connection that went
-    /// away is the one whose work should go with it.
-    ///
-    /// `ids` are the things this connection had open: pending upload spools and
-    /// staged reservations, both keyed the same way. A staged upload's `Drop`
-    /// removes its own file but cannot reach the state to give the storage back,
-    /// so the reservation has to be released from here.
+    /// Per connection, not per member, so closing a laptop does not cancel the
+    /// same member's transfer from their phone. `ids` cover both pending spools
+    /// and staged reservations (keyed the same way); the latter must be released
+    /// here because a staged upload's `Drop` cannot reach the state.
     pub fn cancel_connection_uploads(&mut self, member: Uuid, ids: &[Uuid]) {
         for id in ids {
-            if self.uploads.get(id).is_some_and(|p| p.uploader == member) {
-                self.uploads.remove(id);
-            }
+            self.cancel_upload(member, *id);
             if self
                 .reservations
                 .get(id)
@@ -1251,10 +1044,8 @@ impl PartyState {
     }
 
     /// Drop every upload belonging to `member`, across all their connections.
-    ///
-    /// Only for tests and for a deliberate per-member reset; the disconnect path
-    /// wants [`Self::cancel_connection_uploads`], which does not reach across a
-    /// member's other devices.
+    /// For tests and deliberate resets; disconnects use
+    /// [`Self::cancel_connection_uploads`].
     pub fn cancel_uploads_for(&mut self, member: Uuid) {
         self.uploads.retain(|_, p| p.uploader != member);
         self.reservations.retain(|_, r| r.member != member);
@@ -1268,25 +1059,17 @@ impl PartyState {
             .count()
     }
 
-    /// Bytes currently held in upload spools, across every member.
-    ///
-    /// Not a limit — [`MAX_CONCURRENT_UPLOADS`] and [`MAX_PARTY_FILE_BYTES`]
-    /// are what bound this — but the number a test needs in order to assert
-    /// that an abandoned upload was actually reclaimed rather than merely
-    /// forgotten by its connection.
+    /// Bytes currently held in upload spools, across every member (lets tests
+    /// assert an abandoned upload was reclaimed).
     pub fn staged_upload_bytes(&self) -> u64 {
         self.uploads.values().map(|p| p.data.len() as u64).sum()
     }
 
-    /// One chunk of a stored blob, plus the file's total size, for a member who
-    /// is allowed to see it. `None` when unknown or not permitted — the same
-    /// answer either way, so the endpoint never reveals a file's existence.
+    /// One chunk of a blob plus its total size, if `member` may see it. `None`
+    /// when unknown or not permitted, so existence is never revealed.
     ///
-    /// Reads **under the lock**. The server's own request path does not use
-    /// this: it goes through [`Self::plan_blob_read`] so the bytes move after
-    /// the lock is released. Kept for in-process callers and tests, and
-    /// delegating rather than duplicating so there is exactly one place that
-    /// decides what a read is allowed to see.
+    /// Reads **under the lock**: for in-process callers and tests. The server
+    /// uses [`Self::plan_blob_read`], to which this delegates.
     pub fn blob_chunk_for(&self, member: Uuid, hash: &str, offset: u64) -> Option<(Vec<u8>, u64)> {
         let plan = self.plan_blob_read(member, hash, Some(offset))?;
         let total = plan.total();
@@ -1320,16 +1103,8 @@ impl PartyState {
         self.post_inline_file(sender, UploadTarget::Channel(channel), name, mime, data)
     }
 
-    /// Run all three upload phases back to back, with no lock to release
-    /// between them.
-    ///
-    /// The convenience form of the staged path, for in-process callers and
-    /// tests. It writes under whatever lock the caller holds, which is why the
-    /// server's request path does **not** use it — but it is the same three
-    /// functions in the same order, so there is still exactly one place that
-    /// decides what may be stored and exactly one that writes it. The previous
-    /// inline path was a second implementation of both, and a second
-    /// implementation is what quietly stops matching.
+    /// Run all three upload phases back to back, under whatever lock the caller
+    /// holds — the in-process/test form of the server's staged path.
     pub(super) fn post_inline_file(
         &mut self,
         sender: Uuid,
@@ -1346,10 +1121,8 @@ impl PartyState {
         self.commit_upload(staged).map(|(env, _)| env)
     }
 
-    /// Record a file reference and append the file message to a channel.
-    ///
-    /// Called by `commit_upload` for both the inline and the chunked path,
-    /// so every file message is appended in exactly one way.
+    /// Record a file reference and append the file message to a channel (the
+    /// single append path for inline and chunked uploads).
     pub(super) fn append_file_message(
         &mut self,
         sender: Uuid,
@@ -1394,11 +1167,8 @@ impl PartyState {
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.
-    ///
-    /// When the store is disk-backed the bytes are read on demand rather than
-    /// kept resident: holding every blob in memory made the storage ceiling
-    /// (1 GiB by default) a *memory* ceiling too, which is how a small VPS gets
-    /// OOM-killed by a community that is merely using the feature.
+    /// Disk-backed stores read on demand, so the storage ceiling is not also a
+    /// memory ceiling.
     pub fn blob_bytes(&self, hash: &str) -> Option<Vec<u8>> {
         let record = self.blobs.get(hash)?;
         if let Some(resident) = &record.data {
@@ -1414,55 +1184,31 @@ impl PartyState {
         }
     }
 
-    /// Whether `member` may download the blob `hash`. A file is accessible only if
-    /// it is referenced by a message in a channel the member may **read** or in a
-    /// DM thread the member is a party to. Without this, any joined member who
-    /// learned a content hash could fetch a file shared privately in a DM between
-    /// two *other* members — content-addressed storage is shared, but the
-    /// download endpoint must still enforce who can see what.
-    /// Decided over the reference table rather than by re-scanning every message
-    /// in every channel: the references *are* the record of where a file was
-    /// shared, and a deleted reference has to stop granting access immediately.
+    /// Whether `member` may download the blob `hash`: some share of it must
+    /// grant them `download` (content is stored once, so the endpoint is what
+    /// enforces who sees what). Decided over the reference table, so a deleted
+    /// reference stops granting access immediately.
     pub(super) fn member_can_access_blob(&self, member: Uuid, hash: &str) -> bool {
-        // Any *one* share that grants download is enough: the same bytes can sit
-        // in several places under different grants, and being allowed to fetch
-        // them anywhere means being allowed to fetch them.
         self.file_refs
             .iter()
             .filter(|r| r.hash == hash)
             .any(|r| self.effective_perms(member, r).download)
     }
 
-    /// The bytes of a stored blob, but only when `member` is permitted to see it.
-    /// Returns `None` both when the blob is unknown and when access is denied, so
-    /// the endpoint never reveals the existence of a file the member can't access.
-    ///
-    /// Reads **under the lock**, like [`Self::blob_chunk_for`], and for the same
-    /// reason is not what the server's request path uses. Delegates to
-    /// [`Self::plan_blob_read`] so both share one access decision.
+    /// The bytes of a blob, if `member` may see it (`None` otherwise, so
+    /// existence is never revealed). Reads under the lock, like
+    /// [`Self::blob_chunk_for`].
     pub fn blob_bytes_for(&self, member: Uuid, hash: &str) -> Option<Vec<u8>> {
         self.plan_blob_read(member, hash, None)?.perform()
     }
 
-    /// Decide a download *without performing it*.
+    /// Decide a download *without performing it*: authorise under the lock, and
+    /// let the caller move the bytes once it is released (`BlobReadPlan::perform`).
     ///
-    /// Access control is a question about state, so it is answered here, under
-    /// the lock. Moving the bytes is not: a whole-blob read is up to
-    /// `MAX_PARTY_FILE_BYTES` (100 MiB) of disk I/O, and doing it here means
-    /// every other member's message waits behind one member's download. The
-    /// caller performs the plan once it has let go of the lock — see
-    /// `BlobReadPlan::perform`.
-    ///
-    /// Authorisation is therefore point-in-time, which was already the contract
-    /// (see `member_can_access_blob`) and is now a wider window: a member whose
-    /// access is revoked mid-read still receives the rest of what they had
-    /// already been cleared for. Content addressing is what makes that safe to
-    /// state — the path named here always holds the same bytes, so a late read
-    /// cannot return something *else*. Revocation takes effect at the next
-    /// request.
-    ///
-    /// `offset` selects a chunked read (`PARTY_CHUNK_BYTES` from there);
-    /// `None` asks for the whole blob.
+    /// Authorisation is point-in-time; content addressing guarantees a late read
+    /// still returns the same bytes, and revocation applies from the next
+    /// request. `offset` selects a chunked read (`PARTY_CHUNK_BYTES` from
+    /// there); `None` asks for the whole blob.
     pub fn plan_blob_read(
         &self,
         member: Uuid,
@@ -1475,8 +1221,7 @@ impl PartyState {
         let record = self.blobs.get(hash)?;
         let total = record.size;
 
-        // Memory-only store (no blob directory): the bytes are already here, so
-        // there is nothing to defer. Tests run this way.
+        // Memory-only store (tests): the bytes are already here.
         if let Some(resident) = &record.data {
             let total = resident.len() as u64;
             let bytes = match offset {
@@ -1495,10 +1240,7 @@ impl PartyState {
         Some(BlobReadPlan::OnDisk {
             path: dir.join(hash),
             offset: offset.unwrap_or(0),
-            // A whole-blob read is bounded by the blob's own recorded size; a
-            // chunked one by the chunk size. Either way the length is decided
-            // here, so the read cannot be talked into being larger than the
-            // file the record describes.
+            // Bounded by the recorded size (or one chunk), never by the file.
             len: match offset {
                 None => total,
                 Some(at) => (total.saturating_sub(at)).min(PARTY_CHUNK_BYTES as u64),
@@ -1506,7 +1248,4 @@ impl PartyState {
             total,
         })
     }
-
-    // --- Durable mirroring (best-effort: failures are logged, not propagated, so a
-    // transient disk error never drops a live request) --------------------------
 }

@@ -1,14 +1,8 @@
-//! Coverage-guided fuzzing of `sanitize_filename`.
-//!
-//! This one has already earned its place. The property suite found that the
-//! function was not idempotent, and that single odd property was hiding a
-//! security bug: a peer-chosen filename could be crafted so the executable-file
-//! warning saw no extension while Windows created the file as an executable
-//! (GHSA-6q3g-734c-22jm). The function decides what a peer's chosen name becomes
-//! on disk, so its output is a security boundary.
-//!
-//! The invariants asserted here are the ones that make the name safe to join to
-//! a directory and to inspect for a dangerous extension.
+//! Coverage-guided fuzzing of `sanitize_filename`, whose output (what a peer's
+//! chosen name becomes on disk) is a security boundary: non-idempotence once hid
+//! an executable-warning bypass (GHSA-6q3g-734c-22jm). The invariants are the ones
+//! that make the name safe to join to a directory and to check for a dangerous
+//! extension.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -29,26 +23,20 @@ fuzz_target!(|data: &[u8]| {
     // Never empty: an empty name joins to the directory itself.
     assert!(!out.is_empty(), "empty name for {raw:?}");
 
-    // The name that is checked must be the name that reaches disk. Windows
-    // silently drops trailing dots and spaces, which is exactly how the
-    // executable-warning bypass worked.
+    // The name checked must be the name on disk: Windows silently drops
+    // trailing dots and spaces (how the bypass worked).
     assert!(!out.ends_with('.'), "trailing dot survived: {out:?}");
     assert!(!out.ends_with(' '), "trailing space survived: {out:?}");
 
     // Bounded, so the receiver's `tmp_<uuid>_` prefix still fits under NAME_MAX.
     assert!(out.len() <= 255, "name too long: {} bytes", out.len());
 
-    // Idempotent. This is the property that found the bug: if sanitising twice
-    // differs from sanitising once, some invariant is being re-broken after it
-    // was established, and the name on disk depends on how many times the
-    // function happened to be called.
+    // Idempotent (the property that found the bug): otherwise an invariant is
+    // re-broken after being established.
     assert_eq!(out, sanitize_filename(&out), "not a fixed point: {raw:?}");
 
-    // No control characters and no bidi overrides. This is the assertion the
-    // docstring above leans on and the target had dropped: U+202E renders
-    // `photo_gnp.exe` as `photo_exe.png`, so a name that survives with one in
-    // it defeats the executable-extension warning by display alone, without
-    // changing a byte of what runs.
+    // No control characters or bidi overrides: U+202E renders `photo_gnp.exe` as
+    // `photo_exe.png`, defeating the warning by display alone.
     assert!(
         !out.chars().any(|c| c.is_control()),
         "control character survived: {out:?}"
@@ -61,9 +49,7 @@ fuzz_target!(|data: &[u8]| {
         "bidi override survived: {out:?}"
     );
 
-    // Not a Windows reserved device name. `CON`, `NUL`, `COM1` and friends are
-    // devices at every path, so writing to one is not writing a file — and the
-    // name that reaches disk is the one the user was shown.
+    // Not a Windows device name (`CON`, `NUL`, `COM1`…: devices at every path).
     const RESERVED: [&str; 22] = [
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",

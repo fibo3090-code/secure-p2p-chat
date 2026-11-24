@@ -3,8 +3,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::MAX_PACKET_SIZE;
 
-/// Send a length-prefixed packet over TCP
-/// Format: 4 bytes big-endian length || payload
+/// Send a packet framed as a 4-byte big-endian length, then the payload.
 pub async fn send_packet<S>(stream: &mut S, payload: &[u8]) -> Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -32,21 +31,17 @@ where
     Ok(())
 }
 
-/// Receive a length-prefixed packet from TCP
-/// Format: 4 bytes big-endian length || payload
-///
-/// SECURITY: Uses chunked reading to prevent DoS via allocation pressure.
-/// Instead of pre-allocating the full buffer, we read in chunks.
+/// Receive a packet framed by [`send_packet`]. Reachable before the handshake by
+/// anyone who can connect, so the length is capped and the body read in chunks:
+/// a forged prefix cannot make us allocate the whole claimed size up front.
 pub async fn recv_packet<S>(stream: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
-    // Read length header
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
     let total_len = u32::from_be_bytes(header) as usize;
 
-    // Validate length
     if total_len > MAX_PACKET_SIZE {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -57,9 +52,7 @@ where
         ));
     }
 
-    // Use chunked reading to prevent DoS via allocation pressure
-    // Start with a small buffer and grow as data arrives
-    const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
+    const CHUNK_SIZE: usize = 64 * 1024;
     let mut buf = Vec::with_capacity(CHUNK_SIZE.min(total_len));
     let mut remaining = total_len;
 
@@ -119,15 +112,10 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1024);
 
         let payload = b"Hello, world!";
-
-        // Send
         tokio::spawn(async move {
             send_packet(&mut client, payload).await.unwrap();
         });
-
-        // Receive
         let received = recv_packet(&mut server).await.unwrap();
-
         assert_eq!(payload, &received[..]);
     }
 
@@ -142,7 +130,6 @@ mod tests {
         });
 
         let received = recv_packet(&mut server).await.unwrap();
-
         assert_eq!(payload, received);
     }
 
@@ -151,7 +138,6 @@ mod tests {
         let (mut client, mut _server) = tokio::io::duplex(1024);
 
         let payload = vec![0u8; MAX_PACKET_SIZE + 1];
-
         let result = send_packet(&mut client, &payload).await;
         assert!(result.is_err());
     }
@@ -160,12 +146,11 @@ mod tests {
     async fn test_framing_recv_reject_oversized_header() {
         let (mut client, mut server) = tokio::io::duplex(1024);
 
-        // Send a packet header claiming oversized payload
+        // A header claiming an oversized payload, with no body: recv must fail at once.
         let oversized_len = (MAX_PACKET_SIZE as u32 + 1).to_be_bytes();
 
         tokio::spawn(async move {
             client.write_all(&oversized_len).await.ok();
-            // Don't send the actual data—recv should fail immediately
         });
 
         let result = recv_packet(&mut server).await;

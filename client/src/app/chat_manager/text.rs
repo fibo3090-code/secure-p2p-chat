@@ -1,5 +1,5 @@
-//! Text messaging: chunked send/reassembly of large messages,
-//! broadcast, typing indicators, and notification previews.
+//! Text messaging: chunked send and reassembly of large messages, typing
+//! indicators and notification previews.
 
 use super::*;
 
@@ -48,9 +48,8 @@ impl ChatManager {
         let message_id = Uuid::new_v4();
         let total_chunks = u32::try_from(chunks.len())
             .map_err(|_| anyhow!("Message is too large to chunk safely"))?;
-        // Symmetric with the receiver's decode cap: refuse to build a message
-        // the peer would reject anyway, so the user gets a clear error instead
-        // of a silently dropped message.
+        // Mirror the receiver's decode cap, so the user gets an error instead of
+        // a message the peer silently drops.
         if total_chunks > crate::MAX_TEXT_CHUNKS {
             bail!(
                 "Message is too large to send (would need {} chunks, max {})",
@@ -125,15 +124,14 @@ impl ChatManager {
         text_part: String,
         timestamp_millis: u64,
     ) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
-        // Defense in depth: the wire decoder already caps `total_chunks`, but
-        // guard here too so this buffer can never pre-allocate an unbounded
-        // number of slots regardless of how it is reached.
+        // Defence in depth: the decoder caps `total_chunks` too, but this buffer
+        // must never pre-allocate unboundedly however it is reached.
         if total_chunks == 0 || total_chunks > crate::MAX_TEXT_CHUNKS {
             bail!("Invalid chunk count for large text message");
         }
         let key = (chat_id, message_id);
-        // Bound the number of concurrent partial messages per chat so a peer
-        // cannot open many reassembly buffers and sit on memory until timeout.
+        // Bound partial messages per chat, so a peer cannot pin memory with
+        // buffers it never completes.
         if !self.incoming_text_messages.contains_key(&key) {
             let in_flight = self
                 .incoming_text_messages
@@ -232,23 +230,21 @@ impl ChatManager {
             text.len()
         );
 
-        // Refused here rather than trusted to every front-end: a blank message
-        // went over the wire and showed up as an empty bubble on both ends.
+        // Refused here, not trusted to every front-end: a blank message showed
+        // up as an empty bubble on both ends.
         if text.trim().is_empty() {
             bail!("Nothing to send — the message is empty.");
         }
 
-        // An incoming conversation on the host is served by a differently-keyed session.
+        // An incoming chat on the host is served by a differently-keyed session.
         let actual_session_chat_id = self.session_for_chat(chat_id);
 
         let has_session = self.chats.contains_key(&chat_id)
             && self.sessions.contains_key(&actual_session_chat_id);
 
-        // One-to-one chat path
         if !has_session {
-            // An established conversation (fingerprint confirmed) without a
-            // session means the peer dropped — telling the user "connecting"
-            // there is a lie that hides why their message went nowhere.
+            // A confirmed conversation without a session means the peer
+            // dropped; saying "connecting" would hide why the send failed.
             let was_established = self
                 .chats
                 .get(&chat_id)
@@ -259,11 +255,8 @@ impl ChatManager {
                 actual_session_chat_id,
                 was_established,
             );
-            // This MUST be an error, not a toast-and-Ok. A front-end reads
-            // success as "sent": it clears the composer and shows no message
-            // row, so the text the user typed is destroyed and only a
-            // four-second toast marks its passing. Failing loudly lets every
-            // caller keep the draft.
+            // MUST be an error, not toast-and-Ok: a front-end reads Ok as "sent"
+            // and clears the composer, destroying the user's text.
             if was_established {
                 bail!(
                     "Not delivered: the peer is disconnected. Reconnect (or ask them to) and try again."
@@ -292,14 +285,12 @@ impl ChatManager {
             }
         }
 
-        // Add to local history
         let message_id = Uuid::new_v4();
         chat.messages
             .push(Message::sent(message_id, MessageContent::Text { text }));
 
-        // Register for a delivery receipt: TextSendComplete will report the
-        // wire seq for this message (frames drain FIFO per session), and the
-        // peer's Ack for that seq marks it delivered.
+        // Delivery receipt: TextSendComplete reports this message's wire seq
+        // (frames drain FIFO per session); the peer's Ack for it marks delivery.
         self.pending_text_sends
             .entry(actual_session_chat_id)
             .or_default()
@@ -308,12 +299,12 @@ impl ChatManager {
         Ok(())
     }
 
-    /// Send typing start indicator
+    /// Send a typing-start indicator.
     pub fn send_typing_start(&mut self, chat_id: Uuid) -> Result<()> {
         self.send_typing(chat_id, true)
     }
 
-    /// Send typing stop indicator
+    /// Send a typing-stop indicator.
     pub fn send_typing_stop(&mut self, chat_id: Uuid) -> Result<()> {
         self.send_typing(chat_id, false)
     }

@@ -20,7 +20,7 @@ the area report for whatever you pick up → [findings-index.md](findings-index.
 | Area reports | 13 (+1 external) |
 | Findings | 348 (3 Critical, 43 High, 126 Medium, 143 Low, 33 Info) |
 | Status | ~95 % VERIFIED by tracing the code; the rest SUSPECTED and labelled |
-| Already fixed | CRYPTO-01 and QUAL-01 (see §1); 22 more and 6 in part after the test-suite audit (see §9) |
+| Already fixed | CRYPTO-01 and QUAL-01 (see §1); CRYPTO-04 (invite fingerprint now checked on first dial); 22 more and 6 in part after the test-suite audit (see §9) |
 | Not covered | No dynamic testing of installers, native dialogs, real NATs, or Windows/macOS behaviour; nothing here proves the absence of other defects |
 
 The numbers overcount: the same root cause is often reported by several

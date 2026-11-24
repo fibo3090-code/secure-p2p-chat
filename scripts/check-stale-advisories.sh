@@ -31,6 +31,14 @@ deny = open("deny.toml", encoding="utf-8").read()
 block = re.search(r"ignore\s*=\s*\[(.*?)\n\]", deny, re.S)
 accepted = set(re.findall(r"RUSTSEC-\d{4}-\d{4}", re.sub(r"#[^\n]*", "", block.group(1) if block else "")))
 doc = open("SECURITY.md", encoding="utf-8").read()
+# Only the accepted list counts: the rest of the file may name an advisory in
+# the past tense ("rsa 0.10 fixes RUSTSEC-2023-0071"), which is history, not
+# an acceptance.
+listed = re.search(r"Known-accepted.*?(?=\n(?:- |#)|\Z)", doc, re.S)
+if not listed:
+    print("SECURITY.md has no 'Known-accepted' advisory list", file=sys.stderr)
+    sys.exit(1)
+doc = listed.group(0)
 # Shorthand like RUSTSEC-2026-0194/0195 names both.
 documented = set()
 for year, first, rest in re.findall(r"RUSTSEC-(\d{4})-(\d{4})((?:/\d{4})*)", doc):

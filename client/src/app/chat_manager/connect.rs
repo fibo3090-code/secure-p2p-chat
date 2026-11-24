@@ -4,8 +4,7 @@
 use super::*;
 use std::future::Future;
 
-/// The session task's ends of the channels a session is driven through. The
-/// manager keeps the other ends (see [`ChatManager::spawn_session`]).
+/// The session task's ends of the channels a session is driven through.
 pub(super) struct SessionChannels {
     pub to_app_tx: mpsc::UnboundedSender<SessionEvent>,
     pub from_app_rx: mpsc::UnboundedReceiver<ProtocolMessage>,
@@ -14,8 +13,8 @@ pub(super) struct SessionChannels {
 }
 
 impl ChatManager {
-    /// Send the user's accept/reject decision for a fingerprint verification to
-    /// the session task. `chat_id` is the SESSION id the prompt carried.
+    /// Send the user's accept/reject decision to the session task. `chat_id` is
+    /// the SESSION id the prompt carried; accepting persists the fingerprint.
     pub fn confirm_fingerprint(&mut self, chat_id: Uuid, accept: bool) -> Result<()> {
         tracing::info!(chat_id = %chat_id, accept = %accept, "Confirming fingerprint");
         let Some(tx) = self.fingerprint_confirm_senders.get(&chat_id).cloned() else {
@@ -23,20 +22,46 @@ impl ChatManager {
             bail!("No confirmation channel for chat {}", chat_id);
         };
 
-        // Take *this session's* prompt out of the queue — matching by session
-        // id, not "whatever is pending", so answering one peer never resolves or
-        // discards another's. A rejected prompt is removed too: that session is
-        // about to die and its entry must not block the queue behind it.
+        // Remove *this session's* prompt (rejected ones too: that session dies).
         let pending = self.take_fingerprint_request(chat_id);
 
         // On accept, persist the fingerprint before confirming the session.
-        if let Some(fp) = pending.filter(|_| accept).map(|p| p.fingerprint) {
+        if let Some(PendingFingerprint {
+            fingerprint: fp,
+            warning,
+            ..
+        }) = pending.filter(|_| accept)
+        {
             // In host mode the session id is the placeholder's, while the
             // fingerprint belongs on the incoming chat the peer created.
             let target_chat_id = self.chat_for_session(chat_id);
             if let Some(chat) = self.chats.get_mut(&target_chat_id) {
                 tracing::debug!("Storing verified fingerprint for chat {}", target_chat_id);
                 chat.peer_fingerprint = Some(fp.clone());
+            }
+            // The user was told this is not the key in the contact's invite,
+            // compared the safety code, and accepted it anyway. The contact
+            // follows that decision: left on the invite's key, blocking it
+            // later would block a key that never connects, and every
+            // reconnect would warn about the key just accepted. Only ever on
+            // an explicit accept *of a warning* — never silently.
+            //
+            // When the conversation's own key changed too, the prompt led with
+            // `KeyChanged` (the stronger claim) and the invite mismatch was
+            // not named in it — but the accepted key contradicts the invite
+            // all the same, so the session's expected key decides here, not
+            // just the warning that happened to be shown.
+            let rebind = match &warning {
+                Some(FingerprintWarning::InviteMismatch { contact_id, .. }) => Some(*contact_id),
+                Some(FingerprintWarning::KeyChanged { .. }) => self
+                    .expected_fingerprints
+                    .get(&chat_id)
+                    .filter(|e| !e.fingerprint.eq_ignore_ascii_case(&fp))
+                    .map(|e| e.contact_id),
+                None => None,
+            };
+            if let Some(contact_id) = rebind {
+                self.rebind_contact_fingerprint(contact_id, &fp);
             }
             // A user-confirmed fingerprint also verifies the matching contact.
             self.promote_contact_verified(target_chat_id, &fp);
@@ -46,15 +71,9 @@ impl ChatManager {
             .map_err(|e| anyhow!("Failed to send confirmation: {}", e))
     }
 
-    /// The user refused a peer's fingerprint: end the session, and discard the
-    /// conversation only if this connection created it.
-    ///
-    /// A first contact's conversation is empty and unverified, and nothing
-    /// should be left of it. But the same prompt appears when a *known*
-    /// conversation's key changes — the possible-impostor case — and there the
-    /// conversation and its history are the user's: refusing whoever answered
-    /// must not delete them. (The TUI used to delete unconditionally; the
-    /// desktop never did, leaving an empty dead conversation behind.)
+    /// The user refused a peer's fingerprint: end the session, and delete the
+    /// conversation only if this connection created it (empty, unverified). A
+    /// known conversation whose key changed keeps its history.
     pub fn reject_fingerprint(&mut self, session_id: Uuid) -> Result<()> {
         let conversation = self.resolve_display_chat_id(session_id);
         let created_by_this_connection = self
@@ -68,22 +87,10 @@ impl ChatManager {
         answered
     }
 
-    /// Wire up a session and spawn the task that runs it.
-    ///
-    /// `run` receives the task's ends of the channels and returns the session
-    /// future. Everything else — the manager's ends, the task handle, and what
-    /// happens when the session fails — is the same for every kind of session,
-    /// so it lives here once.
-    ///
-    /// The chat and session handle are registered before the session even
-    /// dials, so a failure that was only logged left a conversation reporting
-    /// itself connected forever, any TOFU prompt it queued stuck at the head of
-    /// the queue, and — for a listener that never accepted anyone — a
-    /// placeholder that made `check_rehost_needed()` report "already hosting"
-    /// for good. Every failure is therefore reported as `Error` (prefixed with
-    /// `failure`) followed by `Disconnected`, which is the event that clears
-    /// all of it. The message loop sends its own `Disconnected` on the normal
-    /// path; this only fires when it never got that far.
+    /// Wire up a session and spawn the task that runs it (`run` gets the task's
+    /// channel ends). State is registered before the session dials, so any
+    /// failure is reported as `Error` (prefixed with `failure`) then
+    /// `Disconnected`, which is what clears that state.
     pub(super) fn spawn_session<F, Fut>(&mut self, chat_id: Uuid, failure: &'static str, run: F)
     where
         F: FnOnce(SessionChannels) -> Fut,
@@ -91,9 +98,7 @@ impl ChatManager {
     {
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         let (from_app_tx, from_app_rx) = mpsc::unbounded_channel();
-        // Bounded lane for outgoing bulk file data (backpressure).
         let (file_tx, file_rx) = mpsc::channel(FILE_LANE_CAPACITY);
-        // So the UI can accept/reject the peer's fingerprint.
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
 
         let failure_tx = to_app_tx.clone();
@@ -124,12 +129,8 @@ impl ChatManager {
         self.fingerprint_confirm_senders.insert(chat_id, confirm_tx);
     }
 
-    /// Before starting a listener: drop a placeholder whose session is already
-    /// gone, and report one that is still live.
-    ///
-    /// A stale placeholder must be removed together with its task, or a
-    /// listener still parked in `accept()` keeps the port and the next bind
-    /// fails with EADDRINUSE.
+    /// Before starting a listener: drop a placeholder whose session is gone
+    /// (with its task, or it keeps the port bound), and report a live one.
     fn live_host_placeholder(&mut self) -> Option<Uuid> {
         let id = self.host_placeholder_id()?;
         if self.sessions.contains_key(&id) {
@@ -154,18 +155,14 @@ impl ChatManager {
         let chat_id = Uuid::new_v4();
         tracing::info!(chat_id = %chat_id, port = %port, "start_host called");
 
-        // Bind BEFORE any state is created. A bind that failed inside the
-        // spawned task was only logged, while the chat and session handle below
-        // had already been inserted — leaving a "Host on :port" conversation
-        // that `is_connected()` reported as Connected, `is_hosting` stuck true,
-        // and `my_addresses` advertising a port nothing was listening on.
+        // Bind BEFORE creating any state, so a failed bind cannot leave a
+        // phantom "Host on :port" conversation that reports itself connected.
         let listener = match crate::network::bind_host_listener(port).await {
             Ok(listener) => listener,
             Err(e) => {
                 tracing::error!(port = %port, error = %e, "Could not bind host listener");
-                // Auto-rehost is a timer. Retrying a port another process owns,
-                // forever, logs every tick and tells the user nothing — so after
-                // a few attempts stop claiming to host and say why, once.
+                // Stop claiming to host after repeated failures (auto-rehost
+                // is a timer).
                 self.rehost_failures = self.rehost_failures.saturating_add(1);
                 if self.rehost_failures >= MAX_CONSECUTIVE_REHOST_FAILURES {
                     self.stop_hosting();
@@ -175,11 +172,8 @@ impl ChatManager {
             }
         };
         self.rehost_failures = 0;
-        // The port actually bound, which is not the requested one when the
-        // caller asked for 0 (OS-assigned). Everything downstream — the chat
-        // title, "share this address", the UPnP mapping, and the port
-        // auto-rehost rebinds — must use this, or the app advertises `:0` and
-        // every rehost lands somewhere new.
+        // The port actually bound (the request may be 0), which everything
+        // downstream must advertise and rebind.
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
 
         let password = self.connection_password.clone();
@@ -195,14 +189,7 @@ impl ChatManager {
                 password,
             )
         });
-        let mut chat = Chat::new(
-            chat_id,
-            format!("Host on :{}", port),
-            ChatKind::Dm,
-            Transport::Direct,
-        );
-        chat.is_host_placeholder = true;
-        self.chats.insert(chat_id, chat);
+        self.insert_host_placeholder(chat_id, format!("Host on :{}", port), Transport::Direct);
 
         self.is_hosting = true;
         self.hosting_port = Some(port);
@@ -215,11 +202,9 @@ impl ChatManager {
         Ok(chat_id)
     }
 
-    /// Best-effort UPnP / NAT-PMP port mapping so peers outside the LAN can
-    /// reach us. Runs in the background; the first result lands via
-    /// `poll_session_events` so hosting is never delayed by a slow or absent
-    /// gateway. The task then renews the lease until hosting stops (dropping
-    /// `upnp_cancel`), and unmaps the port on the way out.
+    /// Best-effort UPnP / NAT-PMP mapping in the background (the result lands
+    /// via `poll_session_events`). Renews the lease until `upnp_cancel` is
+    /// dropped, then unmaps.
     fn start_port_mapping(&mut self, port: u16) {
         use crate::network::nat;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -227,28 +212,21 @@ impl ChatManager {
         self.pending_upnp = Some(result_rx);
         self.upnp_cancel = Some(cancel_tx);
         tokio::spawn(async move {
-            // Initial mapping, cancellation-aware: if hosting stops while the
-            // gateway call is still pending (up to 15s), abort instead of
-            // creating a mapping after shutdown has begun.
+            // Cancellation-aware: no mapping is created after hosting stopped.
             let first = tokio::select! {
                 m = nat::map_port(port) => m,
                 _ = &mut cancel_rx => return,
             };
             let protocol = first.as_ref().ok().map(|m| m.protocol);
             let _ = result_tx.send(first);
-            // If the first mapping failed there's nothing to renew or clean.
-            // `protocol` tracks the protocol currently in force so cleanup
-            // unmaps the right one even if a renewal switches UPnP<->NAT-PMP.
+            // `protocol` tracks the one in force, since a renewal may switch.
             let Some(mut protocol) = protocol else { return };
             loop {
                 tokio::select! {
-                    // Compose the wait + remap into one future so a cancel
-                    // aborts even a slow (up-to-15s) remap in progress instead
-                    // of waiting for it to finish first.
+                    // One future, so a cancel aborts even a slow remap.
                     remapped = async {
                         tokio::time::sleep(nat::RENEW_AFTER).await;
-                        // Re-map to refresh the lease; ignore transient errors,
-                        // the existing mapping is still valid until it expires.
+                        // Transient errors are ignored: the lease is still valid.
                         nat::map_port(port).await
                     } => {
                         if let Ok(m) = remapped {
@@ -297,14 +275,11 @@ impl ChatManager {
             )
             .await
         });
-        let mut chat = Chat::new(
+        self.insert_host_placeholder(
             chat_id,
             format!("Relay host via {}", relay_server),
-            ChatKind::Dm,
             Transport::Relay,
         );
-        chat.is_host_placeholder = true;
-        self.chats.insert(chat_id, chat);
 
         self.is_hosting = true;
         self.add_toast(
@@ -326,10 +301,8 @@ impl ChatManager {
             .await
     }
 
-    /// Connect trying each `(host, port)` candidate in priority order (e.g. a
-    /// contact's internet-reachable address first, then the LAN one). The chat
-    /// is labeled after the first candidate; the session runs over whichever
-    /// address actually accepted the connection.
+    /// Connect trying each `(host, port)` candidate in priority order; the chat
+    /// is labeled after the first.
     pub async fn connect_to_host_candidates(
         &mut self,
         targets: Vec<(String, u16)>,
@@ -412,15 +385,8 @@ impl ChatManager {
         Ok(chat_id)
     }
 
-    /// The conversation an outgoing session is about to serve: created on
-    /// first contact, otherwise brought in line with the new session.
-    ///
-    /// On a reconnect (or a chat pre-created elsewhere, e.g. by the contacts
-    /// dialog) the route is normalized to the one actually being dialled, so a
-    /// conversation is never persisted or rendered with a transport it no
-    /// longer uses. Its sequence counters are reset because the new session's
-    /// wire sequence restarts at 1, and the previous session's high-water mark
-    /// would otherwise reject the peer's first messages as replays.
+    /// The conversation an outgoing session will serve: created on first
+    /// contact, otherwise given the dialled transport and reset sequences.
     fn prepare_outgoing_chat(&mut self, chat_id: Uuid, title: String, transport: Transport) {
         let chat = self
             .chats
@@ -428,6 +394,12 @@ impl ChatManager {
             .or_insert_with(|| Chat::new(chat_id, title, ChatKind::Dm, transport));
         chat.transport = transport;
         chat.reset_sequences();
+    }
+
+    fn insert_host_placeholder(&mut self, chat_id: Uuid, title: String, transport: Transport) {
+        let mut chat = Chat::new(chat_id, title, ChatKind::Dm, transport);
+        chat.is_host_placeholder = true;
+        self.chats.insert(chat_id, chat);
     }
 
     /// A conversation with a live session to the peer holding `fingerprint`.
@@ -440,12 +412,9 @@ impl ChatManager {
             .map(|(id, _)| *id)
     }
 
-    /// Connect to a saved contact, reusing whatever already reaches them.
-    ///
-    /// In order: a live session on the contact's own conversation; a live
-    /// session with the same peer (matched by fingerprint) in another one;
-    /// otherwise dial — direct addresses first, then the relay — into the
-    /// conversation this contact already has, so history never fragments.
+    /// Connect to a saved contact, reusing whatever already reaches them: a live
+    /// session on its conversation, or with the same fingerprint elsewhere;
+    /// otherwise dial (addresses, then relay) into its existing conversation.
     pub async fn connect_to_contact(
         &mut self,
         contact_id: Uuid,
@@ -480,13 +449,8 @@ impl ChatManager {
             return Ok(active);
         }
 
-        // Reconnecting must land in the conversation this contact already has.
-        // `contact_to_chat` is the fast path, but it is only populated once a
-        // connection has been associated — a contact imported from an invite,
-        // or one whose association was never recorded, would otherwise start a
-        // brand-new chat every time and fragment the history. The contact's
-        // fingerprint identifies the same peer across chats, which is how
-        // returning peers are recognised everywhere else in the manager.
+        // Land in the contact's existing conversation: the mapping, else one
+        // matched by fingerprint (an imported contact has no mapping yet).
         let target = mapped.or(existing_chat_id).or_else(|| {
             let fp = contact.fingerprint.as_deref()?;
             let found = self
@@ -502,10 +466,7 @@ impl ChatManager {
             Some(found)
         });
 
-        // Direct-connect candidates in priority order (multi-address invites:
-        // e.g. internet-reachable first, LAN second). Unparsable entries are
-        // dropped rather than aborting, so a stale candidate can't block the
-        // relay fallback.
+        // Unparsable candidates are dropped so they cannot block the relay.
         let candidates: Vec<(String, u16)> = contact
             .candidate_addresses()
             .iter()
@@ -528,29 +489,27 @@ impl ChatManager {
                 .await?
         } else {
             tracing::error!(%contact_id, "Contact has no address and no active session");
-            // Do not point at a contact editor: there isn't one. Telling
-            // someone to use a feature that does not exist is worse than
-            // telling them nothing.
             bail!(
                 "This contact has no address or relay token to dial. Ask them for a fresh invite link, or have them connect to you first."
             );
         };
-        self.associate_contact_with_chat(contact_id, chat_id);
-        // The invite named a key. If the conversation has not verified one yet,
-        // the key that answers is checked against it (see
-        // `handle_tofu_verification`); a verified one is checked already.
-        let unverified = self
-            .chats
-            .get(&chat_id)
-            .is_some_and(|c| c.peer_fingerprint.is_none());
-        match contact.fingerprint {
-            Some(fp) if unverified => {
-                self.expected_fingerprints.insert(chat_id, fp);
-            }
-            _ => {
-                self.expected_fingerprints.remove(&chat_id);
-            }
+        // The invite's fingerprint becomes what this session is *expected* to
+        // present (CRYPTO-04). It is never trusted on that basis — an invite is
+        // not verification — but a different key answering takes the warning
+        // path instead of passing for an ordinary first use. Recording it after
+        // the dial is safe: session events are only handled through `&mut
+        // self`, which this call holds until it returns.
+        if let Some(fingerprint) = contact.fingerprint.clone() {
+            self.expected_fingerprints.insert(
+                chat_id,
+                ExpectedPeer {
+                    contact_id,
+                    contact_name: contact.name.clone(),
+                    fingerprint,
+                },
+            );
         }
+        self.associate_contact_with_chat(contact_id, chat_id);
         Ok(chat_id)
     }
 }

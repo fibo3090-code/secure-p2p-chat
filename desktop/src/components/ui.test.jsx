@@ -85,8 +85,11 @@ describe("Input / PasswordInput", () => {
     render(<PasswordInput value="hunter2hunter2" onChange={() => {}} />);
     const field = document.querySelector("input");
     expect(field.type).toBe("password");
-    await userEvent.click(screen.getByRole("button", { name: "Toggle visibility" }));
+    const toggle = screen.getByRole("button", { name: "Show password" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    await userEvent.click(toggle);
     expect(field.type).toBe("text");
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("tells the password manager which field this is", async () => {

@@ -26,6 +26,8 @@ rsa = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
+# `SysRng`: the OS CSPRNG in the rand_core 0.10 form rsa 0.10 requires.
+getrandom = { workspace = true, features = ["sys_rng"] }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 hkdf = { workspace = true }

@@ -1,9 +1,7 @@
-//! End-to-end tests for the relay rendezvous: a self-hosted server pairs a
-//! host and a joiner by token. Punch-capable peers hole punch a direct TCP
-//! connection (the relay never carries session bytes); when punching is
-//! disabled the relay bridges the (already-encrypted) v3 session traffic as
-//! before. Both paths must complete the full handshake and deliver an
-//! application message without the relay ever terminating the chat encryption.
+//! Relay rendezvous end to end: a self-hosted relay pairs a host and a joiner
+//! by token. Punch-capable peers go direct; with punching disabled the relay
+//! bridges the already-encrypted session. Both must complete the handshake and
+//! deliver a message without the relay terminating the chat encryption.
 
 use messenger_core::core::{generate_rsa_keypair, ProtocolMessage};
 use messenger_core::network::{
@@ -22,13 +20,16 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(25);
 /// `cargo test` (threaded) behaves like `cargo nextest` (process-per-test).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Host emits `NewConnection`; client emits `ShowFingerprintVerification`. Both
-/// mean "peer identity received, awaiting TOFU confirmation".
+/// The host's `NewConnection` or the client's `ShowFingerprintVerification`.
 fn awaiting_confirmation(ev: &SessionEvent) -> bool {
     matches!(
         ev,
         SessionEvent::NewConnection { .. } | SessionEvent::ShowFingerprintVerification { .. }
     )
+}
+
+fn is_ready(ev: &SessionEvent) -> bool {
+    matches!(ev, SessionEvent::Ready)
 }
 
 async fn wait_until<F>(
@@ -45,11 +46,8 @@ where
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(ev)) => {
-                if pred(&ev) {
-                    return ev;
-                }
-            }
+            Ok(Some(ev)) if pred(&ev) => return ev,
+            Ok(Some(_)) => {}
             Ok(None) => panic!("[{label}] event channel closed before match"),
             Err(_) => panic!("[{label}] timed out waiting for event"),
         }
@@ -77,9 +75,8 @@ async fn start_relay() -> String {
 }
 
 /// One full pairing on an existing relay: handshake, TOFU on both ends, and one
-/// host→client message carrying `payload`. Split out from
-/// [`pair_and_exchange`] so several pairings can share one relay — which is
-/// what the reconnect and concurrency tests need.
+/// host→client message carrying `payload`. Returns the peer labels each side
+/// saw (`p2p:*` when punched, `relay:*` when bridged).
 async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (String, String) {
     let relay_addr = relay_addr.to_string();
     let token = token.to_string();
@@ -96,7 +93,6 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
     let (_client_file_tx, client_file_rx) = mpsc::channel(8);
     let (client_confirm, client_confirm_rx) = mpsc::unbounded_channel();
 
-    // Host registers the token first.
     let host_relay = relay_addr.clone();
     let host_token = token.clone();
     let host_handle = tokio::spawn(async move {
@@ -114,7 +110,7 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
         .await
     });
 
-    // Joiner connects shortly after so the token is already registered.
+    // The joiner follows once the token is registered.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let client_relay = relay_addr.clone();
     let client_token = token.clone();
@@ -133,7 +129,7 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
         .await
     });
 
-    // The client announces the transport it ended up with before handshaking.
+    // The client announces the transport it got before handshaking.
     let client_label = match wait_until(&mut client_events, "client", |ev| {
         matches!(ev, SessionEvent::Connected { .. })
     })
@@ -143,8 +139,7 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
         _ => unreachable!(),
     };
 
-    // TOFU confirmation on both ends; the host's NewConnection carries its
-    // own view of the peer label.
+    // The host's NewConnection carries its own view of the peer label.
     let host_label = match wait_until(&mut host_events, "host", awaiting_confirmation).await {
         SessionEvent::NewConnection { peer_addr, .. } => peer_addr,
         other => panic!("host expected NewConnection, got {other:?}"),
@@ -153,17 +148,10 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
     host_confirm.send(true).unwrap();
     client_confirm.send(true).unwrap();
 
-    wait_until(&mut host_events, "host", |ev| {
-        matches!(ev, SessionEvent::Ready)
-    })
-    .await;
-    wait_until(&mut client_events, "client", |ev| {
-        matches!(ev, SessionEvent::Ready)
-    })
-    .await;
+    wait_until(&mut host_events, "host", is_ready).await;
+    wait_until(&mut client_events, "client", is_ready).await;
 
-    // A message sent by the host arrives at the client, proving the selected
-    // transport carries the encrypted session end to end.
+    // The host's message reaches the client over the selected transport.
     host_out
         .send(ProtocolMessage::Text {
             text: payload.to_string(),
@@ -194,8 +182,8 @@ async fn pair_and_exchange_on(relay_addr: &str, token: &str, payload: &str) -> (
     (host_label, client_label)
 }
 
-// Each test runs on its own single-threaded runtime, so blocking that thread
-// on the std mutex cannot deadlock — the lock exists to serialize env access.
+// Each test runs on its own single-threaded runtime, so holding the std mutex
+// across awaits cannot deadlock.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn two_peers_hole_punch_a_direct_session_via_the_rendezvous() {
@@ -232,10 +220,7 @@ async fn two_peers_pair_through_the_bridged_relay_when_punching_is_disabled() {
     );
 }
 
-/// A relay is a long-lived service: peers drop and redial it constantly. One
-/// completed session must leave it able to broker the next one — a rendezvous
-/// slot that leaked, or a listener that died with its first pairing, would make
-/// the app work exactly once per relay restart.
+/// One completed session must leave the relay able to broker the next.
 #[tokio::test]
 async fn one_relay_brokers_a_second_session_after_the_first_ends() {
     let relay_addr = start_relay().await;
@@ -243,18 +228,14 @@ async fn one_relay_brokers_a_second_session_after_the_first_ends() {
     let first = generate_relay_token();
     pair_and_exchange_on(&relay_addr, &first, "first session").await;
 
-    // A fresh token, as a reconnecting pair would use.
     let second = generate_relay_token();
     pair_and_exchange_on(&relay_addr, &second, "second session").await;
 
-    // And the very same token again, which is legitimate once its slot has been
-    // released by the pairing that consumed it.
+    // And the same token again, legitimate once its slot was released.
     pair_and_exchange_on(&relay_addr, &first, "third session").await;
 }
 
-/// Two pairings brokered at the same time by one relay. Each must reach its own
-/// partner: crossing them would put two strangers into a session together, with
-/// nothing but the v3 handshake's fingerprint check between them.
+/// Two simultaneous pairings must each reach their own partner.
 #[tokio::test]
 async fn one_relay_brokers_two_pairings_at_once() {
     let relay_addr = start_relay().await;
@@ -272,15 +253,13 @@ async fn one_relay_brokers_two_pairings_at_once() {
         })
     };
 
-    // `pair_and_exchange_on` asserts each side received its *own* payload, so
-    // completing at all is the crossing check.
+    // Each pairing asserts it received its *own* payload.
     a.await.expect("pairing A");
     b.await.expect("pairing B");
 }
 
-/// A joiner that dials a token nobody registered must fail, and must fail
-/// *quickly* — the relay answers with an error rather than parking the client
-/// on a five-minute wait. The relay must also still be serving afterwards.
+/// An unknown token must fail *fast* (an error, not a five-minute wait) and
+/// leave the relay serving.
 #[tokio::test]
 async fn an_unknown_token_fails_fast_and_leaves_the_relay_serving() {
     let relay_addr = start_relay().await;
@@ -309,37 +288,26 @@ async fn an_unknown_token_fails_fast_and_leaves_the_relay_serving() {
     .expect("joining an unknown token must not hang");
     assert!(result.is_err(), "an unknown token must not pair");
 
-    // The relay survived the refusal and still brokers a real pairing.
     pair_and_exchange_on(&relay_addr, &generate_relay_token(), "still serving").await;
 }
 
-/// The accept loop must survive connections that fail, one after another.
-///
-/// Both public accept loops log a failed `accept()` and continue rather than
-/// propagating it, because a transient failure — the peer vanishing between the
-/// SYN and the accept, or a momentary EMFILE — would otherwise take the whole
-/// rendezvous down for the life of the process. That is a one-line decision with
-/// no test behind it, and its absence is invisible until the day it matters.
-///
-/// What this injects is the failure that actually happens constantly in the
-/// wild: peers that connect and hang up without speaking. True EMFILE injection
-/// is deliberately not attempted — lowering `RLIMIT_NOFILE` would destabilise the
-/// test process itself and has no Windows equivalent, so it would trade a real
-/// check for a flaky one. This covers the same `continue`.
+/// The accept loop must survive connections that fail (both accept loops log
+/// and continue, or one transient error would take the rendezvous down). This
+/// injects the common case, peers that hang up without speaking; real EMFILE
+/// injection would destabilise the test process.
 #[tokio::test]
 async fn the_relay_keeps_serving_after_a_burst_of_failed_connections() {
     let relay_addr = start_relay().await;
 
-    // Connect and drop, repeatedly. Each one reaches the accept loop and then
-    // fails in `handle_relay_connection` when the hello never arrives.
-    // Under the relay's own per-address cap (20 per 30s), with room left for the
-    // pairing below — otherwise this would be testing the rate limiter instead.
+    // Connect and drop: each fails in `handle_relay_connection` when no hello
+    // arrives. Kept under the per-address cap (20 per 30 s) so this does not
+    // test the rate limiter instead.
     for _ in 0..6 {
         if let Ok(stream) = tokio::net::TcpStream::connect(&relay_addr).await {
             drop(stream);
         }
     }
-    // And some that connect, send garbage, and leave.
+    // And some that send garbage first.
     for _ in 0..6 {
         if let Ok(mut stream) = tokio::net::TcpStream::connect(&relay_addr).await {
             use tokio::io::AsyncWriteExt;
@@ -348,6 +316,5 @@ async fn the_relay_keeps_serving_after_a_burst_of_failed_connections() {
         }
     }
 
-    // The listener is still there and still brokers a real pairing.
     pair_and_exchange_on(&relay_addr, &generate_relay_token(), "still serving").await;
 }

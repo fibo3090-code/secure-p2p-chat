@@ -7,21 +7,20 @@ pub(crate) struct ConvSummary {
     id: String,
     title: String,
     last: Option<String>,
+    /// Whether the newest message is the user's own, so the list can prefix the
+    /// preview with "You:" — without it a row cannot say whose turn it is.
+    last_from_me: bool,
     connected: bool,
     placeholder: bool,
     kind: &'static str,
     transport: &'static str,
-    /// True once the peer's fingerprint has been confirmed (TOFU-verified). The
-    /// UI must not claim "verified" for conversations that are still pending.
+    /// The peer's fingerprint is confirmed (TOFU-verified).
     verified: bool,
-    /// Total message count.
     messages: usize,
-    /// Messages from the peer the user has not seen yet. Computed from the read
-    /// mark persisted in the encrypted history, **not** from what happened to be
-    /// on screen this session — so anything that arrived while the app was
-    /// closed is still badged on the next launch.
+    /// Unseen peer messages, from the read mark persisted in the history, so
+    /// anything that arrived while the app was closed is still badged.
     unread: usize,
-    /// RFC 3339 timestamp of the newest message, for "last activity" display.
+    /// RFC 3339 timestamp of the newest message.
     last_at: Option<String>,
 }
 
@@ -53,8 +52,7 @@ pub(crate) async fn list_conversations(
     for id in mgr.chat_ids() {
         if let Some(chat) = mgr.get_chat(id) {
             let last = chat.messages.last().map(|m| match &m.content {
-                // The sidebar shows a line; a peer's 24 MiB message used to be
-                // shipped whole as the preview on every refresh (PERF-02).
+                // A preview line, not a 24 MiB message (PERF-02).
                 MessageContent::Text { text } => preview_of(text),
                 MessageContent::File { filename, .. } => format!("📎 {}", filename),
             });
@@ -62,6 +60,7 @@ pub(crate) async fn list_conversations(
                 id: id.to_string(),
                 title: chat.title.clone(),
                 last,
+                last_from_me: chat.messages.last().is_some_and(|m| m.from_me),
                 connected: mgr.is_connected(&id),
                 placeholder: chat.is_host_placeholder,
                 kind: kind_str(chat.kind),
@@ -76,24 +75,19 @@ pub(crate) async fn list_conversations(
     Ok(out)
 }
 
-/// Mark a conversation as read up to its newest message. The read mark lives in
-/// the encrypted history, so the badge stays cleared across restarts.
+/// Mark a conversation read up to its newest message (persisted in history).
 #[tauri::command]
 pub(crate) async fn mark_read(id: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     ensure_ready(&state)?;
     let chat_id = parse_id(&id)?;
     state.manager.lock().await.mark_chat_read(chat_id);
-    // Like `send_message`, this fires often (every open, and again on each
-    // arrival in the open thread) and a save rewrites the entire history. The
-    // poll loop picks the new read mark up — `state_signature` includes it —
-    // and writes it within `HISTORY_SAVE_MIN_INTERVAL`.
+    // No save: this fires often, and the poll loop writes the new read mark
+    // within `HISTORY_SAVE_MIN_INTERVAL`.
     Ok(())
 }
 
-/// Report what the user can see: whether the window has focus, and which
-/// conversation is open. `ChatManager` owns no window handle, so the shell has
-/// to push this down — without it "notify when a message arrives in the
-/// background" fires for the thread the user is actively reading.
+/// Report window focus and the open conversation, so notifications never fire
+/// for the thread on screen (`ChatManager` owns no window handle).
 #[tauri::command]
 pub(crate) async fn set_presence(
     focused: bool,
@@ -101,8 +95,7 @@ pub(crate) async fn set_presence(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    // An unparseable id means "no conversation open" rather than an error — the
-    // shell should never be able to break presence tracking with a bad string.
+    // An unparseable id means "no conversation open", never an error.
     let active = chat.as_deref().and_then(|c| Uuid::parse_str(c).ok());
     state.manager.lock().await.set_ui_presence(focused, active);
     Ok(())
@@ -117,9 +110,9 @@ pub(crate) struct TransferDto {
     size: u64,
     received: u64,
     status: &'static str,
-    /// "incoming" or "outgoing", so the UI can label the direction.
+    /// "incoming" or "outgoing".
     direction: &'static str,
-    /// Whether the transfer is still cancellable (pending or in progress).
+    /// Still cancellable (pending or in progress).
     cancellable: bool,
     /// Failure reason when `status == "failed"`.
     error: Option<String>,
@@ -136,9 +129,7 @@ fn transfer_status_parts(s: &TransferStatus) -> (&'static str, Option<String>) {
     }
 }
 
-/// The active file transfers (both directions), polled by the frontend on the
-/// same `state-updated` cadence as the conversation list, so large sends and
-/// receives show live progress instead of nothing.
+/// The active file transfers (both directions), for live progress.
 #[tauri::command]
 pub(crate) async fn list_transfers(
     state: tauri::State<'_, Bridge>,
@@ -196,10 +187,9 @@ pub(crate) fn preview_of(text: &str) -> String {
     }
 }
 
-/// Bytes of one message's text sent to the chat pane. A peer can send a text
-/// of about 24 MiB (512 chunks); shipped whole, one such message made every
-/// refresh of that conversation move and parse tens of MB on the webview's
-/// main thread (PERF-02). The full text stays in the history.
+/// Bytes of one message's text sent to the chat pane. A ~24 MiB peer text
+/// shipped whole stalled every refresh of the webview (PERF-02); the history
+/// keeps the full text.
 pub(crate) const MAX_DISPLAY_TEXT_BYTES: usize = 256 * 1024;
 
 /// `text` cut to [`MAX_DISPLAY_TEXT_BYTES`] on a character boundary, with a
@@ -219,9 +209,8 @@ pub(crate) fn display_text(text: &str) -> std::borrow::Cow<'_, str> {
     ))
 }
 
-/// Return the conversation (with messages) as JSON for the chat pane. Every
-/// message is included; only oversized texts are cut (see
-/// [`MAX_DISPLAY_TEXT_BYTES`]).
+/// The conversation (with messages) as JSON for the chat pane; only oversized
+/// texts are cut (see [`MAX_DISPLAY_TEXT_BYTES`]).
 #[tauri::command]
 pub(crate) async fn get_conversation(
     id: String,
@@ -267,17 +256,12 @@ pub(crate) async fn send_message(
         .await
         .send_message(uuid, text)
         .map_err(|e| e.to_string())?;
-    // Deliberately does NOT save here. Every save rewrites the whole encrypted
-    // history, so saving per message is quadratic over a conversation's life.
-    // The poll loop notices the change and writes it within
-    // `HISTORY_SAVE_MIN_INTERVAL`, and the window-close handler flushes — so
-    // the message is persisted, just not once per keystroke-batch.
+    // No save: per-message saves are quadratic. The poll loop writes within
+    // `HISTORY_SAVE_MIN_INTERVAL` and window close flushes.
     Ok(())
 }
 
-/// Pick a file with the native dialog and send it over the given conversation.
-/// The picker runs on a blocking thread so it never stalls the async runtime;
-/// a cancelled dialog is a successful no-op.
+/// Pick a file and send it over the conversation; cancelling is a no-op.
 #[tauri::command]
 pub(crate) async fn send_file<R: tauri::Runtime>(
     id: String,
@@ -325,8 +309,7 @@ pub(crate) async fn accept_transfer(
     Ok(())
 }
 
-/// Decline an incoming file offer: the spooled data is deleted and the rest
-/// of the stream is discarded.
+/// Decline an incoming file offer: the spool is deleted, the rest discarded.
 #[tauri::command]
 pub(crate) async fn decline_transfer(
     id: String,
@@ -343,9 +326,8 @@ pub(crate) async fn decline_transfer(
 }
 
 /// Resolve a file message's on-disk path from history, plus whether the user
-/// sent it (as opposed to receiving it from the peer). The webview only ever
-/// passes (chat id, message id) — never a raw filesystem path — so the bridge
-/// cannot be used to open or read arbitrary files.
+/// sent it. The webview passes only (chat id, message id), never a raw path,
+/// so the bridge cannot open or read arbitrary files.
 async fn file_message_path(
     state: &tauri::State<'_, Bridge>,
     id: &str,
@@ -389,8 +371,7 @@ fn launch_with_os(path: &Path, reveal: bool) -> std::io::Result<()> {
     {
         use std::os::windows::process::CommandExt;
         if reveal {
-            // The `/select,` argument must reach explorer as one raw token,
-            // quoted, or paths with spaces get split.
+            // `/select,` must reach explorer as one quoted raw token.
             std::process::Command::new("explorer")
                 .raw_arg(format!("/select,\"{}\"", path.display()))
                 .spawn()?;
@@ -568,8 +549,7 @@ fn execution_risk(path: &Path) -> Option<OpenRisk> {
             runs: true,
         });
     }
-    // On Unix the executable bit decides, with or without an extension: a peer
-    // can send a file named `notes` that runs on click.
+    // On Unix the executable bit decides, extension or not.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -593,8 +573,8 @@ fn execution_risk(path: &Path) -> Option<OpenRisk> {
     })
 }
 
-/// Outcome of [`open_file`]: either it opened, or it was held back because the
-/// file would execute and the user has not said to go ahead.
+/// Outcome of [`open_file`]: opened, or held back because the file would
+/// execute and the user has not confirmed.
 #[derive(Serialize)]
 pub(crate) struct OpenOutcome {
     opened: bool,
@@ -608,16 +588,10 @@ pub(crate) struct OpenOutcome {
     filename: Option<String>,
 }
 
-/// Open a sent/received file with the default app (`reveal: false`) or show it
-/// in the file manager (`reveal: true`). A file card in the chat is no longer
-/// a dead end — this is what its click and folder button call.
-///
-/// A file that ARRIVED FROM A PEER and would execute is refused unless
-/// `confirm` is set: "open" on a received `.exe`/`.lnk`/`.desktop` runs
-/// attacker-chosen code, and a chat file card is exactly where a user clicks
-/// without thinking. Revealing in the file manager is always allowed — it
-/// launches nothing. Files the user sent came off their own disk, so they are
-/// not gated.
+/// Open a file with the default app (`reveal: false`) or show it in the file
+/// manager (`reveal: true`). A file RECEIVED from a peer that would execute is
+/// refused unless `confirm` is set; revealing launches nothing, and files the
+/// user sent are not gated.
 #[tauri::command]
 pub(crate) async fn open_file(
     id: String,
@@ -653,13 +627,11 @@ pub(crate) async fn open_file(
     })
 }
 
-/// Cap on how large an image is inlined as a preview; larger ones fall back to
-/// the plain file card (the webview would balloon on multi-MB data URLs).
+/// Largest image inlined as a preview; bigger ones get the plain file card.
 const PREVIEW_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Inline preview for an image file message, as a `data:` URL, or `None` when
-/// the file is not a previewable image (or too large). SVG is deliberately
-/// excluded — it can carry scripts, and history files may come from a peer.
+/// Inline preview of an image file message as a `data:` URL, or `None`. SVG is
+/// excluded: it can carry scripts, and the file may come from a peer.
 #[tauri::command]
 pub(crate) async fn file_preview(
     id: String,
@@ -687,9 +659,8 @@ pub(crate) async fn file_preview(
     )))
 }
 
-/// Open an http(s) link from a message in the system browser. The scheme is
-/// whitelisted here — message text comes from the peer, and anything except
-/// plain web URLs (file:, smb:, custom app schemes, …) must not launch.
+/// Open an http(s) link from a message in the system browser. Only web
+/// schemes: message text comes from the peer.
 #[tauri::command]
 pub(crate) async fn open_url(url: String, state: tauri::State<'_, Bridge>) -> Result<(), String> {
     ensure_ready(&state)?;
@@ -739,8 +710,7 @@ pub(crate) async fn delete_chat(id: String, state: tauri::State<'_, Bridge>) -> 
 mod size_tests {
     use super::*;
 
-    /// PERF-02: the sidebar preview and the chat pane must not carry a peer's
-    /// 24 MiB message whole; both cut on a character boundary.
+    /// PERF-02: preview and chat pane text are bounded, cut on char boundaries.
     #[test]
     fn previews_and_displayed_texts_are_bounded() {
         let huge = "ü".repeat(MAX_DISPLAY_TEXT_BYTES); // twice the cap in bytes

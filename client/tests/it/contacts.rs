@@ -1,4 +1,5 @@
-//! Property tests over the contact store.
+//! Property tests over the contact store's **trust lifecycle**, over random
+//! operation sequences (ordering is where the failures live):
 //!
 //! Not "add and remove keep the map consistent" — that is a test of `HashMap`,
 //! and names are the one field with no rules attached to them. What carries weight here is the **trust lifecycle**, because the
@@ -20,10 +21,20 @@ use p2pem_classic::types::{Config, Contact, TrustState};
 use proptest::prelude::*;
 use uuid::Uuid;
 
-/// A hex fingerprint derived from a seed, so a property can generate distinct
-/// identities without generating invalid ones.
+/// A valid hex fingerprint per seed, so properties get distinct identities.
 fn fingerprint_for(seed: u8) -> String {
     format!("{seed:02x}").repeat(32)
+}
+
+fn manager() -> ChatManager {
+    ChatManager::new(Config::default())
+}
+
+/// Import an invite for `seed`, expecting success.
+fn imported(manager: &mut ChatManager, seed: u8) -> Uuid {
+    manager
+        .import_contact(contact_with("Peer", Some(fingerprint_for(seed))))
+        .expect("import succeeds")
 }
 
 fn contact_with(name: &str, fingerprint: Option<String>) -> Contact {
@@ -37,8 +48,7 @@ fn contact_with(name: &str, fingerprint: Option<String>) -> Contact {
         fingerprint,
         public_key: None,
         created_at: chrono::Utc::now(),
-        // The point of the test: an invite may *claim* anything. The store must
-        // not take its word for it.
+        // An invite may *claim* anything; the store must not believe it.
         trust_state: TrustState::Trusted,
         notes: String::new(),
         tags: Vec::new(),
@@ -46,7 +56,6 @@ fn contact_with(name: &str, fingerprint: Option<String>) -> Contact {
     }
 }
 
-/// One step in a randomised lifecycle.
 #[derive(Debug, Clone)]
 enum Op {
     Block,
@@ -64,7 +73,7 @@ proptest! {
     /// A contact added by hand starts Unverified, whatever it is called.
     #[test]
     fn a_new_contact_is_never_trusted_on_arrival(name in ".{0,32}") {
-        let mut manager = ChatManager::new(Config::default());
+        let mut manager = manager();
         let id = manager.add_contact(name, None, Some(fingerprint_for(1)), None);
         prop_assert_eq!(
             manager.get_contact(id).map(|c| c.trust_state),
@@ -72,29 +81,22 @@ proptest! {
         );
     }
 
-    /// An invite link is not verification. Whatever `trust_state` the link
-    /// carries, the imported contact starts Unverified — otherwise pasting a
-    /// link would pre-trust whatever fingerprint it named, and that peer would
-    /// connect with no safety-code prompt at all.
+    /// An invite link is not verification: whatever `trust_state` it carries,
+    /// the contact starts Unverified (else its peer skips the safety code).
     #[test]
     fn importing_an_invite_never_confers_trust(seed in 0u8..64) {
-        let mut manager = ChatManager::new(Config::default());
-        let id = manager
-            .import_contact(contact_with("Imported", Some(fingerprint_for(seed))))
-            .expect("a well-formed invite imports");
+        let mut manager = manager();
+        let id = imported(&mut manager, seed);
         prop_assert_eq!(
             manager.get_contact(id).map(|c| c.trust_state),
             Some(TrustState::Unverified)
         );
     }
 
-    /// The trust clamp must not run in the other direction. Importing a contact
-    /// marked `Blocked` keeps the block — flattening it to `Unverified` would
-    /// silently lift a block, which is the failure the clamp exists to avoid the
-    /// mirror image of.
+    /// The clamp must not run the other way: an imported `Blocked` stays blocked.
     #[test]
     fn importing_never_lifts_a_block(seed in 0u8..64) {
-        let mut manager = ChatManager::new(Config::default());
+        let mut manager = manager();
         let mut contact = contact_with("Blocked Peer", Some(fingerprint_for(seed)));
         contact.trust_state = TrustState::Blocked;
         let id = manager.import_contact(contact).expect("import succeeds");
@@ -104,11 +106,10 @@ proptest! {
         );
     }
 
-    /// Identity is the fingerprint. Re-importing the same one refreshes the
-    /// existing contact instead of adding a second card for the same person.
+    /// Re-importing a fingerprint refreshes the contact rather than adding one.
     #[test]
     fn importing_the_same_identity_twice_does_not_duplicate(seed in 0u8..64, times in 2usize..6) {
-        let mut manager = ChatManager::new(Config::default());
+        let mut manager = manager();
         let fp = fingerprint_for(seed);
         let mut ids = Vec::new();
         for i in 0..times {
@@ -126,7 +127,7 @@ proptest! {
     /// Your own invite is refused however many times it is pasted.
     #[test]
     fn your_own_invite_is_always_refused(seed in 0u8..64) {
-        let mut manager = ChatManager::new(Config::default());
+        let mut manager = manager();
         let mine = fingerprint_for(seed);
         manager.set_my_fingerprint(mine.clone());
 
@@ -140,15 +141,12 @@ proptest! {
         prop_assert!(manager.contacts.is_empty());
     }
 
-    /// Blocking sticks. Any sequence of block/unblock ends in exactly the state
-    /// the last operation asked for, and a blocked contact is never left in some
-    /// intermediate trust state.
+    /// Any block/unblock sequence ends in the state the last operation asked
+    /// for, never an intermediate one.
     #[test]
     fn block_and_unblock_converge(seed in 0u8..64, ops in proptest::collection::vec(op_strategy(), 1..12)) {
-        let mut manager = ChatManager::new(Config::default());
-        let id = manager
-            .import_contact(contact_with("Peer", Some(fingerprint_for(seed))))
-            .expect("import succeeds");
+        let mut manager = manager();
+        let id = imported(&mut manager, seed);
 
         let mut removed = false;
         let mut blocked = false;
@@ -175,9 +173,8 @@ proptest! {
                 Some(TrustState::Blocked) => prop_assert!(blocked, "blocked without a block"),
                 Some(other) => {
                     prop_assert!(!blocked, "a blocked contact must read as Blocked, got {:?}", other);
-                    // Unblocking must not invent verification. Nothing in this
-                    // test ever confirms a fingerprint in a chat, so the only
-                    // honest resting state is Unverified.
+                    // Nothing here confirms a fingerprint, so Unverified is the
+                    // only honest resting state.
                     prop_assert_eq!(
                         other,
                         TrustState::Unverified,
@@ -188,16 +185,13 @@ proptest! {
         }
     }
 
-    /// Deleting a contact revokes its trust: the fingerprint is cleared from
-    /// every chat that held it, so the peer has to be verified again. The
-    /// confirmation dialog promises this, which is what makes it worth a test.
+    /// Deleting a contact clears its fingerprint from every chat, so the peer
+    /// must be verified again (as the confirmation dialog promises).
     #[test]
     fn deleting_a_contact_revokes_the_fingerprint_it_vouched_for(seed in 0u8..64) {
-        let mut manager = ChatManager::new(Config::default());
+        let mut manager = manager();
         let fp = fingerprint_for(seed);
-        let id = manager
-            .import_contact(contact_with("Peer", Some(fp.clone())))
-            .expect("import succeeds");
+        let id = imported(&mut manager, seed);
 
         // A conversation that trusts this fingerprint.
         let chat_id = Uuid::new_v4();

@@ -14,7 +14,7 @@ use messenger_server::run_accept_loop;
 use messenger_server::state::PartyState;
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
 use p2pem_classic::app::ChatManager;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ use uuid::Uuid;
 /// turns load into a flake — which trains people to re-run instead of read.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
-pub fn rsa_key() -> RsaPrivateKey {
+pub fn rsa_key() -> PrivateKey {
     generate_rsa_keypair(RSA_KEY_BITS).expect("rsa key")
 }
 
@@ -75,7 +75,7 @@ where
 /// Port 0 rather than "find a free port, release it, bind it": that pattern is
 /// a race between two tests under a parallel runner, and it was the only
 /// reason the nextest retry existed for these files.
-pub async fn host_on_any_port(host: &mut ChatManager, key: RsaPrivateKey) -> u16 {
+pub async fn host_on_any_port(host: &mut ChatManager, key: PrivateKey) -> u16 {
     host.start_host(0, key).await.expect("start host");
     host.hosting_port
         .expect("start_host records the port it bound")
@@ -91,7 +91,7 @@ pub async fn dial_and_verify(
     host: &mut ChatManager,
     client: &mut ChatManager,
     port: u16,
-    client_key: RsaPrivateKey,
+    client_key: PrivateKey,
 ) -> (Uuid, Uuid) {
     let client_chat = client
         .connect_to_host("127.0.0.1", port, None, client_key)
@@ -199,7 +199,7 @@ where
 
 /// Step one of a first join: connect with no pin and learn the server's
 /// fingerprint, as the user would see it before accepting.
-pub async fn learn_fingerprint(address: &str, key: &RsaPrivateKey) -> String {
+pub async fn learn_fingerprint(address: &str, key: &PrivateKey) -> String {
     match PartyManager::new()
         .connect_and_join(address, "probe", None, key, None)
         .await

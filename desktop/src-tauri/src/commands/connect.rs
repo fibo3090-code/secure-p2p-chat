@@ -2,8 +2,8 @@
 //! and TOFU fingerprint confirmation.
 use crate::*;
 
-/// Start hosting. `password` (optional) becomes the session-only connection
-/// password peers must supply; it is never persisted.
+/// Start hosting. `password` (optional) is the session-only connection
+/// password peers must supply; never persisted.
 #[tauri::command]
 pub(crate) async fn start_host(
     port: u16,
@@ -11,10 +11,9 @@ pub(crate) async fn start_host(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    // No fingerprint here on purpose: mDNS advertises reachability only, never
-    // identity. See `Discovery::register`.
+    // mDNS advertises reachability only, never identity (no fingerprint).
     let (pk, name) = {
-        let id = crate::lock_identity(&state.identity);
+        let id = lock_or_recover(&state.identity);
         (
             id.private_key().map_err(|e| e.to_string())?,
             id.name.clone(),
@@ -29,14 +28,9 @@ pub(crate) async fn start_host(
             .map_err(|e| e.to_string())?;
         mgr.config.enable_mdns
     };
-    // Advertise on the LAN so nearby peers can find this host without typing
-    // an address. Best-effort: hosting works fine without mDNS.
+    // Best-effort LAN advertisement.
     if enable_mdns {
-        let mut slot = crate::lock_or_recover(&state.discovery);
-        if slot.is_none() {
-            *slot = messenger_core::network::Discovery::new().ok();
-        }
-        if let Some(d) = slot.as_mut() {
+        if let Some(d) = discovery(&state).as_mut() {
             if let Err(e) = d.register(&name, port) {
                 tracing::warn!("mDNS registration failed: {e}");
             }
@@ -45,8 +39,17 @@ pub(crate) async fn start_host(
     Ok(())
 }
 
-/// Dial a peer directly. `password` (optional) is the host's connection
-/// password; session-only, never persisted.
+/// The mDNS handle, created on first use.
+fn discovery(state: &Bridge) -> MutexGuard<'_, Option<Discovery>> {
+    let mut slot = lock_or_recover(&state.discovery);
+    if slot.is_none() {
+        *slot = Discovery::new().ok();
+    }
+    slot
+}
+
+/// Dial a peer directly. `password` (optional) is the host's session-only
+/// connection password.
 #[tauri::command]
 pub(crate) async fn connect_peer(
     host: String,
@@ -55,10 +58,9 @@ pub(crate) async fn connect_peer(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let pk = {
-        let id = crate::lock_identity(&state.identity);
-        id.private_key().map_err(|e| e.to_string())?
-    };
+    let pk = lock_or_recover(&state.identity)
+        .private_key()
+        .map_err(|e| e.to_string())?;
     let mut mgr = state.manager.lock().await;
     // Only the dial password: this must not clear the host's (TAURI-03).
     mgr.set_dial_password(password.filter(|p| !p.is_empty()));
@@ -68,9 +70,8 @@ pub(crate) async fn connect_peer(
         .map_err(|e| e.to_string())
 }
 
-/// Peers discovered on the local network via mDNS. Returns `enabled: false`
-/// (and no peers) while the `enable_mdns` setting is off — browsing only runs
-/// when the user opted in, since it also reveals presence on the LAN.
+/// Peers discovered on the LAN via mDNS. Browsing runs only while the user has
+/// opted in (`enable_mdns`), since it reveals presence; otherwise `enabled: false`.
 #[tauri::command]
 pub(crate) async fn list_discovered_peers(
     state: tauri::State<'_, Bridge>,
@@ -80,16 +81,10 @@ pub(crate) async fn list_discovered_peers(
     if !enabled {
         return Ok(serde_json::json!({ "enabled": false, "peers": [] }));
     }
-    {
-        let mut slot = crate::lock_or_recover(&state.discovery);
-        if slot.is_none() {
-            *slot = messenger_core::network::Discovery::new().ok();
-        }
-        if let Some(d) = slot.as_ref() {
-            d.poll(&state.discovered);
-        }
+    if let Some(d) = discovery(&state).as_ref() {
+        d.poll(&state.discovered);
     }
-    let peers: Vec<serde_json::Value> = crate::lock_or_recover(&state.discovered)
+    let peers: Vec<serde_json::Value> = lock_or_recover(&state.discovered)
         .iter()
         .map(|p| {
             serde_json::json!({
@@ -104,16 +99,15 @@ pub(crate) async fn list_discovered_peers(
 }
 
 /// Whether the conversation is locked (no new peer may connect; auto-rehost
-/// paused). Mirrors the terminal client's `:lock` toggle.
+/// paused), like the terminal client's `:lock`.
 #[tauri::command]
 pub(crate) async fn lock_state(state: tauri::State<'_, Bridge>) -> Result<bool, String> {
     ensure_ready(&state)?;
     Ok(state.manager.lock().await.is_conversation_locked())
 }
 
-/// Lock or unlock the conversation. Locking also stops the live listener so
-/// no new peer can join until unlocked (existing sessions keep running);
-/// unlocking lets auto-rehost resume when enabled.
+/// Lock or unlock the conversation. Locking also stops the listener (existing
+/// sessions keep running).
 #[tauri::command]
 pub(crate) async fn set_locked(
     locked: bool,
@@ -127,11 +121,9 @@ pub(crate) async fn set_locked(
             mgr.stop_hosting();
         }
     }
-    // A locked user must also disappear from the LAN: the mDNS registration
-    // from start_host would otherwise keep advertising name/fingerprint and a
-    // now-dead address.
+    // A locked user must also stop advertising on the LAN.
     if locked {
-        if let Some(d) = crate::lock_or_recover(&state.discovery).as_mut() {
+        if let Some(d) = lock_or_recover(&state.discovery).as_mut() {
             if let Err(e) = d.unregister() {
                 tracing::warn!("mDNS unregister on lock failed: {e}");
             }
@@ -140,17 +132,15 @@ pub(crate) async fn set_locked(
     Ok(())
 }
 
-/// The addresses a peer can use to reach this host: the LAN address (primary
-/// local IPv4 + listening port) and, when UPnP resolved one, the external
-/// address. Shown after "Start hosting" so the user knows what to share.
+/// The addresses a peer can use to reach this host: LAN (primary IPv4 + port)
+/// and, when UPnP resolved one, external.
 #[tauri::command]
 pub(crate) async fn my_addresses(
     state: tauri::State<'_, Bridge>,
 ) -> Result<serde_json::Value, String> {
     ensure_ready(&state)?;
     let mgr = state.manager.lock().await;
-    // The live listener's port, not the settings one — the user may have
-    // typed a different port in the Host pane.
+    // The live listener's port, not the settings one.
     let port = mgr.hosting_port.unwrap_or(mgr.config.listen_port);
     let local = messenger_core::util::primary_local_ipv4()
         .map(|ip| messenger_core::util::format_host_port(&ip, port));
@@ -161,19 +151,16 @@ pub(crate) async fn my_addresses(
     }))
 }
 
-/// Start hosting through a blind relay broker. Returns the connection token the
-/// peer needs (alongside the relay address) to dial in — relay is a *transport*,
-/// the conversation is still a verified DM.
+/// Host through a blind relay. Returns the token the peer needs to dial in.
 #[tauri::command]
 pub(crate) async fn host_via_relay(
     relay: String,
     state: tauri::State<'_, Bridge>,
 ) -> Result<String, String> {
     ensure_ready(&state)?;
-    let pk = {
-        let id = crate::lock_identity(&state.identity);
-        id.private_key().map_err(|e| e.to_string())?
-    };
+    let pk = lock_or_recover(&state.identity)
+        .private_key()
+        .map_err(|e| e.to_string())?;
     state
         .manager
         .lock()
@@ -192,10 +179,9 @@ pub(crate) async fn connect_via_relay(
     state: tauri::State<'_, Bridge>,
 ) -> Result<(), String> {
     ensure_ready(&state)?;
-    let pk = {
-        let id = crate::lock_identity(&state.identity);
-        id.private_key().map_err(|e| e.to_string())?
-    };
+    let pk = lock_or_recover(&state.identity)
+        .private_key()
+        .map_err(|e| e.to_string())?;
     state
         .manager
         .lock()
@@ -219,30 +205,28 @@ pub(crate) async fn confirm_fingerprint(
         if accept {
             mgr.confirm_fingerprint(uuid, true)
         } else {
-            // Ends the session, and discards the conversation only if this
-            // connection created it (see `ChatManager::reject_fingerprint`).
+            // Ends the session; discards the chat only if this connection created it.
             mgr.reject_fingerprint(uuid)
         }
     }
     .map_err(|e| e.to_string());
-    // Only clear the pending prompt on success. If confirmation failed, keep it so
-    // `pending_fingerprint()` can still surface it and the user can retry.
+    // Keep the prompt on failure so the user can retry.
     if result.is_ok() {
-        *crate::lock_or_recover(&state.pending_fp) = None;
-        // An accepted fingerprint is persisted onto the chat; save so trust survives a restart.
+        *lock_or_recover(&state.pending_fp) = None;
+        // The accepted fingerprint is on the chat now; save so trust survives a restart.
         persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     }
     result
 }
 
-/// The pending TOFU fingerprint prompt, if any. The frontend polls this so a
-/// dropped `fingerprint-request` event never leaves a session stuck unverified.
+/// The pending TOFU prompt, polled so a dropped `fingerprint-request` event
+/// never leaves a session stuck unverified.
 #[tauri::command]
 pub(crate) fn pending_fingerprint(state: tauri::State<'_, Bridge>) -> Option<serde_json::Value> {
     if ensure_ready(&state).is_err() {
         return None;
     }
-    crate::lock_or_recover(&state.pending_fp)
+    lock_or_recover(&state.pending_fp)
         .as_ref()
         .map(fingerprint_prompt_json)
 }

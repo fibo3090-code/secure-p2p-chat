@@ -1,14 +1,8 @@
 //! Host-listener lifecycle: binding is the caller's business, and the port is
-//! released the moment a peer completes the handshake — not before, or one
-//! connection that never speaks closes the port for everyone (audit NET-02).
-//!
-//! Both properties exist because of one bug: `run_host_session` used to bind the
-//! port itself and hold the listener for the whole conversation. After the first
-//! peer connected, the app's auto-rehost called `start_host` again, the bind
-//! failed with EADDRINUSE *inside the spawned task* (logged and nothing else) —
-//! and the UI was left showing a "Host on :port" conversation that reported
-//! itself connected while nothing was listening. Hosting accepted exactly one
-//! peer, ever, and said nothing about it.
+//! released the moment a peer completes the handshake, not before (or one
+//! silent connection closes the port for everyone, audit NET-02). Both exist
+//! because `run_host_session` once bound the port itself: auto-rehost then hit
+//! EADDRINUSE inside the task, leaving a phantom "Host on :port" chat.
 
 use messenger_core::core::generate_rsa_keypair;
 use messenger_core::network::{
@@ -20,9 +14,8 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-/// Try to bind `port` for up to ~2s. The release happens on the session task's
-/// timeline (right after a handshake completes), so a single immediate attempt
-/// would be racy; a bounded retry is not.
+/// Try to bind `port` for up to ~2 s: the release happens on the session
+/// task's timeline, so one immediate attempt would be racy.
 async fn rebind_within(port: u16) -> bool {
     for _ in 0..100 {
         if bind_host_listener(port).await.is_ok() {
@@ -73,8 +66,7 @@ async fn host_keeps_its_port_through_idle_connections_and_releases_it_for_a_peer
         "an idle connection must not make the host give up its port"
     );
 
-    // A real peer completes the handshake (and the password gate): now the
-    // listener is released.
+    // A real peer completes the handshake: now the listener is released.
     let mut peer = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connecting to the host");
@@ -109,8 +101,8 @@ async fn host_keeps_its_port_through_idle_connections_and_releases_it_for_a_peer
     session.abort();
 }
 
-/// A bind failure has to surface to the caller, so it can refuse to create the
-/// chat and session state that made the phantom "Host on :port" conversation.
+/// A bind failure surfaces to the caller, so it can refuse to create the
+/// phantom chat and session state.
 #[tokio::test]
 async fn binding_an_occupied_port_is_an_error_the_caller_can_see() {
     let held = bind_host_listener(0).await.expect("first bind");

@@ -79,17 +79,18 @@ pub fn shareable_event_logs(logs: &LogBuffer) -> String {
 }
 
 pub fn format_event_logs(logs: &LogBuffer) -> String {
-    let mut log_text = String::new();
-    for event in logs.events() {
-        log_text.push_str(&format!(
-            "[{}] {} [{}] {}\n",
-            event.time.to_rfc3339(),
-            event.level,
-            event.target,
-            event.message
-        ));
-    }
-    log_text
+    logs.events()
+        .iter()
+        .map(|e| {
+            format!(
+                "[{}] {} [{}] {}\n",
+                e.time.to_rfc3339(),
+                e.level,
+                e.target,
+                e.message
+            )
+        })
+        .collect()
 }
 
 pub fn default_diagnostics_dir() -> PathBuf {
@@ -271,22 +272,7 @@ mod tests {
             sessions: 0,
             active_toasts: 0,
             discovered_peers: 0,
-            config: DiagnosticsConfig {
-                download_dir: "Downloads".to_string(),
-                temp_dir: "temp".to_string(),
-                auto_accept_files: false,
-                enable_notifications: true,
-                enable_typing_indicators: true,
-                show_log_terminal: false,
-                theme: "Dark".to_string(),
-                font_size: 14,
-                auto_connect: false,
-                auto_host_on_startup: false,
-                listen_port: crate::PORT_DEFAULT,
-                auto_trust_on_first_use: false,
-                enable_mdns: false,
-                relay_server: None,
-            },
+            config: DiagnosticsConfig::from(&Config::default()),
         };
 
         let token = "0123456789abcdef0123456789abcdef";

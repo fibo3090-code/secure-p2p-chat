@@ -1,15 +1,7 @@
-//! Per-member budget for writes: posts, DMs, uploads, shares and governance
-//! actions.
-//!
-//! Only channel creation used to be limited. Any member could post 64 KiB
-//! messages and DMs as fast as their link allowed, each one stored durably,
-//! committed under the global state lock and fanned out to every connection —
-//! enough for a single member to slow the whole community to a crawl and grow
-//! the database without bound. This is a token bucket per member, with two
-//! budgets: one for the number of writes, one for the bytes of text they carry.
-//!
-//! In memory only, like the channel-creation limiter: it is a burst limiter,
-//! not a quota, and a restart forgiving it costs nothing.
+//! Per-member budget for writes (posts, DMs, uploads, shares, governance): a
+//! token bucket per member for the number of writes and one for the bytes of
+//! text they carry, so one member cannot slow the community to a crawl or grow
+//! the database without bound. In memory only: a burst limiter, not a quota.
 
 use std::collections::HashMap;
 use std::time::Instant;

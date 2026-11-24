@@ -1,15 +1,10 @@
-//! Communities (Party servers): join/leave, channels, DMs, file sharing,
-//! and the saved-communities file (parties.json) with fingerprint pinning.
+//! Communities (Party servers): a thin bridge over `PartyManager` (shared with
+//! the terminal client), plus the saved-communities file (parties.json) with
+//! fingerprint pinning. Params are single words (Tauri arg-naming footgun).
 use crate::*;
 use messenger_core::party::{ChannelKind, FilePermissions, Role, UploadTarget};
 use p2pem_classic::app::party_manager::{PartyDial, PartyManager};
 use p2pem_classic::app::saved_parties::{load_saved_parties, save_saved_parties, SavedParty};
-
-// ── Communities (Party servers) ─────────────────────────────────────────────
-//
-// A thin bridge over `PartyManager`, the same one the terminal client drives. Command
-// params are single words (`server`, `channel`, …) to avoid the Tauri 2
-// arg-naming footgun where a snake_case param silently no-ops.
 
 #[derive(Serialize)]
 pub(crate) struct PartyMemberDto {
@@ -17,10 +12,8 @@ pub(crate) struct PartyMemberDto {
     username: String,
     online: bool,
     is_me: bool,
-    /// Message count in my DM thread with this member (0 when not joined yet).
-    /// The frontend derives DM unread badges from it.
+    /// Messages in my DM thread with this member, for unread badges.
     dm_messages: usize,
-    /// Lowercase role name (`guest`/`member`/`admin`/`owner`).
     role: &'static str,
 }
 
@@ -28,14 +21,12 @@ pub(crate) struct PartyMemberDto {
 pub(crate) struct PartyChannelDto {
     id: String,
     name: String,
-    /// Message count in this channel; the frontend derives unread badges from it.
+    /// Message count, for unread badges.
     messages: usize,
-    /// Lowercase channel kind (`public`/`private`/`locked`/`announce`).
     kind: &'static str,
-    /// Member ids on a private channel's list; empty for every other kind.
+    /// A private channel's member ids; empty for every other kind.
     members: Vec<String>,
-    /// Whether *this* client may post here, so the composer can say why not
-    /// instead of letting the user type into a channel that will refuse them.
+    /// Whether this client may post here, so the composer can say why not.
     can_post: bool,
 }
 
@@ -52,7 +43,6 @@ pub(crate) struct PartyFileDto {
     is_dm: bool,
     shared_at: u64,
     can_delete: bool,
-    /// What this client may do with the file, so the UI offers exactly that.
     can_view: bool,
     can_download: bool,
     can_share: bool,
@@ -74,7 +64,6 @@ pub(crate) struct PartyAuditDto {
     detail: String,
 }
 
-/// Wire name for a role, in both directions.
 fn role_str(r: Role) -> &'static str {
     match r {
         Role::Guest => "guest",
@@ -89,8 +78,7 @@ fn parse_role(s: &str) -> Result<Role, String> {
         "guest" => Ok(Role::Guest),
         "member" => Ok(Role::Member),
         "admin" => Ok(Role::Admin),
-        // The owner is the first member to join and is never assigned, so it is
-        // deliberately not parseable here.
+        // Ownership is never assigned, so "owner" is deliberately unparseable.
         other => Err(format!("unknown role: {other}")),
     }
 }
@@ -119,7 +107,7 @@ pub(crate) struct PartyServerDto {
     id: String,
     name: String,
     address: String,
-    /// The username this client joined with (for rejoin flows).
+    /// The username this client joined with (for rejoin).
     username: String,
     fingerprint: String,
     status: &'static str,
@@ -128,9 +116,7 @@ pub(crate) struct PartyServerDto {
     channels: Vec<PartyChannelDto>,
     members: Vec<PartyMemberDto>,
     last_error: Option<String>,
-    /// This client's own role, so the UI shows admin controls only to admins.
-    /// The server enforces regardless; this is about not offering a button that
-    /// will be refused.
+    /// So the UI offers admin controls only to admins (the server enforces).
     my_role: &'static str,
     /// Most recent successful governance action, shown once then cleared.
     last_notice: Option<String>,
@@ -146,7 +132,7 @@ pub(crate) struct PartyMessageDto {
     kind: &'static str,
     text: String,
     size: Option<u64>,
-    /// Content hash of a file message, used to request its download. `None` for text.
+    /// Content hash of a file message, to request its download.
     hash: Option<String>,
     timestamp: u64,
 }
@@ -166,9 +152,8 @@ fn server_dto(
     conn: &p2pem_classic::app::party_manager::PartyServerConn,
 ) -> PartyServerDto {
     let (status, status_detail) = party_status_parts(&conn.status);
-    // Fail closed. `Role::default()` is `Member`, and `Joined`/`Channels` arrive
-    // before `Members`, so defaulting would briefly hand a guest a member's
-    // permissions — offering them a composer the server then refuses.
+    // Fail closed: `Members` arrives after `Joined`/`Channels`, and defaulting to
+    // `Role::default()` (Member) would briefly give a guest a composer.
     let my_role = conn
         .member_id
         .and_then(|me| conn.members.iter().find(|m| m.id == me))
@@ -182,13 +167,10 @@ fn server_dto(
             username: m.username.clone(),
             online: m.online,
             is_me: conn.member_id == Some(m.id),
-            dm_messages: conn
-                .member_id
-                .map(|me| {
-                    let thread = messenger_core::party::dm_thread_id(me, m.id);
-                    conn.messages.get(&thread).map_or(0, |v| v.len())
-                })
-                .unwrap_or(0),
+            dm_messages: conn.member_id.map_or(0, |me| {
+                let thread = messenger_core::party::dm_thread_id(me, m.id);
+                conn.messages.get(&thread).map_or(0, |v| v.len())
+            }),
             role: role_str(m.role),
         })
         .collect();
@@ -201,8 +183,7 @@ fn server_dto(
             messages: conn.messages.get(&c.id).map_or(0, |v| v.len()),
             kind: kind_str(c.kind),
             members: c.members.iter().map(|m| m.to_string()).collect(),
-            // Mirrors the server's rule so the composer can explain itself
-            // rather than accepting a message the server will refuse.
+            // Mirrors the server's rule.
             can_post: conn
                 .member_id
                 .is_some_and(|me| c.kind.may_post(my_role, c.members.contains(&me)).is_ok()),
@@ -261,8 +242,7 @@ fn server_dto(
     }
 }
 
-/// Turn a stored envelope into a display DTO, resolving the sender's username
-/// from the member directory and flagging the local user's own messages.
+/// A stored envelope as a display DTO, with the sender's username resolved.
 fn message_dto(
     env: &messenger_core::party::Envelope,
     conn: &p2pem_classic::app::party_manager::PartyServerConn,
@@ -289,9 +269,16 @@ fn message_dto(
     }
 }
 
-/// What `party_join` did. `status: "joined"` means the credentials went out and
-/// the join is in flight; `status: "verify"` means nothing was sent yet and the
-/// user has to confirm the server's identity first.
+/// Run one `PartyManager` call under its lock, as a command result.
+async fn with_party<T, E: std::fmt::Display>(
+    state: &Bridge,
+    f: impl FnOnce(&mut PartyManager) -> Result<T, E>,
+) -> Result<T, String> {
+    f(&mut *state.party.lock().await).map_err(|e| e.to_string())
+}
+
+/// What `party_join` did: `"joined"` (credentials sent, join in flight) or
+/// `"verify"` (nothing sent; the user must confirm the server's identity).
 #[derive(Serialize)]
 pub(crate) struct PartyJoinDto {
     status: &'static str,
@@ -300,20 +287,11 @@ pub(crate) struct PartyJoinDto {
     sas: Option<String>,
 }
 
-/// Connect to a community server and join with a username.
-///
-/// Two-step on purpose. The `Join` frame carries the community username *and
-/// password*, so it must not be written to a server whose identity the user has
-/// not accepted. If this address has a pin, it is compared before the frame goes
-/// out. If it has none — a first join — the connection is made far enough to
-/// learn the server's fingerprint, then dropped, and the UI is asked to show it.
-/// Calling again with `fingerprint` set to the one the user accepted completes
-/// the join, and only if the new connection presents exactly that key.
-///
-/// The second step used to be a bare `trust: true`, which sent the
-/// credentials to whatever key answered the *second* connection: the
-/// fingerprint the user had just verified was never compared with it (audit
-/// TAURI-01 / UI-01).
+/// Connect to a community server and join. Two-step, because the `Join` frame
+/// carries the username and password: with no pin, the first call only learns
+/// the server's fingerprint for the user to verify; a second call with
+/// `fingerprint` set joins only if the server presents exactly that key
+/// (audit TAURI-01 / UI-01).
 #[tauri::command]
 pub(crate) async fn party_join(
     address: String,
@@ -325,24 +303,18 @@ pub(crate) async fn party_join(
     ensure_ready(&state)?;
     let address = address.trim().to_string();
     let username = username.trim().to_string();
-    let pk = {
-        let id = crate::lock_identity(&state.identity);
-        id.private_key().map_err(|e| e.to_string())?
-    };
+    let pk = lock_or_recover(&state.identity)
+        .private_key()
+        .map_err(|e| e.to_string())?;
     let password = Some(password).filter(|p| !p.trim().is_empty());
 
-    // TOFU pinning: if we've joined this address before, its identity must not
-    // have changed. Look the pin up BEFORE connecting and hand it down, so the
-    // comparison happens inside `connect_and_join` while the tunnel is up but
-    // before the `Join` frame carrying the username and password is written.
+    // A saved pin always wins over the step-one fingerprint; it is compared
+    // inside `connect_and_join` before the `Join` frame is written.
     let saved = load_saved_parties(&state.parties_path)?;
     let pinned = saved
         .into_iter()
         .find(|p| p.address.eq_ignore_ascii_case(&address) && !p.fingerprint.is_empty())
         .map(|p| p.fingerprint)
-        // No pin yet: the fingerprint the user verified in step one, if this
-        // is step two. A saved pin always wins — it is what was verified
-        // before, and the step-one prompt never appears for a pinned address.
         .or_else(|| fingerprint.filter(|f| !f.trim().is_empty()));
 
     // Dial with no lock held: the poll loop takes the community lock first
@@ -377,8 +349,7 @@ pub(crate) async fn party_join(
         } => (server_id, fingerprint),
     };
 
-    // Rejoin replaces: drop any older entry for the same address (e.g. a
-    // disconnected or join-rejected zombie) so the list never shows duplicates.
+    // Rejoin replaces any older entry for the same address.
     let stale: Vec<Uuid> = party
         .server_ids()
         .into_iter()
@@ -394,10 +365,7 @@ pub(crate) async fn party_join(
     }
     drop(party);
 
-    // The saved entry (and with it the pin) is written by the poll loop once the
-    // server actually accepts us. Saving here would pin a community the user
-    // never got into — a typo'd address or a wrong password would leave a
-    // permanent entry behind.
+    // The poll loop saves (and pins) the entry once the server accepts us.
     Ok(PartyJoinDto {
         status: "joined",
         server: Some(sid.to_string()),
@@ -418,13 +386,12 @@ pub(crate) async fn party_list(
         .into_iter()
         .filter_map(|id| party.server(id).map(|conn| server_dto(id, conn)))
         .collect();
-    // Stable order so the UI's server list doesn't reshuffle each poll.
+    // Stable order so the server list doesn't reshuffle each poll.
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     Ok(out)
 }
 
-/// Messages in a channel (already seeded from durable history on join; live
-/// posts arrive via the poll loop).
+/// Messages in a channel (seeded on join; live posts arrive via the poll loop).
 #[tauri::command]
 pub(crate) async fn party_history(
     server: String,
@@ -446,7 +413,6 @@ pub(crate) async fn party_history(
     Ok(msgs)
 }
 
-/// Post a text message to a channel.
 #[tauri::command]
 pub(crate) async fn party_post(
     server: String,
@@ -457,15 +423,9 @@ pub(crate) async fn party_post(
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
     let cid = parse_id(&channel)?;
-    state
-        .party
-        .lock()
-        .await
-        .post(sid, cid, text)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.post(sid, cid, text)).await
 }
 
-/// Create a new channel on a community server.
 #[tauri::command]
 pub(crate) async fn party_create_channel(
     server: String,
@@ -474,15 +434,9 @@ pub(crate) async fn party_create_channel(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
-    state
-        .party
-        .lock()
-        .await
-        .create_channel(sid, name)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.create_channel(sid, name)).await
 }
 
-/// Send a direct message to another member of a community server.
 #[tauri::command]
 pub(crate) async fn party_send_dm(
     server: String,
@@ -493,16 +447,11 @@ pub(crate) async fn party_send_dm(
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
     let to = parse_id(&to)?;
-    state
-        .party
-        .lock()
-        .await
-        .send_dm(sid, to, text)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.send_dm(sid, to, text)).await
 }
 
-/// The DM thread with a member. Requests a fresh fetch (offline catch-up); the
-/// authoritative history lands on a later poll.
+/// The DM thread with a member. Also requests a fresh fetch, which lands on a
+/// later poll.
 #[tauri::command]
 pub(crate) async fn party_dm_history(
     server: String,
@@ -524,8 +473,7 @@ pub(crate) async fn party_dm_history(
         .collect())
 }
 
-/// Clear a server's last surfaced error (e.g. a rejected post) after the UI has
-/// shown it.
+/// Clear a server's last surfaced error once the UI has shown it.
 #[tauri::command]
 pub(crate) async fn party_clear_error(
     server: String,
@@ -546,9 +494,8 @@ pub(crate) async fn party_saved(
     load_saved_parties(&state.parties_path)
 }
 
-/// Leave a community: drop the connection, forget its local state, and remove it
-/// from the saved list. The server keeps the membership, so rejoining with the
-/// same identity later resumes it.
+/// Leave a community and forget it locally. The server keeps the membership,
+/// so rejoining with the same identity resumes it.
 #[tauri::command]
 pub(crate) async fn party_leave(
     server: String,
@@ -570,9 +517,8 @@ pub(crate) async fn party_leave(
     Ok(())
 }
 
-/// Create a channel of a given kind. `members` seeds a private channel and is
-/// ignored otherwise. Only admins may create the restricted kinds; the server
-/// enforces that regardless of what the UI offers.
+/// Create a channel of a given kind; `members` seeds a private channel. The
+/// server enforces who may create the restricted kinds.
 #[tauri::command]
 pub(crate) async fn party_create_channel_kind(
     server: String,
@@ -585,15 +531,12 @@ pub(crate) async fn party_create_channel_kind(
     let sid = parse_id(&server)?;
     let kind = parse_kind(&kind)?;
     let members = parse_ids(&members)?;
-    state
-        .party
-        .lock()
-        .await
-        .create_channel_of_kind(sid, name, kind, members)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| {
+        p.create_channel_of_kind(sid, name, kind, members)
+    })
+    .await
 }
 
-/// Delete a channel and its history (admins only).
 #[tauri::command]
 pub(crate) async fn party_delete_channel(
     server: String,
@@ -603,15 +546,9 @@ pub(crate) async fn party_delete_channel(
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
     let cid = parse_id(&channel)?;
-    state
-        .party
-        .lock()
-        .await
-        .delete_channel(sid, cid)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.delete_channel(sid, cid)).await
 }
 
-/// Change a channel's kind and private membership (admins only).
 #[tauri::command]
 pub(crate) async fn party_set_channel_access(
     server: String,
@@ -625,15 +562,9 @@ pub(crate) async fn party_set_channel_access(
     let cid = parse_id(&channel)?;
     let kind = parse_kind(&kind)?;
     let members = parse_ids(&members)?;
-    state
-        .party
-        .lock()
-        .await
-        .set_channel_access(sid, cid, kind, members)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.set_channel_access(sid, cid, kind, members)).await
 }
 
-/// Change another member's role (admins only).
 #[tauri::command]
 pub(crate) async fn party_set_role(
     server: String,
@@ -645,16 +576,10 @@ pub(crate) async fn party_set_role(
     let sid = parse_id(&server)?;
     let mid = parse_id(&member)?;
     let role = parse_role(&role)?;
-    state
-        .party
-        .lock()
-        .await
-        .set_role(sid, mid, role)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.set_role(sid, mid, role)).await
 }
 
-/// Ask the server for the Drive listing and this member's quota. The answers
-/// arrive asynchronously and land in the next `party-updated` event.
+/// Request the Drive listing and quota; they land in a later `party-updated`.
 #[tauri::command]
 pub(crate) async fn party_refresh_files(
     server: String,
@@ -662,17 +587,11 @@ pub(crate) async fn party_refresh_files(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
-    state
-        .party
-        .lock()
-        .await
-        .refresh_files(sid)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.refresh_files(sid)).await
 }
 
-/// Re-share a file into another channel or DM without re-uploading it.
-/// `from` is the location it is being shared *from*, which is where the
-/// caller's right to do so comes from.
+/// Re-share a file into another channel or DM without re-uploading. `from` is
+/// where the caller's right to share it comes from.
 #[tauri::command]
 pub(crate) async fn party_share_file(
     server: String,
@@ -690,17 +609,10 @@ pub(crate) async fn party_share_file(
         (None, Some(p)) => UploadTarget::Dm(parse_id(&p)?),
         (None, None) => return Err("no destination given".to_string()),
     };
-    state
-        .party
-        .lock()
-        .await
-        .share_file(sid, hash, from, target)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.share_file(sid, hash, from, target)).await
 }
 
-/// The four rights, as one object. Tauri binds a struct parameter by its own
-/// name, so this stays a single-word key (`perms`) and keeps the command's
-/// signature readable.
+/// The four rights as one single-word struct parameter (`perms`).
 #[derive(Deserialize)]
 pub(crate) struct PermsDto {
     view: bool,
@@ -709,8 +621,8 @@ pub(crate) struct PermsDto {
     share: bool,
 }
 
-/// Change what a shared file grants — by default (`member` omitted) or for one
-/// member. The server refuses anything the caller does not hold themselves.
+/// Change what a shared file grants, by default (`member` omitted) or for one
+/// member. The server refuses rights the caller does not hold.
 #[tauri::command]
 pub(crate) async fn party_set_file_permissions(
     server: String,
@@ -723,27 +635,17 @@ pub(crate) async fn party_set_file_permissions(
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
     let loc = parse_id(&location)?;
-    let member = match member {
-        Some(m) => Some(parse_id(&m)?),
-        None => None,
+    let member = member.as_deref().map(parse_id).transpose()?;
+    let perms = FilePermissions {
+        view: perms.view,
+        download: perms.download,
+        delete: perms.delete,
+        share: perms.share,
     };
-    state
-        .party
-        .lock()
-        .await
-        .set_file_permissions(
-            sid,
-            hash,
-            loc,
-            member,
-            FilePermissions {
-                view: perms.view,
-                download: perms.download,
-                delete: perms.delete,
-                share: perms.share,
-            },
-        )
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| {
+        p.set_file_permissions(sid, hash, loc, member, perms)
+    })
+    .await
 }
 
 /// Delete one share of a file (its uploader, or an admin).
@@ -757,15 +659,10 @@ pub(crate) async fn party_delete_file(
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
     let loc = parse_id(&location)?;
-    state
-        .party
-        .lock()
-        .await
-        .delete_file(sid, hash, loc)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.delete_file(sid, hash, loc)).await
 }
 
-/// Ask for the audit log (admins only). Lands in the next `party-updated`.
+/// Request the audit log (admins only); lands in a later `party-updated`.
 #[tauri::command]
 pub(crate) async fn party_refresh_audit(
     server: String,
@@ -773,15 +670,9 @@ pub(crate) async fn party_refresh_audit(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let sid = parse_id(&server)?;
-    state
-        .party
-        .lock()
-        .await
-        .refresh_audit(sid, 200)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.refresh_audit(sid, 200)).await
 }
 
-/// Clear the last governance notice once the UI has shown it.
 #[tauri::command]
 pub(crate) async fn party_clear_notice(
     server: String,
@@ -797,19 +688,10 @@ fn parse_ids(ids: &[String]) -> Result<Vec<Uuid>, String> {
     ids.iter().map(|s| parse_id(s)).collect()
 }
 
-/// Open the native file picker (parented to the app window) and read the chosen
-/// file's bytes, returning `(name, mime, data)`. `Ok(None)` if the user
-/// cancelled.
-///
-/// A community upload is sent inline, so the whole file is held in memory by
-/// definition — which is exactly why the size is checked against
-/// [`messenger_core::party::MAX_PARTY_FILE_BYTES`] *before* reading rather than
-/// after. Reading first meant picking a 4 GB file allocated 4 GB only to be
-/// rejected. The read is async: the previous blocking `std::fs::read` ran on the
-/// async runtime and stalled every other task on that worker for its duration.
-///
-/// Files past `MAX_INLINE_FILE_BYTES` are not refused — `PartyManager` streams
-/// them in chunks — so the only hard limit here is the server's ceiling.
+/// Pick a file and read it as `(name, mime, data)`; `Ok(None)` if cancelled.
+/// The size is checked against `MAX_PARTY_FILE_BYTES` *before* reading, and
+/// the read is async. Files past `MAX_INLINE_FILE_BYTES` are streamed in
+/// chunks by `PartyManager`, so the server's ceiling is the only hard limit.
 async fn pick_upload<R: tauri::Runtime>(
     window: tauri::WebviewWindow<R>,
 ) -> Result<Option<(String, String, Vec<u8>)>, String> {
@@ -853,8 +735,7 @@ pub(crate) async fn read_upload(path: &Path) -> Result<(String, String, Vec<u8>)
     Ok((name, mime, data))
 }
 
-/// Pick a file and post it to a community channel. The picker runs on a blocking
-/// thread, parented to the app window; a cancelled dialog is a successful no-op.
+/// Pick a file and post it to a channel; cancelling is a no-op.
 #[tauri::command]
 pub(crate) async fn party_send_file<R: tauri::Runtime>(
     server: String,
@@ -868,15 +749,10 @@ pub(crate) async fn party_send_file<R: tauri::Runtime>(
     let Some((name, mime, data)) = pick_upload(window).await? else {
         return Ok(());
     };
-    state
-        .party
-        .lock()
-        .await
-        .send_file(sid, cid, name, mime, data)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.send_file(sid, cid, name, mime, data)).await
 }
 
-/// Pick a file and send it as a direct message to another community member.
+/// Pick a file and send it as a DM; cancelling is a no-op.
 #[tauri::command]
 pub(crate) async fn party_send_file_dm<R: tauri::Runtime>(
     server: String,
@@ -890,12 +766,7 @@ pub(crate) async fn party_send_file_dm<R: tauri::Runtime>(
     let Some((name, mime, data)) = pick_upload(window).await? else {
         return Ok(());
     };
-    state
-        .party
-        .lock()
-        .await
-        .send_file_dm(sid, peer, name, mime, data)
-        .map_err(|e| e.to_string())
+    with_party(&state, |p| p.send_file_dm(sid, peer, name, mime, data)).await
 }
 
 /// Ask the server for a file and wait, bounded, for its bytes. Split from
@@ -929,15 +800,13 @@ pub(crate) async fn fetch_party_file(
     }
 }
 
-/// How long to wait for a community server to deliver a requested file before
-/// giving up. Generous enough for a large blob on a slow link, short enough that
-/// a server which simply never answers produces an error instead of a click that
-/// does nothing forever.
+/// How long to wait for a requested file, so a server that never answers gives
+/// an error rather than a click that does nothing forever.
 const PARTY_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Download a community file by content hash and save it via the native dialog.
-/// `name` seeds the save dialog. The server only returns bytes the caller is
-/// allowed to see (access-checked there). A cancelled save dialog is a no-op.
+/// Download a community file by content hash and save it via the native
+/// dialog, which `name` seeds. The server access-checks the read. A cancelled
+/// dialog is a no-op.
 #[tauri::command]
 pub(crate) async fn party_download_file<R: tauri::Runtime>(
     server: String,
@@ -964,10 +833,8 @@ pub(crate) async fn party_download_file<R: tauri::Runtime>(
     )
     .await?;
     let Some(path) = picked else {
-        return Ok(()); // user cancelled the save dialog
+        return Ok(());
     };
-    // Async: this runs on the shared runtime, and a blocking write of a
-    // multi-megabyte blob stalls every other task on that worker.
     tokio::fs::write(&path, &data)
         .await
         .map_err(|e| e.to_string())

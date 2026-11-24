@@ -1,7 +1,5 @@
-//! Connection commands: hosting, connecting (direct and relayed), the connection password and the hosting lock.
-//!
-//! Bodies of `TuiApp::execute_command`, one method per command, so the
-//! dispatcher reads as a table.
+//! Connection commands (hosting, direct and relayed connects, connection
+//! password, hosting lock): bodies of `TuiApp::execute_command`.
 
 use super::*;
 
@@ -88,15 +86,15 @@ impl TuiApp {
     }
 
     pub(super) fn cmd_connection_password(&mut self, pw: Option<String>) {
-        let set = pw.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+        let set = pw.as_ref().is_some_and(|p| !p.is_empty());
         self.chat_manager.set_connection_password(pw);
         if set {
             self.toast(
                 ToastLevel::Success,
-                "Connection password set (applies to next host/connect)".to_string(),
+                "Connection password set (applies to next host/connect)",
             );
         } else {
-            self.toast(ToastLevel::Info, "Connection password cleared".to_string());
+            self.toast(ToastLevel::Info, "Connection password cleared");
         }
     }
 
@@ -106,10 +104,10 @@ impl TuiApp {
             self.chat_manager.stop_hosting();
             self.toast(
                 ToastLevel::Warning,
-                "Conversation locked — no new connections accepted".to_string(),
+                "Conversation locked — no new connections accepted",
             );
         } else {
-            self.toast(ToastLevel::Info, "Conversation unlocked".to_string());
+            self.toast(ToastLevel::Info, "Conversation unlocked");
         }
     }
 }

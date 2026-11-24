@@ -78,7 +78,7 @@ describe("ConfirmDelete", () => {
 describe("InfoDialog", () => {
   it("shows the grouped fingerprint and the transport in words", () => {
     render(<InfoDialog target={chat} onClose={() => {}} />);
-    expect(screen.getByText(/direct \(peer-to-peer\)/)).toBeTruthy();
+    expect(screen.getByText(/Direct \(peer-to-peer\)/)).toBeTruthy();
     // Grouped in fours so it can be read aloud without losing your place.
     expect(screen.getByText(/^abab abab/)).toBeTruthy();
   });
@@ -88,8 +88,17 @@ describe("InfoDialog", () => {
     expect(screen.getByText("No fingerprint yet.")).toBeTruthy();
   });
 
-  it("describes a relayed conversation as still end-to-end encrypted", () => {
+  it("says what a relay can and cannot see", () => {
     render(<InfoDialog target={{ ...chat, transport: "relay" }} onClose={() => {}} />);
-    expect(screen.getByText(/blind broker, still end-to-end encrypted/)).toBeTruthy();
+    // Honest about content *and* metadata: it can't read messages, but it does
+    // see both addresses and when the two of you talk.
+    expect(screen.getByText(/can't read your messages, but it sees both IP addresses/)).toBeTruthy();
+  });
+
+  it("puts your fingerprint beside theirs so a later check is a comparison", () => {
+    render(<InfoDialog target={chat} myFingerprint={"cd".repeat(32)} onClose={() => {}} />);
+    expect(screen.getByText("Compare fingerprints")).toBeTruthy();
+    expect(screen.getByText(/^abab abab/)).toBeTruthy();
+    expect(screen.getByText(/^cdcd cdcd/)).toBeTruthy();
   });
 });

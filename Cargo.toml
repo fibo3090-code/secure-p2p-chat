@@ -8,7 +8,7 @@ default-members = ["client"]
 [workspace.package]
 version = "1.17.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.92"
 authors = ["fibo3090 <fibo3090@example.com>"]
 license = "MIT"
 
@@ -31,7 +31,7 @@ serde_json = "1"
 bincode = "1"
 
 # Cryptography (RustCrypto)
-rsa = "0.9.10"
+rsa = "0.10.0"
 sha2 = "0.10"
 # Constant-time primitives (used for secret comparisons that must not leak
 # their match length through timing).
@@ -96,7 +96,7 @@ argon2 = { version = "0.6", features = ["parallel"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # File dialogs
-rfd = "0.17.2"
+rfd = "0.18.0"
 
 # Open files
 open = "5"
@@ -126,7 +126,11 @@ proptest = "1"
 # generation and Argon2 were ~95% of all test time unoptimised; at opt-level 3
 # the core unit tests went from 133 s to 8 s (audit DX-01). The workspace's own
 # crates keep debug assertions and fast incremental builds.
-[profile.dev.package.num-bigint-dig]
+# rsa 0.10 does its arithmetic in crypto-bigint (and its key generation in
+# crypto-primes) rather than num-bigint-dig, so those are what need it now.
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.crypto-primes]
 opt-level = 3
 [profile.dev.package.rsa]
 opt-level = 3
@@ -135,10 +139,6 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 [profile.dev.package.sha2]
-opt-level = 3
-[profile.dev.package.num-integer]
-opt-level = 3
-[profile.dev.package.num-traits]
 opt-level = 3
 
 # Line tables are enough for test-failure backtraces; full debuginfo made each

@@ -3,9 +3,10 @@
 // (party_* commands) and refreshed on the `party-updated` event.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
-import { cx, Avatar, Button, Input, PasswordInput } from "./ui.jsx";
+import { cx, Avatar, Button, Input, PasswordInput, Page } from "./ui.jsx";
 import { api, onBridge, fmtTime, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
+import { SafetyGrid } from "./SafetyGrid.jsx";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
 import {
   DrivePanel, AuditPanel, ChannelAccessDialog, FilePermissionsDialog, ShareFileDialog,
@@ -85,90 +86,157 @@ function JoinForm({ onJoined, onCancel, initial }) {
   }
 
   const join = () => joinWith(address, username, password);
+  const pickedSaved = saved.find((p) => p.address === address.trim() && p.username === username.trim());
+  // With saved communities, the blank form waits behind "Join another
+  // community" — picking one of yours is the common path.
+  const [another, setAnother] = useState(false);
+  // A known community only needs its password; the address and username are
+  // already right, so they stay folded unless the user asks to edit them.
+  const [editDetails, setEditDetails] = useState(false);
+  const showForm = saved.length === 0 || !!pickedSaved || another;
+  const passRef = useRef(null);
+  // Field-level errors sit on the field they are about, not at the bottom of
+  // the form under the password box.
+  const errField = err === "Enter the server address." ? "addr"
+    : /^(Choose a username|Username must)/.test(err) ? "user" : null;
+  const fieldErr = (id) => errField === id && (
+    <div className="onb-err" id={`party-${id}-err`}><Icon name="alert" size={13} /> {err}</div>
+  );
+
+  // Said once, as a calm callout rather than a bold clause buried in the middle
+  // of a paragraph: what a community is, and the one thing it is not.
+  const notE2E = (
+    <div className="callout is-warn">
+      <Icon name="shieldAlert" size={16} />
+      <p>
+        <strong>Communities are not end-to-end encrypted.</strong> Messages, DMs and
+        files are stored on the server, readable by whoever runs it. For private
+        conversations, use a direct chat.
+      </p>
+    </div>
+  );
 
   if (verify) {
     return (
-      <div className="chat-pane chat-empty">
-        <div className="chat-empty-inner" style={{ maxWidth: 460 }}>
-          <span className="chat-empty-ic"><Icon name="lock" size={28} /></span>
-          <div className="chat-empty-h">Verify this community server</div>
-          <div className="chat-empty-p">
+      <Page title="Communities" sub="Check the server before anything is sent to it.">
+        <section className="card is-focus">
+          <div className="card-ic"><Icon name="fingerprint" size={22} /></div>
+          <h2 className="card-title">Verify this community server</h2>
+          <p className="card-lead">
             You have never joined <code>{verify.address}</code> before. Your username and
             password have <strong>not</strong> been sent yet. Check that this fingerprint
             matches the one the operator gave you — their server prints it every time it
             starts:
+          </p>
+          <div className="party-verify-fp-row">
+            <SafetyGrid fingerprint={verify.fingerprint} n={8} cell={18} />
+            <div className="party-verify-fp-side">
+              <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
+              <Button size="sm" variant="ghost" icon="copy" onClick={() => navigator.clipboard?.writeText(verify.fingerprint)
+                .then(() => toast("Fingerprint copied", "success"))
+                .catch(() => toast("Could not copy", "error"))}>Copy</Button>
+            </div>
           </div>
-          <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
-          <div className="chat-empty-p">
-            Messages, DMs and files you post in a community are <strong>not end-to-end
-            encrypted</strong>: they are stored on the server readable by its operator.
-          </div>
-          <div className="party-join">
-            <Button icon="check" disabled={busy} full
-              onClick={() => joinWith(verify.address, verify.username, verify.password, verify.fingerprint)}>
-              The fingerprint matches — join
-            </Button>
-            <Button variant="ghost" full disabled={busy}
+          {notE2E}
+          <div className="card-actions">
+            <Button variant="ghost" disabled={busy}
               onClick={() => { setVerify(null); setBusy(false); }}>
               Cancel
             </Button>
+            <Button icon="check" disabled={busy}
+              onClick={() => joinWith(verify.address, verify.username, verify.password, verify.fingerprint)}>
+              The fingerprint matches — join
+            </Button>
           </div>
-        </div>
-      </div>
+        </section>
+      </Page>
     );
   }
 
   return (
-    <div className="chat-pane chat-empty">
-      <div className="chat-empty-inner" style={{ maxWidth: 440 }}>
-        <span className="chat-empty-ic"><Icon name="users" size={28} /></span>
-        <div className="chat-empty-h">Join a community</div>
-        <div className="chat-empty-p">
-          Communities are administered, multi-channel rooms that keep history on a
-          server someone runs. <strong>They are not end-to-end encrypted:</strong> the
-          operator can read every message, DM and file posted there. The first time you
-          join one you will be asked to check its fingerprint with the operator before
-          anything is sent.
-        </div>
-        {saved.length > 0 && (
-          <div className="party-saved">
-            <div className="party-saved-h">Your communities</div>
-            {saved.map((p) => (
-              // Selecting a saved community fills the form; it does not join.
-              // Joining straight from the card sent whatever happened to be in
-              // the shared password box — so a password typed for one
-              // community went to whichever card was clicked next.
-              <button key={p.address} className="party-saved-card" disabled={busy}
-                title={`Fill in ${p.username}@${p.address}`}
-                onClick={() => { setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); }}>
-                <Avatar name={p.name || p.address} size={28} party />
-                <span className="party-saved-txt">
-                  <span className="party-saved-name">{p.name || p.address}</span>
-                  <span className="party-saved-sub mono">{p.username} · {p.address}</span>
-                </span>
-                <Icon name="chevronRight" size={14} />
-              </button>
-            ))}
-            <div className="party-saved-hint">
-              Pick one to fill the form below, then add its password if it has one and press
-              Connect &amp; join.
-            </div>
+    <Page title="Communities"
+      sub="Shared, multi-channel rooms hosted on a server someone runs."
+      actions={onCancel && <Button variant="ghost" icon="arrowLeft" onClick={onCancel}>Back</Button>}>
+      {notE2E}
+      {saved.length > 0 && (
+        <section>
+          <h2 className="section-h">Your communities</h2>
+          <div className="list-card">
+            {saved.map((p) => {
+              const picked = p.address === address.trim() && p.username === username.trim();
+              return (
+                // Selecting a saved community fills the form; it does not join.
+                // Joining straight from the card sent whatever happened to be in
+                // the shared password box — so a password typed for one
+                // community went to whichever card was clicked next.
+                <button key={p.address} className={cx("list-row", picked && "is-picked")} disabled={busy}
+                  title={`Fill in ${p.username}@${p.address}`} aria-pressed={picked}
+                  onClick={() => {
+                    setAddress(p.address); setUsername(p.username); setPassword(""); setErr(""); setEditDetails(false);
+                    // Next step is the password (if it has one), then Join.
+                    setTimeout(() => passRef.current?.focus(), 0);
+                  }}>
+                  <Avatar name={p.name || p.address} size={36} party />
+                  <span className="list-row-main">
+                    <span className="list-row-name">{p.name || p.address}</span>
+                    <span className="list-row-sub">Username: {p.username} · {p.address} · <Icon name="lock" size={11} /> Server key pinned</span>
+                  </span>
+                  <span className={cx("list-row-use", picked && "is-on")}>{picked ? <><Icon name="check" size={14} /> Selected</> : "Rejoin"}</span>
+                </button>
+              );
+            })}
           </div>
-        )}
-        <div className="party-join">
-          <Input value={address} autoFocus placeholder="server address · 192.168.1.20:12345"
-            onChange={(e) => setAddress(e.target.value)} />
-          <Input value={username} placeholder="username" maxLength={MAX_USERNAME_CHARS}
-            onChange={(e) => setUsername(e.target.value)} />
-          <PasswordInput value={password} placeholder="server password (optional)"
-            onChange={(e) => setPassword(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && join()} />
-          <Button icon="users" onClick={join} disabled={busy} full>Connect &amp; join</Button>
-          {onCancel && <Button variant="ghost" onClick={onCancel} full>Cancel</Button>}
-          {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+        </section>
+      )}
+      {!showForm && (
+        <div>
+          <Button variant="ghost" icon="plus" onClick={() => setAnother(true)}>Join another community</Button>
         </div>
-      </div>
-    </div>
+      )}
+      {showForm && <form className="card" onSubmit={(e) => { e.preventDefault(); void join(); }}>
+        <h2 className="card-title">{pickedSaved ? `Rejoin ${pickedSaved.name || pickedSaved.address}` : "Join a community"}</h2>
+        <p className="card-lead">
+          {pickedSaved
+            ? "Add its password if it has one, then join."
+            : "Ask the operator for the server address and, if it has one, its password. The first time, you'll check its fingerprint before anything is sent."}
+        </p>
+        {pickedSaved && !editDetails ? (
+          <p className="field-hint">
+            As <strong>{pickedSaved.username}</strong> on {pickedSaved.address}
+            {" · "}<button type="button" className="chat-empty-link" onClick={() => setEditDetails(true)}>Edit details</button>
+          </p>
+        ) : (
+                <div className="field-grid">
+          <div className="field">
+            <label className="field-label" htmlFor="party-addr">Server address</label>
+            <Input id="party-addr" value={address} autoFocus placeholder="192.168.1.20:12345"
+              aria-invalid={errField === "addr" || undefined}
+              aria-describedby={errField === "addr" ? "party-addr-err" : undefined}
+              onChange={(e) => setAddress(e.target.value)} />
+            {fieldErr("addr")}
+          </div>
+          <div className="field">
+            <label className="field-label" htmlFor="party-user">Username</label>
+            <Input id="party-user" value={username} placeholder="How others will see you" maxLength={MAX_USERNAME_CHARS}
+              aria-invalid={errField === "user" || undefined}
+              aria-describedby={errField === "user" ? "party-user-err" : undefined}
+              onChange={(e) => setUsername(e.target.value)} />
+            {fieldErr("user")}
+          </div>
+        </div>
+        )}
+        <div className="field">
+          <label className="field-label" htmlFor="party-pass">Server password <span className="field-opt">optional</span></label>
+          <PasswordInput id="party-pass" ref={passRef} value={password} placeholder="Leave empty if the server has none"
+            autoComplete="off"
+            onChange={(e) => setPassword(e.target.value)} />
+        </div>
+        {err && !errField && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
+        <div className="card-actions">
+          <Button icon="users" type="submit" disabled={busy}>Connect &amp; join</Button>
+        </div>
+      </form>}
+    </Page>
   );
 }
 
@@ -638,29 +706,36 @@ export function Parties() {
             </div>
           </div>
           <div className="party-head-r">
-            <div className="party-views" role="tablist" aria-label="Community view">
-              <button role="tab" aria-selected={view === "chat"}
+            <div className="party-views" role="group" aria-label="Community view">
+              <button aria-pressed={view === "chat"}
                 className={cx("party-view", view === "chat" && "is-active")}
                 onClick={() => setView("chat")} title="Conversation">
                 <Icon name="message" size={14} />
               </button>
-              <button role="tab" aria-selected={view === "drive"}
+              <button aria-pressed={view === "drive"}
                 className={cx("party-view", view === "drive" && "is-active")}
                 onClick={() => setView("drive")} title="Shared files">
                 <Icon name="folder" size={14} />
               </button>
               {isAdmin && (
-                <button role="tab" aria-selected={view === "audit"}
+                <button aria-pressed={view === "audit"}
                   className={cx("party-view", view === "audit" && "is-active")}
                   onClick={() => setView("audit")} title="Activity log">
                   <Icon name="clock" size={14} />
                 </button>
               )}
             </div>
-            <div className="party-fp" title="Verify this out of band">
-              <Icon name="fingerprint" size={13} />
-              <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
-            </div>
+            {/* A truncated fingerprint can't be checked; the button reveals and
+                copies the whole pinned key. */}
+            <button className="party-fp" title={`Server key pinned. Full fingerprint: ${server?.fingerprint || ""}`}
+              aria-label="Copy the server's pinned fingerprint"
+              onClick={() => navigator.clipboard?.writeText(server?.fingerprint || "")
+                .then(() => toast("Server fingerprint copied", "success"))
+                .catch(() => toast("Could not copy", "error"))}>
+              <Icon name="lock" size={13} />
+              <span>Key pinned</span>
+              <Icon name="copy" size={12} />
+            </button>
             <button className={cx("party-leave", confirmLeave && "is-confirm")}
               title={confirmLeave
                 ? "Click again to leave. This also forgets the server's verified fingerprint, so rejoining means checking its code again."

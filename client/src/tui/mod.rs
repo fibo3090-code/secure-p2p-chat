@@ -29,10 +29,8 @@ pub struct TuiLaunchConfig {
     pub port: u16,
 }
 
-/// Put the terminal back the way the shell expects it: cooked mode, main
-/// screen, bracketed paste off, cursor visible. Best effort — every step runs
-/// even if an earlier one fails, because a half-restored terminal is the
-/// failure being prevented.
+/// Put the terminal back the way the shell expects it. Best effort: every step
+/// runs even if an earlier one fails.
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -43,24 +41,18 @@ fn restore_terminal() {
     );
 }
 
-/// Owns the terminal's raw/alternate-screen state for the life of the TUI and
-/// restores it on drop — including the early returns. `TuiApp::new(logs)?` used
-/// to return *after* raw mode and the alternate screen were entered, so a
-/// startup error (an unreadable identity file is the realistic one) left the
-/// shell in raw mode on a blank screen with the error invisible (audit TUI-06).
+/// Owns the raw/alternate-screen state and restores it on drop, including on
+/// early returns: a startup error must not leave the shell in raw mode on a
+/// blank screen (audit TUI-06).
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let guard = TerminalGuard;
-        // Bracketed paste makes a paste arrive as one `Event::Paste` instead of
-        // keystrokes. Without it every pasted newline was an Enter: each line
-        // was sent as a message, and a line starting with `:` ran as a command
-        // (`:send ~/.ssh/id_rsa`) — audit TUI-05.
-        //
-        // Mouse capture is intentionally NOT enabled — we handle no mouse
-        // events and capturing would block the terminal's native selection.
+        // Bracketed paste delivers a paste as one `Event::Paste`, so a pasted
+        // newline is not Enter and a pasted `:` line is not a command (audit
+        // TUI-05). No mouse capture: it would block native text selection.
         execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         Ok(guard)
     }
@@ -82,7 +74,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Main entry point for the TUI.
 pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
     install_panic_hook();
     let guard = TerminalGuard::enter()?;
@@ -98,9 +89,8 @@ pub async fn run(logs: LogBuffer, launch: TuiLaunchConfig) -> Result<()> {
     drop(guard);
 
     if let Err(err) = res {
-        // The alternate screen is already torn down here, so stderr is the only
-        // channel the user still sees; the tracing call keeps the structured
-        // record for diagnostics exports.
+        // The screen is restored, so stderr reaches the user; tracing keeps
+        // the record for diagnostics exports.
         tracing::error!(error = ?err, "TUI exited with an error");
         eprintln!("The TUI exited with an error: {err:?}");
     }
@@ -142,7 +132,6 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
         app.execute_command(TuiCommand::Host(Some(launch.port)))
             .await;
     }
-
     if let Some(target) = launch.connect.as_deref() {
         // `--port` is the default for a target that names none: `--connect
         // 1.2.3.4 --port 9000` dialled 12345 (TUI-10).
@@ -161,40 +150,36 @@ async fn apply_launch_config(app: &mut TuiApp, launch: &TuiLaunchConfig) {
             ),
         }
     }
-
     if let Some(relay) = launch.host_relay.as_deref() {
         let cmd = match launch.relay_token.as_deref() {
             Some(token) => format!(":host-relay {} {}", relay, token),
             None => format!(":host-relay {}", relay),
         };
-        match TuiApp::parse_command(&cmd) {
-            Ok(cmd @ TuiCommand::HostRelay { .. }) => app.execute_command(cmd).await,
-            Ok(_) => {}
-            Err(e) => app.chat_manager.add_toast(
-                crate::types::ToastLevel::Error,
-                format!("Invalid relay host launch: {}", e),
-            ),
-        }
+        launch_command(app, cmd, "relay host launch").await;
     }
-
     if let Some(relay) = launch.relay_connect.as_deref() {
         match launch.relay_token.as_deref() {
             Some(token) => {
-                match TuiApp::parse_command(&format!(":connect-relay {} {}", relay, token)) {
-                    Ok(cmd @ TuiCommand::ConnectRelay { .. }) => app.execute_command(cmd).await,
-                    Ok(_) => {}
-                    Err(e) => app.chat_manager.add_toast(
-                        crate::types::ToastLevel::Error,
-                        format!("Invalid relay connect launch: {}", e),
-                    ),
-                }
+                let cmd = format!(":connect-relay {} {}", relay, token);
+                launch_command(app, cmd, "relay connect launch").await;
             }
-            None => app.chat_manager.add_toast(
-                crate::types::ToastLevel::Error,
-                "--connect-relay requires --relay-token <token>".to_string(),
-            ),
+            None => launch_error(app, "--connect-relay requires --relay-token <token>".into()),
         }
     }
+}
+
+/// Run a command built from launch flags (its command word is fixed, so it
+/// parses to that command or to an error).
+async fn launch_command(app: &mut TuiApp, raw: String, what: &str) {
+    match TuiApp::parse_command(&raw) {
+        Ok(cmd) => app.execute_command(cmd).await,
+        Err(e) => launch_error(app, format!("Invalid {}: {}", what, e)),
+    }
+}
+
+fn launch_error(app: &mut TuiApp, msg: String) {
+    app.chat_manager
+        .add_toast(crate::types::ToastLevel::Error, msg);
 }
 
 /// Place the hardware cursor in the input/command box using the editable field's

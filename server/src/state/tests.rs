@@ -13,6 +13,141 @@ fn join_owner(state: &mut PartyState, name: &str) -> Uuid {
     assert_eq!(state.role_of(id), Role::Owner);
     id
 }
+fn octet() -> String {
+    "application/octet-stream".to_string()
+}
+
+/// Post `data` as a file with a generic MIME type.
+fn put_file(
+    state: &mut PartyState,
+    who: Uuid,
+    channel: Uuid,
+    name: impl Into<String>,
+    data: impl Into<Vec<u8>>,
+) -> Result<Envelope, String> {
+    state.post_file(who, channel, name.into(), octet(), data.into())
+}
+
+fn put_file_dm(
+    state: &mut PartyState,
+    from: Uuid,
+    to: Uuid,
+    name: impl Into<String>,
+    data: impl Into<Vec<u8>>,
+) -> Result<Envelope, String> {
+    state.post_file_dm(from, to, name.into(), octet(), data.into())
+}
+
+/// A disk-backed state in a fresh directory (keep the directory alive: the
+/// state's files live in it).
+fn disk_state() -> (tempfile::TempDir, PartyState) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = PartyState::load("Srv", None, dir.path()).unwrap();
+    (dir, state)
+}
+
+/// Start a chunked upload with a generic MIME type.
+fn start(
+    state: &mut PartyState,
+    who: Uuid,
+    name: impl Into<String>,
+    size: u64,
+    target: UploadTarget,
+) -> Result<Uuid, String> {
+    state.start_upload(who, name.into(), octet(), size, target)
+}
+
+/// Start a chunked upload of `data` and send it as one chunk, ready to finish.
+fn spool(
+    state: &mut PartyState,
+    who: Uuid,
+    name: impl Into<String>,
+    data: &[u8],
+    target: UploadTarget,
+) -> Uuid {
+    let upload = start(state, who, name, data.len() as u64, target).unwrap();
+    state.upload_chunk(who, upload, data).unwrap();
+    upload
+}
+
+/// [`spool`], then phase 1 and the (unlocked) staging write.
+fn staged(
+    state: &mut PartyState,
+    who: Uuid,
+    name: &str,
+    data: &[u8],
+    target: UploadTarget,
+) -> StagedUpload {
+    let upload = spool(state, who, name, data, target);
+    let mut staged = state.begin_upload(who, upload).unwrap();
+    staged.write_staging().unwrap();
+    staged
+}
+
+/// Post `data` as a file and return its content hash.
+fn put_file_hash(
+    state: &mut PartyState,
+    who: Uuid,
+    channel: Uuid,
+    name: &str,
+    data: impl Into<Vec<u8>>,
+) -> String {
+    let env = put_file(state, who, channel, name, data).unwrap();
+    file_payload(&env).hash.clone()
+}
+
+/// A new channel's id (no explicit members).
+fn new_channel(state: &mut PartyState, who: Uuid, name: &str, kind: ChannelKind) -> Uuid {
+    state
+        .create_channel_of_kind(who, name, kind, vec![])
+        .unwrap()
+        .id
+}
+
+/// Create a public channel against `who`'s allowance, at `now`.
+fn create_public_at(
+    state: &mut PartyState,
+    who: Uuid,
+    name: &str,
+    now: Instant,
+) -> Result<ChannelInfo, String> {
+    state.create_channel_of_kind_at(who, name, ChannelKind::Public, vec![], now)
+}
+
+/// The sequence numbers of a history page.
+fn seqs(page: Vec<Envelope>) -> Vec<u64> {
+    page.iter().map(|e| e.seq).collect()
+}
+
+/// Staging files left in a blob directory.
+fn staging_leftovers(blobs: &Path) -> Vec<String> {
+    std::fs::read_dir(blobs)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("staging_"))
+        .collect()
+}
+
+/// Download `hash` chunk by chunk as `who`, as a client does, checking the
+/// reported total and the chunk size on every chunk.
+fn download_chunked(state: &PartyState, who: Uuid, hash: &str, total: usize) -> Vec<u8> {
+    let mut got = Vec::new();
+    loop {
+        let (chunk, reported) = state
+            .blob_chunk_for(who, hash, got.len() as u64)
+            .expect("the member may read this file");
+        assert_eq!(reported, total as u64, "reported size drifted");
+        if chunk.is_empty() {
+            return got;
+        }
+        assert!(
+            chunk.len() <= PARTY_CHUNK_BYTES,
+            "a chunk must not exceed the chunk size"
+        );
+        got.extend_from_slice(&chunk);
+    }
+}
 
 #[test]
 fn open_server_join_succeeds_and_lists_member() {
@@ -57,7 +192,7 @@ fn password_matches_covers_every_combination() {
 
 #[test]
 fn password_protected_join_enforced() {
-    let mut state = PartyState::new("Locked", Some("s3cret".to_string()));
+    let mut state = PartyState::new("Locked", Some("s3cret".into()));
     assert_eq!(
         state.join("alice", None, None),
         Err(JoinError::WrongPassword)
@@ -124,25 +259,20 @@ fn uploaded_file_names_are_sanitized_against_path_traversal() {
 
     // A member-chosen name must never be able to escape a client's download
     // directory when later joined onto it.
-    let env = state
-        .post_file(
-            alice,
-            chan,
-            "..\\..\\Startup\\evil.exe".to_string(),
-            "application/octet-stream".to_string(),
-            b"payload".to_vec(),
-        )
-        .unwrap();
-    match &env.payload {
-        MessagePayload::File(f) => {
-            assert!(
-                !f.name.contains("..") && !f.name.contains('\\') && !f.name.contains('/'),
-                "stored name must be traversal-safe, got {:?}",
-                f.name
-            );
-        }
-        other => panic!("expected a File payload, got {other:?}"),
-    }
+    let env = put_file(
+        &mut state,
+        alice,
+        chan,
+        "..\\..\\Startup\\evil.exe",
+        b"payload",
+    )
+    .unwrap();
+    let f = file_payload(&env);
+    assert!(
+        !f.name.contains("..") && !f.name.contains('\\') && !f.name.contains('/'),
+        "stored name must be traversal-safe, got {:?}",
+        f.name
+    );
 }
 
 #[test]
@@ -172,9 +302,7 @@ fn oversized_message_text_rejected_in_channels_and_dms() {
 #[test]
 fn reconnecting_with_same_fingerprint_reuses_the_member() {
     let mut state = PartyState::new("Open", None);
-    let id1 = state
-        .join("alice", None, Some("FP-alice".to_string()))
-        .unwrap();
+    let id1 = state.join("alice", None, Some("FP-alice".into())).unwrap();
 
     // Simulate a dropped connection.
     state.set_online(id1, false);
@@ -183,7 +311,7 @@ fn reconnecting_with_same_fingerprint_reuses_the_member() {
     // existing membership (same id, back online), not be locked out by its own
     // offline ghost entry as "username taken".
     let id2 = state
-        .join("alice", None, Some("FP-alice".to_string()))
+        .join("alice", None, Some("FP-alice".into()))
         .expect("returning member must be allowed to rejoin");
     assert_eq!(id1, id2, "a returning identity keeps its member id");
     assert_eq!(state.members().len(), 1, "no duplicate member is created");
@@ -196,13 +324,11 @@ fn reconnecting_with_same_fingerprint_reuses_the_member() {
 #[test]
 fn a_different_identity_cannot_take_an_existing_username() {
     let mut state = PartyState::new("Open", None);
-    state
-        .join("alice", None, Some("FP-alice".to_string()))
-        .unwrap();
+    state.join("alice", None, Some("FP-alice".into())).unwrap();
     // A different fingerprint claiming the same username is still rejected
     // (prevents impersonation of an established member).
     assert_eq!(
-        state.join("alice", None, Some("FP-mallory".to_string())),
+        state.join("alice", None, Some("FP-mallory".into())),
         Err(JoinError::UsernameTaken)
     );
 }
@@ -213,29 +339,12 @@ fn posting_assigns_monotonic_per_channel_seq() {
     let alice = state.join("alice", None, None).unwrap();
     let chan = state.default_channel();
 
-    let m1 = state
-        .post_message(alice, chan, "first".to_string())
-        .unwrap();
-    let m2 = state
-        .post_message(alice, chan, "second".to_string())
-        .unwrap();
+    let m1 = state.post_message(alice, chan, "first".into()).unwrap();
+    let m2 = state.post_message(alice, chan, "second".into()).unwrap();
     assert_eq!(m1.seq, 1);
     assert_eq!(m2.seq, 2);
     assert_eq!(m2.sender, alice);
-    assert_eq!(m2.payload, MessagePayload::Text("second".to_string()));
-}
-
-#[test]
-fn posting_rejects_non_members_and_unknown_channels() {
-    let mut state = PartyState::new("Open", None);
-    let stranger = Uuid::new_v4();
-    let chan = state.default_channel();
-    assert!(state.post_message(stranger, chan, "x".to_string()).is_err());
-
-    let alice = state.join("alice", None, None).unwrap();
-    assert!(state
-        .post_message(alice, Uuid::new_v4(), "x".to_string())
-        .is_err());
+    assert_eq!(m2.payload, MessagePayload::Text("second".into()));
 }
 
 #[test]
@@ -331,10 +440,10 @@ fn durable_state_persists_and_reloads() {
         let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
         channel = state.default_channel();
         let alice = state
-            .join("alice", None, Some("FINGERPRINT".to_string()))
+            .join("alice", None, Some("FINGERPRINT".into()))
             .unwrap();
         state
-            .post_message(alice, channel, "persisted msg".to_string())
+            .post_message(alice, channel, "persisted msg".into())
             .unwrap();
     } // dropped; everything was written through to the database on each mutation
 
@@ -351,14 +460,13 @@ fn durable_state_persists_and_reloads() {
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].payload,
-        MessagePayload::Text("persisted msg".to_string())
+        MessagePayload::Text("persisted msg".into())
     );
 }
 
 #[test]
 fn load_without_existing_snapshot_starts_fresh() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, state) = disk_state();
     assert!(state.members().is_empty());
     assert_eq!(state.channels().len(), 1); // default `general`
 }
@@ -370,11 +478,11 @@ fn direct_messages_share_one_order_independent_thread() {
     let bob = state.join("bob", None, None).unwrap();
     let thread = messenger_core::party::dm_thread_id(alice, bob);
 
-    let m1 = state.post_dm(alice, bob, "hi bob".to_string()).unwrap();
+    let m1 = state.post_dm(alice, bob, "hi bob".into()).unwrap();
     assert_eq!(m1.channel, thread);
     assert_eq!(m1.sender, alice);
     assert_eq!(m1.seq, 1);
-    let m2 = state.post_dm(bob, alice, "hey alice".to_string()).unwrap();
+    let m2 = state.post_dm(bob, alice, "hey alice".into()).unwrap();
     assert_eq!(m2.channel, thread);
     assert_eq!(m2.seq, 2);
 
@@ -397,15 +505,6 @@ fn create_channel_adds_unique_named_channels() {
 }
 
 #[test]
-fn dm_rejects_non_members() {
-    let mut state = PartyState::new("Open", None);
-    let alice = state.join("alice", None, None).unwrap();
-    let stranger = Uuid::new_v4();
-    assert!(state.post_dm(alice, stranger, "x".to_string()).is_err());
-    assert!(state.post_dm(stranger, alice, "x".to_string()).is_err());
-}
-
-#[test]
 fn dm_history_persists_across_reload() {
     let dir = tempfile::tempdir().unwrap();
     let thread;
@@ -414,22 +513,17 @@ fn dm_history_persists_across_reload() {
         let alice = s.join("alice", None, None).unwrap();
         let bob = s.join("bob", None, None).unwrap();
         thread = messenger_core::party::dm_thread_id(alice, bob);
-        s.post_dm(alice, bob, "secret".to_string()).unwrap();
+        s.post_dm(alice, bob, "secret".into()).unwrap();
     }
     let s = PartyState::load("Srv", None, dir.path()).unwrap();
     assert_eq!(s.dm_history(thread, 0).len(), 1);
 }
 
-/// A blob whose bytes cannot be written must fail the upload outright.
-///
-/// The failure this guards is silent and permanent: the write error used to
-/// be logged and swallowed, so the blob was recorded, the file message was
-/// posted and broadcast to the whole channel, and every download of it
-/// answered "unknown file" from then on — with the sender told it worked.
+/// A blob whose bytes cannot be written must fail the upload outright, not be
+/// recorded and broadcast as a file every download then calls "unknown".
 #[test]
 fn an_unwritable_blob_store_refuses_the_upload_instead_of_posting_a_dead_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (dir, mut state) = disk_state();
     let alice = state.join("alice", None, None).unwrap();
     let channel = state.default_channel();
 
@@ -467,7 +561,7 @@ fn created_channels_and_their_order_persist_across_reload() {
         general = s.default_channel();
         let alice = s.join("alice", None, None).unwrap();
         random_id = s.create_channel("random").unwrap().id;
-        s.post_message(alice, random_id, "in random".to_string())
+        s.post_message(alice, random_id, "in random".into())
             .unwrap();
     }
     let s = PartyState::load("Srv", None, dir.path()).unwrap();
@@ -481,10 +575,7 @@ fn created_channels_and_their_order_persist_across_reload() {
     let member = s.members()[0].id;
     let history = s.history_since(member, random_id, 0);
     assert_eq!(history.len(), 1);
-    assert_eq!(
-        history[0].payload,
-        MessagePayload::Text("in random".to_string())
-    );
+    assert_eq!(history[0].payload, MessagePayload::Text("in random".into()));
 }
 
 #[test]
@@ -533,7 +624,7 @@ fn legacy_json_snapshot_is_imported_once() {
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].payload,
-        MessagePayload::Text("hello from the past".to_string())
+        MessagePayload::Text("hello from the past".into())
     );
     assert!(
         !dir.path().join("party_state.json").exists(),
@@ -562,15 +653,7 @@ fn post_file_stores_blob_and_posts_a_file_message() {
     let alice = state.join("alice", None, None).unwrap();
     let chan = state.default_channel();
 
-    let env = state
-        .post_file(
-            alice,
-            chan,
-            "hi.txt".into(),
-            "text/plain".into(),
-            b"hello".to_vec(),
-        )
-        .expect("post_file");
+    let env = put_file(&mut state, alice, chan, "hi.txt", b"hello").expect("post_file");
     assert_eq!(env.seq, 1);
     let meta = file_payload(&env);
     assert_eq!(meta.name, "hi.txt");
@@ -588,24 +671,8 @@ fn identical_uploads_are_deduplicated_by_content() {
     let alice = state.join("alice", None, None).unwrap();
     let chan = state.default_channel();
 
-    let a = state
-        .post_file(
-            alice,
-            chan,
-            "a.bin".into(),
-            "application/octet-stream".into(),
-            b"same".to_vec(),
-        )
-        .unwrap();
-    let b = state
-        .post_file(
-            alice,
-            chan,
-            "b.bin".into(),
-            "application/octet-stream".into(),
-            b"same".to_vec(),
-        )
-        .unwrap();
+    let a = put_file(&mut state, alice, chan, "a.bin", b"same").unwrap();
+    let b = put_file(&mut state, alice, chan, "b.bin", b"same").unwrap();
 
     // Two messages, two names, but one shared content-addressed blob.
     assert_eq!(file_payload(&a).hash, file_payload(&b).hash);
@@ -620,19 +687,9 @@ fn oversized_and_empty_uploads_are_rejected() {
     let alice = state.join("alice", None, None).unwrap();
     let chan = state.default_channel();
 
-    assert!(state
-        .post_file(alice, chan, "empty".into(), "text/plain".into(), Vec::new())
-        .is_err());
+    assert!(put_file(&mut state, alice, chan, "empty", Vec::new()).is_err());
     let too_big = vec![0u8; MAX_INLINE_FILE_BYTES + 1];
-    assert!(state
-        .post_file(
-            alice,
-            chan,
-            "big".into(),
-            "application/octet-stream".into(),
-            too_big
-        )
-        .is_err());
+    assert!(put_file(&mut state, alice, chan, "big", too_big).is_err());
     // Nothing was stored.
     assert!(state.blobs.is_empty());
     assert!(state.history_since(alice, chan, 0).is_empty());
@@ -643,26 +700,10 @@ fn post_file_rejects_non_members_and_unknown_channels() {
     let mut state = PartyState::new("Open", None);
     let stranger = Uuid::new_v4();
     let chan = state.default_channel();
-    assert!(state
-        .post_file(
-            stranger,
-            chan,
-            "x".into(),
-            "text/plain".into(),
-            b"x".to_vec()
-        )
-        .is_err());
+    assert!(put_file(&mut state, stranger, chan, "x", b"x").is_err());
 
     let alice = state.join("alice", None, None).unwrap();
-    assert!(state
-        .post_file(
-            alice,
-            Uuid::new_v4(),
-            "x".into(),
-            "text/plain".into(),
-            b"x".to_vec()
-        )
-        .is_err());
+    assert!(put_file(&mut state, alice, Uuid::new_v4(), "x", b"x").is_err());
 }
 
 #[test]
@@ -672,15 +713,7 @@ fn file_dm_is_stored_in_the_thread() {
     let bob = state.join("bob", None, None).unwrap();
     let thread = messenger_core::party::dm_thread_id(alice, bob);
 
-    let env = state
-        .post_file_dm(
-            alice,
-            bob,
-            "secret.txt".into(),
-            "text/plain".into(),
-            b"psst".to_vec(),
-        )
-        .expect("post_file_dm");
+    let env = put_file_dm(&mut state, alice, bob, "secret.txt", b"psst").expect("post_file_dm");
     assert_eq!(env.channel, thread);
     assert_eq!(file_payload(&env).name, "secret.txt");
     assert_eq!(state.dm_history(thread, 0).len(), 1);
@@ -698,26 +731,12 @@ fn a_new_blob_past_the_storage_ceiling_is_rejected() {
     state.set_max_blob_bytes(8);
 
     // First upload fits under the 8-byte ceiling.
-    state
-        .post_file(
-            alice,
-            chan,
-            "a.bin".into(),
-            "application/octet-stream".into(),
-            vec![1u8; 6],
-        )
+    put_file(&mut state, alice, chan, "a.bin", vec![1u8; 6])
         .expect("a blob under the ceiling is accepted");
 
     // A distinct second blob would push the total to 12 bytes: rejected,
     // stored nowhere, and no message is posted for it.
-    let err = state
-        .post_file(
-            alice,
-            chan,
-            "b.bin".into(),
-            "application/octet-stream".into(),
-            vec![2u8; 6],
-        )
+    let err = put_file(&mut state, alice, chan, "b.bin", vec![2u8; 6])
         .expect_err("a blob past the ceiling must be rejected");
     assert!(err.contains("storage"), "error should say why: {err}");
     assert_eq!(state.blobs.len(), 1, "the rejected blob must not be stored");
@@ -729,14 +748,7 @@ fn a_new_blob_past_the_storage_ceiling_is_rejected() {
 
     // Re-uploading already-stored content adds no bytes, so deduplicated
     // uploads still succeed at the ceiling.
-    state
-        .post_file(
-            alice,
-            chan,
-            "a-again.bin".into(),
-            "application/octet-stream".into(),
-            vec![1u8; 6],
-        )
+    put_file(&mut state, alice, chan, "a-again.bin", vec![1u8; 6])
         .expect("re-upload of stored content adds no bytes and stays allowed");
 }
 
@@ -808,16 +820,7 @@ fn blobs_and_file_messages_persist_across_reload() {
         let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
         chan = s.default_channel();
         let alice = s.join("alice", None, None).unwrap();
-        let env = s
-            .post_file(
-                alice,
-                chan,
-                "doc.txt".into(),
-                "text/plain".into(),
-                b"durable".to_vec(),
-            )
-            .unwrap();
-        hash = file_payload(&env).hash.clone();
+        hash = put_file_hash(&mut s, alice, chan, "doc.txt", b"durable");
     }
     let s = PartyState::load("Srv", None, dir.path()).unwrap();
     // The blob bytes and the file message both survived.
@@ -833,20 +836,10 @@ fn blobs_and_file_messages_persist_across_reload() {
 /// storage ceiling would double as a resident-memory ceiling.
 #[test]
 fn disk_backed_blobs_are_not_held_in_memory() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut s) = disk_state();
     let alice = s.join("alice", None, None).unwrap();
     let chan = s.default_channel();
-    let env = s
-        .post_file(
-            alice,
-            chan,
-            "doc.txt".into(),
-            "text/plain".into(),
-            b"durable".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut s, alice, chan, "doc.txt", b"durable");
 
     assert!(
         s.blobs[&hash].data.is_none(),
@@ -873,22 +866,15 @@ fn non_public_channels_are_enforced_rather_than_decorative() {
         (ChannelKind::Locked, "locked"),
         (ChannelKind::Announce, "announce"),
     ] {
-        let id = Uuid::new_v4();
-        state.channels.push(Channel {
-            id,
-            name: label.to_string(),
-            kind,
-            members: Vec::new(),
-            history: History::new(),
-        });
+        let channel = Channel::new(label, kind);
+        let id = channel.id;
+        state.channels.push(channel);
         assert!(
-            state.post_message(bob, id, "hi".to_string()).is_err(),
+            state.post_message(bob, id, "hi".into()).is_err(),
             "{label}: an ordinary member must not be able to post"
         );
         assert!(
-            state
-                .post_file(bob, id, "f".into(), "text/plain".into(), b"x".to_vec())
-                .is_err(),
+            put_file(&mut state, bob, id, "f", b"x").is_err(),
             "{label}: an ordinary member must not be able to upload"
         );
     }
@@ -907,7 +893,7 @@ fn non_public_channels_are_enforced_rather_than_decorative() {
         "a private channel must not even be listed to a non-member"
     );
     // The public channel is unaffected.
-    assert!(state.post_message(bob, public, "hi".to_string()).is_ok());
+    assert!(state.post_message(bob, public, "hi".into()).is_ok());
     assert_eq!(state.history_since(bob, public, 0).len(), 1);
 }
 
@@ -924,13 +910,13 @@ fn admins_can_post_where_ordinary_members_cannot() {
         .create_channel_of_kind(owner, "news", ChannelKind::Announce, vec![])
         .unwrap();
     assert!(state
-        .post_message(owner, announce.id, "release day".to_string())
+        .post_message(owner, announce.id, "release day".into())
         .is_ok());
 
     let bob = state.join("bob", None, None).unwrap();
     assert_eq!(state.role_of(bob), Role::Member);
     assert!(state
-        .post_message(bob, announce.id, "me too".to_string())
+        .post_message(bob, announce.id, "me too".into())
         .is_err());
     // But bob can still read it — that is the point of an announce channel.
     assert_eq!(state.history_since(bob, announce.id, 0).len(), 1);
@@ -952,13 +938,13 @@ fn private_channel_membership_grants_access() {
     assert!(private.members.contains(&bob));
 
     assert!(state
-        .post_message(bob, private.id, "in the club".to_string())
+        .post_message(bob, private.id, "in the club".into())
         .is_ok());
     assert_eq!(state.history_since(bob, private.id, 0).len(), 1);
 
     // Carol is not on the list: she cannot post, read, or even see it.
     assert!(state
-        .post_message(carol, private.id, "let me in".to_string())
+        .post_message(carol, private.id, "let me in".into())
         .is_err());
     assert!(state.history_since(carol, private.id, 0).is_empty());
     assert!(!state.channels_for(carol).iter().any(|c| c.id == private.id));
@@ -1000,16 +986,7 @@ fn blobs_in_unreadable_channels_are_not_downloadable() {
     let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let chan = state.default_channel();
-    let env = state
-        .post_file(
-            bob,
-            chan,
-            "secret.txt".into(),
-            "text/plain".into(),
-            b"classified".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, bob, chan, "secret.txt", b"classified");
     assert!(state.blob_bytes_for(bob, &hash).is_some());
 
     // Flip the channel to Private with bob off the list: he can no longer
@@ -1111,10 +1088,8 @@ fn a_guest_cannot_write_anywhere() {
     state.set_role(owner, bob, Role::Guest).unwrap();
     let chan = state.default_channel();
 
-    assert!(state.post_message(bob, chan, "hello".to_string()).is_err());
-    assert!(state
-        .post_file(bob, chan, "f".into(), "text/plain".into(), b"x".to_vec())
-        .is_err());
+    assert!(state.post_message(bob, chan, "hello".into()).is_err());
+    assert!(put_file(&mut state, bob, chan, "f", b"x").is_err());
     assert!(state
         .create_channel_of_kind(bob, "mine", ChannelKind::Public, vec![])
         .is_err());
@@ -1122,9 +1097,7 @@ fn a_guest_cannot_write_anywhere() {
     // who could still DM everyone was not stopped by it.
     assert!(state.post_dm(bob, owner, "hi".to_string()).is_err());
     // Reading is still allowed.
-    state
-        .post_message(owner, chan, "welcome".to_string())
-        .unwrap();
+    state.post_message(owner, chan, "welcome".into()).unwrap();
     assert_eq!(state.history_since(bob, chan, 0).len(), 1);
 }
 
@@ -1132,35 +1105,14 @@ fn a_guest_cannot_write_anywhere() {
 /// nothing decremented it, so deleting was impossible and storage only grew.
 #[test]
 fn deleting_the_last_reference_reclaims_the_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (dir, mut state) = disk_state();
     let owner = join_owner(&mut state, "owner");
     let a = state.default_channel();
-    let b = state
-        .create_channel_of_kind(owner, "second", ChannelKind::Public, vec![])
-        .unwrap()
-        .id;
+    let b = new_channel(&mut state, owner, "second", ChannelKind::Public);
 
     // The same content shared twice is one blob with two references.
-    let env = state
-        .post_file(
-            owner,
-            a,
-            "d.txt".into(),
-            "text/plain".into(),
-            b"same".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
-    state
-        .post_file(
-            owner,
-            b,
-            "d.txt".into(),
-            "text/plain".into(),
-            b"same".to_vec(),
-        )
-        .unwrap();
+    let hash = put_file_hash(&mut state, owner, a, "d.txt", b"same");
+    put_file(&mut state, owner, b, "d.txt", b"same").unwrap();
     assert_eq!(state.blobs[&hash].refcount, 2);
     assert_eq!(state.quota_for(owner).used, 4, "dedup: counted once");
 
@@ -1185,16 +1137,7 @@ fn only_the_uploader_or_an_admin_may_delete_a_file() {
     let carol = state.join("carol", None, None).unwrap();
     let chan = state.default_channel();
 
-    let env = state
-        .post_file(
-            bob,
-            chan,
-            "b.txt".into(),
-            "text/plain".into(),
-            b"bobs".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, bob, chan, "b.txt", b"bobs");
 
     assert!(
         state.delete_file(carol, &hash, chan).is_err(),
@@ -1203,16 +1146,7 @@ fn only_the_uploader_or_an_admin_may_delete_a_file() {
     assert!(state.delete_file(owner, &hash, chan).is_ok(), "an admin");
 
     // And the uploader can delete their own.
-    let env = state
-        .post_file(
-            bob,
-            chan,
-            "c.txt".into(),
-            "text/plain".into(),
-            b"more".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, bob, chan, "c.txt", b"more");
     assert!(state.delete_file(bob, &hash, chan).is_ok());
 }
 
@@ -1224,21 +1158,9 @@ fn deleting_a_file_revokes_access_but_keeps_history_intact() {
     let mut state = PartyState::new("Srv", None);
     let owner = join_owner(&mut state, "owner");
     let chan = state.default_channel();
-    state
-        .post_message(owner, chan, "before".to_string())
-        .unwrap();
-    let env = state
-        .post_file(
-            owner,
-            chan,
-            "x.txt".into(),
-            "text/plain".into(),
-            b"bytes".to_vec(),
-        )
-        .unwrap();
-    state
-        .post_message(owner, chan, "after".to_string())
-        .unwrap();
+    state.post_message(owner, chan, "before".into()).unwrap();
+    let env = put_file(&mut state, owner, chan, "x.txt", b"bytes").unwrap();
+    state.post_message(owner, chan, "after".into()).unwrap();
     let hash = file_payload(&env).hash.clone();
 
     state.delete_file(owner, &hash, chan).unwrap();
@@ -1246,11 +1168,7 @@ fn deleting_a_file_revokes_access_but_keeps_history_intact() {
 
     let history = state.history_since(owner, chan, 0);
     assert_eq!(history.len(), 3, "history keeps its shape");
-    assert_eq!(
-        history.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        vec![1, 2, 3],
-        "and its sequence numbers"
-    );
+    assert_eq!(seqs(history), vec![1, 2, 3], "and its sequence numbers");
 }
 
 /// The server-wide ceiling alone lets the first member to reach it deny the
@@ -1263,55 +1181,24 @@ fn a_member_cannot_exceed_their_own_storage_allowance() {
     state.set_max_member_blob_bytes(10);
     let chan = state.default_channel();
 
-    assert!(state
-        .post_file(
-            bob,
-            chan,
-            "a".into(),
-            "text/plain".into(),
-            b"12345678".to_vec()
-        )
-        .is_ok());
+    assert!(put_file(&mut state, bob, chan, "a", b"12345678").is_ok());
     // Distinct content, so it is a new blob rather than a deduplicated
     // re-share, and it would take him past the ceiling.
-    let err = state
-        .post_file(
-            bob,
-            chan,
-            "b".into(),
-            "text/plain".into(),
-            b"abcdefgh".to_vec(),
-        )
+    let err = put_file(&mut state, bob, chan, "b", b"abcdefgh")
         .expect_err("this would take bob past his allowance");
     assert!(err.contains("allowance"), "got: {err}");
     assert_eq!(state.quota_for(bob).used, 8);
     assert_eq!(state.quota_for(bob).limit, Some(10));
 
     // Admins are exempt: they are who clears space when it fills.
-    assert!(state
-        .post_file(
-            owner,
-            chan,
-            "c".into(),
-            "text/plain".into(),
-            b"abcdefghij!".to_vec()
-        )
-        .is_ok());
+    assert!(put_file(&mut state, owner, chan, "c", b"abcdefghij!").is_ok());
     assert_eq!(state.quota_for(owner).limit, None);
 
     // Freeing a reference frees the allowance again.
     let hash = blob_hash(b"12345678");
     state.delete_file(bob, &hash, chan).unwrap();
     assert_eq!(state.quota_for(bob).used, 0);
-    assert!(state
-        .post_file(
-            bob,
-            chan,
-            "d".into(),
-            "text/plain".into(),
-            b"abcdefgh".to_vec()
-        )
-        .is_ok());
+    assert!(put_file(&mut state, bob, chan, "d", b"abcdefgh").is_ok());
 }
 
 /// The Drive listing shows a member their own files and the ones shared
@@ -1323,39 +1210,12 @@ fn the_file_listing_respects_who_may_see_what() {
     let bob = state.join("bob", None, None).unwrap();
     let public = state.default_channel();
 
-    state
-        .post_file(
-            bob,
-            public,
-            "shared.txt".into(),
-            "text/plain".into(),
-            b"pub".to_vec(),
-        )
-        .unwrap();
+    put_file(&mut state, bob, public, "shared.txt", b"pub").unwrap();
     // A DM between owner and bob.
-    state
-        .post_file_dm(
-            owner,
-            bob,
-            "dm.txt".into(),
-            "text/plain".into(),
-            b"dm".to_vec(),
-        )
-        .unwrap();
+    put_file_dm(&mut state, owner, bob, "dm.txt", b"dm").unwrap();
     // A private channel bob is not in.
-    let secret = state
-        .create_channel_of_kind(owner, "secret", ChannelKind::Private, vec![])
-        .unwrap()
-        .id;
-    state
-        .post_file(
-            owner,
-            secret,
-            "hidden.txt".into(),
-            "text/plain".into(),
-            b"sec".to_vec(),
-        )
-        .unwrap();
+    let secret = new_channel(&mut state, owner, "secret", ChannelKind::Private);
+    put_file(&mut state, owner, secret, "hidden.txt", b"sec").unwrap();
 
     let listing = state.files_for(bob);
     let names: Vec<&str> = listing.iter().map(|f| f.name.as_str()).collect();
@@ -1484,24 +1344,8 @@ fn repeated_shares_of_one_file_survive_a_reload_individually() {
         let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
         owner = join_owner(&mut s, "owner");
         channel = s.default_channel();
-        let env = s
-            .post_file(
-                owner,
-                channel,
-                "twice.txt".into(),
-                "text/plain".into(),
-                b"same bytes".to_vec(),
-            )
-            .unwrap();
-        hash = file_payload(&env).hash.clone();
-        s.post_file(
-            owner,
-            channel,
-            "twice.txt".into(),
-            "text/plain".into(),
-            b"same bytes".to_vec(),
-        )
-        .unwrap();
+        hash = put_file_hash(&mut s, owner, channel, "twice.txt", b"same bytes");
+        put_file(&mut s, owner, channel, "twice.txt", b"same bytes").unwrap();
         assert_eq!(s.blobs[&hash].refcount, 2);
         assert_eq!(s.file_refs.len(), 2);
     }
@@ -1536,16 +1380,7 @@ fn governance_state_survives_a_reload() {
             .create_channel_of_kind(owner, "secret", ChannelKind::Private, vec![bob])
             .unwrap()
             .id;
-        let env = s
-            .post_file(
-                owner,
-                private_id,
-                "p.txt".into(),
-                "text/plain".into(),
-                b"private bytes".to_vec(),
-            )
-            .unwrap();
-        hash = file_payload(&env).hash.clone();
+        hash = put_file_hash(&mut s, owner, private_id, "p.txt", b"private bytes");
     }
 
     let s = PartyState::load("Srv", None, dir.path()).unwrap();
@@ -1573,23 +1408,10 @@ fn governance_state_survives_a_reload() {
 /// are stranded with nothing holding a count and nothing able to reach them.
 #[test]
 fn deleting_a_channel_reclaims_the_files_shared_in_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (dir, mut state) = disk_state();
     let owner = join_owner(&mut state, "owner");
-    let extra = state
-        .create_channel_of_kind(owner, "temp", ChannelKind::Public, vec![])
-        .unwrap()
-        .id;
-    let env = state
-        .post_file(
-            owner,
-            extra,
-            "t.txt".into(),
-            "text/plain".into(),
-            b"temp".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let extra = new_channel(&mut state, owner, "temp", ChannelKind::Public);
+    let hash = put_file_hash(&mut state, owner, extra, "t.txt", b"temp");
 
     state.delete_channel(owner, extra).unwrap();
     assert!(!state.blobs.contains_key(&hash));
@@ -1607,8 +1429,7 @@ fn deleting_a_channel_reclaims_the_files_shared_in_it() {
 /// upload once it lands.
 #[test]
 fn a_chunked_upload_round_trips_and_posts_a_file_message() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
 
@@ -1618,15 +1439,8 @@ fn a_chunked_upload_round_trips_and_posts_a_file_message() {
         .map(|i| (i % 251) as u8)
         .collect();
 
-    let upload = state
-        .start_upload(
-            owner,
-            "big.bin".into(),
-            "application/octet-stream".into(),
-            payload.len() as u64,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
+    let target = UploadTarget::Channel(channel);
+    let upload = start(&mut state, owner, "big.bin", payload.len() as u64, target).unwrap();
     for chunk in payload.chunks(PARTY_CHUNK_BYTES) {
         state.upload_chunk(owner, upload, chunk).unwrap();
     }
@@ -1644,20 +1458,7 @@ fn a_chunked_upload_round_trips_and_posts_a_file_message() {
     );
 
     // And it comes back down in order, in chunks, with the total attached.
-    let mut got = Vec::new();
-    loop {
-        let (data, total) = state
-            .blob_chunk_for(owner, &meta.hash, got.len() as u64)
-            .unwrap();
-        assert_eq!(total, payload.len() as u64);
-        if data.is_empty() {
-            break;
-        }
-        got.extend_from_slice(&data);
-        if got.len() as u64 >= total {
-            break;
-        }
-    }
+    let got = download_chunked(&state, owner, &meta.hash, payload.len());
     assert_eq!(got, payload);
 }
 
@@ -1668,40 +1469,16 @@ fn an_upload_that_exceeds_its_declared_size_is_dropped() {
     let mut state = PartyState::new("Srv", None);
     let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
-    let upload = state
-        .start_upload(
-            owner,
-            "x.bin".into(),
-            "application/octet-stream".into(),
-            4,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(owner, upload, b"abcd").unwrap();
+    let upload = spool(
+        &mut state,
+        owner,
+        "x.bin",
+        b"abcd",
+        UploadTarget::Channel(channel),
+    );
     assert!(state.upload_chunk(owner, upload, b"more").is_err());
     // The upload is gone, so finishing it fails too.
     assert!(state.finish_upload(owner, upload).is_err());
-}
-
-/// Finishing early must not store a truncated file under a hash that claims
-/// to be the whole thing.
-#[test]
-fn an_incomplete_upload_cannot_be_finished() {
-    let mut state = PartyState::new("Srv", None);
-    let owner = join_owner(&mut state, "owner");
-    let channel = state.default_channel();
-    let upload = state
-        .start_upload(
-            owner,
-            "x.bin".into(),
-            "application/octet-stream".into(),
-            10,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(owner, upload, b"abc").unwrap();
-    let err = state.finish_upload(owner, upload).unwrap_err();
-    assert!(err.contains("incomplete"), "got: {err}");
 }
 
 /// Everything checkable is checked before a byte moves — otherwise the
@@ -1753,71 +1530,24 @@ fn uploads_are_refused_up_front_on_size_quota_and_permission() {
     let mut state = PartyState::new("Srv", None);
     let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
-    let octet = || "application/octet-stream".to_string();
+    let target = UploadTarget::Channel(state.default_channel());
 
     // Past the server's hard ceiling.
-    assert!(state
-        .start_upload(
-            bob,
-            "huge".into(),
-            octet(),
-            MAX_PARTY_FILE_BYTES + 1,
-            UploadTarget::Channel(channel),
-        )
-        .is_err());
+    assert!(start(&mut state, bob, "huge", MAX_PARTY_FILE_BYTES + 1, target).is_err());
     // Empty.
-    assert!(state
-        .start_upload(bob, "e".into(), octet(), 0, UploadTarget::Channel(channel),)
-        .is_err());
+    assert!(start(&mut state, bob, "e", 0, target).is_err());
     // Past the member's allowance.
     state.set_max_member_blob_bytes(1024);
-    let err = state
-        .start_upload(
-            bob,
-            "big".into(),
-            octet(),
-            4096,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap_err();
+    let err = start(&mut state, bob, "big", 4096, target).unwrap_err();
     assert!(err.contains("allowance"), "got: {err}");
     state.set_max_member_blob_bytes(MAX_MEMBER_BLOB_BYTES);
-    // Too many at once. The cap counts the spools the state is actually
-    // holding, so it has to be reached by opening them, not by asserting it.
-    let opened: Vec<Uuid> = (0..MAX_CONCURRENT_UPLOADS)
-        .map(|i| {
-            state
-                .start_upload(
-                    bob,
-                    format!("n{i}"),
-                    octet(),
-                    16,
-                    UploadTarget::Channel(channel),
-                )
-                .expect("under the cap")
-        })
-        .collect();
-    let err = state
-        .start_upload(bob, "n".into(), octet(), 16, UploadTarget::Channel(channel))
-        .unwrap_err();
-    assert!(err.contains("in progress"), "got: {err}");
-    for upload in opened {
-        state.cancel_upload(bob, upload);
-    }
+    // (Too many at once: `the_upload_cap_counts_what_the_server_is_holding`.)
     // A channel they may not post to.
-    let locked = state
-        .create_channel_of_kind(owner, "locked", ChannelKind::Locked, vec![])
-        .unwrap()
-        .id;
-    assert!(state
-        .start_upload(bob, "l".into(), octet(), 16, UploadTarget::Channel(locked),)
-        .is_err());
+    let locked = new_channel(&mut state, owner, "locked", ChannelKind::Locked);
+    assert!(start(&mut state, bob, "l", 16, UploadTarget::Channel(locked)).is_err());
     // A guest cannot upload at all, DM included.
     state.set_role(owner, bob, Role::Guest).unwrap();
-    assert!(state
-        .start_upload(bob, "g".into(), octet(), 16, UploadTarget::Dm(owner))
-        .is_err());
+    assert!(start(&mut state, bob, "g", 16, UploadTarget::Dm(owner)).is_err());
 }
 
 /// One member's upload id must be useless to anyone else, and a disconnect
@@ -1828,15 +1558,7 @@ fn uploads_are_owned_by_their_uploader_and_cleaned_up() {
     let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
-    let upload = state
-        .start_upload(
-            bob,
-            "x".into(),
-            "application/octet-stream".into(),
-            8,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
+    let upload = start(&mut state, bob, "x", 8, UploadTarget::Channel(channel)).unwrap();
 
     // Someone else's id gets the same answer as a made-up one.
     assert!(state.upload_chunk(owner, upload, b"abcd").is_err());
@@ -1852,32 +1574,18 @@ fn uploads_are_owned_by_their_uploader_and_cleaned_up() {
     assert!(state.upload_chunk(bob, upload, b"abcd").is_err());
 }
 
-/// An upload finished short must not leave its spool behind.
-///
-/// This was an unbounded memory leak a Guest could drive: declare the
-/// maximum, send all but a byte of it, call `FinishUpload`. The server
-/// answered "upload is incomplete" and kept every byte, while the
-/// connection — which cleared its own list *before* the call — reported
-/// nothing in flight, so `MAX_CONCURRENT_UPLOADS` read zero and the
-/// disconnect sweep, gated on that same list, never ran. Each round leaked
-/// up to `MAX_PARTY_FILE_BYTES` and nothing short of a restart reclaimed it.
+/// An upload finished short must not leave its spool behind (each round used
+/// to leak up to `MAX_PARTY_FILE_BYTES` while the concurrency cap read zero),
+/// nor store a truncated file under a hash that claims to be the whole thing.
 #[test]
 fn an_upload_finished_short_does_not_leak_its_spool() {
     let mut state = PartyState::new("Srv", None);
-    let owner = join_owner(&mut state, "owner");
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
-    let _ = owner;
 
     for _ in 0..(MAX_CONCURRENT_UPLOADS * 3) {
-        let upload = state
-            .start_upload(
-                bob,
-                "x".into(),
-                "application/octet-stream".into(),
-                64,
-                UploadTarget::Channel(channel),
-            )
+        let upload = start(&mut state, bob, "x", 64, UploadTarget::Channel(channel))
             .expect("the cap must not be reached by abandoned uploads");
         state.upload_chunk(bob, upload, &[0u8; 32]).unwrap();
 
@@ -1904,60 +1612,26 @@ fn an_upload_finished_short_does_not_leak_its_spool() {
 fn the_upload_cap_counts_what_the_server_is_holding() {
     let mut state = PartyState::new("Srv", None);
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
 
-    let mut opened = Vec::new();
-    for i in 0..MAX_CONCURRENT_UPLOADS {
-        opened.push(
-            state
-                .start_upload(
-                    bob,
-                    format!("f{i}"),
-                    "application/octet-stream".into(),
-                    16,
-                    UploadTarget::Channel(channel),
-                )
-                .expect("under the cap"),
-        );
-    }
+    let opened: Vec<Uuid> = (0..MAX_CONCURRENT_UPLOADS)
+        .map(|i| start(&mut state, bob, format!("f{i}"), 16, target).expect("under the cap"))
+        .collect();
     assert_eq!(state.uploads_in_flight(bob), MAX_CONCURRENT_UPLOADS);
-    assert!(state
-        .start_upload(
-            bob,
-            "one-too-many".into(),
-            "application/octet-stream".into(),
-            16,
-            UploadTarget::Channel(channel),
-        )
-        .is_err());
+    let err = start(&mut state, bob, "one-too-many", 16, target).unwrap_err();
+    assert!(err.contains("in progress"), "got: {err}");
 
     // Cancelling one frees exactly one slot.
     state.cancel_upload(bob, opened[0]);
     assert_eq!(state.uploads_in_flight(bob), MAX_CONCURRENT_UPLOADS - 1);
-    assert!(state
-        .start_upload(
-            bob,
-            "now-there-is-room".into(),
-            "application/octet-stream".into(),
-            16,
-            UploadTarget::Channel(channel),
-        )
-        .is_ok());
+    assert!(start(&mut state, bob, "now-there-is-room", 16, target).is_ok());
 }
 
-/// A chunked download reads one chunk, not the whole file.
-///
-/// Serving 64 KiB of a 100 MiB blob used to read all 100 MiB off disk —
-/// about 160 GiB over a full download's 1,600 chunks, every byte of it with
-/// the state mutex held, so one member fetching a large file repeatedly
-/// stalled everyone else's messages.
-///
-/// The observable contract is unchanged, which is what this pins: same
-/// bytes, same reported total, same behaviour past the end.
+/// A chunked download reads one chunk, not the whole file — with the same
+/// bytes, reported total and behaviour past the end.
 #[test]
 fn a_chunked_read_returns_the_same_bytes_from_disk_as_from_memory() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     let owner = join_owner(&mut state, "owner");
     let channel = state.default_channel();
 
@@ -1965,34 +1639,9 @@ fn a_chunked_read_returns_the_same_bytes_from_disk_as_from_memory() {
     let payload: Vec<u8> = (0..(PARTY_CHUNK_BYTES * 2 + 1234))
         .map(|i| (i % 251) as u8)
         .collect();
-    let env = state
-        .post_file(
-            owner,
-            channel,
-            "big.bin".into(),
-            "application/octet-stream".into(),
-            payload.clone(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, owner, channel, "big.bin", payload.clone());
 
-    let mut reassembled = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let (chunk, total) = state
-            .blob_chunk_for(owner, &hash, offset)
-            .expect("the owner may read their own file");
-        assert_eq!(total, payload.len() as u64, "reported size drifted");
-        if chunk.is_empty() {
-            break;
-        }
-        assert!(
-            chunk.len() <= PARTY_CHUNK_BYTES,
-            "a chunk must not exceed the chunk size"
-        );
-        reassembled.extend_from_slice(&chunk);
-        offset += chunk.len() as u64;
-    }
+    let reassembled = download_chunked(&state, owner, &hash, payload.len());
     assert_eq!(reassembled, payload, "the file did not round-trip");
 
     // Past the end is an empty chunk and the real total, not an error.
@@ -2005,74 +1654,36 @@ fn a_chunked_read_returns_the_same_bytes_from_disk_as_from_memory() {
     // Access is still decided before any byte is read.
     let mallory = state.join("mallory", None, None).unwrap();
     state.set_role(owner, mallory, Role::Guest).unwrap();
-    let private = state
-        .create_channel_of_kind(owner, "private", ChannelKind::Private, vec![])
-        .unwrap()
-        .id;
-    let env = state
-        .post_file(
-            owner,
-            private,
-            "secret.bin".into(),
-            "application/octet-stream".into(),
-            b"secret".to_vec(),
-        )
-        .unwrap();
-    let secret_hash = file_payload(&env).hash.clone();
+    let private = new_channel(&mut state, owner, "private", ChannelKind::Private);
+    let secret_hash = put_file_hash(&mut state, owner, private, "secret.bin", b"secret");
     assert!(
         state.blob_chunk_for(mallory, &secret_hash, 0).is_none(),
         "a chunked read must not bypass the access check"
     );
 }
 
-/// Peak disk is bounded by the storage ceiling, not by what happens to
-/// arrive at once.
-///
-/// Phase 2 writes the whole payload before phase 3 re-checks the ceiling, so
-/// without a reservation the limit bounds only what is *stored*: members
-/// each finishing several uploads would stage far past it and only then be
-/// refused, having already written every byte. Reserving in phase 1 is what
-/// makes the ceiling mean something about the disk.
+/// Peak disk is bounded by the storage ceiling: phase 1 reserves, so uploads
+/// cannot all stage past it before phase 3 re-checks.
 #[test]
 fn staged_uploads_are_counted_against_the_storage_ceiling() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = join_owner(&mut state, "owner");
+    let (_dir, mut state) = disk_state();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
     // Room for two of these and no more.
     state.set_max_blob_bytes(200);
     state.set_max_member_blob_bytes(1_000_000);
-    let _ = owner;
 
     let mut staged = Vec::new();
     for i in 0..2 {
-        let upload = state
-            .start_upload(
-                bob,
-                format!("f{i}"),
-                "application/octet-stream".into(),
-                100,
-                UploadTarget::Channel(channel),
-            )
-            .unwrap();
-        state.upload_chunk(bob, upload, &[b'x'; 100]).unwrap();
+        let upload = spool(&mut state, bob, format!("f{i}"), &[b'x'; 100], target);
         staged.push(state.begin_upload(bob, upload).expect("within the ceiling"));
     }
 
     // Nothing is stored yet — every byte of that is a reservation — and the
     // third upload is refused *before* it is written, not after.
     assert_eq!(state.blobs.len(), 0, "nothing has been committed yet");
-    let upload = state
-        .start_upload(
-            bob,
-            "third".into(),
-            "application/octet-stream".into(),
-            100,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, &[b'z'; 100]).unwrap();
+    let upload = spool(&mut state, bob, "third", &[b'z'; 100], target);
     let err = state
         .begin_upload(bob, upload)
         .expect_err("the ceiling is already spoken for");
@@ -2082,16 +1693,7 @@ fn staged_uploads_are_counted_against_the_storage_ceiling() {
     // consumes its spool — see `begin_upload` — so this needs a fresh one.)
     let first = staged.remove(0);
     state.discard_upload(first);
-    let upload = state
-        .start_upload(
-            bob,
-            "fourth".into(),
-            "application/octet-stream".into(),
-            100,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, &[b'w'; 100]).unwrap();
+    let upload = spool(&mut state, bob, "fourth", &[b'w'; 100], target);
     assert!(
         state.begin_upload(bob, upload).is_ok(),
         "discarding a staged upload must release its claim"
@@ -2099,32 +1701,17 @@ fn staged_uploads_are_counted_against_the_storage_ceiling() {
 }
 
 /// A deduplicated re-upload still succeeds at a full ceiling — on the
-/// **chunked** path too, not only the inline one.
-///
-/// Content the store already holds costs no new storage, so it must not be
-/// refused for lack of room. That is easy inline (the bytes are in hand and
-/// can be hashed) and was briefly lost for chunked uploads, where the hash
-/// used to be unknown until after the ceiling check and the reservation had
-/// to assume the worst. Accumulating the hash as chunks arrive removes the
-/// guesswork rather than documenting it.
+/// **chunked** path too (the hash accumulates as chunks arrive).
 #[test]
 fn a_deduplicated_chunked_reupload_succeeds_at_a_full_ceiling() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
-    let owner = join_owner(&mut state, "owner");
+    let (_dir, mut state) = disk_state();
+    let _owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
-    let _ = owner;
+    let target = UploadTarget::Channel(state.default_channel());
     let payload = [7u8; 200];
 
     let upload_it = |state: &mut PartyState, name: &str| -> Result<(), String> {
-        let upload = state.start_upload(
-            bob,
-            name.to_string(),
-            "application/octet-stream".into(),
-            payload.len() as u64,
-            UploadTarget::Channel(channel),
-        )?;
+        let upload = start(state, bob, name, payload.len() as u64, target)?;
         for chunk in payload.chunks(64) {
             state.upload_chunk(bob, upload, chunk)?;
         }
@@ -2137,16 +1724,7 @@ fn a_deduplicated_chunked_reupload_succeeds_at_a_full_ceiling() {
     state.set_max_blob_bytes(payload.len() as u64);
 
     // Distinct content is refused, as it must be.
-    let upload = state
-        .start_upload(
-            bob,
-            "other.bin".into(),
-            "application/octet-stream".into(),
-            8,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, b"distinct").unwrap();
+    let upload = spool(&mut state, bob, "other.bin", b"distinct", target);
     let err = state.finish_upload(bob, upload).unwrap_err();
     assert!(err.contains("storage is full"), "got: {err}");
 
@@ -2160,38 +1738,19 @@ fn a_deduplicated_chunked_reupload_succeeds_at_a_full_ceiling() {
 /// leave a claim on storage that nothing releases.
 #[test]
 fn a_disconnect_releases_a_staged_upload_s_claim() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
     state.set_max_blob_bytes(150);
 
-    let upload = state
-        .start_upload(
-            bob,
-            "f".into(),
-            "application/octet-stream".into(),
-            100,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, &[b'x'; 100]).unwrap();
+    let upload = spool(&mut state, bob, "f", &[b'x'; 100], target);
     let staged = state.begin_upload(bob, upload).unwrap();
 
     // The connection goes away with the upload mid-flight.
     state.cancel_uploads_for(bob);
     drop(staged);
 
-    let upload = state
-        .start_upload(
-            bob,
-            "again".into(),
-            "application/octet-stream".into(),
-            100,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, &[b'y'; 100]).unwrap();
+    let upload = spool(&mut state, bob, "again", &[b'y'; 100], target);
     assert!(
         state.begin_upload(bob, upload).is_ok(),
         "the abandoned upload's claim was never released"
@@ -2200,28 +1759,14 @@ fn a_disconnect_releases_a_staged_upload_s_claim() {
 
 /// One member's two devices are two connections, and closing one must not
 /// cancel the other's uploads.
-///
-/// The disconnect sweep used to run per *member*, so a laptop closing took
-/// the phone's transfer with it. Sweeping the ids the departing connection
-/// actually had open is what makes multi-device work rather than merely
-/// appear to.
 #[test]
 fn closing_one_device_does_not_cancel_another_s_uploads() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
 
     let start = |state: &mut PartyState, name: &str| {
-        let upload = state
-            .start_upload(
-                bob,
-                name.to_string(),
-                "application/octet-stream".into(),
-                8,
-                UploadTarget::Channel(channel),
-            )
-            .unwrap();
+        let upload = start(state, bob, name, 8, target).unwrap();
         state.upload_chunk(bob, upload, b"1234").unwrap();
         upload
     };
@@ -2254,23 +1799,13 @@ fn closing_one_device_does_not_cancel_another_s_uploads() {
 /// disconnect releases that one and leaves another device's alone.
 #[test]
 fn a_disconnect_releases_only_its_own_reservation() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
     state.set_max_blob_bytes(250);
 
     let stage_one = |state: &mut PartyState, fill: u8| {
-        let upload = state
-            .start_upload(
-                bob,
-                format!("f{fill}.bin"),
-                "application/octet-stream".into(),
-                100,
-                UploadTarget::Channel(channel),
-            )
-            .unwrap();
-        state.upload_chunk(bob, upload, &[fill; 100]).unwrap();
+        let upload = spool(state, bob, format!("f{fill}.bin"), &[fill; 100], target);
         (upload, state.begin_upload(bob, upload).unwrap())
     };
 
@@ -2279,16 +1814,7 @@ fn a_disconnect_releases_only_its_own_reservation() {
     phone.write_staging().unwrap();
 
     // 200 of 250 reserved: a third 100-byte upload has no room.
-    let upload = state
-        .start_upload(
-            bob,
-            "third.bin".into(),
-            "application/octet-stream".into(),
-            100,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, &[b'c'; 100]).unwrap();
+    let upload = spool(&mut state, bob, "third.bin", &[b'c'; 100], target);
     assert!(state.begin_upload(bob, upload).is_err());
 
     // The laptop disconnects mid-stage. Its reservation goes; the phone's
@@ -2296,16 +1822,7 @@ fn a_disconnect_releases_only_its_own_reservation() {
     drop(laptop);
     state.cancel_connection_uploads(bob, &[laptop_id]);
 
-    let upload = state
-        .start_upload(
-            bob,
-            "fourth.bin".into(),
-            "application/octet-stream".into(),
-            100,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, &[b'd'; 100]).unwrap();
+    let upload = spool(&mut state, bob, "fourth.bin", &[b'd'; 100], target);
     assert!(
         state.begin_upload(bob, upload).is_ok(),
         "the laptop's reservation was not released"
@@ -2316,43 +1833,21 @@ fn a_disconnect_releases_only_its_own_reservation() {
 }
 
 /// Two members uploading identical content must not be able to delete each
-/// other's bytes.
-///
-/// Staging under the *content hash* would let one member's failed commit
-/// unlink the file the other's commit is about to record, leaving a file
-/// message that answers "unknown file" for good. Staging under a per-upload
-/// id makes that impossible rather than unlikely.
+/// other's bytes (staging is per upload, never per content hash).
 #[test]
 fn identical_concurrent_uploads_do_not_delete_each_other() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     // The first joiner is the Owner and cannot be demoted, so the two
     // uploaders are ordinary members joining after them.
     let owner = join_owner(&mut state, "owner");
     let alice = state.join("alice", None, None).unwrap();
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
     let payload = b"a forwarded image".to_vec();
 
-    let stage_for = |state: &mut PartyState, who: Uuid| {
-        let upload = state
-            .start_upload(
-                who,
-                "same.bin".into(),
-                "application/octet-stream".into(),
-                payload.len() as u64,
-                UploadTarget::Channel(channel),
-            )
-            .unwrap();
-        state.upload_chunk(who, upload, &payload).unwrap();
-        let mut staged = state.begin_upload(who, upload).unwrap();
-        staged.write_staging().unwrap();
-        staged
-    };
-
     // Both stage the same bytes, both written to disk, neither committed.
-    let alice_staged = stage_for(&mut state, alice);
-    let bob_staged = stage_for(&mut state, bob);
+    let alice_staged = staged(&mut state, alice, "same.bin", &payload, target);
+    let bob_staged = staged(&mut state, bob, "same.bin", &payload, target);
 
     // Alice's commit fails on the far side of the write — she was demoted
     // while her bytes were going down.
@@ -2375,34 +1870,16 @@ fn identical_concurrent_uploads_do_not_delete_each_other() {
 /// The staging directory does not accumulate files.
 #[test]
 fn a_discarded_upload_leaves_no_file_behind() {
-    let dir = tempfile::tempdir().unwrap();
-    let blobs = dir.path().join("blobs");
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (dir, mut state) = disk_state();
     let bob = state.join("bob", None, None).unwrap();
-    let channel = state.default_channel();
+    let target = UploadTarget::Channel(state.default_channel());
 
     for _ in 0..3 {
-        let upload = state
-            .start_upload(
-                bob,
-                "f".into(),
-                "application/octet-stream".into(),
-                8,
-                UploadTarget::Channel(channel),
-            )
-            .unwrap();
-        state.upload_chunk(bob, upload, b"12345678").unwrap();
-        let mut staged = state.begin_upload(bob, upload).unwrap();
-        staged.write_staging().unwrap();
-        state.discard_upload(staged);
+        let pending = staged(&mut state, bob, "f", b"12345678", target);
+        state.discard_upload(pending);
     }
 
-    let leftovers: Vec<_> = std::fs::read_dir(&blobs)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("staging_"))
-        .collect();
+    let leftovers = staging_leftovers(&dir.path().join("blobs"));
     assert!(
         leftovers.is_empty(),
         "staging files left behind: {leftovers:?}"
@@ -2428,49 +1905,32 @@ fn startup_sweeps_staging_files_a_crash_left_behind() {
     let _state = PartyState::load("Srv", None, dir.path()).unwrap();
 
     assert!(keep.exists(), "the sweep removed a real blob");
-    let leftovers: Vec<_> = std::fs::read_dir(&blobs)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("staging_"))
-        .collect();
+    let leftovers = staging_leftovers(&blobs);
     assert!(leftovers.is_empty(), "sweep missed: {leftovers:?}");
 }
 
-/// Permission is re-checked on the far side of the write, not only before it.
-///
-/// `begin_upload` checks; for a 100 MiB upload that check is minutes old by
-/// the time the bytes land, and the lock was released for all of it. Anyone
-/// demoted, or any channel deleted, in that window used to get its message
-/// appended anyway. `check_may_post_file` is one function called from both
-/// ends precisely so the two cannot drift — which is how the DM recipient
-/// came to be checked only on the way in.
+/// Permission is re-checked on the far side of the write, not only before it:
+/// the uploader may be demoted, or the channel deleted, while the lock is free.
 #[test]
 fn permission_lost_during_the_write_refuses_the_commit() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (dir, mut state) = disk_state();
     let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let channel = state.default_channel();
 
     // (a) The uploader is demoted to a read-only role mid-DM-upload.
-    let upload = state
-        .start_upload(
-            bob,
-            "for-carol.bin".into(),
-            "application/octet-stream".into(),
-            4,
-            UploadTarget::Dm(carol),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, b"abcd").unwrap();
-    let mut staged = state.begin_upload(bob, upload).unwrap();
-    staged.write_staging().unwrap();
+    let pending = staged(
+        &mut state,
+        bob,
+        "for-carol.bin",
+        b"abcd",
+        UploadTarget::Dm(carol),
+    );
     state.set_role(owner, bob, Role::Guest).unwrap();
 
     let err = state
-        .commit_upload(staged)
+        .commit_upload(pending)
         .expect_err("a guest may not send a DM");
     assert!(err.contains("read-only"), "got: {err}");
     assert!(
@@ -2482,55 +1942,37 @@ fn permission_lost_during_the_write_refuses_the_commit() {
 
     // (b) The channel is deleted mid-upload.
     state.set_role(owner, bob, Role::Member).unwrap();
-    let doomed = state
-        .create_channel_of_kind(owner, "doomed", ChannelKind::Public, vec![])
-        .unwrap()
-        .id;
-    let upload = state
-        .start_upload(
-            bob,
-            "f.bin".into(),
-            "application/octet-stream".into(),
-            4,
-            UploadTarget::Channel(doomed),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, b"efgh").unwrap();
-    let mut staged = state.begin_upload(bob, upload).unwrap();
-    staged.write_staging().unwrap();
+    let doomed = new_channel(&mut state, owner, "doomed", ChannelKind::Public);
+    let pending = staged(
+        &mut state,
+        bob,
+        "f.bin",
+        b"efgh",
+        UploadTarget::Channel(doomed),
+    );
     state.delete_channel(owner, doomed).unwrap();
 
     assert!(
-        state.commit_upload(staged).is_err(),
+        state.commit_upload(pending).is_err(),
         "a deleted channel still accepted a file"
     );
 
     // And nothing of either attempt is left on disk.
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("blobs"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("staging_"))
-        .collect();
+    let leftovers = staging_leftovers(&dir.path().join("blobs"));
     assert!(
         leftovers.is_empty(),
         "staging files left behind: {leftovers:?}"
     );
 
     // A permitted upload still works, so this is not just refusing everything.
-    let upload = state
-        .start_upload(
-            bob,
-            "ok.bin".into(),
-            "application/octet-stream".into(),
-            4,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
-    state.upload_chunk(bob, upload, b"ijkl").unwrap();
-    let mut staged = state.begin_upload(bob, upload).unwrap();
-    staged.write_staging().unwrap();
-    assert!(state.commit_upload(staged).is_ok());
+    let pending = staged(
+        &mut state,
+        bob,
+        "ok.bin",
+        b"ijkl",
+        UploadTarget::Channel(channel),
+    );
+    assert!(state.commit_upload(pending).is_ok());
 }
 
 /// Someone else's failed `FinishUpload` must not discard your spool. The
@@ -2543,15 +1985,7 @@ fn a_strangers_finish_does_not_drop_your_upload() {
     let bob = state.join("bob", None, None).unwrap();
     let channel = state.default_channel();
 
-    let upload = state
-        .start_upload(
-            bob,
-            "x".into(),
-            "application/octet-stream".into(),
-            8,
-            UploadTarget::Channel(channel),
-        )
-        .unwrap();
+    let upload = start(&mut state, bob, "x", 8, UploadTarget::Channel(channel)).unwrap();
     state.upload_chunk(bob, upload, b"abcd").unwrap();
 
     assert!(state.finish_upload(owner, upload).is_err());
@@ -2568,16 +2002,7 @@ fn view_and_download_are_separate_rights() {
     let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let chan = state.default_channel();
-    let env = state
-        .post_file(
-            owner,
-            chan,
-            "d.txt".into(),
-            "text/plain".into(),
-            b"bytes".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, owner, chan, "d.txt", b"bytes");
 
     // The default: bob can see it and fetch it.
     assert_eq!(state.files_for(bob).len(), 1);
@@ -2592,9 +2017,7 @@ fn view_and_download_are_separate_rights() {
             None,
             FilePermissions {
                 view: true,
-                download: false,
-                delete: false,
-                share: false,
+                ..FilePermissions::none()
             },
         )
         .unwrap();
@@ -2621,16 +2044,7 @@ fn a_member_grant_overrides_the_default() {
     let bob = state.join("bob", None, None).unwrap();
     let carol = state.join("carol", None, None).unwrap();
     let chan = state.default_channel();
-    let env = state
-        .post_file(
-            owner,
-            chan,
-            "d.txt".into(),
-            "text/plain".into(),
-            b"bytes".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, owner, chan, "d.txt", b"bytes");
 
     state
         .set_file_permissions(owner, &hash, chan, None, FilePermissions::none())
@@ -2642,10 +2056,8 @@ fn a_member_grant_overrides_the_default() {
             chan,
             Some(bob),
             FilePermissions {
-                view: true,
-                download: true,
                 delete: false,
-                share: true,
+                ..FilePermissions::all()
             },
         )
         .unwrap();
@@ -2671,16 +2083,7 @@ fn a_grant_cannot_exceed_what_the_granter_holds() {
     let chan = state.default_channel();
 
     // Bob shares a file, so he is its uploader and holds everything.
-    let env = state
-        .post_file(
-            bob,
-            chan,
-            "b.txt".into(),
-            "text/plain".into(),
-            b"bobs".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, bob, chan, "b.txt", b"bobs");
     assert!(state
         .set_file_permissions(bob, &hash, chan, Some(carol), FilePermissions::all())
         .is_ok());
@@ -2698,26 +2101,13 @@ fn a_grant_cannot_exceed_what_the_granter_holds() {
 /// authority over it.
 #[test]
 fn sharing_a_file_elsewhere_costs_a_reference_not_a_copy() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut state) = disk_state();
     let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let first = state.default_channel();
-    let second = state
-        .create_channel_of_kind(owner, "second", ChannelKind::Public, vec![])
-        .unwrap()
-        .id;
+    let second = new_channel(&mut state, owner, "second", ChannelKind::Public);
 
-    let env = state
-        .post_file(
-            owner,
-            first,
-            "d.txt".into(),
-            "text/plain".into(),
-            b"shared".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, owner, first, "d.txt", b"shared");
 
     // Bob has only the default grant, which does not include share.
     let err = state
@@ -2733,10 +2123,8 @@ fn sharing_a_file_elsewhere_costs_a_reference_not_a_copy() {
             first,
             Some(bob),
             FilePermissions {
-                view: true,
-                download: true,
                 delete: false,
-                share: true,
+                ..FilePermissions::all()
             },
         )
         .unwrap();
@@ -2781,16 +2169,7 @@ fn a_grant_cannot_give_a_guest_write_rights() {
     let owner = join_owner(&mut state, "owner");
     let bob = state.join("bob", None, None).unwrap();
     let chan = state.default_channel();
-    let env = state
-        .post_file(
-            owner,
-            chan,
-            "d.txt".into(),
-            "text/plain".into(),
-            b"bytes".to_vec(),
-        )
-        .unwrap();
-    let hash = file_payload(&env).hash.clone();
+    let hash = put_file_hash(&mut state, owner, chan, "d.txt", b"bytes");
 
     state
         .set_file_permissions(owner, &hash, chan, Some(bob), FilePermissions::all())
@@ -2815,16 +2194,7 @@ fn file_permissions_survive_a_reload() {
         owner = join_owner(&mut s, "owner");
         bob = s.join("bob", None, None).unwrap();
         chan = s.default_channel();
-        let env = s
-            .post_file(
-                owner,
-                chan,
-                "d.txt".into(),
-                "text/plain".into(),
-                b"bytes".to_vec(),
-            )
-            .unwrap();
-        hash = file_payload(&env).hash.clone();
+        hash = put_file_hash(&mut s, owner, chan, "d.txt", b"bytes");
         s.set_file_permissions(owner, &hash, chan, None, FilePermissions::none())
             .unwrap();
         s.set_file_permissions(
@@ -2833,10 +2203,8 @@ fn file_permissions_survive_a_reload() {
             chan,
             Some(bob),
             FilePermissions {
-                view: true,
-                download: true,
-                delete: true,
                 share: false,
+                ..FilePermissions::all()
             },
         )
         .unwrap();
@@ -2927,12 +2295,8 @@ fn channel_creation_is_capped() {
     assert_eq!(state.channels.len(), MAX_CHANNELS);
 }
 
-/// The server-wide [`MAX_CHANNELS`] cap does not tell a hundred members
-/// making one channel each from one member making a hundred. Without a
-/// per-member limit, any single joined member can walk the server to its
-/// ceiling in a burst — broadcasting a refreshed directory to every
-/// connection each time and denying everyone else the feature until an admin
-/// cleans up.
+/// A per-member channel creation limit, so one member cannot walk the server
+/// to [`MAX_CHANNELS`] in a burst.
 #[test]
 fn a_member_cannot_burst_create_channels() {
     let mut state = PartyState::new("Open", None);
@@ -2941,12 +2305,10 @@ fn a_member_cannot_burst_create_channels() {
     let now = Instant::now();
 
     for i in 0..MAX_CHANNELS_PER_MEMBER {
-        state
-            .create_channel_of_kind_at(bob, &format!("bob{i}"), ChannelKind::Public, vec![], now)
+        create_public_at(&mut state, bob, &format!("bob{i}"), now)
             .unwrap_or_else(|e| panic!("channel {i} is within the allowance: {e}"));
     }
-    let err = state
-        .create_channel_of_kind_at(bob, "one-more", ChannelKind::Public, vec![], now)
+    let err = create_public_at(&mut state, bob, "one-more", now)
         .expect_err("past the per-member allowance");
     assert!(
         err.contains("wait a moment"),
@@ -2970,17 +2332,11 @@ fn the_channel_rate_limit_is_per_member() {
     let now = Instant::now();
 
     for i in 0..MAX_CHANNELS_PER_MEMBER {
-        state
-            .create_channel_of_kind_at(bob, &format!("bob{i}"), ChannelKind::Public, vec![], now)
-            .unwrap();
+        create_public_at(&mut state, bob, &format!("bob{i}"), now).unwrap();
     }
-    assert!(state
-        .create_channel_of_kind_at(bob, "bob-extra", ChannelKind::Public, vec![], now)
-        .is_err());
+    assert!(create_public_at(&mut state, bob, "bob-extra", now).is_err());
     assert!(
-        state
-            .create_channel_of_kind_at(carol, "carol1", ChannelKind::Public, vec![], now)
-            .is_ok(),
+        create_public_at(&mut state, carol, "carol1", now).is_ok(),
         "an unrelated member must not be caught in someone else's limit"
     );
 }
@@ -2993,18 +2349,12 @@ fn the_channel_rate_limit_window_slides() {
     let now = Instant::now();
 
     for i in 0..MAX_CHANNELS_PER_MEMBER {
-        state
-            .create_channel_of_kind_at(bob, &format!("bob{i}"), ChannelKind::Public, vec![], now)
-            .unwrap();
+        create_public_at(&mut state, bob, &format!("bob{i}"), now).unwrap();
     }
-    assert!(state
-        .create_channel_of_kind_at(bob, "blocked", ChannelKind::Public, vec![], now)
-        .is_err());
+    assert!(create_public_at(&mut state, bob, "blocked", now).is_err());
 
     let later = now + CHANNEL_CREATE_WINDOW + Duration::from_secs(1);
-    assert!(state
-        .create_channel_of_kind_at(bob, "later", ChannelKind::Public, vec![], later)
-        .is_ok());
+    assert!(create_public_at(&mut state, bob, "later", later).is_ok());
 }
 
 /// A refused creation must not cost the member part of their allowance —
@@ -3017,13 +2367,10 @@ fn a_rejected_channel_name_does_not_consume_the_allowance() {
     let now = Instant::now();
 
     for _ in 0..20 {
-        assert!(state
-            .create_channel_of_kind_at(bob, "general", ChannelKind::Public, vec![], now)
-            .is_err());
+        assert!(create_public_at(&mut state, bob, "general", now).is_err());
     }
     for i in 0..MAX_CHANNELS_PER_MEMBER {
-        state
-            .create_channel_of_kind_at(bob, &format!("bob{i}"), ChannelKind::Public, vec![], now)
+        create_public_at(&mut state, bob, &format!("bob{i}"), now)
             .unwrap_or_else(|e| panic!("attempt {i} should still be allowed: {e}"));
     }
 }
@@ -3034,7 +2381,7 @@ fn history_requires_membership() {
     let mut state = PartyState::new("Open", None);
     let alice = state.join("alice", None, None).unwrap();
     let chan = state.default_channel();
-    state.post_message(alice, chan, "hi".to_string()).unwrap();
+    state.post_message(alice, chan, "hi".into()).unwrap();
 
     let stranger = Uuid::new_v4();
     assert!(state.history_since(stranger, chan, 0).is_empty());
@@ -3044,8 +2391,7 @@ fn history_requires_membership() {
 /// `synchronous=FULL` — several fsyncs per post, all under the state lock.
 #[test]
 fn the_database_runs_in_wal_mode_with_normal_sync() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, s) = disk_state();
     let conn = s.db.as_ref().unwrap();
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -3071,23 +2417,20 @@ fn multi_row_mutations_commit_as_one_transaction() {
         // A DM writes its thread row and its message; here it runs inside an
         // outer transaction, so the inner one must not try to nest.
         s.with_tx(|s| {
-            s.post_dm(alice, bob, "inside".to_string()).unwrap();
+            s.post_dm(alice, bob, "inside".into()).unwrap();
             assert!(!s.db.as_ref().unwrap().is_autocommit());
         });
         assert!(s.db.as_ref().unwrap().is_autocommit(), "committed");
-        s.post_dm(alice, bob, "outside".to_string()).unwrap();
+        s.post_dm(alice, bob, "outside".into()).unwrap();
     }
     let s = PartyState::load("Srv", None, dir.path()).unwrap();
     let thread = messenger_core::party::dm_thread_id(alice, bob);
     assert_eq!(s.dm_history(thread, 0).len(), 2);
 }
 
-/// SRV-01: a page was capped at 200 envelopes and nothing else, and 200
-/// envelopes of 64 KiB text are 12.8 MiB. About 130 maximum-size posts made
-/// every page covering them unsendable, every joining client was disconnected
-/// on its first history fetch, and the community stayed unjoinable across
-/// restarts. A channel full of maximum-size messages must still page in frames
-/// that fit, and paging must reach the end.
+/// SRV-01: a channel full of maximum-size messages must still page in frames
+/// that fit (a count-only cap made such pages unsendable), and paging must
+/// reach the end.
 #[test]
 fn a_channel_of_maximum_size_messages_still_pages_in_frames_that_fit() {
     let mut state = PartyState::new("Open", None);
@@ -3222,15 +2565,14 @@ fn the_file_listing_is_capped_to_fit_one_frame() {
     let alice = state.join("alice", None, None).unwrap();
     let chan = state.default_channel();
     for i in 0..(MAX_FILE_LISTING + 5) {
-        state
-            .post_file(
-                alice,
-                chan,
-                format!("f{i}.txt"),
-                "text/plain".into(),
-                format!("{i}").into_bytes(),
-            )
-            .unwrap();
+        put_file(
+            &mut state,
+            alice,
+            chan,
+            format!("f{i}.txt"),
+            format!("{i}").into_bytes(),
+        )
+        .unwrap();
     }
     let listing = state.files_for(alice);
     assert_eq!(listing.len(), MAX_FILE_LISTING);
@@ -3407,8 +2749,7 @@ fn only_the_newest_history_stays_in_memory_and_older_pages_come_from_disk() {
 /// serves every message, and access control still applies to disk pages.
 #[test]
 fn a_tiny_resident_cap_still_serves_everything_to_those_who_may_read_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
+    let (_dir, mut s) = disk_state();
     s.set_resident_history(3);
     let alice = s.join("alice", None, None).unwrap();
     let chan = s.default_channel();
@@ -3450,12 +2791,7 @@ fn an_undecodable_stored_message_is_skipped_rather_than_fatal() {
             .unwrap();
     }
     let mut s = PartyState::load("Srv", None, dir.path()).expect("the server still starts");
-    let seqs: Vec<u64> = s
-        .history_since(alice, chan, 0)
-        .iter()
-        .map(|e| e.seq)
-        .collect();
-    assert_eq!(seqs, vec![2]);
+    assert_eq!(seqs(s.history_since(alice, chan, 0)), vec![2]);
     assert_eq!(s.post_message(alice, chan, "three".into()).unwrap().seq, 3);
 }
 
@@ -3475,14 +2811,7 @@ fn retention_prunes_old_history_and_files_but_keeps_numbering() {
         for text in ["one", "two", "three"] {
             s.post_message(alice, channel, text.to_string()).unwrap();
         }
-        s.post_file(
-            alice,
-            channel,
-            "notes.txt".to_string(),
-            "text/plain".to_string(),
-            b"old notes".to_vec(),
-        )
-        .unwrap();
+        put_file(&mut s, alice, channel, "notes.txt", b"old notes").unwrap();
         assert_eq!(s.files_for(alice).len(), 1);
 
         // Nothing happens without a retention period.
@@ -3496,21 +2825,15 @@ fn retention_prunes_old_history_and_files_but_keeps_numbering() {
         assert_eq!(report.messages, 3);
         assert_eq!(report.files, 1);
         assert!(s.files_for(alice).is_empty());
-        let left: Vec<u64> = s
-            .history_since(alice, channel, 0)
-            .iter()
-            .map(|e| e.seq)
-            .collect();
-        assert_eq!(left, vec![4]);
+        assert_eq!(seqs(s.history_since(alice, channel, 0)), vec![4]);
     }
     let mut s = PartyState::load("Srv", None, dir.path()).unwrap();
-    let left: Vec<u64> = s
-        .history_since(alice, channel, 0)
-        .iter()
-        .map(|e| e.seq)
-        .collect();
-    assert_eq!(left, vec![4], "pruned rows stay pruned across a restart");
-    let next = s.post_message(alice, channel, "five".to_string()).unwrap();
+    assert_eq!(
+        seqs(s.history_since(alice, channel, 0)),
+        vec![4],
+        "pruned rows stay pruned across a restart"
+    );
+    let next = s.post_message(alice, channel, "five".into()).unwrap();
     assert_eq!(next.seq, 5, "numbering continues, never reusing a seq");
 }
 

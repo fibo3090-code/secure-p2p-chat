@@ -1,28 +1,19 @@
 //! TCP hole punching (simultaneous open), coordinated by the relay rendezvous.
 //!
-//! The relay learns each peer's public endpoint from the source address of its
-//! control connection and hands it to the other side together with the peer's
-//! self-reported LAN candidates. Both peers then:
+//! The relay hands each peer the other's public endpoint (the source address of its
+//! control connection) plus self-reported LAN candidates. Both peers then:
 //!
-//! 1. re-bind the *same local port* their relay control connection uses
-//!    (`SO_REUSEADDR`, plus `SO_REUSEPORT` on Unix), so outbound SYNs reuse the
-//!    NAT mapping the control connection already created;
-//! 2. listen on that port *and* repeatedly `connect()` toward every peer
-//!    candidate — crossing SYNs complete as a TCP simultaneous open on NATs
-//!    with endpoint-independent mapping, and the listener catches the
-//!    straggler SYN when one NAT is friendlier than the other;
-//! 3. validate every socket that gets established with a fixed-size hello
-//!    frame (magic + role + a tag derived from the rendezvous token), which
-//!    rejects strangers, crossed sessions, and self-connections;
-//! 4. deterministically select exactly one socket: the host picks the first
-//!    validated socket and sends `SELECT`; the joiner answers `ACK`. Success is
-//!    reported only after that mutual confirmation, so both ends run the chat
-//!    handshake over the same connection.
+//! 1. re-bind their relay control connection's local port (`SO_REUSEADDR`, plus
+//!    `SO_REUSEPORT` on Unix) so outbound SYNs reuse its NAT mapping;
+//! 2. listen on that port *and* repeatedly dial every candidate: crossing SYNs complete
+//!    as a simultaneous open, and the listener catches a straggler SYN;
+//! 3. validate each established socket with a hello frame (magic + role + a tag derived
+//!    from the token), rejecting strangers, crossed sessions and self-connections;
+//! 4. select exactly one socket: the host sends `SELECT` on the first validated one and
+//!    the joiner answers `ACK`, so both run the chat handshake over the same connection.
 //!
-//! Everything is bounded by deadlines, and any failure makes the caller fall
-//! back to the bridged relay path. The hello tag is pairing hygiene, not
-//! authentication — the punched socket carries the exact same v3 handshake
-//! (ECDH, identity proof, TOFU) as any direct connection.
+//! Everything is deadline-bounded; any failure falls back to the bridged relay. The tag
+//! is pairing hygiene, not authentication: the socket carries the full handshake.
 
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
@@ -37,18 +28,16 @@ use tokio::time::{sleep, timeout, timeout_at, Instant};
 
 /// Overall budget for establishing and validating candidate sockets.
 pub(crate) const PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Extra slack for the SELECT/ACK confirmation after the candidate deadline.
-/// The joiner waits twice this so the host always decides first.
+/// Extra slack for SELECT/ACK after the candidate deadline; the joiner waits twice
+/// this so the host always decides first.
 const SELECT_GRACE: Duration = Duration::from_secs(3);
-/// Per-attempt connect timeout; a NAT that will ever let the SYN through does
-/// so quickly, and short attempts mean more crossing SYNs per budget.
+/// Per-attempt connect timeout; short attempts mean more crossing SYNs per budget.
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Pause between connect retries toward the same candidate.
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(300);
 /// Budget for the hello exchange on one established socket.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Cap on how many peer candidates we will dial (abuse guard: candidates are
-/// peer-supplied strings relayed by the server).
+/// Cap on peer candidates dialed (they are peer-supplied strings).
 pub(crate) const MAX_PUNCH_CANDIDATES: usize = 8;
 
 /// Connections to the punch port being validated at once; more are closed
@@ -63,8 +52,8 @@ const HELLO_LEN: usize = HELLO_MAGIC.len() + 1 + TAG_LEN;
 const SELECT_BYTE: u8 = 0xA5;
 const ACK_BYTE: u8 = 0x5A;
 
-/// Which side of the rendezvous we are. The host leads socket selection; the
-/// joiner follows. Both sides listen *and* dial regardless of role.
+/// Which side of the rendezvous we are. The host leads socket selection; both sides
+/// listen and dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PunchRole {
     Host,
@@ -196,10 +185,9 @@ fn is_lan_reachable(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Try to hole punch a direct TCP connection to the peer. `local_port` must be
-/// the local port of the relay control connection (its NAT mapping is what the
-/// punch reuses). Returns a mutually confirmed, validated stream, or an error
-/// after the deadline — the caller then falls back to the bridged relay.
+/// Try to hole punch a direct TCP connection to the peer from `local_port`, the relay
+/// control connection's port (its NAT mapping is what the punch reuses). Returns a
+/// mutually confirmed stream, or an error after the deadline.
 pub(crate) async fn attempt_punch(
     role: PunchRole,
     local_port: u16,
@@ -229,15 +217,13 @@ pub(crate) async fn attempt_punch_with_timeout(
     let tag = HelloTags::new(token, role);
     let deadline = Instant::now() + budget;
 
-    // Validated sockets flow from listener/dialer workers into the selection
-    // phase. Workers stop at the deadline; dropping the JoinSet aborts any
-    // stragglers and closes their unclaimed sockets.
+    // Validated sockets flow from listener/dialer workers into selection; dropping
+    // the JoinSet aborts stragglers and closes their unclaimed sockets.
     let (validated_tx, validated_rx) = mpsc::channel::<TcpStream>(MAX_PUNCH_CANDIDATES);
     let mut workers: JoinSet<()> = JoinSet::new();
 
-    // Listeners: v4 always (the relay connection is normally v4), v6 only if
-    // some candidate needs it. A bind failure is not fatal — the dialers can
-    // still win via simultaneous open.
+    // Listeners for each address family a candidate needs. A bind failure is not
+    // fatal: the dialers can still win via simultaneous open.
     let want_v6 = peer_candidates.iter().any(SocketAddr::is_ipv6);
     let want_v4 = peer_candidates.iter().any(SocketAddr::is_ipv4);
     for ipv6 in [false, true] {
@@ -377,9 +363,8 @@ async fn select_as_joiner(
             joined = waiters.join_next(), if !waiters.is_empty() => {
                 match joined {
                     Some(Ok(Ok(stream))) => return Ok(stream),
-                    // A waiter failed (bad SELECT byte / dropped socket). If the
-                    // receiver is closed and no waiters remain, nothing else can
-                    // arrive — give up so we fall back to the bridged relay.
+                    // A waiter failed; with the receiver closed and no waiters left,
+                    // nothing else can arrive.
                     Some(_) if !rx_open && waiters.is_empty() => {
                         bail!("hole punch produced no usable connection");
                     }
@@ -420,8 +405,7 @@ fn punch_listener(ipv6: bool, local_port: u16) -> Result<TcpListener> {
     Ok(socket.listen(16)?)
 }
 
-/// Dial one candidate from the (reused) punch port, bounded by the per-attempt
-/// timeout.
+/// Dial one candidate from the (reused) punch port, bounded per attempt.
 async fn connect_once(local_port: u16, dest: SocketAddr) -> Result<TcpStream> {
     let socket = reusable_socket(dest.is_ipv6(), local_port)?;
     let stream = timeout(CONNECT_ATTEMPT_TIMEOUT, socket.connect(dest))
@@ -430,10 +414,9 @@ async fn connect_once(local_port: u16, dest: SocketAddr) -> Result<TcpStream> {
     Ok(stream)
 }
 
-/// Connect to `host:port` from a reuse-enabled socket. The relay control
-/// connection MUST be dialed this way: punch sockets later re-bind its local
-/// port, and (on Linux) that only works when the first socket on the port was
-/// itself bound with the reuse flags set.
+/// Connect to `host:port` from a reuse-enabled socket. The relay control connection
+/// must be dialed this way: on Linux, re-binding its port later only works if the
+/// first socket on it had the reuse flags set.
 pub(crate) async fn connect_reusable(host: &str, port: u16) -> Result<TcpStream> {
     let mut last_err: Option<anyhow::Error> = None;
     for addr in tokio::net::lookup_host((host, port)).await? {
@@ -455,9 +438,8 @@ pub(crate) async fn connect_reusable(host: &str, port: u16) -> Result<TcpStream>
     Err(last_err.unwrap_or_else(|| anyhow!("relay address did not resolve")))
 }
 
-/// A TCP socket bound to the punch port with address (and, on Unix, port)
-/// reuse enabled, so several dialers, the listener, and the still-open relay
-/// control connection can share one local port.
+/// A TCP socket bound to `local_port` with address (and on Unix port) reuse, so the
+/// dialers, the listener and the open control connection can share one port.
 fn reusable_socket(ipv6: bool, local_port: u16) -> Result<TcpSocket> {
     let socket = if ipv6 {
         TcpSocket::new_v6()?
@@ -476,9 +458,8 @@ fn reusable_socket(ipv6: bool, local_port: u16) -> Result<TcpSocket> {
     Ok(socket)
 }
 
-/// Mutual hello exchange on a freshly established socket: proves the other end
-/// is our rendezvous peer (same token, opposite role) before the socket may
-/// enter selection.
+/// Mutual hello exchange on a fresh socket: the other end must be our rendezvous peer
+/// (same token, opposite role) before the socket may enter selection.
 async fn validate(mut stream: TcpStream, role: PunchRole, tag: HelloTags) -> Result<TcpStream> {
     stream.set_nodelay(true).ok();
     let exchange = async {
@@ -679,6 +660,24 @@ mod tests {
         assert!(joiner.await.unwrap().is_ok());
     }
 
+    /// Punch between two loopback ports with the given tokens.
+    async fn punch_pair(
+        host_token: &'static str,
+        joiner_token: &'static str,
+        budget: Duration,
+    ) -> (Result<TcpStream>, Result<TcpStream>) {
+        let (port_a, port_b) = (free_port(), free_port());
+        let side = |role, port, peer: u16, token| {
+            tokio::spawn(async move {
+                let peer = format!("127.0.0.1:{peer}").parse().unwrap();
+                attempt_punch_with_timeout(role, port, &[peer], token, budget).await
+            })
+        };
+        let host = side(PunchRole::Host, port_a, port_b, host_token);
+        let joiner = side(PunchRole::Joiner, port_b, port_a, joiner_token);
+        (host.await.unwrap(), joiner.await.unwrap())
+    }
+
     #[test]
     fn candidates_are_filtered_deduped_and_capped() {
         let locals: Vec<String> = vec![
@@ -711,31 +710,9 @@ mod tests {
 
     #[tokio::test]
     async fn peers_punch_each_other_over_loopback() {
-        let port_a = free_port();
-        let port_b = free_port();
-        let token = "cafebabe";
-
-        let host = tokio::spawn(async move {
-            attempt_punch(
-                PunchRole::Host,
-                port_a,
-                &[format!("127.0.0.1:{port_b}").parse().unwrap()],
-                token,
-            )
-            .await
-        });
-        let joiner = tokio::spawn(async move {
-            attempt_punch(
-                PunchRole::Joiner,
-                port_b,
-                &[format!("127.0.0.1:{port_a}").parse().unwrap()],
-                token,
-            )
-            .await
-        });
-
-        let mut host_stream = host.await.unwrap().expect("host punch");
-        let mut joiner_stream = joiner.await.unwrap().expect("joiner punch");
+        let (host, joiner) = punch_pair("cafebabe", "cafebabe", PUNCH_TIMEOUT).await;
+        let mut host_stream = host.expect("host punch");
+        let mut joiner_stream = joiner.expect("joiner punch");
 
         host_stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -748,32 +725,8 @@ mod tests {
 
     #[tokio::test]
     async fn mismatched_tokens_never_pair() {
-        let port_a = free_port();
-        let port_b = free_port();
-        let budget = Duration::from_secs(2);
-
-        let host = tokio::spawn(async move {
-            attempt_punch_with_timeout(
-                PunchRole::Host,
-                port_a,
-                &[format!("127.0.0.1:{port_b}").parse().unwrap()],
-                "token-one",
-                budget,
-            )
-            .await
-        });
-        let joiner = tokio::spawn(async move {
-            attempt_punch_with_timeout(
-                PunchRole::Joiner,
-                port_b,
-                &[format!("127.0.0.1:{port_a}").parse().unwrap()],
-                "token-two",
-                budget,
-            )
-            .await
-        });
-
-        assert!(host.await.unwrap().is_err());
-        assert!(joiner.await.unwrap().is_err());
+        let (host, joiner) = punch_pair("token-one", "token-two", Duration::from_secs(2)).await;
+        assert!(host.is_err());
+        assert!(joiner.is_err());
     }
 }
