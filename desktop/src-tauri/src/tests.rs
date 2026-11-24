@@ -2864,3 +2864,144 @@ fn a_poll_tick_emits_what_changed_and_persists_it() {
     assert!(events.is_empty());
     assert_eq!(delay, crate::POLL_SLOW);
 }
+
+/// `list_transfers` is a string contract with the frontend: `Messages.jsx`
+/// shows Accept/Decline only for `"awaiting"`, a failure's reason only from
+/// `error` on `"failed"`, and the cancel button from `cancellable`. A renamed
+/// status would hide the Accept button with every test of the Rust side
+/// still green.
+#[test]
+fn list_transfers_reports_each_status_in_the_frontends_words() {
+    use messenger_core::types::{FileTransferState, TransferDirection, TransferStatus};
+    let h = ready_harness();
+    let chat = h.seed_chat_with_incoming("Peer", 0);
+    let manager = h.bridge().manager.clone();
+    let statuses = [
+        (TransferStatus::Pending, TransferDirection::Outgoing),
+        (
+            TransferStatus::AwaitingAcceptance,
+            TransferDirection::Incoming,
+        ),
+        (TransferStatus::InProgress, TransferDirection::Incoming),
+        (TransferStatus::Completed, TransferDirection::Outgoing),
+        (
+            TransferStatus::Failed("disk full".into()),
+            TransferDirection::Incoming,
+        ),
+        (TransferStatus::Cancelled, TransferDirection::Outgoing),
+    ];
+    tauri::async_runtime::block_on(async {
+        let mut m = manager.lock().await;
+        for (i, (status, direction)) in statuses.into_iter().enumerate() {
+            m.insert_transfer_for_test(FileTransferState {
+                id: uuid::Uuid::from_u128(i as u128 + 1),
+                chat_id: chat,
+                filename: format!("f{i}"),
+                size: 10,
+                received: 5,
+                status,
+                seq: 0,
+                direction,
+            });
+        }
+    });
+    let listed = h.ipc("list_transfers", json!({})).unwrap();
+    let by_name = |name: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["filename"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} missing from {listed}"))
+    };
+    let expected = [
+        ("f0", "pending", "outgoing", true, Value::Null),
+        ("f1", "awaiting", "incoming", false, Value::Null),
+        ("f2", "active", "incoming", true, Value::Null),
+        ("f3", "done", "outgoing", false, Value::Null),
+        ("f4", "failed", "incoming", false, json!("disk full")),
+        ("f5", "cancelled", "outgoing", false, Value::Null),
+    ];
+    for (name, status, direction, cancellable, error) in expected {
+        let t = by_name(name);
+        assert_eq!(t["status"], status, "{t}");
+        assert_eq!(t["direction"], direction, "{t}");
+        assert_eq!(t["cancellable"], cancellable, "{t}");
+        assert_eq!(t["error"], error, "{t}");
+        assert_eq!(t["chat_id"], chat.to_string());
+        assert_eq!(
+            (t["size"].as_u64(), t["received"].as_u64()),
+            (Some(10), Some(5))
+        );
+    }
+}
+
+/// A message too long to render is cut for display only: `get_conversation`
+/// sends the webview at most `MAX_DISPLAY_TEXT_BYTES` and says how much was
+/// left out, while the history keeps every byte. Short messages pass through
+/// untouched.
+#[test]
+fn get_conversation_cuts_a_huge_message_for_display_only() {
+    use crate::commands::chats::MAX_DISPLAY_TEXT_BYTES;
+    let h = ready_harness();
+    let chat = h.seed_chat_with_incoming("Peer", 0);
+    let huge = "é".repeat(MAX_DISPLAY_TEXT_BYTES); // twice the cap, in bytes
+    h.push_incoming(chat, &huge);
+    h.push_incoming(chat, "short and sweet");
+    let conv = h
+        .ipc("get_conversation", json!({ "id": chat.to_string() }))
+        .unwrap();
+    let texts: Vec<&str> = conv["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"]["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        texts[0].len() < MAX_DISPLAY_TEXT_BYTES + 128,
+        "{} bytes sent",
+        texts[0].len()
+    );
+    assert!(texts[0].ends_with("the full message is kept in your history]"));
+    assert!(texts[0].starts_with("éé"), "cut mid-character");
+    assert_eq!(texts[1], "short and sweet");
+    let manager = h.bridge().manager.clone();
+    let kept = tauri::async_runtime::block_on(async {
+        let m = manager.lock().await;
+        match &m.get_chat(chat).unwrap().messages[0].content {
+            messenger_core::types::MessageContent::Text { text } => text.len(),
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(kept, huge.len(), "the stored message was shortened");
+}
+
+/// Unlocking honours "host on startup": with it on, the app is listening as
+/// soon as the password is accepted; with it off, it is not.
+#[test]
+fn unlocking_hosts_on_startup_only_when_the_setting_is_on() {
+    for on in [true, false] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut identity = Identity::new_with_plaintext("Tester".to_string()).expect("identity");
+        identity.encrypt("right-password-1234").expect("encrypt");
+        let mut bridge = fresh_bridge(dir.path());
+        identity.save(&bridge.identity_path).expect("save identity");
+        bridge.identity = Arc::new(StdMutex::new(identity));
+        bridge.needs_password_setup = std::sync::atomic::AtomicBool::new(false);
+        {
+            let mut m = tauri::async_runtime::block_on(bridge.manager.lock());
+            m.config.auto_host_on_startup = on;
+            m.config.listen_port = 0;
+        }
+        let manager = bridge.manager.clone();
+        let h = harness_with(bridge, dir);
+        h.ipc("unlock", json!({ "password": "right-password-1234" }))
+            .expect("unlock");
+        let hosting = tauri::async_runtime::block_on(manager.lock()).is_hosting;
+        assert_eq!(hosting, on, "auto_host_on_startup = {on}");
+        if on {
+            tauri::async_runtime::block_on(manager.lock()).stop_hosting();
+        }
+    }
+}
