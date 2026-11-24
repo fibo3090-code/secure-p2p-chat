@@ -1344,19 +1344,41 @@ mod tests {
 
     #[test]
     fn absurd_stored_argon_params_are_refused() {
-        let mut identity = fresh("Hostile File");
+        let mut locked = fresh("Hostile File");
         let password = test_password();
-        identity.encrypt(&password).unwrap();
+        locked.encrypt(&password).unwrap();
 
-        // 2 GiB: legal per the RFC, but unlock must not allocate it.
-        identity.argon_params.as_mut().unwrap().m_cost_kib = 2 * 1024 * 1024;
+        // Each cost on its own, one past its cap: an edited `identity.json`
+        // needs only one of them to turn unlock into a huge allocation (memory)
+        // or a hang (time, lanes). 2 GiB is legal per the RFC, for instance.
+        type Edit = fn(&mut ArgonParams);
+        let edits: [(&str, Edit); 3] = [
+            ("memory", |p| p.m_cost_kib = MAX_ARGON_M_COST_KIB + 1),
+            ("time", |p| p.t_cost = MAX_ARGON_T_COST + 1),
+            ("lanes", |p| p.p_cost = MAX_ARGON_P_COST + 1),
+        ];
+        for (which, edit) in edits {
+            let mut identity = locked.clone();
+            edit(identity.argon_params.as_mut().unwrap());
+            let err = identity
+                .decrypt(&password)
+                .expect_err("out-of-range parameters must be refused");
+            assert!(
+                err.to_string().contains("out of range"),
+                "{which}: expected a parameter-range error, got: {err}"
+            );
+        }
 
-        let err = identity
-            .decrypt(&password)
-            .expect_err("out-of-range parameters must be refused");
+        // At the cap is allowed: it gets past the range check, and then fails
+        // only because these are not the costs the key was wrapped with. (The
+        // lane count is the one boundary cheap enough to run; the memory and
+        // time caps at their limit would cost a 1 GiB / 16-pass derivation.)
+        let mut identity = locked.clone();
+        identity.argon_params.as_mut().unwrap().p_cost = MAX_ARGON_P_COST;
+        let err = identity.decrypt(&password).unwrap_err();
         assert!(
-            err.to_string().contains("out of range"),
-            "expected a parameter-range error, got: {err}"
+            err.is::<WrongPassword>(),
+            "the cap itself was refused: {err}"
         );
     }
 
