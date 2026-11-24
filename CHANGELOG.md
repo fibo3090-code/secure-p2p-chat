@@ -51,6 +51,10 @@ predate tagged releases.
 
 ### Fixed
 
+- A file still arriving when the sender started another one used to vanish
+  from the transfer list without a word. It still stops — one file at a time
+  per sender — but a warning now names the file that was interrupted.
+
 - A community server that cannot write a message to its database (a full
   disk, say) now refuses it, so the sender's app takes it back off the screen.
   It used to confirm the message and lose it at the next restart.

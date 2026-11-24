@@ -2801,3 +2801,143 @@ async fn auto_reconnect_dials_mapped_contacts_into_their_own_conversations() {
         "the blocked contact was dialled too"
     );
 }
+
+/// Three ways a peer's file offer ends before it starts, each of which must
+/// leave nothing behind and tell the sender to stop: a new offer arriving
+/// while the previous file is still streaming (the old spool is discarded and
+/// that transfer failed, not left at 10% for ever), an offer over
+/// `MAX_FILE_SIZE`, and a download folder that cannot be written.
+#[tokio::test]
+async fn a_file_offer_that_cannot_proceed_cleans_up_and_tells_the_sender() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = manager_in(dir.path(), false);
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Peer".into());
+    let mut control = wire_session_for_test(&mut mgr, chat);
+    let cancels = |rx: &mut mpsc::UnboundedReceiver<ProtocolMessage>| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|m| matches!(m, ProtocolMessage::FileCancel { .. }))
+            .count()
+    };
+
+    // Superseded mid-stream.
+    frame(&mut mgr, chat, meta("first.bin", 100, 1));
+    frame(&mut mgr, chat, chunk(&[7; 10], 2));
+    let first = mgr.active_transfers_snapshot()[0].id;
+    frame(&mut mgr, chat, meta("second.bin", 50, 3));
+    // The new offer clears finished rows, so the user learns of the lost file
+    // from the toast, and the row does not linger at 10%.
+    assert_eq!(
+        transfer_status(&mgr, first),
+        None,
+        "the abandoned row lingered"
+    );
+    assert!(
+        mgr.toasts.iter().any(|t| t.message
+            == "File transfer interrupted (the sender started another file): first.bin"),
+        "the half-received file vanished without a word"
+    );
+    let spools: Vec<_> = downloads_left(dir.path())
+        .into_iter()
+        .filter(|n| n.to_string_lossy().contains("first.bin"))
+        .collect();
+    assert!(spools.is_empty(), "the abandoned spool stayed: {spools:?}");
+    let second = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.filename == "second.bin")
+        .expect("the new offer was not taken");
+    assert_eq!(second.status, TransferStatus::AwaitingAcceptance);
+    frame(&mut mgr, chat, ProtocolMessage::FileCancel { seq: 4 });
+    let _ = cancels(&mut control);
+
+    // Too big to accept at all.
+    let before = mgr.active_transfers_snapshot().len();
+    frame(
+        &mut mgr,
+        chat,
+        meta("huge.iso", crate::MAX_FILE_SIZE + 1, 5),
+    );
+    assert_eq!(cancels(&mut control), 1, "the sender was not told to stop");
+    assert_eq!(mgr.active_transfers_snapshot().len(), before);
+    assert!(mgr
+        .toasts
+        .iter()
+        .any(|t| t.message.starts_with("Failed to receive file")));
+
+    // Nowhere to write it: the download "folder" is a file.
+    let blocker = dir.path().join("not-a-folder");
+    std::fs::write(&blocker, b"x").unwrap();
+    mgr.config.download_dir = blocker;
+    frame(&mut mgr, chat, meta("third.bin", 10, 6));
+    assert_eq!(cancels(&mut control), 1, "the sender was not told to stop");
+    let third = mgr
+        .active_transfers_snapshot()
+        .into_iter()
+        .find(|t| t.filename == "third.bin")
+        .expect("the failed offer is not shown");
+    assert!(
+        matches!(third.status, TransferStatus::Failed(_)),
+        "{:?}",
+        third.status
+    );
+    // A failed offer does not block the next one.
+    mgr.config.download_dir = dir.path().join("downloads");
+    frame(&mut mgr, chat, meta("fourth.bin", 10, 7));
+    assert!(mgr
+        .active_transfers_snapshot()
+        .iter()
+        .any(|t| t.filename == "fourth.bin" && t.status.is_active()));
+}
+
+/// A background port mapping resolves on a later poll: success publishes the
+/// external address (which the invite link then carries) and names the
+/// protocol, failure says LAN and relay still work, and an attempt whose task
+/// went away is forgotten quietly. Still pending, nothing changes.
+#[tokio::test]
+async fn a_port_mapping_result_is_applied_on_the_next_poll() {
+    use crate::network::nat::{MappedAddress, Protocol};
+    let mut mgr = ChatManager::default();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    mgr.pending_upnp = Some(rx);
+    mgr.poll_session_events();
+    assert!(mgr.pending_upnp.is_some(), "a pending attempt was dropped");
+    tx.send(Ok(MappedAddress {
+        external_ip: "203.0.113.5".parse().unwrap(),
+        external_port: 40000,
+        protocol: Protocol::NatPmp,
+    }))
+    .unwrap();
+    mgr.poll_session_events();
+    assert_eq!(mgr.external_address.as_deref(), Some("203.0.113.5:40000"));
+    assert!(mgr.pending_upnp.is_none());
+    assert!(mgr
+        .toasts
+        .iter()
+        .any(|t| t.message == "NAT-PMP: reachable from the internet at 203.0.113.5:40000"));
+
+    let mut mgr = ChatManager::default();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    mgr.pending_upnp = Some(rx);
+    tx.send(Err(anyhow!("no gateway"))).unwrap();
+    mgr.poll_session_events();
+    assert_eq!(mgr.external_address, None);
+    assert!(mgr.pending_upnp.is_none());
+    assert!(mgr
+        .toasts
+        .iter()
+        .any(|t| t.message == "UPnP port mapping failed: no gateway (LAN/relay still work)"));
+
+    let mut mgr = ChatManager::default();
+    let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<MappedAddress>>();
+    mgr.pending_upnp = Some(rx);
+    drop(tx);
+    mgr.poll_session_events();
+    assert!(mgr.pending_upnp.is_none());
+    assert!(
+        mgr.toasts.is_empty(),
+        "a vanished attempt raised {:?}",
+        mgr.toasts
+    );
+}

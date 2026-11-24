@@ -598,9 +598,16 @@ impl ChatManager {
             tracing::warn!(%abandoned, "a new file offer arrived before the previous one finished");
             self.pending_file_end.remove(&abandoned);
             self.discard_spool(abandoned, "superseded");
-            self.set_transfer_status(
+            let filename = self.set_transfer_status(
                 abandoned,
                 TransferStatus::Failed("the sender started another file".to_string()),
+            );
+            // The new offer purges finished transfers from the list at once,
+            // so the failed row is never seen: without this the half-received
+            // file just vanished from the screen.
+            self.add_toast(
+                ToastLevel::Warning,
+                format!("File transfer interrupted (the sender started another file): {filename}"),
             );
         }
         let transfer_id = match self.start_receiving_file(chat_id, filename, size) {
