@@ -481,7 +481,7 @@ export default function App() {
         )}
         {nav === "contacts" && (
           <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }}
-            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) openConv(id); }}
+            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) void openConv(id); }}
             connectedChats={new Set(convs.filter((c) => c.connected).map((c) => c.id))} /></main>
         )}
         {nav === "settings" && (
