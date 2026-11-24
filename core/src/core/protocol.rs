@@ -948,6 +948,22 @@ mod tests {
         }
     }
 
+    /// The advertised signature-scheme list is capped at 8 entries (two exist):
+    /// a list of exactly 8 decodes, 9 is refused rather than passed on to the
+    /// negotiation.
+    #[test]
+    fn the_signature_scheme_list_is_capped_at_eight() {
+        let schemes = |n: usize| ProtocolMessage::SupportedSignatureSchemes {
+            schemes: vec![1; n],
+        };
+        assert_eq!(decode(&schemes(8)), Some(schemes(8)));
+        assert_eq!(
+            decode(&schemes(9)),
+            None,
+            "a 9-entry scheme list was accepted"
+        );
+    }
+
     /// A legacy numeric field is bounded at the longest decimal `u64` (20 bytes)
     /// before it is parsed: `u64::MAX` itself still decodes, but anything longer
     /// is refused — including padding that `trim` would otherwise have parsed
