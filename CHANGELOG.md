@@ -23,6 +23,14 @@ predate tagged releases.
   `brace-expansion` and `zod` updates clear five advisories in the test and
   build tooling; `npm audit` now reports none, with or without dev
   dependencies.
+- Desktop notifications on Linux (`notify-rust` 4.19) now talk to D-Bus through
+  `zbus` 6, which retires three unmaintained-crate advisory acceptances.
+  `uuid`, `zeroize` and `tauri-plugin-log` move to their latest patch releases.
+- `url` 2.5.9 and `cookie` 0.18.3 fix RUSTSEC-2026-0592 (stack overflow on
+  nested `blob:` URLs) and RUSTSEC-2026-0594 (private-cookie nonce reuse after
+  `fork`), reached through Tauri (and, for `url`, the UPnP client). `chrono` is now flagged unmaintained
+  upstream (RUSTSEC-2026-0543) with no release to move to; it is accepted, with
+  the reason, in `deny.toml` and `SECURITY.md`.
 
 ## [1.17.0] - 2026-11-09
 
