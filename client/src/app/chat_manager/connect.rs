@@ -48,8 +48,23 @@ impl ChatManager {
             // follows that decision: left on the invite's key, blocking it
             // later would block a key that never connects, and every
             // reconnect would warn about the key just accepted. Only ever on
-            // an explicit accept *of that warning* — never silently.
-            if let Some(FingerprintWarning::InviteMismatch { contact_id, .. }) = warning {
+            // an explicit accept *of a warning* — never silently.
+            //
+            // When the conversation's own key changed too, the prompt led with
+            // `KeyChanged` (the stronger claim) and the invite mismatch was
+            // not named in it — but the accepted key contradicts the invite
+            // all the same, so the session's expected key decides here, not
+            // just the warning that happened to be shown.
+            let rebind = match &warning {
+                Some(FingerprintWarning::InviteMismatch { contact_id, .. }) => Some(*contact_id),
+                Some(FingerprintWarning::KeyChanged { .. }) => self
+                    .expected_fingerprints
+                    .get(&chat_id)
+                    .filter(|e| !e.fingerprint.eq_ignore_ascii_case(&fp))
+                    .map(|e| e.contact_id),
+                None => None,
+            };
+            if let Some(contact_id) = rebind {
                 self.rebind_contact_fingerprint(contact_id, &fp);
             }
             // A user-confirmed fingerprint also verifies the matching contact.

@@ -437,7 +437,7 @@ async fn connect_to_blocked_contact_is_refused() {
     );
     mgr.block_contact(contact_id).unwrap();
 
-    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
     let err = mgr
         .connect_to_contact(contact_id, None, &privkey)
         .await
@@ -462,7 +462,7 @@ async fn dialing_an_invited_contact_warns_when_a_different_key_answers() {
         Some(invite_fp.clone()),
         None,
     );
-    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
     let chat_id = mgr
         .connect_to_contact(contact_id, None, &privkey)
         .await
@@ -507,7 +507,7 @@ async fn dialing_an_invited_contact_still_prompts_when_the_invite_key_answers() 
         Some(invite_fp.clone()),
         None,
     );
-    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
     let chat_id = mgr
         .connect_to_contact(contact_id, None, &privkey)
         .await
@@ -550,7 +550,7 @@ async fn auto_trust_does_not_accept_a_key_that_contradicts_the_invite() {
         Some(invite_fp.clone()),
         None,
     );
-    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
     let chat_id = mgr
         .connect_to_contact(contact_id, None, &privkey)
         .await
@@ -580,7 +580,7 @@ async fn accepting_a_key_over_the_invite_warning_rebinds_the_contact() {
         Some(invite_fp.clone()),
         None,
     );
-    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
     let chat_id = mgr
         .connect_to_contact(contact_id, None, &privkey)
         .await
@@ -596,6 +596,73 @@ async fn accepting_a_key_over_the_invite_warning_rebinds_the_contact() {
     let contact = mgr.get_contact(contact_id).unwrap();
     assert_eq!(contact.fingerprint.as_deref(), Some(presented_fp.as_str()));
     assert_eq!(contact.trust_state, TrustState::Verified);
+}
+
+/// The conversation's key changed *and* the invite named a third key: the
+/// prompt leads with the changed key, but accepting it must still move the
+/// contact to the accepted key. Otherwise the contact stays pinned to the
+/// invite's key and every later dial warns about the key just accepted.
+#[tokio::test]
+async fn accepting_a_changed_key_that_also_contradicts_the_invite_rebinds_the_contact() {
+    let invite_fp = "aa".repeat(32);
+    let previous_fp = "cc".repeat(32);
+    let presented_fp = "bb".repeat(32);
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.clone()),
+        None,
+    );
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some(previous_fp.clone());
+    mgr.handle_tofu_verification(chat_id, &presented_fp, "127.0.0.1:1", "123456 🎃🎈🎁");
+    assert_eq!(
+        mgr.pending_fingerprint().unwrap().warning,
+        Some(FingerprintWarning::KeyChanged {
+            previous: previous_fp.clone()
+        })
+    );
+
+    mgr.confirm_fingerprint(chat_id, true).unwrap();
+
+    assert_eq!(
+        mgr.get_chat(chat_id).unwrap().peer_fingerprint.as_deref(),
+        Some(presented_fp.as_str())
+    );
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.fingerprint.as_deref(), Some(presented_fp.as_str()));
+    assert_eq!(contact.trust_state, TrustState::Verified);
+}
+
+/// A changed key on a conversation that was dialled with the invite's own key
+/// leaves the contact alone: the invite was right, only the chat's pin moved.
+#[tokio::test]
+async fn accepting_a_changed_key_that_matches_the_invite_keeps_the_contact() {
+    let invite_fp = "aa".repeat(32);
+    let mut mgr = ChatManager::new(Config::default());
+    let contact_id = mgr.add_contact(
+        "Alice".into(),
+        Some("127.0.0.1:1".into()),
+        Some(invite_fp.clone()),
+        None,
+    );
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
+    let chat_id = mgr
+        .connect_to_contact(contact_id, None, &privkey)
+        .await
+        .unwrap();
+    mgr.get_chat_mut(chat_id).unwrap().peer_fingerprint = Some("cc".repeat(32));
+    mgr.handle_tofu_verification(chat_id, &invite_fp, "127.0.0.1:1", "123456 🎃🎈🎁");
+
+    mgr.confirm_fingerprint(chat_id, true).unwrap();
+
+    let contact = mgr.get_contact(contact_id).unwrap();
+    assert_eq!(contact.fingerprint.as_deref(), Some(invite_fp.as_str()));
 }
 
 /// A prompt for a conversation whose key changed says so in the prompt itself,
