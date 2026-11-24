@@ -950,6 +950,19 @@ mod tests {
         let hex_str = ed25519_public_to_hex(&vkey_orig);
         assert_eq!(hex_str.len(), 64);
         assert_eq!(ed25519_public_from_hex(&hex_str).unwrap(), vkey_orig);
+
+        // The private key, against RFC 8032 §7.1 test 1 (an independent known
+        // answer, so an export that returns anything but the key's bytes fails).
+        let secret = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let public = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let skey = ed25519_private_from_hex(secret).unwrap();
+        assert_eq!(ed25519_private_to_hex(&skey), secret);
+        assert_eq!(ed25519_public_to_hex(&skey.verifying_key()), public);
+        assert!(
+            ed25519_private_from_hex(&secret[..62]).is_err(),
+            "31 bytes accepted"
+        );
+        assert!(ed25519_private_from_hex("zz").is_err());
     }
 
     #[test]
