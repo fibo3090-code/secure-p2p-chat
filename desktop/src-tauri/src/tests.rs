@@ -1928,6 +1928,85 @@ fn the_poll_loop_slows_down_only_when_backgrounded_and_quiet() {
     );
 }
 
+/// What the poll loop tells the webview each tick. The loop itself needs a
+/// real window, so its decision is a method — and this is what pins it: only
+/// what changed is announced, a transfer's progress alone gets the light
+/// refresh, and a quiet tick says nothing.
+#[test]
+fn the_poll_loop_announces_only_what_changed() {
+    let mut memory = crate::PollMemory::default();
+    let (events, moved) = memory.refresh_events(1, 10, 100, false);
+    assert_eq!(
+        events,
+        ["state-updated", "party-updated"],
+        "the first tick paints everything"
+    );
+    assert!(moved);
+
+    let (events, moved) = memory.refresh_events(1, 10, 100, false);
+    assert!(events.is_empty() && !moved, "a quiet tick sent {events:?}");
+
+    // Only bytes moved: the light event, not a full refetch.
+    let (events, moved) = memory.refresh_events(1, 11, 100, false);
+    assert_eq!(events, ["transfers-updated"]);
+    assert!(moved);
+
+    // The surface and the transfers both changed: one full refresh covers both.
+    assert_eq!(
+        memory.refresh_events(2, 12, 100, false).0,
+        ["state-updated"]
+    );
+    // A newly published prompt forces a refresh even with nothing else new.
+    assert_eq!(memory.refresh_events(2, 12, 100, true).0, ["state-updated"]);
+    // Communities alone.
+    let (events, moved) = memory.refresh_events(2, 12, 101, false);
+    assert_eq!(events, ["party-updated"]);
+    assert!(moved);
+}
+
+/// The chat-surface signature moves for what the UI draws without a message
+/// count changing — a fingerprint accepted (the verified badge), hosting
+/// starting, a contact added — and stays put otherwise.
+#[test]
+fn the_ui_signature_moves_for_badges_and_hosting() {
+    let h = ready_harness();
+    let chat = h.seed_chat_with_incoming("Peer", 1);
+    let manager = h.bridge().manager.clone();
+    let sig = || {
+        let m = tauri::async_runtime::block_on(manager.lock());
+        crate::ui_signature_from(&m, crate::state_signature(&m))
+    };
+    let start = sig();
+    assert_eq!(sig(), start, "the signature is not stable");
+    tauri::async_runtime::block_on(async {
+        manager
+            .lock()
+            .await
+            .get_chat_mut(chat)
+            .unwrap()
+            .peer_fingerprint = Some("ab".repeat(32));
+    });
+    let verified = sig();
+    assert_ne!(
+        verified, start,
+        "accepting a fingerprint did not refresh the badge"
+    );
+    h.ipc("start_host", json!({ "port": 0, "password": null }))
+        .unwrap();
+    let hosting = sig();
+    assert_ne!(hosting, verified, "starting to host was not announced");
+    tauri::async_runtime::block_on(async {
+        manager
+            .lock()
+            .await
+            .add_contact("New".into(), Some("192.0.2.1:1".into()), None, None);
+    });
+    assert_ne!(sig(), hosting, "a new contact was not announced");
+    // With nothing in flight, transfer progress has nothing to report.
+    let m = tauri::async_runtime::block_on(manager.lock());
+    assert_eq!(crate::transfer_signature(&m), crate::transfer_signature(&m));
+}
+
 // ── Start-up (init_bridge) ──────────────────────────────────────────────────
 
 /// Run the real start-up path over `dir` (`P2PEM_DATA_DIR`), restoring the

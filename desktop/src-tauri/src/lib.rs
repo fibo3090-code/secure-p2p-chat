@@ -535,14 +535,12 @@ fn ui_signature_from(mgr: &ChatManager, state_sig: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     state_sig.hash(&mut h);
+    // TOFU trust (the "verified" badge) needs nothing here: accepting a
+    // fingerprint changes `state_sig`, which hashes every chat's
+    // `peer_fingerprint` — `the_ui_signature_moves_for_badges_and_hosting`
+    // pins that it moves.
     for id in mgr.chat_ids() {
         mgr.is_connected(&id).hash(&mut h);
-        // TOFU trust: accepting a fingerprint flips the conversation's
-        // "verified" badge without changing any message count, so it must
-        // perturb the signature or the warning UI goes stale.
-        if let Some(chat) = mgr.get_chat(id) {
-            chat.peer_fingerprint.hash(&mut h);
-        }
     }
     // A transfer starting, finishing or failing changes what the chat pane
     // shows; its byte count ticking up does not need the whole conversation
@@ -684,6 +682,47 @@ struct PollMemory {
     joined_recorded: std::collections::HashSet<Uuid>,
 }
 
+impl PollMemory {
+    /// Which refresh events one tick sends the webview, given this tick's
+    /// signatures, and whether anything moved at all (which keeps the loop on
+    /// its fast period).
+    ///
+    /// - `state-updated` when the rendered chat surface changed, or a TOFU
+    ///   prompt was just published (its fallback polling must run): the
+    ///   webview refetches everything, transfers included;
+    /// - otherwise `transfers-updated` when only transfer progress moved — the
+    ///   light refresh, instead of re-serialising every conversation four
+    ///   times a second for the length of a transfer (PERF-01);
+    /// - `party-updated` when the Communities surface changed.
+    ///
+    /// Nothing is sent for a tick on which nothing changed.
+    fn refresh_events(
+        &mut self,
+        ui_sig: u64,
+        transfer_sig: u64,
+        party_sig: u64,
+        new_prompt: bool,
+    ) -> (Vec<&'static str>, bool) {
+        let mut events = Vec::new();
+        let transfers_moved = self.last_transfer_sig != Some(transfer_sig);
+        self.last_transfer_sig = Some(transfer_sig);
+        let mut moved = transfers_moved;
+        if self.last_ui_sig != Some(ui_sig) || new_prompt {
+            moved = true;
+            self.last_ui_sig = Some(ui_sig);
+            events.push("state-updated");
+        } else if transfers_moved {
+            events.push("transfers-updated");
+        }
+        if self.last_party_sig != Some(party_sig) {
+            moved = true;
+            self.last_party_sig = Some(party_sig);
+            events.push("party-updated");
+        }
+        (events, moved)
+    }
+}
+
 /// Poll period while the user is looking, or something has just moved.
 const POLL_FAST: Duration = Duration::from_millis(250);
 /// Poll period in the background once nothing has moved for
@@ -757,23 +796,12 @@ fn spawn_poll_loop(app: tauri::AppHandle, ctx: PollContext) {
             }
             let new_prompt =
                 ctx.publish_fingerprint_prompt(&app, prompt, &mut memory.last_fp_session);
-            // Emit refresh events only when the rendered surface changed (or a
-            // TOFU prompt appeared, so its fallback polling always runs).
-            let transfers_moved = memory.last_transfer_sig != Some(transfer_sig);
-            memory.last_transfer_sig = Some(transfer_sig);
-            moved |= transfers_moved || memory.last_party_sig != Some(party_sig);
-            if memory.last_ui_sig != Some(ui_sig) || new_prompt {
-                moved = true;
-                memory.last_ui_sig = Some(ui_sig);
-                // A full refresh refetches the transfers too.
-                let _ = app.emit("state-updated", ());
-            } else if transfers_moved {
-                let _ = app.emit("transfers-updated", ());
-            }
-            // Nudge the Communities pane only when the directory/messages changed.
-            if memory.last_party_sig != Some(party_sig) {
-                memory.last_party_sig = Some(party_sig);
-                let _ = app.emit("party-updated", ());
+            // Emit refresh events only for what changed (see `refresh_events`).
+            let (events, changed) =
+                memory.refresh_events(ui_sig, transfer_sig, party_sig, new_prompt);
+            moved |= changed;
+            for event in events {
+                let _ = app.emit(event, ());
             }
             if moved {
                 last_activity = std::time::Instant::now();
