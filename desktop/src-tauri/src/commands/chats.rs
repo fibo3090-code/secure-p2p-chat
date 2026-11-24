@@ -354,18 +354,21 @@ async fn file_message_path(
 }
 
 /// Open a file with the OS default app, or reveal it in the file manager.
-/// Under `cfg(test)` the request is recorded (`tests::opened`) instead.
+/// In the bridge tests the request is recorded (`tests::opened`) instead. Same
+/// gate as the `tests` module itself, which is off on Windows (see
+/// Cargo.toml): a plain `cfg(test)` here named a module that does not exist
+/// there, and the Windows test build did not compile.
 fn open_path_os(path: &Path, reveal: bool) -> std::io::Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     {
         crate::tests::opened::record(path, reveal);
         Ok(())
     }
-    #[cfg(not(test))]
+    #[cfg(not(all(test, not(windows))))]
     launch_with_os(path, reveal)
 }
 
-#[cfg_attr(test, allow(dead_code))]
+#[cfg_attr(all(test, not(windows)), allow(dead_code))]
 fn launch_with_os(path: &Path, reveal: bool) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
