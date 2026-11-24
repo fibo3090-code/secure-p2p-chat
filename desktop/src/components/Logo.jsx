@@ -5,11 +5,13 @@
 // background, so the mark sits on dark and light surfaces alike.
 import { useId } from "react";
 
+// A titled mark is named by its <title> and aria-label; an untitled one is
+// decoration and hidden from assistive technology.
 export function Logo({ size = 32, title }) {
-  const gid = `p2pem-bubble-${useId().replace(/:/g, "")}`;
+  const gid = `p2pem-bubble-${useId().replaceAll(":", "")}`;
   return (
     <svg className="logo" width={size} height={size} viewBox="190 170 644 660"
-      role={title ? "img" : undefined} aria-label={title} aria-hidden={title ? undefined : true}
+      aria-label={title} aria-hidden={title ? undefined : true}
       focusable="false" xmlns="http://www.w3.org/2000/svg">
       {title && <title>{title}</title>}
       <defs>

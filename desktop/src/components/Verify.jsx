@@ -14,7 +14,8 @@ function group(fp) {
 // and eighteen", which is not how two people compare a code.
 function SasCode({ sas }) {
   const [digits, emoji] = splitSas(sas);
-  const spoken = `${digits.replace(/\s/g, "").split("").join(" ")}${emoji ? `, then ${emoji}` : ""}`;
+  const spokenDigits = digits.replace(/\s/g, "").split("").join(" ");
+  const spoken = emoji ? `${spokenDigits}, then ${emoji}` : spokenDigits;
   return (
     <div className="verify-sas" role="img" aria-label={`Safety code: ${spoken}`}>
       <span className="verify-sas-digits" aria-hidden="true">{digits}</span>
@@ -23,10 +24,18 @@ function SasCode({ sas }) {
   );
 }
 
+// Digits (and the spaces between them) first, emoji after. A single linear
+// scan rather than a backtracking pattern.
 function splitSas(sas) {
-  const m = String(sas || "").match(/^([\d\s]+)(.*)$/u);
-  return m ? [m[1].trim(), m[2].trim()] : [String(sas || ""), ""];
+  const s = String(sas || "");
+  let i = 0;
+  while (i < s.length && /[\d\s]/.test(s[i])) i++;
+  return i === 0 ? [s, ""] : [s.slice(0, i).trim(), s.slice(i).trim()];
 }
+
+// Fingerprints compared as the same 64 hex characters, whatever spacing or
+// case either side used.
+const normFp = (fp) => String(fp || "").replace(/\s+/g, "").toLowerCase();
 
 const LOOKUP_TIMEOUT_MS = 400;
 
@@ -64,15 +73,13 @@ export function Verify({ req, onClose }) {
       .finally(done);
     return () => { live = false; clearTimeout(timer); };
   }, [req?.chat_id]);
-  const changedNow = !!(known?.fingerprint && req?.fingerprint &&
-    String(known.fingerprint).replace(/\s+/g, "").toLowerCase() !== String(req.fingerprint).replace(/\s+/g, "").toLowerCase());
+  const changed = !!(known?.fingerprint && req?.fingerprint &&
+    normFp(known.fingerprint) !== normFp(req.fingerprint));
   // The lookup resolves after the dialog opened, so focus moves when the
   // changed-key state is known, not only on mount.
-  useEffect(() => { if (changedNow) rejectRef.current?.focus(); }, [changedNow]);
+  useEffect(() => { if (changed) rejectRef.current?.focus(); }, [changed]);
   if (!req) return null;
   const first = req.peer_name.split(" ")[0];
-  const norm = (fp) => String(fp || "").replace(/\s+/g, "").toLowerCase();
-  const changed = !!(known?.fingerprint && req.fingerprint && norm(known.fingerprint) !== norm(req.fingerprint));
   const route = known?.transport === "relay" ? "Via relay — the relay can't read this conversation"
     : known?.transport === "server" ? "Via a community server"
       : known?.transport === "direct" ? "Direct connection" : null;

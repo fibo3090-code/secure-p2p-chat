@@ -184,7 +184,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
           <Button variant="ghost" icon="plus" onClick={() => setAnother(true)}>Join another community</Button>
         </div>
       )}
-      {showForm && <form className="card" onSubmit={(e) => { e.preventDefault(); join(); }}>
+      {showForm && <form className="card" onSubmit={(e) => { e.preventDefault(); void join(); }}>
         <h2 className="card-title">{pickedSaved ? `Rejoin ${pickedSaved.name || pickedSaved.address}` : "Join a community"}</h2>
         <p className="card-lead">
           {pickedSaved

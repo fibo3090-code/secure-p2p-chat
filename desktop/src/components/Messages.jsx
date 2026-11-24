@@ -67,7 +67,7 @@ function ChatMenu({ contact, onVerify, onRename, onDelete, onInfo }) {
             {!isPlaceholder && (
               <button role="menuitem" onClick={item(onRename)}><Icon name="edit" size={15} /> Rename</button>
             )}
-            <div className="pop-sep" role="separator" />
+            <hr className="pop-sep" />
             <button role="menuitem" className="is-danger" onClick={item(onDelete)}>
               <Icon name="trash" size={15} /> {isPlaceholder ? "Stop listening" : "Delete conversation"}
             </button>

@@ -78,7 +78,7 @@ export function Contacts({ onConnected, onOpenChat, connectedChats }) {
     <Page title="Contacts"
       sub={contacts.length === 0 ? "People you add from an invite link"
         : `${contacts.length} saved · ${verifiedCount} verified`}>
-      <form className="contact-import" onSubmit={(e) => { e.preventDefault(); importLink(); }}>
+      <form className="contact-import" onSubmit={(e) => { e.preventDefault(); void importLink(); }}>
         <label className="field-label" htmlFor="invite-link">Add someone from their invite link</label>
         <div className="creator-row">
           <input id="invite-link" className="input" value={link}
@@ -93,12 +93,12 @@ export function Contacts({ onConnected, onOpenChat, connectedChats }) {
         {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
       </form>
 
-      <div className="list-card" role="list" aria-label="Contacts">
+      <ul className="list-card" aria-label="Contacts">
         {contacts.length === 0 && (
-          <div className="list-empty">
+          <li className="list-empty">
             <Icon name="user" size={22} />
             <span>No contacts yet. Paste an invite link above to add your first one.</span>
-          </div>
+          </li>
         )}
         {contacts.map((c) => {
           const blocked = c.trust === "blocked";
@@ -111,7 +111,7 @@ export function Contacts({ onConnected, onOpenChat, connectedChats }) {
             : !c.reachable ? "No saved address"
               : c.relay_only ? "Reachable via relay" : "Reachable directly";
           return (
-            <div key={c.id} className={cx("contact-row", blocked && "is-blocked")} role="listitem">
+            <li key={c.id} className={cx("contact-row", blocked && "is-blocked")}>
               <Avatar name={c.name} size={42} />
               {/* The row opens the conversation you already have with them;
                   Connect is the separate, explicit action that dials. */}
@@ -152,10 +152,10 @@ export function Contacts({ onConnected, onOpenChat, connectedChats }) {
                   { icon: "trash", label: "Delete contact", danger: true, onClick: () => setDeleteTarget(c) },
                 ]} />
               </div>
-            </div>
+            </li>
           );
         })}
-      </div>
+      </ul>
 
       {deleteTarget && (
         <Modal open onClose={() => setDeleteTarget(null)} width={420}
