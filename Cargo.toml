@@ -8,7 +8,7 @@ default-members = ["client"]
 [workspace.package]
 version = "1.17.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.92"
 authors = ["fibo3090 <fibo3090@example.com>"]
 license = "MIT"
 
@@ -96,7 +96,7 @@ argon2 = "0.6"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # File dialogs
-rfd = "0.17.2"
+rfd = "0.18.0"
 
 # Open files
 open = "5"

@@ -23,6 +23,9 @@ predate tagged releases.
 - UPnP port mapping (`igd-next`) 0.17 → 0.18. `mdns-sd`, `uuid`, `serde_json`,
   `arboard`, `open`, `log`, `unicode-width`, `tauri-build`, `tauri-plugin-log`
   and `proptest` move to their latest compatible releases.
+- Native file dialogs: `rfd` 0.17 → 0.18 (GTK3 memory-leak fixes among
+  others). It needs Rust 1.92, so the minimum supported Rust version for
+  building from source rises from 1.90 to 1.92.
 - Desktop front-end: lucide-react 1.70, and the Tauri CLI moves to 2.12 to
   match the Tauri crate and `@tauri-apps/api`.
 - Development tooling only, nothing that ships: jsdom 30, Playwright 1.64,
