@@ -838,8 +838,10 @@ mod tests {
             "the PKCS#1 private encoding changed"
         );
         let pkcs1_pem = pem_encode_private(&key).unwrap();
+        // `pem_encode_private` uses the platform's line ending (CRLF on
+        // Windows), so the text is compared with LF line endings.
         assert_eq!(
-            hex::encode(Sha256::digest(pkcs1_pem.as_bytes())),
+            hex::encode(Sha256::digest(pkcs1_pem.replace("\r\n", "\n").as_bytes())),
             PKCS1_PEM_SHA256,
             "pem_encode_private's output changed"
         );
