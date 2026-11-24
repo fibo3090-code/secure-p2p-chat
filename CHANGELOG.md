@@ -13,6 +13,13 @@ predate tagged releases.
 
 ### Dependencies
 
+- `rsa` 0.9 → 0.10. Its private-key arithmetic is now constant-time
+  (`crypto-bigint`), which fixes the Marvin timing advisory RUSTSEC-2023-0071
+  that `deny.toml` had accepted (the app only ever signed with RSA, never
+  decrypted). Keys, fingerprints, the derived Ed25519 subkey, the history key
+  and RSA-PSS signatures are byte-for-byte what 0.9 produced, pinned by a new
+  known-answer test, so existing identities, histories, pins and peers on older
+  versions are unaffected in both directions.
 - UPnP port mapping (`igd-next`) 0.17 → 0.18. `mdns-sd`, `uuid`, `serde_json`,
   `arboard`, `open`, `log`, `unicode-width`, `tauri-build`, `tauri-plugin-log`
   and `proptest` move to their latest compatible releases.
@@ -23,13 +30,6 @@ predate tagged releases.
   `brace-expansion` and `zod` updates clear five advisories in the test and
   build tooling; `npm audit` now reports none, with or without dev
   dependencies.
-- `rsa` 0.9 → 0.10. Its private-key arithmetic is now constant-time
-  (`crypto-bigint`), which fixes the Marvin timing advisory RUSTSEC-2023-0071
-  that `deny.toml` had accepted (the app only ever signed with RSA, never
-  decrypted). Keys, fingerprints, the derived Ed25519 subkey, the history key
-  and RSA-PSS signatures are byte-for-byte what 0.9 produced, pinned by a new
-  known-answer test, so existing identities, histories, pins and peers on older
-  versions are unaffected in both directions.
 
 ## [1.17.0] - 2026-11-09
 
