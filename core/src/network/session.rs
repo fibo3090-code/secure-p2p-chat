@@ -1663,6 +1663,37 @@ mod tests {
         pem_encode_public(&RsaPublicKey::from(key)).unwrap()
     }
 
+    /// The version goes on the wire as a plaintext big-endian u32, and it is
+    /// the one thing an older peer reads before deciding how to talk to us.
+    /// Two peers built from the same code agree on any value, so only a known
+    /// answer catches it drifting: big-endian, high bytes zero, equal to
+    /// `PROTOCOL_VERSION` (bump that, not this encoding, to change it).
+    /// The plaintext version check is the first thing either side does, and
+    /// the downgrade floor: anything before v3 (no ECDH-first handshake) is
+    /// refused, naming the other side from our role, while v3 and the current
+    /// version pass. A packet that is not exactly four bytes is refused too.
+    #[test]
+    fn peers_before_v3_are_refused_and_named() {
+        let packet = |v: u32| v.to_be_bytes();
+        for (us, them) in [(NonceRole::Host, "Client"), (NonceRole::Client, "Host")] {
+            let err = check_peer_version(&packet(2), us).unwrap_err().to_string();
+            assert_eq!(err, format!("{them} version 2 too old (need v3+)"));
+            assert_eq!(check_peer_version(&packet(3), us).unwrap(), 3);
+            let current = PROTOCOL_VERSION as u32;
+            assert_eq!(check_peer_version(&packet(current), us).unwrap(), current);
+            for bad in [&[0u8, 0, 3][..], &[0, 0, 0, 3, 0]] {
+                assert!(check_peer_version(bad, us).is_err(), "{bad:?} accepted");
+            }
+        }
+    }
+
+    #[test]
+    fn our_version_goes_on_the_wire_as_a_big_endian_u32() {
+        let v = PROTOCOL_VERSION as u32;
+        assert!(v < 256, "update this known answer for a version over 255");
+        assert_eq!(our_version_bytes(), [0, 0, 0, v as u8]);
+    }
+
     fn identity_proof(pem: String, signature: Vec<u8>, scheme: SignatureScheme) -> IdentityProof {
         IdentityProof {
             public_key_pem: pem,
