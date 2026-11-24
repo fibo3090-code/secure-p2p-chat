@@ -403,6 +403,59 @@ here beyond the findings named elsewhere in this section.
   keychain or TPM). Left open on purpose rather than shipped as a protection
   that only looks like one.
 
+### Second pass, on the tree merged with `main` (2026-11-24)
+
+After merging `main` (desktop redesign, CRYPTO-04, rsa 0.10), coverage was
+re-measured **from a clean profile**: the earlier figures mixed stale
+instrumented binaries and shifted line numbers. Rust is at **91.6 % of lines**
+(`cargo llvm-cov`, all crates), the frontend at **82.7 %** (vitest + v8).
+`server/src/main.rs` and `client/src/main.rs` read lower than what is tested,
+because the CLI tests stop those binaries with `kill()` (SIGKILL) and a killed
+process writes no profile.
+
+**Bug found and fixed.** A peer offering a second file while the first was
+still streaming made the first vanish from the transfer list with no message:
+its "the sender started another file" status was purged in the same call
+that set it. A warning now names the file
+(`a_file_offer_that_cannot_proceed_cleans_up_and_tells_the_sender`, seen
+failing before the fix).
+
+**Tests that could not fail, fixed.**
+- `Settings` "rolls a rejected toggle back rather than leaving it flipped"
+  checked only the error toast; it passed with the rollback deleted.
+- `the_ui_signature_moves_for_badges_and_hosting` ended on
+  `transfer_signature(m) == transfer_signature(m)`; replaced by
+  `transfer_progress_and_transfer_state_move_different_signatures`.
+- `renders_every_overlay_without_panic` passes for an overlay that draws
+  nothing; `overlays_say_what_the_state_they_show_is` checks the words.
+
+**Contracts now tested from both sides.**
+- `desktop/src/lib/bridge.invoke.test.js` runs every real `bridge.js` wrapper
+  against a recording `invoke`: each command must be registered in
+  `invoke_handler()`, and its exact key set must be one a Rust IPC test sends.
+  This is the arg-naming footgun behind "messages send but don't arrive".
+- `list_transfers_reports_each_status_in_the_frontends_words` pins the status
+  strings `Messages.jsx` branches on.
+
+**Previously untested code now exercised**, each test seen failing under a
+deliberate break of the code it covers:
+- the desktop poll loop's body (`PollContext::tick`, now separate from the
+  loop so the mock runtime can run it);
+- `--retain-days` pruning at server start-up;
+- start-up auto-reconnect and auto-host;
+- the hosting guards (a second listener, a dead one, repeated bind failures);
+- the TUI's community governance and messaging commands, and the transfers
+  overlay;
+- the protocol's redacting `Debug` (no message text or key bytes in logs)
+  and the legacy `FILE_CHUNK` arm;
+- Reconnect choosing the right saved contact;
+- the listener card and every Settings switch's wiring.
+
+**Left open on purpose.** QUAL-10 (the async `IncomingFile` receiver has no
+caller in this workspace) is public API of `messenger-core`, and the agent CLI
+lives in a sibling repository this pass could not inspect. Deleting it, and its
+test, waits on checking that repository.
+
 ## Method and limits
 
 - Static reading of every file in each area, by thirteen auditors in parallel
