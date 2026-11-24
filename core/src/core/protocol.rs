@@ -820,6 +820,115 @@ mod tests {
         assert!(decode(&text_chunk(0, crate::MAX_TEXT_CHUNKS, x())).is_some());
     }
 
+    /// Frames are logged (`?msg` at debug), and the log goes into clipboard
+    /// copies and diagnostics bundles. The hand-written `Debug` is what keeps
+    /// message text and key material out of it: text is redacted and key
+    /// bytes are reported by length only. Every variant is formatted, so a new
+    /// one cannot fall back to a derived `Debug` unnoticed.
+    #[test]
+    fn debug_output_never_carries_message_text_or_key_bytes() {
+        let secret = "the launch code is 0000";
+        let key = vec![0xAB; 32];
+        let frames = [
+            ProtocolMessage::Version { version: 5 },
+            ProtocolMessage::EphemeralKey {
+                public_key: key.clone(),
+            },
+            ProtocolMessage::SupportedSignatureSchemes {
+                schemes: vec![1, 2],
+            },
+            ProtocolMessage::Text {
+                text: secret.into(),
+                timestamp: 1,
+                seq: 2,
+            },
+            ProtocolMessage::TextChunk {
+                message_id: Uuid::nil(),
+                chunk_index: 0,
+                total_chunks: 2,
+                text_part: secret.into(),
+                timestamp: 1,
+                seq: 3,
+            },
+            ProtocolMessage::FileMeta {
+                filename: "plan.pdf".into(),
+                size: 9,
+                seq: 4,
+            },
+            ProtocolMessage::FileChunk {
+                chunk: secret.as_bytes().to_vec(),
+                seq: 5,
+            },
+            ProtocolMessage::FileEnd { seq: 6 },
+            ProtocolMessage::FileCancel { seq: 7 },
+            ProtocolMessage::Ping { seq: 8 },
+            ProtocolMessage::TypingStart { seq: 9 },
+            ProtocolMessage::TypingStop { seq: 10 },
+            ProtocolMessage::Rekey {
+                nonce: key.clone(),
+                seq: 11,
+            },
+            ProtocolMessage::Ack {
+                acked_seq: 3,
+                seq: 12,
+            },
+        ];
+        let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        for frame in &frames {
+            let shown = format!("{frame:?}");
+            assert!(!shown.contains(secret), "{shown}");
+            assert!(!shown.contains("171, 171"), "key bytes in {shown}");
+            assert!(
+                !shown.to_lowercase().contains(&key_hex),
+                "key hex in {shown}"
+            );
+        }
+        let shown = |i: usize| format!("{:?}", frames[i]);
+        assert!(shown(3).contains("REDACTED") && shown(4).contains("REDACTED"));
+        assert!(shown(1).contains("public_key_len: 32"), "{}", shown(1));
+        assert!(shown(12).contains("nonce_len: 32"), "{}", shown(12));
+        assert!(shown(6).contains("chunk_len: 23"), "{}", shown(6));
+        // What is not secret stays useful for debugging.
+        assert!(shown(5).contains("plan.pdf") && shown(13).contains("acked_seq: 3"));
+    }
+
+    /// The legacy ASCII `FILE_CHUNK:<seq>:<bytes>` arm: the bytes are taken
+    /// verbatim (binary, so never text-decoded), capped at `FILE_CHUNK_SIZE`
+    /// like the binary arm, and a frame with no separator or a bad sequence is
+    /// refused rather than defaulted.
+    #[test]
+    fn legacy_file_chunks_parse_and_are_capped() {
+        let mut frame = b"FILE_CHUNK:12:".to_vec();
+        frame.extend_from_slice(&[0xFF, 0x00, b':', 0x80]);
+        assert_eq!(
+            ProtocolMessage::from_plain_bytes(&frame),
+            Some(ProtocolMessage::FileChunk {
+                chunk: vec![0xFF, 0x00, b':', 0x80],
+                seq: 12
+            })
+        );
+        let mut full = b"FILE_CHUNK:1:".to_vec();
+        full.extend(std::iter::repeat_n(7u8, crate::FILE_CHUNK_SIZE));
+        assert!(ProtocolMessage::from_plain_bytes(&full).is_some());
+        full.push(7);
+        assert!(
+            ProtocolMessage::from_plain_bytes(&full).is_none(),
+            "an oversized chunk was accepted"
+        );
+        for bad in [
+            &b"FILE_CHUNK:12"[..],
+            b"FILE_CHUNK:x:abc",
+            b"FILE_CHUNK:-1:abc",
+            b"FILE_CHUNK::abc",
+        ] {
+            assert!(
+                ProtocolMessage::from_plain_bytes(bad).is_none(),
+                "{:?} parsed",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
     #[test]
     fn legacy_ascii_formats_still_parse() {
         assert_eq!(
