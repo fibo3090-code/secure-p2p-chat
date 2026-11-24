@@ -2646,3 +2646,158 @@ fn an_unsigned_invite_cannot_change_an_existing_contact() {
     );
     assert_eq!(mgr.contacts[&id].trust_state, TrustState::Verified);
 }
+
+/// One listener at a time: a second `start_host` is refused while the first
+/// is live (and so is relay hosting), but a placeholder whose session has
+/// died — its task gone, nothing listening — is cleared and replaced rather
+/// than blocking hosting for the rest of the process.
+#[tokio::test]
+async fn hosting_twice_is_refused_but_a_dead_listener_is_replaced() {
+    let mut mgr = ChatManager::default();
+    let first = mgr.start_host(0, throwaway_key()).await.unwrap();
+
+    let again = mgr.start_host(0, throwaway_key()).await;
+    assert!(
+        again.unwrap_err().to_string().contains("Already listening"),
+        "a second listener was started"
+    );
+    let relay = mgr
+        .start_host_via_relay("127.0.0.1:1", None, throwaway_key())
+        .await;
+    assert!(relay.unwrap_err().to_string().contains("Already hosting"));
+    assert_eq!(
+        mgr.chats.values().filter(|c| c.is_host_placeholder).count(),
+        1
+    );
+
+    // The session behind the placeholder is gone (as after a crash in its
+    // task): the next start clears it and listens again.
+    mgr.teardown_session(first);
+    let second = mgr.start_host(0, throwaway_key()).await.unwrap();
+    assert_ne!(second, first);
+    assert!(
+        !mgr.chats.contains_key(&first),
+        "the dead placeholder stayed"
+    );
+    assert_eq!(
+        mgr.chats.values().filter(|c| c.is_host_placeholder).count(),
+        1
+    );
+    mgr.stop_hosting();
+}
+
+/// Auto-rehost is a timer, so a port that cannot be bound must not be retried
+/// for ever while the app claims to be hosting: after
+/// `MAX_CONSECUTIVE_REHOST_FAILURES` failures in a row it stops and says why.
+/// A success in between resets the count — a transient failure is not one of
+/// a run.
+#[tokio::test]
+async fn repeated_bind_failures_stop_hosting_but_a_success_resets_the_count() {
+    use super::MAX_CONSECUTIVE_REHOST_FAILURES as MAX;
+    let taken = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut mgr = ChatManager::default();
+    mgr.is_hosting = true;
+    mgr.hosting_port = Some(port);
+    for _ in 0..MAX - 1 {
+        assert!(mgr.start_host(port, throwaway_key()).await.is_err());
+    }
+    assert!(mgr.is_hosting, "stopped before the limit");
+    // A success resets the run.
+    let ok = mgr.start_host(0, throwaway_key()).await.unwrap();
+    mgr.remove_host_placeholder(ok);
+    for _ in 0..MAX - 1 {
+        assert!(mgr.start_host(port, throwaway_key()).await.is_err());
+    }
+    assert!(mgr.is_hosting, "a success did not reset the failure count");
+    assert!(mgr.start_host(port, throwaway_key()).await.is_err());
+    assert!(
+        !mgr.is_hosting,
+        "hosting continued after {MAX} failures in a row"
+    );
+    assert_eq!(mgr.hosting_port, None);
+    assert!(
+        mgr.toasts
+            .iter()
+            .any(|t| t.message.starts_with("Stopped hosting —")),
+        "the user was not told why"
+    );
+    drop(taken);
+}
+
+/// `auto_reconnect_contacts` runs when the desktop app unlocks. With
+/// `auto_connect` off it dials nobody. On, it dials each mapped contact into
+/// *its own* conversation (not a new one), skips a blocked contact, and drops a
+/// mapping whose contact has been deleted rather than tripping on it each
+/// start-up. (The blocked skip is two layers deep — `connect_to_contact`
+/// refuses a blocked contact too — so this fails only when both go.)
+#[tokio::test]
+async fn auto_reconnect_dials_mapped_contacts_into_their_own_conversations() {
+    use std::time::{Duration, Instant};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    let mut mgr = ChatManager::default();
+    let (alice_chat, blocked_chat, orphan_chat) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for (id, title) in [
+        (alice_chat, "Alice"),
+        (blocked_chat, "Mallory"),
+        (orphan_chat, "Gone"),
+    ] {
+        mgr.create_local_chat_for_test(id, title.into());
+    }
+    let alice = mgr.add_contact("Alice".into(), Some(addr.clone()), None, None);
+    let mallory = mgr.add_contact("Mallory".into(), Some(addr.clone()), None, None);
+    mgr.block_contact(mallory).unwrap();
+    let deleted = Uuid::new_v4();
+    mgr.contact_to_chat.insert(alice, alice_chat);
+    mgr.contact_to_chat.insert(mallory, blocked_chat);
+    mgr.contact_to_chat.insert(deleted, orphan_chat);
+    let chats_before = mgr.chats.len();
+
+    mgr.config.auto_connect = false;
+    mgr.auto_reconnect_contacts(&throwaway_key()).await;
+    assert!(mgr.sessions.is_empty(), "dialled with auto_connect off");
+    assert!(
+        mgr.contact_to_chat.contains_key(&deleted),
+        "touched state while off"
+    );
+
+    mgr.config.auto_connect = true;
+    mgr.auto_reconnect_contacts(&throwaway_key()).await;
+    assert!(
+        mgr.sessions.contains_key(&alice_chat),
+        "Alice was not dialled into her chat"
+    );
+    assert!(
+        !mgr.sessions.contains_key(&blocked_chat),
+        "a blocked contact was dialled"
+    );
+    assert!(
+        !mgr.contact_to_chat.contains_key(&deleted),
+        "the stale mapping stayed"
+    );
+    assert_eq!(mgr.contact_to_chat.get(&alice), Some(&alice_chat));
+    assert_eq!(
+        mgr.chats.len(),
+        chats_before,
+        "a reconnect opened a new conversation"
+    );
+
+    // And the dial really reached the address: exactly one connection.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut accepted = 0;
+    while Instant::now() < deadline && accepted == 0 {
+        match listener.accept() {
+            Ok(_) => accepted += 1,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert_eq!(accepted, 1, "nothing dialled the contact's address");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        listener.accept().is_err(),
+        "the blocked contact was dialled too"
+    );
+}
