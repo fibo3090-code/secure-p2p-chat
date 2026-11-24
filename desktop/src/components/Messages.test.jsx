@@ -415,3 +415,48 @@ describe("ChatPane links", () => {
     });
   }
 });
+
+// A listener's thread is where the user goes to find what to give the other
+// person. "Waiting for someone to connect" with no address on it was a dead
+// end; the card shows the addresses the backend reports, copies exactly what
+// it shows, and says plainly when new peers are being refused.
+describe("ChatPane while listening", () => {
+  const base = { draft: "", setDraft: () => {}, onSend: () => {}, transfers: [], onStart: () => {} };
+  const hosting = () => contactFixture({ state: "hosting", placeholder: true, trust: "unverified", messages: [] });
+
+  it("shows where it can be reached, and copies what it shows", async () => {
+    let answer;
+    installApi({
+      myAddresses: () => new Promise((r) => { answer = r; }),
+      myInviteLink: "chat-p2p://invite/v2/abc",
+    });
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const onDelete = vi.fn();
+    render(<ChatPane {...base} contact={hosting()} onDelete={onDelete} />);
+
+    expect(await screen.findByText("Waiting for someone to connect")).toBeTruthy();
+    expect(screen.getByText("Looking up your address…")).toBeTruthy();
+    answer({ local: "192.168.1.20:12345", external: "203.0.113.5:40000" });
+    expect(await screen.findByText("192.168.1.20:12345")).toBeTruthy();
+    expect(screen.getByText("203.0.113.5:40000")).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "Copy over the internet address" }));
+    expect(writeText).toHaveBeenLastCalledWith("203.0.113.5:40000");
+    await userEvent.click(screen.getByRole("button", { name: /Copy invite link/ }));
+    expect(writeText).toHaveBeenLastCalledWith("chat-p2p://invite/v2/abc");
+
+    await userEvent.click(screen.getByRole("button", { name: /Stop listening/ }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("says it is refusing new peers while the door is closed", async () => {
+    installApi({ myAddresses: { local: "192.168.1.20:12345", external: null }, myInviteLink: "" });
+    render(<ChatPane {...base} contact={hosting()} gateClosed />);
+    expect(await screen.findByText("Paused — not accepting new peers")).toBeTruthy();
+    // Only the address that exists is offered, and no empty invite button.
+    expect(await screen.findByText("192.168.1.20:12345")).toBeTruthy();
+    expect(screen.queryByText("Over the internet")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Copy invite link/ })).toBeNull();
+  });
+});

@@ -95,8 +95,38 @@ describe("Settings", () => {
     // when the backend kept it off is telling the user the wrong thing about
     // whether peers can write to their disk unattended.
     const row = await screen.findByText("Auto-accept incoming files");
+    const toggle = row.closest('[role="switch"]');
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
     await userEvent.click(row);
     await waitFor(() => expect(toasts().at(-1)?.message).toMatch(/read-only/));
+    // The title's promise: the switch shows the backend's value again.
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  // Every switch is the same component, so the bug to catch is wiring: a
+  // label that writes another setting ("Reconnect contacts" flipping mDNS,
+  // which announces you on the LAN). Each one must write its own key, the
+  // flipped value, and nothing else.
+  it.each([
+    ["Desktop notifications", "enable_notifications"],
+    ["Send typing indicators", "enable_typing_indicators"],
+    ["Host automatically on startup", "auto_host_on_startup"],
+    ["UPnP port mapping", "enable_upnp"],
+    ["Reconnect contacts on startup", "auto_connect"],
+    ["LAN peer discovery (mDNS)", "enable_mdns"],
+    ["Auto-accept incoming files", "auto_accept_files"],
+  ])("%s writes %s and only that", async (label, key) => {
+    const api = installApi({ getSettings: settings });
+    render(<Settings identity={identity} theme="dark" setTheme={() => {}} />);
+    const toggle = (await screen.findByText(label)).closest('[role="switch"]');
+    expect(toggle.getAttribute("aria-checked")).toBe(String(settings[key]));
+    await userEvent.click(toggle);
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalledTimes(1));
+    const sent = api.updateSettings.mock.calls[0][0];
+    const changed = Object.keys(sent).filter((k) => sent[k] !== settings[k]);
+    expect(changed).toEqual([key]);
+    expect(sent[key]).toBe(!settings[key]);
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe(String(!settings[key])));
   });
 
   it("refuses a port outside 1–65535 and restores the previous value", async () => {
