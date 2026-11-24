@@ -31,7 +31,7 @@ serde_json = "1"
 bincode = "1"
 
 # Cryptography (RustCrypto)
-rsa = "0.9.10"
+rsa = "0.10.0"
 sha2 = "0.10"
 # Constant-time primitives (used for secret comparisons that must not leak
 # their match length through timing).
@@ -126,7 +126,11 @@ proptest = "1"
 # generation and Argon2 were ~95% of all test time unoptimised; at opt-level 3
 # the core unit tests went from 133 s to 8 s (audit DX-01). The workspace's own
 # crates keep debug assertions and fast incremental builds.
-[profile.dev.package.num-bigint-dig]
+# rsa 0.10 does its arithmetic in crypto-bigint (and its key generation in
+# crypto-primes) rather than num-bigint-dig, so those are what need it now.
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.crypto-primes]
 opt-level = 3
 [profile.dev.package.rsa]
 opt-level = 3
@@ -135,10 +139,6 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 [profile.dev.package.sha2]
-opt-level = 3
-[profile.dev.package.num-integer]
-opt-level = 3
-[profile.dev.package.num-traits]
 opt-level = 3
 
 # Line tables are enough for test-failure backtraces; full debuginfo made each

@@ -25,7 +25,7 @@ fn an_invite_whose_fingerprint_contradicts_its_key_is_refused() {
 
     // A real key, paired with a fingerprint that is not its own.
     let key = generate_rsa_keypair(RSA_KEY_BITS).expect("key");
-    let pem = messenger_core::core::pem_encode_public(&rsa::RsaPublicKey::from(&key))
+    let pem = messenger_core::core::pem_encode_public(&rsa::PublicKey::from(&key))
         .expect("encode public key");
     let honest = messenger_core::core::fingerprint_pubkey(pem.as_bytes()).unwrap();
     let forged = "ff".repeat(32);

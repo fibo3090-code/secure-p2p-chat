@@ -15,9 +15,9 @@ version = 2
 # the `image` AVIF chain, and those entries went with it.
 # Verify a claim before adding one: `cargo tree --workspace --target all -i <crate>`.
 ignore = [
-    "RUSTSEC-2023-0071", # rsa Marvin timing issue. No upstream fix. Used for
-                         # RSA-PSS *signatures* only; this app performs no RSA
-                         # decryption, which is what the attack targets.
+    # RUSTSEC-2023-0071 (rsa Marvin timing issue) was accepted here while no
+    # fix existed. rsa 0.10 does its private-key arithmetic in constant-time
+    # crypto-bigint and is listed as patched, so the entry was removed.
     "RUSTSEC-2024-0436", # paste unmaintained (transitive, proc-macro/build-time)
     "RUSTSEC-2025-0141", # bincode unmaintained (direct in core, migration pending)
     # chrono unmaintained (announced upstream, chronotope/chrono#1768; no

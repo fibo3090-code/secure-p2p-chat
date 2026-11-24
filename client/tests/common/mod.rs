@@ -12,7 +12,7 @@ use messenger_server::run_accept_loop;
 use messenger_server::state::PartyState;
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
 use p2pem_classic::app::ChatManager;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

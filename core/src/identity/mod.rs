@@ -12,7 +12,7 @@ use chacha20poly1305::{
 use rand::RngCore;
 use rsa::{
     pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
-    RsaPrivateKey, RsaPublicKey,
+    PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -106,7 +106,7 @@ impl Identity {
 
     fn generate(name: String, keep_plaintext: bool) -> Result<Self> {
         tracing::info!("Generating new identity (plaintext kept: {keep_plaintext}) for: {name}");
-        let private_key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)?;
+        let private_key = crate::core::crypto::generate_rsa_keypair(2048)?;
         let public_key_pem = RsaPublicKey::from(&private_key).to_public_key_pem(LineEnding::LF)?;
         let private_key_pem_plaintext = if keep_plaintext {
             Some(Zeroizing::new(
@@ -558,9 +558,17 @@ mod tests {
 
     fn kat_identity() -> Identity {
         use rsa::traits::PublicKeyParts;
-        use rsa::BigUint;
+        use rsa::BoxedUint;
 
-        let big = |h: &str| BigUint::parse_bytes(h.as_bytes(), 16).unwrap();
+        let big = |h: &str| {
+            let bytes = hex::decode(if h.len() % 2 == 1 {
+                format!("0{h}")
+            } else {
+                h.to_string()
+            })
+            .unwrap();
+            BoxedUint::from_be_slice_vartime(&bytes)
+        };
         let key = RsaPrivateKey::from_components(
             big(KAT_N),
             big(KAT_E),
@@ -588,6 +596,115 @@ mod tests {
                 key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string(),
             )),
         }
+    }
+
+    /// Every RSA artefact peers and files depend on, pinned to what `rsa` 0.9
+    /// produced for the same key. `history_key_derivation_is_frozen` covers the
+    /// PKCS#8 encoding; this covers the rest of what an `rsa` upgrade can move:
+    ///
+    /// - the public PEM and the fingerprint derived from it (every pin,
+    ///   verified contact and invite is keyed by it);
+    /// - the PKCS#1 private encoding `pem_encode_private` writes;
+    /// - the Ed25519 subkey, which is derived from the PKCS#8 DER — a shift
+    ///   there silently changes the key every v4 peer has bound to us;
+    /// - RSA-PSS signatures made by 0.9 (identity proofs, invites, Ed25519
+    ///   bindings) still verifying, and new ones verifying with the same
+    ///   salt length 0.9 required.
+    ///
+    /// As with the history key, a failure here is not an expectation to update:
+    /// it means the upgrade breaks existing users or peers.
+    #[test]
+    fn rsa_artefacts_match_what_rsa_0_9_produced() {
+        use crate::core::crypto::{
+            cross_sign_ed25519, derive_ed25519_subkey, pem_decode_private, pem_encode_private,
+            rsa_sign_pss, rsa_verify_pss, verify_ed25519_binding,
+        };
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::signature::Verifier;
+
+        const PUBLIC_PEM_SHA256: &str =
+            "3dd4b1c4ca3f12e462b6bb3e611658fe79356a47c57d09e12fc44ad2f2f56c09";
+        const FINGERPRINT: &str =
+            "451daceba2d7f52a6d668e87363395bfa11e4e50f6ceeaaa051865181240bcac";
+        const PKCS1_DER_SHA256: &str =
+            "3ec5cfe7475929a9741ebaf3225a9a832f2ac59ed23d07fd60acb2fe8e55ffb0";
+        const PKCS1_PEM_SHA256: &str =
+            "ae65d6a05a8ee56b168deeed94a7a0ea7cc8eb0b440a10794e2231960c004e92";
+        const ED25519_SUBKEY_PUBLIC: &str =
+            "077df54cb0989b9ad239cec5a9425b3ab7d91768cb1c390665731d8a008b227d";
+        const MESSAGE: &[u8] = b"p2pem rsa 0.9 -> 0.10 compatibility vector";
+        const PSS_SIGNATURE_BY_0_9: &str = "3dbdec5cc8d1125a6ad7258bd4fe31f85cc79eb482d2b5403ac818bd96524d7591de3c4e6ac501e753597ed2f6607585d85e574b07584df5cefa71410fc8c8ab3bc842cf3a53ca64c6d426aa1f1333f94e37d9cfb7e961da4758a058ffce8ae908e4f10f259b60c650c39a39383e6c889e4e1e675c7585dc47760ba6fc4c6683";
+        const BINDING_SIGNATURE_BY_0_9: &str = "9d1838484c7d52a8242c097b4203f6bff24d7e995cb8da44c75100a5c334374d98c9ec48b980bd24ae22af1093e93207ada90d2861a09f1904df2b75a9a5a047f3782f3e375255817ed2b1b3203f1f5dea77195260e6a045f694bc9aa11f9691d1768d96432f2da9e747f76e8f0711c03c1c5a7a1086ca4366e881ac5971aa61";
+
+        let identity = kat_identity();
+        let key = identity.private_key().unwrap();
+        let public = identity.public_key().unwrap();
+
+        assert_eq!(
+            hex::encode(Sha256::digest(identity.public_key_pem.as_bytes())),
+            PUBLIC_PEM_SHA256,
+            "the public PEM encoding changed"
+        );
+        assert_eq!(identity.fingerprint, FINGERPRINT, "the fingerprint changed");
+        assert_eq!(
+            hex::encode(Sha256::digest(key.to_pkcs1_der().unwrap().as_bytes())),
+            PKCS1_DER_SHA256,
+            "the PKCS#1 private encoding changed"
+        );
+        let pkcs1_pem = pem_encode_private(&key).unwrap();
+        // `pem_encode_private` uses the platform's line ending (CRLF on
+        // Windows), so the text is compared with LF line endings.
+        assert_eq!(
+            hex::encode(Sha256::digest(pkcs1_pem.replace("\r\n", "\n").as_bytes())),
+            PKCS1_PEM_SHA256,
+            "pem_encode_private's output changed"
+        );
+        assert_eq!(
+            pem_decode_private(&pkcs1_pem)
+                .unwrap()
+                .to_pkcs8_der()
+                .unwrap()
+                .as_bytes(),
+            key.to_pkcs8_der().unwrap().as_bytes(),
+            "a PKCS#1 round trip must give back the same key"
+        );
+
+        let subkey = derive_ed25519_subkey(&key).unwrap();
+        assert_eq!(
+            hex::encode(subkey.verifying_key().to_bytes()),
+            ED25519_SUBKEY_PUBLIC,
+            "the derived Ed25519 subkey changed"
+        );
+
+        rsa_verify_pss(
+            &public,
+            MESSAGE,
+            &hex::decode(PSS_SIGNATURE_BY_0_9).unwrap(),
+        )
+        .expect("a signature made by rsa 0.9 must still verify");
+        verify_ed25519_binding(
+            &public,
+            &subkey.verifying_key(),
+            &hex::decode(BINDING_SIGNATURE_BY_0_9).unwrap(),
+        )
+        .expect("an Ed25519 binding made by rsa 0.9 must still verify");
+
+        // And the other direction: what we sign now carries the 32-byte salt
+        // rsa 0.9's verifier requires (a fixed-salt verifier rejects any other
+        // length), so old peers accept it.
+        let fresh = rsa_sign_pss(&key, MESSAGE).unwrap();
+        rsa::pss::VerifyingKey::<rsa::sha2::Sha256>::new_with_salt_len(public.clone(), 32)
+            .verify(
+                MESSAGE,
+                &rsa::pss::Signature::try_from(fresh.as_slice()).unwrap(),
+            )
+            .expect("new signatures must use the 32-byte salt");
+        let binding = cross_sign_ed25519(&key, &subkey.verifying_key()).unwrap();
+        verify_ed25519_binding(&public, &subkey.verifying_key(), &binding).unwrap();
+
+        let mut tampered = hex::decode(PSS_SIGNATURE_BY_0_9).unwrap();
+        tampered[10] ^= 1;
+        assert!(rsa_verify_pss(&public, MESSAGE, &tampered).is_err());
     }
 
     /// A failure here is not a test to update: shipping the change would make

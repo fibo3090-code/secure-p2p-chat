@@ -11,7 +11,7 @@ use messenger_core::util::canonical_fingerprint;
 use messenger_server::hub::Hub;
 use messenger_server::state::PartyState;
 use messenger_server::{identity, run_accept_loop};
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 

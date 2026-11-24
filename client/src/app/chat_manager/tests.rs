@@ -404,7 +404,7 @@ async fn connect_to_blocked_contact_is_refused() {
     );
     mgr.block_contact(contact_id).unwrap();
 
-    let privkey = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap();
+    let privkey = messenger_core::core::generate_rsa_keypair(1024).unwrap();
     let err = mgr
         .connect_to_contact(contact_id, None, &privkey)
         .await

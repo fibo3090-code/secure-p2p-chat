@@ -4,7 +4,7 @@
 //! Two trust tiers share one data model (`docs/platform_spec.md`):
 //! Administered (server stores plaintext; implemented) and E2EE (Phase 4).
 
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use uuid::Uuid;

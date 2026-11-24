@@ -168,7 +168,7 @@ pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duratio
 pub async fn run_host_session_via_relay(
     relay_server: &str,
     token: &str,
-    privkey: rsa::RsaPrivateKey,
+    privkey: rsa::PrivateKey,
     to_app_tx: tokio::sync::mpsc::UnboundedSender<crate::types::SessionEvent>,
     from_app_rx: tokio::sync::mpsc::UnboundedReceiver<crate::core::ProtocolMessage>,
     file_rx: tokio::sync::mpsc::Receiver<crate::core::ProtocolMessage>,
@@ -197,7 +197,7 @@ pub async fn run_host_session_via_relay(
 pub async fn run_client_session_via_relay(
     relay_server: &str,
     token: &str,
-    privkey: rsa::RsaPrivateKey,
+    privkey: rsa::PrivateKey,
     to_app_tx: tokio::sync::mpsc::UnboundedSender<crate::types::SessionEvent>,
     from_app_rx: tokio::sync::mpsc::UnboundedReceiver<crate::core::ProtocolMessage>,
     file_rx: tokio::sync::mpsc::Receiver<crate::core::ProtocolMessage>,

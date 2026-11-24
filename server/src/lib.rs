@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use messenger_core::network::ratelimit::{limiter_key, RateLimiter};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 

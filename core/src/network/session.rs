@@ -1,8 +1,5 @@
 use anyhow::{anyhow, Result};
-use rand::rngs::OsRng;
-use rsa::pss::{SigningKey, VerifyingKey};
-use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -18,8 +15,9 @@ use crate::core::{
     cross_sign_ed25519, derive_ed25519_subkey, derive_session_key, ed25519_public_from_bytes,
     ed25519_signature_from_bytes, fingerprint_pubkey, generate_ephemeral_keypair,
     negotiate_signature_scheme, parse_x25519_public, pem_decode_public, pem_encode_public,
-    recv_packet, send_packet, sign_ed25519, verify_ed25519, verify_ed25519_binding, AesCipher,
-    Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage, SignatureScheme, PROTOCOL_VERSION,
+    recv_packet, rsa_sign_pss, rsa_verify_pss, send_packet, sign_ed25519, verify_ed25519,
+    verify_ed25519_binding, AesCipher, Ed25519Proof, IdentityProof, NonceRole, ProtocolMessage,
+    SignatureScheme, PROTOCOL_VERSION,
 };
 use crate::network::ratelimit::RateLimiter;
 use crate::types::SessionEvent;
@@ -396,9 +394,9 @@ fn build_identity_signature(
     let digest = hasher.finalize();
     match scheme {
         SignatureScheme::RsaPss => {
-            let signing_key = SigningKey::<Sha256>::new(privkey.clone());
-            let mut rng = OsRng;
-            Ok(signing_key.sign_with_rng(&mut rng, &digest).to_vec())
+            // The pre-hashed transcript digest is the PSS *message* (hashed
+            // again inside), exactly as before; changing that breaks every peer.
+            rsa_sign_pss(privkey, &digest)
         }
         SignatureScheme::Ed25519 => {
             let signing_key = derive_ed25519_subkey(privkey)?;
@@ -432,15 +430,8 @@ fn verify_identity_proof(proof: &IdentityProof, peer_ephemeral_bytes: &[u8]) -> 
     let digest = hasher.finalize();
 
     match proof.signature_scheme {
-        SignatureScheme::RsaPss => {
-            let verifying_key = VerifyingKey::<Sha256>::new(peer_pubkey);
-            verifying_key
-                .verify(
-                    &digest,
-                    &rsa::pss::Signature::try_from(proof.signature.as_slice())?,
-                )
-                .map_err(|e| anyhow!("Identity signature verification failed: {}", e))
-        }
+        SignatureScheme::RsaPss => rsa_verify_pss(&peer_pubkey, &digest, &proof.signature)
+            .map_err(|e| anyhow!("Identity signature verification failed: {}", e)),
         SignatureScheme::Ed25519 => {
             // The subkey blob is carried inside the signature field, so it is
             // just as peer-controlled as the proof around it.

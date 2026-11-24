@@ -21,7 +21,7 @@ use messenger_core::party::{
     MAX_PARTY_FILE_BYTES, PARTY_CHUNK_BYTES, UNKNOWN_FILE_ERROR,
 };
 use messenger_core::util::{current_timestamp_millis, parse_host_port};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
