@@ -707,6 +707,90 @@ mod tests {
         assert_eq!(shown.iter().filter(|r| r.contains('▶')).count(), 1);
     }
 
+    /// What each of these overlay states *says*, not only that it draws:
+    /// `renders_every_overlay_without_panic` passes for an overlay that
+    /// renders nothing at all.
+    #[test]
+    fn overlays_say_what_the_state_they_show_is() {
+        use crate::app::party_manager::PartyStatus;
+        use crate::app::FingerprintWarning;
+        let make = app;
+        let joined = |rows: &[String]| rows.join("\n");
+        let prompt = |sas: &str, warning| TuiOverlay::FingerprintVerify {
+            fingerprint: "ab".repeat(32),
+            peer_name: "Peer".into(),
+            sas: sas.into(),
+            chat_id: Uuid::new_v4(),
+            warning,
+        };
+
+        // :help <command> shows that command, not the list.
+        let mut app = make();
+        app.help_topic = Some("send".into());
+        app.overlay = TuiOverlay::Help;
+        let shown = joined(&screen(&mut app, 120, 40));
+        assert!(
+            shown.contains(":send <path>") && shown.contains("Command name: send"),
+            "{shown}"
+        );
+
+        // A changed key and a key that is not the invite's each lead with a
+        // warning naming what was expected.
+        for (warning, says) in [
+            (
+                FingerprintWarning::KeyChanged {
+                    previous: "cd".repeat(32),
+                },
+                "key has CHANGED (was cdcdcdcdcdcdcdcd…)",
+            ),
+            (
+                FingerprintWarning::InviteMismatch {
+                    contact_id: Uuid::new_v4(),
+                    contact_name: "Alice".into(),
+                    expected: "ef".repeat(32),
+                },
+                "NOT the key in Alice's invite (expected efefefefefefefef…)",
+            ),
+        ] {
+            let mut app = make();
+            app.overlay = prompt("12-34-56 🐶 🐱 🦊", Some(warning));
+            let shown = joined(&screen(&mut app, 160, 50));
+            assert!(shown.contains(says), "{says}:\n{shown}");
+            assert!(shown.contains("Read this code aloud"));
+        }
+
+        // A legacy peer has no safety code: the prompt falls back to the
+        // grid and says so, rather than showing an empty code to compare.
+        let mut app = make();
+        app.overlay = prompt("", None);
+        let shown = joined(&screen(&mut app, 160, 50));
+        assert!(
+            shown.contains("safety grid / fingerprint matches"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Read this code aloud") && !shown.contains("WARNING"));
+
+        // A refused join says why in the Communities pane.
+        let mut app = make();
+        let (server, _, _out, _keep) = app.party_manager.add_joined_server_for_test("srv:1");
+        app.party_manager
+            .server_mut_for_test(server)
+            .unwrap()
+            .status = PartyStatus::Rejected("wrong password".into());
+        app.overlay = TuiOverlay::Party;
+        let shown = joined(&screen(&mut app, 160, 50));
+        assert!(shown.contains("rejected: wrong password"), "{shown}");
+
+        // Setting a password is two steps, and the second says it is the second.
+        let mut app = make();
+        app.overlay = TuiOverlay::Password {
+            mode: PasswordMode::Set,
+        };
+        assert!(joined(&screen(&mut app, 120, 40)).contains("at least 12 characters"));
+        app.new_password_first = Some(zeroize::Zeroizing::new("first attempt".into()));
+        assert!(joined(&screen(&mut app, 120, 40)).contains("Type the same password again"));
+    }
+
     #[test]
     fn render_does_not_panic_with_stale_chat_ids() {
         let mut app = app();

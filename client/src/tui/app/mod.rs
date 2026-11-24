@@ -2191,6 +2191,100 @@ mod tests {
         assert!(out.try_recv().is_err());
     }
 
+    /// The everyday community commands, typed: a DM by `#N` or by name (any
+    /// case), a channel created, a file shared into the first channel with its
+    /// own name and type, and moving the pane's selection onto a DM thread
+    /// fetches that thread's history. What names nothing says so and sends
+    /// nothing.
+    #[tokio::test]
+    async fn messaging_commands_reach_the_member_channel_and_thread_they_name() {
+        use messenger_core::party::{MemberInfo, PartyRequest, Role};
+        let (mut app, data) = app();
+        let (server, general, mut out, _keep) = app.party_manager.add_joined_server_for_test("a:1");
+        app.current_party = Some(server);
+        let bob = Uuid::new_v4();
+        app.party_manager
+            .server_mut_for_test(server)
+            .unwrap()
+            .members
+            .push(MemberInfo {
+                id: bob,
+                username: "Bob".into(),
+                online: true,
+                role: Role::Member,
+            });
+        let shared = data.path().join("notes.txt");
+        std::fs::write(&shared, b"agenda").unwrap();
+        let drain = |out: &mut tokio::sync::mpsc::UnboundedReceiver<PartyRequest>| {
+            std::iter::from_fn(|| out.try_recv().ok()).collect::<Vec<_>>()
+        };
+
+        for line in ["party-dm #1 by number", "party-dm bob by name"] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+        }
+        app.execute_command(TuiApp::parse_command("party-create-channel ops").unwrap())
+            .await;
+        assert!(last_toast(&app).contains("Creating channel 'ops'"));
+        app.execute_command(TuiCommand::PartySendFile(shared.display().to_string()))
+            .await;
+        assert!(
+            last_toast(&app).contains("Sharing 'notes.txt'"),
+            "{}",
+            last_toast(&app)
+        );
+        let sent = drain(&mut out);
+        assert!(
+            matches!(&sent[..], [
+                PartyRequest::SendDm { to: a, text: t1 },
+                PartyRequest::SendDm { to: b, text: t2 },
+                PartyRequest::CreateChannel { name },
+                PartyRequest::PostFile { channel, name: file, mime, data },
+            ] if *a == bob && *b == bob && t1 == "by number" && t2 == "by name"
+                && name == "ops" && *channel == general && file == "notes.txt"
+                && mime == "text/plain" && data == b"agenda"),
+            "{sent:?}"
+        );
+
+        for (line, says) in [
+            ("party-dm #2 nobody there", "No member '#2'"),
+            ("party-dm mallory hi", "No member 'mallory'"),
+        ] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+            assert!(
+                last_toast(&app).contains(says),
+                "{line}: {}",
+                last_toast(&app)
+            );
+        }
+        app.execute_command(TuiCommand::PartySendFile("/no/such/file.txt".into()))
+            .await;
+        assert!(
+            last_toast(&app).starts_with("Could not share"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(
+            drain(&mut out).is_empty(),
+            "a refused command sent something"
+        );
+
+        // Pane: #general, then the DM thread with Bob. Moving onto it asks
+        // for its history; moving back to the channel asks for nothing.
+        app.execute_command(TuiCommand::PartyPane).await;
+        // Opening the pane refreshes the Drive listing; that is not the thread.
+        let _ = drain(&mut out);
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let opened = drain(&mut out);
+        assert!(
+            matches!(&opened[..], [PartyRequest::FetchDmHistory { with, .. }] if *with == bob),
+            "opening the DM thread did not fetch it: {opened:?}"
+        );
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(drain(&mut out).is_empty());
+    }
+
     /// TUI-17: the TUI pinned no community, so every join was a first contact
     /// and `:party-trust` became a reflex. A join that completes pins the
     /// server's fingerprint; a later join to that address is held to it — a
