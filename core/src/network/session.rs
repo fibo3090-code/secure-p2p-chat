@@ -1895,6 +1895,24 @@ mod tests {
         assert!(!transport.rekey_due(), "the client initiated a rotation");
     }
 
+    /// Every frame sent counts toward the rotation threshold. Received frames
+    /// count too, which is why the end-to-end rekey tests could not tell: a
+    /// sender whose own frames did not count still rotated on the peer's.
+    #[tokio::test]
+    async fn each_frame_sent_counts_toward_the_next_rekey() {
+        let key: [u8; 32] = rand::random();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, b"aad".to_vec(), tx);
+        for sent in 1..=3 {
+            transport
+                .send(ProtocolMessage::Ping { seq: 0 })
+                .await
+                .unwrap();
+            assert_eq!(transport.messages_since_rekey, sent);
+        }
+    }
+
     /// EXT-01: a client's `Rekey` must not move the host's key.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
