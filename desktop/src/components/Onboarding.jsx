@@ -112,10 +112,14 @@ export function LockScreen({ onUnlock }) {
         <Brand />
         <div className="onb-p-min">Enter your password to unlock your identity and history.</div>
         <div className="onb-field">
-          <PasswordInput value={pw} autoFocus placeholder="Password" disabled={busy}
+          <label className="onb-flabel" htmlFor="unlock-pw">Password</label>
+          <PasswordInput id="unlock-pw" value={pw} autoFocus disabled={busy}
             autoComplete="current-password"
+            aria-invalid={!!err || undefined} aria-describedby={err ? "unlock-err" : undefined}
             onChange={(e) => { setPw(e.target.value); setErr(""); }} />
-          {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}
+          <div aria-live="assertive">
+            {err && <span className="onb-err" id="unlock-err"><Icon name="alert" size={13} /> {err}</span>}
+          </div>
         </div>
         <Button type="submit" full icon="unlock" disabled={busy}>{busy ? "Unlocking…" : "Unlock"}</Button>
       </form>
@@ -124,7 +128,7 @@ export function LockScreen({ onUnlock }) {
   );
 }
 
-export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
+export function SetPasswordScreen({ minLength, onSet }) {
   const min = minLength || FALLBACK_MIN_PASSWORD;
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
@@ -156,29 +160,35 @@ export function SetPasswordScreen({ fingerprint, minLength, onSet }) {
         <Brand sub="Secure your new identity" />
         <div className="onb-p-min">
           This password encrypts your identity and message history on this device.
-          There is no account and no recovery — nobody, including us, can reset it.
         </div>
-        {fingerprint && (
-          <div className="onb-field">
-            <span className="onb-flabel">Your new fingerprint</span>
-            <code className="onb-fp-code" title={fingerprint}>{fingerprint.slice(0, 32).replace(/(.{4})/g, "$1 ").trim()} …</code>
-          </div>
-        )}
+        {/* The one irreversible fact, said where it cannot be missed. */}
+        <div className="onb-warn" role="note">
+          <Icon name="alert" size={15} />
+          <span><strong>There is no recovery.</strong> Forget this password and your identity and history are gone — nobody, including us, can reset it.</span>
+        </div>
         <div className="onb-field">
-          <PasswordInput value={pw} autoFocus placeholder={`New password (${min}+ characters)`} disabled={busy}
-            autoComplete="new-password"
+          <label className="onb-flabel" htmlFor="new-pw">New password</label>
+          <PasswordInput id="new-pw" value={pw} autoFocus disabled={busy}
+            autoComplete="new-password" aria-describedby="new-pw-hint"
             onChange={(e) => { setPw(e.target.value); setErr(""); }} />
-          <div className="onb-strength">
-            <span className={"onb-strength-bar s" + strength.score} />
-            <span className="onb-fhint">{strength.label}</span>
+          <div className="onb-strength" id="new-pw-hint">
+            {/* Neutral until the first keystroke: a red bar before anything is
+                typed reads as an error the user has not made. */}
+            <span className={"onb-strength-bar " + (pw ? "s" + strength.score : "s-empty")} />
+            <span className="onb-fhint">{pw ? strength.label : `At least ${min} characters`}</span>
           </div>
         </div>
         <div className="onb-field">
-          <PasswordInput value={pw2} placeholder="Confirm password" disabled={busy}
+          <label className="onb-flabel" htmlFor="new-pw2">Confirm password</label>
+          <PasswordInput id="new-pw2" value={pw2} disabled={busy}
             autoComplete="new-password"
+            aria-invalid={mismatch || undefined}
+            aria-describedby={mismatch ? "new-pw2-err" : undefined}
             onChange={(e) => { setPw2(e.target.value); setErr(""); }} />
-          {mismatch && <span className="onb-err"><Icon name="alert" size={13} /> Passwords don't match</span>}
-          {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}
+          <div aria-live="polite">
+            {mismatch && <span className="onb-err" id="new-pw2-err"><Icon name="alert" size={13} /> Passwords don't match</span>}
+            {err && <span className="onb-err"><Icon name="alert" size={13} /> {err}</span>}
+          </div>
         </div>
         <Button type="submit" full icon="shieldCheck" disabled={busy || !!formError}>
           {busy ? "Securing…" : "Create identity"}

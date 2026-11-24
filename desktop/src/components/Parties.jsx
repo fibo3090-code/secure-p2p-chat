@@ -6,6 +6,7 @@ import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Input, PasswordInput, Page } from "./ui.jsx";
 import { api, onBridge, fmtTime, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
+import { SafetyGrid } from "./SafetyGrid.jsx";
 import { markRead, computeUnread, pruneTo } from "../lib/partyUnread.js";
 import {
   DrivePanel, AuditPanel, ChannelAccessDialog, FilePermissionsDialog, ShareFileDialog,
@@ -127,7 +128,15 @@ function JoinForm({ onJoined, onCancel, initial }) {
             matches the one the operator gave you — their server prints it every time it
             starts:
           </p>
-          <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
+          <div className="party-verify-fp-row">
+            <SafetyGrid fingerprint={verify.fingerprint} n={8} cell={18} />
+            <div className="party-verify-fp-side">
+              <code className="vf-fp-code party-verify-fp">{groupFingerprint(verify.fingerprint)}</code>
+              <Button size="sm" variant="ghost" icon="copy" onClick={() => navigator.clipboard?.writeText(verify.fingerprint)
+                .then(() => toast("Fingerprint copied", "success"))
+                .catch(() => toast("Could not copy", "error"))}>Copy</Button>
+            </div>
+          </div>
           {notE2E}
           <div className="card-actions">
             <Button variant="ghost" disabled={busy}
@@ -170,7 +179,7 @@ function JoinForm({ onJoined, onCancel, initial }) {
                   <Avatar name={p.name || p.address} size={36} party />
                   <span className="list-row-main">
                     <span className="list-row-name">{p.name || p.address}</span>
-                    <span className="list-row-sub">Username: {p.username} · <span className="mono">{p.address}</span></span>
+                    <span className="list-row-sub">Username: {p.username} · {p.address} · <Icon name="lock" size={11} /> Server key pinned</span>
                   </span>
                   <span className={cx("list-row-use", picked && "is-on")}>{picked ? <><Icon name="check" size={14} /> Selected</> : "Rejoin"}</span>
                 </button>
@@ -677,29 +686,36 @@ export function Parties() {
             </div>
           </div>
           <div className="party-head-r">
-            <div className="party-views" role="tablist" aria-label="Community view">
-              <button role="tab" aria-selected={view === "chat"}
+            <div className="party-views" role="group" aria-label="Community view">
+              <button aria-pressed={view === "chat"}
                 className={cx("party-view", view === "chat" && "is-active")}
                 onClick={() => setView("chat")} title="Conversation">
                 <Icon name="message" size={14} />
               </button>
-              <button role="tab" aria-selected={view === "drive"}
+              <button aria-pressed={view === "drive"}
                 className={cx("party-view", view === "drive" && "is-active")}
                 onClick={() => setView("drive")} title="Shared files">
                 <Icon name="folder" size={14} />
               </button>
               {isAdmin && (
-                <button role="tab" aria-selected={view === "audit"}
+                <button aria-pressed={view === "audit"}
                   className={cx("party-view", view === "audit" && "is-active")}
                   onClick={() => setView("audit")} title="Activity log">
                   <Icon name="clock" size={14} />
                 </button>
               )}
             </div>
-            <div className="party-fp" title="Verify this out of band">
-              <Icon name="fingerprint" size={13} />
-              <code>{(server?.fingerprint || "").slice(0, 24)}…</code>
-            </div>
+            {/* A truncated fingerprint can't be checked; the button reveals and
+                copies the whole pinned key. */}
+            <button className="party-fp" title={`Server key pinned. Full fingerprint: ${server?.fingerprint || ""}`}
+              aria-label="Copy the server's pinned fingerprint"
+              onClick={() => navigator.clipboard?.writeText(server?.fingerprint || "")
+                .then(() => toast("Server fingerprint copied", "success"))
+                .catch(() => toast("Could not copy", "error"))}>
+              <Icon name="lock" size={13} />
+              <span>Key pinned</span>
+              <Icon name="copy" size={12} />
+            </button>
             <button className={cx("party-leave", confirmLeave && "is-confirm")}
               title={confirmLeave
                 ? "Click again to leave. This also forgets the server's verified fingerprint, so rejoining means checking its code again."

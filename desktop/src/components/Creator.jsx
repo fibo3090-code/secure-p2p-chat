@@ -234,9 +234,9 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
   return (
     <Modal open={open} onClose={onClose} width={480} title="New connection" icon="plus"
       sub="Start an end-to-end encrypted conversation">
-      <div className="seg" role="tablist" aria-label="How to connect">
+      <div className="seg" role="group" aria-label="What to do">
         {MODES.map((m) => (
-          <button key={m.id} role="tab" aria-selected={mode === m.id} className={cx("seg-btn", mode === m.id && "is-active")}
+          <button key={m.id} aria-pressed={mode === m.id} className={cx("seg-btn", mode === m.id && "is-active")}
             onClick={() => { setMode(m.id); reset(); }}>
             <Icon name={m.icon} size={15} />{m.label}
           </button>
@@ -276,7 +276,7 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
 
       {mode === "connect" && viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead">Use the relay and token the other person shared with you.</p>
+          <p className="creator-lead">Use the relay and token the other person shared with you. The relay can't read your messages, but it sees both IP addresses and when you talk.</p>
           <div className="field">
             <label className="field-label" htmlFor="cr-relay">Relay address</label>
             <Input id="cr-relay" mono value={relay} autoFocus placeholder="relay.example.com:9000"
@@ -322,7 +322,7 @@ export function Creator({ open, onClose, initialMode, initialRelay = false }) {
 
       {mode === "host" && viaRelay && (
         <div className="creator-pane">
-          <p className="creator-lead">No port forwarding needed: the relay brokers the connection. You'll get a token to share.</p>
+          <p className="creator-lead">No port forwarding needed: the relay brokers the connection and gives you a token to share. It can't read your messages, but it sees both IP addresses and when you talk.</p>
           <div className="field">
             <label className="field-label" htmlFor="cr-hrelay">Relay address</label>
             <Input id="cr-hrelay" mono value={relay} autoFocus placeholder="relay.example.com:9000"

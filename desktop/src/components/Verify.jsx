@@ -151,7 +151,7 @@ export function Verify({ req, onClose }) {
             onClick={() => decide(false)}>Reject</Button>
           <Button variant={changed ? "ghost" : "primary"} icon="shieldCheck" disabled={busy || !settled}
             onClick={() => decide(true)}>
-            {busy ? "Working…" : "Codes match — trust"}
+            {busy ? "Working…" : changed ? "Codes match — trust new key" : "Codes match — trust"}
           </Button>
         </div>
         {/* Escape hatch, shown only after a failed decision. The dialog is

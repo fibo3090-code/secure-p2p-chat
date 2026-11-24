@@ -51,11 +51,11 @@ const STATE_WORDS = { connected: "Connected", hosting: "Listening for a peer", o
 
 const TRANSPORT_LABEL = {
   direct: "Direct (peer-to-peer)",
-  relay: "Relayed (blind broker, still end-to-end encrypted)",
+  relay: "Via a relay — it can't read your messages, but it sees both IP addresses and when you talk",
   server: "Server (community)",
 };
 
-export function InfoDialog({ target, onClose, onRename, onDelete }) {
+export function InfoDialog({ target, onClose, onRename, onDelete, myFingerprint }) {
   if (!target) return null;
   const fp = target.fingerprint || "";
   const transport = TRANSPORT_LABEL[target.transport] || TRANSPORT_LABEL.direct;
@@ -93,10 +93,26 @@ export function InfoDialog({ target, onClose, onRename, onDelete }) {
         </dl>
         {!fp && <div className="verify-hint">No fingerprint yet.</div>}
         {fp && (
+          // Side by side, so a later check is a real comparison: read your
+          // fingerprint to them while they read theirs back, or hold the two
+          // screens together. A lone grid of their key proved nothing.
           <details className="verify-advanced">
-            <summary>Full fingerprint (advanced)</summary>
-            <SafetyGrid fingerprint={fp} n={8} cell={26} />
-            <div className="verify-code">{fp.replace(/(.{4})/g, "$1 ").trim()}</div>
+            <summary>Compare fingerprints</summary>
+            <div className="fp-compare">
+              <div className="fp-col">
+                <span className="fp-col-h">{target.name}</span>
+                <SafetyGrid fingerprint={fp} n={8} cell={18} />
+                <code className="verify-code">{fp.replace(/(.{4})/g, "$1 ").trim()}</code>
+              </div>
+              {myFingerprint && (
+                <div className="fp-col">
+                  <span className="fp-col-h">You</span>
+                  <SafetyGrid fingerprint={myFingerprint} n={8} cell={18} />
+                  <code className="verify-code">{myFingerprint.replace(/(.{4})/g, "$1 ").trim()}</code>
+                </div>
+              )}
+            </div>
+            <p className="verify-hint">On their screen the two are swapped: their “You” must equal your “{target.name}”.</p>
           </details>
         )}
         <div className="info-actions" role="group" aria-label="Conversation actions">

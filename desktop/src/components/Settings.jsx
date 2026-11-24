@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { Icon } from "../lib/Icon.jsx";
 import { cx, Avatar, Button, Modal, PasswordInput, Page } from "./ui.jsx";
 import { THEMES } from "../lib/themes.js";
+import { TEXT_SIZES } from "../lib/textSize.js";
 import { api, friendlyError } from "../lib/bridge.js";
 import { toast } from "../lib/toast.js";
 
@@ -45,7 +46,8 @@ function SettingsNav() {
           onClick={(e) => {
             e.preventDefault();
             setActive(id);
-            document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+            const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+            document.getElementById(id)?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "start" });
           }}>
           <Icon name={icon} size={16} /> {label}
         </a>
@@ -208,7 +210,7 @@ function DeleteAllDialog({ open, onClose }) {
   );
 }
 
-export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
+export function Settings({ identity, theme, setTheme, onIdentityChanged, textSize = "default", setTextSize = () => {} }) {
   const [s, setS] = useState(null);
   const [portDraft, setPortDraft] = useState("");
   const [nameDraft, setNameDraft] = useState(identity?.name || "");
@@ -412,6 +414,19 @@ export function Settings({ identity, theme, setTheme, onIdentityChanged }) {
                 {theme === t.id && <Icon name="check" size={15} />}
               </button>
             ))}
+          </div>
+          <div className="set-row set-textsize">
+            <span className="set-row-txt">
+              <span className="set-row-label" id="textsize-l">Text size</span>
+              <span className="set-row-hint">Ctrl + and Ctrl − change it too.</span>
+            </span>
+            <div className="seg seg-inline" role="group" aria-labelledby="textsize-l">
+              {TEXT_SIZES.map((t) => (
+                <button key={t.id} aria-pressed={textSize === t.id}
+                  className={cx("seg-btn", textSize === t.id && "is-active")}
+                  onClick={() => setTextSize(t.id)}>{t.label}</button>
+              ))}
+            </div>
           </div>
         </section>
 
