@@ -449,6 +449,13 @@ impl ChatManager {
             .insert(id, Chat::new(id, title, ChatKind::Dm, Transport::Direct));
     }
 
+    /// Test helper: record (or replace, by id) a transfer, as if its frames had
+    /// arrived. Lets a front-end test check what it does with a transfer in
+    /// each state without streaming one over a real session.
+    pub fn insert_transfer_for_test(&mut self, transfer: FileTransferState) {
+        self.active_transfers.insert(transfer.id, transfer);
+    }
+
     /// Test helper: inject a mock session.
     pub fn add_session_for_test(&mut self, chat_id: Uuid, handle: SessionHandle) {
         self.sessions.insert(chat_id, handle);

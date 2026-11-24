@@ -1940,9 +1940,51 @@ fn the_ui_signature_moves_for_badges_and_hosting() {
             .add_contact("New".into(), Some("192.0.2.1:1".into()), None, None);
     });
     assert_ne!(sig(), hosting, "a new contact was not announced");
-    // With nothing in flight, transfer progress has nothing to report.
-    let m = tauri::async_runtime::block_on(manager.lock());
-    assert_eq!(crate::transfer_signature(&m), crate::transfer_signature(&m));
+}
+
+/// PERF-01: byte progress moves only the transfer signature, so the poll loop
+/// sends the light `transfers-updated`; a transfer changing *state* (here,
+/// failing) moves the chat-surface signature, because the pane draws it.
+#[test]
+fn transfer_progress_and_transfer_state_move_different_signatures() {
+    use messenger_core::types::{FileTransferState, TransferDirection, TransferStatus};
+    let h = ready_harness();
+    let chat = h.seed_chat_with_incoming("Peer", 0);
+    let manager = h.bridge().manager.clone();
+    let transfer = |received, status| FileTransferState {
+        id: uuid::Uuid::from_u128(7),
+        chat_id: chat,
+        filename: "big.bin".into(),
+        size: 1 << 20,
+        received,
+        status,
+        seq: 0,
+        direction: TransferDirection::Incoming,
+    };
+    let sigs = |t: FileTransferState| {
+        let mut m = tauri::async_runtime::block_on(manager.lock());
+        m.insert_transfer_for_test(t);
+        (
+            crate::ui_signature_from(&m, crate::state_signature(&m)),
+            crate::transfer_signature(&m),
+        )
+    };
+    let (ui0, tr0) = sigs(transfer(0, TransferStatus::InProgress));
+    assert_eq!(
+        sigs(transfer(0, TransferStatus::InProgress)),
+        (ui0, tr0),
+        "not stable"
+    );
+
+    let (ui1, tr1) = sigs(transfer(64 * 1024, TransferStatus::InProgress));
+    assert_ne!(tr1, tr0, "progress did not move the transfer signature");
+    assert_eq!(ui1, ui0, "progress alone refetched every conversation");
+
+    let (ui2, _) = sigs(transfer(
+        64 * 1024,
+        TransferStatus::Failed("disk full".into()),
+    ));
+    assert_ne!(ui2, ui1, "a failed transfer did not refresh the chat pane");
 }
 
 // ── Start-up (init_bridge) ──────────────────────────────────────────────────

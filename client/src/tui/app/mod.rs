@@ -2063,6 +2063,134 @@ mod tests {
         assert!(!posted(first), "the post went to the other community");
     }
 
+    /// The governance commands, typed as a user types them, against a joined
+    /// community: each names its target by what is on screen (a username, a
+    /// `#channel`, part of a file name) and must send the request for *that*
+    /// id — or, when nothing matches, say so and send nothing.
+    #[tokio::test]
+    async fn governance_commands_send_the_request_for_what_they_name() {
+        use messenger_core::party::{
+            ChannelKind, FileEntry, FilePermissions, MemberInfo, PartyRequest, Role,
+        };
+        let (mut app, _data) = app();
+        let (server, general, mut out, _keep) = app.party_manager.add_joined_server_for_test("a:1");
+        app.current_party = Some(server);
+        let bob = Uuid::new_v4();
+        let carol = Uuid::new_v4();
+        let conn = app.party_manager.server_mut_for_test(server).unwrap();
+        for (id, name) in [(bob, "Bob"), (carol, "carol")] {
+            conn.members.push(MemberInfo {
+                id,
+                username: name.into(),
+                online: true,
+                role: Role::Member,
+            });
+        }
+        conn.files.push(FileEntry {
+            hash: "deadbeef".repeat(8),
+            name: "Minutes.pdf".into(),
+            size: 10,
+            mime: "application/pdf".into(),
+            uploader: bob,
+            uploader_name: "Bob".into(),
+            location: general,
+            location_name: "#general".into(),
+            is_dm: false,
+            shared_at: 0,
+            can_delete: true,
+            perms: FilePermissions::default(),
+        });
+
+        let run = |line: &'static str| {
+            let cmd = TuiApp::parse_command(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            (cmd, line)
+        };
+        let mut sent = Vec::new();
+        for (cmd, _) in [
+            run("party-role bob ADMIN"),
+            run("party-channel-access #General private carol nobody"),
+            run("party-delete-file minutes"),
+            run("party-delete-channel #general"),
+            run("party-files"),
+            run("party-audit"),
+        ] {
+            app.execute_command(cmd).await;
+            sent.extend(std::iter::from_fn(|| out.try_recv().ok()));
+        }
+        let expected = vec![
+            PartyRequest::SetRole {
+                member: bob,
+                role: Role::Admin,
+            },
+            // A name that matches no member is dropped, not sent as a guess.
+            PartyRequest::SetChannelAccess {
+                channel: general,
+                kind: ChannelKind::Private,
+                members: vec![carol],
+            },
+            PartyRequest::DeleteFile {
+                hash: "deadbeef".repeat(8),
+                channel: general,
+            },
+            PartyRequest::DeleteChannel { channel: general },
+            PartyRequest::ListFiles,
+            PartyRequest::FetchQuota,
+            PartyRequest::FetchAuditLog { limit: 50 },
+        ];
+        assert_eq!(format!("{sent:?}"), format!("{expected:?}"));
+
+        // Nothing matches: a toast that names the problem, and no request.
+        for (line, says) in [
+            ("party-role mallory admin", "No member called 'mallory'"),
+            ("party-role bob owner", "Unknown role 'owner'"),
+            (
+                "party-channel-access #nowhere public",
+                "No channel called '#nowhere'",
+            ),
+            (
+                "party-channel-access #general secret",
+                "Unknown kind 'secret'",
+            ),
+            (
+                "party-delete-file budget",
+                "No shared file matches 'budget'",
+            ),
+            (
+                "party-delete-channel #nowhere",
+                "No channel called '#nowhere'",
+            ),
+        ] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+            assert!(
+                last_toast(&app).contains(says),
+                "{line}: {}",
+                last_toast(&app)
+            );
+            assert!(out.try_recv().is_err(), "{line} sent a request anyway");
+        }
+
+        // With no community joined, every one of them says how to join one.
+        app.current_party = None;
+        for line in [
+            "party-files",
+            "party-audit",
+            "party-delete-file x",
+            "party-role bob admin",
+            "party-channel-access #general public",
+            "party-delete-channel #general",
+        ] {
+            app.execute_command(TuiApp::parse_command(line).unwrap())
+                .await;
+            assert!(
+                last_toast(&app).contains(":party-connect"),
+                "{line}: {}",
+                last_toast(&app)
+            );
+        }
+        assert!(out.try_recv().is_err());
+    }
+
     /// TUI-17: the TUI pinned no community, so every join was a first contact
     /// and `:party-trust` became a reflex. A join that completes pins the
     /// server's fingerprint; a later join to that address is held to it — a
@@ -2981,10 +3109,33 @@ mod tests {
         app.identity = identity;
         std::fs::write(&app.history_path, b"h").unwrap();
 
+        // No password set: there is nothing to check one against, so nothing
+        // may be deleted on the strength of whatever was typed.
+        let plain = std::mem::replace(
+            &mut app.identity,
+            Identity::new_with_plaintext("T".into()).unwrap(),
+        );
+        app.execute_command(TuiCommand::Wipe {
+            password: password.clone(),
+        })
+        .await;
+        assert!(
+            last_toast(&app).contains("Set a password first"),
+            "{}",
+            last_toast(&app)
+        );
+        assert_eq!(app.overlay, TuiOverlay::None);
+        app.identity = plain;
+
         app.execute_command(TuiCommand::Wipe {
             password: wrong.clone(),
         })
         .await;
+        assert!(
+            last_toast(&app).contains("Wrong password"),
+            "{}",
+            last_toast(&app)
+        );
         assert_eq!(app.overlay, TuiOverlay::None);
         assert!(app.identity_path.exists());
 
@@ -3010,6 +3161,28 @@ mod tests {
             !app.history_path.exists(),
             "the exit save must not recreate it"
         );
+    }
+
+    /// `:send` needs a conversation, and a file that cannot be sent says why
+    /// instead of failing quietly.
+    #[tokio::test]
+    async fn send_names_what_is_missing() {
+        let (mut app, _data) = app();
+        app.execute_command(TuiCommand::Send("/nowhere/at/all.bin".into()))
+            .await;
+        assert_eq!(last_toast(&app), "No chat selected");
+
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "Peer".into());
+        app.sync_chat_ids();
+        app.execute_command(TuiCommand::Send("/nowhere/at/all.bin".into()))
+            .await;
+        assert!(
+            last_toast(&app).starts_with("Send file failed:"),
+            "{}",
+            last_toast(&app)
+        );
+        assert!(app.chat_manager.active_transfers_snapshot().is_empty());
     }
 
     /// PERF-03: autosave rewrote the whole history every 30 s even when

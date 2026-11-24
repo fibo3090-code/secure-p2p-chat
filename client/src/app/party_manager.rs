@@ -894,6 +894,12 @@ impl PartyManager {
         (id, channel, outgoing_rx, Box::new(incoming_tx))
     }
 
+    /// Test helper: the connection a test set up, to give it members or files.
+    #[cfg(test)]
+    pub(crate) fn server_mut_for_test(&mut self, id: Uuid) -> Option<&mut PartyServerConn> {
+        self.servers.get_mut(&id)
+    }
+
     pub fn server_ids(&self) -> Vec<Uuid> {
         self.servers.keys().copied().collect()
     }

@@ -631,6 +631,82 @@ mod tests {
         }
     }
 
+    fn screen(app: &mut TuiApp, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|f| ui(f, app)).expect("draw");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The transfers overlay is the only place the TUI shows a transfer's
+    /// state, and the only one where an offer waiting for :accept says so.
+    /// Each status reads as itself, progress is a percentage of the size, the
+    /// direction is drawn, and the selection marker sits on the chosen row.
+    #[test]
+    fn the_transfers_overlay_says_what_each_transfer_is_doing() {
+        use messenger_core::types::{FileTransferState, TransferDirection, TransferStatus};
+        let mut app = app();
+        let chat = Uuid::new_v4();
+        let rows = [
+            (
+                "offer.pdf",
+                TransferStatus::AwaitingAcceptance,
+                TransferDirection::Incoming,
+                0,
+            ),
+            (
+                "half.bin",
+                TransferStatus::InProgress,
+                TransferDirection::Outgoing,
+                512,
+            ),
+            (
+                "broke.iso",
+                TransferStatus::Failed("disk full".into()),
+                TransferDirection::Incoming,
+                10,
+            ),
+        ];
+        for (i, (name, status, direction, received)) in rows.into_iter().enumerate() {
+            app.chat_manager
+                .insert_transfer_for_test(FileTransferState {
+                    id: Uuid::from_u128(i as u128 + 1),
+                    chat_id: chat,
+                    filename: name.into(),
+                    size: 1024,
+                    received,
+                    status,
+                    seq: 0,
+                    direction,
+                });
+        }
+        app.overlay = TuiOverlay::Transfers;
+        let shown = screen(&mut app, 160, 40);
+        let row = |name: &str| {
+            shown
+                .iter()
+                .find(|r| r.contains(name))
+                .unwrap_or_else(|| panic!("{name} not shown:\n{}", shown.join("\n")))
+                .clone()
+        };
+        assert!(row("offer.pdf").contains("[awaiting approval — :accept / :decline]"));
+        assert!(row("half.bin").contains("[50%]"), "{}", row("half.bin"));
+        assert!(row("half.bin").contains('⬆') && row("offer.pdf").contains('⬇'));
+        assert!(row("broke.iso").contains("failed: disk full"));
+
+        let marked: Vec<_> = shown.iter().filter(|r| r.contains('▶')).collect();
+        assert_eq!(marked.len(), 1, "one selected row");
+        app.transfer_sel = 2;
+        let shown = screen(&mut app, 160, 40);
+        assert!(shown.iter().any(|r| r.contains("▶ ⬇ broke.iso")));
+        // A selection past the end (the list shrank) still marks a real row.
+        app.transfer_sel = 99;
+        let shown = screen(&mut app, 160, 40);
+        assert_eq!(shown.iter().filter(|r| r.contains('▶')).count(), 1);
+    }
+
     #[test]
     fn render_does_not_panic_with_stale_chat_ids() {
         let mut app = app();
