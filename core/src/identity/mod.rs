@@ -501,10 +501,7 @@ impl Identity {
     pub fn history_key(&self) -> Result<[u8; 32]> {
         let privkey = self.private_key()?;
         let der = privkey.to_pkcs8_der()?;
-        let digest = Sha256::digest(der.as_bytes());
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&digest);
-        Ok(key)
+        Ok(Sha256::digest(der.as_bytes()).into())
     }
 }
 
