@@ -201,9 +201,6 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect, paused, tabStop = t
           {/* aria-hidden: every marker here is repeated in the row's aria-label
               above, in words. Leaving them exposed makes a reader announce a
               bare glyph after the name. */}
-          {c.trust === "verified" && !hosting && (
-            <span className="conv-verified" aria-hidden="true" title="Verified"><Icon name="shieldCheck" size={13} /></span>
-          )}
           <span className="conv-time">{c.lastT}</span>
         </div>
         <div className="conv-line2">
@@ -222,9 +219,6 @@ const ConvRow = memo(function ConvRow({ c, active, onSelect, paused, tabStop = t
             {/* Only a real peer can be unverified. A listener with nobody on
                 the other end used to wear the same warning, and a warning that
                 shows up where nothing is wrong is one people learn to skip. */}
-            {c.trust === "unverified" && !hosting && (
-              <span className="marker-warn" title="Not verified"><Icon name="shieldAlert" size={13} /></span>
-            )}
             {c.unread > 0 && <span className="conv-unread">{c.unread > 99 ? "99+" : c.unread}</span>}
           </span>
         </div>
@@ -670,6 +664,13 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
   const online = contact ? contact.state === "connected" : false;
   const hosting = contact ? contact.state === "hosting" : false;
   const canRedial = !!(reconnectContact && reconnectContact.reachable && reconnectContact.trust !== "blocked");
+  const [redial, setRedial] = useState({ busy: false, failed: "" });
+  useEffect(() => { setRedial({ busy: false, failed: "" }); }, [contactId]);
+  const doReconnect = async () => {
+    setRedial({ busy: true, failed: "" });
+    try { await onReconnect(contact); setRedial({ busy: false, failed: "" }); }
+    catch (e) { setRedial({ busy: false, failed: friendlyError(e) }); }
+  };
   const copyInvite = () => api.myInviteLink()
     .then((l) => navigator.clipboard?.writeText(l))
     .then(() => toast("Invite link copied", "success"))
@@ -766,8 +767,12 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
               <span className={"chat-state state-txt-" + contact.state}>{STATE_LABEL[contact.state]}</span>
               {!hosting && (
                 <>
-                  <span className="chat-dot" aria-hidden="true">·</span>
-                  <span>{TRANSPORT_WORD[contact.transport] || TRANSPORT_WORD.direct}</span>
+                  {contact.transport && contact.transport !== "direct" && (
+                    <>
+                      <span className="chat-dot" aria-hidden="true">·</span>
+                      <span>{TRANSPORT_WORD[contact.transport]}</span>
+                    </>
+                  )}
                   <span className="chat-dot" aria-hidden="true">·</span>
                   <button className={cx("chat-trust", contact.trust === "verified" ? "is-ok" : "is-pending")}
                     onClick={() => onVerify && onVerify(contact)}
@@ -842,17 +847,28 @@ export function ChatPane({ contact, onVerify, onRename, onDelete, onInfo, onSend
         // ending in the one thing that helps: dial them back, or (with no saved
         // address) hand them a way to dial you.
         <div className="composer">
-          <div className="composer-notice" role="status">
+          <div className={cx("composer-notice", redial.failed && "is-failed")} role="status">
             <span className="composer-notice-txt">
               {contact.state === "connecting"
                 ? OFFLINE_NOTICE.connecting
-                : canRedial
-                  ? `${contact.name} is offline. You can write again once you're connected.`
-                  : `${contact.name} is offline and there's no saved address to reach them. Send them your invite link so they can connect to you.`}
+                : redial.failed
+                  ? <>Couldn't reach {contact.name}{reconnectContact?.address ? ` at ${reconnectContact.address}` : ""}. They need P2PEM open and accepting new peers — or send them your invite link. <span className="composer-notice-why">({redial.failed})</span></>
+                  : canRedial
+                    ? `${contact.name} is offline. You can write again once you're connected.`
+                    : `${contact.name} is offline and there's no saved address to reach them. Send them your invite link so they can connect to you.`}
             </span>
-            {contact.state !== "connecting" && (canRedial
-              ? <Button size="sm" icon="refresh" onClick={() => onReconnect && onReconnect(contact)}>Reconnect</Button>
-              : <Button size="sm" variant="ghost" icon="link" onClick={copyInvite}>Copy invite link</Button>)}
+            {contact.state !== "connecting" && (
+              <span className="composer-notice-actions">
+                {canRedial && (
+                  <Button size="sm" icon="refresh" disabled={redial.busy} onClick={doReconnect}>
+                    {redial.busy ? "Connecting…" : redial.failed ? "Try again" : "Reconnect"}
+                  </Button>
+                )}
+                {(!canRedial || redial.failed) && (
+                  <Button size="sm" variant="ghost" icon="link" onClick={copyInvite}>Copy invite link</Button>
+                )}
+              </span>
+            )}
           </div>
         </div>
       )}

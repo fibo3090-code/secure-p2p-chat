@@ -334,14 +334,13 @@ export default function App() {
       || null;
   }
 
+  // Throws on failure: the offline strip shows what went wrong and what the
+  // other person needs to do, instead of a toast that disappears.
   async function reconnect(c) {
     const k = contactFor(c);
     if (!k) return;
-    try {
-      await api.connectContact(k.id);
-      toast(`Connecting to ${c.name}…`, "info");
-      refresh();
-    } catch (e) { toast(friendlyError(e), "error"); }
+    await api.connectContact(k.id);
+    refresh();
   }
 
   async function sendFile(c) {
@@ -376,7 +375,6 @@ export default function App() {
       {nav === "chats" && activeId && (
         <a className="skip-link" href="#composer-input">Skip to message box</a>
       )}
-      <div className="hex-bg" />
       {historyIssue && (
         <HistoryBanner issue={historyIssue} onSetAside={async () => {
           const moved = await api.setAsideHistory();

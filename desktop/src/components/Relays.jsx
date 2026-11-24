@@ -68,14 +68,16 @@ export function Relays({ onPair }) {
         </div>
       </section>
 
-      <section className="card">
-        <h2 className="card-title">Run your own relay</h2>
+      {/* A build command is for people running infrastructure, not for
+          someone who installed the app: it waits behind a disclosure. */}
+      <details className="card card-details">
+        <summary className="card-title">Advanced: run your own relay</summary>
         <p className="card-lead">
           Host one on a machine you both can reach — a small VPS or a box on your network.
-          It stores nothing.
+          It stores nothing. From a checkout of the source:
         </p>
         <Copyable value={LOCAL_RELAY_CMD} />
-      </section>
+      </details>
     </Page>
   );
 }

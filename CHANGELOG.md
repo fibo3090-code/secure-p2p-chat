@@ -39,6 +39,35 @@ predate tagged releases.
     under Dial and Host, with the action in a footer.
   - Daylight was redesigned, and every text colour holds at least 4.5:1 in all
     five themes.
+- **Desktop app, second pass after an independent review.**
+  - **Reachability:** listening is no longer shown as a conversation. A single
+    status under the Chats title shows whether you are listening and whether new
+    peers are accepted. It opens a panel with the addresses to share, your invite
+    link, an "Accept new peers" switch and Start/Stop listening.
+  - **Trust:**
+    - Conversation info puts your fingerprint beside theirs, so a later check is
+      a real comparison.
+    - Accepting a changed key reads "trust new key".
+    - Relay copy now says what a relay *can* see (both IP addresses and when you
+      talk), as well as what it can't.
+    - A community's server key has a colour grid, a Copy button and a "pinned"
+      marker.
+  - **Accessibility:**
+    - The conversation is announced as it arrives, with who wrote each message.
+      Reading history is no longer interrupted: a "New messages" pill appears
+      instead.
+    - Arrow keys work in the conversation list and in menus.
+    - Ctrl +/− zoom works, and there is a Text size setting.
+    - Focus is visible inside sent bubbles, and controls in Daylight have
+      clearer edges.
+    - Password fields have real labels.
+  - **Look:**
+    - Sent bubbles carry a hint of the logo's teal.
+    - The list rows and the header show fewer badges.
+    - The date separator is quieter.
+    - Settings is centred like the other pages.
+  - **Offline:** a failed Reconnect says why and what the other person needs to
+    do.
 
 ### Dependencies
 

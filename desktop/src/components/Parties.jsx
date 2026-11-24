@@ -202,14 +202,14 @@ function JoinForm({ onJoined, onCancel, initial }) {
         </p>
         {pickedSaved && !editDetails ? (
           <p className="field-hint">
-            As <strong>{pickedSaved.username}</strong> on <span className="mono">{pickedSaved.address}</span>
+            As <strong>{pickedSaved.username}</strong> on {pickedSaved.address}
             {" · "}<button type="button" className="chat-empty-link" onClick={() => setEditDetails(true)}>Edit details</button>
           </p>
         ) : (
                 <div className="field-grid">
           <div className="field">
             <label className="field-label" htmlFor="party-addr">Server address</label>
-            <Input id="party-addr" mono value={address} autoFocus placeholder="192.168.1.20:12345"
+            <Input id="party-addr" value={address} autoFocus placeholder="192.168.1.20:12345"
               aria-invalid={errField === "addr" || undefined}
               aria-describedby={errField === "addr" ? "party-addr-err" : undefined}
               onChange={(e) => setAddress(e.target.value)} />

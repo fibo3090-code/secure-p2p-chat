@@ -36,7 +36,6 @@ export function BootScreen({ error, retrying, onRetry, fatal }) {
   if (fatal) {
     return (
       <div className="onb-stage">
-        <div className="onb-hex" />
         <div className="onb-card">
           <Brand sub="Your identity could not be opened" />
           <div className="onb-p-min">
@@ -57,7 +56,6 @@ export function BootScreen({ error, retrying, onRetry, fatal }) {
   }
   return (
     <div className="onb-stage">
-      <div className="onb-hex" />
       <div className="onb-card">
         <Brand sub={error ? "Couldn't start" : "Starting up"} />
         {error ? (
@@ -107,7 +105,6 @@ export function LockScreen({ onUnlock }) {
 
   return (
     <div className="onb-stage">
-      <div className="onb-hex" />
       <form className="onb-card" onSubmit={submit}>
         <Brand />
         <div className="onb-p-min">Enter your password to unlock your identity and history.</div>
@@ -155,7 +152,6 @@ export function SetPasswordScreen({ minLength, onSet }) {
 
   return (
     <div className="onb-stage">
-      <div className="onb-hex" />
       <form className="onb-card" onSubmit={submit}>
         <Brand sub="Secure your new identity" />
         <div className="onb-p-min">
@@ -223,7 +219,6 @@ export function BackupPrompt({ onExport, onSkip }) {
 
   return (
     <div className="onb-stage">
-      <div className="onb-hex" />
       <div className="onb-card">
         <Brand sub="Back up your identity" />
         <div className="onb-p-min">

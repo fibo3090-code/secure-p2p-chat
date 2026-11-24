@@ -137,6 +137,16 @@ describe("ChatPane composer", () => {
     expect(screen.getByRole("button", { name: /Copy invite link/ })).toBeTruthy();
   });
 
+  it("says why a reconnect failed and offers the invite link as the way out", async () => {
+    const onReconnect = vi.fn(async () => { throw new Error("connection refused"); });
+    render(<ChatPane {...base} contact={contactFixture({ state: "offline", messages: [] })}
+      reconnectContact={{ id: "k1", reachable: true, trust: "verified", address: "10.0.0.5:12345" }} onReconnect={onReconnect} />);
+    await userEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+    expect(await screen.findByText(/Couldn't reach .* at 10\.0\.0\.5:12345/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Try again/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Copy invite link/ })).toBeTruthy();
+  });
+
   it("offers Reconnect when the conversation has a reachable contact", async () => {
     const onReconnect = vi.fn();
     const contact = contactFixture({ state: "offline", messages: [] });
