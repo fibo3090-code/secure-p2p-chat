@@ -504,3 +504,49 @@ describe("App — theme", () => {
     expect(document.documentElement.getAttribute("data-theme")).toBe(other.id);
   });
 });
+
+// Reconnect dials a saved contact, so which contact it picks is the whole
+// question: the bridge's own association (the contact's `chat_id`) wins, a
+// contact holding the conversation's verified fingerprint is the fallback, and
+// with neither there is nothing to dial — the invite link is offered instead.
+describe("App — reconnecting an offline conversation", () => {
+  const fp = "ab".repeat(32);
+  const contact = (id, over) => ({
+    id, name: id, address: "192.0.2.1:12345", reachable: true, relay_only: false,
+    trust: "verified", fingerprint: "ef".repeat(32), chat_id: null, ...over,
+  });
+  async function openOffline(contacts) {
+    const api = readyApi({
+      listConversations: [{ ...conv, connected: false }],
+      listContacts: contacts,
+      connectContact: vi.fn(async () => {}),
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole("option", { name: /Alice/ }));
+    await screen.findByRole("log", { name: "Messages with Alice" });
+    return api;
+  }
+
+  it("dials the contact associated with the conversation before a fingerprint match", async () => {
+    const api = await openOffline([
+      contact("k-same-key", { fingerprint: fp }),
+      contact("k-linked", { chat_id: "chat-1" }),
+    ]);
+    await userEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(api.connectContact).toHaveBeenCalledWith("k-linked"));
+    expect(api.connectContact).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the contact holding the conversation's verified key", async () => {
+    const api = await openOffline([contact("k-other"), contact("k-same-key", { fingerprint: fp })]);
+    await userEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    await waitFor(() => expect(api.connectContact).toHaveBeenCalledWith("k-same-key"));
+  });
+
+  it("offers the invite link, not a dial, when no saved contact matches", async () => {
+    const api = await openOffline([contact("k-stranger")]);
+    expect(await screen.findByRole("button", { name: /Copy invite link/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+    expect(api.connectContact).not.toHaveBeenCalled();
+  });
+});
