@@ -777,6 +777,18 @@ mod tests {
         let mut huge_text = b"TEXT:1:".to_vec();
         huge_text.extend(std::iter::repeat_n(b'a', crate::MAX_TEXT_MESSAGE_BYTES + 1));
         assert!(ProtocolMessage::from_plain_bytes(&huge_text).is_none());
+        // The cap is on the whole frame and inclusive: exactly at it decodes.
+        let mut at_cap = b"TEXT:1:".to_vec();
+        at_cap.resize(crate::MAX_TEXT_MESSAGE_BYTES, b'a');
+        assert!(
+            matches!(
+                ProtocolMessage::from_plain_bytes(&at_cap),
+                Some(ProtocolMessage::Text { .. })
+            ),
+            "a legacy text frame of exactly the cap was refused"
+        );
+        at_cap.push(b'a');
+        assert!(ProtocolMessage::from_plain_bytes(&at_cap).is_none());
 
         // A legacy ephemeral key must be exactly 32 bytes, neither side of it.
         for len in [31usize, 33, 8 * 1024 * 1024] {
@@ -806,6 +818,13 @@ mod tests {
             other => panic!("legacy FILE_META should parse and sanitise, got {other:?}"),
         }
         assert!(ProtocolMessage::from_plain_bytes(b"FILE_META|0|name|not_a_number").is_none());
+        // The declared size is capped at MAX_FILE_SIZE, inclusive.
+        let meta = |size: u64| format!("FILE_META|0|name|{size}").into_bytes();
+        assert!(ProtocolMessage::from_plain_bytes(&meta(crate::MAX_FILE_SIZE)).is_some());
+        assert!(
+            ProtocolMessage::from_plain_bytes(&meta(crate::MAX_FILE_SIZE + 1)).is_none(),
+            "a legacy offer over MAX_FILE_SIZE was accepted"
+        );
     }
 
     /// `total_chunks` must be non-zero and capped (it sizes the reassembly buffer, so
