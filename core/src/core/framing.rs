@@ -119,18 +119,21 @@ mod tests {
         assert_eq!(payload, &received[..]);
     }
 
+    /// The cap is inclusive on both ends: a payload of exactly
+    /// `MAX_PACKET_SIZE` is sent and received. A sender stricter than the
+    /// receiver (or the reverse) would refuse frames the other side produces.
     #[tokio::test]
-    async fn test_framing_large_payload() {
-        let (mut client, mut server) = tokio::io::duplex(10 * 1024 * 1024);
+    async fn a_payload_of_exactly_the_cap_round_trips() {
+        let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
 
-        let payload = vec![42u8; 1024 * 1024]; // 1 MB
+        let payload: Vec<u8> = (0..MAX_PACKET_SIZE).map(|i| i as u8).collect();
         let payload_clone = payload.clone();
         tokio::spawn(async move {
             send_packet(&mut client, &payload_clone).await.unwrap();
         });
 
         let received = recv_packet(&mut server).await.unwrap();
-        assert_eq!(payload, received);
+        assert!(payload == received, "the payload changed in transit");
     }
 
     #[tokio::test]
