@@ -1,16 +1,6 @@
-// ESLint for the frontend.
-//
-// Added because a real bug got through without it. A patch applied twice left
-// three duplicated JSX props in the change-password dialog; SonarCloud caught it,
-// but only in CI, after a push. `react/jsx-no-duplicate-props` is a default rule
-// and would have flagged it on save.
-//
-// The rule set is deliberately narrow. A linter that reports 400 style opinions
-// on its first run gets switched off, and then it is not there for the one
-// finding that mattered. What is enabled here is the set that catches *bugs* —
-// things that are silently wrong at runtime rather than merely unfashionable.
-// Formatting is not policed at all; there is no prettier here and this is not a
-// backdoor for one.
+// ESLint for the frontend. Deliberately narrow: rules that catch *bugs* (silently
+// wrong at runtime), not style — a linter that reports 400 opinions gets switched
+// off. Formatting is not policed.
 
 import js from "@eslint/js";
 import globals from "globals";
@@ -19,7 +9,6 @@ import reactHooks from "eslint-plugin-react-hooks";
 
 export default [
     {
-        // Build output and dependencies are not ours to lint.
         ignores: ["dist/**", "node_modules/**", "src-tauri/**"],
     },
     js.configs.recommended,
@@ -39,42 +28,28 @@ export default [
         settings: { react: { version: "detect" } },
         plugins: { react, "react-hooks": reactHooks },
         rules: {
-            // ── The reason this file exists ──────────────────────────────────
-            // A duplicate prop is not a style question: the last one wins and
-            // the earlier one is silently discarded, so the code says one thing
-            // and does another.
+            // Why this file exists: duplicated JSX props once shipped (the last
+            // silently wins).
             "react/jsx-no-duplicate-props": "error",
 
-            // Without this, `no-unused-vars` cannot see that a binding is used
-            // inside JSX and reports every imported component as dead. It is the
-            // rule that makes the whole config usable, and leaving it out
-            // produced 92 false errors on the first run.
+            // Lets `no-unused-vars` see bindings used in JSX.
             "react/jsx-uses-vars": "error",
 
-            // ── Bugs, not opinions ──────────────────────────────────────────
-            // `useEffect` with a stale closure is this app's most likely
-            // rendering bug, and the poll loop makes stale reads easy to write.
+            // Stale `useEffect` closures are this app's likeliest render bug.
             "react-hooks/rules-of-hooks": "error",
             "react-hooks/exhaustive-deps": "warn",
 
-            // JSX that references an undefined component renders nothing and
-            // says nothing.
+            // An undefined component renders nothing and says nothing.
             "react/jsx-no-undef": "error",
             "react/jsx-key": "error",
             "react/no-children-prop": "error",
             "react/jsx-no-target-blank": "error",
 
-            // `react/prop-types` wants PropTypes declarations on every
-            // component. This codebase deliberately does not use them, so the
-            // rule would report every file and teach people to ignore output.
+            // No PropTypes in this codebase; no React in scope with the modern transform.
             "react/prop-types": "off",
-            // JSX does not need React in scope under the modern transform.
             "react/react-in-jsx-scope": "off",
 
-            // ── From the recommended set, tuned ─────────────────────────────
-            // Unused *arguments* are often deliberate (a callback signature you
-            // must accept but do not use), so only flag unused variables, and
-            // allow the conventional leading underscore to opt out.
+            // Unused arguments are often a required callback signature; `_x` opts out.
             "no-unused-vars": [
                 "error",
                 {
@@ -83,18 +58,13 @@ export default [
                     caughtErrors: "none",
                 },
             ],
-            // An empty catch is how errors get swallowed. This codebase does it
-            // intentionally in places and comments why, so warn rather than
-            // error — but do not let it be invisible.
+            // Deliberate (commented) empty catches exist, so warn, not error.
             "no-empty": ["warn", { allowEmptyCatch: true }],
         },
     },
     {
-        // The Playwright smoke tests drive a real browser from Node; there is
-        // no React in them at all. The React plugin's rules are not merely
-        // noisy here, they are wrong: `react-hooks/rules-of-hooks` reads
-        // Playwright's `use` fixture callback as React's `use` hook and reports
-        // an error on correct code.
+        // Playwright code has no React, and rules-of-hooks misreads its `use`
+        // fixture callback as React's `use` hook.
         files: ["smoke/**", "playwright.config.js"],
         languageOptions: { globals: { ...globals.node } },
         rules: {
@@ -103,8 +73,7 @@ export default [
         },
     },
     {
-        // Test files get the test globals and a lighter touch: a deliberately
-        // malformed fixture is the point of a test, not a mistake in it.
+        // Tests: test globals, and a malformed fixture is the point, not a mistake.
         files: ["**/*.test.{js,jsx}", "src/test/**"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },

@@ -1,9 +1,6 @@
-//! TUI command language.
-//!
-//! Every action in the TUI is reachable by typing a `:`-prefixed command, so the
-//! whole app can be driven from the keyboard (or by an automated client). The
-//! same `TuiCommand` values are produced both by the command line and by overlay
-//! shortcuts, and they all funnel through `TuiApp::execute_command`.
+//! TUI command language: every action is reachable as a `:`-prefixed command.
+//! The command line and overlay shortcuts both produce `TuiCommand`s, which all
+//! funnel through `TuiApp::execute_command`.
 
 /// A parsed command ready for execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,8 +21,7 @@ pub enum TuiCommand {
     },
     Disconnect,
     StopHost,
-    /// Set (or clear, when `None`) the P2P connection password used for hosting and
-    /// connecting.
+    /// Set (or clear, when `None`) the P2P connection password.
     ConnectionPassword(Option<String>),
     /// Lock (`true`) or unlock (`false`) the conversation against new connections.
     Lock(bool),
@@ -86,25 +82,19 @@ pub enum TuiCommand {
         username: String,
         password: Option<String>,
     },
-    /// Accept the community server identity shown by the last `:party-connect`
-    /// and finish joining. Separate command because the credentials are only
-    /// sent once the user has confirmed the fingerprint out of band.
+    /// Accept the server identity shown by the last `:party-connect` and join;
+    /// the credentials are only sent after this out-of-band check.
     PartyTrust,
     PartyPost(String),
-    /// Send a direct message to a member (by username or `#index`) on the current
-    /// Party server.
+    /// DM a member (by username or `#index`) on the current Party server.
     PartyDm {
         target: String,
         text: String,
     },
-    /// Create a channel on the current Party server.
     PartyCreateChannel(String),
-    /// Share a local file into the current Party server's channel.
     PartySendFile(String),
-    /// Download a shared file (matched by name or content-hash prefix) from the
-    /// current Party server into the download directory.
+    /// Download a shared file (by name or hash prefix) to the download dir.
     PartyDownload(String),
-    /// Open the Communities pane.
     PartyPane,
     /// Refresh the shared-file listing and storage usage.
     PartyFiles,
@@ -142,8 +132,7 @@ pub enum TuiCommand {
     ForceQuit,
 }
 
-/// Registry of commands used to render `:help` and validate names.
-/// Tuple: (name, usage, description).
+/// (name, usage, description): renders `:help` and supplies usage errors.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("host", ":host [port]", "Start listening for an incoming peer"),
     ("connect", ":connect <host[:port]>", "Connect to a hosting peer"),
@@ -308,8 +297,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("quit", ":quit", "Save and exit (alias :q)"),
 ];
 
-/// Non-canonical command names accepted by the parser.
-/// Tuple: (alias, canonical command name).
+/// (alias, canonical name) for the non-canonical names the parser accepts.
 pub const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("party-channel", "party-create-channel"),
     ("diag", "diagnostics"),
@@ -339,9 +327,8 @@ pub fn parse_bool(value: &str) -> std::result::Result<bool, String> {
     }
 }
 
-/// The arguments after a command word, with usage errors drawn from
-/// [`COMMANDS`] — so `:help` and the error for a malformed command can never
-/// disagree, which is what happened when each arm spelled its own.
+/// The arguments after a command word. Usage errors come from [`COMMANDS`],
+/// so `:help` and a malformed command's error cannot disagree.
 struct Args<'a> {
     cmd: &'a str,
     words: std::str::SplitWhitespace<'a>,
@@ -357,7 +344,6 @@ impl<'a> Args<'a> {
         }
     }
 
-    /// The next word, if any.
     fn next(&mut self) -> Option<&'a str> {
         self.words.next()
     }
@@ -376,8 +362,8 @@ impl<'a> Args<'a> {
         non_empty(self.rest, || self.usage())
     }
 
-    /// The remainder after `first` (a word already taken with [`Self::word`]),
-    /// required — for `<target> <free text>` commands.
+    /// The required remainder after `first` (already taken with
+    /// [`Self::word`]), for `<target> <free text>` commands.
     fn text_after(&self, first: &str) -> Result<String, String> {
         non_empty(self.rest[first.len()..].trim(), || self.usage())
     }
@@ -418,7 +404,6 @@ pub fn parse_command(raw: &str) -> std::result::Result<TuiCommand, String> {
         ),
         "connect" => {
             let target = a.word()?;
-            // The same parser every other connect path uses.
             let (host, port) = crate::util::parse_host_port(target, Some(crate::PORT_DEFAULT))
                 .map_err(|e| format!("{e} in '{target}'"))?;
             C::Connect { host, port }
@@ -556,24 +541,30 @@ pub use parse_bool as parse_setting_bool;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use TuiCommand as C;
+
+    fn p(raw: &str) -> TuiCommand {
+        parse_command(raw).unwrap()
+    }
+
+    fn err(raw: &str) -> bool {
+        parse_command(raw).is_err()
+    }
 
     #[test]
     fn parses_connection_commands() {
+        assert_eq!(p(":host 7777"), C::Host(Some(7777)));
+        assert_eq!(p(":host"), C::Host(None));
         assert_eq!(
-            parse_command(":host 7777").unwrap(),
-            TuiCommand::Host(Some(7777))
-        );
-        assert_eq!(parse_command(":host").unwrap(), TuiCommand::Host(None));
-        assert_eq!(
-            parse_command(":connect 10.0.0.1").unwrap(),
-            TuiCommand::Connect {
+            p(":connect 10.0.0.1"),
+            C::Connect {
                 host: "10.0.0.1".into(),
                 port: crate::PORT_DEFAULT
             }
         );
         assert_eq!(
-            parse_command(":connect-relay relay:23456 tok").unwrap(),
-            TuiCommand::ConnectRelay {
+            p(":connect-relay relay:23456 tok"),
+            C::ConnectRelay {
                 relay: "relay:23456".into(),
                 token: "tok".into()
             }
@@ -583,96 +574,84 @@ mod tests {
     #[test]
     fn parses_party_file_commands() {
         assert_eq!(
-            parse_command(":party-send-file C:\\pics\\cat photo.png").unwrap(),
-            TuiCommand::PartySendFile("C:\\pics\\cat photo.png".into()),
+            p(":party-send-file C:\\pics\\cat photo.png"),
+            C::PartySendFile("C:\\pics\\cat photo.png".into()),
             "the whole rest (spaces included) is the path"
         );
-        assert!(parse_command(":party-send-file").is_err());
-
+        assert!(err(":party-send-file"));
         assert_eq!(
-            parse_command(":party-download cat photo.png").unwrap(),
-            TuiCommand::PartyDownload("cat photo.png".into())
+            p(":party-download cat photo.png"),
+            C::PartyDownload("cat photo.png".into())
         );
-        assert!(parse_command(":party-download").is_err());
+        assert!(err(":party-download"));
     }
 
     #[test]
     fn parses_connection_password_and_lock() {
         let pw = format!("pw-{}", uuid::Uuid::new_v4());
         assert_eq!(
-            parse_command(&format!(":connection-password {pw}")).unwrap(),
-            TuiCommand::ConnectionPassword(Some(pw))
+            p(&format!(":connection-password {pw}")),
+            C::ConnectionPassword(Some(pw))
         );
-        assert_eq!(
-            parse_command(":connection-password").unwrap(),
-            TuiCommand::ConnectionPassword(None)
-        );
-        assert_eq!(parse_command(":lock on").unwrap(), TuiCommand::Lock(true));
-        assert_eq!(parse_command(":lock off").unwrap(), TuiCommand::Lock(false));
-        assert!(parse_command(":lock").is_err());
+        assert_eq!(p(":connection-password"), C::ConnectionPassword(None));
+        assert_eq!(p(":lock on"), C::Lock(true));
+        assert_eq!(p(":lock off"), C::Lock(false));
+        assert!(err(":lock"));
     }
 
     #[test]
     fn parses_party_commands() {
         let party_pw = format!("pw-{}", uuid::Uuid::new_v4());
         assert_eq!(
-            parse_command(&format!(":party-connect 10.0.0.5:9000 alice {party_pw}")).unwrap(),
-            TuiCommand::PartyConnect {
+            p(&format!(":party-connect 10.0.0.5:9000 alice {party_pw}")),
+            C::PartyConnect {
                 address: "10.0.0.5:9000".into(),
                 username: "alice".into(),
                 password: Some(party_pw),
             }
         );
         assert_eq!(
-            parse_command(":party-connect 10.0.0.5 bob").unwrap(),
-            TuiCommand::PartyConnect {
+            p(":party-connect 10.0.0.5 bob"),
+            C::PartyConnect {
                 address: "10.0.0.5".into(),
                 username: "bob".into(),
                 password: None,
             }
         );
         assert_eq!(
-            parse_command(":party-post hello everyone").unwrap(),
-            TuiCommand::PartyPost("hello everyone".into())
+            p(":party-post hello everyone"),
+            C::PartyPost("hello everyone".into())
         );
         assert_eq!(
-            parse_command(":party-dm alice hi there").unwrap(),
-            TuiCommand::PartyDm {
+            p(":party-dm alice hi there"),
+            C::PartyDm {
                 target: "alice".into(),
                 text: "hi there".into()
             }
         );
-        assert!(parse_command(":party-dm alice").is_err());
-        assert_eq!(
-            parse_command(":party-create-channel random").unwrap(),
-            TuiCommand::PartyCreateChannel("random".into())
-        );
-        assert_eq!(
-            parse_command(":party-channel random").unwrap(),
-            TuiCommand::PartyCreateChannel("random".into())
-        );
-        assert!(parse_command(":party-create-channel").is_err());
-        assert_eq!(
-            parse_command(":party-status").unwrap(),
-            TuiCommand::PartyStatus
-        );
-        assert!(parse_command(":party-connect 10.0.0.5").is_err());
-        assert!(parse_command(":party-post").is_err());
+        assert!(err(":party-dm alice"));
+        for raw in [":party-create-channel random", ":party-channel random"] {
+            assert_eq!(p(raw), C::PartyCreateChannel("random".into()));
+        }
+        assert!(err(":party-create-channel"));
+        assert_eq!(p(":party-status"), C::PartyStatus);
+        assert!(err(":party-connect 10.0.0.5"));
+        assert!(err(":party-post"));
     }
 
     #[test]
     fn parses_contact_commands() {
         assert_eq!(
-            parse_command(":contact-add Alice 1.2.3.4:9000 ab12").unwrap(),
-            TuiCommand::ContactAdd {
+            p(":contact-add Alice 1.2.3.4:9000 ab12"),
+            C::ContactAdd {
                 name: "Alice".into(),
                 address: "1.2.3.4:9000".into(),
                 fingerprint: Some("ab12".into())
             }
         );
         assert_eq!(
-            parse_command(":contact-rename 2 New Name").unwrap(),
-            TuiCommand::ContactRename {
+            p(":contact-rename 2 New Name"),
+            C::ContactRename {
                 target: "2".into(),
                 new_name: "New Name".into()
             }
@@ -682,54 +661,45 @@ mod tests {
     #[test]
     fn parses_set_and_verify() {
         assert_eq!(
-            parse_command(":set notifications off").unwrap(),
-            TuiCommand::Set {
+            p(":set notifications off"),
+            C::Set {
                 key: "notifications".into(),
                 value: "off".into()
             }
         );
-        assert_eq!(
-            parse_command(":verify accept").unwrap(),
-            TuiCommand::Verify(true)
-        );
-        assert_eq!(
-            parse_command(":verify reject").unwrap(),
-            TuiCommand::Verify(false)
-        );
-        assert!(parse_command(":verify maybe").is_err());
+        assert_eq!(p(":verify accept"), C::Verify(true));
+        assert_eq!(p(":verify reject"), C::Verify(false));
+        assert!(err(":verify maybe"));
     }
 
     #[test]
     fn import_and_send_preserve_remainder() {
         assert_eq!(
-            parse_command(":import chat-p2p://invite/v2/abc").unwrap(),
-            TuiCommand::Import("chat-p2p://invite/v2/abc".into())
+            p(":import chat-p2p://invite/v2/abc"),
+            C::Import("chat-p2p://invite/v2/abc".into())
         );
         assert_eq!(
-            parse_command(":send C:/path with space/file.txt").unwrap(),
-            TuiCommand::Send("C:/path with space/file.txt".into())
+            p(":send C:/path with space/file.txt"),
+            C::Send("C:/path with space/file.txt".into())
         );
     }
 
     #[test]
     fn rejects_unknown_and_empty() {
-        assert!(parse_command(":bogus").is_err());
-        assert!(parse_command(":").is_err());
-        assert!(parse_command(":rename").is_err());
+        assert!(err(":bogus"));
+        assert!(err(":"));
+        assert!(err(":rename"));
     }
 
     #[test]
     fn parses_quit_aliases() {
-        assert_eq!(parse_command(":q").unwrap(), TuiCommand::Quit);
-        assert_eq!(parse_command(":quit!").unwrap(), TuiCommand::ForceQuit);
+        assert_eq!(p(":q"), C::Quit);
+        assert_eq!(p(":quit!"), C::ForceQuit);
     }
 
     #[test]
     fn parses_help_topics_and_command_aliases() {
-        assert_eq!(
-            parse_command(":help connect").unwrap(),
-            TuiCommand::Help(Some("connect".into()))
-        );
+        assert_eq!(p(":help connect"), C::Help(Some("connect".into())));
         assert_eq!(
             command_help("party-channel").unwrap().0,
             "party-create-channel"
@@ -740,22 +710,19 @@ mod tests {
 
     #[test]
     fn parses_ipv6_targets_without_losing_host_bits() {
-        assert_eq!(
-            parse_command(":connect ::1").unwrap(),
-            TuiCommand::Connect {
-                host: "::1".into(),
-                port: crate::PORT_DEFAULT,
-            }
-        );
-        // The brackets are address syntax, not part of the host: a socket
-        // cannot resolve "[::1]", only "::1".
-        assert_eq!(
-            parse_command(":connect [::1]:9000").unwrap(),
-            TuiCommand::Connect {
-                host: "::1".into(),
-                port: 9000,
-            }
-        );
+        // The brackets are address syntax: a socket resolves "::1", not "[::1]".
+        for (raw, port) in [
+            (":connect ::1", crate::PORT_DEFAULT),
+            (":connect [::1]:9000", 9000),
+        ] {
+            assert_eq!(
+                p(raw),
+                C::Connect {
+                    host: "::1".into(),
+                    port
+                }
+            );
+        }
     }
 
     #[test]

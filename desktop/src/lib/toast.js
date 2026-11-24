@@ -3,24 +3,16 @@ let seq = 0;
 let toasts = [];
 const subs = new Set();
 
-// Most toasts are confirmations that can scroll by. Errors are not: they are the
-// only place the app reports "not delivered", "transfer interrupted" or a failed
-// verification, and four seconds is not enough to read one — let alone for a
-// screen reader to finish announcing it. Errors therefore stay until dismissed.
+// Confirmations expire; errors stay until dismissed (four seconds is too short
+// to read one, or for a screen reader to announce it).
 export const DEFAULT_TTL_MS = 4000;
 
-// Hard cap on how many are held at once. Errors no longer expire on their own,
-// so without this a flapping connection would grow the list without bound and
-// bury the screen (and the live region) under its own history. Oldest go first.
+// Cap held toasts so a flapping connection cannot bury the screen; oldest go first.
 export const MAX_TOASTS = 6;
 
 function emit() { subs.forEach((fn) => fn(toasts)); }
 
-/**
- * Show a toast. `ms` defaults to 4s for info/success and to "stay until
- * dismissed" for errors; pass an explicit number to override, or 0 to require a
- * manual dismiss.
- */
+/** Show a toast. `ms` overrides the default lifetime; 0 means manual dismiss. */
 export function toast(message, level = "info", ms) {
   const t = { id: ++seq, message: String(message), level };
   const ttl = ms === undefined ? (level === "error" ? 0 : DEFAULT_TTL_MS) : ms;

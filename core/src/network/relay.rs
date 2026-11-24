@@ -1,22 +1,17 @@
 //! Relay rendezvous with TCP hole punching and a bridged fallback.
 //!
-//! A host registers a random token; a joiner presents the same token. When both
-//! sides are punch-capable, the server sends each of them the other's public
-//! endpoint (observed from the control connection) plus self-reported LAN
-//! candidates, and the peers attempt a direct TCP hole punch (`punch.rs`). Only
-//! if that fails — hostile NATs, CGNAT, filtered networks — does the server
-//! fall back to what it always did: pair the two control connections and
-//! forward the (already end-to-end encrypted) session bytes between them.
+//! A host registers a random token; a joiner presents the same token. When both sides
+//! are punch-capable, the server sends each the other's public endpoint (observed from
+//! the control connection) plus self-reported LAN candidates, and the peers attempt a
+//! TCP hole punch (`punch.rs`). Only if that fails does the server pair the two control
+//! connections and forward the (end-to-end encrypted) session bytes.
 //!
-//! Wire compatibility: the control protocol is bincode enums, so new variants
-//! are only appended. A legacy peer registering with the old `Host`/`Join`
-//! variants simply gets the bridged path; a new client talking to a legacy
-//! server detects the dropped connection and re-registers in legacy mode.
+//! Wire compatibility: the control protocol is bincode enums with variants only ever
+//! appended. A legacy peer gets the bridged path; a new client facing a legacy server
+//! sees the dropped connection and re-registers in legacy mode.
 //!
-//! Trust model is unchanged: the token (and the hello tag derived from it) is
-//! rendezvous pairing, not authentication. Whether punched or bridged, the
-//! socket carries the same v3 handshake — ECDH, identity proof, TOFU — and the
-//! relay never holds key material.
+//! The token is rendezvous pairing, not authentication: either way the socket carries
+//! the full handshake and TOFU, and the relay never holds key material.
 
 use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
@@ -34,37 +29,29 @@ use crate::network::ratelimit::RateLimiter;
 
 const RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 const RELAY_TOKEN_BYTES: usize = 16;
-/// How long a freshly accepted connection has to send its `Host`/`Join` frame.
-///
-/// Without this a peer could connect and simply never speak: `recv_relay_message`
-/// would await forever, holding a task and a socket for the life of the process.
-/// That is the cheapest possible denial of service against a public rendezvous.
+/// How long a freshly accepted connection has to send its `Host`/`Join` frame, so a
+/// peer that connects and never speaks cannot hold a task and socket forever.
 const RELAY_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Most rendezvous slots the server will hold at once. Each pending entry parks
-/// a task and a socket for up to [`RELAY_WAIT_TIMEOUT`], so an uncapped map is
-/// an uncapped memory cost paid by anyone who can open connections.
+/// Most rendezvous slots held at once; each parks a task and a socket for up to
+/// [`RELAY_WAIT_TIMEOUT`].
 const MAX_PENDING_RENDEZVOUS: usize = 1024;
-/// Connections one address may open to the relay within [`RELAY_RATE_WINDOW`].
-/// More generous than the community server's: a legitimate client reconnects
-/// per rendezvous attempt, and punch retries reuse the control connection.
+/// Connections one address may open within [`RELAY_RATE_WINDOW`]; generous because a
+/// client reconnects per rendezvous attempt.
 const RELAY_MAX_CONNECTIONS_PER_IP: usize = 20;
 const RELAY_RATE_WINDOW: Duration = Duration::from_secs(30);
-/// How long the server waits for both peers' punch outcomes before assuming
-/// the worst and bridging. Must exceed the client-side punch budget plus the
-/// selection grace, with margin for slow links.
+/// How long the server waits for both punch outcomes before bridging. Must exceed the
+/// client-side punch budget plus the selection grace.
 const PUNCH_REPORT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest candidate string the server will forward (abuse guard).
 const MAX_CANDIDATE_CHARS: usize = 64;
 
-/// Setting this environment variable (to any non-empty value) disables hole
-/// punching and forces the bridged relay path — useful for debugging and for
-/// networks where punch traffic is unwelcome.
+/// Set (non-empty) to disable hole punching and force the bridged relay path.
 pub const NO_HOLEPUNCH_ENV: &str = "P2PEM_NO_HOLEPUNCH";
 
 #[derive(Debug, Serialize, Deserialize)]
 enum RelayRequest {
-    /// Legacy (pre-punch) registrations: always bridged. Kept first — bincode
-    /// encodes the variant index, so existing peers stay wire-compatible.
+    /// Legacy (pre-punch) registrations: always bridged. Kept first, since bincode
+    /// encodes the variant index.
     Host {
         token: String,
     },
@@ -82,10 +69,9 @@ enum RelayRequest {
     },
 }
 
-/// What a punch-capable client tells the rendezvous about itself. The public
-/// endpoint is *not* self-reported — the server observes it from the control
-/// connection's source address, which is exactly the NAT mapping the punch
-/// will reuse.
+/// What a punch-capable client reports about itself. The public endpoint is not
+/// self-reported: the server observes it from the control connection, which is the
+/// NAT mapping the punch reuses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PunchCaps {
     /// LAN candidates as `ip:port`, already carrying the punch source port.
@@ -97,8 +83,8 @@ enum RelayResponse {
     Waiting,
     Paired,
     Error(String),
-    /// Both sides are punch-capable: attempt a direct connection to these
-    /// candidates, then report a [`PunchOutcome`]. Appended variant.
+    /// Both sides are punch-capable: try these candidates, then report a
+    /// [`PunchOutcome`]. Appended variant.
     PunchStart {
         peer_public: String,
         peer_locals: Vec<String>,
@@ -121,11 +107,9 @@ type PendingMap = Arc<Mutex<HashMap<String, PendingRelay>>>;
 /// How the rendezvous ended up connecting the two peers.
 #[derive(Debug)]
 enum RelayStream {
-    /// Hole punch succeeded: a direct socket to the peer; the relay is out of
-    /// the path entirely.
+    /// Hole punch succeeded: a direct socket; the relay is out of the path.
     Direct(TcpStream),
-    /// Bridged through the relay server (legacy peers, punch failure, or
-    /// punching disabled).
+    /// Bridged through the relay (legacy peers, punch failure, or punching disabled).
     Relayed(TcpStream),
 }
 
@@ -143,19 +127,12 @@ pub async fn run_relay_server(port: u16) -> Result<()> {
     run_relay_server_with_wait_timeout(port, RELAY_WAIT_TIMEOUT).await
 }
 
-/// [`run_relay_server`] with a caller-chosen rendezvous lifetime.
-///
-/// The only reason this exists is testability: [`RELAY_WAIT_TIMEOUT`] is five
-/// minutes, and the expiry behaviour it governs — a stale token being refused,
-/// and an abandoned slot being swept so it cannot lock the table — is worth a
-/// test that does not take five minutes to run. Production always uses the
-/// constant.
+/// [`run_relay_server`] with a caller-chosen rendezvous lifetime, so expiry is testable
+/// without a five-minute wait. Production always uses [`RELAY_WAIT_TIMEOUT`].
 pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duration) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-    // Same hardening the community server's accept loop has: an unlimited
-    // connection rate against a public rendezvous is an unlimited task and
-    // memory cost, and every accepted socket parks a slot until it times out.
+    // Same per-IP limit as the community server: every accepted socket parks a slot.
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::with_limits(
         RELAY_MAX_CONNECTIONS_PER_IP,
         RELAY_RATE_WINDOW,
@@ -163,10 +140,8 @@ pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duratio
     tracing::info!("Relay server listening on port {}", port);
 
     loop {
-        // A failed `accept` is almost always transient (the peer went away
-        // between the SYN and our accept, or we momentarily ran out of file
-        // descriptors). Propagating it with `?` would take the whole rendezvous
-        // down for the life of the process over a single hiccup.
+        // A failed accept is almost always transient (EMFILE, peer gone); `?` would
+        // take the rendezvous down for the life of the process.
         let (stream, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
@@ -193,7 +168,7 @@ pub async fn run_relay_server_with_wait_timeout(port: u16, wait_timeout: Duratio
 pub async fn run_host_session_via_relay(
     relay_server: &str,
     token: &str,
-    privkey: rsa::RsaPrivateKey,
+    privkey: rsa::PrivateKey,
     to_app_tx: tokio::sync::mpsc::UnboundedSender<crate::types::SessionEvent>,
     from_app_rx: tokio::sync::mpsc::UnboundedReceiver<crate::core::ProtocolMessage>,
     file_rx: tokio::sync::mpsc::Receiver<crate::core::ProtocolMessage>,
@@ -222,7 +197,7 @@ pub async fn run_host_session_via_relay(
 pub async fn run_client_session_via_relay(
     relay_server: &str,
     token: &str,
-    privkey: rsa::RsaPrivateKey,
+    privkey: rsa::PrivateKey,
     to_app_tx: tokio::sync::mpsc::UnboundedSender<crate::types::SessionEvent>,
     from_app_rx: tokio::sync::mpsc::UnboundedReceiver<crate::core::ProtocolMessage>,
     file_rx: tokio::sync::mpsc::Receiver<crate::core::ProtocolMessage>,
@@ -266,11 +241,9 @@ async fn connect_to_relay(relay_server: &str, token: &str, as_host: bool) -> Res
     connect_to_relay_with(relay_server, token, as_host, !punching_disabled_by_env()).await
 }
 
-/// Errors from one registration attempt, split by whether re-registering in
-/// legacy mode could help.
+/// Errors from one registration attempt, split by whether legacy mode could help.
 enum AttemptError {
-    /// The server dropped us before answering at all — the signature of a
-    /// pre-punch relay that could not parse the new registration variant.
+    /// Dropped before any answer: a pre-punch relay that could not parse the request.
     LegacyServer(anyhow::Error),
     Fatal(anyhow::Error),
 }
@@ -314,8 +287,7 @@ async fn relay_attempt(
     as_host: bool,
     try_punch: bool,
 ) -> Result<RelayStream, AttemptError> {
-    // Reuse-enabled dial: the punch phase re-binds this connection's local
-    // port, which requires the reuse flags to be set on it from the start.
+    // Reuse-enabled dial: the punch phase re-binds this connection's local port.
     let mut stream = crate::network::punch::connect_reusable(host, port)
         .await
         .map_err(AttemptError::Fatal)?;
@@ -365,8 +337,7 @@ async fn relay_attempt(
                 let candidates = parse_candidates(&peer_public, &peer_locals);
                 match attempt_punch(role, local_port, &candidates, token).await {
                     Ok(direct) => {
-                        // Best-effort: the server only uses this to skip the
-                        // bridge; the direct socket is already confirmed.
+                        // Best-effort: the direct socket is already confirmed.
                         let _ =
                             send_relay_message(&mut stream, &PunchOutcome { success: true }).await;
                         tracing::info!(
@@ -389,54 +360,31 @@ async fn relay_attempt(
 }
 
 fn build_request(token: &str, as_host: bool, try_punch: bool, local_port: u16) -> RelayRequest {
+    let token = token.to_string();
     if !try_punch {
         return if as_host {
-            RelayRequest::Host {
-                token: token.to_string(),
-            }
+            RelayRequest::Host { token }
         } else {
-            RelayRequest::Join {
-                token: token.to_string(),
-            }
+            RelayRequest::Join { token }
         };
     }
-    // LAN candidate: lets two peers behind the *same* NAT punch directly even
-    // when the router doesn't hairpin its own external address.
+    // LAN candidate: lets two peers behind the same NAT punch even without hairpinning.
     let mut local_addrs = Vec::new();
     if let Some(ip) = crate::util::primary_local_ipv4() {
         local_addrs.push(crate::util::format_host_port(&ip, local_port));
     }
     let punch = PunchCaps { local_addrs };
     if as_host {
-        RelayRequest::HostV2 {
-            token: token.to_string(),
-            punch,
-        }
+        RelayRequest::HostV2 { token, punch }
     } else {
-        RelayRequest::JoinV2 {
-            token: token.to_string(),
-            punch,
-        }
+        RelayRequest::JoinV2 { token, punch }
     }
 }
 
-/// Turn on TCP keepalive for a bridged socket.
-///
-/// A relayed session is a live conversation: it can legitimately sit idle for
-/// hours, so an inactivity timeout would disconnect people mid-chat. The problem
-/// is narrower than idleness — it is the *half-open* peer, the one whose machine
-/// slept, lost its network, or was killed without a FIN. `copy_bidirectional`
-/// has no way to notice: it is waiting on a socket that will never speak and
-/// never close, and it holds the task, both sockets and the pairing forever.
-///
-/// Keepalive is the mechanism built for exactly this. The kernel probes a quiet
-/// connection and tears it down when the peer stops answering, which surfaces as
-/// a normal end-of-stream and lets the task exit. It costs a few bytes an hour
-/// on genuinely idle connections and nothing on busy ones.
-///
-/// Failure to set it is logged and ignored: a relay that refuses to bridge
-/// because a socket option did not take is worse than one that bridges without
-/// the probe.
+/// Turn on TCP keepalive for a bridged socket. A relayed chat may idle for hours, so
+/// no inactivity timeout; but a half-open peer (slept, lost network, killed without
+/// FIN) would pin `copy_bidirectional`, both sockets and the task forever. Failure to
+/// set it is logged and ignored rather than refusing to bridge.
 fn enable_keepalive(stream: &TcpStream, side: &str) {
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(60))
@@ -451,8 +399,7 @@ async fn handle_relay_connection(
     pending: PendingMap,
     wait_timeout: Duration,
 ) -> Result<()> {
-    // Bounded: a client that connects and then says nothing must not hold this
-    // task and socket open indefinitely.
+    // Bounded, so a client that never speaks cannot hold this task open.
     let hello = tokio::time::timeout(
         RELAY_HELLO_TIMEOUT,
         recv_relay_message::<RelayRequest>(&mut stream),
@@ -464,34 +411,27 @@ async fn handle_relay_connection(
             RELAY_HELLO_TIMEOUT.as_secs()
         )
     })??;
-    match hello {
-        RelayRequest::Host { token } => host_flow(stream, pending, token, None, wait_timeout).await,
-        RelayRequest::HostV2 { token, punch } => {
-            host_flow(
-                stream,
-                pending,
-                token,
-                Some(sanitize_caps(punch)),
-                wait_timeout,
-            )
-            .await
-        }
-        RelayRequest::Join { token } => join_flow(stream, pending, token, None, wait_timeout).await,
-        RelayRequest::JoinV2 { token, punch } => {
-            join_flow(
-                stream,
-                pending,
-                token,
-                Some(sanitize_caps(punch)),
-                wait_timeout,
-            )
-            .await
-        }
+    let (token, caps, is_host) = match hello {
+        RelayRequest::Host { token } => (token, None, true),
+        RelayRequest::Join { token } => (token, None, false),
+        RelayRequest::HostV2 { token, punch } => (token, Some(sanitize_caps(punch)), true),
+        RelayRequest::JoinV2 { token, punch } => (token, Some(sanitize_caps(punch)), false),
+    };
+    if is_host {
+        host_flow(stream, pending, token, caps, wait_timeout).await
+    } else {
+        join_flow(stream, pending, token, caps, wait_timeout).await
     }
 }
 
-/// Bound peer-supplied candidate lists before forwarding them: the server
-/// never parses these, so cap count and length instead.
+/// Tell the client why it is refused, then fail with the same message.
+async fn refuse(stream: &mut TcpStream, reason: &str) -> Result<()> {
+    send_relay_message(stream, &RelayResponse::Error(reason.to_string())).await?;
+    bail!("{reason}")
+}
+
+/// Bound peer-supplied candidate lists before forwarding them (the server never parses
+/// them, so cap count and length).
 fn sanitize_caps(mut caps: PunchCaps) -> PunchCaps {
     caps.local_addrs.retain(|a| a.len() <= MAX_CANDIDATE_CHARS);
     caps.local_addrs.truncate(MAX_PUNCH_CANDIDATES);
@@ -510,9 +450,8 @@ async fn host_flow(
     let (rendezvous_tx, rendezvous_rx) = oneshot::channel();
     {
         let mut guard = pending.lock().await;
-        // Expired slots are only removed by their own timeout task, so sweep
-        // them here too before deciding the map is full — otherwise a burst of
-        // abandoned hosts would lock out legitimate ones for five minutes.
+        // Sweep expired slots before deciding the map is full, or a burst of abandoned
+        // hosts would lock out legitimate ones until their own timeouts fire.
         guard.retain(|_, entry| entry.created_at.elapsed() <= wait_timeout);
         if guard.len() >= MAX_PENDING_RENDEZVOUS {
             send_relay_message(
@@ -522,25 +461,11 @@ async fn host_flow(
             .await?;
             bail!("relay rendezvous table is full ({MAX_PENDING_RENDEZVOUS} slots)");
         }
-        // This answer does tell an unauthenticated caller whether a token is
-        // currently registered — but so does every other answer, so reordering
-        // the checks does not close it and should not be mistaken for closing
-        // it. The alternative to "already in use" is `Waiting`, which is just as
-        // distinguishable: a caller learns the same bit either way, because
-        // registering *is* the observable difference. Removing the oracle would
-        // mean the relay no longer answering differently for a taken token,
-        // which it cannot do while a token is what pairs two peers.
-        //
-        // What bounds the exposure is `validate_token` above and the token's own
-        // entropy: guessing is the attack, and this only confirms a guess the
-        // caller could equally confirm by squatting on it.
+        // This answer reveals whether a token is registered, but so does `Waiting`:
+        // registering is the observable difference. Token entropy and
+        // `validate_token` are what bound guessing.
         if guard.contains_key(&token) {
-            send_relay_message(
-                &mut stream,
-                &RelayResponse::Error("Relay token already in use".to_string()),
-            )
-            .await?;
-            bail!("Relay token already in use");
+            return refuse(&mut stream, "Relay token already in use").await;
         }
         guard.insert(
             token.clone(),
@@ -557,15 +482,9 @@ async fn host_flow(
     let (mut peer_stream, joiner_caps) =
         match tokio::time::timeout(wait_timeout, rendezvous_rx).await {
             Ok(Ok(paired)) => paired,
-            // The sender went away without pairing us. Either the joiner's task
-            // dropped mid-handshake, or another host's sweep removed our slot
-            // because it had aged out — in which case this *is* the timeout,
-            // arriving through a different branch.
-            //
-            // Both used to end with the connection simply closing, so from the
-            // host's side an expired rendezvous looked identical to a broken
-            // relay. And the slot was left in the table either way, holding a
-            // token nobody could re-register until the sweep found it.
+            // The sender went away unpaired: the joiner's task dropped, or a sweep
+            // removed our aged-out slot (the timeout by another route). Free the
+            // slot and say which, so an expiry is not mistaken for a broken relay.
             Ok(Err(_)) => {
                 release_dead_slot(&pending, &token).await;
                 let reason = if waiting_since.elapsed() >= wait_timeout {
@@ -573,22 +492,15 @@ async fn host_flow(
                 } else {
                     "Relay joiner dropped before pairing"
                 };
-                send_relay_message(&mut stream, &RelayResponse::Error(reason.to_string())).await?;
-                bail!("{reason}");
+                return refuse(&mut stream, reason).await;
             }
             Err(_) => {
                 release_dead_slot(&pending, &token).await;
-                send_relay_message(
-                    &mut stream,
-                    &RelayResponse::Error("Relay wait timed out".to_string()),
-                )
-                .await?;
-                bail!("Relay wait timed out");
+                return refuse(&mut stream, "Relay wait timed out").await;
             }
         };
 
-    // Punch phase: only when both sides registered as punch-capable. Any
-    // hiccup degrades to the bridge — never to a failed pairing.
+    // Punch only when both sides are punch-capable; any hiccup degrades to the bridge.
     if let (Some(host_caps), Some(joiner_caps)) = (host_caps, joiner_caps) {
         match coordinate_punch(&mut stream, &mut peer_stream, host_caps, joiner_caps).await {
             Ok(true) => {
@@ -602,24 +514,16 @@ async fn host_flow(
 
     send_relay_message(&mut stream, &RelayResponse::Paired).await?;
     send_relay_message(&mut peer_stream, &RelayResponse::Paired).await?;
-    // Before handing both sockets to the copy loop: a peer that vanishes without
-    // closing would otherwise pin this task and both sockets indefinitely.
+    // A peer that vanishes without closing would otherwise pin this task forever.
     enable_keepalive(&stream, "host");
     enable_keepalive(&peer_stream, "joiner");
     copy_bidirectional(&mut stream, &mut peer_stream).await?;
     Ok(())
 }
 
-/// Release a host's rendezvous slot once its wait is over — but only if the slot
-/// is still that host's.
-///
-/// By the time a wait ends, the slot may already be gone: the expiry sweep in
-/// `host_flow` removes aged-out slots, and the same token can then be
-/// registered again — typically by the same app retrying as its first wait ran
-/// out. Removing by token alone then deleted the *new* host's slot, and it
-/// waited out its whole timeout with nobody able to join it. A waiting host
-/// always holds its slot's receiver, so a slot whose receiver is gone is a dead
-/// one, and only a dead one is removed.
+/// Release a host's rendezvous slot once its wait is over, but only if it is still a
+/// dead slot (receiver gone). A sweep may already have removed it and the same token
+/// been registered again by a retrying host, whose live slot must survive.
 async fn release_dead_slot(pending: &PendingMap, token: &str) {
     let mut guard = pending.lock().await;
     if guard
@@ -642,32 +546,16 @@ async fn join_flow(
         let mut guard = pending.lock().await;
         match guard.remove(&token) {
             Some(entry) => entry,
-            None => {
-                send_relay_message(
-                    &mut stream,
-                    &RelayResponse::Error("Unknown relay token".to_string()),
-                )
-                .await?;
-                bail!("Unknown relay token");
-            }
+            None => return refuse(&mut stream, "Unknown relay token").await,
         }
     };
-
     if pending_entry.created_at.elapsed() > wait_timeout {
-        send_relay_message(
-            &mut stream,
-            &RelayResponse::Error("Relay token expired".to_string()),
-        )
-        .await?;
-        bail!("Relay token expired");
+        return refuse(&mut stream, "Relay token expired").await;
     }
 
-    // Acknowledge the join before handing the socket to the host. This is what
-    // lets a punch-capable joiner tell a *new* relay (that later drops the
-    // connection because the host vanished at the handoff) apart from a *legacy*
-    // relay that closed because it could not parse the `JoinV2` frame: only the
-    // legacy server stays silent, so the joiner falls back to legacy mode solely
-    // in that genuine case. The client treats `Waiting` as "keep reading".
+    // Acknowledge before handing the socket over: only a legacy relay (which cannot
+    // parse `JoinV2`) stays silent, so the joiner falls back to legacy mode solely in
+    // that case and not when the host vanished at the handoff.
     send_relay_message(&mut stream, &RelayResponse::Waiting).await?;
 
     pending_entry
@@ -678,8 +566,7 @@ async fn join_flow(
 }
 
 /// Hand each peer the other's endpoints, then wait for both outcome reports.
-/// `Ok(true)` means both sides confirmed a direct connection and the control
-/// streams can be dropped; anything else means "bridge them".
+/// `Ok(true)` means both confirmed a direct connection; anything else means bridge.
 async fn coordinate_punch(
     host: &mut TcpStream,
     joiner: &mut TcpStream,
@@ -745,38 +632,9 @@ async fn recv_relay_message<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream
 
 #[cfg(test)]
 mod tests {
-
-    /// A finished host releases only its own rendezvous slot. Removing by token
-    /// alone deleted a slot that a new host had registered with the same token
-    /// after the old one expired, leaving that host unreachable.
-    #[tokio::test]
-    async fn a_finished_wait_releases_only_a_dead_slot() {
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let token = "ab".repeat(RELAY_TOKEN_BYTES);
-
-        // A live host is waiting on this token (it holds the receiver).
-        let (tx, live_rx) = oneshot::channel();
-        pending.lock().await.insert(
-            token.clone(),
-            PendingRelay {
-                created_at: Instant::now(),
-                rendezvous_tx: tx,
-            },
-        );
-        release_dead_slot(&pending, &token).await;
-        assert!(
-            pending.lock().await.contains_key(&token),
-            "a waiting host's slot was released by somebody else's timeout"
-        );
-
-        // Once nobody waits on it, the slot is dead and is released.
-        drop(live_rx);
-        release_dead_slot(&pending, &token).await;
-        assert!(!pending.lock().await.contains_key(&token));
-    }
-
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinHandle;
 
     /// Reserve an ephemeral loopback port, then free it for the server to bind.
     fn free_port() -> u16 {
@@ -785,12 +643,41 @@ mod tests {
     }
 
     async fn start_relay() -> String {
+        start_relay_with_wait(RELAY_WAIT_TIMEOUT).await
+    }
+
+    /// A relay with a caller-chosen slot lifetime, so expiry is testable quickly.
+    async fn start_relay_with_wait(wait: Duration) -> String {
         let port = free_port();
         tokio::spawn(async move {
-            let _ = run_relay_server(port).await;
+            let _ = run_relay_server_with_wait_timeout(port, wait).await;
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         format!("127.0.0.1:{port}")
+    }
+
+    fn spawn_connect(
+        relay: &str,
+        token: &str,
+        as_host: bool,
+        punch: bool,
+    ) -> JoinHandle<Result<RelayStream>> {
+        let (relay, token) = (relay.to_string(), token.to_string());
+        tokio::spawn(async move { connect_to_relay_with(&relay, &token, as_host, punch).await })
+    }
+
+    /// Register a host, give it `delay`, then a joiner; returns both outcomes.
+    async fn pair(
+        relay: &str,
+        token: &str,
+        host_punch: bool,
+        join_punch: bool,
+        delay: Duration,
+    ) -> (Result<RelayStream>, Result<RelayStream>) {
+        let host = spawn_connect(relay, token, true, host_punch);
+        tokio::time::sleep(delay).await;
+        let join = spawn_connect(relay, token, false, join_punch);
+        (host.await.unwrap(), join.await.unwrap())
     }
 
     async fn exchange_ping_pong(host: RelayStream, join: RelayStream) {
@@ -805,93 +692,58 @@ mod tests {
         assert_eq!(&buf, b"pong");
     }
 
+    /// A finished host releases only a dead slot: removing by token alone deleted a
+    /// slot a new host had registered with the same token after the old one expired.
     #[tokio::test]
-    async fn legacy_peers_pair_bridged_and_forward_bytes() {
-        let relay_addr = start_relay().await;
-        let token = generate_relay_token();
+    async fn a_finished_wait_releases_only_a_dead_slot() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let token = "ab".repeat(RELAY_TOKEN_BYTES);
 
-        let host_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, true, false).await }
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let join_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, false, false).await }
-        });
+        let (tx, live_rx) = oneshot::channel();
+        pending.lock().await.insert(
+            token.clone(),
+            PendingRelay {
+                created_at: Instant::now(),
+                rendezvous_tx: tx,
+            },
+        );
+        release_dead_slot(&pending, &token).await;
+        assert!(
+            pending.lock().await.contains_key(&token),
+            "a waiting host's slot was released by somebody else's timeout"
+        );
 
-        let host = host_task.await.unwrap().unwrap();
-        let join = join_task.await.unwrap().unwrap();
-        assert!(matches!(host, RelayStream::Relayed(_)));
-        assert!(matches!(join, RelayStream::Relayed(_)));
-        exchange_ping_pong(host, join).await;
+        drop(live_rx);
+        release_dead_slot(&pending, &token).await;
+        assert!(!pending.lock().await.contains_key(&token));
     }
 
+    /// (host punch-capable, joiner punch-capable, expect a direct socket). A mixed
+    /// pair must not start a punch phase the legacy joiner cannot understand.
     #[tokio::test]
-    async fn punch_capable_peers_connect_directly() {
-        let relay_addr = start_relay().await;
-        let token = generate_relay_token();
-
-        let host_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, true, true).await }
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let join_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, false, true).await }
-        });
-
-        let host = host_task.await.unwrap().unwrap();
-        let join = join_task.await.unwrap().unwrap();
-        assert!(matches!(host, RelayStream::Direct(_)));
-        assert!(matches!(join, RelayStream::Direct(_)));
-        exchange_ping_pong(host, join).await;
+    async fn peers_pair_direct_or_bridged_by_capability() {
+        let relay = start_relay().await;
+        for (host_punch, join_punch, direct) in [
+            (false, false, false),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let token = generate_relay_token();
+            let delay = Duration::from_millis(100);
+            let (host, join) = pair(&relay, &token, host_punch, join_punch, delay).await;
+            let (host, join) = (host.unwrap(), join.unwrap());
+            for stream in [&host, &join] {
+                assert_eq!(
+                    matches!(stream, RelayStream::Direct(_)),
+                    direct,
+                    "host punch {host_punch}, joiner punch {join_punch}: {stream:?}"
+                );
+            }
+            exchange_ping_pong(host, join).await;
+        }
     }
 
-    #[tokio::test]
-    async fn mixed_capability_peers_fall_back_to_bridged() {
-        let relay_addr = start_relay().await;
-        let token = generate_relay_token();
-
-        // Punch-capable host, legacy joiner: the server must not start a punch
-        // phase the joiner cannot understand.
-        let host_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, true, true).await }
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let join_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, false, false).await }
-        });
-
-        let host = host_task.await.unwrap().unwrap();
-        let join = join_task.await.unwrap().unwrap();
-        assert!(matches!(host, RelayStream::Relayed(_)));
-        assert!(matches!(join, RelayStream::Relayed(_)));
-        exchange_ping_pong(host, join).await;
-    }
-
-    /// Start a relay whose rendezvous slots expire almost immediately, so the
-    /// expiry paths can be exercised without a five-minute test.
-    async fn start_relay_with_wait(wait: Duration) -> String {
-        let port = free_port();
-        tokio::spawn(async move {
-            let _ = run_relay_server_with_wait_timeout(port, wait).await;
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        format!("127.0.0.1:{port}")
-    }
-
-    /// A joiner presenting a token nobody is hosting must be told so, promptly.
-    /// Answering nothing would leave the client hanging on a typo.
+    /// Answering nothing would leave a client hanging on a typo'd token.
     #[tokio::test]
     async fn an_unknown_token_is_refused() {
         let relay_addr = start_relay().await;
@@ -904,18 +756,12 @@ mod tests {
         );
     }
 
-    /// Two hosts cannot register the same token: the second would otherwise
-    /// replace the first, silently stealing whoever joins next.
+    /// A second host would otherwise replace the first and steal whoever joins next.
     #[tokio::test]
     async fn a_token_cannot_be_hosted_twice_at_once() {
         let relay_addr = start_relay().await;
         let token = generate_relay_token();
-
-        let first = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, true, true).await }
-        });
+        let first = spawn_connect(&relay_addr, &token, true, true);
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let err = connect_to_relay_with(&relay_addr, &token, true, true)
@@ -925,23 +771,16 @@ mod tests {
             err.to_string().contains("already in use"),
             "the error should say why: {err}"
         );
-
         first.abort();
     }
 
-    /// A stale token must not pair. The slot is swept and the joiner is refused,
-    /// rather than being handed a host that gave up long ago.
+    /// A stale token is refused rather than handed a host that gave up, and the
+    /// host's own wait ends instead of parking forever.
     #[tokio::test]
     async fn an_expired_token_no_longer_pairs() {
         let relay_addr = start_relay_with_wait(Duration::from_millis(300)).await;
         let token = generate_relay_token();
-
-        let host = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, true, true).await }
-        });
-        // Let the host register, then outlive its slot.
+        let host = spawn_connect(&relay_addr, &token, true, true);
         tokio::time::sleep(Duration::from_millis(900)).await;
 
         let err = connect_to_relay_with(&relay_addr, &token, false, true)
@@ -953,97 +792,61 @@ mod tests {
             "the joiner should be refused, got: {msg}"
         );
 
-        // And the host's own wait ends rather than parking forever.
         let host_result = tokio::time::timeout(Duration::from_secs(5), host)
             .await
             .expect("the host's wait must time out on its own");
         assert!(host_result.expect("host task").is_err());
     }
 
-    /// The relay keeps serving after a pairing ends — including the same token
-    /// again, since it is released once the two peers are joined. A rendezvous
-    /// that leaked its slot would refuse the reconnect that follows every
-    /// dropped connection.
+    /// The token is released once its peers are joined, so the reconnect that
+    /// follows every dropped connection can reuse it.
     #[tokio::test]
     async fn a_token_can_be_reused_once_its_pairing_is_over() {
         let relay_addr = start_relay().await;
         let token = generate_relay_token();
-
+        let delay = Duration::from_millis(100);
         for round in 0..2 {
-            let host_task = tokio::spawn({
-                let relay_addr = relay_addr.clone();
-                let token = token.clone();
-                async move { connect_to_relay_with(&relay_addr, &token, true, false).await }
-            });
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let join_task = tokio::spawn({
-                let relay_addr = relay_addr.clone();
-                let token = token.clone();
-                async move { connect_to_relay_with(&relay_addr, &token, false, false).await }
-            });
-
-            let host = host_task
-                .await
-                .unwrap()
-                .unwrap_or_else(|e| panic!("round {round} host: {e}"));
-            let join = join_task
-                .await
-                .unwrap()
-                .unwrap_or_else(|e| panic!("round {round} joiner: {e}"));
+            let (host, join) = pair(&relay_addr, &token, false, false, delay).await;
+            let host = host.unwrap_or_else(|e| panic!("round {round} host: {e}"));
+            let join = join.unwrap_or_else(|e| panic!("round {round} joiner: {e}"));
             exchange_ping_pong(host, join).await;
             // Dropping both ends releases the bridge before the next round.
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    /// Several pairings share one relay. Each must reach its own partner: a
-    /// rendezvous that mixed them up would connect two strangers, and the v3
-    /// handshake would be the only thing standing between them.
+    /// Several pairings share one relay; each must reach its own partner.
     #[tokio::test]
     async fn concurrent_pairings_do_not_cross() {
         let relay_addr = start_relay().await;
-        const PAIRS: usize = 4;
-
-        let mut tasks = Vec::new();
-        for i in 0..PAIRS {
-            let relay_addr = relay_addr.clone();
-            tasks.push(tokio::spawn(async move {
-                let token = generate_relay_token();
-                let host_task = tokio::spawn({
-                    let relay_addr = relay_addr.clone();
-                    let token = token.clone();
-                    async move { connect_to_relay_with(&relay_addr, &token, true, false).await }
-                });
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let join = connect_to_relay_with(&relay_addr, &token, false, false)
-                    .await
-                    .expect("joiner pairs");
-                let host = host_task.await.unwrap().expect("host pairs");
-
-                // A per-pair payload: if the relay crossed two rendezvous, the
-                // bytes would arrive on the wrong socket.
-                let (mut host_stream, _) = label_stream(host, "test");
-                let (mut join_stream, _) = label_stream(join, "test");
-                let payload = format!("pair-{i}");
-                host_stream.write_all(payload.as_bytes()).await.unwrap();
-                let mut buf = vec![0u8; payload.len()];
-                join_stream.read_exact(&mut buf).await.unwrap();
-                assert_eq!(
-                    String::from_utf8(buf).unwrap(),
-                    payload,
-                    "pair {i} received another pair's bytes"
-                );
-            }));
-        }
+        let tasks: Vec<_> = (0..4)
+            .map(|i| {
+                let relay_addr = relay_addr.clone();
+                tokio::spawn(async move {
+                    let token = generate_relay_token();
+                    let delay = Duration::from_millis(100);
+                    let (host, join) = pair(&relay_addr, &token, false, false, delay).await;
+                    let (mut host_stream, _) = label_stream(host.expect("host pairs"), "test");
+                    let (mut join_stream, _) = label_stream(join.expect("joiner pairs"), "test");
+                    let payload = format!("pair-{i}");
+                    host_stream.write_all(payload.as_bytes()).await.unwrap();
+                    let mut buf = vec![0u8; payload.len()];
+                    join_stream.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(
+                        String::from_utf8(buf).unwrap(),
+                        payload,
+                        "pair {i} received another pair's bytes"
+                    );
+                })
+            })
+            .collect();
         for t in tasks {
             t.await.expect("pair task");
         }
     }
 
-    /// Emulates the pre-punch relay server: only the two legacy request
-    /// variants exist, an unknown variant is a deserialize error, and the
-    /// connection is dropped without a response — exactly what a new client
-    /// sees when talking to an old deployment.
+    /// The pre-punch relay server: only the legacy variants exist, so a V2 request
+    /// fails to deserialize and the connection drops without a response.
     mod legacy_server {
         use super::*;
 
@@ -1069,7 +872,6 @@ mod tests {
                 let pending = pending.clone();
                 tokio::spawn(async move {
                     let payload = recv_packet(&mut stream).await?;
-                    // Old server: bincode error on a V2 variant → connection drop.
                     let request: LegacyRequest = bincode::deserialize(&payload)?;
                     match request {
                         LegacyRequest::Host { token } => {
@@ -1095,6 +897,8 @@ mod tests {
         }
     }
 
+    /// A punch-capable registration dropped by an old server is silently retried in
+    /// legacy mode and still pairs.
     #[tokio::test]
     async fn new_clients_fall_back_against_a_legacy_server() {
         let port = free_port();
@@ -1105,22 +909,9 @@ mod tests {
         let relay_addr = format!("127.0.0.1:{port}");
         let token = generate_relay_token();
 
-        // Punch-capable registration gets dropped by the old server; the
-        // client must silently retry in legacy mode and still pair.
-        let host_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, true, true).await }
-        });
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let join_task = tokio::spawn({
-            let relay_addr = relay_addr.clone();
-            let token = token.clone();
-            async move { connect_to_relay_with(&relay_addr, &token, false, true).await }
-        });
-
-        let host = host_task.await.unwrap().expect("host legacy fallback");
-        let join = join_task.await.unwrap().expect("joiner legacy fallback");
+        let (host, join) = pair(&relay_addr, &token, true, true, Duration::from_millis(150)).await;
+        let host = host.expect("host legacy fallback");
+        let join = join.expect("joiner legacy fallback");
         assert!(matches!(host, RelayStream::Relayed(_)));
         assert!(matches!(join, RelayStream::Relayed(_)));
         exchange_ping_pong(host, join).await;

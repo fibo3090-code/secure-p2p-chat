@@ -18,7 +18,7 @@ vi.mock("../lib/bridge.js", async (importOriginal) => {
   return { ...actual, api: bridge.api };
 });
 
-import { Verify } from "./Verify.jsx";
+import { Verify, warningText } from "./Verify.jsx";
 import { stubApi } from "../test/render.jsx";
 
 function installApi(overrides) {
@@ -45,7 +45,11 @@ describe("Verify", () => {
 
   it("leads with the safety code and demotes the fingerprint to advanced", () => {
     render(<Verify req={req} onClose={() => {}} />);
-    expect(screen.getByText("418 902 🎃🎈🎁")).toBeTruthy();
+    // Digits and emoji are laid out apart for reading aloud; both are shown,
+    // and a screen reader gets the digits one at a time.
+    expect(screen.getByText("418 902")).toBeTruthy();
+    expect(screen.getByText("🎃🎈🎁")).toBeTruthy();
+    expect(screen.getByRole("img", { name: /Safety code: 4 1 8 9 0 2, then 🎃🎈🎁/ })).toBeTruthy();
     expect(screen.getByText(/Read this aloud with Alice/)).toBeTruthy();
     // The 64-char compare is the backstop, not the instruction.
     expect(screen.getByText(/Full fingerprint \(advanced\)/)).toBeTruthy();
@@ -55,6 +59,38 @@ describe("Verify", () => {
     render(<Verify req={{ ...req, sas: null }} onClose={() => {}} />);
     expect(screen.getByText(/Compare this grid/)).toBeTruthy();
     expect(screen.queryByText(/Read this aloud/)).toBeNull();
+  });
+
+  // CRYPTO-04: a key that is not the one in the dialled contact's invite must
+  // not look like a first contact.
+  it("leads with a warning when the key is not the one in the contact's invite", () => {
+    render(<Verify req={{ ...req, warning: { kind: "invite_mismatch", contact: "Alice", expected: "cd".repeat(32) } }}
+      onClose={() => {}} />);
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toMatch(/not the key in Alice's invite/);
+    expect(alert.textContent).toContain("cd".repeat(8));
+    expect(screen.getByText(/Unexpected key/)).toBeTruthy();
+    // The SAS is still the check, and accepting is still possible — but it is
+    // worded as trusting a *new* key, not as a routine confirmation.
+    expect(screen.getByText("418 902")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /trust this new key/ })).toBeTruthy();
+  });
+
+  it("warns when a known conversation's key changed", () => {
+    render(<Verify req={{ ...req, warning: { kind: "key_changed", previous: "ef".repeat(32) } }} onClose={() => {}} />);
+    expect(screen.getByRole("alert").textContent).toMatch(/key has changed/);
+  });
+
+  it("shows no warning for an ordinary first use", () => {
+    render(<Verify req={{ ...req, warning: null }} onClose={() => {}} />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText(/Check it's really Alice/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Codes match — trust" })).toBeTruthy();
+  });
+
+  it("still warns for a warning kind it does not know", () => {
+    expect(warningText({ kind: "something_new" })).toBeTruthy();
+    expect(warningText(null)).toBeNull();
   });
 
   it("cannot be dismissed — a live session is waiting on the answer", async () => {
@@ -107,5 +143,35 @@ describe("Verify", () => {
     // A security dialog must not show the previous request's failure above a
     // fresh decision.
     expect(screen.queryByText(/session is gone/i)).toBeNull();
+  });
+
+  it("says the safety code changed when a verified conversation sees a new key", async () => {
+    // The real bridge serialises the Rust enum as "Relay", not "relay".
+    installApi({ getConversation: { id: "chat-1", peer_fingerprint: "cd".repeat(32), transport: "Relay" } });
+    render(<Verify req={req} onClose={() => {}} />);
+    // A changed key must not read as a first connection.
+    expect(await screen.findByText("Alice's safety code changed")).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toMatch(/different key/);
+    // Trusting a changed key is deliberate: Reject has focus, trust is not the hero.
+    expect(document.activeElement.textContent).toMatch(/Reject/);
+    expect(screen.getByRole("button", { name: /Codes match/ }).className).not.toMatch(/btn-primary/);
+  });
+
+  it("stays a plain check when the stored key matches or there is none", async () => {
+    installApi({ getConversation: { id: "chat-1", peer_fingerprint: "AB".repeat(32), transport: "Direct" } });
+    render(<Verify req={req} onClose={() => {}} />);
+    expect(await screen.findByText("Direct connection")).toBeTruthy();
+    // Same key in a different case is the same key — no false alarm.
+    expect(screen.queryByText(/safety code changed/)).toBeNull();
+  });
+
+  it("holds the trust button until the lookup has settled", async () => {
+    let resolve;
+    installApi({ getConversation: () => new Promise((r) => { resolve = r; }) });
+    render(<Verify req={req} onClose={() => {}} />);
+    expect(screen.getByRole("button", { name: /Codes match/ }).disabled).toBe(true);
+    resolve({ id: "chat-1", peer_fingerprint: null, transport: "Direct" });
+    await screen.findByText("Direct connection");
+    expect(screen.getByRole("button", { name: /Codes match/ }).disabled).toBe(false);
   });
 });

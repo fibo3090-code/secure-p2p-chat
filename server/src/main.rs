@@ -1,14 +1,6 @@
-//! Party/Community server for the Encrypted Messenger.
-//!
-//! The server binds a TCP listener and serves each client over a reused
-//! Protocol v3 encrypted tunnel ([`messenger_core::network::host_handshake`]),
-//! driving the shared [`state::PartyState`] via the [`dispatch`] layer. Members
-//! join with a username + the server password, post to channels and DMs,
-//! share files, and the server stores history durably (SQLite + blob store) so
-//! offline members catch up on reconnect.
-
-//! Everything below the argument parsing lives in the library half of this
-//! crate (`lib.rs`), so the server can also be stood up in process by a test.
+//! Party/Community server binary: argument parsing on top of the library half
+//! (`lib.rs`), which serves each client over a v3 encrypted tunnel and stores
+//! history durably (SQLite + blob store) so offline members catch up.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +11,7 @@ use messenger_core::util::canonical_fingerprint;
 use messenger_server::hub::Hub;
 use messenger_server::state::PartyState;
 use messenger_server::{identity, run_accept_loop};
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -55,10 +47,9 @@ struct Args {
 
     /// Fingerprint of the identity that owns this community (shown as yours in
     /// the app: desktop Settings > Your identity, TUI :identity). That member
-    /// becomes the owner when they join, and any other owner becomes an admin —
-    /// which is also how to recover a community whose ownership went to the
-    /// wrong identity. Without it, the server prints a one-time owner claim
-    /// token until someone claims ownership.
+    /// becomes the owner on join and any other owner becomes an admin — also
+    /// how to recover a community whose ownership went to the wrong identity.
+    /// Without it, the server prints a one-time owner claim token.
     #[arg(long, env = "PARTY_OWNER", value_name = "FINGERPRINT")]
     owner: Option<String>,
 
@@ -98,8 +89,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let password_protected = args.password.is_some();
 
-    // Durable state: members, channels, and history survive restarts (loaded from
-    // and auto-saved to the data dir).
+    // Durable state: members, channels, and history survive restarts.
     let mut loaded = PartyState::load(&args.name, args.password, &args.data_dir)?;
     loaded.set_owner_fingerprint(owner);
     let retention = args

@@ -1,8 +1,6 @@
 //! Contacts and invite links.
 use crate::*;
 
-// ── Contacts + invite links ─────────────────────────────────────────────────
-
 #[derive(Serialize)]
 pub(crate) struct ContactDto {
     id: String,
@@ -10,17 +8,16 @@ pub(crate) struct ContactDto {
     fingerprint: Option<String>,
     address: Option<String>,
     trust: &'static str,
-    /// Whether this contact can be dialled at all. A contact imported from a
-    /// relay invite has no direct address but *is* reachable through its relay
-    /// token — the UI used to grey out Connect for exactly those, because it
-    /// only knew about `address`.
+    /// Dialable at all: a relay-invite contact has no address but a token.
     reachable: bool,
-    /// True when the only way to reach them is the relay, so the UI can say
-    /// "via relay" instead of showing an empty address line.
+    /// The relay is the only route, so the UI can say "via relay".
     relay_only: bool,
-    /// Deleting this contact would lift a block, letting them connect again.
-    /// The confirmation dialog has to be able to say so.
+    /// Deleting this contact would lift a block; the dialog must say so.
     blocked: bool,
+    /// The conversation this contact is already associated with, if any, so a
+    /// conversation that went offline can offer "Reconnect" and a contact row
+    /// can open its existing thread instead of starting another.
+    chat_id: Option<String>,
 }
 
 /// An imported invite plus whether the link that produced it was signed.
@@ -52,6 +49,7 @@ fn contact_dto(c: &messenger_core::types::Contact) -> ContactDto {
         reachable: has_direct || has_relay,
         relay_only: has_relay && !has_direct,
         blocked: c.trust_state == messenger_core::types::TrustState::Blocked,
+        chat_id: None,
     }
 }
 
@@ -61,13 +59,18 @@ pub(crate) async fn list_contacts(
 ) -> Result<Vec<ContactDto>, String> {
     ensure_ready(&state)?;
     let mgr = state.manager.lock().await;
-    Ok(mgr.contacts.values().map(contact_dto).collect())
+    Ok(mgr
+        .contacts
+        .values()
+        .map(|c| ContactDto {
+            chat_id: mgr.contact_to_chat.get(&c.id).map(|id| id.to_string()),
+            ..contact_dto(c)
+        })
+        .collect())
 }
 
-/// The current user's signed invite link. Embeds every reachable candidate
-/// address in priority order — the UPnP external mapping first (reachable
-/// from outside the LAN), then the local IP + configured listen port — so
-/// peers try them in turn.
+/// The user's signed invite link, with every candidate address in priority
+/// order: the UPnP external mapping first, then LAN IP + listen port.
 #[tauri::command]
 pub(crate) async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<String, String> {
     ensure_ready(&state)?;
@@ -86,18 +89,14 @@ pub(crate) async fn my_invite_link(state: tauri::State<'_, Bridge>) -> Result<St
         }
         addrs
     };
-    let id = crate::lock_identity(&state.identity);
+    let id = lock_or_recover(&state.identity);
     id.generate_signed_invite_link_with_addresses(addresses, None, None)
         .map_err(|e| e.to_string())
 }
 
-/// Parse an invite link and store it as a contact.
-///
-/// The result carries `signed`: a v1 link has no signature at all, so anyone can
-/// mint one naming anybody. That does not make the contact dangerous by itself
-/// — an imported contact starts `Unverified` and still has to pass the safety
-/// code on first connection — but the UI says so rather than importing both
-/// kinds of link with the same silent success.
+/// Parse an invite link and store it as a contact. `signed` is false for a v1
+/// link, which anyone can mint; the contact still starts `Unverified`, but the
+/// UI warns.
 #[tauri::command]
 pub(crate) async fn import_invite(
     link: String,
@@ -110,8 +109,7 @@ pub(crate) async fn import_invite(
     let id = mgr.import_contact(contact).map_err(|e| e.to_string())?;
     let dto = contact_dto(mgr.get_contact(id).expect("just inserted"));
     drop(mgr);
-    // Contacts are not covered by the poll loop's change signature, so an
-    // import that is not saved here survives only until the next crash.
+    // Contact mutations save immediately.
     persist_history(&state.manager, &state.history_path, &state.saved_sig).await;
     Ok(ImportedContactDto {
         contact: dto,
@@ -119,10 +117,8 @@ pub(crate) async fn import_invite(
     })
 }
 
-/// Delete a saved contact (its conversations and history are kept).
-///
-/// This also clears the peer's stored fingerprint, so the confirmation dialog's
-/// promise — that they will have to be verified again — is actually true.
+/// Delete a saved contact (conversations are kept). Also clears the peer's
+/// stored fingerprint, so they must be verified again.
 #[tauri::command]
 pub(crate) async fn remove_contact(
     id: String,
@@ -135,8 +131,7 @@ pub(crate) async fn remove_contact(
     Ok(())
 }
 
-/// Block a contact: live sessions with it are dropped and future connection
-/// attempts from its fingerprint are refused automatically.
+/// Block a contact: live sessions drop and its fingerprint is refused.
 #[tauri::command]
 pub(crate) async fn block_contact(
     id: String,
@@ -173,15 +168,9 @@ pub(crate) async fn unblock_contact(
     Ok(())
 }
 
-/// Dial a stored contact.
-///
-/// Goes through `ChatManager::connect_to_contact` rather than dialling the
-/// saved address directly. That method is what keeps a contact in ONE
-/// conversation: it reuses the chat already mapped to the contact (or matched
-/// by fingerprint), so reconnecting continues the thread instead of opening
-/// another "Peer ab12cd34" and fragmenting the history. Dialling `connect_to_host`
-/// here also skipped the blocked-contact check, every candidate address after
-/// the first, the relay fallback, and the contact↔chat association.
+/// Dial a stored contact via `connect_to_contact`, which keeps the contact in
+/// ONE conversation and applies the blocked check, every candidate address and
+/// the relay fallback. Never dial `connect_to_host` directly here.
 #[tauri::command]
 pub(crate) async fn connect_contact(
     id: String,
@@ -189,10 +178,9 @@ pub(crate) async fn connect_contact(
 ) -> Result<(), String> {
     ensure_ready(&state)?;
     let uuid = parse_id(&id)?;
-    let pk = {
-        let id = crate::lock_identity(&state.identity);
-        id.private_key().map_err(|e| e.to_string())?
-    };
+    let pk = lock_or_recover(&state.identity)
+        .private_key()
+        .map_err(|e| e.to_string())?;
     state
         .manager
         .lock()

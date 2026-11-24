@@ -1,27 +1,12 @@
-//! Adversarial tests against every parser that touches attacker-controlled input.
+//! Property tests (proptest, on stable, gating every PR) against every parser
+//! that touches attacker-controlled input; `core/fuzz/` is the coverage-guided
+//! half. A panic here is a remote DoS, a filename mis-parse a write outside the
+//! download directory. Every parser must:
 //!
-//! Everything here is reachable by a remote party. `from_plain_bytes` sees every
-//! frame a peer sends once it is decrypted; the Party codecs see everything a
-//! community server or client sends; `sanitize_filename` sees a name chosen
-//! entirely by whoever is sending a file. A panic in any of them is a remote
-//! denial of service, and a mis-parse in the filename path is a write outside the
-//! download directory.
-//!
-//! These are property tests rather than `cargo-fuzz` targets on purpose. Coverage
-//! guided fuzzing finds deeper paths, but it needs a nightly toolchain and a
-//! separate long-running job — so in practice it runs rarely and reviews nothing.
-//! Proptest runs on stable in the ordinary suite, on every pull request, and
-//! shrinks a failure to a minimal reproducing input. The right end state is both;
-//! this is the half that actually gates a merge.
-//!
-//! The contract every parser here is held to:
-//!
-//! 1. **Never panic**, on any input, ever. Return `None`.
-//! 2. **Never allocate proportionally to a declared length** before that length
-//!    has been checked against the real buffer.
-//! 3. **Round-trip**: anything that decodes must re-encode to something that
-//!    decodes to the same value. A decoder that accepts what its encoder cannot
-//!    produce is a decoder with an unreachable state in it.
+//! 1. **Never panic** on any input; return `None`.
+//! 2. **Never allocate proportionally to a declared length** before checking it
+//!    against the real buffer.
+//! 3. **Round-trip**: anything that decodes re-encodes to the same value.
 
 use messenger_core::core::ProtocolMessage;
 use messenger_core::party::{PartyRequest, PartyResponse};
@@ -78,6 +63,12 @@ fn valid_frames() -> Vec<ProtocolMessage> {
     ]
 }
 
+/// `valid_frames()[idx % len]`, encoded.
+fn encoded_frame(idx: usize) -> Vec<u8> {
+    let frames = valid_frames();
+    frames[idx % frames.len()].to_plain_bytes()
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
 
@@ -87,8 +78,7 @@ proptest! {
         let _ = ProtocolMessage::from_plain_bytes(&bytes);
     }
 
-    /// The first byte selects the variant, so walk every tag deliberately rather
-    /// than hoping random bytes hit each one.
+    /// Walk every first-byte tag deliberately.
     #[test]
     fn every_tag_survives_arbitrary_payloads(
         tag in any::<u8>(),
@@ -99,9 +89,8 @@ proptest! {
         let _ = ProtocolMessage::from_plain_bytes(&frame);
     }
 
-    /// A declared length that lies about the buffer must be refused, not trusted.
-    /// This is the classic shape: a 4-byte length field claiming gigabytes with
-    /// nothing behind it.
+    /// A declared length that lies about the buffer (4 bytes claiming
+    /// gigabytes) must be refused without allocating it.
     #[test]
     fn oversized_declared_lengths_are_refused(
         tag in any::<u8>(),
@@ -111,16 +100,13 @@ proptest! {
         let mut frame = vec![tag];
         frame.extend_from_slice(&declared.to_be_bytes());
         frame.extend_from_slice(&tail);
-        // Must not panic and must not hang trying to allocate `declared` bytes.
         let _ = ProtocolMessage::from_plain_bytes(&frame);
     }
 
     /// Truncating a valid frame anywhere must fail cleanly.
     #[test]
     fn truncated_valid_frames_fail_cleanly(idx in 0usize..16, cut in 0usize..512) {
-        let frames = valid_frames();
-        let frame = &frames[idx % frames.len()];
-        let encoded = frame.to_plain_bytes();
+        let encoded = encoded_frame(idx);
         let at = cut.min(encoded.len());
         let _ = ProtocolMessage::from_plain_bytes(&encoded[..at]);
     }
@@ -132,9 +118,7 @@ proptest! {
         pos in 0usize..512,
         xor in 1u8..=255,
     ) {
-        let frames = valid_frames();
-        let frame = &frames[idx % frames.len()];
-        let mut encoded = frame.to_plain_bytes();
+        let mut encoded = encoded_frame(idx);
         if !encoded.is_empty() {
             let p = pos % encoded.len();
             encoded[p] ^= xor;
@@ -142,24 +126,18 @@ proptest! {
         let _ = ProtocolMessage::from_plain_bytes(&encoded);
     }
 
-    /// Appending junk to a valid frame must not turn it into a different valid
-    /// frame with attacker-chosen contents.
+    /// Appending junk must not turn a frame into a different one.
     #[test]
     fn trailing_junk_does_not_change_meaning(
         idx in 0usize..16,
         junk in proptest::collection::vec(any::<u8>(), 1..64),
     ) {
-        let frames = valid_frames();
-        let frame = &frames[idx % frames.len()];
-        let mut encoded = frame.to_plain_bytes();
+        let mut encoded = encoded_frame(idx);
         let clean = ProtocolMessage::from_plain_bytes(&encoded);
         encoded.extend_from_slice(&junk);
         let dirty = ProtocolMessage::from_plain_bytes(&encoded);
 
         if let (Some(a), Some(b)) = (&clean, &dirty) {
-            // If both parse, the trailing bytes must not have altered the
-            // decoded value — otherwise an on-path attacker could append to a
-            // frame and change what the peer reads.
             prop_assert_eq!(
                 std::mem::discriminant(a),
                 std::mem::discriminant(b),
@@ -168,16 +146,9 @@ proptest! {
         }
     }
 
-    /// Anything the decoder accepts must survive a re-encode unchanged. A
-    /// decoder that accepts what its encoder cannot produce has a state in it
-    /// that nothing else in the system knows about.
-    ///
-    /// The assertion is on the **bytes**, not on the discriminant. Comparing
-    /// discriminants let a decoder that silently altered a frame's contents —
-    /// a lossy filename, a sanitised name, a truncation — round-trip clean,
-    /// which is precisely the class of bug this property is for. Encoding is
-    /// compared from the second encode onward because the legacy `TEXT:` arm
-    /// stamps the current clock, so only the re-encoded form is a fixpoint.
+    /// Anything the decoder accepts re-encodes to a byte fixpoint. Bytes, not
+    /// discriminants: a discriminant check passes a decoder that alters content.
+    /// Compared from the second encode on, as legacy `TEXT:` stamps the clock.
     #[test]
     fn decode_encode_decode_is_stable(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
         if let Some(first) = ProtocolMessage::from_plain_bytes(&bytes) {
@@ -210,10 +181,8 @@ proptest! {
         let _ = PartyResponse::from_bytes(&bytes);
     }
 
-    /// Bincode stops at the end of a value and ignores the rest, so a Party
-    /// frame with junk appended used to decode to exactly the frame without it:
-    /// two distinct byte strings with one meaning, on the codec both a client
-    /// and a server parse from a party they have not yet decided to trust.
+    /// Party frames reject trailing bytes (bincode ignores them by default,
+    /// giving two byte strings one meaning).
     #[test]
     fn party_frames_reject_trailing_bytes(
         junk in proptest::collection::vec(any::<u8>(), 1..64),
@@ -240,24 +209,21 @@ proptest! {
         );
     }
 
-    /// `sanitize_filename` decides where a received file is written, so its
-    /// output is a security boundary, not a cosmetic one.
+    /// `sanitize_filename` decides where a received file is written.
     #[test]
     fn sanitized_filenames_are_always_safe(raw in ".{0,300}") {
         let out = sanitize_filename(&raw);
 
-        // It must never produce something that escapes the download directory.
         prop_assert!(!out.contains('/'), "path separator survived: {out:?}");
         prop_assert!(!out.contains('\\'), "path separator survived: {out:?}");
         prop_assert!(out != ".." && out != ".", "traversal component survived: {out:?}");
         prop_assert!(!out.starts_with("..") || !out.contains(std::path::MAIN_SEPARATOR),
             "traversal survived: {out:?}");
 
-        // Never empty — an empty name would join to the directory itself.
+        // Never empty (it would join to the directory itself).
         prop_assert!(!out.is_empty(), "empty filename for input {raw:?}");
 
-        // Never a bare Windows device name, which resolves to a device rather
-        // than a file regardless of the directory it is joined to.
+        // Never a bare Windows device name.
         let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
         for device in ["CON", "PRN", "AUX", "NUL"] {
             prop_assert_ne!(stem.as_str(), device, "device name survived: {:?}", out);
@@ -269,29 +235,22 @@ proptest! {
             prop_assert_ne!(stem.as_str(), lpt.as_str());
         }
 
-        // No control characters or bidi controls — U+202E renders
-        // "photo_gnp.exe" as "photo_exe.png" in every file manager. The full set
-        // the sanitiser strips, not only the overrides: the isolates
-        // (U+2066..=U+2069) and the plain marks (U+200E, U+200F) reorder the
-        // display just as effectively, and asserting a narrower set than the
-        // implementation guarantees leaves the difference untested.
+        // No control or bidi characters (the full set the sanitiser strips).
         prop_assert!(
             !out.chars().any(|c| c.is_control()
                 || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')),
             "control or bidi character survived: {out:?}"
         );
 
-        // Windows silently drops trailing dots and spaces, which would turn
-        // "evil.exe " into "evil.exe" after the extension check had passed.
+        // Windows drops trailing dots/spaces ("evil.exe " -> "evil.exe").
         prop_assert!(!out.ends_with(' ') && !out.ends_with('.'), "trailing dot/space: {out:?}");
 
         // Bounded, so the receiver's `tmp_<uuid>_` prefix still fits under NAME_MAX.
         prop_assert!(out.len() <= 255, "filename too long: {} bytes", out.len());
     }
 
-    /// Sanitising is idempotent: running it twice must not produce something
-    /// different from running it once, or the name written to disk depends on
-    /// how many times it happened to be passed through.
+    /// Sanitising is idempotent, or the name on disk depends on how often it
+    /// was sanitised.
     #[test]
     fn sanitizing_is_idempotent(raw in ".{0,200}") {
         let once = sanitize_filename(&raw);
@@ -300,8 +259,7 @@ proptest! {
     }
 }
 
-/// Hand-picked hostile filenames, alongside the random ones. These are the
-/// shapes that actually get used.
+/// Hand-picked hostile filenames, alongside the random ones.
 #[test]
 fn known_hostile_filenames_are_defused() {
     let attacks = [
@@ -351,7 +309,7 @@ fn known_hostile_filenames_are_defused() {
         );
         assert!(out.len() <= 255, "{raw:?} produced {} bytes", out.len());
 
-        // And joining it to a directory must stay inside that directory.
+        // Joined to a directory it must stay inside it.
         let joined = std::path::Path::new("/downloads").join(&out);
         assert!(
             joined.starts_with("/downloads"),
@@ -365,83 +323,70 @@ fn known_hostile_filenames_are_defused() {
     }
 }
 
-/// Invalid UTF-8 in a peer-supplied string field is refused, not repaired.
-///
-/// `String::from_utf8_lossy` turns each invalid byte into U+FFFD — three bytes
-/// for one. Every cap in this decoder counts *wire* bytes, so lossy decoding
-/// meant a 64 KiB `Text` frame produced a 192 KiB `String`, and 512 `TextChunk`
-/// frames at the 48 KiB chunk cap produced roughly 72 MiB against a documented
-/// budget of about 24 MiB. It also made the decoder accept frames its own
-/// encoder cannot reproduce: the re-encoded form was three times as long and,
-/// past the cap, no longer parsed at all.
-///
-/// Every one of these fields is written by `to_plain_bytes` out of a Rust
-/// `String`, so refusing costs a conforming peer nothing.
+/// Invalid UTF-8 in a peer string field is refused, not repaired: lossy
+/// decoding expands each bad byte to three while every cap counts wire bytes
+/// (a 64 KiB `Text` became 192 KiB; 512 chunks ~72 MiB vs ~24 MiB), and it
+/// accepted frames the encoder cannot reproduce.
 #[test]
 fn invalid_utf8_is_refused_rather_than_repaired() {
-    // Tag 2 — Text: seq, timestamp, len, then the bytes.
-    let mut text = vec![2u8];
-    text.extend_from_slice(&1u64.to_be_bytes());
-    text.extend_from_slice(&0u64.to_be_bytes());
-    text.extend_from_slice(&3u32.to_be_bytes());
-    text.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-    assert!(
-        ProtocolMessage::from_plain_bytes(&text).is_none(),
-        "invalid UTF-8 accepted in Text"
-    );
-
-    // Tag 11 — TextChunk: id, seq, timestamp, index, total, len, bytes.
-    let mut chunk = vec![11u8];
-    chunk.extend_from_slice(&[0u8; 16]);
-    chunk.extend_from_slice(&1u64.to_be_bytes());
-    chunk.extend_from_slice(&0u64.to_be_bytes());
-    chunk.extend_from_slice(&0u32.to_be_bytes());
-    chunk.extend_from_slice(&2u32.to_be_bytes());
-    chunk.extend_from_slice(&3u32.to_be_bytes());
-    chunk.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-    assert!(
-        ProtocolMessage::from_plain_bytes(&chunk).is_none(),
-        "invalid UTF-8 accepted in TextChunk"
-    );
-
-    // Tag 3 — FileMeta. `sanitize_filename` bounds the length, so this one is
-    // not the amplification bug; it is the field a peer most wants to control,
-    // and two distinct byte strings must not collapse onto one name on disk.
-    let mut meta = vec![3u8];
-    meta.extend_from_slice(&1u64.to_be_bytes());
-    meta.extend_from_slice(&10u64.to_be_bytes());
-    meta.extend_from_slice(&3u32.to_be_bytes());
-    meta.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-    assert!(
-        ProtocolMessage::from_plain_bytes(&meta).is_none(),
-        "invalid UTF-8 accepted in FileMeta"
-    );
-
-    // The legacy arms decode the same way. `FILE_META|` is the one that keeps
-    // what it decoded; it used to answer `Some(FileMeta { filename: "\u{fffd}\u{fffd}\u{fffd}" })`.
-    let mut legacy = b"FILE_META|1|".to_vec();
-    legacy.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-    legacy.extend_from_slice(b"|10");
-    assert!(
-        ProtocolMessage::from_plain_bytes(&legacy).is_none(),
-        "invalid UTF-8 accepted in legacy FILE_META"
-    );
-
-    let mut legacy_text = b"TEXT:1:".to_vec();
-    legacy_text.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-    assert!(
-        ProtocolMessage::from_plain_bytes(&legacy_text).is_none(),
-        "invalid UTF-8 accepted in legacy TEXT"
-    );
+    let bad = [0xFFu8; 3];
+    let cases: [(&str, Vec<u8>); 5] = [
+        // Tag 2 — Text: seq, timestamp, len, bytes.
+        (
+            "Text",
+            [
+                &[2u8][..],
+                &1u64.to_be_bytes(),
+                &0u64.to_be_bytes(),
+                &3u32.to_be_bytes(),
+                &bad,
+            ]
+            .concat(),
+        ),
+        // Tag 11 — TextChunk: id, seq, timestamp, index, total, len, bytes.
+        (
+            "TextChunk",
+            [
+                &[11u8][..],
+                &[0u8; 16],
+                &1u64.to_be_bytes(),
+                &0u64.to_be_bytes(),
+                &0u32.to_be_bytes(),
+                &2u32.to_be_bytes(),
+                &3u32.to_be_bytes(),
+                &bad,
+            ]
+            .concat(),
+        ),
+        // Tag 3 — FileMeta: two byte strings must not collapse onto one name.
+        (
+            "FileMeta",
+            [
+                &[3u8][..],
+                &1u64.to_be_bytes(),
+                &10u64.to_be_bytes(),
+                &3u32.to_be_bytes(),
+                &bad,
+            ]
+            .concat(),
+        ),
+        // Legacy arms; `FILE_META|` used to keep "\u{fffd}\u{fffd}\u{fffd}".
+        (
+            "legacy FILE_META",
+            [&b"FILE_META|1|"[..], &bad, b"|10"].concat(),
+        ),
+        ("legacy TEXT", [&b"TEXT:1:"[..], &bad].concat()),
+    ];
+    for (name, frame) in cases {
+        assert!(
+            ProtocolMessage::from_plain_bytes(&frame).is_none(),
+            "invalid UTF-8 accepted in {name}"
+        );
+    }
 }
 
-/// The legacy numeric arms bound the slice before they decode it.
-///
-/// Each one parses a `u64` and throws the string away, which was the argument
-/// for leaving them lossy. That argument is about what is *retained*, not about
-/// what is *allocated*: a frame is capped at `MAX_PACKET_SIZE` (8 MiB), so
-/// `PING:` followed by 8 MiB of `0xFF` cost about 24 MiB transiently, per frame,
-/// per connection, before returning `None`.
+/// The legacy numeric arms bound the slice before decoding it: lossy decoding
+/// of `PING:` + 8 MiB of `0xFF` cost ~24 MiB transiently per frame.
 #[test]
 fn legacy_numeric_arms_refuse_an_oversized_field() {
     for prefix in [
@@ -459,7 +404,6 @@ fn legacy_numeric_arms_refuse_an_oversized_field() {
             String::from_utf8_lossy(prefix)
         );
 
-        // A number of a length a real peer could send still parses.
         let mut ok = prefix.to_vec();
         ok.extend_from_slice(b"1");
         assert!(
@@ -470,14 +414,12 @@ fn legacy_numeric_arms_refuse_an_oversized_field() {
     }
 }
 
-/// A frame claiming an enormous payload must be refused without allocating for
-/// it. If this ever regresses it will show up as the test timing out or the
-/// process being killed, which is exactly the remote symptom.
+/// A frame claiming an enormous payload must be refused without allocating
+/// (a regression shows up as a timeout or OOM kill).
 #[test]
 fn declared_gigabyte_payloads_do_not_allocate() {
     for tag in 0u8..=20 {
         let mut frame = vec![tag];
-        // Every length-prefixed arm reads a big-endian u32.
         frame.extend_from_slice(&u32::MAX.to_be_bytes());
         frame.extend_from_slice(&u64::MAX.to_be_bytes());
         frame.extend_from_slice(&u64::MAX.to_be_bytes());
@@ -486,22 +428,16 @@ fn declared_gigabyte_payloads_do_not_allocate() {
     }
 }
 
-/// The two truncation bugs the property tests above found, pinned as explicit
-/// regressions with the reasoning attached — a shrunk proptest input is a
-/// reproducer, not an explanation.
+/// The two truncation bugs the property tests found, pinned with reasoning.
 mod truncation_reintroduced_what_sanitising_removed {
     use super::*;
 
-    /// Truncation used to cut a name at a dot and hand back `…​.exe.`, which
-    /// `Path::extension()` reports as `Some("")` — not `"exe"` — so the desktop
-    /// app's "this file will run as a program" gate never fired. Windows drops
-    /// the trailing dot when it creates the file, so what landed on disk *was*
-    /// an executable. The peer chooses the filename.
+    /// Truncation used to yield `….exe.`, whose `extension()` is `Some("")`, so
+    /// the "runs as a program" gate missed what Windows then created as `.exe`.
     #[test]
     fn a_crafted_name_cannot_hide_an_executable_extension() {
-        // Sized against MAX_FILENAME_BYTES (150). The final segment is over 16
-        // characters so it is not treated as an extension, which is what makes
-        // the whole name get cut blindly.
+        // Sized against MAX_FILENAME_BYTES (150); the >16-char last segment is
+        // not an extension, so the whole name gets cut blindly.
         let attack = format!("{}.exe.{}", "A".repeat(145), "Z".repeat(30));
         let out = sanitize_filename(&attack);
 
@@ -516,13 +452,10 @@ mod truncation_reintroduced_what_sanitising_removed {
             Some("exe"),
             "the gate must see the extension the OS will act on, got {out:?}"
         );
-        // The name checked and the name Windows would create must be the same.
         assert_eq!(out, out.trim_end_matches(['.', ' ']));
     }
 
-    /// Truncating between two dots separated by a multi-byte character brought
-    /// them together, re-creating a `..` that the traversal collapse had already
-    /// removed.
+    /// Truncating between two dots around a multi-byte char re-created a `..`.
     #[test]
     fn truncation_cannot_recreate_a_traversal_component() {
         // `𐀀` is four bytes, so the cut lands inside the region between the dots.
@@ -535,8 +468,6 @@ mod truncation_reintroduced_what_sanitising_removed {
     }
 
     /// The general property both bugs violated: sanitising is a fixed point.
-    /// If a second pass changes anything, the name on disk depends on how many
-    /// times it happened to be sanitised.
     #[test]
     fn sanitising_the_known_attacks_is_stable() {
         for attack in [
@@ -553,13 +484,9 @@ mod truncation_reintroduced_what_sanitising_removed {
     }
 }
 
-/// The tracked seed corpus must actually reach the decoders it is for.
-///
-/// Seeds are only worth tracking if they decode: a corpus of inputs that all
-/// bounce off the first field teaches libFuzzer nothing and is exactly the
-/// starting-from-nothing problem it exists to fix. This is also the check that
-/// catches a seed going stale when a decoder is tightened — which has already
-/// happened once here, when the frame decoder stopped repairing invalid UTF-8.
+/// The tracked seed corpus must still reach its decoders: undecodable seeds
+/// teach libFuzzer nothing, and this catches a seed going stale when a decoder
+/// is tightened.
 #[test]
 fn the_tracked_seed_corpus_still_reaches_its_decoders() {
     use std::path::Path;
@@ -581,31 +508,23 @@ fn the_tracked_seed_corpus_still_reaches_its_decoders() {
         out
     }
 
-    // Party frames are bincode: an enum variant is a little-endian u32, so an
-    // undecodable seed is a seed that does nothing at all.
+    // Party frames are bincode (variant = LE u32): every seed must decode.
     let party = seeds("party_frame");
     assert!(!party.is_empty(), "no party_frame seeds found");
-    let decoded = party
+    let stale: Vec<&String> = party
         .iter()
         .filter(|(_, b)| {
-            PartyRequest::from_bytes(b).is_some() || PartyResponse::from_bytes(b).is_some()
+            PartyRequest::from_bytes(b).is_none() && PartyResponse::from_bytes(b).is_none()
         })
-        .count();
-    assert_eq!(
-        decoded,
-        party.len(),
-        "party_frame seeds that no longer decode: {:?}",
-        party
-            .iter()
-            .filter(|(_, b)| PartyRequest::from_bytes(b).is_none()
-                && PartyResponse::from_bytes(b).is_none())
-            .map(|(n, _)| n)
-            .collect::<Vec<_>>()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "party_frame seeds that no longer decode: {stale:?}"
     );
 
-    // Protocol frames: most seeds should decode, but some are deliberately at
-    // or past a cap and must be *refused* — so assert the split rather than
-    // that everything parses.
+    // Some protocol seeds deliberately sit past a cap and must be refused, so
+    // assert only that some decode.
     let protocol = seeds("protocol_frame");
     assert!(!protocol.is_empty(), "no protocol_frame seeds found");
     let accepted: Vec<&String> = protocol
@@ -617,7 +536,6 @@ fn the_tracked_seed_corpus_still_reaches_its_decoders() {
         !accepted.is_empty(),
         "no protocol_frame seed decodes at all — the corpus is dead weight"
     );
-    // And every seed, accepted or not, must leave the decoder unharmed.
     for (name, bytes) in &protocol {
         let _ = ProtocolMessage::from_plain_bytes(bytes);
         assert!(
@@ -626,8 +544,6 @@ fn the_tracked_seed_corpus_still_reaches_its_decoders() {
         );
     }
 
-    // Identity proofs are read before any trust decision; the seeds are there
-    // to give the fuzzer a valid shape to mutate from.
     let proofs = seeds("identity_proof");
     assert!(!proofs.is_empty(), "no identity_proof seeds found");
     let ok = proofs

@@ -1,18 +1,10 @@
-//! Per-IP connection rate limiting for accept loops.
-//!
-//! Used by both listeners that face the open internet:
+//! Per-IP connection rate limiting for the accept loops that face the internet:
 //!
 //! - the **community server**, where `dispatch::MAX_JOIN_ATTEMPTS` caps password
-//!   guesses *within* one connection and so pushes an attacker into reconnecting
-//!   between guesses. This is the other half: it caps how often they may
-//!   reconnect. Together they put a hard ceiling on guesses per minute per
-//!   address, on top of the RSA handshake each attempt already pays for.
+//!   guesses per connection and this caps reconnects, together bounding guesses per
+//!   minute per address;
 //! - the **relay server**, where every accepted socket parks a task holding a
-//!   rendezvous slot until it times out, so an unlimited connection rate is an
-//!   unlimited memory and task cost.
-//!
-//! It also blunts plain connection floods — an accepted socket spawns a task
-//! that immediately starts work that is not cheap.
+//!   rendezvous slot until it times out.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -23,51 +15,29 @@ pub const MAX_CONNECTIONS: usize = 10;
 /// The sliding window those connections are counted over.
 pub const WINDOW: Duration = Duration::from_secs(30);
 
-/// How many source addresses one limiter will track at once.
+/// How many source addresses one limiter tracks at once.
 ///
-/// The per-address history is pruned by [`WINDOW`], which bounds the table for
-/// *honest* traffic but not for an attacker: a scan from a fresh address every
-/// few milliseconds — trivial from an IPv6 /64, and the normal shape of an
-/// internet-wide sweep — adds an entry per packet and only ever drops them
-/// `WINDOW` later. That is an unbounded allocation driven by a remote party, so
-/// the table is capped as well as aged.
-///
-/// At the cap, the addresses whose most recent connection is oldest are evicted
-/// first. Evicting the *stalest* is what keeps the limit meaningful under the
-/// attack that forces it: whoever is connecting hardest has the freshest entry
-/// and so is the last to be forgotten. The size is generous next to any real
-/// deployment (a busy server sees far fewer than this in a 30-second window) and
-/// costs well under a megabyte.
+/// Ageing alone does not bound the table against a scan from fresh addresses (trivial
+/// from an IPv6 /64), so it is capped too. At the cap the addresses seen least recently
+/// are evicted first: whoever is connecting hardest has the freshest entry and is the
+/// last to be forgotten. Generous next to any real deployment, under a megabyte.
 pub const MAX_TRACKED_ADDRESSES: usize = 4096;
 
-/// One address's recent history.
-///
-/// `last_seen` advances on *every* check, including the ones that are refused,
-/// while `attempts` only records the connections that were allowed. The two
-/// differ precisely for an address that is over its limit and still trying —
-/// which is why eviction orders on `last_seen`: an attacker who keeps knocking
-/// must not be able to age their own entry out of the table.
+/// One address's recent history. `last_seen` advances on every check, refused ones
+/// included, while `attempts` records only allowed connections; eviction orders on
+/// `last_seen` so an address that keeps knocking cannot age itself out.
 #[derive(Debug)]
 struct Entry {
     attempts: Vec<Instant>,
     last_seen: Instant,
 }
 
-/// The key a source address is counted under.
+/// The key a source address is counted under: IPv4 per address, **IPv6 per /64** (the
+/// smallest block routinely delegated, so per-address counting is bypassed by
+/// incrementing a number; not wider, or one ISP's customers would share a bucket).
 ///
-/// IPv4 is counted per address. **IPv6 is counted per /64**, which is the
-/// smallest block anyone is routinely delegated — a single residential or cloud
-/// allocation hands its holder 2^64 addresses, so counting per-address means the
-/// limit can be stepped around by incrementing a number. Every honest client
-/// shares a /64 with the rest of its own LAN, which is the same blast radius
-/// IPv4 NAT already gives us, so this costs legitimate users nothing new.
-///
-/// It deliberately does not go wider than /64: /48 would put unrelated customers
-/// of one ISP into a single bucket, which turns a rate limit into collateral
-/// damage.
-///
-/// Public so the community server's per-address *concurrency* cap groups
-/// addresses exactly the way this rate limit does.
+/// Public so the community server's per-address concurrency cap groups addresses
+/// exactly the way this rate limit does.
 pub fn limiter_key(ip: IpAddr) -> IpAddr {
     match canonical_ip(ip) {
         IpAddr::V4(v4) => IpAddr::V4(v4),
@@ -80,30 +50,12 @@ pub fn limiter_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The well-known NAT64 prefix from RFC 6052 §2.1, `64:ff9b::/96`.
-///
-/// Every IPv4 address reachable through a NAT64 gateway is embedded in it, so a
-/// /64 mask over one of these addresses puts *the entire IPv4 internet* into a
-/// single bucket. Translating back to the IPv4 address it carries is the same
-/// move as unwrapping an IPv4-mapped address, for the same reason.
+/// The well-known NAT64 prefix (RFC 6052 §2.1), `64:ff9b::/96`.
 const NAT64_WELL_KNOWN_PREFIX: [u8; 12] = [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
 
-/// Reduce an address to the one that actually identifies its source.
-///
-/// An IPv6 socket accepting IPv4 connections reports them as IPv4-mapped
-/// (`::ffff:a.b.c.d`). Masking those to a /64 zeroes octets 8..16 — which is
-/// where the `ffff` marker *and* the whole IPv4 address live — so
-/// `::ffff:1.2.3.4` and `::ffff:203.0.113.9` both became `::`. Every IPv4
-/// client would have shared one bucket, and any single IPv4 address could have
-/// spent the limit for all of them.
-///
-/// This was latent only because the relay binds `0.0.0.0` today. The point of
-/// the /64 work is dual-stack, and the moment anything binds `[::]` the
-/// collapse becomes a one-address denial of service against every IPv4 peer.
-///
-/// NAT64 is the same shape one level up, and worth handling here rather than
-/// discovering later: those addresses are not the gateway's own, they are the
-/// IPv4 destination wearing an IPv6 costume.
+/// Reduce an address to the one that identifies its source. IPv4-mapped
+/// (`::ffff:a.b.c.d`) and NAT64 addresses carry the IPv4 address in octets 8..16, which
+/// a /64 mask would wipe, putting every IPv4 client into one bucket.
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     let IpAddr::V6(v6) = ip else {
         return ip;
@@ -140,8 +92,7 @@ impl RateLimiter {
         Self::default()
     }
 
-    /// A limiter with a caller-chosen cap and window. The relay and the party
-    /// server have different connection profiles, so they pick their own.
+    /// A limiter with a caller-chosen cap and window.
     pub fn with_limits(max: usize, window: Duration) -> Self {
         Self {
             attempts: HashMap::new(),
@@ -151,31 +102,23 @@ impl RateLimiter {
         }
     }
 
-    /// Override how many addresses may be tracked at once. Exposed so the
-    /// eviction path is testable without allocating [`MAX_TRACKED_ADDRESSES`]
-    /// entries; production uses the default.
+    /// Override how many addresses may be tracked at once (so eviction is testable).
     pub fn with_max_tracked(mut self, max_tracked: usize) -> Self {
         self.max_tracked = max_tracked.max(1);
         self
     }
 
-    /// Record a connection from `ip` and report whether it should be refused.
-    ///
-    /// `now` is passed in so the behaviour is testable without sleeping.
+    /// Record a connection from `ip` at `now` and report whether it should be refused.
     pub fn check_at(&mut self, ip: IpAddr, now: Instant) -> bool {
-        // Count IPv6 by /64 rather than by address; see `limiter_key`.
         let ip = limiter_key(ip);
-        // Drop addresses whose whole history has aged out, so a long-running
-        // server does not accumulate an entry per address it has ever seen.
+        // Drop addresses whose whole history has aged out.
         let window = self.window;
         self.attempts.retain(|_, e| {
             e.attempts.iter().any(|t| now.duration_since(*t) < window)
                 || now.duration_since(e.last_seen) < window
         });
 
-        // Age-based pruning alone leaves the table at the mercy of whoever is
-        // rotating source addresses, so enforce the hard ceiling too. Only a
-        // *new* address can grow the table, so this is the one place to check.
+        // Only a new address can grow the table, so enforce the ceiling here.
         if !self.attempts.contains_key(&ip) && self.attempts.len() >= self.max_tracked {
             self.evict_stalest();
         }
@@ -200,15 +143,9 @@ impl RateLimiter {
         self.check_at(ip, Instant::now())
     }
 
-    /// Drop the addresses whose most recent connection is oldest, until there is
-    /// room for one more.
-    ///
-    /// Evicting an entry forgives that address its recent connections, so the
-    /// order matters: the freshest entries are the ones actively being limited,
-    /// and dropping those is exactly what an attacker rotating addresses would
-    /// want. A batch is taken rather than a single entry so a sustained scan
-    /// pays for the sort once every `max_tracked / 16` new addresses instead of
-    /// on every one of them.
+    /// Drop the addresses seen least recently until there is room for one more. A batch
+    /// is taken so a sustained scan pays for the sort once per `max_tracked / 16` new
+    /// addresses rather than on every one.
     fn evict_stalest(&mut self) {
         let target = self.max_tracked.saturating_sub(1);
         let batch = (self.max_tracked / 16).max(1);
@@ -219,8 +156,6 @@ impl RateLimiter {
             .iter()
             .map(|(ip, entry)| (*ip, entry.last_seen))
             .collect();
-        // Oldest last-seen first: those are the addresses closest to ageing out
-        // on their own.
         by_recency.sort_unstable_by_key(|(_, last)| *last);
 
         let removed = by_recency.len().min(want_removed);
@@ -248,49 +183,53 @@ mod tests {
         IpAddr::from([10, 0, 0, last])
     }
 
-    #[test]
-    fn allows_up_to_the_cap_then_refuses() {
+    fn ip6(last: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, last])
+    }
+
+    fn parse(s: &str) -> IpAddr {
+        s.parse().expect("valid address")
+    }
+
+    /// Spend `a`'s whole budget on a default limiter; returns it with `a` refused.
+    fn flooded(a: IpAddr, now: Instant) -> RateLimiter {
         let mut rl = RateLimiter::new();
-        let now = Instant::now();
         for i in 0..MAX_CONNECTIONS {
-            assert!(!rl.check_at(ip(1), now), "connection {i} must be allowed");
+            assert!(!rl.check_at(a, now), "connection {i} must be allowed");
         }
         assert!(
-            rl.check_at(ip(1), now),
-            "the connection past the cap must be refused"
+            rl.check_at(a, now),
+            "the connection past the cap is refused"
         );
+        rl
+    }
+
+    /// Flooding `a` must not limit `b`.
+    fn assert_independent(a: IpAddr, b: IpAddr) {
+        let now = Instant::now();
+        let mut rl = flooded(a, now);
+        assert!(!rl.check_at(b, now), "{b} must not inherit {a}'s count");
     }
 
     #[test]
+    fn allows_up_to_the_cap_then_refuses() {
+        flooded(ip(1), Instant::now());
+    }
+
+    /// A rate limit, not a ban: once the window has passed the address is welcome.
+    #[test]
     fn the_window_slides() {
-        let mut rl = RateLimiter::new();
         let now = Instant::now();
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(ip(1), now);
-        }
-        assert!(rl.check_at(ip(1), now));
-        // Once the window has passed, the same address is welcome again —
-        // this is a rate limit, not a ban.
-        let later = now + WINDOW + Duration::from_secs(1);
-        assert!(!rl.check_at(ip(1), later));
+        let mut rl = flooded(ip(1), now);
+        assert!(!rl.check_at(ip(1), now + WINDOW + Duration::from_secs(1)));
     }
 
     #[test]
     fn addresses_are_limited_independently() {
-        let mut rl = RateLimiter::new();
-        let now = Instant::now();
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(ip(1), now);
-        }
-        assert!(rl.check_at(ip(1), now), "the flooding address is limited");
-        assert!(
-            !rl.check_at(ip(2), now),
-            "an unrelated address must not be caught in someone else's limit"
-        );
+        assert_independent(ip(1), ip(2));
     }
 
-    /// A server that ran for a month must not hold an entry per address it has
-    /// ever seen.
+    /// A long-running server must not hold an entry per address it has ever seen.
     #[test]
     fn stale_addresses_are_forgotten() {
         let mut rl = RateLimiter::new();
@@ -299,8 +238,7 @@ mod tests {
         rl.check_at(ip(2), now);
         assert_eq!(rl.tracked_addresses(), 2);
 
-        let later = now + WINDOW + Duration::from_secs(1);
-        rl.check_at(ip(3), later);
+        rl.check_at(ip(3), now + WINDOW + Duration::from_secs(1));
         assert_eq!(
             rl.tracked_addresses(),
             1,
@@ -308,20 +246,13 @@ mod tests {
         );
     }
 
-    fn ip6(last: u16) -> IpAddr {
-        IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, last])
-    }
-
-    /// A scan from a fresh address every few milliseconds used to add a table
-    /// entry per source and only drop it a whole window later, which is an
-    /// allocation a remote party controls. The table has a hard ceiling now.
+    /// A scan from a fresh address per packet, all inside one window, must not grow the
+    /// table past its cap.
     #[test]
     fn the_address_table_is_capped() {
         let mut rl = RateLimiter::with_limits(MAX_CONNECTIONS, WINDOW).with_max_tracked(64);
         let now = Instant::now();
         for i in 0..10_000u16 {
-            // Every connection from a brand-new address, all inside one window
-            // so nothing ages out on its own.
             rl.check_at(ip6(i), now + Duration::from_millis(u64::from(i)));
         }
         assert!(
@@ -331,24 +262,18 @@ mod tests {
         );
     }
 
-    /// Eviction must forget the addresses that have gone quiet, never the one
-    /// currently flooding — otherwise the scan that fills the table is also the
-    /// way to clear your own limit.
+    /// Eviction forgets quiet addresses, never the one flooding, or filling the table
+    /// would be the way to clear your own limit.
     #[test]
     fn eviction_keeps_the_freshest_addresses() {
         let mut rl = RateLimiter::with_limits(3, WINDOW).with_max_tracked(4);
         let now = Instant::now();
-
-        // The flooder reaches its cap and is being refused.
         for _ in 0..3 {
             rl.check_at(ip(1), now);
         }
         assert!(rl.check_at(ip(1), now), "the flooder is limited");
 
-        // Now a rotation of fresh addresses pushes the table over its ceiling
-        // many times over, while the flooder keeps knocking alongside it. Each
-        // refused knock still counts as contact, so the flooder is never the
-        // stalest entry and never evicted.
+        // Fresh addresses overflow the table while the flooder keeps knocking.
         for i in 0..40u16 {
             let t = now + Duration::from_millis(u64::from(i) + 1);
             rl.check_at(ip6(i), t);
@@ -362,14 +287,10 @@ mod tests {
         );
     }
 
-    /// A /64 is the smallest block anyone is routinely delegated, so counting
-    /// IPv6 per address means the limit is bypassed by incrementing a number.
     #[test]
     fn ipv6_is_limited_by_prefix_not_by_address() {
         let mut rl = RateLimiter::new();
         let now = Instant::now();
-
-        // Every connection from a different address inside one /64.
         for i in 0..MAX_CONNECTIONS {
             assert!(
                 !rl.check_at(ip6(i as u16), now),
@@ -387,109 +308,33 @@ mod tests {
         );
     }
 
-    /// …but a genuinely different network is still its own bucket. Widening
-    /// beyond /64 would make one ISP customer's flood everyone else's problem.
     #[test]
     fn separate_ipv6_prefixes_are_independent() {
-        let mut rl = RateLimiter::new();
-        let now = Instant::now();
-        let other = IpAddr::from([0x2001, 0xdb8, 0, 1, 0, 0, 0, 1]);
-
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(ip6(1), now);
-        }
-        assert!(rl.check_at(ip6(2), now), "the flooding /64 is limited");
-        assert!(
-            !rl.check_at(other, now),
-            "a different /64 must not inherit someone else's limit"
-        );
+        assert_independent(ip6(1), IpAddr::from([0x2001, 0xdb8, 0, 1, 0, 0, 0, 1]));
     }
 
-    #[test]
-    fn ipv4_is_still_counted_per_address() {
-        let mut rl = RateLimiter::new();
-        let now = Instant::now();
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(ip(1), now);
-        }
-        assert!(rl.check_at(ip(1), now));
-        assert!(
-            !rl.check_at(ip(2), now),
-            "IPv4 neighbours must stay independent"
-        );
-    }
-
-    /// An IPv6 socket accepting IPv4 connections reports them as IPv4-mapped.
-    /// Masking those to a /64 wiped the `ffff` marker along with the address, so
-    /// every IPv4 client landed in the `::` bucket and one of them could spend
-    /// the limit for all of them.
+    /// IPv4-mapped addresses count per IPv4 address, and share the plain form's bucket
+    /// so a dual-stack listener does not hand out two budgets for one address.
     #[test]
     fn ipv4_mapped_addresses_are_counted_per_ipv4_address() {
-        let mapped = |last: u8| -> IpAddr {
-            format!("::ffff:203.0.113.{last}")
-                .parse()
-                .expect("valid IPv4-mapped address")
-        };
-
-        let mut rl = RateLimiter::new();
+        assert_independent(parse("::ffff:203.0.113.1"), parse("::ffff:203.0.113.2"));
         let now = Instant::now();
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(mapped(1), now);
-        }
-        assert!(rl.check_at(mapped(1), now), "this one is over its own cap");
+        let mut rl = flooded(parse("::ffff:203.0.113.1"), now);
         assert!(
-            !rl.check_at(mapped(2), now),
-            "a neighbouring IPv4 address must not inherit the first one's count"
-        );
-
-        // And the mapped form is the same bucket as the plain form, so a
-        // dual-stack listener does not hand out two budgets for one address.
-        assert!(
-            rl.check_at("203.0.113.1".parse().unwrap(), now),
+            rl.check_at(parse("203.0.113.1"), now),
             "the mapped and plain forms of one address must share a bucket"
         );
     }
 
-    /// The same collapse one level up. `64:ff9b::/96` is the well-known NAT64
-    /// prefix, so a /64 over it is a single bucket for the whole IPv4 internet:
-    /// one client behind any NAT64 gateway anywhere would lock out every other.
     #[test]
     fn nat64_addresses_are_counted_per_embedded_ipv4_address() {
-        let nat64 = |last: u8| -> IpAddr {
-            format!("64:ff9b::203.0.113.{last}")
-                .parse()
-                .expect("valid NAT64 address")
-        };
-
-        let mut rl = RateLimiter::new();
-        let now = Instant::now();
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(nat64(1), now);
-        }
-        assert!(rl.check_at(nat64(1), now));
-        assert!(
-            !rl.check_at(nat64(2), now),
-            "NAT64 clients must not share one bucket"
-        );
+        assert_independent(parse("64:ff9b::203.0.113.1"), parse("64:ff9b::203.0.113.2"));
     }
 
-    /// A genuine IPv6 address that merely starts with the same first four
-    /// octets is not NAT64 — the prefix is 96 bits, not 32.
+    /// NAT64 is a 96-bit prefix: sharing only its first 32 bits is not NAT64.
     #[test]
     fn a_longer_prefix_match_is_not_treated_as_nat64() {
-        let a: IpAddr = "64:ff9b:1::1".parse().unwrap();
-        let b: IpAddr = "64:ff9b:2::1".parse().unwrap();
-
-        let mut rl = RateLimiter::new();
-        let now = Instant::now();
-        for _ in 0..MAX_CONNECTIONS {
-            rl.check_at(a, now);
-        }
-        assert!(rl.check_at(a, now));
-        assert!(
-            !rl.check_at(b, now),
-            "these are different /64s and must be independent"
-        );
+        assert_independent(parse("64:ff9b:1::1"), parse("64:ff9b:2::1"));
     }
 
     #[test]

@@ -70,17 +70,18 @@ pub struct DiagnosticsReport {
 /// Render the retained log events as plain text for the clipboard and the
 /// diagnostics bundle.
 pub fn format_event_logs(logs: &LogBuffer) -> String {
-    let mut log_text = String::new();
-    for event in logs.events() {
-        log_text.push_str(&format!(
-            "[{}] {} [{}] {}\n",
-            event.time.to_rfc3339(),
-            event.level,
-            event.target,
-            event.message
-        ));
-    }
-    log_text
+    logs.events()
+        .iter()
+        .map(|e| {
+            format!(
+                "[{}] {} [{}] {}\n",
+                e.time.to_rfc3339(),
+                e.level,
+                e.target,
+                e.message
+            )
+        })
+        .collect()
 }
 
 pub fn default_diagnostics_dir() -> PathBuf {
@@ -107,20 +108,19 @@ pub fn export_diagnostics_bundle(
     std::fs::create_dir_all(&bundle_dir)
         .with_context(|| format!("failed to create bundle directory {}", bundle_dir.display()))?;
 
-    let report_path = bundle_dir.join("diagnostics.json");
-    let logs_path = bundle_dir.join("logs.txt");
-    let readme_path = bundle_dir.join("README.txt");
-
     let report_json = serde_json::to_string_pretty(report)?;
-    std::fs::write(&report_path, report_json)
-        .with_context(|| format!("failed to write {}", report_path.display()))?;
-    std::fs::write(&logs_path, logs)
-        .with_context(|| format!("failed to write {}", logs_path.display()))?;
-    std::fs::write(
-        &readme_path,
-        "Diagnostics bundle for support.\nShare diagnostics.json and logs.txt when reporting a bug.\nPrivate keys are not included.\n",
-    )
-    .with_context(|| format!("failed to write {}", readme_path.display()))?;
+    for (name, contents) in [
+        ("diagnostics.json", report_json.as_str()),
+        ("logs.txt", logs),
+        (
+            "README.txt",
+            "Diagnostics bundle for support.\nShare diagnostics.json and logs.txt when reporting a bug.\nPrivate keys are not included.\n",
+        ),
+    ] {
+        let path = bundle_dir.join(name);
+        std::fs::write(&path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
 
     Ok(bundle_dir)
 }
@@ -185,22 +185,7 @@ mod tests {
             sessions: 0,
             active_toasts: 0,
             discovered_peers: 0,
-            config: DiagnosticsConfig {
-                download_dir: "Downloads".to_string(),
-                temp_dir: "temp".to_string(),
-                auto_accept_files: false,
-                enable_notifications: true,
-                enable_typing_indicators: true,
-                show_log_terminal: false,
-                theme: "Dark".to_string(),
-                font_size: 14,
-                auto_connect: false,
-                auto_host_on_startup: false,
-                listen_port: crate::PORT_DEFAULT,
-                auto_trust_on_first_use: false,
-                enable_mdns: false,
-                relay_server: None,
-            },
+            config: DiagnosticsConfig::from(&Config::default()),
         };
 
         let bundle_dir = export_diagnostics_bundle(dir.path(), &report, "hello logs").unwrap();

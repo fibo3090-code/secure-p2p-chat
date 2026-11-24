@@ -1,31 +1,15 @@
 // @vitest-environment jsdom
 //
-// The relay pane. It is deliberately honest about what the backend does and does
-// not do — saved relays and live routes are not tracked yet — so one of these
-// tests pins the empty state rather than letting a future change quietly
-// fabricate data there.
+// The relay pane. It explains relays and points pairing at New connection; it is
+// deliberately honest that saved relays and live routes are not tracked, so one
+// of these tests pins that rather than letting a future change fabricate data.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-const bridge = vi.hoisted(() => ({ api: {}, real: null }));
-vi.mock("../lib/bridge.js", async (importOriginal) => {
-  const actual = await importOriginal();
-  bridge.real = actual.api;
-  return { ...actual, api: bridge.api };
-});
-
 import { Relays } from "./Relays.jsx";
-import { stubApi } from "../test/render.jsx";
 import { subscribe, dismiss } from "../lib/toast.js";
-
-function installApi(overrides) {
-  const api = stubApi(bridge.real, overrides);
-  Object.keys(bridge.api).forEach((k) => delete bridge.api[k]);
-  Object.assign(bridge.api, api);
-  return api;
-}
 
 // Read the toast store without mounting <Toasts/>.
 function toasts() {
@@ -35,7 +19,7 @@ function toasts() {
 }
 function clearToasts() { toasts().forEach((t) => dismiss(t.id)); }
 
-beforeEach(() => { clearToasts(); installApi({}); });
+beforeEach(() => { clearToasts(); });
 afterEach(clearToasts);
 
 describe("Relays", () => {
@@ -45,52 +29,22 @@ describe("Relays", () => {
     expect(screen.getByText(/end-to-end encrypted and fingerprint-verified/)).toBeTruthy();
   });
 
-  it("refuses to pair without an address, and says which field is missing", async () => {
-    const api = installApi({});
-    render(<Relays />);
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-    expect(api.connectViaRelay).not.toHaveBeenCalled();
-    expect(toasts().at(-1).message).toMatch(/Enter the relay address/);
-
-    await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "relay.test:9000");
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-    expect(api.connectViaRelay).not.toHaveBeenCalled();
-    expect(toasts().at(-1).message).toMatch(/connection token/);
+  it("sends pairing to New connection, in relay mode, instead of a second form", async () => {
+    const onPair = vi.fn();
+    render(<Relays onPair={onPair} />);
+    await userEvent.click(screen.getByRole("button", { name: /Connect with a token/ }));
+    expect(onPair).toHaveBeenCalledWith("connect");
+    await userEvent.click(screen.getByRole("button", { name: /Open a relay session/ }));
+    expect(onPair).toHaveBeenCalledWith("host");
+    // No duplicate pairing form on this page.
+    expect(screen.queryByPlaceholderText("connection token")).toBeNull();
   });
 
-  it("pairs with the trimmed address and token", async () => {
-    const api = installApi({});
-    const onConnected = vi.fn();
-    render(<Relays onConnected={onConnected} />);
-    await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "  relay.test:9000  ");
-    await userEvent.type(screen.getByPlaceholderText("connection token"), " rly_abc ");
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-
-    expect(api.connectViaRelay).toHaveBeenCalledWith("relay.test:9000", "rly_abc");
-    expect(onConnected).toHaveBeenCalled();
-  });
-
-  it("opens a relay session and shows the token to share", async () => {
-    installApi({ hostViaRelay: async () => "rly_deadbeef" });
+  it("does not invent saved relays it does not track", () => {
+    // Saved relays and live routes are not tracked, so the page must not show
+    // a list (or a placeholder apologising for one) as if they were.
     render(<Relays />);
-    await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "relay.test:9000");
-    await userEvent.click(screen.getByRole("button", { name: "Host" }));
-    expect(await screen.findByText("rly_deadbeef")).toBeTruthy();
-  });
-
-  it("reports a failed pairing instead of silently doing nothing", async () => {
-    installApi({ connectViaRelay: async () => { throw new Error("relay refused the token"); } });
-    render(<Relays />);
-    await userEvent.type(screen.getByPlaceholderText("relay.example.com:9000"), "relay.test:9000");
-    await userEvent.type(screen.getByPlaceholderText("connection token"), "rly_abc");
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-    expect(toasts().at(-1).message).toMatch(/relay refused the token/);
-    expect(toasts().at(-1).level).toBe("error");
-  });
-
-  it("shows an explicit empty state rather than inventing saved relays", () => {
-    render(<Relays />);
-    expect(screen.getByText(/aren't tracked yet/)).toBeTruthy();
+    expect(screen.queryByText(/Saved relays/i)).toBeNull();
   });
 
   it("offers a runnable command for a self-hosted relay", () => {

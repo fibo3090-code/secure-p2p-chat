@@ -1,23 +1,20 @@
-//! File, identity and chat-management commands.
-//!
-//! Bodies of `TuiApp::execute_command`, one method per command, so the
-//! dispatcher reads as a table.
+//! File, identity and chat-management commands: bodies of
+//! `TuiApp::execute_command`.
 
 use super::*;
 
 impl TuiApp {
     pub(super) async fn cmd_send(&mut self, path: String) {
         let Some(chat_id) = self.selected_chat_id() else {
-            self.toast(ToastLevel::Warning, "No chat selected".to_string());
+            self.toast(ToastLevel::Warning, "No chat selected");
             return;
         };
-        match self
+        if let Err(e) = self
             .chat_manager
             .send_file(chat_id, PathBuf::from(path))
             .await
         {
-            Ok(()) => {}
-            Err(e) => self.toast(ToastLevel::Error, format!("Send file failed: {}", e)),
+            self.toast(ToastLevel::Error, format!("Send file failed: {}", e));
         }
     }
 
@@ -42,10 +39,7 @@ impl TuiApp {
                     self.toast(ToastLevel::Error, format!("File offer: {}", e));
                 }
             }
-            None => self.toast(
-                ToastLevel::Warning,
-                "No incoming file is awaiting approval".to_string(),
-            ),
+            None => self.toast(ToastLevel::Warning, "No incoming file is awaiting approval"),
         }
     }
 
@@ -69,20 +63,13 @@ impl TuiApp {
     pub(super) fn cmd_backup(&mut self, dest: String) {
         let source = self.identity_path.clone();
         if !self.identity.is_encrypted() {
-            // A legacy plaintext identity must never be copied around:
-            // the backup would contain the raw private key. (The
-            // startup password prompt can be dismissed with Esc, so
-            // this state is reachable.)
+            // Never copy a plaintext identity: it holds the raw private key.
             self.toast(
                 ToastLevel::Error,
-                "Set a password first (:password) — refusing to export an unencrypted identity"
-                    .to_string(),
+                "Set a password first (:password) — refusing to export an unencrypted identity",
             );
         } else if !source.exists() {
-            self.toast(
-                ToastLevel::Error,
-                "No identity file to back up yet".to_string(),
-            );
+            self.toast(ToastLevel::Error, "No identity file to back up yet");
         } else {
             match std::fs::copy(&source, &dest) {
                 Ok(_) => self.toast(
@@ -100,11 +87,11 @@ impl TuiApp {
                 if let Err(e) = self.chat_manager.rename_chat(id, title) {
                     self.toast(ToastLevel::Error, format!("Rename failed: {}", e));
                 } else {
-                    self.toast(ToastLevel::Success, "Chat renamed".to_string());
+                    self.toast(ToastLevel::Success, "Chat renamed");
                     self.save_history_now();
                 }
             }
-            None => self.toast(ToastLevel::Warning, "No chat selected".to_string()),
+            None => self.toast(ToastLevel::Warning, "No chat selected"),
         }
     }
 
@@ -125,17 +112,14 @@ impl TuiApp {
         if !self.identity.is_encrypted() {
             self.toast(
                 ToastLevel::Error,
-                "Set a password first; :wipe checks it before deleting anything.".to_string(),
+                "Set a password first; :wipe checks it before deleting anything.",
             );
             return;
         }
         let checked = Identity::load(&self.identity_path).and_then(|mut id| id.decrypt(password));
         match checked {
             Ok(()) => self.overlay = TuiOverlay::ConfirmWipe,
-            Err(_) => self.toast(
-                ToastLevel::Error,
-                "Wrong password — nothing was deleted".to_string(),
-            ),
+            Err(_) => self.toast(ToastLevel::Error, "Wrong password — nothing was deleted"),
         }
     }
 
@@ -170,7 +154,7 @@ impl TuiApp {
         if self.chat_manager.history_load_error().is_none() {
             self.toast(
                 ToastLevel::Info,
-                "Your history loaded normally; there is nothing to reset.".to_string(),
+                "Your history loaded normally; there is nothing to reset.",
             );
             return;
         }

@@ -1,13 +1,73 @@
 // Fingerprint (TOFU) verification — colored safety grid + the hex code, with
 // accept/reject. Driven by the bridge's `fingerprint-request` event.
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Modal, Button } from "./ui.jsx";
 import { Icon } from "../lib/Icon.jsx";
 import { SafetyGrid } from "./SafetyGrid.jsx";
-import { api, friendlyError } from "../lib/bridge.js";
+import { api, friendlyError, normalizeTransport } from "../lib/bridge.js";
 function group(fp) {
   return (fp || "").replace(/(.{4})/g, "$1 ").trim();
 }
+
+// The safety code, laid out for reading aloud: digits in two groups, emoji
+// apart. A screen reader gets the digits one by one rather than "four hundred
+// and eighteen", which is not how two people compare a code.
+function SasCode({ sas }) {
+  const [digits, emoji] = splitSas(sas);
+  const spokenDigits = digits.replace(/\s/g, "").split("").join(" ");
+  const spoken = emoji ? `${spokenDigits}, then ${emoji}` : spokenDigits;
+  return (
+    <div className="verify-sas" role="img" aria-label={`Safety code: ${spoken}`}>
+      <span className="verify-sas-digits" aria-hidden="true">{digits}</span>
+      {emoji && <span className="verify-sas-emoji" aria-hidden="true">{emoji}</span>}
+    </div>
+  );
+}
+
+// Digits (and the spaces between them) first, emoji after. A single linear
+// scan rather than a backtracking pattern.
+function splitSas(sas) {
+  const s = String(sas || "");
+  let i = 0;
+  while (i < s.length && /[\d\s]/.test(s[i])) i++;
+  return i === 0 ? [s, ""] : [s.slice(0, i).trim(), s.slice(i).trim()];
+}
+
+// Fingerprints compared as the same 64 hex characters, whatever spacing or
+// case either side used.
+const normFp = (fp) => String(fp || "").replace(/\s+/g, "").toLowerCase();
+
+// Why the backend says this prompt is not an ordinary first use (the bridge's
+// `warning`, CRYPTO-04), or null. Unknown kinds still warn: a newer backend
+// that adds a reason must not have it rendered as a first contact by an older
+// dialog.
+export function warningText(warning) {
+  if (!warning) return null;
+  const short = (fp) => (fp || "").slice(0, 16);
+  switch (warning.kind) {
+    case "invite_mismatch":
+      return `This is not the key in ${warning.contact}'s invite (expected ${short(warning.expected)}…). ` +
+        "Someone may be intercepting the connection.";
+    case "key_changed":
+      return `This conversation's key has changed (was ${short(warning.previous)}…). ` +
+        "It may be a new device — or someone intercepting the connection.";
+    default:
+      return "This is not the key this peer was expected to present.";
+  }
+}
+
+function subtitle(changed, warning, first) {
+  if (changed) return "This could be a new device — or someone intercepting";
+  if (warning) return "Unexpected key — do not trust it unless the codes match";
+  return `Check it's really ${first}`;
+}
+
+function trustLabel(busy, alarm) {
+  if (busy) return "Working…";
+  return alarm ? "Codes match — trust this new key" : "Codes match — trust";
+}
+
+const LOOKUP_TIMEOUT_MS = 400;
 
 export function Verify({ req, onClose }) {
   const [err, setErr] = useState("");
@@ -16,7 +76,50 @@ export function Verify({ req, onClose }) {
   // stale error when a new request arrives — a security-sensitive dialog must
   // not show a previous request's failure before the user acts.
   useEffect(() => { setErr(""); }, [req?.chat_id]);
+  // What we already know about this conversation: a fingerprint stored from an
+  // earlier verification (so a *different* one now means the key changed), and
+  // how the bytes are travelling. A key change must not read as "first
+  // connection" — it is the prompt where the user most needs to slow down.
+  const [known, setKnown] = useState(null);
+  // Until the lookup settles, "trust" stays disabled: a changed-key warning
+  // must never appear under a cursor already on the button. Bounded, so a hung
+  // call cannot trap the user in an unanswerable prompt.
+  const [settled, setSettled] = useState(false);
+  const rejectRef = useRef(null);
+  useEffect(() => {
+    setKnown(null);
+    setSettled(false);
+    if (!req?.chat_id) { setSettled(true); return undefined; }
+    let live = true;
+    const done = () => live && setSettled(true);
+    const timer = setTimeout(done, LOOKUP_TIMEOUT_MS);
+    api.getConversation(req.chat_id)
+      .then((chat) => live && chat && setKnown({
+        fingerprint: chat.peer_fingerprint || null,
+        // The Rust enum serialises as "Direct"/"Relay"; compare normalised.
+        transport: chat.transport ? normalizeTransport(chat.transport) : null,
+      }))
+      .catch(() => {})
+      .finally(done);
+    return () => { live = false; clearTimeout(timer); };
+  }, [req?.chat_id]);
+  const changed = !!(known?.fingerprint && req?.fingerprint &&
+    normFp(known.fingerprint) !== normFp(req.fingerprint));
+  // The backend's own verdict (CRYPTO-04): set when the key is not the one in
+  // the dialled contact's invite, or when the conversation's key changed. It
+  // is authoritative and needs no lookup, so it leads whenever it is present.
+  const warning = warningText(req?.warning);
+  // Either way the user is being asked to trust a key that contradicts what
+  // they had: trusting must be deliberate.
+  const alarm = changed || !!warning;
+  // The lookup resolves after the dialog opened, so focus moves when the
+  // changed-key state is known, not only on mount.
+  useEffect(() => { if (alarm) rejectRef.current?.focus(); }, [alarm]);
   if (!req) return null;
+  const first = req.peer_name.split(" ")[0];
+  const route = known?.transport === "relay" ? "Via relay — the relay can't read this conversation"
+    : known?.transport === "server" ? "Via a community server"
+      : known?.transport === "direct" ? "Direct connection" : null;
   async function decide(accept) {
     if (busy) return;
     setBusy(true);
@@ -37,10 +140,27 @@ export function Verify({ req, onClose }) {
     // click outside used to clear the prompt without answering, leaving the peer
     // hanging with no explanation and the prompt reappearing on the next poll,
     // which reads as a bug. The only ways out are Verify and Reject.
-    <Modal open={!!req} onClose={onClose} width={440} title={`Verify ${req.peer_name}`} icon="fingerprint"
+    <Modal open={!!req} onClose={onClose} width={440}
+      title={changed ? `${first}'s safety code changed` : `Verify ${req.peer_name}`}
+      icon={alarm ? "alert" : "fingerprint"} tone={alarm ? "warn" : undefined}
       dismissable={false}
-      sub="Trust on first use — confirm out of band">
+      sub={subtitle(changed, warning, first)}>
       <div className="verify-body">
+        {/* One warning, never two: the backend's verdict when it gave one
+            (it covers both a changed key and an invite mismatch), otherwise
+            what the conversation lookup found. */}
+        {warning ? (
+          <div className="verify-changed" role="alert">
+            {warning} Reject unless the codes match exactly.
+          </div>
+        ) : changed && (
+          <div className="verify-changed" role="alert">
+            You verified {first} before, and this is a different key. Only trust it if
+            {" "}{first} tells you — by voice or in person — that they reinstalled or changed devices.
+          </div>
+        )}
+        {/* The route reassures; on an unexpected key it is the wrong moment to. */}
+        {route && !alarm && <div className="verify-route">{route}</div>}
         {req.sas ? (
           <>
             {/* Primary check: the short authentication string. Both peers see
@@ -48,7 +168,7 @@ export function Verify({ req, onClose }) {
                 Reading it aloud is far less error-prone than a 64-char hex
                 compare, so it leads and the grid/hex become the backstop. */}
             <div className="verify-sas-label">Read this aloud with {req.peer_name.split(" ")[0]}:</div>
-            <div className="verify-sas">{req.sas}</div>
+            <SasCode sas={req.sas} />
             <div className="verify-hint">
               It must match on both screens. If the codes differ, someone may be
               intercepting the connection — reject it.
@@ -70,14 +190,20 @@ export function Verify({ req, onClose }) {
           </>
         )}
         {err && <div className="onb-err"><Icon name="alert" size={13} /> {err}</div>}
-        {/* Both outcomes are real choices, so neither is styled as an
-            afterthought — rejecting a connection you could not verify is the
-            correct action, not an edge case. */}
+        {/* Both outcomes are real choices, so neither is an afterthought —
+            rejecting a connection you could not verify is the correct action,
+            not an edge case. Reject is the tinted danger button rather than a
+            solid red one: two full-strength buttons side by side read as an
+            alarm, and nothing here is wrong yet. */}
         <div className="verify-actions">
-          <Button icon="shieldCheck" disabled={busy} onClick={() => decide(true)}>
-            {busy ? "Working…" : "Codes match — trust"}
+          {/* On a changed key, trusting must be deliberate: equal weight, and
+              the default focus on Reject so Enter never accepts out of habit. */}
+          <Button ref={rejectRef} variant="danger-ghost" icon="x" disabled={busy}
+            onClick={() => decide(false)}>Reject</Button>
+          <Button variant={alarm ? "ghost" : "primary"} icon="shieldCheck" disabled={busy || !settled}
+            onClick={() => decide(true)}>
+            {trustLabel(busy, alarm)}
           </Button>
-          <Button variant="danger" icon="x" disabled={busy} onClick={() => decide(false)}>Reject</Button>
         </div>
         {/* Escape hatch, shown only after a failed decision. The dialog is
             otherwise undismissable so a pending prompt can't be waved away by

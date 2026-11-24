@@ -153,7 +153,7 @@ The primitives are sound and used correctly in most places: X25519 with a contri
 ### CRYPTO-04 — An invite's fingerprint is never compared with the fingerprint presented on first connection
 - Severity: Medium
 - Category: security
-- Status: VERIFIED
+- Status: VERIFIED — **Fixed since the audit**: `connect_to_contact` records the contact's fingerprint as the session's *expected* value; a different key gets an `InviteMismatch` warning in the prompt itself (desktop `Verify`, TUI overlay), ahead of auto-trust; a matching key still gets the ordinary SAS prompt. Accepting over the warning rebinds the contact to the accepted key. Tests: `dialing_an_invited_contact_*`, `auto_trust_does_not_accept_a_key_that_contradicts_the_invite`, `accepting_a_key_over_the_invite_warning_rebinds_the_contact` in `client/src/app/chat_manager/tests.rs`.
 - Location:
   - `client/src/app/chat_manager/connect.rs:431-516` (`connect_to_contact` dials but never seeds or checks an expected fingerprint)
   - `client/src/app/chat_manager/events.rs:91-138` (a `None` stored fingerprint leads to a plain first-use prompt)

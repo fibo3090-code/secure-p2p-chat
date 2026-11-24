@@ -1,41 +1,24 @@
-// Smoke tests: does the assembled application actually come up?
+// Smoke tests: does the assembled app actually come up? Every other test checks
+// pieces, and all passed on a change (a `script-src 'self'` meta tag blocking the
+// inline React Refresh preamble) that left every screen blank. jsdom does not
+// enforce CSP, so this needs a real browser — the only part of the suite that does.
 //
-// Everything else in this suite tests *pieces*. `csp.test.js` checks the
-// policy's contents, the component tests render trees under jsdom, the invoke
-// contract compares two lists of names. All of them passed — 15 CI checks green
-// — on the change that made the app open to a permanently blank window.
+// Two servers, because they are different code paths:
+//   dev    — Vite's dev server, with HMR and the inline preamble (what regressed).
+//   built  — `vite preview` over `dist/`, under the production policy.
 //
-// It got through because no gate anywhere started the app and looked at it. The
-// break was a `script-src 'self'` meta tag blocking the inline React Refresh
-// preamble that `@vitejs/plugin-react` injects in dev: the entry module never
-// ran, so the thing that would have rendered an error was the thing that failed
-// to load. jsdom cannot catch that — it does not enforce CSP at all — so this
-// needs a real browser, and it is the only part of the suite that uses one.
-//
-// Two servers, because they are genuinely different code paths and only one of
-// them broke:
-//
-//   dev    — Vite's dev server, with HMR and the inline preamble. The path that
-//            regressed, and the one CI had never touched.
-//   built  — `vite preview` over `dist/`, i.e. the bytes the packaged app
-//            embeds, under the production policy with no inline allowance.
-//
-// Deliberately no Tauri here. `bridge.js` falls back to an in-memory mock when
-// `window.__TAURI_INTERNALS__` is absent, so the whole UI is reachable in a
-// plain browser — which means this runs headless on Linux, macOS and Windows
-// without a webview, a display, or a Rust build.
+// No Tauri: `bridge.js` falls back to an in-memory mock without
+// `window.__TAURI_INTERNALS__`, so this runs headless with no webview or Rust build.
 
 import { defineConfig } from "@playwright/test";
 
-// The dev port is pinned in `vite.config.js` and `tauri.conf.json`; keep it in
-// step with those. The preview port is Vite's own default.
+// Keep DEV_PORT in step with `vite.config.js` and `tauri.conf.json`; the preview
+// port is Vite's default.
 const DEV_PORT = 5173;
 const PREVIEW_PORT = 4173;
 
-// `127.0.0.1` rather than `localhost` for the same reason `vite.config.js` pins
-// it: which of `::1` and `127.0.0.1` a name resolves to first is a property of
-// the machine, and a mismatch here shows up as a blank page — the exact symptom
-// these tests exist to distinguish from a real failure.
+// `127.0.0.1`, not `localhost`: which of `::1`/`127.0.0.1` a name resolves to is
+// per machine, and a mismatch looks like the blank page these tests hunt for.
 const DEV_URL = `http://127.0.0.1:${DEV_PORT}`;
 const PREVIEW_URL = `http://127.0.0.1:${PREVIEW_PORT}`;
 
@@ -45,27 +28,22 @@ export default defineConfig({
   timeout: 45_000,
   expect: { timeout: 10_000 },
   forbidOnly: !!process.env.CI,
-  // No retries. A smoke test that passes on the second attempt is telling you
-  // something, and burying it defeats the point of the job.
+  // No retries: a smoke test that passes on the second attempt is telling you something.
   retries: 0,
   workers: process.env.CI ? 1 : undefined,
-  // The HTML report is what the CI job uploads on failure: a blank-page bug
-  // is near-impossible to diagnose from a log line, and the report carries the
-  // screenshot and the recorded console/CSP output together.
+  // CI uploads the HTML report on failure: it carries the screenshot and the
+  // recorded console/CSP output, which a blank-page bug needs.
   reporter: process.env.CI
     ? [["github"], ["list"], ["html", { open: "never" }]]
     : [["list"]],
   use: {
-    // Nothing here is timing-sensitive enough to want video, and traces on
-    // first retry are moot with retries at zero.
     screenshot: "only-on-failure",
   },
 
   webServer: [
     {
-      // `npm run`, not `npx`: npx falls back to fetching from the registry
-      // and running lifecycle scripts when a binary is missing locally, which
-      // is not something a CI job should be able to do by accident.
+      // `npm run`, not `npx`: npx can fetch from the registry and run lifecycle
+      // scripts when a local binary is missing.
       command: `npm run dev -- --port ${DEV_PORT} --strictPort --host 127.0.0.1`,
       url: DEV_URL,
       reuseExistingServer: !process.env.CI,
@@ -74,8 +52,7 @@ export default defineConfig({
       stderr: "pipe",
     },
     {
-      // `dist/` is built by the `smoke` npm script before this runs, so preview
-      // always serves the current source rather than the committed artifact.
+      // The `smoke` npm script builds `dist/` first, so this serves current source.
       command: `npm run preview -- --port ${PREVIEW_PORT} --strictPort --host 127.0.0.1`,
       url: PREVIEW_URL,
       reuseExistingServer: !process.env.CI,
@@ -89,11 +66,8 @@ export default defineConfig({
     {
       name: "dev",
       use: { baseURL: DEV_URL },
-      // `production-policy.spec.js` asserts what the *shipped* page allows.
-      // The dev server deliberately differs, so the file does not apply here
-      // — excluded by config rather than guarded by a `test.skip` inside the
-      // test, which reads as a disabled test to anyone (and anything) that
-      // scans for them.
+      // The production policy does not apply to the dev server. Excluded here
+      // rather than by a `test.skip`, which reads as a disabled test.
       testIgnore: /production-policy\.spec\.js/,
     },
     { name: "built", use: { baseURL: PREVIEW_URL } },

@@ -1,10 +1,6 @@
-//! Coverage-guided fuzzing of the community-server codecs.
-//!
-//! `PartyRequest` is what a server parses from every client, and `PartyResponse`
-//! is what a client parses from every server — including a server it has just
-//! met and not yet decided to trust. Both are bincode, which is a format with no
-//! self-description, so a malformed frame is entirely a question of how the
-//! decoder handles nonsense.
+//! Coverage-guided fuzzing of the community-server codecs: `PartyRequest` (parsed
+//! by the server from every client) and `PartyResponse` (parsed by a client, even
+//! from a server it has not yet decided to trust). Both are bincode.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -16,13 +12,8 @@ fuzz_target!(|data: &[u8]| {
     let request = PartyRequest::from_bytes(data);
     let response = PartyResponse::from_bytes(data);
 
-    // Contract 2: anything accepted must survive a round trip *byte for byte*.
-    //
-    // Without this the target asserted nothing at all: both calls were
-    // `...ok()` and discarded, and a decoder that cannot panic structurally
-    // cannot fail such a target no matter how long it runs. Encoding is the
-    // property worth checking here, because bincode's accept set is easy to
-    // make wider than its output set.
+    // Contract 2: anything accepted round-trips *byte for byte* (bincode's accept
+    // set is easily wider than its output set).
     if let Some(request) = request {
         let re_encoded = request.to_bytes();
         let again = PartyRequest::from_bytes(&re_encoded)
@@ -33,10 +24,8 @@ fuzz_target!(|data: &[u8]| {
             "PartyRequest encoding is not a fixpoint"
         );
 
-        // Contract 3: trailing bytes are not free. Bincode stops at the end of
-        // a value and ignores the rest, which gives two distinct byte strings
-        // one meaning — an on-path attacker appends to a frame and changes its
-        // bytes without changing what the peer reads.
+        // Contract 3: trailing bytes are refused, or two byte strings share one
+        // meaning.
         let mut padded = re_encoded.clone();
         padded.push(0);
         assert!(

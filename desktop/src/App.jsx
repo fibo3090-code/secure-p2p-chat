@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, onBridge, summaryToConv, chatToContact, friendlyError } from "./lib/bridge.js";
 import { computeUnread } from "./lib/partyUnread.js";
 import { Icon } from "./lib/Icon.jsx";
+import { Logo } from "./components/Logo.jsx";
 import { cx, Avatar } from "./components/ui.jsx";
 import { ConvList, ChatPane } from "./components/Messages.jsx";
+import { Reachability } from "./components/Reachability.jsx";
 import { BootScreen, LockScreen, SetPasswordScreen, BackupPrompt } from "./components/Onboarding.jsx";
 import { Creator } from "./components/Creator.jsx";
 import { Verify } from "./components/Verify.jsx";
@@ -15,7 +17,8 @@ import { Toasts } from "./components/Toasts.jsx";
 import { HistoryBanner } from "./components/HistoryBanner.jsx";
 import { RenameDialog, ConfirmDelete, InfoDialog } from "./components/ChatDialogs.jsx";
 import { toast } from "./lib/toast.js";
-import { THEMES, loadTheme, saveTheme } from "./lib/themes.js";
+import { loadTheme, saveTheme } from "./lib/themes.js";
+import { loadTextSize, saveTextSize, applyTextSize } from "./lib/textSize.js";
 
 function RailBtn({ icon, label, active, onClick, badge }) {
   // The badge is a bare number next to an icon, so a reader announced "Chats"
@@ -29,36 +32,6 @@ function RailBtn({ icon, label, active, onClick, badge }) {
       <span className="rail-label">{label}</span>
       {badge > 0 && <span className="rail-badge" aria-hidden="true">{badge}</span>}
     </button>
-  );
-}
-
-function ThemeMenu({ theme, setTheme }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
-  return (
-    <div className="theme-wrap" ref={ref}>
-      <button className="tb-icon" title="Theme" onClick={() => setOpen((o) => !o)}>
-        <Icon name="settings" size={16} />
-      </button>
-      {open && (
-        <div className="theme-menu">
-          {THEMES.map((t) => (
-            <button key={t.id} className={cx("theme-opt", theme === t.id && "is-active")}
-              onClick={() => { setTheme(t.id); setOpen(false); }}>
-              <span className="theme-dot" style={{ background: t.swatch }} />
-              {t.label}
-              {theme === t.id && <span className="theme-check"><Icon name="check" size={15} /></span>}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -86,6 +59,7 @@ export default function App() {
   // Which tab the connection dialog opens on, so the get-started suggestions
   // land the user on the path they picked instead of a generic dialog.
   const [creatorMode, setCreatorMode] = useState("connect");
+  const [creatorRelay, setCreatorRelay] = useState(false);
   const [fpReq, setFpReq] = useState(null);
   const [renameTarget, setRenameTarget] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
@@ -97,6 +71,9 @@ export default function App() {
   const activeIdRef = useRef(null);
   const visibleRef = useRef(true);
   const [transfers, setTransfers] = useState([]);
+  // Saved contacts, so an offline conversation can offer "Reconnect" — the
+  // notice used to say "reconnect to this peer" with nothing on screen that did.
+  const [savedContacts, setSavedContacts] = useState([]);
   const [partyUnread, setPartyUnread] = useState(0);
   // Conversation lock: when on, no new peer can connect (listener stopped,
   // auto-rehost paused). Existing sessions keep running.
@@ -109,8 +86,12 @@ export default function App() {
   const [visible, setVisible] = useState(true);
 
   const setTheme = useCallback((id) => { setThemeState(id); saveTheme(id); }, []);
-  const openCreator = useCallback((mode = "connect") => {
+  const [textSize, setTextSizeState] = useState(loadTextSize());
+  const setTextSize = useCallback((id) => { setTextSizeState(id); saveTextSize(id); }, []);
+  useEffect(() => { applyTextSize(textSize); }, [textSize]);
+  const openCreator = useCallback((mode = "connect", relay = false) => {
     setCreatorMode(mode);
+    setCreatorRelay(relay);
     setCreatorOpen(true);
   }, []);
 
@@ -217,6 +198,7 @@ export default function App() {
         .then((p) => setFpReq((cur) => (p && cur && cur.chat_id === p.chat_id ? cur : p)))
         .catch(() => {});
       api.lockState().then(setLockedState).catch(() => {});
+      api.listContacts().then((l) => setSavedContacts(l || [])).catch(() => {});
       setActiveId((cur) => {
         if (cur) {
           api.getConversation(cur).then((chat) => {
@@ -279,7 +261,7 @@ export default function App() {
     }} />;
   }
   if (auth.state === "set_password") {
-    return <SetPasswordScreen fingerprint={auth.fingerprint} minLength={auth.min_password_len}
+    return <SetPasswordScreen minLength={auth.min_password_len}
       onSet={async (pw) => {
         try {
           await api.setPassword(pw);
@@ -298,6 +280,10 @@ export default function App() {
   }
 
   const contacts = convs.map(summaryToConv);
+  // Listeners are a state of the app, not people: they live in the
+  // reachability status, not among the conversations.
+  const listRows = contacts.filter((c) => !c.placeholder);
+  const listeners = contacts.filter((c) => c.placeholder);
   const connCount = convs.filter((c) => c.connected).length;
 
   async function openConv(id) {
@@ -339,6 +325,24 @@ export default function App() {
     refresh();
   }
 
+  // The saved contact behind a conversation: the bridge's own association
+  // first, then a matching verified fingerprint.
+  function contactFor(c) {
+    if (!c) return null;
+    return savedContacts.find((k) => k.chat_id === c.id)
+      || (c.fingerprint ? savedContacts.find((k) => k.fingerprint === c.fingerprint) : null)
+      || null;
+  }
+
+  // Throws on failure: the offline strip shows what went wrong and what the
+  // other person needs to do, instead of a toast that disappears.
+  async function reconnect(c) {
+    const k = contactFor(c);
+    if (!k) return;
+    await api.connectContact(k.id);
+    refresh();
+  }
+
   async function sendFile(c) {
     try { await api.sendFile(c.id); refresh(); }
     catch (e) { toast(friendlyError(e), "error"); }
@@ -371,33 +375,6 @@ export default function App() {
       {nav === "chats" && activeId && (
         <a className="skip-link" href="#composer-input">Skip to message box</a>
       )}
-      <div className="hex-bg" />
-      <header className="titlebar">
-        <div className="tb-left">
-          <span className="tb-brand"><Icon name="shieldCheck" size={16} /> P2PEM</span>
-          <span className={cx("tb-status", connCount && "is-on")}>
-            <span className="tb-status-dot" />
-            {connCount ? `${connCount} peer${connCount > 1 ? "s" : ""} connected` : "No active peers"}
-          </span>
-        </div>
-        <div className="tb-right">
-          <button className={cx("tb-icon", locked && "is-locked")}
-            title={locked
-              ? "Conversation locked: no new peer can connect. Click to unlock."
-              : "Lock the conversation: stop listening and refuse new peers."}
-            onClick={async () => {
-              try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Locked — no new peers can connect" : "Unlocked", "info"); }
-              catch (e) { toast(friendlyError(e), "error"); }
-            }}>
-            <Icon name={locked ? "lock" : "unlock"} size={16} />
-          </button>
-          <button className="tb-btn" onClick={() => openCreator()}>
-            <Icon name="plus" size={15} /> New connection
-          </button>
-          <ThemeMenu theme={theme} setTheme={setTheme} />
-        </div>
-      </header>
-
       {historyIssue && (
         <HistoryBanner issue={historyIssue} onSetAside={async () => {
           const moved = await api.setAsideHistory();
@@ -411,6 +388,13 @@ export default function App() {
             more than one region a reader will call that. Naming it is what makes
             the landmark list usable. */}
         <nav className="rail" role="navigation" aria-label="Primary">
+          {/* The app's one brand moment inside the shell. There is no app-wide
+              title bar any more: the window already has one, and ours only held
+              controls that each had a better home (theme → Settings, new
+              conversation → the list header, the peer gate → the rail foot). */}
+          <div className="rail-brand" title="P2PEM">
+            <Logo size={36} title="P2PEM" />
+          </div>
           <div className="rail-nav">
             <RailBtn icon="message" label="Chats" active={nav === "chats"} onClick={() => setNav("chats")}
               badge={convs.reduce((n, c) => n + (c.unread || 0), 0)} />
@@ -421,7 +405,7 @@ export default function App() {
             <RailBtn icon="settings" label="Settings" active={nav === "settings"} onClick={() => setNav("settings")} />
           </div>
           <div className="rail-foot">
-            <button className={cx("rail-id", nav === "settings" && "is-active")}
+            <button className="rail-id"
               title={`${auth.name} — open your identity settings`}
               aria-label={`${auth.name} — open your identity settings`}
               onClick={() => setNav("settings")}>
@@ -433,15 +417,43 @@ export default function App() {
         {nav === "chats" && (
           <>
             <aside className="col-list">
-              <ConvList contacts={contacts} activeId={activeId} onSelect={openConv}
-                onAdd={() => openCreator()} query={query} setQuery={setQuery} />
+              <ConvList contacts={listRows} activeId={activeId} onSelect={openConv}
+                onAdd={() => openCreator()} query={query} setQuery={setQuery}
+                connectedCount={connCount} gateClosed={locked}
+                status={
+                  <Reachability listeners={listeners} locked={locked} connected={connCount}
+                    onChanged={refresh}
+                    onToggleLock={async () => {
+                      try { await api.setLocked(!locked); setLockedState(!locked); toast(!locked ? "Closed to new peers" : "Accepting new peers", "info"); }
+                      catch (e) { toast(friendlyError(e), "error"); }
+                    }}
+                    onStopListening={async (l) => {
+                      try {
+                        await api.deleteChat(l.id);
+                        if (activeId === l.id) { setActiveId(null); activeIdRef.current = null; setActive(null); }
+                        toast("Stopped listening", "info");
+                        refresh();
+                      } catch (e) { toast(friendlyError(e), "error"); }
+                    }} />
+                } />
             </aside>
             <main className="col-main" id="main-content" tabIndex={-1}>
               <ChatPane contact={active} draft={draft} setDraft={setDraft} onSend={send}
                 onSendFile={sendFile}
+                reconnectContact={contactFor(active)}
+                onReconnect={reconnect}
                 // A user with no conversations at all gets the get-started
                 // panel rather than "select a conversation" with nothing to select.
-                isFirstRun={convs.length === 0}
+                isFirstRun={listRows.length === 0}
+                gateClosed={locked}
+                waiting={(() => {
+                  const unread = convs.filter((c) => (c.unread || 0) > 0);
+                  return unread.length ? {
+                    total: unread.reduce((n, c) => n + c.unread, 0), chats: unread.length,
+                    firstId: unread[0].id, firstName: unread[0].title,
+                  } : null;
+                })()}
+                onJump={(id) => id && openConv(id)}
                 onStart={openCreator}
                 // A swallowed failure here is a cancel button that does
                 // nothing, on a transfer the user is actively trying to stop.
@@ -475,20 +487,24 @@ export default function App() {
           </>
         )}
         {nav === "contacts" && (
-          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Contacts onConnected={() => { setNav("chats"); refresh(); }}
+            onOpenChat={(id) => { if (convs.some((c) => c.id === id)) void openConv(id); }}
+            connectedChats={new Set(convs.filter((c) => c.connected).map((c) => c.id))} /></main>
         )}
         {nav === "settings" && (
-          <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth} /></main>
+          <main className="col-full" id="main-content" tabIndex={-1}><Settings identity={auth} theme={theme} setTheme={setTheme} onIdentityChanged={refreshAuth}
+            textSize={textSize} setTextSize={setTextSize} /></main>
         )}
         {nav === "parties" && <main className="col-full" id="main-content" tabIndex={-1}><Parties /></main>}
-        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onConnected={() => { setNav("chats"); refresh(); }} /></main>}
+        {nav === "relays" && <main className="col-full" id="main-content" tabIndex={-1}><Relays onPair={(mode) => openCreator(mode, true)} /></main>}
       </div>
 
-      <Creator open={creatorOpen} initialMode={creatorMode} onClose={() => setCreatorOpen(false)} />
+      <Creator open={creatorOpen} initialMode={creatorMode} initialRelay={creatorRelay} onClose={() => setCreatorOpen(false)} />
       <Verify req={fpReq} onClose={() => setFpReq(null)} />
       <RenameDialog target={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={doRename} />
       <ConfirmDelete target={deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete} />
-      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)} />
+      <InfoDialog target={infoTarget} onClose={() => setInfoTarget(null)} myFingerprint={auth.fingerprint}
+        onRename={(c) => setRenameTarget(c)} onDelete={(c) => setDeleteTarget(c)} />
       <Toasts />
     </div>
   );

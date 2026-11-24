@@ -1,19 +1,11 @@
-//! In-house editable text field for the TUI.
-//!
-//! Provides a UTF-8-safe, cursor-aware editor used by the message input, the
-//! command line, and overlay text fields (e.g. password entry). A small
-//! hand-rolled editor is used instead of `tui-textarea` because that crate
-//! pins `ratatui 0.29`, which is incompatible with this project's `ratatui 0.30`.
-//!
-//! The cursor is tracked as a char index into a `Vec<char>` so insert/delete are
-//! simple and never split a multi-byte code point. Display columns use
-//! `unicode-width` so wide (CJK/emoji) glyphs position the terminal cursor
-//! correctly.
+//! Editable text field for the message input, command line and password entry
+//! (hand-rolled: `tui-textarea` pins ratatui 0.29). The cursor is a char index
+//! into a `Vec<char>`, so edits never split a code point; display columns use
+//! `unicode-width` so wide glyphs place the terminal cursor correctly.
 
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
-/// A single- or multi-line editable text buffer with a char-index cursor.
 #[derive(Clone, Default)]
 pub struct EditableField {
     chars: Vec<char>,
@@ -22,7 +14,7 @@ pub struct EditableField {
     multiline: bool,
     /// Render the contents as `•` (used for password entry).
     masked: bool,
-    /// Previously submitted entries (oldest first); used for history recall.
+    /// Previously submitted entries, oldest first.
     history: Vec<String>,
     /// Index into `history` while browsing, or `None` when editing live text.
     history_pos: Option<usize>,
@@ -43,13 +35,11 @@ impl EditableField {
         self
     }
 
-    /// Current contents as a `String`.
     pub fn text(&self) -> String {
         self.chars.iter().collect()
     }
 
-    /// Text suitable for rendering (masked fields return `•` per char,
-    /// preserving newlines).
+    /// Text for rendering: masked fields show `•` per char, keeping newlines.
     pub fn display_text(&self) -> String {
         if self.masked {
             self.chars
@@ -162,8 +152,7 @@ impl EditableField {
         }
     }
 
-    /// Cursor position for rendering: `(row, col)` in display cells, relative to
-    /// the start of the text. `col` accounts for wide glyphs.
+    /// Cursor `(row, col)` in display cells from the start of the text.
     pub fn cursor_display(&self) -> (u16, u16) {
         let mut row = 0u16;
         let mut col = 0u16;
@@ -227,9 +216,8 @@ impl EditableField {
         }
     }
 
-    /// Handle a pure-editing key. Returns `true` if the key was consumed.
-    /// Submission keys (Enter), cancellation (Esc), Tab, and newline insertion
-    /// are intentionally left to the caller because their meaning is contextual.
+    /// Handle a pure-editing key, returning whether it was consumed. Enter,
+    /// Esc, Tab and newline insertion are contextual, so left to the caller.
     pub fn handle_edit_key(&mut self, key: &KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {

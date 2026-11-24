@@ -1,20 +1,13 @@
-//! The invite-link wire format: one definition, used to both mint and read.
+//! The invite-link wire format, used to both mint and read.
 //!
-//! A signed invite is verified by **re-serializing** the payload and checking
-//! the signature over those bytes, so the reader's struct must match the
-//! writer's field for field, in order, with the same skip rules. That struct
-//! used to be declared three times — in the generator, in the client's parser
-//! and in a test helper — each with a comment begging the others to stay in
-//! sync. The test helper had already drifted (it lacked `addresses`). Now there
-//! is one, here.
-//!
-//! What this module decides is only *what the link says and whether it is
-//! internally consistent*. It never decides trust: a contact made from a valid
-//! invite is still `Unverified` until the user compares the SAS.
+//! A signed invite is verified by **re-serializing** the payload, so this one
+//! struct must match the writer's field for field, in order, with the same skip
+//! rules. Decoding never decides trust: an imported contact stays `Unverified`
+//! until the user compares the SAS.
 
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
 use crate::core::crypto::{fingerprint_pubkey, pem_decode_public, rsa_sign_pss, rsa_verify_pss};
@@ -33,10 +26,9 @@ pub struct InvitePayload {
     pub public_key: String,
 }
 
-/// The signed payload. **Field order is part of the signature** — do not
-/// reorder, rename or insert fields; append only, with
-/// `#[serde(default, skip_serializing_if = ...)]` so links minted before the
-/// new field re-serialize byte-identically and keep verifying.
+/// The signed payload. **Field order is part of the signature**: append only,
+/// with `#[serde(default, skip_serializing_if = ...)]`, so older links
+/// re-serialize byte-identically and keep verifying.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SignedInvitePayload {
     pub version: u32,
@@ -49,8 +41,8 @@ pub struct SignedInvitePayload {
     pub relay_token: Option<String>,
     pub fingerprint: String,
     pub public_key: String,
-    /// The full ordered candidate list; omitted when it adds nothing beyond
-    /// `address` (0 or 1 candidate). Must stay last with this exact skip rule.
+    /// Full ordered candidate list, omitted for 0 or 1 candidate. Must stay
+    /// last with this exact skip rule.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
 }
@@ -62,18 +54,15 @@ struct SignedInvite {
     signature: Vec<u8>,
 }
 
-/// Whether a link is the **signed** (v2+) format. Decided by the prefix, not by
-/// searching for `/v2/`: a v1 payload is standard base64, which contains `/`,
-/// so an unsigned link could carry `/v2/` by chance.
+/// Whether a link is signed (v2+), by prefix: v1 standard base64 can contain
+/// `/v2/` by chance.
 pub fn is_signed(link: &str) -> bool {
     link.trim().starts_with(SIGNED_INVITE_PREFIX)
 }
 
 /// Sign `payload` with `privkey` and encode it as a v2 link.
 pub fn encode_signed(payload: SignedInvitePayload, privkey: &RsaPrivateKey) -> Result<String> {
-    // Deterministic for this app (serde_json, fixed field order), but not a
-    // general-purpose canonicalization: the verifier re-serializes with the
-    // same struct, which is what makes the bytes agree.
+    // The verifier re-serializes with the same struct, so the bytes agree.
     let signature = rsa_sign_pss(privkey, serde_json::to_string(&payload)?.as_bytes())?;
     let json = serde_json::to_string(&SignedInvite { payload, signature })?;
     Ok(format!(
@@ -91,10 +80,8 @@ pub fn encode_unsigned(payload: &InvitePayload) -> Result<String> {
     ))
 }
 
-/// Reject an invite whose `fingerprint` field does not match the key it
-/// ships. The two are separate fields on the wire and only the key is
-/// self-attesting; the fingerprint is what every trust decision is made
-/// against, so a mismatch means one of them is a lie.
+/// Reject an invite whose `fingerprint` does not match the key it ships: only
+/// the key is self-attesting, and the fingerprint decides trust.
 pub fn check_fingerprint_binding(claimed: &str, public_key_pem: &str) -> Result<()> {
     let derived = fingerprint_pubkey(public_key_pem.as_bytes())
         .map_err(|e| anyhow!("Invalid public key in invite: {}", e))?;
@@ -118,14 +105,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Decode and verify a signed link (with or without surrounding whitespace):
-/// signature, fingerprint ↔ key binding, and the validity window. Returns the
-/// payload only if all three hold, with its fingerprint in canonical form.
+/// Decode and verify a signed link: signature, fingerprint/key binding and
+/// validity window. The returned fingerprint is canonical.
 pub fn decode_signed(link: &str) -> Result<SignedInvitePayload> {
     decode_signed_at(link, now_secs())
 }
 
-fn decode_signed_at(link: &str, now: u64) -> Result<SignedInvitePayload> {
+/// Strip the prefix and decode a signed link's JSON envelope (unverified).
+fn decode_envelope(link: &str) -> Result<SignedInvite> {
     let encoded = link
         .trim()
         .strip_prefix(SIGNED_INVITE_PREFIX)
@@ -133,8 +120,11 @@ fn decode_signed_at(link: &str, now: u64) -> Result<SignedInvitePayload> {
     let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|e| anyhow!("Invalid v2 invite link: {}", e))?;
-    let invite: SignedInvite =
-        serde_json::from_slice(&json).map_err(|e| anyhow!("Invalid v2 invite data: {}", e))?;
+    serde_json::from_slice(&json).map_err(|e| anyhow!("Invalid v2 invite data: {}", e))
+}
+
+fn decode_signed_at(link: &str, now: u64) -> Result<SignedInvitePayload> {
+    let invite = decode_envelope(link)?;
 
     let payload = &invite.payload;
     let pubkey = pem_decode_public(&payload.public_key)
@@ -149,14 +139,12 @@ fn decode_signed_at(link: &str, now: u64) -> Result<SignedInvitePayload> {
         anyhow!("Invite signature verification failed: {}", e)
     })?;
 
-    // The signature only proves that whoever built this invite holds the
-    // private key for the `public_key` *inside it*. `fingerprint` is a separate
-    // field, and it is the one that decides trust everywhere else — so bind it.
+    // The signature only proves possession of the key *inside* the invite;
+    // `fingerprint` is a separate field and decides trust, so bind it.
     check_fingerprint_binding(&payload.fingerprint, &payload.public_key)?;
     let fingerprint = crate::util::canonical_fingerprint(&payload.fingerprint);
 
-    // The timestamp is covered by the signature, so a stale or future-dated
-    // value cannot be forged without breaking verification above.
+    // The timestamp is signed, so it cannot be forged past the check above.
     let ts = payload.timestamp;
     if ts > now + crate::INVITE_TIMESTAMP_SKEW_SECS {
         tracing::warn!(timestamp = ts, now, "Rejecting invite dated in the future");
@@ -179,10 +167,8 @@ fn decode_signed_at(link: &str, now: u64) -> Result<SignedInvitePayload> {
     })
 }
 
-/// Decode a legacy unsigned link (the prefix is optional — bare base64 was
-/// accepted historically). Nothing signs a v1 invite, so passing the binding
-/// check does not make it trustworthy; it only rejects a link that is
-/// internally inconsistent.
+/// Decode a legacy unsigned link (prefix optional). Nothing signs v1, so the
+/// binding check only rejects an internally inconsistent link.
 pub fn decode_unsigned(link: &str) -> Result<InvitePayload> {
     let link = link.trim();
     let encoded = link.strip_prefix(INVITE_PREFIX).unwrap_or(link);
@@ -204,12 +190,7 @@ pub fn resign_for_test(
     privkey: &RsaPrivateKey,
     edit: impl FnOnce(&mut SignedInvitePayload),
 ) -> Result<String> {
-    let encoded = link
-        .trim()
-        .strip_prefix(SIGNED_INVITE_PREFIX)
-        .ok_or_else(|| anyhow!("Not a signed invite link"))?;
-    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?;
-    let mut invite: SignedInvite = serde_json::from_slice(&json)?;
+    let mut invite = decode_envelope(link)?;
     edit(&mut invite.payload);
     encode_signed(invite.payload, privkey)
 }
@@ -220,7 +201,7 @@ mod tests {
     use crate::core::{generate_rsa_keypair, pem_encode_public};
 
     fn payload(key: &RsaPrivateKey, timestamp: u64) -> SignedInvitePayload {
-        let pem = pem_encode_public(&rsa::RsaPublicKey::from(key)).unwrap();
+        let pem = pem_encode_public(&rsa::PublicKey::from(key)).unwrap();
         SignedInvitePayload {
             version: 2,
             timestamp,
@@ -232,6 +213,15 @@ mod tests {
             fingerprint: fingerprint_pubkey(pem.as_bytes()).unwrap(),
             public_key: pem,
             addresses: Vec::new(),
+        }
+    }
+
+    fn v1_of(p: SignedInvitePayload) -> InvitePayload {
+        InvitePayload {
+            name: p.name,
+            address: p.address,
+            fingerprint: p.fingerprint,
+            public_key: p.public_key,
         }
     }
 
@@ -250,10 +240,7 @@ mod tests {
         let key = generate_rsa_keypair(2048).unwrap();
         let now = now_secs();
         let link = encode_signed(payload(&key, now), &key).unwrap();
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(link.strip_prefix(SIGNED_INVITE_PREFIX).unwrap())
-            .unwrap();
-        let mut invite: SignedInvite = serde_json::from_slice(&json).unwrap();
+        let mut invite = decode_envelope(&link).unwrap();
         invite.payload.address = Some("6.6.6.6:12345".into());
         let tampered = format!(
             "{SIGNED_INVITE_PREFIX}{}",
@@ -287,13 +274,7 @@ mod tests {
     #[test]
     fn unsigned_links_round_trip_and_bind_their_fingerprint() {
         let key = generate_rsa_keypair(2048).unwrap();
-        let signed = payload(&key, 0);
-        let v1 = InvitePayload {
-            name: signed.name,
-            address: signed.address,
-            fingerprint: signed.fingerprint,
-            public_key: signed.public_key,
-        };
+        let v1 = v1_of(payload(&key, 0));
         let link = encode_unsigned(&v1).unwrap();
         assert!(!is_signed(&link));
         assert_eq!(decode_unsigned(&link).unwrap(), v1);
@@ -306,8 +287,7 @@ mod tests {
         assert!(err.to_string().contains("inconsistent"), "{err}");
     }
 
-    /// The binding check accepts any case; what comes out must be the one
-    /// spelling a handshake produces, or comparisons against it silently fail.
+    /// Any case is accepted, but the output must be the canonical spelling.
     #[test]
     fn decoded_fingerprints_are_canonical() {
         let key = generate_rsa_keypair(2048).unwrap();
@@ -322,52 +302,38 @@ mod tests {
             canonical
         );
 
-        let v1 = InvitePayload {
-            name: shouting.name,
-            address: shouting.address,
-            fingerprint: shouting.fingerprint,
-            public_key: shouting.public_key,
-        };
         assert_eq!(
-            decode_unsigned(&encode_unsigned(&v1).unwrap())
+            decode_unsigned(&encode_unsigned(&v1_of(shouting)).unwrap())
                 .unwrap()
                 .fingerprint,
             canonical
         );
     }
 
-    /// A signed invite whose `public_key` smuggles the victim's key in a
-    /// preamble, signed by the attacker and claiming the victim's fingerprint,
-    /// used to pass both the signature and the binding check — and then
-    /// refreshed the victim's verified contact with the attacker's address.
+    /// `public_key` smuggling the victim's key in a preamble, signed by the
+    /// attacker and claiming the victim's fingerprint, used to pass both checks.
     #[test]
     fn an_invite_carrying_two_keys_is_refused() {
         let victim = generate_rsa_keypair(2048).unwrap();
         let attacker = generate_rsa_keypair(2048).unwrap();
-        let victim_pem = pem_encode_public(&rsa::RsaPublicKey::from(&victim)).unwrap();
+        let victim_pem = pem_encode_public(&rsa::PublicKey::from(&victim)).unwrap();
         let crafted = format!(
             "x{}\n{}",
             victim_pem.trim_end(),
-            pem_encode_public(&rsa::RsaPublicKey::from(&attacker)).unwrap()
+            pem_encode_public(&rsa::PublicKey::from(&attacker)).unwrap()
         );
         let now = now_secs();
         let mut forged = payload(&victim, now);
-        forged.public_key = crafted.clone();
+        forged.public_key = crafted;
         forged.fingerprint = fingerprint_pubkey(victim_pem.as_bytes()).unwrap();
         let link = encode_signed(forged.clone(), &attacker).unwrap();
         assert!(decode_signed_at(&link, now).is_err());
 
-        let v1 = InvitePayload {
-            name: forged.name,
-            address: forged.address,
-            fingerprint: forged.fingerprint,
-            public_key: crafted,
-        };
-        assert!(decode_unsigned(&encode_unsigned(&v1).unwrap()).is_err());
+        assert!(decode_unsigned(&encode_unsigned(&v1_of(forged)).unwrap()).is_err());
     }
 
-    /// A v1 invite is fingerprinted before any PEM parse; a key whose markers
-    /// are out of order used to panic the whole app.
+    /// v1 invites are fingerprinted before any PEM parse; out-of-order markers
+    /// used to panic the app.
     #[test]
     fn a_malformed_v1_key_is_an_error_not_a_crash() {
         let v1 = InvitePayload {

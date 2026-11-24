@@ -1,61 +1,29 @@
 //! Bridge integration tests: drive the real command handlers through Tauri's
-//! mock runtime, over the same IPC path the webview uses.
+//! mock runtime, over the webview's IPC path. Two invariants:
 //!
-//! Two invariants matter here:
+//! 1. **Invoke keys must bind.** Every call uses the exact keys
+//!    `desktop/src/lib/bridge.js` sends, so a rename on either side fails here
+//!    (an "invalid args" error) instead of silently no-opping in production.
+//! 2. **The auth barrier holds.** No state-mutating command runs before
+//!    unlock / set-password completes.
 //!
-//! 1. **Invoke keys must bind.** Tauri 2 matches JS payload keys to Rust
-//!    parameter names by exact name; a mismatch makes the command fail
-//!    argument deserialization (surfaced as an "invalid args" error) — the
-//!    root cause of past "messages send but don't arrive" bugs. Every call in
-//!    these tests uses the exact keys `desktop/src/lib/bridge.js` sends, so a
-//!    rename on either side breaks CI instead of production.
-//! 2. **The auth barrier holds.** No state-mutating command may run before
-//!    unlock / set-password completes, no matter what the frontend does.
-//!
-//! The mock runtime has no window and no webview process, so anything driven
-//! purely by UI events stays out of scope; commands that open native dialogs
-//! (`send_file`, `export_identity`, `pick_download_dir`) are exercised only
-//! for their auth gating.
+//! The mock runtime has no real window, so commands that open native dialogs
+//! are exercised only for their auth gating.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
 use messenger_core::identity::Identity;
-use messenger_core::types::Config;
 use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeBody, InvokeResponseBody};
 use tauri::test::{mock_builder, mock_context, noop_assets, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tokio::sync::Mutex;
-
-use p2pem_classic::app::party_manager::PartyManager;
-use p2pem_classic::app::ChatManager;
 
 use crate::{invoke_handler, Bridge};
 
-/// A bridge over a fresh plaintext identity in a temp dir — the state a brand
-/// new install boots into (password setup pending).
+/// A bridge over a fresh plaintext identity: a new install (setup pending).
 fn fresh_bridge(dir: &std::path::Path) -> Bridge {
     let identity = Identity::new_with_plaintext("Tester".to_string()).expect("identity");
-    let history_path = dir.join("history.json.enc");
-    // Same wiring the real bridge does: without it the manager cannot recognise
-    // the user's own invite link, so a harness would silently exercise a
-    // different code path from production.
-    let mut manager = ChatManager::new(Config::default());
-    manager.set_my_fingerprint(identity.fingerprint.clone());
-    Bridge {
-        manager: Arc::new(Mutex::new(manager)),
-        party: Arc::new(Mutex::new(PartyManager::new())),
-        identity: Arc::new(StdMutex::new(identity)),
-        discovery: Arc::new(StdMutex::new(None)),
-        discovered: Arc::new(StdMutex::new(Vec::new())),
-        identity_path: history_path.with_file_name("identity.json"),
-        parties_path: history_path.with_file_name("parties.json"),
-        history_path,
-        needs_password_setup: std::sync::atomic::AtomicBool::new(true),
-        pending_fp: Arc::new(StdMutex::new(None)),
-        init_error: None,
-        saved_sig: Arc::new(StdMutex::new(None)),
-    }
+    Bridge::new(identity, dir.join("history.json.enc"), true, None)
 }
 
 /// A bridge that failed to read an existing identity at startup.
@@ -67,8 +35,7 @@ fn broken_identity_bridge(dir: &std::path::Path) -> Bridge {
 }
 
 struct Harness {
-    // Held alive for the duration of the test; dropping the app tears down the
-    // mock runtime under the webview.
+    // Dropping the app tears down the mock runtime under the webview.
     _app: tauri::App<tauri::test::MockRuntime>,
     webview: tauri::WebviewWindow<tauri::test::MockRuntime>,
     _dir: tempfile::TempDir,
@@ -99,15 +66,25 @@ fn harness() -> Harness {
 /// A harness that has completed password setup and is fully "ready".
 fn ready_harness() -> Harness {
     let h = harness();
-    h.ipc(
-        "set_password",
-        json!({ "password": "bridge-test-passphrase" }),
-    )
-    .expect("set_password");
+    h.set_password();
     h
 }
 
 impl Harness {
+    /// Complete first-run setup with the test passphrase.
+    fn set_password(&self) {
+        self.ipc(
+            "set_password",
+            json!({ "password": "bridge-test-passphrase" }),
+        )
+        .expect("set_password");
+    }
+
+    /// The `state` field `auth_status` reports.
+    fn auth_state(&self) -> Value {
+        self.ipc("auth_status", json!({})).unwrap()["state"].take()
+    }
+
     /// Where this harness's bridge keeps the encrypted history.
     fn bridge_history_path(&self) -> std::path::PathBuf {
         self._dir.path().join("history.json.enc")
@@ -149,33 +126,35 @@ impl Harness {
         }
         res
     }
-}
 
-impl Harness {
-    /// Seed a conversation holding `incoming` peer messages, as if they had
-    /// arrived over the wire. Returns the chat id.
+    /// Append a peer text message to a chat, as if it arrived over the wire.
+    fn push_incoming(&self, id: uuid::Uuid, text: &str) {
+        use messenger_core::types::{Message, MessageContent};
+        use tauri::Manager;
+        let manager = self._app.state::<Bridge>().manager.clone();
+        let content = MessageContent::Text {
+            text: text.to_string(),
+        };
+        tauri::async_runtime::block_on(async move {
+            if let Some(chat) = manager.lock().await.get_chat_mut(id) {
+                chat.messages
+                    .push(Message::received(content, chrono::Utc::now()));
+            }
+        });
+    }
+
+    /// Seed a conversation holding `incoming` peer messages. Returns its id.
     fn seed_chat_with_incoming(&self, title: &str, incoming: usize) -> uuid::Uuid {
         use tauri::Manager;
         let id = uuid::Uuid::new_v4();
-        let bridge = self._app.state::<Bridge>();
-        let manager = bridge.manager.clone();
+        let manager = self._app.state::<Bridge>().manager.clone();
+        let title = title.to_string();
         tauri::async_runtime::block_on(async move {
-            let mut mgr = manager.lock().await;
-            mgr.create_local_chat_for_test(id, title.to_string());
-            if let Some(chat) = mgr.get_chat_mut(id) {
-                for _ in 0..incoming {
-                    chat.messages.push(messenger_core::types::Message {
-                        id: uuid::Uuid::new_v4(),
-                        from_me: false,
-                        content: messenger_core::types::MessageContent::Text {
-                            text: "hi".to_string(),
-                        },
-                        timestamp: chrono::Utc::now(),
-                        delivered: false,
-                    });
-                }
-            }
+            manager.lock().await.create_local_chat_for_test(id, title);
         });
+        for _ in 0..incoming {
+            self.push_incoming(id, "hi");
+        }
         id
     }
 
@@ -191,25 +170,38 @@ impl Harness {
     }
 }
 
+/// An `update_settings` payload with the keys `bridge.js` sends: every toggle
+/// off unless named in `on`.
+fn settings(port: u16, on: &[&str]) -> Value {
+    let mut s = json!({ "listen_port": port });
+    for key in [
+        "enable_notifications",
+        "enable_typing_indicators",
+        "auto_host_on_startup",
+        "enable_upnp",
+        "auto_accept_files",
+        "auto_connect",
+        "enable_mdns",
+    ] {
+        s[key] = json!(on.contains(&key));
+    }
+    json!({ "settings": s })
+}
+
 fn err_text(e: &Value) -> &str {
     e.as_str().unwrap_or_default()
 }
 
-/// The webview origin Tauri considers *local* — remote origins are ACL-gated
-/// and would reject every command. Windows serves the app from
-/// `http://tauri.localhost`; everywhere else it's `tauri://localhost`.
+/// The webview origin Tauri considers *local*; remote origins are ACL-gated.
 #[cfg(windows)]
 const LOCAL_ORIGIN: &str = "http://tauri.localhost";
 #[cfg(not(windows))]
 const LOCAL_ORIGIN: &str = "tauri://localhost";
 
-// ── Auth lifecycle ──────────────────────────────────────────────────────────
-
 #[test]
 fn fresh_identity_requires_password_setup() {
     let h = harness();
-    let status = h.ipc("auth_status", json!({})).unwrap();
-    assert_eq!(status["state"], "set_password");
+    assert_eq!(h.auth_state(), "set_password");
 
     // The barrier: every post-auth command must refuse to run.
     for (cmd, args) in [
@@ -246,20 +238,13 @@ fn fresh_identity_requires_password_setup() {
     }
 
     // Setup completes → the same surface opens up.
-    h.ipc(
-        "set_password",
-        json!({ "password": "bridge-test-passphrase" }),
-    )
-    .unwrap();
-    let status = h.ipc("auth_status", json!({})).unwrap();
-    assert_eq!(status["state"], "ready");
+    h.set_password();
+    assert_eq!(h.auth_state(), "ready");
     let settings = h.ipc("get_settings", json!({})).unwrap();
     assert_eq!(settings["listen_port"], 12345);
 }
 
-/// The password floor is enforced by the core, not merely suggested by the UI —
-/// a frontend that skipped its own validation must still be refused, and the
-/// error has to be specific enough to show the user.
+/// The password floor is enforced by the core, with a user-facing error.
 #[test]
 fn set_password_enforces_the_length_floor() {
     let h = harness();
@@ -274,20 +259,15 @@ fn set_password_enforces_the_length_floor() {
         err_text(&err)
     );
     // The rejection must not half-apply: setup is still pending.
-    assert_eq!(
-        h.ipc("auth_status", json!({})).unwrap()["state"],
-        "set_password"
-    );
+    assert_eq!(h.auth_state(), "set_password");
 
     h.ipc("set_password", json!({ "password": "a".repeat(min) }))
         .expect("an acceptable password was refused");
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
+    assert_eq!(h.auth_state(), "ready");
 }
 
-/// An identity file that exists but cannot be read must surface as a distinct
-/// terminal state — **never** as `set_password`, which would invite the user to
-/// create a new identity right over the one that failed to load, abandoning
-/// their history and their contacts' verified fingerprint.
+/// An identity file that exists but cannot be read is a distinct terminal
+/// state, never `set_password` (which would replace it).
 #[test]
 fn unreadable_identity_reports_an_error_state_and_gates_everything() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -320,20 +300,13 @@ fn unreadable_identity_reports_an_error_state_and_gates_everything() {
     }
 }
 
-/// The screen reads the floor from the bridge rather than hardcoding one, so
-/// `auth_status` has to report it.
-/// An existing history file that cannot be read must survive the unlock: the
-/// poll loop and every immediate save used to write the empty state over it.
+/// An unreadable history file must survive unlock and every immediate save.
 #[test]
 fn an_unreadable_history_survives_unlock_and_can_be_set_aside() {
     let h = harness();
     std::fs::write(h.bridge_history_path(), b"written by a future version").unwrap();
 
-    h.ipc(
-        "set_password",
-        json!({ "password": "bridge-test-passphrase" }),
-    )
-    .expect("set_password");
+    h.set_password();
     let status = h.ipc("history_status", json!({})).unwrap();
     assert!(
         status["error"].is_string(),
@@ -363,16 +336,7 @@ fn delete_all_data_needs_the_password_and_the_word_then_removes_everything() {
     let h = ready_harness();
     let identity_path = h.bridge_history_path().with_file_name("identity.json");
     // Settings save immediately, so this puts a history file on disk.
-    let settings = json!({ "settings": {
-        "enable_notifications": false,
-        "enable_typing_indicators": false,
-        "auto_host_on_startup": false,
-        "listen_port": 23456,
-        "enable_upnp": false,
-        "auto_accept_files": false,
-        "auto_connect": false,
-        "enable_mdns": false,
-    }});
+    let settings = settings(23456, &[]);
     h.ipc("update_settings", settings.clone()).unwrap();
     std::fs::write(identity_path.with_file_name("parties.json"), b"[]").unwrap();
     assert!(identity_path.exists() && h.bridge_history_path().exists());
@@ -401,13 +365,13 @@ fn delete_all_data_needs_the_password_and_the_word_then_removes_everything() {
     assert!(!identity_path.exists());
     assert!(!h.bridge_history_path().exists());
 
-    // A save attempted afterwards (the close flush does exactly this) must
-    // not put the history back.
+    // A later save (the close flush does this) must not put the history back.
     let _ = h.ipc("update_settings", settings);
     assert!(!h.bridge_history_path().exists());
     assert!(!identity_path.with_file_name("parties.json").exists());
 }
 
+/// The set-password screen reads the floor from `auth_status`.
 #[test]
 fn auth_status_publishes_the_password_floor() {
     let h = harness();
@@ -427,7 +391,7 @@ fn locked_identity_requires_unlock() {
     bridge.needs_password_setup = std::sync::atomic::AtomicBool::new(false);
     let h = harness_with(bridge, dir);
 
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+    assert_eq!(h.auth_state(), "unlock");
     let err = h.ipc("get_settings", json!({})).expect_err("gated");
     assert_eq!(err_text(&err), "Unlock required");
 
@@ -435,19 +399,15 @@ fn locked_identity_requires_unlock() {
         .ipc("unlock", json!({ "password": "wrong" }))
         .expect_err("wrong password accepted");
     assert_eq!(err_text(&err), "Wrong password");
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "unlock");
+    assert_eq!(h.auth_state(), "unlock");
 
     h.ipc("unlock", json!({ "password": "right-password-1234" }))
         .expect("unlock");
-    assert_eq!(h.ipc("auth_status", json!({})).unwrap()["state"], "ready");
+    assert_eq!(h.auth_state(), "ready");
 }
 
-// ── Invoke-key contract with bridge.js ──────────────────────────────────────
-
-/// Every argument-taking command, called with the exact payload keys
-/// `bridge.js` sends. Bogus-but-well-typed values are fine — a semantic error
-/// ("No such conversation") proves the args bound; an "invalid args" error
-/// fails the test.
+/// Every argument-taking command, with the exact payload keys `bridge.js`
+/// sends. A semantic error proves the args bound; "invalid args" fails.
 #[test]
 fn frontend_payload_keys_bind_to_command_args() {
     let h = ready_harness();
@@ -494,19 +454,9 @@ fn frontend_payload_keys_bind_to_command_args() {
         ),
         (
             "update_settings",
-            json!({ "settings": {
-                "enable_notifications": true,
-                "enable_typing_indicators": true,
-                "auto_host_on_startup": false,
-                "listen_port": 12345,
-                "enable_upnp": false,
-                "auto_accept_files": false,
-                "auto_connect": false,
-                "enable_mdns": false,
-            }}),
+            settings(12345, &["enable_notifications", "enable_typing_indicators"]),
         ),
-        // Communities governance. These fail on "unknown server" — after the
-        // args have bound, which is the whole point of this test.
+        // Communities: these fail on "unknown server", after the args bind.
         ("party_leave", json!({ "server": uuid })),
         (
             "party_create_channel_kind",
@@ -581,10 +531,8 @@ fn frontend_payload_keys_bind_to_command_args() {
     }
 }
 
-/// Message text comes from the peer, so `open_url` must launch nothing but
-/// plain web URLs — `file:`, `smb:` and custom app schemes have to be refused
-/// before anything reaches the OS. Only the rejected half is exercised here:
-/// a valid https URL would spawn a real browser under the test runner.
+/// `open_url` refuses everything but plain web URLs (message text comes from
+/// the peer). Only the rejected half runs: https would spawn a real browser.
 #[test]
 fn open_url_rejects_non_web_schemes() {
     let h = ready_harness();
@@ -602,22 +550,17 @@ fn open_url_rejects_non_web_schemes() {
     }
 }
 
-// ── Settings ────────────────────────────────────────────────────────────────
-
 #[test]
 fn settings_roundtrip_and_validation() {
     let h = ready_harness();
-    let update = json!({ "settings": {
-        "enable_notifications": false,
-        "enable_typing_indicators": false,
-        "auto_host_on_startup": true,
-        "listen_port": 23456,
-        "enable_upnp": false,
-        "auto_accept_files": true,
-        "auto_connect": true,
-        "enable_mdns": true,
-    }});
-    h.ipc("update_settings", update).expect("update_settings");
+    let on = [
+        "auto_host_on_startup",
+        "auto_accept_files",
+        "auto_connect",
+        "enable_mdns",
+    ];
+    h.ipc("update_settings", settings(23456, &on))
+        .expect("update_settings");
     let s = h.ipc("get_settings", json!({})).unwrap();
     assert_eq!(s["enable_notifications"], false);
     assert_eq!(s["enable_typing_indicators"], false);
@@ -628,25 +571,15 @@ fn settings_roundtrip_and_validation() {
     assert_eq!(s["enable_mdns"], true);
 
     // Port 0 is rejected and must not clobber the stored settings.
-    let bad = json!({ "settings": {
-        "enable_notifications": false,
-        "enable_typing_indicators": false,
-        "auto_host_on_startup": true,
-        "listen_port": 0,
-        "enable_upnp": false,
-        "auto_accept_files": true,
-        "auto_connect": true,
-        "enable_mdns": true,
-    }});
+    let bad = settings(0, &on);
     let err = h.ipc("update_settings", bad).expect_err("port 0 accepted");
     assert!(err_text(&err).contains("listen port"));
     let s = h.ipc("get_settings", json!({})).unwrap();
     assert_eq!(s["listen_port"], 23456);
 }
 
-/// Changing the password must re-encrypt the identity file and nothing else.
-/// The history key is derived from the private key, which a rotation does not
-/// touch — so if this ever started losing history it would be silent and total.
+/// Changing the password re-wraps the identity file and nothing else: the
+/// history key derives from the unchanged private key.
 #[test]
 fn change_password_rotates_the_file_and_keeps_history_readable() {
     let h = ready_harness();
@@ -686,17 +619,14 @@ fn change_password_rotates_the_file_and_keeps_history_readable() {
     .expect("change_password");
 
     // Still unlocked, same identity, same conversation.
-    let status = h.ipc("auth_status", json!({})).unwrap();
-    assert_eq!(status["state"], "ready");
+    assert_eq!(h.auth_state(), "ready");
     let after = h
         .ipc("get_conversation", json!({ "id": id.to_string() }))
         .expect("conversation after the change");
     assert_eq!(before, after, "a password change must not touch history");
 
-    // The rotation reached the shared identity, not just a temporary copy: the
-    // old password is no longer the current one. (That the *new* one opens the
-    // re-wrapped file is proved in core's `identity` tests, which do not pay for
-    // a Tauri harness — Argon2 at 64 MiB is ~1s per call.)
+    // The rotation reached the shared identity, not a copy: the old password
+    // no longer works. (Core's identity tests prove the new one opens the file.)
     h.ipc(
         "change_password",
         json!({ "current": "bridge-test-passphrase", "new": "bridge-test-passphrase-3" }),
@@ -720,8 +650,6 @@ fn display_name_changes_are_persisted_and_validated() {
     assert!(!err_text(&err).is_empty());
     assert_eq!(h.ipc("my_identity", json!({})).unwrap()["name"], "Alice");
 }
-
-// ── Hosting & conversation lock ─────────────────────────────────────────────
 
 #[test]
 fn lock_stops_hosting_and_unlock_allows_rehost() {
@@ -751,8 +679,6 @@ fn lock_stops_hosting_and_unlock_allows_rehost() {
     assert_eq!(h.ipc("lock_state", json!({})).unwrap(), false);
 }
 
-// ── TOFU surface ────────────────────────────────────────────────────────────
-
 #[test]
 fn no_pending_fingerprint_on_fresh_session() {
     let h = ready_harness();
@@ -760,8 +686,7 @@ fn no_pending_fingerprint_on_fresh_session() {
         h.ipc("pending_fingerprint", json!({})).unwrap(),
         Value::Null
     );
-    // Confirming a session that doesn't exist must fail loudly, not silently
-    // trust anything.
+    // Confirming a nonexistent session must fail, not trust anything.
     let bogus = uuid::Uuid::new_v4().to_string();
     h.ipc(
         "confirm_fingerprint",
@@ -770,7 +695,41 @@ fn no_pending_fingerprint_on_fresh_session() {
     .expect_err("confirmed a fingerprint with no pending session");
 }
 
-// ── Invites & contacts ──────────────────────────────────────────────────────
+/// CRYPTO-04: the prompt the webview polls must say when the key is not the
+/// one in the dialled contact's invite, or `Verify` renders a first contact.
+#[test]
+fn pending_fingerprint_carries_the_invite_mismatch_warning() {
+    use p2pem_classic::app::{FingerprintWarning, PendingFingerprint};
+    use tauri::Manager;
+
+    let h = ready_harness();
+    let session = uuid::Uuid::new_v4();
+    let pending = h._app.state::<Bridge>().pending_fp.clone();
+    *pending.lock().unwrap() = Some(PendingFingerprint {
+        fingerprint: "bb".repeat(32),
+        peer_name: "10.0.0.2:12345".into(),
+        sas: "123456 🎃🎈🎁".into(),
+        session_id: session,
+        warning: Some(FingerprintWarning::InviteMismatch {
+            contact_id: uuid::Uuid::new_v4(),
+            contact_name: "Alice".into(),
+            expected: "aa".repeat(32),
+        }),
+    });
+
+    let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+    assert_eq!(prompt["chat_id"], session.to_string());
+    assert_eq!(
+        prompt["warning"],
+        json!({ "kind": "invite_mismatch", "contact": "Alice", "expected": "aa".repeat(32) })
+    );
+
+    // An ordinary first use carries an explicit null, not a missing key.
+    pending.lock().unwrap().as_mut().unwrap().warning = None;
+    let prompt = h.ipc("pending_fingerprint", json!({})).unwrap();
+    assert_eq!(prompt["warning"], Value::Null);
+    assert!(prompt.as_object().unwrap().contains_key("warning"));
+}
 
 #[test]
 fn invite_link_roundtrip_creates_contact() {
@@ -788,14 +747,12 @@ fn invite_link_roundtrip_creates_contact() {
         .expect("import a peer's invite");
     assert_eq!(imported["contact"]["name"], "Peer");
     assert_eq!(imported["signed"], true);
-    // An invite carries a fingerprint but no verification: the contact is
-    // Unverified until the safety code is compared on first connection.
+    // An invite is not verification.
     assert_eq!(imported["contact"]["trust"], "unverified");
     let contacts = h.ipc("list_contacts", json!({})).unwrap();
     assert_eq!(contacts.as_array().map(Vec::len), Some(1));
 
-    // Importing the same link again refreshes that contact rather than adding
-    // a duplicate card for the same peer.
+    // Re-importing refreshes the contact rather than duplicating it.
     h.ipc("import_invite", json!({ "link": link }))
         .expect("re-import is not an error");
     let contacts = h.ipc("list_contacts", json!({})).unwrap();
@@ -813,8 +770,6 @@ fn invite_link_roundtrip_creates_contact() {
         .expect_err("imported a garbage link");
 }
 
-// ── Conversations ───────────────────────────────────────────────────────────
-
 #[test]
 fn conversation_commands_reject_unknown_ids() {
     let h = ready_harness();
@@ -826,10 +781,8 @@ fn conversation_commands_reject_unknown_ids() {
         .ipc("get_conversation", json!({ "id": bogus }))
         .expect_err("got a nonexistent conversation");
     assert_eq!(err_text(&err), "No such conversation");
-    // send_message with no live session MUST fail. It used to return Ok and
-    // only push a toast, which the frontend reads as "sent": it cleared the
-    // composer and added no message row, so the user's text was destroyed with
-    // a four-second toast as its only trace.
+    // send_message with no live session MUST fail: the frontend reads Ok as
+    // "sent" and clears the composer.
     let err = h
         .ipc("send_message", json!({ "id": bogus, "text": "hi" }))
         .expect_err("a send with no session must not report success");
@@ -848,12 +801,8 @@ fn conversation_commands_reject_unknown_ids() {
         .expect_err("parsed a malformed uuid");
 }
 
-// ── Unread accounting ───────────────────────────────────────────────────────
-
-/// The list must report messages the user has never seen as unread, and only
-/// stop doing so once the conversation is explicitly marked read. The previous
-/// frontend derived this from the message count at first load, which silently
-/// marked everything that arrived while the app was closed as already read.
+/// Unread comes from the persisted read mark, so messages that arrived while
+/// the app was closed still badge until explicitly marked read.
 #[test]
 fn unread_reflects_the_persisted_read_mark() {
     let h = ready_harness();
@@ -865,29 +814,11 @@ fn unread_reflects_the_persisted_read_mark() {
     assert_eq!(h.unread_of(id), 0);
 
     // A later arrival badges again, from the mark — not from zero.
-    let bridge_manager = {
-        use tauri::Manager;
-        h._app.state::<Bridge>().manager.clone()
-    };
-    tauri::async_runtime::block_on(async {
-        let mut mgr = bridge_manager.lock().await;
-        if let Some(chat) = mgr.get_chat_mut(id) {
-            chat.messages.push(messenger_core::types::Message {
-                id: uuid::Uuid::new_v4(),
-                from_me: false,
-                content: messenger_core::types::MessageContent::Text {
-                    text: "later".to_string(),
-                },
-                timestamp: chrono::Utc::now(),
-                delivered: false,
-            });
-        }
-    });
+    h.push_incoming(id, "later");
     assert_eq!(h.unread_of(id), 1);
 }
 
-/// Marking an unknown conversation read is a no-op, not an error: the shell can
-/// race a deletion, and that must not surface as a failure to the user.
+/// Marking an unknown conversation read is a no-op: the shell can race a delete.
 #[test]
 fn mark_read_tolerates_unknown_and_malformed_ids() {
     let h = ready_harness();
@@ -900,8 +831,7 @@ fn mark_read_tolerates_unknown_and_malformed_ids() {
         .expect_err("malformed id should be rejected");
 }
 
-/// Presence is best-effort telemetry from the shell, so a malformed chat id
-/// must degrade to "nothing open" rather than fail the call.
+/// Presence is best-effort: a malformed chat id degrades to "nothing open".
 #[test]
 fn set_presence_accepts_partial_information() {
     let h = ready_harness();

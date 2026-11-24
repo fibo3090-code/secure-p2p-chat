@@ -1,15 +1,8 @@
 //! Party/Community server, as a library.
 //!
-//! The binary in `main.rs` is a thin wrapper: it parses arguments, loads the
-//! durable state and the server identity, binds a listener, and hands all of it
-//! to [`run_accept_loop`].
-//!
-//! It is split this way so the server can be stood up **in process** by a test.
-//! Communities are the most involved subsystem in the workspace — a real join
-//! crosses the v3 handshake, the join gate, the hub, the dispatch layer, SQLite
-//! and the blob store — and none of that was reachable end to end while the only
-//! entry point was `fn main`. `client/tests/party_e2e.rs` drives this against the
-//! real `PartyManager` over a loopback socket.
+//! `main.rs` only parses arguments, loads state and identity, binds, and hands
+//! everything to [`run_accept_loop`] — so a test can stand the real server up
+//! in process (`client/tests/party_e2e.rs`).
 
 pub mod connection;
 pub mod dispatch;
@@ -26,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use messenger_core::network::ratelimit::{limiter_key, RateLimiter};
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 
@@ -34,18 +27,13 @@ pub use connection::ConnectionLimits;
 use hub::Hub;
 use state::PartyState;
 
-/// Default ceiling on connections served at once.
-///
-/// Below the common 1024 soft `RLIMIT_NOFILE`, leaving room for the database,
-/// the blob store and the listener itself. The per-address *rate* limit alone
-/// was not a concurrency cap: ten connections per thirty seconds is 1,200 idle
-/// sockets an hour from one address, so file descriptors ran out within the
-/// hour, after which `accept()` failed for everyone.
+/// Default ceiling on connections served at once: below the common 1024
+/// `RLIMIT_NOFILE`, leaving room for the database, blobs and listener (the
+/// per-address *rate* limit alone does not bound concurrency).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
 
-/// Default ceiling on connections from one address (one IPv4 address, or one
-/// IPv6 /64 — see [`limiter_key`]) at once. Generous enough for a household or
-/// an office behind one NAT; low enough that one address cannot take every slot.
+/// Default ceiling on connections from one address (IPv4 address or IPv6 /64,
+/// see [`limiter_key`]) at once: enough for a household behind one NAT.
 pub const DEFAULT_MAX_CONNECTIONS_PER_ADDRESS: usize = 32;
 
 /// Everything the accept loop bounds.
@@ -103,23 +91,17 @@ impl Drop for AddressSlot {
         if let Some(count) = counts.get_mut(&self.key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                // Keyed by address, so an idle entry must not outlive its
-                // connections or the map grows with every address ever seen.
+                // Drop idle entries, or the map grows with every address seen.
                 counts.remove(&self.key);
             }
         }
     }
 }
 
-/// Turn on TCP keepalive, so a peer that vanished without a FIN — a laptop
-/// that slept, a NAT that forgot the mapping — is eventually noticed.
-///
-/// A joined member may legitimately sit idle for hours, so an application-level
-/// idle timeout would disconnect people mid-conversation. The failure that needs
-/// catching is the half-open connection, which otherwise stays registered (and
-/// "online" in everyone's directory) for the life of the process, holding its
-/// task, its socket and any upload reservations. Failure to set it is logged
-/// and ignored.
+/// Turn on TCP keepalive, so a half-open connection (a laptop that slept, a
+/// NAT that forgot) is eventually noticed rather than staying "online" with its
+/// task and reservations. Joined members may idle for hours, so an
+/// application-level idle timeout is not an option. Failure is logged.
 fn enable_keepalive(stream: &TcpStream) {
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(60))
@@ -140,12 +122,8 @@ pub async fn run_accept_loop(
 }
 
 /// Accept connections forever, serving each one over its own encrypted tunnel.
-///
-/// Never returns in normal operation. A failed `accept` is logged and skipped
-/// rather than propagated: it is almost always transient (the peer vanished
-/// between the SYN and the accept, or the process briefly ran out of file
-/// descriptors), and returning would take the whole community down for the life
-/// of the process over one hiccup.
+/// A failed `accept` (usually transient, e.g. EMFILE) is logged and skipped
+/// rather than taking the community down.
 pub async fn run_accept_loop_with(
     listener: TcpListener,
     state: Arc<Mutex<PartyState>>,
@@ -153,10 +131,8 @@ pub async fn run_accept_loop_with(
     hub: Arc<Hub>,
     limits: ServerLimits,
 ) -> anyhow::Result<()> {
-    // Bounds how fast one address may reconnect. Each accepted socket spawns a
-    // task that immediately runs an RSA handshake, and `dispatch::MAX_JOIN_ATTEMPTS`
-    // makes a password guesser reconnect every few attempts — so without this,
-    // reconnecting IS the guessing loop.
+    // Bounds how fast one address may reconnect — otherwise reconnecting after
+    // `dispatch::MAX_JOIN_ATTEMPTS` would itself be the password-guessing loop.
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
     // Bounds how many connections exist at once, which the rate limit does not.
     let slots = Arc::new(Semaphore::new(limits.max_connections));
