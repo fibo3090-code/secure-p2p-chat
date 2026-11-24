@@ -391,7 +391,7 @@ mod tests {
     use uuid::Uuid;
 
     fn app() -> TuiApp {
-        TuiApp::new(LogBuffer::new()).expect("app")
+        TuiApp::ephemeral(LogBuffer::new()).expect("app")
     }
 
     fn draw(app: &mut TuiApp, width: u16, height: u16) {

@@ -21,7 +21,7 @@ use crate::types::{Config, Theme, ToastLevel};
 use anyhow::Result;
 use ratatui::widgets::ListState;
 use ratatui_crossterm::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -166,18 +166,38 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
+    /// The app over the user's own terminal-client profile.
     pub fn new(logs: LogBuffer) -> Result<Self> {
+        match directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger") {
+            Some(dirs) => Self::with_data_dir(logs, dirs.data_dir()),
+            None => {
+                let identity = Identity::new_with_plaintext("TUI_User".to_string())?;
+                Self::from_parts(logs, identity, PathBuf::from("history.json.enc"))
+            }
+        }
+    }
+
+    /// The app over the profile in `data_dir`, created if it is missing.
+    pub fn with_data_dir(logs: LogBuffer, data_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(data_dir).ok();
+        let (identity, _) = Identity::get_or_create(data_dir, "TUI_User")?;
+        Self::from_parts(logs, identity, data_dir.join("history.json.enc"))
+    }
+
+    /// A throwaway app for tests: a fresh, unencrypted identity, with its paths
+    /// in a temp directory that is never created. It reads nothing from disk,
+    /// and a save it was not pointed elsewhere for fails rather than landing
+    /// anywhere. `new` read the real profile, so on a machine with a
+    /// password-protected terminal identity the tests saw that identity and
+    /// loaded the user's real history.
+    pub fn ephemeral(logs: LogBuffer) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("p2pem-tui-ephemeral-{}", Uuid::new_v4()));
+        let identity = Identity::new_with_plaintext("TUI_User".to_string())?;
+        Self::from_parts(logs, identity, dir.join("history.json.enc"))
+    }
+
+    fn from_parts(logs: LogBuffer, identity: Identity, history_path: PathBuf) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
-        let proj_dirs = directories::ProjectDirs::from("com", "chat-p2p", "EncryptedMessenger");
-        let (history_path, identity) = if let Some(ref dirs) = proj_dirs {
-            let data_dir = dirs.data_dir();
-            std::fs::create_dir_all(data_dir).ok();
-            let (identity, _) = Identity::get_or_create(data_dir, "TUI_User")?;
-            (data_dir.join("history.json.enc"), identity)
-        } else {
-            let identity = Identity::new_with_plaintext("TUI_User".to_string())?;
-            (PathBuf::from("history.json.enc"), identity)
-        };
         let identity_path = history_path.with_file_name("identity.json");
         // Lets the manager refuse the user's own invite link as a contact.
         chat_manager.set_my_fingerprint(identity.fingerprint.clone());
@@ -1496,7 +1516,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn app() -> TuiApp {
-        TuiApp::new(LogBuffer::new()).unwrap()
+        TuiApp::ephemeral(LogBuffer::new()).unwrap()
     }
 
     fn key(c: char) -> KeyEvent {
@@ -1637,6 +1657,26 @@ mod tests {
         assert_eq!(app.command_field.text(), "quit now");
     }
 
+    /// The test app never touches a real profile: a fresh, unencrypted
+    /// identity, and paths in a directory that does not exist. `with_data_dir`
+    /// is what reads a profile, and it reads the one it is given.
+    #[test]
+    fn the_test_app_does_not_read_a_real_profile() {
+        let app = app();
+        assert!(!app.identity.is_encrypted());
+        assert!(app.chat_manager.history_load_error.is_none());
+        assert!(!app.history_path.parent().unwrap().exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = Identity::new_with_plaintext("Saved".into()).unwrap();
+        identity.encrypt(&format!("pw-{}", Uuid::new_v4())).unwrap();
+        identity.save(&dir.path().join("identity.json")).unwrap();
+        let app = TuiApp::with_data_dir(LogBuffer::new(), dir.path()).unwrap();
+        assert!(app.identity.is_encrypted());
+        assert_eq!(app.identity_path, dir.path().join("identity.json"));
+        assert_eq!(app.history_path, dir.path().join("history.json.enc"));
+    }
+
     /// TUI-04 / JOURNEY-02: the first-run password prompt cannot be dismissed.
     #[test]
     fn the_first_run_password_prompt_cannot_be_dismissed() {
@@ -1700,8 +1740,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app();
         app.history_path = dir.path().join("history.json.enc");
-        // `TuiApp::new` read the machine's real data dir; ignore what it found.
-        app.chat_manager.history_load_error = None;
         let key: [u8; 32] = rand::random();
         app.chat_manager.set_history_key(key);
         app.chat_manager
