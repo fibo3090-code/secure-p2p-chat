@@ -1,6 +1,7 @@
 //! Modal overlays drawn over the chat layout. While one is open, keys route to
 //! it first (`TuiApp::handle_key_event`); each has an equivalent `:`-command.
 
+use crate::app::FingerprintWarning;
 use crate::tui::app::TuiApp;
 use crate::tui::command::{command_help, COMMANDS};
 use crate::types::{ToastLevel, TransferStatus};
@@ -25,6 +26,9 @@ pub enum TuiOverlay {
         peer_name: String,
         sas: String,
         chat_id: Uuid,
+        /// Set when this is not an ordinary first use: the key changed, or it
+        /// is not the one in the dialled contact's invite (CRYPTO-04).
+        warning: Option<FingerprintWarning>,
     },
     Contacts,
     Settings,
@@ -162,8 +166,9 @@ pub fn render_overlay(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             fingerprint,
             peer_name,
             sas,
+            warning,
             ..
-        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, area),
+        } => render_fingerprint(f, &fingerprint, &peer_name, &sas, warning.as_ref(), area),
         TuiOverlay::Contacts => render_contacts(f, app, area),
         TuiOverlay::Settings => render_settings(f, app, area),
         TuiOverlay::Invite { link } => render_invite(f, &link, area),
@@ -276,24 +281,71 @@ fn render_help(f: &mut Frame, app: &TuiApp, full: Rect) {
     f.render_widget(para, inner);
 }
 
-fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &str, full: Rect) {
+/// The text the fingerprint prompt leads with when it is not a first use.
+pub(crate) fn fingerprint_warning_text(warning: &FingerprintWarning) -> String {
+    match warning {
+        FingerprintWarning::KeyChanged { previous } => format!(
+            "⚠ WARNING: this conversation's key has CHANGED (was {}…). It may be a new device — or someone intercepting the connection. Reject unless the codes match.",
+            short_fingerprint(previous)
+        ),
+        FingerprintWarning::InviteMismatch {
+            contact_name,
+            expected,
+            ..
+        } => format!(
+            "⚠ WARNING: this is NOT the key in {}'s invite (expected {}…). Someone may be intercepting the connection. Reject unless the codes match.",
+            contact_name,
+            short_fingerprint(expected)
+        ),
+    }
+}
+
+fn short_fingerprint(fp: &str) -> String {
+    fp.chars().take(16).collect()
+}
+
+fn render_fingerprint(
+    f: &mut Frame,
+    fingerprint: &str,
+    peer_name: &str,
+    sas: &str,
+    warning: Option<&FingerprintWarning>,
+    full: Rect,
+) {
     let area = centered_rect(70, 70, full);
     let inner = clear_and_block(f, area, "🛡 Verify peer identity");
 
     let has_sas = !sas.is_empty();
     let rows = Layout::vertical([
-        Constraint::Length(2),                           // heading
-        Constraint::Length(2),                           // instruction
-        Constraint::Length(if has_sas { 3 } else { 0 }), // SAS
-        Constraint::Min(6),                              // color grid
-        Constraint::Length(2),                           // fingerprint hex
-        Constraint::Length(1),                           // actions
+        Constraint::Length(if warning.is_some() { 3 } else { 0 }), // warning
+        Constraint::Length(2),                                     // heading
+        Constraint::Length(2),                                     // instruction
+        Constraint::Length(if has_sas { 3 } else { 0 }),           // SAS
+        Constraint::Min(6),                                        // color grid
+        Constraint::Length(2),                                     // fingerprint hex
+        Constraint::Length(1),                                     // actions
     ])
     .split(inner);
 
+    // A warning leads: the SAS still decides, but the user must know this
+    // is not an ordinary first contact before reading the code.
+    if let Some(warning) = warning {
+        f.render_widget(
+            Paragraph::new(fingerprint_warning_text(warning))
+                .wrap(Wrap { trim: true })
+                .style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            rows[0],
+        );
+    }
+
     f.render_widget(
         Paragraph::new(format!("Connecting to {}", peer_name)).style(Style::default().bold()),
-        rows[0],
+        rows[1],
     );
 
     // The SAS leads: both peers see the same code and a MITM makes them
@@ -302,22 +354,22 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
         note(
             f,
             "Read this code aloud with your peer — it must match on both ends:",
-            rows[1],
+            rows[2],
         );
         f.render_widget(
             Paragraph::new(sas.to_string())
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(Style::default().fg(BRAND_ACCENT).bold()),
-            rows[2],
+            rows[3],
         );
     } else {
         note(
             f,
             "Confirm this safety grid / fingerprint matches your peer's, via a separate channel.",
-            rows[1],
+            rows[2],
         );
     }
-    render_grid_and_hex(f, fingerprint, rows[3], rows[4]);
+    render_grid_and_hex(f, fingerprint, rows[4], rows[5]);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -333,7 +385,7 @@ fn render_fingerprint(f: &mut Frame, fingerprint: &str, peer_name: &str, sas: &s
             ),
             Span::raw(" later (:verify accept|reject)"),
         ])),
-        rows[5],
+        rows[6],
     );
 }
 

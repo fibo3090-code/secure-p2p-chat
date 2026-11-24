@@ -25,13 +25,45 @@ impl ChatManager {
         // Remove *this session's* prompt (rejected ones too: that session dies).
         let pending = self.take_fingerprint_request(chat_id);
 
-        if let Some(fp) = pending.filter(|_| accept).map(|p| p.fingerprint) {
-            // On the host the fingerprint belongs on the incoming chat.
+        // On accept, persist the fingerprint before confirming the session.
+        if let Some(PendingFingerprint {
+            fingerprint: fp,
+            warning,
+            ..
+        }) = pending.filter(|_| accept)
+        {
+            // In host mode the session id is the placeholder's, while the
+            // fingerprint belongs on the incoming chat the peer created.
             let target_chat_id = self.chat_for_session(chat_id);
             if let Some(chat) = self.chats.get_mut(&target_chat_id) {
                 tracing::debug!("Storing verified fingerprint for chat {}", target_chat_id);
                 chat.peer_fingerprint = Some(fp.clone());
             }
+            // The user was told this is not the key in the contact's invite,
+            // compared the safety code, and accepted it anyway. The contact
+            // follows that decision: left on the invite's key, blocking it
+            // later would block a key that never connects, and every
+            // reconnect would warn about the key just accepted. Only ever on
+            // an explicit accept *of a warning* — never silently.
+            //
+            // When the conversation's own key changed too, the prompt led with
+            // `KeyChanged` (the stronger claim) and the invite mismatch was
+            // not named in it — but the accepted key contradicts the invite
+            // all the same, so the session's expected key decides here, not
+            // just the warning that happened to be shown.
+            let rebind = match &warning {
+                Some(FingerprintWarning::InviteMismatch { contact_id, .. }) => Some(*contact_id),
+                Some(FingerprintWarning::KeyChanged { .. }) => self
+                    .expected_fingerprints
+                    .get(&chat_id)
+                    .filter(|e| !e.fingerprint.eq_ignore_ascii_case(&fp))
+                    .map(|e| e.contact_id),
+                None => None,
+            };
+            if let Some(contact_id) = rebind {
+                self.rebind_contact_fingerprint(contact_id, &fp);
+            }
+            // A user-confirmed fingerprint also verifies the matching contact.
             self.promote_contact_verified(target_chat_id, &fp);
         }
 
@@ -437,6 +469,22 @@ impl ChatManager {
                 "This contact has no address or relay token to dial. Ask them for a fresh invite link, or have them connect to you first."
             );
         };
+        // The invite's fingerprint becomes what this session is *expected* to
+        // present (CRYPTO-04). It is never trusted on that basis — an invite is
+        // not verification — but a different key answering takes the warning
+        // path instead of passing for an ordinary first use. Recording it after
+        // the dial is safe: session events are only handled through `&mut
+        // self`, which this call holds until it returns.
+        if let Some(fingerprint) = contact.fingerprint.clone() {
+            self.expected_fingerprints.insert(
+                chat_id,
+                ExpectedPeer {
+                    contact_id,
+                    contact_name: contact.name.clone(),
+                    fingerprint,
+                },
+            );
+        }
         self.associate_contact_with_chat(contact_id, chat_id);
         Ok(chat_id)
     }

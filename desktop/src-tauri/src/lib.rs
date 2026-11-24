@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use p2pem_classic::app::party_manager::{PartyJoinOutcome, PartyManager, PartyStatus};
-use p2pem_classic::app::{ChatManager, PendingFingerprint};
+use p2pem_classic::app::{ChatManager, FingerprintWarning, PendingFingerprint};
 
 /// The TOFU prompt currently published to the frontend, held for it to poll.
 type PendingFp = Arc<StdMutex<Option<PendingFingerprint>>>;
@@ -620,11 +620,34 @@ impl PollContext {
 }
 
 /// The shape the frontend expects for a TOFU prompt (event and poll alike).
+///
+/// `warning` is `null` for an ordinary first use, otherwise
+/// `{ kind: "key_changed", previous }` or
+/// `{ kind: "invite_mismatch", contact, expected }` (CRYPTO-04). `Verify`
+/// leads with it, so a key that is not the invite's never reads as a first
+/// contact.
 fn fingerprint_prompt_json(prompt: &PendingFingerprint) -> serde_json::Value {
+    let warning = match &prompt.warning {
+        None => serde_json::Value::Null,
+        Some(FingerprintWarning::KeyChanged { previous }) => serde_json::json!({
+            "kind": "key_changed",
+            "previous": previous,
+        }),
+        Some(FingerprintWarning::InviteMismatch {
+            contact_name,
+            expected,
+            ..
+        }) => serde_json::json!({
+            "kind": "invite_mismatch",
+            "contact": contact_name,
+            "expected": expected,
+        }),
+    };
     serde_json::json!({
         "fingerprint": prompt.fingerprint,
         "peer_name": prompt.peer_name,
         "sas": prompt.sas,
         "chat_id": prompt.session_id.to_string(),
+        "warning": warning,
     })
 }

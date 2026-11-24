@@ -11,6 +11,17 @@ predate tagged releases.
 
 ## [Unreleased]
 
+### Security
+
+- Dialling a contact imported from an invite now checks the key that answers
+  against the one the invite named (audit CRYPTO-04). A different key gets a
+  warning in the verification prompt itself — "this is not the key in Alice's
+  invite" — in both the desktop app and the terminal client, and the
+  auto-trust setting no longer applies to it. The invite's key answering is
+  still not trusted on its own: it gets the ordinary safety-code prompt. A
+  conversation whose key changed now says so in the prompt too, not only in a
+  toast.
+
 ### Dependencies
 
 - `rsa` 0.9 → 0.10. Its private-key arithmetic is now constant-time

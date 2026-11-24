@@ -414,6 +414,7 @@ impl TuiApp {
                     peer_name: pending.peer_name,
                     sas: pending.sas,
                     chat_id: pending.session_id,
+                    warning: pending.warning,
                 };
             }
         }
@@ -1527,6 +1528,7 @@ mod tests {
                     peer_name: "Peer".into(),
                     sas: String::new(),
                     session_id: chat_id,
+                    warning: None,
                 });
         }
         app.overlay = TuiOverlay::FingerprintVerify {
@@ -1534,8 +1536,44 @@ mod tests {
             peer_name: "Peer".into(),
             sas: String::new(),
             chat_id,
+            warning: None,
         };
         (app, chat_id, rx)
+    }
+
+    /// CRYPTO-04: the overlay must carry the prompt's warning, or a key that
+    /// is not the invite's looks exactly like a first contact.
+    #[test]
+    fn the_fingerprint_overlay_carries_an_invite_mismatch_warning() {
+        let mut app = app();
+        let chat_id = Uuid::new_v4();
+        app.chat_manager
+            .create_local_chat_for_test(chat_id, "Peer".into());
+        let warning = crate::app::FingerprintWarning::InviteMismatch {
+            contact_id: Uuid::new_v4(),
+            contact_name: "Alice".into(),
+            expected: "cd".repeat(32),
+        };
+        app.chat_manager
+            .queue_fingerprint_prompt_for_test(crate::app::PendingFingerprint {
+                fingerprint: "deadbeef".into(),
+                peer_name: "Peer".into(),
+                sas: String::new(),
+                session_id: chat_id,
+                warning: Some(warning.clone()),
+            });
+
+        app.tick();
+
+        match &app.overlay {
+            TuiOverlay::FingerprintVerify { warning: shown, .. } => {
+                assert_eq!(shown.as_ref(), Some(&warning));
+            }
+            other => panic!("expected the fingerprint overlay, got {other:?}"),
+        }
+        let text = crate::tui::overlays::fingerprint_warning_text(&warning);
+        assert!(text.contains("NOT the key in Alice's invite"), "{text}");
+        assert!(text.contains(&"cd".repeat(8)), "{text}");
     }
 
     #[test]

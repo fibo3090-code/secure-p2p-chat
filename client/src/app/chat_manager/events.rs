@@ -77,25 +77,70 @@ impl ChatManager {
             peer_name: peer_name.to_string(),
             sas: sas.to_string(),
             session_id,
+            warning: None,
         };
 
-        match stored.as_deref() {
-            Some(known) if known == fingerprint => {
+        // Dialled as a contact whose invite named a key: that key is what this
+        // session should present. Only a *disagreement* changes anything — a
+        // match falls through to the ordinary branches below, because an
+        // invite is not verification and its key still gets the SAS prompt.
+        let invite_mismatch = self
+            .expected_fingerprints
+            .get(&session_id)
+            .filter(|e| !e.fingerprint.eq_ignore_ascii_case(fingerprint))
+            .map(|e| FingerprintWarning::InviteMismatch {
+                contact_id: e.contact_id,
+                contact_name: e.contact_name.clone(),
+                expected: e.fingerprint.clone(),
+            });
+
+        // A changed key outranks an invite mismatch when both apply: the
+        // conversation's own history is the stronger claim about who this is.
+        let key_changed = stored
+            .as_deref()
+            .filter(|known| *known != fingerprint)
+            .map(|known| FingerprintWarning::KeyChanged {
+                previous: known.to_string(),
+            });
+        // Checked before every accepting branch on purpose: neither the
+        // auto-trust setting nor the key being trusted in some *other*
+        // conversation may wave through a key that contradicts what this
+        // conversation, or the invite the user imported, says it should be.
+        if let Some(warning) = key_changed.or(invite_mismatch) {
+            let toast = match &warning {
+                FingerprintWarning::KeyChanged { previous } => {
+                    tracing::warn!(%chat_id, stored = %previous, new = %fingerprint, "FINGERPRINT MISMATCH");
+                    "SECURITY WARNING: Peer fingerprint has changed!".to_string()
+                }
+                FingerprintWarning::InviteMismatch {
+                    contact_name,
+                    expected,
+                    ..
+                } => {
+                    tracing::warn!(
+                        %chat_id,
+                        expected = %expected,
+                        new = %fingerprint,
+                        "INVITE FINGERPRINT MISMATCH: the dialled contact's invite named another key"
+                    );
+                    format!(
+                        "SECURITY WARNING: {} answered with a key that is not the one in their invite",
+                        contact_name
+                    )
+                }
+            };
+            self.queue_fingerprint_request(PendingFingerprint {
+                warning: Some(warning),
+                ..prompt
+            });
+            self.add_toast(ToastLevel::Warning, toast);
+            return;
+        }
+
+        match stored {
+            Some(_) => {
                 tracing::debug!(%chat_id, "Fingerprint matches stored value; proceeding");
                 self.answer_fingerprint_check(session_id, true);
-            }
-            Some(known) => {
-                tracing::warn!(
-                    %chat_id,
-                    stored = %known,
-                    new = %fingerprint,
-                    "FINGERPRINT MISMATCH"
-                );
-                self.queue_fingerprint_request(prompt);
-                self.add_toast(
-                    ToastLevel::Warning,
-                    "SECURITY WARNING: Peer fingerprint has changed!".to_string(),
-                );
             }
             // Auto-trust opted in, or a peer already verified elsewhere.
             None if self.config.auto_trust_on_first_use
