@@ -973,7 +973,12 @@ mod tests {
     fn test_decryption_with_wrong_password_fails() {
         let mut identity = fresh("Test User");
         identity.encrypt(&test_password()).unwrap();
-        assert!(identity.decrypt(&test_password()).is_err());
+        // `test_password()` is random, so this is a different password. It must
+        // fail as *wrong password* — the UIs ask again for that one and report
+        // anything else as a damaged file (TAURI-20) — and say so if printed.
+        let err = identity.decrypt(&test_password()).unwrap_err();
+        assert!(err.is::<WrongPassword>(), "{err:#}");
+        assert_eq!(err.to_string(), "Decryption failed (likely wrong password)");
     }
 
     /// CRYPTO-08: the nonce and salt come from `identity.json`, which can be
