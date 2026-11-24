@@ -2424,6 +2424,53 @@ mod tests {
         }
     }
 
+    /// CRYPTO-02, the half the UI sees: the weak-code warning is sent before the
+    /// verification prompt for a peer without the commitment, and never for a
+    /// current one (a warning on every connection would teach people to ignore
+    /// it). The user rejects at the prompt, so the message loop never starts.
+    #[tokio::test]
+    async fn only_an_uncommitted_peer_gets_the_weak_code_warning() {
+        for (peer_version, warned) in [(PROTOCOL_VERSION as u32, false), (3, true)] {
+            let (host, _client) = handshake_pair(PROTOCOL_VERSION as u32, peer_version).await;
+            let tunnel = host.unwrap();
+            let (to_app_tx, mut to_app_rx) = mpsc::unbounded_channel();
+            let (_from_app_tx, from_app_rx) = mpsc::unbounded_channel();
+            let (_file_tx, file_rx) = mpsc::channel(1);
+            let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+            confirm_tx.send(false).unwrap();
+            let (mut stream, _other) = tokio::io::duplex(64);
+            let prompt = SessionEvent::Ready; // stands in for the prompt
+            let result = verify_then_run(
+                &mut stream,
+                tunnel,
+                prompt,
+                uuid::Uuid::new_v4(),
+                to_app_tx,
+                from_app_rx,
+                file_rx,
+                confirm_rx,
+            )
+            .await;
+            assert!(result.is_err(), "a rejected peer was let through");
+            let events: Vec<_> = std::iter::from_fn(|| to_app_rx.try_recv().ok()).collect();
+            let warnings: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, SessionEvent::Warning(w) if w == LEGACY_SAS_WARNING))
+                .collect();
+            assert_eq!(
+                warnings.len(),
+                usize::from(warned),
+                "peer v{peer_version}: {events:?}"
+            );
+            if warned {
+                assert!(
+                    matches!(events.first(), Some(SessionEvent::Warning(_))),
+                    "the warning must come before the prompt: {events:?}"
+                );
+            }
+        }
+    }
+
     /// A client revealing a key other than the one it committed to (a MITM shopping
     /// for a matching code) is refused before any key is derived.
     #[tokio::test]
