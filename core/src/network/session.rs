@@ -1861,6 +1861,40 @@ mod tests {
         assert!(transport.rekey_due(), "the held rotation is released");
     }
 
+    /// When a rotation is due, from both directions: a fresh host transport is
+    /// not (rotating every frame would be its own failure), nor one message
+    /// short of `REKEY_MESSAGE_COUNT`; the count or `REKEY_TIME_INTERVAL`
+    /// elapsed makes it due; and the client, which never initiates, never is.
+    #[test]
+    fn a_rekey_is_due_by_count_or_by_time_and_only_on_the_host() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), host, aad.clone(), tx.clone());
+        assert!(!transport.rekey_due(), "a fresh session rotates at once");
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT - 1;
+        assert!(!transport.rekey_due(), "rotated a message early");
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        assert!(transport.rekey_due());
+
+        transport.messages_since_rekey = 0;
+        let Some(long_ago) = std::time::Instant::now().checked_sub(REKEY_TIME_INTERVAL) else {
+            return; // a machine up for less than the interval cannot express it
+        };
+        transport.last_rekey_time = long_ago;
+        assert!(
+            transport.rekey_due(),
+            "the time interval does not trigger a rotation"
+        );
+
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, aad, tx);
+        transport.messages_since_rekey = REKEY_MESSAGE_COUNT;
+        transport.last_rekey_time = long_ago;
+        assert!(!transport.rekey_due(), "the client initiated a rotation");
+    }
+
     /// EXT-01: a client's `Rekey` must not move the host's key.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
