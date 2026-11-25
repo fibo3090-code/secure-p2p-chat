@@ -1,6 +1,7 @@
-//! The terminal client binary's non-interactive modes, on the real binary.
-//! (The TUI itself needs a terminal; its behaviour is covered through
-//! `TuiApp` in the unit tests and `tui.rs` here.)
+//! The terminal client binary, run for real: its non-interactive modes, and
+//! (Linux, `in_a_terminal`) the TUI itself started in a pty. The TUI's
+//! behaviour is otherwise covered through `TuiApp` in the unit tests and
+//! `tui.rs` here.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -123,4 +124,175 @@ async fn relay_server_mode_serves_a_rendezvous() {
         "the relay logged nothing useful: {log:?}"
     );
     assert!(!log.contains(secret), "the relay token was logged: {log}");
+}
+
+/// The TUI started for real, in a real terminal: `script` (util-linux) gives
+/// the binary a pty, so `main` → `tui::run` → raw mode, the alternate screen
+/// and the event loop all run as a user's would, over a throwaway profile
+/// (`HOME`/`XDG_*` point at a temp dir, never the developer's).
+#[cfg(target_os = "linux")]
+mod in_a_terminal {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    struct Tui {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        screen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Tui {
+        fn start(home: &std::path::Path) -> Tui {
+            let bin = env!("CARGO_BIN_EXE_p2pem-classic");
+            let mut child = Command::new("script")
+                .args([
+                    "-qfec",
+                    &format!("stty cols 160 rows 40; exec '{bin}'"),
+                    "/dev/null",
+                ])
+                .env("HOME", home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("TERM", "xterm-256color")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("util-linux `script` is needed to give the TUI a terminal");
+            let stdin = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let screen = Arc::new(Mutex::new(Vec::new()));
+            let sink = screen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            Tui {
+                child,
+                stdin,
+                screen,
+            }
+        }
+
+        /// The terminal output so far, escape sequences and box drawing
+        /// removed and whitespace collapsed: what a person would read.
+        fn text(&self) -> String {
+            let raw = String::from_utf8_lossy(&self.screen.lock().unwrap()).into_owned();
+            let mut out = String::new();
+            let mut chars = raw.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    if chars.peek() == Some(&'[') {
+                        chars.next();
+                        for c in chars.by_ref() {
+                            if c.is_ascii_alphabetic() || c == '~' {
+                                break;
+                            }
+                        }
+                    }
+                    out.push(' ');
+                } else if ('\u{2500}'..='\u{257f}').contains(&c) || c.is_whitespace() {
+                    out.push(' ');
+                } else {
+                    out.push(c);
+                }
+            }
+            out.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        fn raw_contains(&self, needle: &[u8]) -> bool {
+            self.screen
+                .lock()
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle)
+        }
+
+        fn wait_for(&self, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !self.text().contains(what) {
+                assert!(
+                    Instant::now() < deadline,
+                    "never showed {what:?}; the screen read: {}",
+                    self.text()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn send(&mut self, bytes: &[u8]) {
+            self.stdin.write_all(bytes).unwrap();
+            self.stdin.flush().unwrap();
+        }
+
+        /// Ctrl+C asks, a second Ctrl+C confirms; then the process must end
+        /// on its own, successfully.
+        fn quit(mut self) -> Self {
+            self.send(b"\x03");
+            self.wait_for("Quit?");
+            self.send(b"\x03");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success(), "the TUI exited with {status}");
+                    return self;
+                }
+                assert!(Instant::now() < deadline, "Ctrl+C twice did not quit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// First launch: the set-password prompt, in a terminal put back the way
+    /// it was found. Quitting there — before any identity exists on disk —
+    /// must leave nothing behind that the next launch cannot read. It used to
+    /// write `history.json.enc` under the never-saved identity's key, so the
+    /// second launch (a new identity) opened a fresh install on "History
+    /// unreadable — nothing is being saved".
+    #[test]
+    fn quitting_at_the_first_run_prompt_leaves_a_clean_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join("data").join("encryptedmessenger");
+
+        let first = Tui::start(home.path()).quit_after("Set a password");
+        // Raw mode's screen and paste mode on, and both off again on exit.
+        for seq in [
+            &b"\x1b[?1049h"[..],
+            b"\x1b[?1049l",
+            b"\x1b[?2004h",
+            b"\x1b[?2004l",
+        ] {
+            assert!(
+                first.raw_contains(seq),
+                "terminal sequence {:?} missing",
+                String::from_utf8_lossy(seq)
+            );
+        }
+        assert!(
+            !profile.join("history.json.enc").exists(),
+            "a history was written under a key no file keeps"
+        );
+        assert!(!profile.join("identity.json").exists());
+
+        let second = Tui::start(home.path()).quit_after("Set a password");
+        assert!(
+            !second.text().contains("History unreadable"),
+            "the second launch: {}",
+            second.text()
+        );
+    }
+
+    impl Tui {
+        fn quit_after(self, what: &str) -> Self {
+            self.wait_for(what);
+            self.quit()
+        }
+    }
 }

@@ -531,6 +531,27 @@ Left as design decisions: whether accepting an `InviteMismatch` should rebind
 the contact (question 1 of the review), and a fuller listener-side identity
 model (question 2) beyond the address hint added here.
 
+### Third pass: the remaining untested entry points (2026-11-25)
+
+- **TUI-25 (new, fixed):** quitting at the terminal client's first-run
+  password prompt wrote `history.json.enc` under the key of an identity that
+  exists only in memory until that password is set. The next launch created
+  a new identity, could not decrypt the file, and opened a fresh install on
+  "History unreadable — nothing is being saved" until `:history-reset`.
+  `TuiApp::new_in` no longer installs a history key for a new identity; the
+  first-run setup installs it once the identity is on disk. Found by the first
+  test to start the TUI in a real terminal: `client it::cli::in_a_terminal`
+  (Linux, `script` for the pty) launches the binary twice over a throwaway
+  profile, checks that the alternate screen and paste mode are restored on
+  exit, and fails without the fix. Cross-platform: `tui::app::tests::
+  a_first_run_app_writes_no_history_until_the_identity_is_saved`. The desktop
+  app was checked and is not affected (its key is set only by `set_password`
+  and `unlock`).
+- **The dev mock** (`bridge.js`, what `npm run dev` runs in a plain browser)
+  is held to the real bridge's command surface in both directions, answers
+  every command with a promise, and boots into each `?mock=` state
+  (`bridge.mock.test.js`; each assertion fails under a matching mutation).
+
 ## Method and limits
 
 - Static reading of every file in each area, by thirteen auditors in parallel

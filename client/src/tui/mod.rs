@@ -350,8 +350,17 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     }
 
+    /// An app past first-run setup. A brand-new identity has no history key
+    /// until its password is set and it is on disk (see `TuiApp::new_in`);
+    /// these tests are about the loop, not setup, so they install the key the
+    /// setup would have.
     fn app_in(dir: &tempfile::TempDir) -> TuiApp {
-        TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app")
+        let mut app =
+            TuiApp::new_in(Some(dir.path().to_path_buf()), LogBuffer::new()).expect("app");
+        if !dir.path().join("identity.json").exists() {
+            app.install_history_key_for_test();
+        }
+        app
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

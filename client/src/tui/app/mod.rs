@@ -200,7 +200,7 @@ impl TuiApp {
     pub fn new_in(data_dir: Option<PathBuf>, logs: LogBuffer) -> Result<Self> {
         let mut chat_manager = ChatManager::new(Config::default());
 
-        let (history_path, identity, _is_new_identity) = if let Some(ref data_dir) = data_dir {
+        let (history_path, identity, is_new_identity) = if let Some(ref data_dir) = data_dir {
             std::fs::create_dir_all(data_dir).ok();
 
             let (identity, is_new) = Identity::get_or_create(data_dir, "TUI_User")?;
@@ -214,7 +214,14 @@ impl TuiApp {
         // to add the user to their own contacts.
         chat_manager.set_my_fingerprint(identity.fingerprint.clone());
 
-        if !identity.is_locked() {
+        // A new identity exists only in memory until the first-run password
+        // is set and `finish_password_update` writes it, which is also where
+        // the history key is installed. Installing it here meant quitting at
+        // that prompt wrote `history.json.enc` under a key nothing kept: the
+        // next launch generated another identity, found a history it could
+        // not decrypt, and opened a fresh install on "History unreadable —
+        // nothing is being saved".
+        if !identity.is_locked() && !is_new_identity {
             if let Ok(key) = identity.history_key() {
                 chat_manager.set_history_key(key);
                 if let Err(e) = chat_manager.load_history_auto(&history_path, &key) {
@@ -1843,6 +1850,18 @@ impl TuiApp {
     pub fn shutdown_save(&mut self) {
         self.save_history_now();
     }
+
+    /// What first-run setup does once the identity is on disk, for tests
+    /// about something other than setup.
+    #[cfg(test)]
+    pub(crate) fn install_history_key_for_test(&mut self) {
+        assert!(
+            self.chat_manager.history_key.is_none(),
+            "a first-run app must not have a history key yet"
+        );
+        let key = self.identity.history_key().expect("an unlocked identity");
+        self.chat_manager.set_history_key(key);
+    }
 }
 
 #[cfg(test)]
@@ -2568,6 +2587,30 @@ mod tests {
         assert!(!app.should_quit);
         app.handle_key_event(ctrl('q'));
         assert!(app.should_quit);
+    }
+
+    /// Leaving at that prompt saves nothing: the identity exists only in
+    /// memory, so a history written now would be under a key no file keeps,
+    /// and the next launch (a new identity) would find it unreadable. The
+    /// history key arrives with the password. (`cli::in_a_terminal` drives
+    /// the same thing through the real binary on Linux.)
+    #[test]
+    fn a_first_run_app_writes_no_history_until_the_identity_is_saved() {
+        let data = tempfile::tempdir().unwrap();
+        let mut app = TuiApp::new_in(Some(data.path().to_path_buf()), LogBuffer::new()).unwrap();
+        assert!(app.chat_manager.history_key.is_none());
+        app.chat_manager
+            .create_local_chat_for_test(Uuid::new_v4(), "Typed before setup".into());
+        app.autosave();
+        app.shutdown_save();
+        assert!(!app.history_path.exists());
+
+        let password = format!("pw-{}", Uuid::new_v4());
+        app.try_set_password(&password);
+        assert!(app.identity_path.exists());
+        assert!(app.chat_manager.history_key.is_some());
+        app.shutdown_save();
+        assert!(app.history_path.exists());
     }
 
     /// JOURNEY-03: `:wipe` checks the password, asks once more (Ctrl+Y only),

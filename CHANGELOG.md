@@ -51,6 +51,12 @@ predate tagged releases.
 
 ### Fixed
 
+- The terminal client no longer greets a fresh install with "History
+  unreadable — nothing is being saved". Quitting at the first-run password
+  prompt used to save an (empty) history under a key that was never written
+  down, so the next launch, with a new identity, could not read it. Nothing is
+  saved now until the identity itself is.
+
 - Relay with hole punching on Windows: a failed punch attempt ran about
   1.5 s past its time limit before falling back to the relay, because a
   connection attempt still in flight at the deadline was waited out. It now
