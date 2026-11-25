@@ -48,6 +48,61 @@ const MAX_DISCOVERED_PEERS: usize = 256;
 /// Most addresses recorded for one service; a real dual-homed peer has two or three.
 const MAX_ADDRESSES_PER_PEER: usize = 8;
 
+/// Apply one mDNS browse event to the peer list: a resolved service becomes
+/// one entry per advertised address (at most `MAX_ADDRESSES_PER_PEER`),
+/// carrying the `fingerprint` it advertises and its host name without the
+/// trailing dot; a removed one goes, matched by its exact full name.
+fn apply_event(event: ServiceEvent, peers: &mut Vec<DiscoveredPeer>) {
+    match event {
+        ServiceEvent::ServiceResolved(info) => {
+            let fullname = info.get_fullname().to_string();
+            let fingerprint = info
+                .get_properties()
+                .get("fingerprint")
+                .map(|p| p.val_str().to_string());
+            let name = info.get_hostname().trim_end_matches('.').to_string();
+            let port = info.get_port();
+            let mut addresses: Vec<_> = info
+                .get_addresses()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            // A set underneath: order it, so which addresses survive the cap
+            // does not depend on hashing.
+            addresses.sort();
+            let resolved: Vec<DiscoveredPeer> = addresses
+                .into_iter()
+                .take(MAX_ADDRESSES_PER_PEER)
+                .map(|address| DiscoveredPeer {
+                    name: name.clone(),
+                    address,
+                    port,
+                    fingerprint: fingerprint.clone(),
+                    fullname: fullname.clone(),
+                })
+                .collect();
+            if resolved.is_empty() {
+                return;
+            }
+            for peer in &resolved {
+                tracing::info!(
+                    name = %peer.name,
+                    address = %peer.address,
+                    port = %peer.port,
+                    "Discovered peer via mDNS"
+                );
+            }
+            merge_resolved(peers, &fullname, resolved);
+        }
+        ServiceEvent::ServiceRemoved(_, fullname) => {
+            tracing::info!(fullname = %fullname, "Peer removed from mDNS");
+            // Exact match, so "laptop-alice" leaving keeps "laptop".
+            peers.retain(|p| p.fullname != fullname);
+        }
+        _ => {}
+    }
+}
+
 /// Fold a freshly resolved service into the peer list. A re-resolve *replaces*
 /// the service's previous entries (a peer that moved, or is dual-homed, must be
 /// listed where it is reachable). The retain runs *before* the cap check, so the
@@ -131,54 +186,8 @@ impl Discovery {
     /// `discovered_peers`. Non-blocking.
     pub fn poll(&self, discovered_peers: &Arc<Mutex<Vec<DiscoveredPeer>>>) {
         while let Ok(event) = self.receiver.try_recv() {
-            match event {
-                ServiceEvent::ServiceResolved(info) => {
-                    let fullname = info.get_fullname().to_string();
-                    let addresses = info.get_addresses();
-                    let port = info.get_port();
-                    let fingerprint = info
-                        .get_properties()
-                        .get("fingerprint")
-                        .map(|p| p.val_str().to_string());
-
-                    let name = info.get_hostname().trim_end_matches('.').to_string();
-                    let resolved: Vec<DiscoveredPeer> = addresses
-                        .iter()
-                        .take(MAX_ADDRESSES_PER_PEER)
-                        .map(|addr| DiscoveredPeer {
-                            name: name.clone(),
-                            address: addr.to_string(),
-                            port,
-                            fingerprint: fingerprint.clone(),
-                            fullname: fullname.clone(),
-                        })
-                        .collect();
-
-                    if resolved.is_empty() {
-                        continue;
-                    }
-
-                    for peer in &resolved {
-                        tracing::info!(
-                            name = %peer.name,
-                            address = %peer.address,
-                            port = %peer.port,
-                            "Discovered peer via mDNS"
-                        );
-                    }
-
-                    if let Ok(mut peers) = discovered_peers.lock() {
-                        merge_resolved(&mut peers, &fullname, resolved);
-                    }
-                }
-                ServiceEvent::ServiceRemoved(_, fullname) => {
-                    tracing::info!(fullname = %fullname, "Peer removed from mDNS");
-                    if let Ok(mut peers) = discovered_peers.lock() {
-                        // Exact match, so "laptop-alice" leaving keeps "laptop".
-                        peers.retain(|p| p.fullname != fullname);
-                    }
-                }
-                _ => {}
+            if let Ok(mut peers) = discovered_peers.lock() {
+                apply_event(event, &mut peers);
             }
         }
     }
@@ -194,25 +203,78 @@ impl Drop for Discovery {
 mod tests {
     use super::*;
 
+    /// A resolved service event, as the daemon would deliver one.
+    fn resolved(instance: &str, host: &str, addrs: &str, fp: Option<&str>) -> ServiceEvent {
+        let props: Vec<(&str, &str)> = fp.map(|f| vec![("fingerprint", f)]).unwrap_or_default();
+        let info =
+            ServiceInfo::new(SERVICE_TYPE, instance, host, addrs, 12345, &props[..]).unwrap();
+        ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service()))
+    }
+
+    /// The daemon's events, applied the way `poll` applies them: one entry per
+    /// advertised address with the advertised fingerprint and the host name
+    /// without its trailing dot, a cap on addresses per peer, nothing for a
+    /// service with no address, and removal by the exact full name only.
     #[test]
-    fn discovered_peer_construction_and_clone() {
-        let peer = DiscoveredPeer {
-            name: "Laptop".to_string(),
-            address: "192.168.1.20".to_string(),
-            port: 12345,
-            fingerprint: Some("AB".repeat(32)),
-            fullname: "Laptop._p2p-messenger._tcp.local.".to_string(),
-        };
-        let cloned = peer.clone();
-        assert_eq!(cloned.name, "Laptop");
-        assert_eq!(cloned.address, "192.168.1.20");
-        assert_eq!(cloned.port, 12345);
-        assert_eq!(
-            cloned.fingerprint.as_deref(),
-            Some("AB".repeat(32).as_str())
+    fn browse_events_become_peers_and_leave_by_exact_name() {
+        let mut peers = Vec::new();
+        let fp = "ab".repeat(32);
+        apply_event(
+            resolved(
+                "laptop",
+                "laptop.local.",
+                "192.168.1.5,192.168.1.6",
+                Some(&fp),
+            ),
+            &mut peers,
         );
-        // Debug must render without panicking.
-        assert!(format!("{:?}", peer).contains("Laptop"));
+        apply_event(
+            resolved("laptop-alice", "alice.local.", "192.168.1.9", None),
+            &mut peers,
+        );
+        assert_eq!(peers.len(), 3);
+        let laptop: Vec<_> = peers.iter().filter(|p| p.name == "laptop.local").collect();
+        assert_eq!(
+            laptop
+                .iter()
+                .map(|p| p.address.as_str())
+                .collect::<Vec<_>>(),
+            ["192.168.1.5", "192.168.1.6"]
+        );
+        assert!(laptop
+            .iter()
+            .all(|p| p.fingerprint.as_deref() == Some(fp.as_str()) && p.port == 12345));
+        assert!(peers
+            .iter()
+            .any(|p| p.name == "alice.local" && p.fingerprint.is_none()));
+
+        // A dual-homed host advertising more than the cap keeps only the cap.
+        let many: Vec<String> = (1..=MAX_ADDRESSES_PER_PEER + 3)
+            .map(|i| format!("10.0.0.{i}"))
+            .collect();
+        apply_event(
+            resolved("busy", "busy.local.", &many.join(","), None),
+            &mut peers,
+        );
+        assert_eq!(
+            peers.iter().filter(|p| p.name == "busy.local").count(),
+            MAX_ADDRESSES_PER_PEER
+        );
+        // No address, nothing to dial: not listed.
+        apply_event(resolved("ghost", "ghost.local.", "", None), &mut peers);
+        assert!(!peers.iter().any(|p| p.name == "ghost.local"));
+
+        // "laptop" leaving must not take "laptop-alice" with it.
+        let laptop_fullname = format!("laptop.{SERVICE_TYPE}");
+        apply_event(
+            ServiceEvent::ServiceRemoved(SERVICE_TYPE.into(), laptop_fullname),
+            &mut peers,
+        );
+        assert!(!peers.iter().any(|p| p.name == "laptop.local"));
+        assert!(
+            peers.iter().any(|p| p.name == "alice.local"),
+            "a prefix match removed another peer"
+        );
     }
 
     /// The removal rule, isolated from the daemon: a departing peer takes itself
