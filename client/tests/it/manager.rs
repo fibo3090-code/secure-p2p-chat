@@ -281,3 +281,29 @@ fn malformed_invite_links_are_refused() {
         assert!(parsed.is_err(), "{:.40}… was accepted", link);
     }
 }
+
+/// Starting to host says so once. `start_host` used to toast "Listening on
+/// port N" itself and the session's `Listening` event toasted it again, so
+/// every host start stacked two identical notices (seen running two real
+/// desktop apps). The event is the one kept: it is the listener reporting in.
+#[tokio::test]
+async fn hosting_announces_the_listener_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = crate::common::manager_in(dir.path());
+    let port = crate::common::host_on_any_port(&mut host, crate::common::rsa_key()).await;
+    let notice = format!("Listening on port {port}");
+    let count = |m: &ChatManager| m.toasts.iter().filter(|t| t.message == notice).count();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while count(&host) == 0 {
+        assert!(Instant::now() < deadline, "the listener never reported in");
+        host.poll_session_events();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Let anything else that was going to say it arrive too.
+    for _ in 0..10 {
+        host.poll_session_events();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(count(&host), 1);
+}

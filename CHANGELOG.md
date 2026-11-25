@@ -51,6 +51,10 @@ predate tagged releases.
 
 ### Fixed
 
+- A desktop host with one peer connected said "2 connected": the listener
+  waiting for the next peer was counted as a person. Starting to host also
+  showed the same "Listening on port …" notice twice.
+
 - The terminal client no longer greets a fresh install with "History
   unreadable — nothing is being saved". Quitting at the first-run password
   prompt used to save an (empty) history under a key that was never written

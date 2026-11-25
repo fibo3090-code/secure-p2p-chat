@@ -550,3 +550,21 @@ describe("App — reconnecting an offline conversation", () => {
     expect(api.connectContact).not.toHaveBeenCalled();
   });
 });
+
+describe("App — the connected count", () => {
+  it("counts the people connected, not the listener waiting for the next one", async () => {
+    // A host's listener is a conversation row with a live session, so it read
+    // as connected: a host with one peer said "2 connected" (seen running two
+    // real apps side by side).
+    readyApi({
+      listConversations: [
+        conv,
+        { ...conv, id: "listener", title: "Host on :23461", connected: true, placeholder: true, last: "" },
+      ],
+    });
+    render(<App />);
+    await screen.findByLabelText(/^1 connected\./);
+    expect(screen.queryByLabelText(/^2 connected/)).toBeNull();
+    expect(screen.queryByText(/2 connected/)).toBeNull();
+  });
+});

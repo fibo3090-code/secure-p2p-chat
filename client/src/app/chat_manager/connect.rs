@@ -195,7 +195,9 @@ impl ChatManager {
 
         self.is_hosting = true;
         self.hosting_port = Some(port);
-        self.add_toast(ToastLevel::Info, format!("Listening on port {}", port));
+        // No toast here: the session's `SessionEvent::Listening` announces the
+        // listener once it is running, and saying it here as well stacked two
+        // identical notices on every host start.
         tracing::debug!(chat_count = %self.chats.len(), session_count = %self.sessions.len(), "Host session initialized");
 
         if self.config.enable_upnp && self.upnp_cancel.is_none() {

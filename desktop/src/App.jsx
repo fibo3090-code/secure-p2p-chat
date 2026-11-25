@@ -284,7 +284,9 @@ export default function App() {
   // reachability status, not among the conversations.
   const listRows = contacts.filter((c) => !c.placeholder);
   const listeners = contacts.filter((c) => c.placeholder);
-  const connCount = convs.filter((c) => c.connected).length;
+  // People, not listeners: a host's listener holds a live session too, and
+  // counting it made a host with one peer read "2 connected".
+  const connCount = listRows.filter((c) => c.state === "connected").length;
 
   async function openConv(id) {
     setActiveId(id);
