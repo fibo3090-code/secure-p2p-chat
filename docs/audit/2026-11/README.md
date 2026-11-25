@@ -484,6 +484,16 @@ of three ways:
   Also untested: `migrate_legacy_plaintext` and the Ed25519 hex helpers, which
   have no caller (see below).
 
+  **Re-run after the review fixes**, on the same five files: 477 mutants;
+  392 caught, 68 that do not compile, 6 that hang a test (caught), **11
+  missed**. All 11 are the ones classified above, and nothing else:
+  - equivalent: `rsa_rng` → `Default`, `|` → `^` in `derive_sas` and
+    `new_with_role`, and the read chunk size `*` → `+`;
+  - not worth a test: the verification window constant, the first
+    keep-alive tick, the initial idle deadline, the invite version field,
+    and the memory and time Argon2 caps at exactly their limit;
+  - no caller: `migrate_legacy_plaintext`.
+
 **Left open on purpose.** QUAL-10 (the async `IncomingFile` receiver has no
 caller in this workspace), `Identity::migrate_legacy_plaintext` and the
 Ed25519 hex helpers are public API of `messenger-core`, and the agent CLI
