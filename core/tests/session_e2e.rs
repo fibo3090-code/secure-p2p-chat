@@ -373,12 +373,20 @@ async fn idle_session_survives_past_the_idle_timeout() {
 
     let (mut host, mut client) = connect_pair().await;
     reach_ready(&mut host, &mut client).await;
+    // One frame each way first. Until a side has received a frame its idle
+    // deadline is the 30-minute verification window plus the idle timeout
+    // (NET-10), so sleeping straight after `Ready` passed with keep-alive
+    // switched off entirely; it is the short timer this has to outlive.
+    host.send(text("hello", 1, 1));
+    assert_eq!(next_text(&mut client.events, "client").await, "hello");
+    client.send(text("hi", 1, 1));
+    assert_eq!(next_text(&mut host.events, "host").await, "hi");
 
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     // Still alive in both directions (a fired idle timer would surface as
     // Error/Disconnected and fail next_text).
-    host.send(text("still here", 1, 1));
+    host.send(text("still here", 2, 1));
     assert_eq!(next_text(&mut client.events, "client").await, "still here");
     client.send(text("me too", 2, 1));
     assert_eq!(next_text(&mut host.events, "host").await, "me too");

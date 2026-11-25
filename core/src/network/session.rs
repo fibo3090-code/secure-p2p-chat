@@ -1958,6 +1958,107 @@ mod tests {
         );
     }
 
+    /// One read of the model "socket": the next queued frame.
+    async fn next_frame(
+        mut rx: mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+    ) -> (
+        mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+        std::io::Result<Vec<u8>>,
+    ) {
+        let frame = rx.recv().await.expect("the test queued enough frames");
+        (rx, frame)
+    }
+
+    /// While a write is blocked (the peer's buffer full), reading continues
+    /// — or crossing transfers deadlock — but only up to
+    /// `MAX_FRAMES_HELD_DURING_WRITE` frames, and not past a read error: a
+    /// peer that never reads must not make us buffer without bound, and
+    /// nothing after a broken frame is trustworthy. The write's own output
+    /// is returned once it completes.
+    #[tokio::test]
+    async fn reading_while_writing_is_bounded_and_stops_at_an_error() {
+        use std::collections::VecDeque;
+        let run = |frames: Vec<std::io::Result<Vec<u8>>>| async move {
+            let (tx, rx) = mpsc::unbounded_channel();
+            for f in frames {
+                tx.send(f).unwrap();
+            }
+            let mut read = Box::pin(next_frame(rx));
+            let mut inbox = VecDeque::new();
+            let blocked = std::future::pending::<()>();
+            let held = tokio::time::timeout(
+                Duration::from_millis(200),
+                write_while_reading(blocked, &mut read, next_frame, &mut inbox),
+            )
+            .await;
+            assert!(held.is_err(), "a blocked write returned");
+            inbox
+        };
+        let ok = |i: u8| Ok(vec![i]);
+
+        let inbox = run((0..MAX_FRAMES_HELD_DURING_WRITE as u8 + 4)
+            .map(ok)
+            .collect())
+        .await;
+        assert_eq!(
+            inbox.len(),
+            MAX_FRAMES_HELD_DURING_WRITE,
+            "held past the cap, or never read"
+        );
+
+        let broken = std::io::Error::other("bad frame");
+        let inbox = run(vec![ok(1), Err(broken), ok(2), ok(3)]).await;
+        assert_eq!(inbox.len(), 2, "kept reading after a read error");
+        assert!(inbox[1].is_err());
+
+        // A write that completes is returned, frames read meanwhile kept.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ok(9)).unwrap();
+        let mut read = Box::pin(next_frame(rx));
+        let mut inbox = VecDeque::new();
+        let write = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "written"
+        };
+        let out = write_while_reading(write, &mut read, next_frame, &mut inbox).await;
+        assert_eq!(out, "written");
+        assert_eq!(inbox.len(), 1);
+    }
+
+    /// A keep-alive is a frame like any other: it takes the next wire seq, or
+    /// the peer's replay check would drop a second ping as a repeat. And on
+    /// the receiving side, a message counts toward the next rekey while a
+    /// keep-alive ping does not (an idle session must not rotate on pings).
+    #[tokio::test]
+    async fn keep_alives_take_a_seq_and_only_real_frames_count_toward_a_rekey() {
+        let key: [u8; 32] = rand::random();
+        let aad = b"transport-aad".to_vec();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = AesCipher::new_with_role(&key, NonceRole::Client).unwrap();
+        let mut transport = Transport::new(tokio::io::sink(), client, aad.clone(), tx);
+        transport.keep_alive().await.unwrap();
+        transport.keep_alive().await.unwrap();
+        assert_eq!(transport.sent_seq, 2);
+        let counted = transport.messages_since_rekey;
+
+        let host = AesCipher::new_with_role(&key, NonceRole::Host).unwrap();
+        let frame = |msg: ProtocolMessage| host.encrypt(&msg.to_plain_bytes(), Some(&aad));
+        transport
+            .receive(&frame(ProtocolMessage::Ping { seq: 1 }))
+            .unwrap();
+        assert_eq!(
+            transport.messages_since_rekey, counted,
+            "a ping counted toward a rekey"
+        );
+        let text = ProtocolMessage::Text {
+            text: "hi".into(),
+            timestamp: 0,
+            seq: 2,
+        };
+        transport.receive(&frame(text)).unwrap();
+        assert_eq!(transport.messages_since_rekey, counted + 1);
+    }
+
     /// EXT-01: a client's `Rekey` must not move the host's key.
     #[test]
     fn the_host_ignores_a_rekey_from_the_client() {
