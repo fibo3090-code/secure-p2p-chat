@@ -552,6 +552,30 @@ model (question 2) beyond the address hint added here.
   every command with a promise, and boots into each `?mock=` state
   (`bridge.mock.test.js`; each assertion fails under a matching mutation).
 
+- **The shipped desktop app, run against itself** (the `two-peers.ps1`
+  checklist, on Linux): two real `p2pem-desktop` builds (`tauri/custom-protocol`,
+  so the bundled `dist/` is served) with separate `P2PEM_DATA_DIR`s under Xvfb,
+  driven with xdotool. Passed: first-run password and backup screens; host →
+  dial → the same safety code on both screens (`98 67 55 🐢🐝🍕`) → accept;
+  messages both ways with delivery ticks; a 300 KB file held for acceptance,
+  accepted, and byte-identical on arrival (SHA-256) with no spool left; restart
+  → unlock → history, file row and "Verified" intact; re-dial lands in the same
+  conversation on both sides, auto-accepted as a returning peer. Found:
+  - **Fixed:** a host with one peer read "2 connected" (the listener was
+    counted as a person) — `App.test.jsx` "the connected count".
+  - **Fixed:** every host start showed "Listening on port N" twice —
+    `it::manager::hosting_announces_the_listener_once`.
+  - **Open (packaging):** on Linux, "Send file" does nothing at all when the
+    desktop has neither xdg-desktop-portal (over D-Bus) nor zenity: `rfd`
+    reports the failure as a cancel, so there is no message either. The
+    `.deb`/`.rpm` declare no dependency on either; a `Recommends` on
+    `xdg-desktop-portal-gtk | zenity` would cover it.
+  - **Open (design):** a conversation you started by dialling an address has
+    no saved contact, so once offline its strip offers only "Copy invite link",
+    not a redial of the address you used.
+  - **Noted:** the desktop app does not handle SIGTERM (no close-time flush);
+    history survived because the poll loop had already saved it.
+
 ## Method and limits
 
 - Static reading of every file in each area, by thirteen auditors in parallel
