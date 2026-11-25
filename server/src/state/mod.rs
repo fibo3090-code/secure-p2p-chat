@@ -306,11 +306,21 @@ struct PendingUpload {
     /// knows under the lock whether the content is already held (and needs no
     /// reservation) without a 100 MiB pass.
     hasher: BlobHasher,
+    /// When the upload was offered or last received a chunk: one that goes
+    /// quiet past `upload_idle_timeout` is dropped (see `expire_idle_uploads`).
+    last_active: std::time::Instant,
 }
 
 /// Uploads one member may have in flight at once (each up to
 /// [`MAX_PARTY_FILE_BYTES`]).
 pub const MAX_CONCURRENT_UPLOADS: usize = 4;
+
+/// How long a chunked upload may go without a chunk before it stops holding
+/// spool budget. The budget counts *declared* sizes, so without this four
+/// members who each offered a 128 MiB upload and then sent nothing blocked
+/// chunked uploads for everyone, indefinitely. A live upload sends a chunk
+/// every few milliseconds; two minutes covers a stalled network.
+pub const UPLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One recorded governance action.
 #[derive(Clone)]
@@ -363,6 +373,8 @@ pub struct PartyState {
     max_member_blob_bytes: u64,
     /// See `MAX_UPLOAD_SPOOL_BYTES`.
     max_upload_spool_bytes: u64,
+    /// See [`UPLOAD_IDLE_TIMEOUT`].
+    upload_idle_timeout: std::time::Duration,
     /// Ceiling on the total bytes of distinct blobs the store will hold.
     max_blob_bytes: u64,
     /// Most members this server registers (see [`MAX_MEMBERS`]).
@@ -416,6 +428,7 @@ impl PartyState {
             reservations: HashMap::new(),
             max_member_blob_bytes: MAX_MEMBER_BLOB_BYTES,
             max_upload_spool_bytes: MAX_UPLOAD_SPOOL_BYTES,
+            upload_idle_timeout: UPLOAD_IDLE_TIMEOUT,
             max_blob_bytes: MAX_TOTAL_BLOB_BYTES,
             max_members: MAX_MEMBERS,
             resident_history: RESIDENT_HISTORY,
@@ -438,6 +451,11 @@ impl PartyState {
     /// Override the server-wide budget for upload bytes in flight (tests).
     pub fn set_max_upload_spool_bytes(&mut self, bytes: u64) {
         self.max_upload_spool_bytes = bytes;
+    }
+
+    /// Override how long an upload may go without a chunk (tests).
+    pub fn set_upload_idle_timeout(&mut self, timeout: std::time::Duration) {
+        self.upload_idle_timeout = timeout;
     }
 
     /// Override how many of each thread's newest envelopes stay in memory on

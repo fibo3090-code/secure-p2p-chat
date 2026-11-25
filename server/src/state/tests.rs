@@ -3014,3 +3014,50 @@ fn a_file_message_the_database_refuses_leaves_nothing_behind() {
         "the refcount drifted"
     );
 }
+
+/// #213 review (open question 3): the in-flight budget counts *declared*
+/// sizes and nothing expired an upload that went quiet, so members who each
+/// offered a large upload and sent nothing blocked chunked uploads for
+/// everyone, for ever. An upload that receives nothing for
+/// `upload_idle_timeout` is dropped when the next one is offered; one that
+/// keeps sending is kept; the quiet sender is told it is gone.
+#[test]
+fn an_upload_that_goes_quiet_stops_holding_the_budget() {
+    let mut state = PartyState::new("Srv", None);
+    let _owner = join_owner(&mut state, "owner");
+    let quiet = state.join("quiet", None, None).unwrap();
+    let busy = state.join("busy", None, None).unwrap();
+    let late = state.join("late", None, None).unwrap();
+    let channel = state.default_channel();
+    let start = |state: &mut PartyState, who, size| {
+        state.start_upload(
+            who,
+            "f".into(),
+            "application/octet-stream".into(),
+            size,
+            UploadTarget::Channel(channel),
+        )
+    };
+    state.set_max_upload_spool_bytes(200);
+    state.set_upload_idle_timeout(std::time::Duration::from_millis(200));
+    let silent = start(&mut state, quiet, 100).unwrap();
+    let active = start(&mut state, busy, 100).unwrap();
+    assert!(
+        start(&mut state, late, 100).unwrap_err().contains("busy"),
+        "the budget was not full to begin with"
+    );
+
+    // The active upload keeps sending; the silent one sends nothing.
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        state.upload_chunk(busy, active, b"x").unwrap();
+    }
+    start(&mut state, late, 100).expect("a quiet upload still held the budget");
+    state
+        .upload_chunk(busy, active, b"y")
+        .expect("an upload that kept sending was dropped");
+    assert_eq!(
+        state.upload_chunk(quiet, silent, b"z").unwrap_err(),
+        "no such upload"
+    );
+}

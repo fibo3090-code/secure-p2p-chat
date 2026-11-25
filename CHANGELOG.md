@@ -51,6 +51,11 @@ predate tagged releases.
 
 ### Fixed
 
+- Community server: a member who started a large upload and then sent
+  nothing kept holding the server's upload budget, so a few such uploads
+  blocked everyone else's. An upload that sends nothing for two minutes is
+  now dropped.
+
 - Desktop: a received `.csv` now asks before it opens, like other types
   that are not known to be display-only — it usually opens in a spreadsheet,
   where a cell can run a command. `.xht`, `.shtml`, `.svgz` and `.sldm` are

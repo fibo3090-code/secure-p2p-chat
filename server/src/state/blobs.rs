@@ -638,6 +638,9 @@ impl PartyState {
         if !self.is_member(uploader) {
             return Err("sender is not a member of this server".to_string());
         }
+        // Before anything counts what is in flight: an upload that went quiet
+        // must not hold the budget (or this member's slots) for ever.
+        self.expire_idle_uploads();
         if self.uploads_in_flight(uploader) >= MAX_CONCURRENT_UPLOADS {
             return Err(format!(
                 "you already have {MAX_CONCURRENT_UPLOADS} uploads in progress"
@@ -694,9 +697,26 @@ impl PartyState {
                 target,
                 data: Vec::with_capacity(size.min(PARTY_CHUNK_BYTES as u64 * 4) as usize),
                 hasher: BlobHasher::new(),
+                last_active: std::time::Instant::now(),
             },
         );
         Ok(id)
+    }
+
+    /// Drop every chunked upload that has received nothing for
+    /// `upload_idle_timeout`, returning how many went. Its sender, if it ever
+    /// resumes, is answered "no such upload" and can offer the file again.
+    pub(super) fn expire_idle_uploads(&mut self) -> usize {
+        let timeout = self.upload_idle_timeout;
+        let before = self.uploads.len();
+        self.uploads.retain(|id, p| {
+            let fresh = p.last_active.elapsed() < timeout;
+            if !fresh {
+                tracing::info!(upload = %id, name = %p.name, "dropped an upload that sent nothing for too long");
+            }
+            fresh
+        });
+        before - self.uploads.len()
     }
 
     /// Append one chunk, refusing anything past the declared size *before*
@@ -724,6 +744,7 @@ impl PartyState {
         }
         pending.data.extend_from_slice(data);
         pending.hasher.update(data);
+        pending.last_active = std::time::Instant::now();
         Ok(())
     }
 
