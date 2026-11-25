@@ -2867,6 +2867,19 @@ fn the_data_directory_is_owner_only() {
     assert_eq!(mode, 0o700, "data directory left {mode:o}");
 }
 
+/// #213 review: every load ran `set_permissions(data_dir, 0o700)?`, so a
+/// data directory the server may write but does not own (a root-owned Docker
+/// volume reached through group permissions) answered EPERM and the upgraded
+/// server would not start. It is a warning now. `/proc/self` stands in for
+/// such a directory: `chmod` on it fails even for root.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_data_directory_that_cannot_be_restricted_is_a_warning_not_a_refusal() {
+    assert!(!restrict_data_dir(std::path::Path::new("/proc/self")));
+    let dir = tempfile::tempdir().unwrap();
+    assert!(restrict_data_dir(dir.path()));
+}
+
 /// Review of #213: with QUAL-05 a file message the database refuses is
 /// refused — but the upload had already published the blob and recorded its
 /// reference, and the commit's transaction commits even when it returns Err.

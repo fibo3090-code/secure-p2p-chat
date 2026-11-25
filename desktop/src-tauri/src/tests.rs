@@ -1207,6 +1207,10 @@ fn opening_a_received_executable_needs_confirmation() {
         ("vector.svg", "svg", true),
         ("Open me.terminal", "terminal", true),
         ("report.docx", "docx", false),
+        // Opens in a spreadsheet, where a cell can be formula/DDE injection.
+        ("figures.csv", "csv", false),
+        ("slide.sldm", "sldm", true),
+        ("drawing.svgz", "svgz", true),
         ("archive.zip", "zip", false),
         ("README", "", false),
     ] {

@@ -26,6 +26,39 @@ use uuid::Uuid;
 mod blobs;
 mod db;
 mod history;
+/// Make `data_dir` owner-only (SRV-11), or say loudly why it could not be.
+///
+/// A failure is a warning, not a refusal to start: a directory the server may
+/// write but does not own (a root-owned Docker volume reached through group
+/// permissions, say) answers `chmod` with EPERM, and failing there stopped an
+/// upgraded server from starting at all. Returns whether the mode is now
+/// owner-only.
+fn restrict_data_dir(data_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)) {
+            let mode = std::fs::metadata(data_dir)
+                .map(|m| format!("{:o}", m.permissions().mode() & 0o777))
+                .unwrap_or_else(|_| "unknown".to_string());
+            tracing::warn!(
+                dir = %data_dir.display(),
+                mode = %mode,
+                error = %e,
+                "could not make the data directory owner-only; it holds every message in \
+                 plaintext, so restrict it yourself (chmod 700, owned by the server's user)"
+            );
+            return false;
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests;
 mod write_rate;
@@ -469,11 +502,7 @@ impl PartyState {
         // and under a 022 umask it and every blob were world-readable on a
         // shared host (SRV-11). The directory's mode covers everything in it,
         // including files created later under the default umask.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        restrict_data_dir(data_dir);
         let blob_dir = data_dir.join(BLOB_DIR);
         std::fs::create_dir_all(&blob_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;

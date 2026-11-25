@@ -51,6 +51,15 @@ predate tagged releases.
 
 ### Fixed
 
+- Desktop: a received `.csv` now asks before it opens, like other types
+  that are not known to be display-only — it usually opens in a spreadsheet,
+  where a cell can run a command. `.xht`, `.shtml`, `.svgz` and `.sldm` are
+  treated as able to run code.
+- Community server: a data directory it may write but does not own (a
+  root-owned Docker volume, say) no longer stops it from starting after the
+  upgrade that made the directory owner-only. It starts and logs a warning
+  saying to restrict the directory.
+
 - Hosting: a saved contact who connected to you with a different key — a new
   device, or someone intercepting them — got a fresh conversation and a
   prompt that looked like a stranger's first connection. When the connection

@@ -61,14 +61,15 @@ export const RISKY_EXTENSIONS = new Set([
   "diagcab", "appinstaller", "msix", "msixbundle", "appx", "appxbundle", "xll",
   "wsc", "sct", "vb", "ws", "ps1xml", "psc1", "jnlp", "website", "mde", "cab",
   "iso", "img", "vhd", "vhdx", "dmg", "docm", "dotm", "xlsm", "xltm", "xlam",
-  "pptm", "potm", "ppam", "html", "htm", "xhtml", "mht", "mhtml", "svg",
+  "pptm", "potm", "ppam", "sldm", "html", "htm", "xhtml", "xht", "shtml", "mht",
+  "mhtml", "svg", "svgz",
   "terminal", "tool", "scpt", "applescript", "workflow", "webloc", "inetloc",
   "fileloc", "mpkg",
 ]);
 
 export const INERT_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif",
-  "avif", "pdf", "txt", "md", "csv", "log", "mp3", "wav", "ogg", "oga", "flac",
+  "avif", "pdf", "txt", "md", "log", "mp3", "wav", "ogg", "oga", "flac",
   "m4a", "aac", "opus", "mp4", "m4v", "mov", "mkv", "webm", "avi",
 ]);
 

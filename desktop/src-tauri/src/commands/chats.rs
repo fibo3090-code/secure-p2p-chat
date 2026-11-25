@@ -498,13 +498,17 @@ const RISKY_EXTENSIONS: &[&str] = &[
     "pptm",
     "potm",
     "ppam",
+    "sldm",
     // Opens in a browser with a `file://` origin, script and all
     "html",
     "htm",
     "xhtml",
+    "xht",
+    "shtml",
     "mht",
     "mhtml",
     "svg",
+    "svgz",
     // macOS launchers and scripts
     "terminal",
     "tool",
@@ -526,8 +530,9 @@ const RISKY_EXTENSIONS: &[&str] = &[
 const INERT_EXTENSIONS: &[&str] = &[
     // Raster images (SVG is not one: it can carry script)
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif",
-    // Documents that only display
-    "pdf", "txt", "md", "csv", "log", // Audio
+    // Documents that only display. Not csv: its default handler is usually a
+    // spreadsheet, where a cell like `=cmd|...` is formula/DDE injection.
+    "pdf", "txt", "md", "log", // Audio
     "mp3", "wav", "ogg", "oga", "flac", "m4a", "aac", "opus", // Video
     "mp4", "m4v", "mov", "mkv", "webm", "avi",
 ];
