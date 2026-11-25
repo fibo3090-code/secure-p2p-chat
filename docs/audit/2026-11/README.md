@@ -490,6 +490,37 @@ Ed25519 hex helpers are public API of `messenger-core`, and the agent CLI
 lives in a sibling repository this pass could not inspect. Deleting them, and their
 test, waits on checking that repository.
 
+### Review of the 24 November PRs (#197–#213)
+
+An independent review of the merged batch and of this branch found these,
+each now fixed with a test seen failing without the fix:
+- **NET-16 bypass (blocking):** an IPv4-mapped IPv6 candidate
+  (`[::ffff:127.0.0.1]`) passed the punch filter and the dual-stack socket
+  dialled the host's own loopback. Candidates are now judged and dialled as
+  the IPv4 address they name.
+- **CRYPTO-04 on the listener side:** a saved contact arriving with another
+  key looked like a stranger. It now warns `ContactAddressMismatch` when the
+  connection comes from that contact's address. The desktop dialog no longer
+  reads a failed lookup as first use, and `get_conversation` resolves
+  session ids.
+- **CRYPTO-04 follow-ups:** a key change that also contradicts an invite
+  says the contact will be repointed, and a Trusted contact stays Trusted.
+- **Refused file messages** no longer leave a counted reference and bytes
+  behind (QUAL-05 follow-up).
+- **The production tunnel derivation** (`HKDF_INFO`, transcript order, AAD
+  format) is pinned by a known answer computed independently.
+- **Diagnostics** scrub IPv6 addresses and server host names.
+- **The data-directory chmod** is a warning, not a refusal to start.
+- **Test hooks** compile only under `cfg(test)` or a dev-only `test-support`
+  feature.
+- **Idle uploads** stop holding the spool budget after two minutes.
+- **csv** asks before opening, and four more types count as able to run
+  code.
+
+Left as design decisions: whether accepting an `InviteMismatch` should rebind
+the contact (question 1 of the review), and a fuller listener-side identity
+model (question 2) beyond the address hint added here.
+
 ## Method and limits
 
 - Static reading of every file in each area, by thirteen auditors in parallel
