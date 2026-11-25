@@ -3061,3 +3061,187 @@ fn an_upload_that_goes_quiet_stops_holding_the_budget() {
         "no such upload"
     );
 }
+
+// ── Gaps found by mutation testing (state/blobs.rs) ─────────────────────────
+
+/// Every size limit admits exactly its own size and refuses one byte more:
+/// the per-member allowance (chunked and inline), the chunked file cap and the
+/// inline cap.
+#[test]
+fn every_file_size_limit_admits_exactly_its_own_size() {
+    let mut state = PartyState::new("Srv", None);
+    let owner = join_owner(&mut state, "owner");
+    let bob = state.join("bob", None, None).unwrap();
+    let carol = state.join("carol", None, None).unwrap();
+    let channel = state.default_channel();
+    let target = UploadTarget::Channel(channel);
+
+    state.set_max_member_blob_bytes(100);
+    assert!(start(&mut state, bob, "fits", 100, target).is_ok());
+    assert!(start(&mut state, carol, "over", 101, target).is_err());
+    assert!(put_file(&mut state, carol, channel, "fits", vec![1u8; 100]).is_ok());
+    assert!(put_file(&mut state, carol, channel, "over", vec![2u8]).is_err());
+
+    // The owner has no allowance; the caps themselves remain.
+    state.set_max_upload_spool_bytes(u64::MAX);
+    assert!(start(&mut state, owner, "max", MAX_PARTY_FILE_BYTES, target).is_ok());
+    assert!(start(&mut state, owner, "max+1", MAX_PARTY_FILE_BYTES + 1, target).is_err());
+    assert!(put_file(
+        &mut state,
+        owner,
+        channel,
+        "inline",
+        vec![3u8; MAX_INLINE_FILE_BYTES]
+    )
+    .is_ok());
+}
+
+/// An upload another member has in flight is *their* reservation: it does not
+/// count against anyone else's allowance.
+#[test]
+fn another_member_s_upload_in_flight_costs_you_nothing() {
+    let mut state = PartyState::new("Srv", None);
+    let _owner = join_owner(&mut state, "owner");
+    let alice = state.join("alice", None, None).unwrap();
+    let bob = state.join("bob", None, None).unwrap();
+    let channel = state.default_channel();
+    state.set_max_member_blob_bytes(100);
+
+    let _held = state
+        .begin_inline_upload(
+            alice,
+            UploadTarget::Channel(channel),
+            "a".into(),
+            octet(),
+            vec![1u8; 90],
+        )
+        .unwrap();
+    assert!(
+        put_file(&mut state, bob, channel, "b", vec![2u8; 100]).is_ok(),
+        "alice's reservation was counted against bob"
+    );
+    assert!(
+        put_file(&mut state, alice, channel, "c", vec![3u8; 20]).is_err(),
+        "alice's own reservation must count against her"
+    );
+}
+
+/// Sharing and setting permissions act on the share named by *both* its hash
+/// and its location — never on another file in that place, or the same file
+/// somewhere else.
+#[test]
+fn file_operations_act_on_the_share_named_not_a_neighbour() {
+    let mut state = PartyState::new("Srv", None);
+    let owner = join_owner(&mut state, "owner");
+    let general = state.default_channel();
+    let other = new_channel(&mut state, owner, "other", ChannelKind::Public);
+    let here = put_file_hash(
+        &mut state,
+        owner,
+        general,
+        "here.txt",
+        b"in general".to_vec(),
+    );
+    let there = put_file_hash(&mut state, owner, other, "there.txt", b"in other".to_vec());
+
+    // `there` is not shared in #general.
+    assert!(state
+        .share_file(owner, &there, general, UploadTarget::Channel(other))
+        .is_err());
+    let shared = state
+        .share_file(owner, &here, general, UploadTarget::Channel(other))
+        .unwrap();
+    assert_eq!(file_payload(&shared).hash, here);
+
+    let locked = FilePermissions {
+        view: true,
+        download: false,
+        delete: false,
+        share: false,
+    };
+    assert!(state
+        .set_file_permissions(owner, &there, general, None, locked)
+        .is_err());
+    let bob = state.join("bob", None, None).unwrap();
+    let here_in_general = state
+        .files_for(bob)
+        .into_iter()
+        .find(|f| f.hash == here && f.location == general)
+        .unwrap();
+    assert!(
+        here_in_general.perms.download,
+        "a neighbour's permissions changed"
+    );
+}
+
+/// A file sent in a DM is listed under the other person's name.
+#[test]
+fn a_dm_file_is_listed_under_the_other_person() {
+    let mut state = PartyState::new("Srv", None);
+    let _owner = join_owner(&mut state, "owner");
+    let alice = state.join("alice", None, None).unwrap();
+    let bob = state.join("bob", None, None).unwrap();
+    put_file_dm(&mut state, alice, bob, "note.txt", b"hi".to_vec()).unwrap();
+    let entry = |viewer| {
+        state
+            .files_for(viewer)
+            .into_iter()
+            .find(|f| f.name == "note.txt")
+            .unwrap()
+    };
+    assert!(entry(alice).is_dm);
+    assert_eq!(entry(alice).location_name, "DM with bob");
+    assert_eq!(entry(bob).location_name, "DM with alice");
+}
+
+/// A chunk asked for past the end of a file is empty, not a panic.
+#[test]
+fn a_chunk_past_the_end_of_a_file_is_empty() {
+    let mut state = PartyState::new("Srv", None);
+    let owner = join_owner(&mut state, "owner");
+    let general = state.default_channel();
+    let hash = put_file_hash(&mut state, owner, general, "f", vec![9u8; 10]);
+    assert_eq!(
+        state.blob_chunk_for(owner, &hash, 10),
+        Some((Vec::new(), 10))
+    );
+    assert_eq!(
+        state.blob_chunk_for(owner, &hash, 1000),
+        Some((Vec::new(), 10))
+    );
+}
+
+/// Expiry reports how many uploads it dropped, and a short finish says how
+/// much is missing.
+#[test]
+fn idle_expiry_counts_what_it_dropped_and_a_short_finish_says_what_is_missing() {
+    let mut state = PartyState::new("Srv", None);
+    let owner = join_owner(&mut state, "owner");
+    let target = UploadTarget::Channel(state.default_channel());
+    let short = start(&mut state, owner, "short", 10, target).unwrap();
+    state.upload_chunk(owner, short, &[0u8; 4]).unwrap();
+    assert_eq!(state.staged_upload_bytes(), 4);
+    let err = state.finish_upload(owner, short).unwrap_err();
+    assert!(err.contains("6.00 B still missing"), "got: {err}");
+
+    start(&mut state, owner, "a", 5, target).unwrap();
+    start(&mut state, owner, "b", 5, target).unwrap();
+    state.set_upload_idle_timeout(Duration::ZERO);
+    assert_eq!(state.expire_idle_uploads(), 2);
+    assert_eq!(state.uploads_in_flight(owner), 0);
+}
+
+/// Disk reads work from a single-threaded runtime (the `#[tokio::test]`
+/// default, and any embedder's): `block_in_place` panics there, so
+/// `blocking_io` must only use it on a multi-threaded runtime.
+#[tokio::test]
+async fn disk_reads_work_on_a_single_threaded_runtime() {
+    let (_dir, mut state) = disk_state();
+    let owner = join_owner(&mut state, "owner");
+    let general = state.default_channel();
+    let hash = put_file_hash(&mut state, owner, general, "f", b"on disk".to_vec());
+    assert_eq!(
+        state.blob_bytes_for(owner, &hash).as_deref(),
+        Some(&b"on disk"[..])
+    );
+}

@@ -1162,4 +1162,253 @@ mod tests {
             [PartyResponse::MessagePosted { .. }]
         ));
     }
+
+    // ── Gaps found by mutation testing ─────────────────────────────────────
+
+    /// The identity verified in the handshake is what a join is bound to: the
+    /// same key rejoins as the same member, another key cannot take the name.
+    #[test]
+    fn the_handshake_fingerprint_is_what_a_join_is_bound_to() {
+        let mut state = PartyState::new("Srv", None);
+        let mut first = ConnState::with_fingerprint("FP-alice".into());
+        let id = joined_id(&mut state, &mut first, "alice");
+        state.set_online(id, false);
+
+        let mut again = ConnState::with_fingerprint("FP-alice".into());
+        assert_eq!(joined_id(&mut state, &mut again, "alice"), id);
+        let mut other = ConnState::with_fingerprint("FP-mallory".into());
+        assert!(matches!(
+            &join(&mut state, &mut other, "alice", None)[..],
+            [PartyResponse::JoinRejected { .. }]
+        ));
+    }
+
+    /// A connection lists exactly the uploads it has open — chunked and inline
+    /// — so a disconnect can release each one's reservation.
+    #[test]
+    fn a_connection_tracks_exactly_its_open_uploads() {
+        let mut state = PartyState::new("Srv", None);
+        let mut owner_conn = ConnState::default();
+        joined_owner_id(&mut state, &mut owner_conn, "owner");
+        let mut conn = ConnState::default();
+        let bob = joined_id(&mut state, &mut conn, "bob");
+        let target = UploadTarget::Channel(state.default_channel());
+        let mut started = Vec::new();
+        for name in ["a", "b"] {
+            let out = handle_request(
+                &mut state,
+                &mut conn,
+                PartyRequest::StartUpload {
+                    name: name.into(),
+                    mime: "text/plain".into(),
+                    size: 4,
+                    target,
+                },
+            );
+            match &out.replies[..] {
+                [PartyResponse::UploadReady { upload, .. }] => started.push(*upload),
+                other => panic!("expected UploadReady, got {other:?}"),
+            }
+        }
+        assert_eq!(conn.open_uploads(), &started[..]);
+        handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::CancelUpload { upload: started[0] },
+        );
+        assert_eq!(conn.open_uploads(), &started[1..]);
+
+        // An inline upload holds a reservation until its deferred write
+        // commits; dropping the connection must give it back.
+        state.set_max_member_blob_bytes(100);
+        let general = state.default_channel();
+        let inline = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::PostFile {
+                channel: general,
+                name: "held".into(),
+                mime: "text/plain".into(),
+                data: vec![1u8; 90],
+            },
+        );
+        assert!(inline.deferred.is_some());
+        assert_eq!(conn.open_uploads().len(), 2);
+        drop(inline); // the write never happens: the connection died
+        let open = conn.open_uploads().to_vec();
+        state.cancel_connection_uploads(bob, &open);
+        assert!(
+            state
+                .post_file(
+                    bob,
+                    general,
+                    "x".into(),
+                    "text/plain".into(),
+                    vec![2u8; 100]
+                )
+                .is_ok(),
+            "the dead connection's reservation was never released"
+        );
+    }
+
+    /// Governance answers: the requester's own list and a confirmation, and
+    /// everyone else is told to re-fetch. A refusal is an `Error`.
+    #[test]
+    fn governance_replies_carry_the_refreshed_lists() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        let owner = joined_owner_id(&mut state, &mut conn, "owner");
+        let bob = joined_id(&mut state, &mut ConnState::default(), "bob");
+        let channel = state.create_channel("temp").unwrap().id;
+        let _ = owner;
+
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::SetChannelAccess {
+                channel,
+                kind: ChannelKind::Locked,
+                members: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            &out.replies[..],
+            [PartyResponse::Channels(_), PartyResponse::Ok(_)]
+        ));
+        assert!(matches!(
+            &out.broadcast[..],
+            [PartyResponse::DirectoryChanged]
+        ));
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::DeleteChannel { channel },
+        );
+        assert!(matches!(
+            &out.replies[..],
+            [PartyResponse::Channels(_), PartyResponse::Ok(_)]
+        ));
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::DeleteChannel { channel },
+        );
+        assert!(matches!(&out.replies[..], [PartyResponse::Error(_)]));
+
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::SetRole {
+                member: bob,
+                role: messenger_core::party::Role::Admin,
+            },
+        );
+        assert!(matches!(
+            &out.replies[..],
+            [
+                PartyResponse::Members(_),
+                PartyResponse::Channels(_),
+                PartyResponse::Ok(_)
+            ]
+        ));
+        assert!(matches!(
+            &out.broadcast[..],
+            [PartyResponse::Members(_), PartyResponse::DirectoryChanged]
+        ));
+
+        // Deleting a file: `Ok` when done, `Error` when refused.
+        let general = state.default_channel();
+        let hash = match state
+            .post_file(
+                owner,
+                general,
+                "f".into(),
+                "text/plain".into(),
+                b"x".to_vec(),
+            )
+            .unwrap()
+            .payload
+        {
+            MessagePayload::File(f) => f.hash,
+            other => panic!("{other:?}"),
+        };
+        let delete = |state: &mut PartyState, conn: &mut ConnState| {
+            handle_request(
+                state,
+                conn,
+                PartyRequest::DeleteFile {
+                    hash: hash.clone(),
+                    channel: general,
+                },
+            )
+        };
+        assert!(matches!(
+            &delete(&mut state, &mut conn).replies[..],
+            [PartyResponse::Ok(_)]
+        ));
+        assert!(matches!(
+            &delete(&mut state, &mut conn).replies[..],
+            [PartyResponse::Error(_)]
+        ));
+    }
+
+    /// A whole-file download is allowed up to and including the inline limit.
+    #[test]
+    fn a_whole_file_download_at_exactly_the_inline_limit_is_allowed() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        let me = joined_owner_id(&mut state, &mut conn, "owner");
+        let data = vec![5u8; MAX_INLINE_FILE_BYTES];
+        let general = state.default_channel();
+        let env = state
+            .post_file(me, general, "edge".into(), "text/plain".into(), data)
+            .unwrap();
+        let MessagePayload::File(file) = env.payload else {
+            panic!()
+        };
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::DownloadFile { hash: file.hash },
+        );
+        assert!(out.deferred.is_some(), "{:?}", out.replies);
+    }
+
+    /// A rate-limited upload offer is a failed send the client can retract,
+    /// like a refused post.
+    #[test]
+    fn a_rate_limited_upload_offer_is_a_failed_send() {
+        let mut state = PartyState::new("Srv", None);
+        let mut conn = ConnState::default();
+        joined_id(&mut state, &mut conn, "alice");
+        let channel = state.default_channel();
+        for i in 0..200 {
+            let out = handle_request(
+                &mut state,
+                &mut conn,
+                PartyRequest::PostMessage {
+                    channel,
+                    text: format!("spam {i}"),
+                },
+            );
+            if matches!(&out.replies[..], [PartyResponse::ActionFailed { .. }]) {
+                break;
+            }
+        }
+        let out = handle_request(
+            &mut state,
+            &mut conn,
+            PartyRequest::StartUpload {
+                name: "f".into(),
+                mime: "text/plain".into(),
+                size: 4,
+                target: UploadTarget::Channel(channel),
+            },
+        );
+        assert!(
+            matches!(&out.replies[..], [PartyResponse::ActionFailed { channel: c, .. }] if *c == channel),
+            "{:?}",
+            out.replies
+        );
+    }
 }

@@ -3104,3 +3104,244 @@ async fn a_trusted_contact_stays_trusted_when_its_new_key_is_accepted() {
     assert_eq!(contact.fingerprint.as_deref(), Some(presented.as_str()));
     assert_eq!(contact.trust_state, TrustState::Trusted);
 }
+
+// ── Gaps found by mutation testing (events.rs, contacts.rs) ────────────────
+
+/// A listener's incoming conversation, as `NewConnection` opens it.
+fn listener_with_caller(mgr: &mut ChatManager, fingerprint: &str) -> (Uuid, Uuid) {
+    let listener = Uuid::new_v4();
+    mgr.create_local_chat_for_test(listener, "Host on :12345".into());
+    mgr.chats.get_mut(&listener).unwrap().is_host_placeholder = true;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    mgr.add_fingerprint_confirm_sender_for_test(listener, tx);
+    let offered = Uuid::new_v4();
+    mgr.handle_session_event(
+        listener,
+        SessionEvent::NewConnection {
+            peer_addr: "198.51.100.9:50000".into(),
+            fingerprint: fingerprint.into(),
+            sas: "123456".into(),
+            chat_id: offered,
+        },
+    );
+    assert!(mgr.chats.contains_key(&offered));
+    (listener, offered)
+}
+
+/// One caller hanging up cleans up after *that* caller only: another
+/// listener's unverified caller keeps its conversation, its mapping, and its
+/// place in the prompt queue. An unverified conversation the user tied to a
+/// contact is kept too.
+#[test]
+fn a_caller_leaving_takes_only_its_own_conversation_with_it() {
+    let mut mgr = ChatManager::default();
+    let (first, first_chat) = listener_with_caller(&mut mgr, &"ab".repeat(32));
+    let (second, second_chat) = listener_with_caller(&mut mgr, &"cd".repeat(32));
+    let (third, third_chat) = listener_with_caller(&mut mgr, &"ef".repeat(32));
+    let contact = mgr
+        .import_contact(contact_with(
+            "Kept",
+            &"99".repeat(32),
+            TrustState::Unverified,
+        ))
+        .unwrap();
+    mgr.associate_contact_with_chat(contact, third_chat);
+
+    mgr.handle_session_event(first, SessionEvent::Disconnected);
+    assert!(!mgr.chats.contains_key(&first_chat));
+    assert!(
+        mgr.chats.contains_key(&second_chat),
+        "another session's caller was dropped"
+    );
+    assert_eq!(
+        mgr.chat_id_mapping.get(&second_chat),
+        Some(&second),
+        "another session's mapping was dropped"
+    );
+
+    mgr.handle_session_event(third, SessionEvent::Disconnected);
+    assert!(
+        mgr.chats.contains_key(&third_chat),
+        "a conversation tied to a contact is the user's, verified or not"
+    );
+}
+
+/// The prompt toast says how many are waiting once there is a queue.
+#[test]
+fn a_second_waiting_prompt_says_how_many_are_waiting() {
+    let mut mgr = ChatManager::default();
+    listener_with_caller(&mut mgr, &"ab".repeat(32));
+    let last = |m: &ChatManager| m.toasts.last().map(|t| t.message.clone()).unwrap();
+    assert_eq!(last(&mgr), "Fingerprint verification required");
+    listener_with_caller(&mut mgr, &"cd".repeat(32));
+    assert_eq!(last(&mgr), "Fingerprint verification required (2 waiting)");
+}
+
+/// Several messages can await their receipts at once; each is marked when its
+/// own ack arrives.
+#[test]
+fn several_sent_messages_await_their_receipts_together() {
+    let mut mgr = ChatManager::default();
+    let (chat_id, _rx) = chat_with_session(&mut mgr, "Receipts");
+    mgr.send_message(chat_id, "one".into()).unwrap();
+    mgr.handle_session_event(chat_id, SessionEvent::TextSendComplete { seq: 7 });
+    mgr.send_message(chat_id, "two".into()).unwrap();
+    mgr.handle_session_event(chat_id, SessionEvent::TextSendComplete { seq: 8 });
+
+    frame(&mut mgr, chat_id, ack(7, 1));
+    frame(&mut mgr, chat_id, ack(8, 2));
+    let delivered: Vec<bool> = mgr.chats[&chat_id]
+        .messages
+        .iter()
+        .map(|m| m.delivered)
+        .collect();
+    assert_eq!(delivered, [true, true]);
+}
+
+/// A `p2p:` label means the rendezvous punched a direct socket: the
+/// conversation reads Direct even if it was dialled through a relay, and the
+/// user is told it went direct.
+#[test]
+fn a_hole_punched_connection_is_labelled_direct() {
+    let (mut mgr, chat) = manager_with_chat("relay dial");
+    mgr.chats.get_mut(&chat).unwrap().transport = Transport::Relay;
+    connected(&mut mgr, chat, "p2p:203.0.113.7:40000");
+    assert_eq!(mgr.chats[&chat].transport, Transport::Direct);
+    assert!(mgr.toasts.last().unwrap().message.contains("hole punched"));
+
+    let (mut mgr, chat) = manager_with_chat("relay dial");
+    connected(&mut mgr, chat, "relay:relay.example:23456");
+    assert_eq!(mgr.chats[&chat].transport, Transport::Relay);
+}
+
+/// The dialler folds a fresh connection into the conversation that already
+/// holds this peer's key — that one, and only that one.
+#[test]
+fn a_reconnect_folds_only_into_the_peer_s_own_conversation() {
+    let peer = "ab".repeat(32);
+
+    // Only an unrelated idle conversation exists: nothing to fold into.
+    let (mut mgr, other) = manager_with_chat("Someone else");
+    mgr.chats.get_mut(&other).unwrap().peer_fingerprint = Some("cd".repeat(32));
+    let (fresh, _rx) = chat_with_session(&mut mgr, "127.0.0.1:12345");
+    show_fingerprint(&mut mgr, fresh, &peer, "Peer");
+    assert!(
+        mgr.chats.contains_key(&fresh),
+        "folded into a stranger's conversation"
+    );
+    assert!(!mgr.chat_id_mapping.contains_key(&other));
+
+    // The peer's own conversation exists: the fresh chat folds into it, and
+    // only the contact bound to the fresh chat follows.
+    let (mut mgr, own) = manager_with_chat("Peer");
+    mgr.chats.get_mut(&own).unwrap().peer_fingerprint = Some(peer.clone());
+    let elsewhere = Uuid::new_v4();
+    mgr.create_local_chat_for_test(elsewhere, "Elsewhere".into());
+    let (fresh, _rx) = chat_with_session(&mut mgr, "127.0.0.1:12345");
+    let follows = mgr
+        .import_contact(contact_with("Peer", &peer, TrustState::Verified))
+        .unwrap();
+    mgr.associate_contact_with_chat(follows, fresh);
+    let stays = mgr
+        .import_contact(contact_with(
+            "Other",
+            &"ef".repeat(32),
+            TrustState::Unverified,
+        ))
+        .unwrap();
+    mgr.associate_contact_with_chat(stays, elsewhere);
+    show_fingerprint(&mut mgr, fresh, &peer, "Peer");
+    assert!(!mgr.chats.contains_key(&fresh));
+    assert_eq!(mgr.chat_id_mapping.get(&own), Some(&fresh));
+    assert_eq!(mgr.contact_to_chat.get(&follows), Some(&own));
+    assert_eq!(mgr.contact_to_chat.get(&stays), Some(&elsewhere));
+
+    // A dial that already holds messages is not a fresh dial: never folded
+    // (folding removes it, and its messages with it).
+    let (mut mgr, own) = manager_with_chat("Peer");
+    mgr.chats.get_mut(&own).unwrap().peer_fingerprint = Some(peer.clone());
+    let (busy, _rx) = chat_with_session(&mut mgr, "127.0.0.1:12345");
+    mgr.send_message(busy, "already said something".into())
+        .unwrap();
+    show_fingerprint(&mut mgr, busy, &peer, "Peer");
+    assert!(
+        mgr.chats.contains_key(&busy),
+        "a chat with history was folded away"
+    );
+}
+
+/// Trust decisions compare *this* fingerprint: blocking one contact blocks
+/// nobody else, deleting one leaves another's verified chat alone, and a new
+/// contact with a different key is not mistaken for an existing one.
+#[test]
+fn trust_follows_the_fingerprint_not_any_contact() {
+    let mut mgr = ChatManager::default();
+    let blocked = "ab".repeat(32);
+    let other = "cd".repeat(32);
+    mgr.import_contact(contact_with("Blocked", &blocked, TrustState::Blocked))
+        .unwrap();
+    let friend = mgr
+        .import_contact(contact_with("Friend", &other, TrustState::Verified))
+        .unwrap();
+    assert!(mgr.is_fingerprint_blocked(&blocked));
+    assert!(!mgr.is_fingerprint_blocked(&other));
+    assert!(!mgr.deleting_contact_would_unblock(friend));
+
+    // Deleting the friend revokes the friend's trust even though another
+    // contact (with another key) still exists.
+    let chat = Uuid::new_v4();
+    mgr.create_local_chat_for_test(chat, "Friend".into());
+    mgr.chats.get_mut(&chat).unwrap().peer_fingerprint = Some(other.clone());
+    mgr.remove_contact(friend);
+    assert_eq!(mgr.chats[&chat].peer_fingerprint, None);
+
+    // An unsigned link for a new person is a new contact, not a refresh.
+    assert!(mgr
+        .import_contact_from_link(
+            contact_with("New", &"ef".repeat(32), TrustState::Unverified),
+            false
+        )
+        .is_ok());
+}
+
+/// Accepting a key on one conversation promotes the contact bound to *that*
+/// conversation; a contact bound elsewhere is not handed the key.
+#[test]
+fn accepting_a_key_promotes_only_the_contact_of_that_conversation() {
+    let (mut mgr, here) = manager_with_chat("Here");
+    let elsewhere = Uuid::new_v4();
+    mgr.create_local_chat_for_test(elsewhere, "Elsewhere".into());
+    let mut keyless = sample_contact_for_test("Keyless");
+    keyless.fingerprint = None;
+    let keyless = mgr.import_contact(keyless).unwrap();
+    mgr.associate_contact_with_chat(keyless, elsewhere);
+    let mut bound = sample_contact_for_test("Bound");
+    bound.fingerprint = None;
+    let bound = mgr.import_contact(bound).unwrap();
+    mgr.associate_contact_with_chat(bound, here);
+
+    let key = "ab".repeat(32);
+    mgr.promote_contact_verified(here, &key);
+    assert_eq!(
+        mgr.contacts[&bound].fingerprint.as_deref(),
+        Some(key.as_str())
+    );
+    assert_eq!(mgr.contacts[&bound].trust_state, TrustState::Verified);
+    assert_eq!(mgr.contacts[&keyless].fingerprint, None);
+}
+
+/// Associating twice does not list the contact twice.
+#[test]
+fn associating_a_contact_twice_lists_it_once() {
+    let (mut mgr, chat) = manager_with_chat("Peer");
+    let contact = mgr
+        .import_contact(contact_with(
+            "Peer",
+            &"ab".repeat(32),
+            TrustState::Unverified,
+        ))
+        .unwrap();
+    mgr.associate_contact_with_chat(contact, chat);
+    mgr.associate_contact_with_chat(contact, chat);
+    assert_eq!(mgr.chats[&chat].participants, [contact]);
+}
