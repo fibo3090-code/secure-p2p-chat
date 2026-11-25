@@ -250,7 +250,7 @@ impl PartyState {
         meta: &FileMeta,
         location: Uuid,
         is_dm: bool,
-    ) {
+    ) -> Uuid {
         let entry = FileRef {
             id: Uuid::new_v4(),
             default_perms: FilePermissions::default(),
@@ -263,7 +263,21 @@ impl PartyState {
             shared_at: current_timestamp_millis(),
         };
         self.persist_file_ref(&entry);
+        let id = entry.id;
         self.file_refs.push(entry);
+        id
+    }
+
+    /// Undo a file reference and the blob reference it held, for a file
+    /// message that could not be stored. The transaction around a commit
+    /// commits even when it returns `Err` (`with_tx`), so without this a
+    /// refused message left the reference recorded and the bytes counted:
+    /// the retry was refused as "already shared there", and the blob was
+    /// never collected, charging the member's quota for a file nobody holds.
+    fn forget_file_ref(&mut self, id: Uuid, hash: &str) {
+        self.file_refs.retain(|r| r.id != id);
+        self.delete_file_ref_row(id);
+        self.release_blob(hash);
     }
 
     /// What `member` may do with the share `r`: an admin holds everything;
@@ -369,30 +383,31 @@ impl PartyState {
             return Err("that file is already shared there".to_string());
         }
 
-        // A new reference to existing bytes: a refcount, counted against the
-        // sharer's quota as one more holder.
-        let meta = {
-            let Some(rec) = self.blobs.get_mut(hash) else {
-                return Err("that file is no longer stored here".to_string());
-            };
+        let Some(rec) = self.blobs.get(hash) else {
+            return Err("that file is no longer stored here".to_string());
+        };
+        let meta = FileMeta {
+            hash: hash.to_string(),
+            name: source.name.clone(),
+            size: rec.size,
+            mime: rec.mime.clone(),
+        };
+
+        // The message first: it is the one write that can be refused (QUAL-05),
+        // and nothing may be counted for a share that was never posted.
+        let envelope = if is_dm {
+            self.append_dm_message(actor, location, MessagePayload::File(meta.clone()))?
+        } else {
+            self.append_channel_message(actor, location, MessagePayload::File(meta.clone()))?
+        };
+        // Then the new reference to existing bytes: a refcount, counted
+        // against the sharer's quota as one more holder.
+        if let Some(rec) = self.blobs.get_mut(hash) {
             rec.refcount += 1;
             let refcount = rec.refcount;
-            let (size, mime) = (rec.size, rec.mime.clone());
             self.persist_blob_refcount(hash, refcount);
-            FileMeta {
-                hash: hash.to_string(),
-                name: source.name.clone(),
-                size,
-                mime,
-            }
-        };
+        }
         self.record_file_ref(actor, &meta, location, is_dm);
-
-        let envelope = if is_dm {
-            self.append_dm_message(actor, location, MessagePayload::File(meta))?
-        } else {
-            self.append_channel_message(actor, location, MessagePayload::File(meta))?
-        };
         let detail = format!("shared {} again", source.name);
         self.record_audit(actor, "file.share", &detail);
         Ok(envelope)
@@ -1129,9 +1144,13 @@ impl PartyState {
         channel: Uuid,
         meta: FileMeta,
     ) -> Result<Envelope, String> {
-        self.record_file_ref(sender, &meta, channel, false);
+        let (hash, file_ref) = (
+            meta.hash.clone(),
+            self.record_file_ref(sender, &meta, channel, false),
+        );
         self.append_channel_message(sender, channel, MessagePayload::File(meta))
             .map_err(|e| {
+                self.forget_file_ref(file_ref, &hash);
                 if e == "unknown channel" {
                     "channel no longer exists".to_string()
                 } else {
@@ -1162,8 +1181,12 @@ impl PartyState {
         meta: FileMeta,
     ) -> Result<Envelope, String> {
         let thread_id = messenger_core::party::dm_thread_id(from, to);
-        self.record_file_ref(from, &meta, thread_id, true);
+        let (hash, file_ref) = (
+            meta.hash.clone(),
+            self.record_file_ref(from, &meta, thread_id, true),
+        );
         self.append_dm_message(from, thread_id, MessagePayload::File(meta))
+            .inspect_err(|_| self.forget_file_ref(file_ref, &hash))
     }
 
     /// The bytes of a stored blob by content hash, or `None` if unknown.

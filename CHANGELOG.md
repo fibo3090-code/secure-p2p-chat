@@ -67,7 +67,9 @@ predate tagged releases.
 
 - A community server that cannot write a message to its database (a full
   disk, say) now refuses it, so the sender's app takes it back off the screen.
-  It used to confirm the message and lose it at the next restart.
+  It used to confirm the message and lose it at the next restart. A refused file
+  or share also leaves nothing behind: it used to stay counted against the
+  sender's storage, and the retry was refused as "already shared there".
 - The desktop app's diagnostics bundle now contains its recent log (scrubbed
   of addresses and identifiers), and a crash leaves a report in the app's data
   folder. Before, a release build's log went nowhere and the bundle said so.

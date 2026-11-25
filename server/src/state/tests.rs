@@ -2866,3 +2866,138 @@ fn the_data_directory_is_owner_only() {
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "data directory left {mode:o}");
 }
+
+/// Review of #213: with QUAL-05 a file message the database refuses is
+/// refused — but the upload had already published the blob and recorded its
+/// reference, and the commit's transaction commits even when it returns Err.
+/// With a full disk the sender was told "try again", the retry was refused as
+/// "that file is already shared there", and the bytes were never collected,
+/// charging the member's quota for a file nobody holds. A refused file
+/// message now leaves no reference and no bytes behind — in memory and in
+/// the database — and the retry succeeds. Same for a share.
+#[test]
+fn a_file_message_the_database_refuses_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = PartyState::load("Srv", None, dir.path()).unwrap();
+    let general = state.default_channel();
+    let alice = state.join("alice", None, Some("FP-A".to_string())).unwrap();
+    let bob = state.join("bob", None, Some("FP-B".to_string())).unwrap();
+    state.set_write_rate_limit(None);
+    let refuse = |state: &PartyState| {
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_msg BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+                 CREATE TRIGGER refuse_dm BEFORE INSERT ON dm_messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+    };
+    let recover = |state: &PartyState| {
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_msg; DROP TRIGGER refuse_dm;")
+            .unwrap();
+    };
+    let file_ref_rows = |state: &PartyState| -> i64 {
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM file_refs", [], |r| r.get(0))
+            .unwrap()
+    };
+    let data = b"minutes of the meeting".to_vec();
+
+    refuse(&state);
+    for dm in [false, true] {
+        let err = if dm {
+            state.post_file_dm(
+                alice,
+                bob,
+                "m.txt".into(),
+                "text/plain".into(),
+                data.clone(),
+            )
+        } else {
+            state.post_file(
+                alice,
+                general,
+                "m.txt".into(),
+                "text/plain".into(),
+                data.clone(),
+            )
+        }
+        .unwrap_err();
+        assert!(err.contains("could not store"), "{err}");
+        assert_eq!(
+            state.quota_for(alice).used,
+            0,
+            "the refused file is still charged"
+        );
+        assert_eq!(state.quota_for(alice).server_used, 0);
+        assert!(
+            state.files_for(alice).is_empty(),
+            "a reference was left behind"
+        );
+        assert_eq!(
+            file_ref_rows(&state),
+            0,
+            "a reference row was left in the database"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("blobs"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+            "the refused file's bytes are still on disk"
+        );
+    }
+
+    // The disk recovers: the retry is stored, once.
+    recover(&state);
+    let posted = state
+        .post_file(
+            alice,
+            general,
+            "m.txt".into(),
+            "text/plain".into(),
+            data.clone(),
+        )
+        .expect("the retry was refused");
+    let hash = match posted.payload {
+        MessagePayload::File(meta) => meta.hash,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(state.files_for(alice).len(), 1);
+
+    // A share into the DM thread, refused, then retried.
+    refuse(&state);
+    let target = UploadTarget::Dm(bob);
+    assert!(state.share_file(alice, &hash, general, target).is_err());
+    assert_eq!(
+        state.files_for(alice).len(),
+        1,
+        "the refused share left a reference"
+    );
+    assert_eq!(file_ref_rows(&state), 1);
+    recover(&state);
+    state
+        .share_file(alice, &hash, general, target)
+        .expect("the retried share was refused as already shared");
+    assert_eq!(state.files_for(alice).len(), 2);
+
+    // Deleting both shares reclaims the bytes: the count was right.
+    let thread = messenger_core::party::dm_thread_id(alice, bob);
+    for location in [general, thread] {
+        state.delete_file(alice, &hash, location).unwrap();
+    }
+    assert_eq!(
+        state.quota_for(alice).server_used,
+        0,
+        "the refcount drifted"
+    );
+}
